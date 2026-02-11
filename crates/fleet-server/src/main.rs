@@ -32,14 +32,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!(
-        http_addr = %config.server.http_addr,
+        https_addr = %config.server.http_addr,
         data_path = %config.data.path,
         max_queries = config.server.max_concurrent_queries,
         "starting fleetd"
     );
 
     let state = AppState::from_config(&config);
-    http::serve(state, &config.server.http_addr).await?;
+    http::serve(state, &config.server).await?;
 
     Ok(())
 }

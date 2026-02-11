@@ -1,13 +1,22 @@
-//! HTTP transport via axum.
+//! HTTPS transport via axum over `tokio-rustls`.
+//!
+//! Uses a manual TLS accept loop with hyper for per-connection control
+//! and future mTLS support.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::Request;
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware;
 use axum::routing::{get, post};
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
+use tower::Service;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
@@ -16,9 +25,11 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::auth_middleware;
+use crate::config::ServerConfig;
 use crate::handlers;
 use crate::shutdown::shutdown_signal;
 use crate::state::AppState;
+use crate::tls;
 
 /// Build the axum router with all routes and middleware.
 pub fn router(state: AppState) -> Router {
@@ -90,50 +101,118 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Start the HTTP server on the configured address with graceful shutdown.
+/// Start the HTTPS server with graceful shutdown.
 ///
-/// On shutdown signal, stops accepting new connections and waits up to
-/// `shutdown_drain_secs` for in-flight requests to complete before
-/// forcing exit.
-pub async fn serve(state: AppState, addr: &str) -> Result<(), crate::error::ServerError> {
+/// Binds a TCP listener, wraps connections in TLS via `tokio-rustls`,
+/// and serves each connection through hyper + axum. On shutdown signal,
+/// stops accepting new connections and drains in-flight requests up to
+/// `shutdown_drain_secs`.
+pub async fn serve(
+    state: AppState,
+    config: &ServerConfig,
+) -> Result<(), crate::error::ServerError> {
     let drain_secs = state.shutdown_drain_secs;
+    let addr = &config.http_addr;
+
+    // Build TLS config (loads or auto-generates cert).
+    let (tls_config, self_signed) = tls::build_server_config(
+        config.tls_cert_path.as_deref(),
+        config.tls_key_path.as_deref(),
+    )
+    .map_err(|e| crate::error::ServerError::Internal(format!("TLS setup failed: {e}")))?;
+
+    if self_signed {
+        tracing::warn!(
+            "using auto-generated self-signed certificate — clients must use --insecure or trust the cert"
+        );
+    }
+
+    let tls_acceptor = TlsAcceptor::from(tls_config);
     let app = router(state);
 
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| crate::error::ServerError::Internal(format!("failed to bind {addr}: {e}")))?;
 
-    tracing::info!(addr = %addr, "HTTP server listening");
+    tracing::info!(addr = %addr, "HTTPS server listening");
 
-    // Use a Notify to share the shutdown signal between graceful drain
-    // and the hard deadline.
+    // Shutdown coordination: Notify fires on SIGINT/SIGTERM.
     let notify = Arc::new(tokio::sync::Notify::new());
-    let n1 = Arc::clone(&notify);
+    let n_signal = Arc::clone(&notify);
 
     tokio::spawn(async move {
         shutdown_signal().await;
-        n1.notify_waiters();
+        n_signal.notify_waiters();
     });
 
-    let n_graceful = Arc::clone(&notify);
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move { n_graceful.notified().await });
+    // Track spawned connection tasks for graceful drain.
+    let mut connections = JoinSet::new();
 
-    let n_deadline = Arc::clone(&notify);
-    let deadline = async move {
-        n_deadline.notified().await;
-        tracing::info!(drain_secs, "shutdown: draining in-flight requests");
-        tokio::time::sleep(Duration::from_secs(drain_secs)).await;
-        tracing::warn!("shutdown drain timeout exceeded, forcing exit");
-    };
+    // Accept loop — runs until shutdown signal.
+    let n_accept = Arc::clone(&notify);
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (tcp_stream, peer_addr) = result.map_err(|e| {
+                    crate::error::ServerError::Internal(format!("accept error: {e}"))
+                })?;
 
-    tokio::select! {
-        result = server => {
-            result.map_err(|e| crate::error::ServerError::Internal(format!("server error: {e}")))?;
+                let tls_acceptor = tls_acceptor.clone();
+                let tower_service = app.clone();
+
+                connections.spawn(async move {
+                    let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                            return;
+                        }
+                    };
+
+                    let io = TokioIo::new(tls_stream);
+
+                    let hyper_service =
+                        hyper::service::service_fn(move |req: Request<Incoming>| {
+                            let mut svc = tower_service.clone();
+                            async move { svc.call(req).await }
+                        });
+
+                    if let Err(e) =
+                        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(io, hyper_service)
+                            .await
+                    {
+                        tracing::debug!(peer = %peer_addr, error = %e, "connection error");
+                    }
+                });
+            }
+            () = n_accept.notified() => {
+                tracing::info!("shutdown: stopping accept loop");
+                break;
+            }
         }
-        () = deadline => {}
     }
 
-    tracing::info!("HTTP server stopped");
+    // Drain in-flight connections with a deadline.
+    tracing::info!(
+        drain_secs,
+        connections = connections.len(),
+        "shutdown: draining in-flight connections"
+    );
+
+    let drain = async { while connections.join_next().await.is_some() {} };
+
+    if tokio::time::timeout(Duration::from_secs(drain_secs), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            remaining = connections.len(),
+            "shutdown drain timeout exceeded, aborting remaining connections"
+        );
+        connections.abort_all();
+    }
+
+    tracing::info!("HTTPS server stopped");
     Ok(())
 }
