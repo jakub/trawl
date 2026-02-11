@@ -17,12 +17,7 @@ use crate::parser::primitives::{ParserExtra, ParserInput, field_name, keyword, s
 fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra<'src>> + Clone {
     field_name()
         .then_ignore(just('(').padded())
-        .then(
-            expr()
-                .map(|spanned| spanned.node)
-                .separated_by(just(',').padded())
-                .collect::<Vec<_>>(),
-        )
+        .then(expr().separated_by(just(',').padded()).collect::<Vec<_>>())
         .then_ignore(just(')').padded())
         .then(keyword("as").padded().ignore_then(field_name()).or_not())
         .map(|((function, args), alias)| AggExpr {

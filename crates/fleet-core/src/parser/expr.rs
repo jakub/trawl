@@ -5,6 +5,8 @@
 
 use chumsky::prelude::*;
 
+use std::ops::Range;
+
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use crate::parser::primitives::{
     ParserExtra, ParserInput, field_name, keyword, literal, quoted_string, spanned,
@@ -144,7 +146,10 @@ pub(crate) fn expr<'src>()
                                 .collect::<Vec<_>>()
                                 .delimited_by(just('(').padded(), just(')').padded()),
                         )
-                        .map(CmpRhs::InList),
+                        .map_with(|list, e| {
+                            let span = e.span();
+                            CmpRhs::InList(list, span.start..span.end)
+                        }),
                 ))
                 .or_not(),
             )
@@ -160,8 +165,8 @@ pub(crate) fn expr<'src>()
                         span,
                     )
                 }
-                Some(CmpRhs::InList(list)) => {
-                    let span = lhs.span.clone();
+                Some(CmpRhs::InList(list, in_span)) => {
+                    let span = lhs.span.start..in_span.end;
                     Spanned::new(
                         Expr::InList {
                             expr: Box::new(lhs),
@@ -228,7 +233,7 @@ pub(crate) fn expr<'src>()
 #[derive(Debug)]
 enum CmpRhs {
     Binary(BinaryOp, Spanned<Expr>),
-    InList(Vec<Spanned<Expr>>),
+    InList(Vec<Spanned<Expr>>, Range<usize>),
 }
 
 #[cfg(test)]
@@ -374,6 +379,14 @@ mod tests {
             Expr::Binary { op, .. } => assert_eq!(*op, BinaryOp::Mul),
             other => panic!("expected Binary Mul, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_in_list_span() {
+        let input = "x in (1, 2)";
+        let result = parse_expr(input);
+        assert_eq!(result.span.start, 0);
+        assert_eq!(result.span.end, input.len());
     }
 
     #[test]

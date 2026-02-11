@@ -195,7 +195,7 @@ pub struct StatsStage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggExpr {
     pub function: String,
-    pub args: Vec<Expr>,
+    pub args: Vec<Spanned<Expr>>,
     pub alias: Option<String>,
 }
 
