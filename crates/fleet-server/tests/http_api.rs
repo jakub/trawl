@@ -1,9 +1,10 @@
-//! End-to-end HTTP API tests for fleetd.
+//! End-to-end HTTPS API tests for fleetd.
 //!
-//! Starts a real server on a random port, creates API keys, and
-//! verifies the full request lifecycle.
+//! Starts a real TLS server on a random port with a self-signed cert,
+//! creates API keys, and verifies the full request lifecycle.
 
 use std::net::TcpListener;
+use std::path::PathBuf;
 
 use fleet_auth::roles::Role;
 use fleet_auth::store::KeyStore;
@@ -57,6 +58,20 @@ fn ensure_fixtures(dir: &std::path::Path) -> String {
     format!("{}/**/*.parquet", parquet_dir.display())
 }
 
+/// Generate a self-signed cert/key pair in the given directory.
+fn generate_test_cert(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+
+    let san = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
+    let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(san).unwrap();
+
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+    (cert_path, key_path)
+}
+
 /// Test server handle with analyst and admin tokens.
 struct TestServer {
     url: String,
@@ -76,6 +91,9 @@ async fn setup() -> TestServer {
     let admin = store.create_key("admin-key", Role::Admin, None).unwrap();
     drop(store);
 
+    // Generate ephemeral self-signed cert.
+    let (cert_path, key_path) = generate_test_cert(tmp.path());
+
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -89,30 +107,29 @@ async fn setup() -> TestServer {
             max_concurrent_requests: 256,
             shutdown_drain_secs: 5,
             log_file: None,
-            tls_cert_path: None,
-            tls_key_path: None,
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig { db_path: auth_db },
     };
 
     let state = AppState::from_config(&config);
-    let app = http::router(state);
 
-    // Spawn the server in a background task.
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    // Spawn the HTTPS server in a background task.
+    let server_config = config.server.clone();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        http::serve(state, &server_config).await.unwrap();
     });
 
-    // Give the server a moment to start.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Give the server a moment to start and bind.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
 
     TestServer {
-        url: format!("http://{addr}"),
+        url: format!("https://{addr}"),
         analyst_token: analyst.plaintext_token,
         admin_token: admin.plaintext_token,
     }
@@ -121,7 +138,7 @@ async fn setup() -> TestServer {
 #[tokio::test]
 async fn health_returns_ok() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, "unused");
+    let client = HttpClient::new_insecure(&server.url, "unused");
     let health = client.health().await.unwrap();
     assert_eq!(health["status"], "ok");
 }
@@ -129,7 +146,7 @@ async fn health_returns_ok() {
 #[tokio::test]
 async fn query_returns_results() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
     let result = client.query("*").await.unwrap();
     assert_eq!(result.row_count(), 3);
 }
@@ -137,7 +154,7 @@ async fn query_returns_results() {
 #[tokio::test]
 async fn query_with_filter() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
     let result = client.query("service:nginx").await.unwrap();
     assert_eq!(result.row_count(), 2);
 }
@@ -145,7 +162,7 @@ async fn query_with_filter() {
 #[tokio::test]
 async fn query_with_stats_pipeline() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
     let result = client.query("* | stats count() by service").await.unwrap();
     // nginx: 2, postgres: 1 → 2 rows
     assert_eq!(result.row_count(), 2);
@@ -154,7 +171,7 @@ async fn query_with_stats_pipeline() {
 #[tokio::test]
 async fn query_rejects_missing_auth() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, "");
+    let client = HttpClient::new_insecure(&server.url, "");
 
     let result = client.query("*").await;
     assert!(result.is_err());
@@ -170,7 +187,7 @@ async fn query_rejects_missing_auth() {
 #[tokio::test]
 async fn query_rejects_invalid_token() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234");
+    let client = HttpClient::new_insecure(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234");
 
     let result = client.query("*").await;
     assert!(result.is_err());
@@ -186,7 +203,7 @@ async fn query_rejects_invalid_token() {
 #[tokio::test]
 async fn query_rejects_bad_dsl() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
 
     let result = client.query("| | | broken {{{").await;
     assert!(result.is_err());
@@ -204,7 +221,7 @@ async fn query_rejects_bad_dsl() {
 #[tokio::test]
 async fn schema_returns_columns() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
 
     let schema = client.schema().await.unwrap();
     assert!(!schema.columns.is_empty());
@@ -222,7 +239,7 @@ async fn schema_returns_columns() {
 #[tokio::test]
 async fn schema_caching_works() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
 
     let first = client.schema().await.unwrap();
     assert!(!first.cached, "first call should not be cached");
@@ -236,8 +253,8 @@ async fn schema_caching_works() {
 #[tokio::test]
 async fn queries_shows_history() {
     let server = setup().await;
-    let analyst = HttpClient::new(&server.url, &server.analyst_token);
-    let admin = HttpClient::new(&server.url, &server.admin_token);
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token);
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token);
 
     // Run a query so there's something in history.
     analyst.query("*").await.unwrap();
@@ -254,7 +271,7 @@ async fn queries_shows_history() {
 #[tokio::test]
 async fn queries_rejects_non_admin() {
     let server = setup().await;
-    let client = HttpClient::new(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
 
     let result = client.queries().await;
     assert!(result.is_err());
