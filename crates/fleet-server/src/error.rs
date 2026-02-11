@@ -20,6 +20,10 @@ pub enum ServerError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// Query execution exceeded the configured timeout.
+    #[error("query timed out")]
+    Timeout,
+
     /// Internal server error (task panics, unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
@@ -40,6 +44,7 @@ impl IntoResponse for ServerError {
             // Auth errors are deliberately opaque.
             Self::Auth(_) => (StatusCode::UNAUTHORIZED, "authentication failed".to_owned()),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "query timed out".to_owned()),
             Self::Internal(_) => {
                 tracing::error!(error = %self, "internal server error");
                 (

@@ -20,6 +20,7 @@ pub fn router(state: AppState) -> Router {
     let authenticated = Router::new()
         .route("/api/v1/query", post(handlers::query))
         .route("/api/v1/schema", get(handlers::schema))
+        .route("/api/v1/queries", get(handlers::queries))
         .layer(middleware::from_fn(auth_middleware));
 
     // Routes that are public (no auth required).

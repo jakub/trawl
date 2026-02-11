@@ -98,11 +98,25 @@ pub async fn query(
         "executing query"
     );
 
-    let start = std::time::Instant::now();
-    let result = match state.pool.execute(&req.query).await {
-        Ok(r) => r,
-        Err(e) => {
-            let elapsed = start.elapsed().as_millis();
+    let query_id = state.tracker.start(&verified, &req.query);
+    let timeout = std::time::Duration::from_secs(state.timeout_secs);
+
+    let result = tokio::time::timeout(timeout, state.pool.execute(&req.query)).await;
+
+    match result {
+        Ok(Ok(qr)) => {
+            let rows = qr.row_count();
+            state.tracker.complete(query_id, rows);
+            tracing::info!(
+                user = %verified.name,
+                rows,
+                query_id,
+                "query complete"
+            );
+            Ok(Json(qr.into()))
+        }
+        Ok(Err(e)) => {
+            state.tracker.fail(query_id, &e.to_string());
             match &e {
                 ServerError::Engine(
                     fleet_engine::error::EngineError::Parse(_)
@@ -111,7 +125,7 @@ pub async fn query(
                     tracing::warn!(
                         user = %verified.name,
                         query = %req.query,
-                        duration_ms = elapsed,
+                        query_id,
                         error = %e,
                         "query failed: bad request"
                     );
@@ -120,25 +134,26 @@ pub async fn query(
                     tracing::error!(
                         user = %verified.name,
                         query = %req.query,
-                        duration_ms = elapsed,
+                        query_id,
                         error = %e,
                         "query failed: engine error"
                     );
                 }
             }
-            return Err(e);
+            Err(e)
         }
-    };
-
-    let elapsed = start.elapsed().as_millis();
-    tracing::info!(
-        user = %verified.name,
-        rows = result.row_count(),
-        duration_ms = elapsed,
-        "query complete"
-    );
-
-    Ok(Json(result.into()))
+        Err(_elapsed) => {
+            state.tracker.timeout(query_id);
+            tracing::warn!(
+                user = %verified.name,
+                query = %req.query,
+                query_id,
+                timeout_secs = state.timeout_secs,
+                "query timed out"
+            );
+            Err(ServerError::Timeout)
+        }
+    }
 }
 
 /// `GET /api/v1/health` — unauthenticated health check.
@@ -218,6 +233,29 @@ pub async fn schema(
     }
 
     Ok(Json(response))
+}
+
+/// `GET /api/v1/queries` — view active and recent queries (admin only).
+#[allow(clippy::unused_async)]
+pub async fn queries(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<QueriesResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::ServerManage) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    Ok(Json(QueriesResponse {
+        active: state.tracker.active(),
+        recent: state.tracker.recent(),
+    }))
+}
+
+/// Response for the queries endpoint.
+#[derive(Debug, Serialize)]
+pub struct QueriesResponse {
+    pub active: Vec<crate::tracker::ActiveQuerySnapshot>,
+    pub recent: Vec<crate::tracker::CompletedQuery>,
 }
 
 // -- helpers -----------------------------------------------------------------

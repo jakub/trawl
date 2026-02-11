@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::pool::ExecutorPool;
+use crate::tracker::QueryTracker;
 
 /// Shared state injected into handlers via axum's `State` extractor.
 #[derive(Debug, Clone)]
@@ -21,6 +22,8 @@ pub struct AppState {
     pub start_time: Instant,
     /// Cached schema introspection result with TTL.
     pub schema_cache: Arc<RwLock<Option<CachedSchema>>>,
+    /// Query lifecycle tracker (active + history).
+    pub tracker: Arc<QueryTracker>,
     /// Query timeout in seconds.
     pub timeout_secs: u64,
 }
@@ -48,6 +51,7 @@ impl AppState {
             auth_db_path: Arc::new(config.auth.db_path.clone()),
             start_time: Instant::now(),
             schema_cache: Arc::new(RwLock::new(None)),
+            tracker: Arc::new(QueryTracker::new()),
             timeout_secs: config.server.timeout_secs,
         }
     }
