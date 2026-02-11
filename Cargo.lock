@@ -856,6 +856,7 @@ dependencies = [
  "fleet-core",
  "fleet-engine",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -896,11 +897,14 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "duckdb",
  "fleet-auth",
+ "fleet-client",
  "fleet-core",
  "fleet-engine",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",

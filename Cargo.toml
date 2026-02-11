@@ -38,6 +38,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"
+tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
