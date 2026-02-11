@@ -1,0 +1,17 @@
+[package]
+name = "fleet-server"
+description = "The fleetd daemon — HTTP, Unix socket, and TCP+TLS listeners"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fleet-core = { workspace = true }
+fleet-engine = { workspace = true }
+fleet-auth = { workspace = true }
+fleet-client = { workspace = true }
+
+[lints]
+workspace = true

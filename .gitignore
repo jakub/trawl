@@ -1,0 +1,22 @@
+# rust build artifacts
+/target/
+
+# editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# environment
+.env
+.env.*
+
+# debug
+*.pdb
+
+# bacon state
+.bacon-locations

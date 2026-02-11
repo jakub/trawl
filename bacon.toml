@@ -1,0 +1,20 @@
+# bacon configuration
+# run `bacon` for clippy-on-save, `bacon test` for test-on-save
+
+default_job = "clippy"
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--color", "always"]
+need_stdout = false
+
+[jobs.check]
+command = ["cargo", "check", "--workspace", "--all-targets", "--color", "always"]
+need_stdout = false
+
+[jobs.test]
+command = ["cargo", "nextest", "run", "--workspace", "--color", "always"]
+need_stdout = true
+
+[jobs.doc]
+command = ["cargo", "doc", "--workspace", "--no-deps", "--color", "always"]
+need_stdout = false

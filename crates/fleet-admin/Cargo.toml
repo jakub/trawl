@@ -1,0 +1,19 @@
+[package]
+name = "fleet-admin"
+description = "Admin CLI for fleet — key management, enrollment, templates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fleet-admin"
+path = "src/main.rs"
+
+[dependencies]
+fleet-client = { workspace = true }
+fleet-core = { workspace = true }
+
+[lints]
+workspace = true

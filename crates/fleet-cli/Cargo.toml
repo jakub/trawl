@@ -1,0 +1,19 @@
+[package]
+name = "fleet-cli"
+description = "CLI tool for querying logs via fleet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fleet"
+path = "src/main.rs"
+
+[dependencies]
+fleet-client = { workspace = true }
+fleet-core = { workspace = true }
+
+[lints]
+workspace = true

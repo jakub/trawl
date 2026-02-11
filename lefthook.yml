@@ -1,0 +1,9 @@
+pre-commit:
+  parallel: true
+  commands:
+    fmt-check:
+      glob: "*.rs"
+      run: source "$HOME/.cargo/env" && cargo fmt --check
+    clippy:
+      glob: "*.rs"
+      run: source "$HOME/.cargo/env" && cargo clippy --workspace --all-targets -- -D warnings

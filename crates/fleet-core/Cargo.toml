@@ -1,0 +1,11 @@
+[package]
+name = "fleet-core"
+description = "DSL parser, AST types, and SQL emitter for fleet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
