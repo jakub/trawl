@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use fleet_engine::executor::Executor;
-use fleet_engine::value::QueryResult;
+use fleet_engine::value::{QueryResult, SchemaResult};
 use tokio::sync::Semaphore;
 
 use crate::error::ServerError;
@@ -61,6 +61,21 @@ impl ExecutorPool {
         })
         .await
         .map_err(|e| ServerError::Internal(format!("query task panicked: {e}")))?
+    }
+
+    /// Introspect the data source schema. Does NOT consume a semaphore permit
+    /// since DESCRIBE queries are lightweight metadata-only operations.
+    pub async fn describe_schema(&self) -> Result<SchemaResult, ServerError> {
+        let data_path = Arc::clone(&self.data_path);
+
+        tokio::task::spawn_blocking(move || {
+            let executor = Executor::new()?;
+            executor
+                .describe_schema(&data_path)
+                .map_err(ServerError::from)
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("schema task panicked: {e}")))?
     }
 }
 

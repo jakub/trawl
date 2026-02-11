@@ -2,6 +2,10 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
+
+use fleet_engine::value::SchemaResult;
+use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::pool::ExecutorPool;
@@ -14,8 +18,24 @@ pub struct AppState {
     /// Path to the `SQLite` auth database.
     pub auth_db_path: Arc<PathBuf>,
     /// Server start time (for health endpoint uptime).
-    pub start_time: std::time::Instant,
+    pub start_time: Instant,
+    /// Cached schema introspection result with TTL.
+    pub schema_cache: Arc<RwLock<Option<CachedSchema>>>,
+    /// Query timeout in seconds.
+    pub timeout_secs: u64,
 }
+
+/// A cached schema result with an expiry timestamp.
+#[derive(Debug, Clone)]
+pub struct CachedSchema {
+    /// The cached schema data.
+    pub result: SchemaResult,
+    /// When this cache entry was created.
+    pub cached_at: Instant,
+}
+
+/// How long schema cache entries are valid (seconds).
+pub const SCHEMA_CACHE_TTL_SECS: u64 = 60;
 
 impl AppState {
     /// Construct app state from a validated [`Config`].
@@ -26,7 +46,9 @@ impl AppState {
                 config.server.max_concurrent_queries,
             ),
             auth_db_path: Arc::new(config.auth.db_path.clone()),
-            start_time: std::time::Instant::now(),
+            start_time: Instant::now(),
+            schema_cache: Arc::new(RwLock::new(None)),
+            timeout_secs: config.server.timeout_secs,
         }
     }
 }

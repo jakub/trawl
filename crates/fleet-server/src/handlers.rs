@@ -3,11 +3,12 @@
 use axum::extract::State;
 use axum::{Extension, Json};
 use fleet_auth::keys::VerifiedKey;
-use fleet_engine::value::{QueryResult, Value};
+use fleet_auth::roles::Permission;
+use fleet_engine::value::{QueryResult, SchemaColumn, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
-use crate::state::AppState;
+use crate::state::{AppState, CachedSchema, SCHEMA_CACHE_TTL_SECS};
 
 // -- request/response types --------------------------------------------------
 
@@ -50,6 +51,34 @@ pub struct HealthResponse {
     pub status: &'static str,
     pub version: &'static str,
     pub uptime_secs: u64,
+}
+
+/// Schema introspection response body.
+#[derive(Debug, Serialize)]
+pub struct SchemaResponse {
+    /// Column descriptors (name + type).
+    pub columns: Vec<SchemaColumnResponse>,
+    /// Number of parquet files matching the configured glob.
+    pub file_count: u64,
+    /// Whether this result was served from cache.
+    pub cached: bool,
+}
+
+/// A single column in the schema response.
+#[derive(Debug, Serialize)]
+pub struct SchemaColumnResponse {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: String,
+}
+
+impl From<SchemaColumn> for SchemaColumnResponse {
+    fn from(col: SchemaColumn) -> Self {
+        Self {
+            name: col.name,
+            data_type: col.data_type,
+        }
+    }
 }
 
 // -- handlers ----------------------------------------------------------------
@@ -120,6 +149,75 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: state.start_time.elapsed().as_secs(),
     })
+}
+
+/// `GET /api/v1/schema` — introspect the data source schema.
+///
+/// Returns column names and types from the configured parquet data.
+/// Results are cached for [`SCHEMA_CACHE_TTL_SECS`] seconds.
+pub async fn schema(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<SchemaResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    // Check cache first.
+    {
+        let cache = state.schema_cache.read().await;
+        if let Some(cached) = &*cache {
+            if cached.cached_at.elapsed().as_secs() < SCHEMA_CACHE_TTL_SECS {
+                tracing::debug!(user = %verified.name, "serving schema from cache");
+                return Ok(Json(SchemaResponse {
+                    columns: cached
+                        .result
+                        .columns
+                        .iter()
+                        .cloned()
+                        .map(SchemaColumnResponse::from)
+                        .collect(),
+                    file_count: cached.result.file_count,
+                    cached: true,
+                }));
+            }
+        }
+    }
+
+    tracing::info!(user = %verified.name, "refreshing schema cache");
+    let start = std::time::Instant::now();
+    let result = state.pool.describe_schema().await?;
+    let elapsed = start.elapsed().as_millis();
+
+    tracing::info!(
+        user = %verified.name,
+        columns = result.columns.len(),
+        file_count = result.file_count,
+        duration_ms = elapsed,
+        "schema introspection complete"
+    );
+
+    let response = SchemaResponse {
+        columns: result
+            .columns
+            .iter()
+            .cloned()
+            .map(SchemaColumnResponse::from)
+            .collect(),
+        file_count: result.file_count,
+        cached: false,
+    };
+
+    // Update cache.
+    {
+        let mut cache = state.schema_cache.write().await;
+        *cache = Some(CachedSchema {
+            result,
+            cached_at: std::time::Instant::now(),
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // -- helpers -----------------------------------------------------------------
