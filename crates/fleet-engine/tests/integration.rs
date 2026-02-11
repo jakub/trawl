@@ -164,3 +164,35 @@ fn time_filter_large_window() {
     let result = exec.run_query("last:99999d", &glob).unwrap();
     assert_eq!(result.row_count(), 13);
 }
+
+// -- JSON source tests (validates read_json_auto pipeline) --
+
+fn setup_json() -> (Executor, String) {
+    let glob = common::fixture_glob_json();
+    let exec = Executor::new().expect("executor should initialize");
+    (exec, glob)
+}
+
+#[test]
+fn json_wildcard_returns_all_rows() {
+    let (exec, glob) = setup_json();
+    let result = exec.run_query("*", &glob).unwrap();
+    assert_eq!(result.row_count(), 13);
+}
+
+#[test]
+fn json_field_filter() {
+    let (exec, glob) = setup_json();
+    let result = exec.run_query("service:nginx", &glob).unwrap();
+    assert_eq!(result.row_count(), 6);
+}
+
+#[test]
+fn json_stats_pipeline() {
+    let (exec, glob) = setup_json();
+    let result = exec
+        .run_query("* | stats count() by service | sort -count", &glob)
+        .unwrap();
+    assert!(result.row_count() > 0);
+    assert_eq!(result.columns[0].name, "service");
+}

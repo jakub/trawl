@@ -1,7 +1,7 @@
 //! Shared test utilities for fleet-engine integration tests.
 //!
-//! Generates deterministic parquet fixtures using `DuckDB` itself,
-//! so we don't need arrow/parquet crates or external tooling.
+//! Generates deterministic fixtures (parquet and ndjson) using `DuckDB`
+//! itself, so we don't need arrow/parquet crates or external tooling.
 //!
 //! Handles nextest's parallel process model: each test runs in its own
 //! process, so we use filesystem-level coordination (existence check +
@@ -13,45 +13,49 @@ use duckdb::Connection;
 
 /// Return the glob path for test parquet files, generating fixtures if needed.
 pub fn fixture_glob() -> String {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("parquet");
-
-    ensure_fixtures(&dir);
+    let dir = fixtures_dir();
+    ensure_fixture(&dir, "logs.parquet", "PARQUET");
     format!("{}/**/*.parquet", dir.display())
 }
 
-/// Generate fixture parquet file if it doesn't already exist.
+/// Return the glob path for test ndjson files, generating fixtures if needed.
+pub fn fixture_glob_json() -> String {
+    let dir = fixtures_dir();
+    ensure_fixture(&dir, "logs.ndjson", "JSON");
+    format!("{}/**/*.ndjson", dir.display())
+}
+
+fn fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("parquet")
+}
+
+/// Generate a fixture file if it doesn't already exist.
 ///
 /// Uses a process-unique temp file to avoid lock conflicts when
 /// multiple nextest processes run concurrently.
-fn ensure_fixtures(dir: &Path) {
-    let parquet_path = dir.join("logs.parquet");
+fn ensure_fixture(dir: &Path, filename: &str, format: &str) {
+    let final_path = dir.join(filename);
 
-    if parquet_path.exists() {
+    if final_path.exists() {
         return;
     }
 
     std::fs::create_dir_all(dir).expect("failed to create fixture directory");
 
-    // write to a process-unique temp file to avoid DuckDB lock conflicts
-    let tmp_path = dir.join(format!("logs_{}.tmp.parquet", std::process::id()));
+    let tmp_path = dir.join(format!("{}_{}.tmp", filename, std::process::id()));
 
-    generate_to(&tmp_path).expect("failed to generate test fixtures");
+    generate_to(&tmp_path, format).expect("failed to generate test fixtures");
 
-    // atomically move to final location — on unix, rename replaces the
-    // target if another process beat us. both files are identical
-    // (deterministic data), so this is fine either way.
-    if let Err(e) = std::fs::rename(&tmp_path, &parquet_path) {
-        // if rename fails, try to clean up and fall back to checking
-        // if the final file exists (another process may have won)
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
         let _ = std::fs::remove_file(&tmp_path);
-        assert!(parquet_path.exists(), "failed to place fixture file: {e}");
+        assert!(final_path.exists(), "failed to place fixture file: {e}");
     }
 }
 
-fn generate_to(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn generate_to(path: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::open_in_memory()?;
 
     conn.execute_batch(
@@ -92,7 +96,7 @@ fn generate_to(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     conn.execute_batch(&format!(
-        "COPY logs TO '{}' (FORMAT PARQUET)",
+        "COPY logs TO '{}' (FORMAT {format})",
         path.display()
     ))?;
 

@@ -28,9 +28,18 @@ pub(crate) struct EmitterState {
 
 impl EmitterState {
     pub(crate) fn new(source: &str) -> Self {
+        let ext = std::path::Path::new(source)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let reader = if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("ndjson") {
+            format!("read_json_auto('{source}')")
+        } else {
+            format!("read_parquet('{source}')")
+        };
         Self {
             step: 0,
-            source: format!("read_parquet('{source}')"),
+            source: reader,
             select: Vec::new(),
             where_clauses: Vec::new(),
             group_by: Vec::new(),
