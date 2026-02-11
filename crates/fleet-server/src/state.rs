@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use fleet_engine::value::SchemaResult;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::pool::ExecutorPool;
@@ -21,7 +21,10 @@ pub struct AppState {
     /// Server start time (for health endpoint uptime).
     pub start_time: Instant,
     /// Cached schema introspection result with TTL.
-    pub schema_cache: Arc<RwLock<Option<CachedSchema>>>,
+    ///
+    /// Uses `Mutex` (not `RwLock`) to prevent thundering herd: only one
+    /// request refreshes the cache while others wait on the lock.
+    pub schema_cache: Arc<Mutex<Option<CachedSchema>>>,
     /// Query lifecycle tracker (active + history).
     pub tracker: Arc<QueryTracker>,
     /// Query timeout in seconds.
@@ -30,6 +33,8 @@ pub struct AppState {
     pub max_request_body_bytes: usize,
     /// Maximum concurrent HTTP requests.
     pub max_concurrent_requests: usize,
+    /// Graceful shutdown drain timeout in seconds.
+    pub shutdown_drain_secs: u64,
 }
 
 /// A cached schema result with an expiry timestamp.
@@ -55,11 +60,12 @@ impl AppState {
             ),
             auth_db_path: Arc::new(config.auth.db_path.clone()),
             start_time: Instant::now(),
-            schema_cache: Arc::new(RwLock::new(None)),
+            schema_cache: Arc::new(Mutex::new(None)),
             tracker: Arc::new(QueryTracker::new()),
             timeout_secs: config.server.timeout_secs,
             max_request_body_bytes: config.server.max_request_body_bytes,
             max_concurrent_requests: config.server.max_concurrent_requests,
+            shutdown_drain_secs: config.server.shutdown_drain_secs,
         }
     }
 }

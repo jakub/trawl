@@ -39,6 +39,10 @@ pub struct ServerConfig {
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
+    /// Graceful shutdown drain timeout in seconds (default: 30).
+    #[serde(default = "default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
+
     /// Optional log file path. When set, logs are written to both stdout and this file.
     pub log_file: Option<PathBuf>,
 }
@@ -79,6 +83,10 @@ fn default_max_request_body_bytes() -> usize {
 
 fn default_max_concurrent_requests() -> usize {
     256
+}
+
+fn default_shutdown_drain_secs() -> u64 {
+    30
 }
 
 /// Portable CPU count without pulling in the `num_cpus` crate.

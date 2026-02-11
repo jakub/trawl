@@ -20,7 +20,11 @@ impl HttpClient {
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            client: Client::new(),
+            client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("failed to build HTTP client"),
         }
     }
 

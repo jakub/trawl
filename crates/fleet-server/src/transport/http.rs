@@ -91,7 +91,12 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Start the HTTP server on the configured address with graceful shutdown.
+///
+/// On shutdown signal, stops accepting new connections and waits up to
+/// `shutdown_drain_secs` for in-flight requests to complete before
+/// forcing exit.
 pub async fn serve(state: AppState, addr: &str) -> Result<(), crate::error::ServerError> {
+    let drain_secs = state.shutdown_drain_secs;
     let app = router(state);
 
     let listener = TcpListener::bind(addr)
@@ -100,10 +105,34 @@ pub async fn serve(state: AppState, addr: &str) -> Result<(), crate::error::Serv
 
     tracing::info!(addr = %addr, "HTTP server listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| crate::error::ServerError::Internal(format!("server error: {e}")))?;
+    // Use a Notify to share the shutdown signal between graceful drain
+    // and the hard deadline.
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let n1 = Arc::clone(&notify);
+
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        n1.notify_waiters();
+    });
+
+    let n_graceful = Arc::clone(&notify);
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move { n_graceful.notified().await });
+
+    let n_deadline = Arc::clone(&notify);
+    let deadline = async move {
+        n_deadline.notified().await;
+        tracing::info!(drain_secs, "shutdown: draining in-flight requests");
+        tokio::time::sleep(Duration::from_secs(drain_secs)).await;
+        tracing::warn!("shutdown drain timeout exceeded, forcing exit");
+    };
+
+    tokio::select! {
+        result = server => {
+            result.map_err(|e| crate::error::ServerError::Internal(format!("server error: {e}")))?;
+        }
+        () = deadline => {}
+    }
 
     tracing::info!("HTTP server stopped");
     Ok(())

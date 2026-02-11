@@ -46,11 +46,12 @@ impl From<QueryResult> for QueryResponse {
 }
 
 /// Health check response body.
+///
+/// Deliberately minimal — version and uptime are omitted to avoid
+/// information disclosure on an unauthenticated endpoint.
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
-    pub version: &'static str,
-    pub uptime_secs: u64,
 }
 
 /// Schema introspection response body.
@@ -165,12 +166,8 @@ pub async fn query(
 
 /// `GET /api/v1/health` — unauthenticated health check.
 #[allow(clippy::unused_async)] // axum requires async handlers
-pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_secs: state.start_time.elapsed().as_secs(),
-    })
+pub async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
 }
 
 /// `GET /api/v1/schema` — introspect the data source schema.
@@ -185,24 +182,24 @@ pub async fn schema(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    // Check cache first.
-    {
-        let cache = state.schema_cache.read().await;
-        if let Some(cached) = &*cache {
-            if cached.cached_at.elapsed().as_secs() < SCHEMA_CACHE_TTL_SECS {
-                tracing::debug!(user = %verified.name, "serving schema from cache");
-                return Ok(Json(SchemaResponse {
-                    columns: cached
-                        .result
-                        .columns
-                        .iter()
-                        .cloned()
-                        .map(SchemaColumnResponse::from)
-                        .collect(),
-                    file_count: cached.result.file_count,
-                    cached: true,
-                }));
-            }
+    // Hold the mutex for the full check-then-refresh cycle to prevent
+    // thundering herd: only one request refreshes while others wait.
+    let mut cache = state.schema_cache.lock().await;
+
+    if let Some(cached) = &*cache {
+        if cached.cached_at.elapsed().as_secs() < SCHEMA_CACHE_TTL_SECS {
+            tracing::debug!(user = %verified.name, "serving schema from cache");
+            return Ok(Json(SchemaResponse {
+                columns: cached
+                    .result
+                    .columns
+                    .iter()
+                    .cloned()
+                    .map(SchemaColumnResponse::from)
+                    .collect(),
+                file_count: cached.result.file_count,
+                cached: true,
+            }));
         }
     }
 
@@ -230,14 +227,10 @@ pub async fn schema(
         cached: false,
     };
 
-    // Update cache.
-    {
-        let mut cache = state.schema_cache.write().await;
-        *cache = Some(CachedSchema {
-            result,
-            cached_at: std::time::Instant::now(),
-        });
-    }
+    *cache = Some(CachedSchema {
+        result,
+        cached_at: std::time::Instant::now(),
+    });
 
     Ok(Json(response))
 }

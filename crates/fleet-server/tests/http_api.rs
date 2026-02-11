@@ -87,6 +87,7 @@ async fn setup() -> TestServer {
             max_result_rows: 100_000,
             max_request_body_bytes: 128 * 1024,
             max_concurrent_requests: 256,
+            shutdown_drain_secs: 5,
             log_file: None,
         },
         data: DataConfig { path: data_glob },

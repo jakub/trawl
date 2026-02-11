@@ -69,12 +69,15 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
 }
 
 /// Extract the bearer token from the Authorization header.
+///
+/// RFC 7235: auth-scheme comparison is case-insensitive.
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("authorization")?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+    let value = headers.get("authorization")?.to_str().ok()?;
+    let bytes = value.as_bytes();
+    if bytes.len() < 7 || !bytes[..7].eq_ignore_ascii_case(b"bearer ") {
+        return None;
+    }
+    Some(&value[7..])
 }
 
 #[cfg(test)]
@@ -99,5 +102,19 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
         assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn accepts_lowercase_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "bearer flt_testtoken123".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), Some("flt_testtoken123"));
+    }
+
+    #[test]
+    fn accepts_mixed_case_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "BEARER flt_testtoken123".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), Some("flt_testtoken123"));
     }
 }
