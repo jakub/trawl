@@ -6,7 +6,7 @@
 use std::fmt;
 
 /// A cell value from a query result row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Value {
     Null,
     Boolean(bool),
@@ -28,13 +28,13 @@ impl fmt::Display for Value {
 }
 
 /// Column metadata from a query result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Column {
     pub name: String,
 }
 
 /// The complete result of a query execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryResult {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<Value>>,
