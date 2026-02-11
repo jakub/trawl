@@ -23,3 +23,6 @@
 
 # generated test fixtures
 crates/fleet-engine/tests/fixtures/
+
+# vector log data
+data/
