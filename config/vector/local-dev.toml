@@ -60,15 +60,16 @@ parsed, err = parse_apache_log(.message, "common")
 if err == null {
   .timestamp = parsed.timestamp
   .src_ip = parsed.host
-  .user_name = if to_string(parsed.identity) ?? "-" != "-" { parsed.identity } else { null }
-  .status = to_int!(parsed.status)
+  identity = to_string(parsed.identity)
+  .user_name = if identity != "-" { identity } else { null }
+  .status = to_int(parsed.status)
   .method = parsed.method
   .uri = parsed.path
   .message = .message
   .host = "demo"
   .service = "apache-demo"
 
-  status = to_int!(parsed.status)
+  status = to_int(parsed.status)
   if status >= 500 {
     .level = "error"
   } else if status >= 400 {
@@ -96,7 +97,7 @@ if err == null {
   .service = parsed.appname
   .message = parsed.message
 
-  sev = to_string(parsed.severity) ?? "info"
+  sev = to_string(parsed.severity)
   if sev == "emerg" || sev == "alert" || sev == "crit" || sev == "err" {
     .level = "error"
   } else if sev == "warning" {
@@ -142,7 +143,7 @@ inputs = ["docker"]
 source = '''
 .timestamp = .timestamp
 .host = .container_name
-.service = split(to_string(.image) ?? "unknown", ":")[0] ?? "unknown"
+.service = split(to_string(.image) ?? "unknown", ":")[0]
 .level = if .stream == "stderr" { "error" } else { "info" }
 .message = .message
 

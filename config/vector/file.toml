@@ -42,7 +42,7 @@ if err != null {
   .timestamp = parsed.timestamp
   .src_ip = parsed.client
   .user_name = if parsed.user != "-" { parsed.user } else { null }
-  .status = to_int!(parsed.status)
+  .status = to_int(parsed.status)
   .uri = parsed.path
   .method = parsed.method
   .message = .message
@@ -50,7 +50,7 @@ if err != null {
   .service = "nginx"
 
   # derive level from status code
-  status = to_int!(parsed.status)
+  status = to_int(parsed.status)
   if status >= 500 {
     .level = "error"
   } else if status >= 400 {

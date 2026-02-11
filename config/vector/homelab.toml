@@ -73,7 +73,7 @@ inputs = ["docker"]
 source = '''
 .timestamp = .timestamp
 .host = .container_name
-.service = split(to_string(.image) ?? "unknown", ":")[0] ?? "unknown"
+.service = split(to_string(.image) ?? "unknown", ":")[0]
 .level = if .stream == "stderr" { "error" } else { "info" }
 .message = .message
 
@@ -164,14 +164,14 @@ if err != null {
   .timestamp = parsed.timestamp
   .src_ip = parsed.client
   .user_name = if parsed.user != "-" { parsed.user } else { null }
-  .status = to_int!(parsed.status)
+  .status = to_int(parsed.status)
   .uri = parsed.path
   .method = parsed.method
   .message = .message
   .host = get_hostname!()
   .service = "nginx"
 
-  status = to_int!(parsed.status)
+  status = to_int(parsed.status)
   if status >= 500 {
     .level = "error"
   } else if status >= 400 {

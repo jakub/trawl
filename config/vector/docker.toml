@@ -35,7 +35,7 @@ source = '''
 .host = .container_name
 
 # service: image name without tag is a reasonable default
-.service = split(to_string(.image) ?? "unknown", ":")[0] ?? "unknown"
+.service = split(to_string(.image) ?? "unknown", ":")[0]
 
 # level: docker doesn't provide structured levels — try to infer from stream
 .level = if .stream == "stderr" { "error" } else { "info" }
