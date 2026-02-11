@@ -64,19 +64,41 @@ fn num_cpus() -> usize {
         .unwrap_or(4)
 }
 
+/// Expand a leading `~/` to `$HOME/`.
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return format!("{}/{rest}", home.to_string_lossy());
+        }
+    }
+    path.to_owned()
+}
+
 impl Config {
     /// Load configuration from a TOML file.
+    ///
+    /// All paths in the config are resolved (tilde-expanded) after parsing.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path.as_ref()).map_err(|e| ConfigError::Io {
             path: path.as_ref().to_owned(),
             source: e,
         })?;
-        let config: Self = toml::from_str(&contents).map_err(|e| ConfigError::Parse {
+        let mut config: Self = toml::from_str(&contents).map_err(|e| ConfigError::Parse {
             path: path.as_ref().to_owned(),
             source: e,
         })?;
+        config.resolve_paths();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Expand `~` to `$HOME` in all path fields.
+    fn resolve_paths(&mut self) {
+        self.data.path = expand_tilde(&self.data.path);
+        self.auth.db_path = PathBuf::from(expand_tilde(&self.auth.db_path.to_string_lossy()));
+        if let Some(log_file) = &self.server.log_file {
+            self.server.log_file = Some(PathBuf::from(expand_tilde(&log_file.to_string_lossy())));
+        }
     }
 
     /// Validate configuration values.

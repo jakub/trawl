@@ -46,15 +46,14 @@ fn init_tracing(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let stdout_layer = fmt::layer().with_filter(make_filter());
 
-    if let Some(raw_log_path) = &config.server.log_file {
-        let log_path = resolve_path(&raw_log_path.to_string_lossy());
+    if let Some(log_path) = &config.server.log_file {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&log_path)?;
+            .open(log_path)?;
         let file_layer = fmt::layer()
             .with_ansi(false)
             .with_writer(file)
