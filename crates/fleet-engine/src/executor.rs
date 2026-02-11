@@ -31,24 +31,25 @@ impl Executor {
         let params = bind_params(&query.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
 
-        let columns: Vec<Column> = stmt
+        // start query execution — column metadata is only available
+        // after DuckDB resolves table-valued functions like read_parquet()
+        let mut result_rows = stmt.query(param_refs.as_slice())?;
+
+        let stmt_ref = result_rows.as_ref().unwrap();
+        let col_count = stmt_ref.column_count();
+        let columns: Vec<Column> = stmt_ref
             .column_names()
             .into_iter()
             .map(|name| Column { name })
             .collect();
-        let col_count = columns.len();
 
-        let row_iter = stmt.query_map(param_refs.as_slice(), |row| {
+        let mut rows = Vec::new();
+        while let Some(row) = result_rows.next()? {
             let mut cells = Vec::with_capacity(col_count);
             for i in 0..col_count {
                 cells.push(extract_value(row, i));
             }
-            Ok(cells)
-        })?;
-
-        let mut rows = Vec::new();
-        for row_result in row_iter {
-            rows.push(row_result?);
+            rows.push(cells);
         }
 
         Ok(QueryResult { columns, rows })

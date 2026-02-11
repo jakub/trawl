@@ -20,3 +20,6 @@
 
 # bacon state
 .bacon-locations
+
+# generated test fixtures
+crates/fleet-engine/tests/fixtures/

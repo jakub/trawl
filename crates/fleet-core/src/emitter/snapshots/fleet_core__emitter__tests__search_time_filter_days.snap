@@ -4,4 +4,4 @@ expression: "emit_dsl(\"last:7d\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet')
-WHERE "timestamp" >= now() - INTERVAL '7 days'
+WHERE "timestamp" >= now()::TIMESTAMP - INTERVAL '7 days'

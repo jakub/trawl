@@ -61,7 +61,10 @@ fn emit_search_token(token: &SearchToken, state: &mut EmitterState) {
         }
         SearchToken::TimeFilter(tf) => {
             let interval = duration_to_interval(&tf.duration);
-            state.push_where(format!("\"timestamp\" >= now() - INTERVAL '{interval}'"));
+            // cast to TIMESTAMP to avoid TIMESTAMPTZ arithmetic requiring ICU
+            state.push_where(format!(
+                "\"timestamp\" >= now()::TIMESTAMP - INTERVAL '{interval}'"
+            ));
         }
         SearchToken::QuotedSearch(qs) => {
             let pattern = format!("%{}%", qs.phrase);
