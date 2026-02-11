@@ -7,5 +7,8 @@
 pub mod connection;
 pub mod error;
 
-pub use connection::HttpClient;
+pub use connection::{
+    ActiveQuerySnapshot, CompletedQuerySnapshot, HttpClient, QueriesResponse, SchemaColumnResponse,
+    SchemaResponse,
+};
 pub use error::ClientError;

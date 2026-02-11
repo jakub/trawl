@@ -57,16 +57,23 @@ fn ensure_fixtures(dir: &std::path::Path) -> String {
     format!("{}/**/*.parquet", parquet_dir.display())
 }
 
-/// Set up a test server with fixtures and return (addr, token).
-async fn setup() -> (String, String) {
+/// Test server handle with analyst and admin tokens.
+struct TestServer {
+    url: String,
+    analyst_token: String,
+    admin_token: String,
+}
+
+/// Set up a test server with fixtures and return a `TestServer` handle.
+async fn setup() -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let data_glob = ensure_fixtures(tmp.path());
     let auth_db = tmp.path().join("auth.db");
 
-    // Create an API key.
+    // Create API keys for both roles.
     let store = KeyStore::open(&auth_db).unwrap();
-    let created = store.create_key("test-key", Role::Analyst, None).unwrap();
-    let token = created.plaintext_token;
+    let analyst = store.create_key("test-key", Role::Analyst, None).unwrap();
+    let admin = store.create_key("admin-key", Role::Admin, None).unwrap();
     drop(store);
 
     let port = free_port();
@@ -98,37 +105,41 @@ async fn setup() -> (String, String) {
     // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
 
-    (format!("http://{addr}"), token)
+    TestServer {
+        url: format!("http://{addr}"),
+        analyst_token: analyst.plaintext_token,
+        admin_token: admin.plaintext_token,
+    }
 }
 
 #[tokio::test]
 async fn health_returns_ok() {
-    let (url, _token) = setup().await;
-    let client = HttpClient::new(&url, "unused");
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, "unused");
     let health = client.health().await.unwrap();
     assert_eq!(health["status"], "ok");
 }
 
 #[tokio::test]
 async fn query_returns_results() {
-    let (url, token) = setup().await;
-    let client = HttpClient::new(&url, &token);
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, &server.analyst_token);
     let result = client.query("*").await.unwrap();
     assert_eq!(result.row_count(), 3);
 }
 
 #[tokio::test]
 async fn query_with_filter() {
-    let (url, token) = setup().await;
-    let client = HttpClient::new(&url, &token);
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, &server.analyst_token);
     let result = client.query("service:nginx").await.unwrap();
     assert_eq!(result.row_count(), 2);
 }
 
 #[tokio::test]
 async fn query_with_stats_pipeline() {
-    let (url, token) = setup().await;
-    let client = HttpClient::new(&url, &token);
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, &server.analyst_token);
     let result = client.query("* | stats count() by service").await.unwrap();
     // nginx: 2, postgres: 1 → 2 rows
     assert_eq!(result.row_count(), 2);
@@ -136,8 +147,8 @@ async fn query_with_stats_pipeline() {
 
 #[tokio::test]
 async fn query_rejects_missing_auth() {
-    let (url, _token) = setup().await;
-    let client = HttpClient::new(&url, "");
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, "");
 
     let result = client.query("*").await;
     assert!(result.is_err());
@@ -152,8 +163,8 @@ async fn query_rejects_missing_auth() {
 
 #[tokio::test]
 async fn query_rejects_invalid_token() {
-    let (url, _token) = setup().await;
-    let client = HttpClient::new(&url, "flt_ZZZZZZZZ_totally_fake_token_here1234");
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234");
 
     let result = client.query("*").await;
     assert!(result.is_err());
@@ -168,8 +179,8 @@ async fn query_rejects_invalid_token() {
 
 #[tokio::test]
 async fn query_rejects_bad_dsl() {
-    let (url, token) = setup().await;
-    let client = HttpClient::new(&url, &token);
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, &server.analyst_token);
 
     let result = client.query("| | | broken {{{").await;
     assert!(result.is_err());
@@ -179,5 +190,73 @@ async fn query_rejects_bad_dsl() {
             assert_eq!(status, 400);
         }
         other => panic!("expected 400 for bad DSL, got: {other:?}"),
+    }
+}
+
+// -- schema endpoint tests ---------------------------------------------------
+
+#[tokio::test]
+async fn schema_returns_columns() {
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, &server.analyst_token);
+
+    let schema = client.schema().await.unwrap();
+    assert!(!schema.columns.is_empty());
+
+    // Our test fixture has these exact columns.
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"timestamp"), "missing timestamp column");
+    assert!(names.contains(&"host"), "missing host column");
+    assert!(names.contains(&"service"), "missing service column");
+    assert!(names.contains(&"level"), "missing level column");
+    assert!(names.contains(&"message"), "missing message column");
+    assert_eq!(schema.file_count, 1);
+}
+
+#[tokio::test]
+async fn schema_caching_works() {
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, &server.analyst_token);
+
+    let first = client.schema().await.unwrap();
+    assert!(!first.cached, "first call should not be cached");
+
+    let second = client.schema().await.unwrap();
+    assert!(second.cached, "second call should be cached");
+}
+
+// -- queries endpoint tests --------------------------------------------------
+
+#[tokio::test]
+async fn queries_shows_history() {
+    let server = setup().await;
+    let analyst = HttpClient::new(&server.url, &server.analyst_token);
+    let admin = HttpClient::new(&server.url, &server.admin_token);
+
+    // Run a query so there's something in history.
+    analyst.query("*").await.unwrap();
+
+    let queries = admin.queries().await.unwrap();
+    assert!(
+        !queries.recent.is_empty(),
+        "recent history should contain the query we just ran"
+    );
+    assert_eq!(queries.recent[0].rows, Some(3));
+    assert!(!queries.recent[0].timed_out);
+}
+
+#[tokio::test]
+async fn queries_rejects_non_admin() {
+    let server = setup().await;
+    let client = HttpClient::new(&server.url, &server.analyst_token);
+
+    let result = client.queries().await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    match err {
+        fleet_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 401);
+        }
+        other => panic!("expected 401 for non-admin, got: {other:?}"),
     }
 }

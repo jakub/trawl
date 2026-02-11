@@ -73,6 +73,58 @@ impl HttpClient {
             .await
             .map_err(|e| ClientError::Parse(e.to_string()))
     }
+
+    /// Fetch schema introspection from the daemon.
+    pub async fn schema(&self) -> Result<SchemaResponse, ClientError> {
+        let url = format!("{}/api/v1/schema", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let message = resp
+                .json::<ErrorResponse>()
+                .await
+                .map_or_else(|_| "unknown error".into(), |e| e.error);
+            return Err(ClientError::Server { status, message });
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| ClientError::Parse(e.to_string()))
+    }
+
+    /// Fetch active and recent queries from the daemon (admin only).
+    pub async fn queries(&self) -> Result<QueriesResponse, ClientError> {
+        let url = format!("{}/api/v1/queries", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let message = resp
+                .json::<ErrorResponse>()
+                .await
+                .map_or_else(|_| "unknown error".into(), |e| e.error);
+            return Err(ClientError::Server { status, message });
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| ClientError::Parse(e.to_string()))
+    }
 }
 
 // -- wire types --------------------------------------------------------------
@@ -93,6 +145,70 @@ struct QueryResponse {
 #[derive(Deserialize)]
 struct ErrorResponse {
     error: String,
+}
+
+/// Schema introspection response from the daemon.
+#[derive(Debug, Deserialize)]
+pub struct SchemaResponse {
+    /// Column descriptors (name + type).
+    pub columns: Vec<SchemaColumnResponse>,
+    /// Number of parquet files matching the configured glob.
+    pub file_count: u64,
+    /// Whether this result was served from cache.
+    pub cached: bool,
+}
+
+/// A single column in the schema response.
+#[derive(Debug, Deserialize)]
+pub struct SchemaColumnResponse {
+    /// Column name.
+    pub name: String,
+    /// Column data type (e.g. "VARCHAR", "TIMESTAMP").
+    #[serde(rename = "type")]
+    pub data_type: String,
+}
+
+/// Active and recent queries response from the daemon.
+#[derive(Debug, Deserialize)]
+pub struct QueriesResponse {
+    /// Currently executing queries.
+    pub active: Vec<ActiveQuerySnapshot>,
+    /// Recently completed queries (most recent first).
+    pub recent: Vec<CompletedQuerySnapshot>,
+}
+
+/// Snapshot of a currently executing query.
+#[derive(Debug, Deserialize)]
+pub struct ActiveQuerySnapshot {
+    /// Monotonic query ID.
+    pub id: u64,
+    /// Authenticated user name.
+    pub user: String,
+    /// User's role.
+    pub role: String,
+    /// The DSL query string.
+    pub query: String,
+    /// How long the query has been running (ms).
+    pub running_ms: u64,
+}
+
+/// A completed query from recent history.
+#[derive(Debug, Deserialize)]
+pub struct CompletedQuerySnapshot {
+    /// Monotonic query ID.
+    pub id: u64,
+    /// Authenticated user name.
+    pub user: String,
+    /// The DSL query string.
+    pub query: String,
+    /// Execution duration in milliseconds.
+    pub duration_ms: u64,
+    /// Row count (if successful).
+    pub rows: Option<usize>,
+    /// Error message (if failed).
+    pub error: Option<String>,
+    /// Whether the query exceeded the timeout.
+    pub timed_out: bool,
 }
 
 impl From<QueryResponse> for QueryResult {
