@@ -4,9 +4,11 @@
 //! lifecycle: creation, verification, listing, and revocation.
 
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use chrono::Utc;
+use rusqlite::OptionalExtension as _;
 use rusqlite::params;
 
 use crate::error::AuthError;
@@ -16,6 +18,12 @@ use crate::token;
 
 /// Current schema version. Bumped when migrations are needed.
 const SCHEMA_VERSION: i64 = 1;
+
+/// Pre-computed dummy argon2id hash used to equalize timing when a prefix
+/// lookup returns no rows. Generated once at process start so that the
+/// `verify_token` call on the miss path takes the same time as on the hit path.
+static DUMMY_HASH: LazyLock<String> =
+    LazyLock::new(|| token::hash_token("dummy-timing-equalization").expect("failed to hash dummy"));
 
 /// `SQLite`-backed storage for API keys.
 #[derive(Debug)]
@@ -155,6 +163,9 @@ impl KeyStore {
              FROM api_keys WHERE prefix = ?1",
         )?;
 
+        // SECURITY: convert to Option instead of early-returning on no rows.
+        // This ensures we always run argon2 verification regardless of whether
+        // the prefix exists, preventing timing oracles that leak prefix validity.
         let row = stmt
             .query_row(params![prefix], |row| {
                 Ok((
@@ -167,14 +178,15 @@ impl KeyStore {
                     row.get::<_, Option<String>>(6)?,
                 ))
             })
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    AuthError::InvalidKey("authentication failed".into())
-                }
-                other => AuthError::Database(other),
-            })?;
+            .optional()
+            .map_err(AuthError::Database)?;
 
-        let (id, db_prefix, name, hash, role_str, active, expires_at) = row;
+        let Some((id, db_prefix, name, hash, role_str, active, expires_at)) = row else {
+            // SECURITY: run argon2 against a dummy hash to equalize timing
+            // with the real-prefix path. The verification will always fail.
+            let _ = token::verify_token(plaintext, &DUMMY_HASH);
+            return Err(AuthError::InvalidKey("authentication failed".into()));
+        };
 
         // SECURITY: always verify the hash FIRST (constant-time via argon2),
         // then check state. Return the same opaque error regardless of which
