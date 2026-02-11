@@ -70,7 +70,7 @@ impl std::error::Error for EmitError {}
 ///
 /// `source` is the parquet glob path, e.g. `"/data/**/*.parquet"`.
 pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
-    let mut state = EmitterState::new(source);
+    let mut state = EmitterState::new(source)?;
 
     // translate search stage into WHERE clauses
     search::emit_search(&query.search, &mut state);
@@ -365,5 +365,39 @@ mod tests {
     #[test]
     fn error_unknown_function() {
         assert_snapshot!(emit_dsl_err("* | stats bogus()"));
+    }
+
+    // -----------------------------------------------------------------------
+    // source path validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_source_with_single_quote() {
+        let query = parser::parse("*").unwrap();
+        let err = emit(&query, "/data/foo';DROP TABLE x;--/*.parquet")
+            .expect_err("should reject single quote in source path");
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn rejects_source_with_semicolon() {
+        let query = parser::parse("*").unwrap();
+        let err = emit(&query, "/data/foo;bar.parquet")
+            .expect_err("should reject semicolon in source path");
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn accepts_valid_glob_source() {
+        let query = parser::parse("*").unwrap();
+        let result = emit(&query, "/data/**/*.parquet");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn accepts_tilde_source() {
+        let query = parser::parse("*").unwrap();
+        let result = emit(&query, "~/.fleet/data/*.parquet");
+        assert!(result.is_ok());
     }
 }

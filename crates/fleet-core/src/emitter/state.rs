@@ -27,7 +27,19 @@ pub(crate) struct EmitterState {
 }
 
 impl EmitterState {
-    pub(crate) fn new(source: &str) -> Self {
+    pub(crate) fn new(source: &str) -> Result<Self, super::EmitError> {
+        // Validate source path to prevent SQL injection in table-valued functions.
+        // DuckDB's read_parquet()/read_json_auto() don't support parameterized paths,
+        // so we must sanitize the path before interpolation.
+        if !source
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_.*?{}[]-~".contains(&b))
+        {
+            return Err(super::EmitError::UnsupportedOperation {
+                message: format!("source path contains invalid characters: {source}"),
+            });
+        }
+
         let ext = std::path::Path::new(source)
             .extension()
             .and_then(|e| e.to_str())
@@ -37,7 +49,7 @@ impl EmitterState {
         } else {
             format!("read_parquet('{source}')")
         };
-        Self {
+        Ok(Self {
             step: 0,
             source: reader,
             select: Vec::new(),
@@ -49,7 +61,7 @@ impl EmitterState {
             has_projection: false,
             ctes: Vec::new(),
             params: Vec::new(),
-        }
+        })
     }
 
     /// Push a parameter value and return the `?` placeholder string.
