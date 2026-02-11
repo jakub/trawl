@@ -71,9 +71,11 @@ impl Executor {
     /// names and types, plus a glob count for file volume.
     pub fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError> {
         // Get column names and types from the parquet schema.
-        let describe_sql = format!("DESCRIBE SELECT * FROM read_parquet('{source}')");
-        let mut stmt = self.conn.prepare(&describe_sql)?;
-        let mut rows = stmt.query([])?;
+        // SECURITY: parameterized to prevent SQL injection via config paths.
+        let mut stmt = self
+            .conn
+            .prepare("DESCRIBE SELECT * FROM read_parquet(?)")?;
+        let mut rows = stmt.query([source])?;
 
         let mut columns = Vec::new();
         while let Some(row) = rows.next()? {
@@ -83,8 +85,11 @@ impl Executor {
         }
 
         // Count matching files.
-        let glob_sql = format!("SELECT count(*)::BIGINT FROM glob('{source}')");
-        let file_count: i64 = self.conn.query_row(&glob_sql, [], |row| row.get(0))?;
+        let file_count: i64 =
+            self.conn
+                .query_row("SELECT count(*)::BIGINT FROM glob(?)", [source], |row| {
+                    row.get(0)
+                })?;
 
         Ok(SchemaResult {
             columns,
