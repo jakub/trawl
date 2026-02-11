@@ -4,7 +4,7 @@
 //! and result extraction.
 
 use duckdb::Connection;
-use duckdb::types::ValueRef;
+use duckdb::types::{TimeUnit, ValueRef};
 use fleet_core::emitter::{self, EmittedQuery, SqlValue};
 use fleet_core::parser;
 
@@ -107,10 +107,108 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> Value {
         ValueRef::Double(f) => Value::Float(f),
         ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
         ValueRef::Blob(bytes) => Value::String(format!("<blob {} bytes>", bytes.len())),
-        // temporal types and everything else: let duckdb format as string
+        ValueRef::Timestamp(unit, val) => Value::String(format_timestamp(unit, val)),
+        ValueRef::Date32(days) => Value::String(format_date(days)),
+        ValueRef::Time64(unit, val) => Value::String(format_time(unit, val)),
+        // everything else: try string extraction, fall back to null
         _ => row
             .get::<_, String>(idx)
             .map(Value::String)
             .unwrap_or(Value::Null),
     }
+}
+
+/// Convert a timestamp value to an ISO 8601 string.
+///
+/// `DuckDB` stores timestamps as integer offsets from the Unix epoch.
+/// The `TimeUnit` indicates the resolution.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
+fn format_timestamp(unit: TimeUnit, val: i64) -> String {
+    let micros = match unit {
+        TimeUnit::Second => val * 1_000_000,
+        TimeUnit::Millisecond => val * 1_000,
+        TimeUnit::Microsecond => val,
+        TimeUnit::Nanosecond => val / 1_000,
+    };
+
+    let (total_secs, sub_secs) = if micros >= 0 {
+        (micros / 1_000_000, (micros % 1_000_000) as u32)
+    } else {
+        // handle pre-epoch timestamps
+        let s = (micros - 999_999) / 1_000_000;
+        let us = (micros - s * 1_000_000) as u32;
+        (s, us)
+    };
+
+    // days since epoch and time-of-day
+    let (days, day_secs) = if total_secs >= 0 {
+        ((total_secs / 86400) as i32, (total_secs % 86400) as u32)
+    } else {
+        let d = (total_secs - 86399) / 86400;
+        let s = (total_secs - d * 86400) as u32;
+        (d as i32, s)
+    };
+
+    let (y, m, d) = days_to_ymd(days);
+    let hour = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let sec = day_secs % 60;
+
+    if sub_secs == 0 {
+        format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}")
+    } else {
+        // trim trailing zeros from fractional seconds
+        let frac = format!("{sub_secs:06}");
+        let trimmed = frac.trim_end_matches('0');
+        format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}.{trimmed}")
+    }
+}
+
+/// Convert a date (days since Unix epoch) to YYYY-MM-DD.
+fn format_date(days: i32) -> String {
+    let (y, m, d) = days_to_ymd(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Convert a time value to HH:MM:SS.
+fn format_time(unit: TimeUnit, val: i64) -> String {
+    let micros = match unit {
+        TimeUnit::Second => val * 1_000_000,
+        TimeUnit::Millisecond => val * 1_000,
+        TimeUnit::Microsecond => val,
+        TimeUnit::Nanosecond => val / 1_000,
+    };
+    let total_secs = micros / 1_000_000;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+///
+/// Uses the civil calendar algorithm from Howard Hinnant's `date` library.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
+fn days_to_ymd(days: i32) -> (i32, u32, u32) {
+    // shift epoch from 0000-03-01 to 1970-01-01
+    let z = i64::from(days) + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u32; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    (y as i32, m, d)
 }

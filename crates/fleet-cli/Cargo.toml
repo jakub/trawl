@@ -14,6 +14,10 @@ path = "src/main.rs"
 [dependencies]
 fleet-client = { workspace = true }
 fleet-core = { workspace = true }
+fleet-engine = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
