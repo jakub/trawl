@@ -395,4 +395,86 @@ mod tests {
         let result = parse_expr("android");
         assert_eq!(result.node, Expr::FieldRef("android".to_string()));
     }
+
+    #[test]
+    fn test_double_minus() {
+        // `a - -b` should parse as Sub(a, Neg(b))
+        let result = parse_expr("a - -b");
+        match &result.node {
+            Expr::Binary { lhs, op, rhs } => {
+                assert_eq!(*op, BinaryOp::Sub);
+                assert_eq!(lhs.node, Expr::FieldRef("a".to_string()));
+                assert!(matches!(
+                    rhs.node,
+                    Expr::Unary {
+                        op: UnaryOp::Neg,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected Binary Sub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_in_list_literals() {
+        let result = parse_expr("x in (1, 2, 3)");
+        match &result.node {
+            Expr::InList { expr, list } => {
+                assert_eq!(expr.node, Expr::FieldRef("x".to_string()));
+                assert_eq!(list.len(), 3);
+            }
+            other => panic!("expected InList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_in_list_field_refs() {
+        let result = parse_expr("x in (y, z)");
+        match &result.node {
+            Expr::InList { expr, list } => {
+                assert_eq!(expr.node, Expr::FieldRef("x".to_string()));
+                assert_eq!(list.len(), 2);
+                assert_eq!(list[0].node, Expr::FieldRef("y".to_string()));
+                assert_eq!(list[1].node, Expr::FieldRef("z".to_string()));
+            }
+            other => panic!("expected InList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_in_list_complex_exprs() {
+        let result = parse_expr("x in (count(), y + 2)");
+        match &result.node {
+            Expr::InList { list, .. } => {
+                assert_eq!(list.len(), 2);
+                assert!(matches!(list[0].node, Expr::FunctionCall { .. }));
+                assert!(matches!(list[1].node, Expr::Binary { .. }));
+            }
+            other => panic!("expected InList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_function_call() {
+        let result = parse_expr("func(other_func(x))");
+        match &result.node {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "func");
+                assert_eq!(args.len(), 1);
+                match &args[0].node {
+                    Expr::FunctionCall {
+                        name: inner_name,
+                        args: inner_args,
+                    } => {
+                        assert_eq!(inner_name, "other_func");
+                        assert_eq!(inner_args.len(), 1);
+                        assert_eq!(inner_args[0].node, Expr::FieldRef("x".to_string()));
+                    }
+                    other => panic!("expected inner FunctionCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
 }
