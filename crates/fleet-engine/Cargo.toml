@@ -9,6 +9,11 @@ publish.workspace = true
 
 [dependencies]
 fleet-core = { workspace = true }
+duckdb = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
 
 [lints]
 workspace = true
