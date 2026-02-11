@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 chumsky = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

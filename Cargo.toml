@@ -21,6 +21,7 @@ fleet-client = { path = "crates/fleet-client" }
 # external deps
 chumsky = "0.12"
 insta = "1"
+regex = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

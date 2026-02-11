@@ -62,38 +62,43 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 
 /// Convert a chumsky `Rich` error into our `ParseError` with a human-friendly message.
 fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
+    use chumsky::error::RichReason;
+
     let span = e.span();
-    let offset = span.start;
-
-    // build a useful message from expected/found
-    let found = if offset >= input.len() {
-        "end of input".to_string()
-    } else {
-        let ch = &input[offset..];
-        let end = ch.char_indices().nth(1).map_or(ch.len(), |(idx, _)| idx);
-        format!("'{}'", &ch[..end])
-    };
-
-    let expected: Vec<String> = e
-        .expected()
-        .map(|exp| match exp {
-            chumsky::error::RichPattern::Token(c) => format!("'{}'", &**c),
-            chumsky::error::RichPattern::Label(l) => l.to_string(),
-            chumsky::error::RichPattern::Identifier(id) => format!("`{id}`"),
-            chumsky::error::RichPattern::Any => "any token".to_string(),
-            chumsky::error::RichPattern::SomethingElse => "something else".to_string(),
-            chumsky::error::RichPattern::EndOfInput => "end of input".to_string(),
-            _ => "unknown".to_string(),
-        })
-        .collect();
-
-    let message = if expected.is_empty() {
-        format!("unexpected {found}")
-    } else {
-        format!("found {found}, expected {}", expected.join(" or "))
-    };
-
     let label = e.contexts().next().map(|(l, _)| l.to_string());
+
+    // custom errors (e.g. overflow, invalid regex) carry their own message
+    let message = if let RichReason::Custom(msg) = e.reason() {
+        msg.clone()
+    } else {
+        let offset = span.start;
+        let found = if offset >= input.len() {
+            "end of input".to_string()
+        } else {
+            let ch = &input[offset..];
+            let end = ch.char_indices().nth(1).map_or(ch.len(), |(idx, _)| idx);
+            format!("'{}'", &ch[..end])
+        };
+
+        let expected: Vec<String> = e
+            .expected()
+            .map(|exp| match exp {
+                chumsky::error::RichPattern::Token(c) => format!("'{}'", &**c),
+                chumsky::error::RichPattern::Label(l) => l.to_string(),
+                chumsky::error::RichPattern::Identifier(id) => format!("`{id}`"),
+                chumsky::error::RichPattern::Any => "any token".to_string(),
+                chumsky::error::RichPattern::SomethingElse => "something else".to_string(),
+                chumsky::error::RichPattern::EndOfInput => "end of input".to_string(),
+                _ => "unknown".to_string(),
+            })
+            .collect();
+
+        if expected.is_empty() {
+            format!("unexpected {found}")
+        } else {
+            format!("found {found}, expected {}", expected.join(" or "))
+        }
+    };
 
     ParseError {
         message,
@@ -259,6 +264,13 @@ mod tests {
         for error in &errors {
             assert!(error.span.start <= error.span.end);
         }
+    }
+
+    #[test]
+    fn test_error_integer_overflow_no_panic() {
+        // overflowing integers must produce a parse error, not a panic
+        let result = parse("x | where count > 99999999999999999999999");
+        assert!(result.is_err());
     }
 
     #[test]

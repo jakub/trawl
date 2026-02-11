@@ -33,8 +33,10 @@ pub(crate) fn spanned<'src, T: 'src>(
 pub(crate) fn uint<'src>() -> impl Parser<'src, ParserInput<'src>, u64, ParserExtra<'src>> + Clone {
     text::int(10)
         .to_slice()
-        .from_str::<u64>()
-        .unwrapped()
+        .try_map(|s: &str, span| {
+            s.parse::<u64>()
+                .map_err(|e| Rich::custom(span, format!("invalid integer: {e}")))
+        })
         .labelled("integer")
 }
 
@@ -44,8 +46,10 @@ pub(crate) fn int<'src>() -> impl Parser<'src, ParserInput<'src>, i64, ParserExt
         .or_not()
         .then(text::int(10).to_slice())
         .to_slice()
-        .from_str::<i64>()
-        .unwrapped()
+        .try_map(|s: &str, span| {
+            s.parse::<i64>()
+                .map_err(|e| Rich::custom(span, format!("invalid integer: {e}")))
+        })
         .labelled("integer")
 }
 
@@ -57,8 +61,10 @@ pub(crate) fn float<'src>() -> impl Parser<'src, ParserInput<'src>, f64, ParserE
         .then(text::int(10))
         .then(just('.').then(text::digits(10)))
         .to_slice()
-        .from_str::<f64>()
-        .unwrapped()
+        .try_map(|s: &str, span| {
+            s.parse::<f64>()
+                .map_err(|e| Rich::custom(span, format!("invalid float: {e}")))
+        })
         .labelled("float")
 }
 
@@ -167,12 +173,17 @@ pub(crate) fn time_unit<'src>()
     .labelled("time unit")
 }
 
-/// Parse a duration like `2h`, `5m`, `30s`.
+/// Parse a duration like `2h`, `5m`, `30s`. Rejects zero-duration values.
 pub(crate) fn duration<'src>()
 -> impl Parser<'src, ParserInput<'src>, FleetDuration, ParserExtra<'src>> + Clone {
     uint()
         .then(time_unit())
-        .map(|(quantity, unit)| FleetDuration { quantity, unit })
+        .try_map(|(quantity, unit), span| {
+            if quantity == 0 {
+                return Err(Rich::custom(span, "duration must be greater than zero"));
+            }
+            Ok(FleetDuration { quantity, unit })
+        })
         .labelled("duration")
 }
 
@@ -237,7 +248,7 @@ pub(crate) fn bare_value<'src>()
         .labelled("value")
 }
 
-/// Parse a regex pattern delimited by `/`: `/pattern/`.
+/// Parse a regex pattern delimited by `/`: `/pattern/`. Validates syntax.
 pub(crate) fn regex_pattern<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     none_of("/")
@@ -245,6 +256,11 @@ pub(crate) fn regex_pattern<'src>()
         .at_least(1)
         .collect::<String>()
         .delimited_by(just('/'), just('/'))
+        .try_map(|pattern, span| {
+            regex::Regex::new(&pattern)
+                .map_err(|e| Rich::custom(span, format!("invalid regex: {e}")))?;
+            Ok(pattern)
+        })
         .labelled("regex pattern")
 }
 
@@ -402,6 +418,44 @@ mod tests {
         assert_eq!(
             bare_value().parse("error*").into_result().unwrap(),
             "error*"
+        );
+    }
+
+    #[test]
+    fn test_uint_overflow() {
+        assert!(
+            uint()
+                .parse("99999999999999999999999")
+                .into_result()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_int_overflow() {
+        assert!(
+            int()
+                .parse("-99999999999999999999999")
+                .into_result()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_duration_zero_rejected() {
+        assert!(duration().parse("0h").into_result().is_err());
+        assert!(duration().parse("0s").into_result().is_err());
+        assert!(duration().parse("0d").into_result().is_err());
+    }
+
+    #[test]
+    fn test_regex_pattern_invalid() {
+        // unclosed group
+        assert!(
+            regex_pattern()
+                .parse("/(?P<unclosed/")
+                .into_result()
+                .is_err()
         );
     }
 }
