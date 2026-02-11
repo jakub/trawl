@@ -2,16 +2,24 @@ use std::io::{self, IsTerminal, Write};
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use fleet_engine::executor::Executor;
 use fleet_engine::value::{QueryResult, Value};
 
 /// fleet — search your logs with a pipeline DSL.
 #[derive(Parser)]
 #[command(name = "fleet", version, about)]
 struct Cli {
-    /// Parquet glob path (e.g. "/data/**/*.parquet").
+    /// Daemon URL (e.g. `http://localhost:8080`). Enables daemon mode.
+    #[arg(long, env = "FLEET_URL")]
+    url: Option<String>,
+
+    /// API key for daemon authentication (required with --url).
+    #[arg(long, env = "FLEET_TOKEN")]
+    token: Option<String>,
+
+    /// Parquet glob path for embedded mode (e.g. "/data/**/*.parquet").
+    /// Used when --url is not set.
     #[arg(long)]
-    data: String,
+    data: Option<String>,
 
     /// The fleet DSL query.
     query: String,
@@ -28,7 +36,8 @@ enum OutputFormat {
     Csv,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     let format = cli.format.unwrap_or_else(|| {
@@ -39,20 +48,13 @@ fn main() {
         }
     });
 
-    let executor = match Executor::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("fleet: failed to initialize engine: {e}");
-            process::exit(1);
-        }
-    };
-
-    let result = match executor.run_query(&cli.query, &cli.data) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("fleet: {e}");
-            process::exit(1);
-        }
+    let result = if let Some(url) = &cli.url {
+        run_daemon_mode(url, &cli).await
+    } else if let Some(data) = &cli.data {
+        run_embedded_mode(data, &cli.query)
+    } else {
+        eprintln!("fleet: provide --url (daemon mode) or --data (embedded mode)");
+        process::exit(1);
     };
 
     let stdout = io::stdout();
@@ -64,6 +66,44 @@ fn main() {
         OutputFormat::Csv => render_csv(&result, &mut out),
     }
 }
+
+/// Connect to the daemon and execute the query over HTTP.
+async fn run_daemon_mode(url: &str, cli: &Cli) -> QueryResult {
+    let token = cli.token.as_deref().unwrap_or_else(|| {
+        eprintln!("fleet: --token is required when using --url");
+        process::exit(1);
+    });
+
+    let client = fleet_client::HttpClient::new(url, token);
+    match client.query(&cli.query).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("fleet: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Execute the query locally with an embedded `DuckDB` engine.
+fn run_embedded_mode(data: &str, query: &str) -> QueryResult {
+    let executor = match fleet_engine::executor::Executor::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fleet: failed to initialize engine: {e}");
+            process::exit(1);
+        }
+    };
+
+    match executor.run_query(query, data) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("fleet: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+// -- output formatters -------------------------------------------------------
 
 fn render_table(result: &QueryResult, out: &mut impl Write) {
     if result.is_empty() {
@@ -90,7 +130,6 @@ fn render_table(result: &QueryResult, out: &mut impl Write) {
 }
 
 fn render_json(result: &QueryResult, out: &mut impl Write) {
-    // ndjson: one JSON object per row
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
@@ -102,11 +141,9 @@ fn render_json(result: &QueryResult, out: &mut impl Write) {
 }
 
 fn render_csv(result: &QueryResult, out: &mut impl Write) {
-    // header
     let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     let _ = writeln!(out, "{}", headers.join(","));
 
-    // rows
     for row in &result.rows {
         let cells: Vec<String> = row.iter().map(|v| csv_escape(&v.to_string())).collect();
         let _ = writeln!(out, "{}", cells.join(","));
