@@ -3,6 +3,8 @@
 //! Handles connection management, prepared statements, parameter binding,
 //! and result extraction.
 
+use std::sync::Arc;
+
 use duckdb::Connection;
 use duckdb::types::{TimeUnit, ValueRef};
 use fleet_core::emitter::{self, EmittedQuery, SqlValue};
@@ -22,6 +24,11 @@ impl Executor {
     pub fn new() -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
         Ok(Self { conn })
+    }
+
+    /// Get an interrupt handle for cancelling in-flight queries from another thread.
+    pub fn interrupt_handle(&self) -> Arc<duckdb::InterruptHandle> {
+        self.conn.interrupt_handle()
     }
 
     /// Execute a pre-emitted query (SQL + params) against `DuckDB`.

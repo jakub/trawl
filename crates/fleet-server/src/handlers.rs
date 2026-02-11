@@ -105,10 +105,10 @@ pub async fn query(
     let query_id = state.tracker.start(&verified, &req.query);
     let timeout = std::time::Duration::from_secs(state.timeout_secs);
 
-    let result = tokio::time::timeout(timeout, state.pool.execute(&req.query)).await;
+    let result = state.pool.execute(&req.query, timeout).await;
 
     match result {
-        Ok(Ok(qr)) => {
+        Ok(qr) => {
             let rows = qr.row_count();
             state.tracker.complete(query_id, rows);
             tracing::info!(
@@ -119,7 +119,18 @@ pub async fn query(
             );
             Ok(Json(qr.into()))
         }
-        Ok(Err(e)) => {
+        Err(ServerError::Timeout) => {
+            state.tracker.timeout(query_id);
+            tracing::warn!(
+                user = %verified.name,
+                query = %req.query,
+                query_id,
+                timeout_secs = state.timeout_secs,
+                "query timed out"
+            );
+            Err(ServerError::Timeout)
+        }
+        Err(e) => {
             // SECURITY: use safe_message() to redact database internals
             // from tracker history and logs.
             let safe_msg = e.safe_message();
@@ -148,17 +159,6 @@ pub async fn query(
                 }
             }
             Err(e)
-        }
-        Err(_elapsed) => {
-            state.tracker.timeout(query_id);
-            tracing::warn!(
-                user = %verified.name,
-                query = %req.query,
-                query_id,
-                timeout_secs = state.timeout_secs,
-                "query timed out"
-            );
-            Err(ServerError::Timeout)
         }
     }
 }

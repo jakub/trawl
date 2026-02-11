@@ -3,8 +3,10 @@
 //! `DuckDB` connections are `!Send`, so each query runs in a
 //! [`tokio::task::spawn_blocking`] task with a fresh [`Executor`].
 //! The semaphore limits concurrency to prevent thread pool exhaustion.
+//! Timed-out queries are interrupted via `DuckDB`'s interrupt handle.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use fleet_engine::executor::Executor;
 use fleet_engine::value::{QueryResult, SchemaResult};
@@ -29,7 +31,11 @@ impl ExecutorPool {
     }
 
     /// Execute a DSL query, blocking on semaphore acquisition if at capacity.
-    pub async fn execute(&self, dsl: &str) -> Result<QueryResult, ServerError> {
+    ///
+    /// If the query exceeds `timeout`, the `DuckDB` connection is interrupted
+    /// and the query is aborted. The semaphore permit is held until the
+    /// blocking task finishes (which happens promptly after interruption).
+    pub async fn execute(&self, dsl: &str, timeout: Duration) -> Result<QueryResult, ServerError> {
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
@@ -39,9 +45,9 @@ impl ExecutorPool {
         }
 
         let wait_start = std::time::Instant::now();
-        let _permit = self
-            .semaphore
-            .acquire()
+        let semaphore = Arc::clone(&self.semaphore);
+        let permit = semaphore
+            .acquire_owned()
             .await
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
@@ -53,14 +59,35 @@ impl ExecutorPool {
         let dsl = dsl.to_owned();
         let data_path = Arc::clone(&self.data_path);
 
-        tokio::task::spawn_blocking(move || {
+        // Channel for the blocking task to send back its interrupt handle
+        // before starting the actual query.
+        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit; // hold permit until this task completes
             let executor = Executor::new()?;
+            // Send interrupt handle to async side before running the query.
+            let _ = interrupt_tx.send(executor.interrupt_handle());
             executor
                 .run_query(&dsl, &data_path)
                 .map_err(ServerError::from)
-        })
-        .await
-        .map_err(|e| ServerError::Internal(format!("query task panicked: {e}")))?
+        });
+
+        // Receive interrupt handle (may fail if executor creation fails first).
+        let interrupt = interrupt_rx.await.ok();
+
+        match tokio::time::timeout(timeout, task).await {
+            // Query completed within timeout.
+            Ok(join_result) => join_result
+                .map_err(|e| ServerError::Internal(format!("query task panicked: {e}")))?,
+            // Timeout elapsed — interrupt the DuckDB query.
+            Err(_elapsed) => {
+                if let Some(handle) = interrupt {
+                    handle.interrupt();
+                }
+                Err(ServerError::Timeout)
+            }
+        }
     }
 
     /// Introspect the data source schema. Does NOT consume a semaphore permit
@@ -86,7 +113,9 @@ mod tests {
     #[tokio::test]
     async fn pool_rejects_invalid_dsl() {
         let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 2);
-        let result = pool.execute("totally broken {{{ query").await;
+        let result = pool
+            .execute("totally broken {{{ query", Duration::from_secs(10))
+            .await;
         assert!(result.is_err());
     }
 
@@ -94,6 +123,6 @@ mod tests {
     async fn pool_respects_concurrency_limit() {
         let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 1);
         // just verifying it doesn't panic with a single permit
-        let _ = pool.execute("service:test").await;
+        let _ = pool.execute("service:test", Duration::from_secs(10)).await;
     }
 }
