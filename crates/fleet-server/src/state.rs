@@ -26,6 +26,10 @@ pub struct AppState {
     pub tracker: Arc<QueryTracker>,
     /// Query timeout in seconds.
     pub timeout_secs: u64,
+    /// Maximum request body size in bytes.
+    pub max_request_body_bytes: usize,
+    /// Maximum concurrent HTTP requests.
+    pub max_concurrent_requests: usize,
 }
 
 /// A cached schema result with an expiry timestamp.
@@ -54,6 +58,8 @@ impl AppState {
             schema_cache: Arc::new(RwLock::new(None)),
             tracker: Arc::new(QueryTracker::new()),
             timeout_secs: config.server.timeout_secs,
+            max_request_body_bytes: config.server.max_request_body_bytes,
+            max_concurrent_requests: config.server.max_concurrent_requests,
         }
     }
 }

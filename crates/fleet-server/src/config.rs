@@ -31,6 +31,14 @@ pub struct ServerConfig {
     #[serde(default = "default_max_result_rows")]
     pub max_result_rows: usize,
 
+    /// Maximum request body size in bytes (default: 128 KB).
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+
+    /// Maximum concurrent HTTP requests (default: 256).
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+
     /// Optional log file path. When set, logs are written to both stdout and this file.
     pub log_file: Option<PathBuf>,
 }
@@ -63,6 +71,14 @@ fn default_max_concurrent_queries() -> usize {
 
 fn default_max_result_rows() -> usize {
     100_000
+}
+
+fn default_max_request_body_bytes() -> usize {
+    128 * 1024 // 128 KB
+}
+
+fn default_max_concurrent_requests() -> usize {
+    256
 }
 
 /// Portable CPU count without pulling in the `num_cpus` crate.

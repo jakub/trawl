@@ -4,9 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::http::{HeaderValue, Method, header};
 use axum::middleware;
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::auth_middleware;
@@ -16,6 +22,9 @@ use crate::state::AppState;
 
 /// Build the axum router with all routes and middleware.
 pub fn router(state: AppState) -> Router {
+    let max_body = state.max_request_body_bytes;
+    let max_conns = state.max_concurrent_requests;
+
     // Routes that require authentication.
     let authenticated = Router::new()
         .route("/api/v1/query", post(handlers::query))
@@ -26,13 +35,25 @@ pub fn router(state: AppState) -> Router {
     // Routes that are public (no auth required).
     let public = Router::new().route("/api/v1/health", get(handlers::health));
 
-    // Merge route groups.
     // Auth db path is injected into extensions so the auth middleware can find it.
     let auth_db_path = Arc::clone(&state.auth_db_path);
 
     Router::new()
         .merge(authenticated)
         .merge(public)
+        // -- security hardening layers (outermost applied first) --
+        .layer(CatchPanicLayer::new())
+        .layer(RequestBodyLimitLayer::new(max_body))
+        .layer(ConcurrencyLimitLayer::new(max_conns))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(
+            CorsLayer::new()
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+        )
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {
