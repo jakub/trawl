@@ -10,12 +10,15 @@
 //! 4. **Expressions** — recursive expression parser with operator precedence
 //! 5. **Pipe stages** — stats, where, sort, limit, table
 
-mod expr;
-mod pipe;
-mod primitives;
-mod search;
+pub(crate) mod expr;
+pub(crate) mod pipe;
+pub(crate) mod primitives;
+pub(crate) mod search;
+
+use chumsky::prelude::*;
 
 use crate::ast::Query;
+use primitives::{ParserExtra, ParserInput};
 
 /// An error produced by the parser, with source location and context.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +43,143 @@ impl std::fmt::Display for ParseError {
 /// # Errors
 ///
 /// Returns a list of parse errors if the input is not valid fleet DSL.
-pub fn parse(_input: &str) -> Result<Query, Vec<ParseError>> {
-    todo!("wire up in commit 8")
+pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
+    let parser = query_parser();
+    let result = parser.parse(input);
+
+    match result.into_result() {
+        Ok(query) => Ok(query),
+        Err(errors) => Err(errors
+            .into_iter()
+            .map(|e| {
+                let span = e.span();
+                ParseError {
+                    message: e.to_string(),
+                    span: span.start..span.end,
+                    label: e.contexts().next().map(|(l, _)| l.to_string()),
+                }
+            })
+            .collect()),
+    }
+}
+
+/// Build the top-level query parser: search stage, then pipeline, then EOF.
+fn query_parser<'src>() -> impl Parser<'src, ParserInput<'src>, Query, ParserExtra<'src>> {
+    search::search_stage()
+        .then(pipe::pipeline())
+        .then_ignore(end())
+        .map(|(search, pipeline)| Query { search, pipeline })
+        .labelled("query")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::*;
+
+    #[test]
+    fn test_simple_field_filter() {
+        let query = parse("service:nginx").unwrap();
+        assert_eq!(query.search.tokens.len(), 1);
+        assert_eq!(query.pipeline.len(), 0);
+    }
+
+    #[test]
+    fn test_multi_token_search() {
+        let query = parse("service:nginx level:error last:2h").unwrap();
+        assert_eq!(query.search.tokens.len(), 3);
+    }
+
+    #[test]
+    fn test_quoted_search() {
+        let query = parse(r#""connection refused""#).unwrap();
+        assert_eq!(query.search.tokens.len(), 1);
+        assert_eq!(
+            query.search.tokens[0].node,
+            SearchToken::QuotedSearch(QuotedSearch {
+                phrase: "connection refused".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_negated_text_search() {
+        let query = parse("-debug service:nginx").unwrap();
+        assert_eq!(query.search.tokens.len(), 2);
+        assert_eq!(
+            query.search.tokens[0].node,
+            SearchToken::TextSearch(TextSearch {
+                term: "debug".to_string(),
+                negated: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_search_with_stats() {
+        let query = parse("service:nginx last:1h | stats count() by host").unwrap();
+        assert_eq!(query.search.tokens.len(), 2);
+        assert_eq!(query.pipeline.len(), 1);
+        assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
+    }
+
+    #[test]
+    fn test_full_pipeline() {
+        let query = parse("service:nginx | stats count() by host | where count > 10 | sort -count")
+            .unwrap();
+        assert_eq!(query.search.tokens.len(), 1);
+        assert_eq!(query.pipeline.len(), 3);
+        assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
+        assert!(matches!(query.pipeline[1].node, PipeStage::Where(_)));
+        assert!(matches!(query.pipeline[2].node, PipeStage::Sort(_)));
+    }
+
+    #[test]
+    fn test_stats_avg_table() {
+        let query =
+            parse("service:nginx | stats avg(duration) by status | table status, avg_duration")
+                .unwrap();
+        assert_eq!(query.pipeline.len(), 2);
+        match &query.pipeline[0].node {
+            PipeStage::Stats(stats) => {
+                assert_eq!(stats.aggregations[0].function, "avg");
+                assert_eq!(stats.group_by, vec!["status".to_string()]);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+        match &query.pipeline[1].node {
+            PipeStage::Table(table) => {
+                assert_eq!(
+                    table.fields,
+                    vec!["status".to_string(), "avg_duration".to_string()]
+                );
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_complex_query() {
+        let query =
+            parse("status:>=400 last:24h | stats count() by host, uri | sort -count | limit 20")
+                .unwrap();
+        assert_eq!(query.search.tokens.len(), 2);
+        assert_eq!(query.pipeline.len(), 3);
+        assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
+        assert!(matches!(query.pipeline[1].node, PipeStage::Sort(_)));
+        assert!(matches!(query.pipeline[2].node, PipeStage::Limit(_)));
+    }
+
+    #[test]
+    fn test_parse_error() {
+        let result = parse("| | invalid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_query() {
+        let query = parse("").unwrap();
+        assert_eq!(query.search.tokens.len(), 0);
+        assert_eq!(query.pipeline.len(), 0);
+    }
 }
