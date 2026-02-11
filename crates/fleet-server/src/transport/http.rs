@@ -60,6 +60,10 @@ pub fn router(state: AppState) -> Router {
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
         ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+        ))
         .layer(
             CorsLayer::new()
                 .allow_methods([Method::GET, Method::POST])
