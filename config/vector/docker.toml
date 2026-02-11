@@ -1,0 +1,67 @@
+# fleet / vector — docker container logs
+#
+# collects logs from all docker containers via the docker daemon socket,
+# normalizes to the fleet schema, and writes ndjson partitioned by hour.
+#
+# usage:
+#   vector --config config/vector/docker.toml
+#
+# prerequisites:
+#   - vector user must have access to /var/run/docker.sock
+#   - containers should log to stdout/stderr (json-file or journald driver)
+
+# -- source: docker daemon --------------------------------------------------
+
+[sources.docker]
+type = "docker_logs"
+
+# collect from all containers by default — filter with include_images or
+# include_containers if you only want specific workloads
+# include_images = ["nginx", "postgres"]
+
+# -- transform: normalize to fleet schema ------------------------------------
+
+[transforms.normalize]
+type = "remap"
+inputs = ["docker"]
+source = '''
+# fleet schema: timestamp, host, service, level, message,
+#               status, duration, uri, method, user_name, src_ip
+
+# timestamp: docker provides .timestamp as ISO 8601
+.timestamp = .timestamp
+
+# host: container hostname (docker sets this to container ID by default)
+.host = .container_name
+
+# service: image name without tag is a reasonable default
+.service = split(to_string(.image) ?? "unknown", ":")[0] ?? "unknown"
+
+# level: docker doesn't provide structured levels — try to infer from stream
+.level = if .stream == "stderr" { "error" } else { "info" }
+
+# message: the actual log line
+.message = .message
+
+# drop docker metadata we don't need
+del(.container_created_at)
+del(.container_id)
+del(.container_name)
+del(.image)
+del(.label)
+del(.stream)
+del(.source_type)
+'''
+
+# -- sink: ndjson files partitioned by hour ----------------------------------
+
+[sinks.fleet_ndjson]
+type = "file"
+inputs = ["normalize"]
+path = "/var/lib/fleet/logs/%Y-%m-%d/%H/docker.ndjson"
+encoding.codec = "json"
+
+# buffer to disk to survive restarts
+[sinks.fleet_ndjson.buffer]
+type = "disk"
+max_size = 268435456  # 256 MiB

@@ -1,0 +1,79 @@
+# fleet / vector — syslog (RFC 5424 / RFC 3164)
+#
+# receives syslog over UDP and TCP, normalizes to the fleet schema,
+# and writes ndjson partitioned by hour.
+#
+# usage:
+#   vector --config config/vector/syslog.toml
+#
+# send logs here from any syslog-capable device:
+#   *.* @fleet-host:5514          # UDP
+#   *.* @@fleet-host:5514         # TCP
+
+# -- source: syslog over UDP and TCP ----------------------------------------
+
+[sources.syslog_udp]
+type = "syslog"
+mode = "udp"
+address = "0.0.0.0:5514"
+
+[sources.syslog_tcp]
+type = "syslog"
+mode = "tcp"
+address = "0.0.0.0:5514"
+
+# -- transform: normalize to fleet schema ------------------------------------
+
+[transforms.normalize]
+type = "remap"
+inputs = ["syslog_udp", "syslog_tcp"]
+source = '''
+# fleet schema: timestamp, host, service, level, message,
+#               status, duration, uri, method, user_name, src_ip
+
+# syslog provides .timestamp already parsed
+.timestamp = .timestamp
+
+# hostname from syslog header
+.host = .hostname
+
+# appname from syslog header (e.g. "sshd", "nginx", "kernel")
+.service = .appname
+
+# map syslog severity to fleet levels
+sev = to_string(.severity) ?? "info"
+if sev == "emerg" || sev == "alert" || sev == "crit" || sev == "err" {
+  .level = "error"
+} else if sev == "warning" {
+  .level = "warn"
+} else if sev == "notice" || sev == "info" {
+  .level = "info"
+} else {
+  .level = "debug"
+}
+
+# the log message
+.message = .message
+
+# drop syslog metadata we've already mapped
+del(.hostname)
+del(.appname)
+del(.facility)
+del(.severity)
+del(.procid)
+del(.msgid)
+del(.version)
+del(.source_type)
+'''
+
+# -- sink: ndjson files partitioned by hour ----------------------------------
+
+[sinks.fleet_ndjson]
+type = "file"
+inputs = ["normalize"]
+path = "/var/lib/fleet/logs/%Y-%m-%d/%H/syslog.ndjson"
+encoding.codec = "json"
+
+[sinks.fleet_ndjson.buffer]
+type = "disk"
+max_size = 268435456  # 256 MiB

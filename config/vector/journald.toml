@@ -1,0 +1,95 @@
+# fleet / vector — systemd journal
+#
+# collects logs from the systemd journal, normalizes to the fleet schema,
+# and writes ndjson partitioned by hour.
+#
+# usage:
+#   vector --config config/vector/journald.toml
+#
+# prerequisites:
+#   - vector user must be in the `systemd-journal` group
+#     (or run as root, but don't)
+
+# -- source: journald -------------------------------------------------------
+
+[sources.journal]
+type = "journald"
+current_boot_only = true
+
+# filter to specific units if you want:
+# include_units = ["nginx", "sshd", "postgresql"]
+
+# -- transform: normalize to fleet schema ------------------------------------
+
+[transforms.normalize]
+type = "remap"
+inputs = ["journal"]
+source = '''
+# fleet schema: timestamp, host, service, level, message,
+#               status, duration, uri, method, user_name, src_ip
+
+.timestamp = .__REALTIME_TIMESTAMP
+
+# journald provides the hostname directly
+.host = .host
+
+# systemd unit name (e.g. "nginx.service" → "nginx")
+unit = to_string(._SYSTEMD_UNIT) ?? ""
+.service = replace(unit, r'.service$', "")
+
+# map journald priority (0-7) to fleet levels
+# 0-2: emergency/alert/critical → error
+# 3:   error → error
+# 4:   warning → warn
+# 5:   notice → info
+# 6:   info → info
+# 7:   debug → debug
+priority = to_int(.PRIORITY) ?? 6
+if priority <= 3 {
+  .level = "error"
+} else if priority == 4 {
+  .level = "warn"
+} else if priority <= 6 {
+  .level = "info"
+} else {
+  .level = "debug"
+}
+
+# the actual log message
+.message = .MESSAGE
+
+# user who started the process (if available)
+.user_name = del(._LOGINUID)
+
+# extract src_ip from sshd messages if present
+if starts_with(to_string(.message) ?? "", "Accepted") ||
+   starts_with(to_string(.message) ?? "", "Failed") {
+  parsed, err = parse_regex(.message, r'from (?P<ip>\d+\.\d+\.\d+\.\d+)')
+  if err == null {
+    .src_ip = parsed.ip
+  }
+}
+
+# drop raw journald fields we've already mapped
+del(.__REALTIME_TIMESTAMP)
+del(.MESSAGE)
+del(.PRIORITY)
+del(._SYSTEMD_UNIT)
+del(._BOOT_ID)
+del(._MACHINE_ID)
+del(._TRANSPORT)
+del(.SYSLOG_IDENTIFIER)
+del(.source_type)
+'''
+
+# -- sink: ndjson files partitioned by hour ----------------------------------
+
+[sinks.fleet_ndjson]
+type = "file"
+inputs = ["normalize"]
+path = "/var/lib/fleet/logs/%Y-%m-%d/%H/journald.ndjson"
+encoding.codec = "json"
+
+[sinks.fleet_ndjson.buffer]
+type = "disk"
+max_size = 268435456  # 256 MiB

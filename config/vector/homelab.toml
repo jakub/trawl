@@ -1,0 +1,211 @@
+# fleet / vector — homelab all-in-one
+#
+# collects logs from all common homelab sources in a single config:
+# docker containers, systemd journal, syslog, and nginx access logs.
+# normalizes everything to the fleet schema and writes ndjson
+# partitioned by hour.
+#
+# usage:
+#   vector --config config/vector/homelab.toml
+#
+# this is the "just make it work" config. it collects everything
+# and writes to a single directory tree that fleet can query with:
+#   fleet --data "/var/lib/fleet/logs/**/*.ndjson" "level:error last:1h"
+#
+# tune the sources section to match your actual setup — comment out
+# what you don't have, uncomment what you do.
+
+# ============================================================================
+# SOURCES
+# ============================================================================
+
+# -- docker containers -------------------------------------------------------
+# requires: vector user in `docker` group, or socket permissions
+
+[sources.docker]
+type = "docker_logs"
+# include_images = ["nginx", "postgres", "redis"]  # filter if needed
+
+# -- systemd journal ---------------------------------------------------------
+# requires: vector user in `systemd-journal` group
+
+[sources.journal]
+type = "journald"
+current_boot_only = true
+# include_units = ["sshd", "nginx", "postgresql"]
+
+# -- syslog from network devices ---------------------------------------------
+# receives syslog from routers, switches, APs, etc.
+
+[sources.syslog]
+type = "syslog"
+mode = "udp"
+address = "0.0.0.0:5514"
+
+# -- nginx access logs (file tail) -------------------------------------------
+# requires: vector user can read /var/log/nginx/
+
+[sources.nginx_access]
+type = "file"
+include = ["/var/log/nginx/access.log"]
+read_from = "beginning"
+
+# ============================================================================
+# TRANSFORMS — normalize to fleet schema
+# ============================================================================
+#
+# fleet schema:
+#   timestamp   TIMESTAMP    — when it happened
+#   host        VARCHAR      — originating host
+#   service     VARCHAR      — service/application name
+#   level       VARCHAR      — error/warn/info/debug
+#   message     VARCHAR      — the log line
+#   status      INTEGER      — HTTP status code (nullable)
+#   duration    DOUBLE       — request duration in seconds (nullable)
+#   uri         VARCHAR      — request URI (nullable)
+#   method      VARCHAR      — HTTP method (nullable)
+#   user_name   VARCHAR      — authenticated user (nullable)
+#   src_ip      VARCHAR      — source IP address (nullable)
+
+[transforms.normalize_docker]
+type = "remap"
+inputs = ["docker"]
+source = '''
+.timestamp = .timestamp
+.host = .container_name
+.service = split(to_string(.image) ?? "unknown", ":")[0] ?? "unknown"
+.level = if .stream == "stderr" { "error" } else { "info" }
+.message = .message
+
+del(.container_created_at)
+del(.container_id)
+del(.container_name)
+del(.image)
+del(.label)
+del(.stream)
+del(.source_type)
+'''
+
+[transforms.normalize_journal]
+type = "remap"
+inputs = ["journal"]
+source = '''
+.timestamp = .__REALTIME_TIMESTAMP
+.host = .host
+
+unit = to_string(._SYSTEMD_UNIT) ?? ""
+.service = replace(unit, r'.service$', "")
+
+priority = to_int(.PRIORITY) ?? 6
+if priority <= 3 {
+  .level = "error"
+} else if priority == 4 {
+  .level = "warn"
+} else if priority <= 6 {
+  .level = "info"
+} else {
+  .level = "debug"
+}
+
+.message = .MESSAGE
+
+del(.__REALTIME_TIMESTAMP)
+del(.MESSAGE)
+del(.PRIORITY)
+del(._SYSTEMD_UNIT)
+del(._BOOT_ID)
+del(._MACHINE_ID)
+del(._TRANSPORT)
+del(.SYSLOG_IDENTIFIER)
+del(.source_type)
+'''
+
+[transforms.normalize_syslog]
+type = "remap"
+inputs = ["syslog"]
+source = '''
+.timestamp = .timestamp
+.host = .hostname
+.service = .appname
+
+sev = to_string(.severity) ?? "info"
+if sev == "emerg" || sev == "alert" || sev == "crit" || sev == "err" {
+  .level = "error"
+} else if sev == "warning" {
+  .level = "warn"
+} else if sev == "notice" || sev == "info" {
+  .level = "info"
+} else {
+  .level = "debug"
+}
+
+.message = .message
+
+del(.hostname)
+del(.appname)
+del(.facility)
+del(.severity)
+del(.procid)
+del(.msgid)
+del(.version)
+del(.source_type)
+'''
+
+[transforms.normalize_nginx]
+type = "remap"
+inputs = ["nginx_access"]
+source = '''
+parsed, err = parse_nginx_log(.message, "combined")
+if err != null {
+  .service = "nginx"
+  .level = "warn"
+  .host = get_hostname!()
+} else {
+  .timestamp = parsed.timestamp
+  .src_ip = parsed.client
+  .user_name = if parsed.user != "-" { parsed.user } else { null }
+  .status = to_int!(parsed.status)
+  .uri = parsed.path
+  .method = parsed.method
+  .message = .message
+  .host = get_hostname!()
+  .service = "nginx"
+
+  status = to_int!(parsed.status)
+  if status >= 500 {
+    .level = "error"
+  } else if status >= 400 {
+    .level = "warn"
+  } else {
+    .level = "info"
+  }
+}
+
+del(.file)
+del(.source_type)
+'''
+
+# ============================================================================
+# SINK — single ndjson file tree, partitioned by date and hour
+# ============================================================================
+#
+# fleet queries this with:
+#   fleet --data "/var/lib/fleet/logs/**/*.ndjson" "your query here"
+#
+# the {{ service }} template groups logs by service within each hour
+# partition, which helps DuckDB's read_json_auto push down filters.
+
+[sinks.fleet_ndjson]
+type = "file"
+inputs = [
+  "normalize_docker",
+  "normalize_journal",
+  "normalize_syslog",
+  "normalize_nginx",
+]
+path = "/var/lib/fleet/logs/%Y-%m-%d/%H/{{ service }}.ndjson"
+encoding.codec = "json"
+
+[sinks.fleet_ndjson.buffer]
+type = "disk"
+max_size = 536870912  # 512 MiB — homelab collects from many sources
