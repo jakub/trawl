@@ -11,12 +11,16 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-# internal crates — external deps added here as needed
+# internal crates
 fleet-core = { path = "crates/fleet-core" }
 fleet-engine = { path = "crates/fleet-engine" }
 fleet-auth = { path = "crates/fleet-auth" }
 fleet-server = { path = "crates/fleet-server" }
 fleet-client = { path = "crates/fleet-client" }
+
+# external deps
+chumsky = "0.12"
+insta = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
