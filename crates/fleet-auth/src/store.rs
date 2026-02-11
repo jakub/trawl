@@ -1,0 +1,468 @@
+//! `SQLite`-backed storage for API keys.
+//!
+//! [`KeyStore`] owns a `rusqlite::Connection` and provides the full key
+//! lifecycle: creation, verification, listing, and revocation.
+
+use std::path::Path;
+use std::time::Duration;
+
+use chrono::Utc;
+use rusqlite::params;
+
+use crate::error::AuthError;
+use crate::keys::{ApiKeyInfo, CreatedKey, VerifiedKey};
+use crate::roles::Role;
+use crate::token;
+
+/// Current schema version. Bumped when migrations are needed.
+const SCHEMA_VERSION: i64 = 1;
+
+/// `SQLite`-backed storage for API keys.
+#[derive(Debug)]
+pub struct KeyStore {
+    conn: rusqlite::Connection,
+}
+
+impl KeyStore {
+    /// Open (or create) the auth database at the given path.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, AuthError> {
+        let conn = rusqlite::Connection::open(path)?;
+        let store = Self { conn };
+        store.initialize()?;
+        Ok(store)
+    }
+
+    /// Open an in-memory database (for testing).
+    pub fn open_in_memory() -> Result<Self, AuthError> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        let store = Self { conn };
+        store.initialize()?;
+        Ok(store)
+    }
+
+    /// Run schema migrations.
+    fn initialize(&self) -> Result<(), AuthError> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                prefix      TEXT    NOT NULL UNIQUE,
+                name        TEXT    NOT NULL,
+                hash        TEXT    NOT NULL,
+                role        TEXT    NOT NULL CHECK (role IN ('admin', 'analyst', 'reader')),
+                active      INTEGER NOT NULL DEFAULT 1,
+                created_at  TEXT    NOT NULL,
+                expires_at  TEXT,
+                last_used   TEXT,
+                revoked_at  TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (prefix);",
+        )?;
+
+        // Insert schema version if not already set.
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
+        if count == 0 {
+            self.conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![SCHEMA_VERSION],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Create a new API key.
+    ///
+    /// Returns the key info AND the plaintext token (which must be shown to
+    /// the user immediately and never stored).
+    pub fn create_key(
+        &self,
+        name: &str,
+        role: Role,
+        expires_in: Option<Duration>,
+    ) -> Result<CreatedKey, AuthError> {
+        let generated = token::generate_token();
+        let hash = token::hash_token(&generated.plaintext)?;
+        let now = Utc::now().to_rfc3339();
+        let expires_at = expires_in.map(|d| {
+            let delta = chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX);
+            (Utc::now() + delta).to_rfc3339()
+        });
+
+        self.conn.execute(
+            "INSERT INTO api_keys (prefix, name, hash, role, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![generated.prefix, name, hash, role.as_str(), now, expires_at,],
+        )?;
+
+        let id = self.conn.last_insert_rowid();
+
+        Ok(CreatedKey {
+            info: ApiKeyInfo {
+                id,
+                prefix: generated.prefix,
+                name: name.to_owned(),
+                role,
+                active: true,
+                created_at: now,
+                expires_at,
+                last_used: None,
+                revoked_at: None,
+            },
+            plaintext_token: generated.plaintext,
+        })
+    }
+
+    /// Verify a plaintext token.
+    ///
+    /// Returns the verified identity if valid, or an appropriate error if
+    /// invalid/expired/revoked. Updates `last_used` timestamp on success.
+    pub fn verify_key(&self, plaintext: &str) -> Result<VerifiedKey, AuthError> {
+        let prefix = token::extract_prefix(plaintext).ok_or_else(|| {
+            AuthError::MalformedToken("token must start with flt_ and be at least 12 chars".into())
+        })?;
+
+        // Look up all keys with this prefix (should be exactly 0 or 1 due to UNIQUE).
+        let mut stmt = self.conn.prepare(
+            "SELECT id, prefix, name, hash, role, active, expires_at
+             FROM api_keys WHERE prefix = ?1",
+        )?;
+
+        let row = stmt
+            .query_row(params![prefix], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    AuthError::InvalidKey("no matching key found".into())
+                }
+                other => AuthError::Database(other),
+            })?;
+
+        let (id, db_prefix, name, hash, role_str, active, expires_at) = row;
+
+        // Check active (not revoked).
+        if !active {
+            return Err(AuthError::KeyRevoked { prefix: db_prefix });
+        }
+
+        // Check expiry.
+        if let Some(ref exp) = expires_at {
+            if let Ok(exp_time) = chrono::DateTime::parse_from_rfc3339(exp) {
+                if Utc::now() > exp_time {
+                    return Err(AuthError::KeyExpired { prefix: db_prefix });
+                }
+            }
+        }
+
+        // Verify the token against the stored hash.
+        if !token::verify_token(plaintext, &hash)? {
+            return Err(AuthError::InvalidKey("token does not match".into()));
+        }
+
+        // Update last_used timestamp.
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE api_keys SET last_used = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+
+        let role: Role = role_str
+            .parse()
+            .map_err(|_| AuthError::UnknownRole(role_str))?;
+
+        Ok(VerifiedKey {
+            id,
+            prefix: db_prefix,
+            name,
+            role,
+        })
+    }
+
+    /// List all keys. Never exposes hashes.
+    ///
+    /// If `active_only` is true, only returns non-revoked keys.
+    pub fn list_keys(&self, active_only: bool) -> Result<Vec<ApiKeyInfo>, AuthError> {
+        let sql = if active_only {
+            "SELECT id, prefix, name, role, active, created_at, expires_at, last_used, revoked_at
+             FROM api_keys WHERE active = 1 ORDER BY created_at DESC"
+        } else {
+            "SELECT id, prefix, name, role, active, created_at, expires_at, last_used, revoked_at
+             FROM api_keys ORDER BY created_at DESC"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let keys = stmt
+            .query_map([], |row| {
+                let role_str: String = row.get(3)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    role_str,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        keys.into_iter()
+            .map(
+                |(
+                    id,
+                    prefix,
+                    name,
+                    role_str,
+                    active,
+                    created_at,
+                    expires_at,
+                    last_used,
+                    revoked_at,
+                )| {
+                    let role: Role = role_str
+                        .parse()
+                        .map_err(|_| AuthError::UnknownRole(role_str))?;
+                    Ok(ApiKeyInfo {
+                        id,
+                        prefix,
+                        name,
+                        role,
+                        active,
+                        created_at,
+                        expires_at,
+                        last_used,
+                        revoked_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Revoke a key by its prefix.
+    pub fn revoke_key(&self, prefix: &str) -> Result<ApiKeyInfo, AuthError> {
+        let now = Utc::now().to_rfc3339();
+
+        let updated = self.conn.execute(
+            "UPDATE api_keys SET active = 0, revoked_at = ?1 WHERE prefix = ?2 AND active = 1",
+            params![now, prefix],
+        )?;
+
+        if updated == 0 {
+            // Check if the key exists at all (might already be revoked).
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE prefix = ?1)",
+                params![prefix],
+                |row| row.get(0),
+            )?;
+
+            if exists {
+                return Err(AuthError::KeyRevoked {
+                    prefix: prefix.to_owned(),
+                });
+            }
+            return Err(AuthError::KeyNotFound {
+                prefix: prefix.to_owned(),
+            });
+        }
+
+        // Return the updated key info.
+        let keys = self.list_keys(false)?;
+        keys.into_iter()
+            .find(|k| k.prefix == prefix)
+            .ok_or_else(|| AuthError::KeyNotFound {
+                prefix: prefix.to_owned(),
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_store() -> KeyStore {
+        KeyStore::open_in_memory().expect("failed to open in-memory store")
+    }
+
+    #[test]
+    fn open_in_memory_succeeds() {
+        let _store = test_store();
+    }
+
+    #[test]
+    fn schema_version_is_set() {
+        let store = test_store();
+        let version: i64 = store
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn create_key_returns_valid_token() {
+        let store = test_store();
+        let created = store.create_key("test-key", Role::Analyst, None).unwrap();
+
+        assert!(created.plaintext_token.starts_with("flt_"));
+        assert_eq!(created.info.name, "test-key");
+        assert_eq!(created.info.role, Role::Analyst);
+        assert!(created.info.active);
+        assert!(created.info.expires_at.is_none());
+    }
+
+    #[test]
+    fn create_and_verify_key() {
+        let store = test_store();
+        let created = store.create_key("my-key", Role::Admin, None).unwrap();
+
+        let verified = store.verify_key(&created.plaintext_token).unwrap();
+        assert_eq!(verified.name, "my-key");
+        assert_eq!(verified.role, Role::Admin);
+        assert_eq!(verified.prefix, created.info.prefix);
+    }
+
+    #[test]
+    fn verify_nonexistent_key() {
+        let store = test_store();
+        let result = store.verify_key("flt_AAAAAAAAthisisnotarealkeyatall1234567");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_wrong_token_for_prefix() {
+        let store = test_store();
+        let created = store.create_key("test", Role::Reader, None).unwrap();
+
+        // Tamper with the token body but keep the prefix intact.
+        let prefix = &created.plaintext_token[..12]; // "flt_" + 8 chars
+        let tampered = format!("{prefix}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0");
+        let result = store.verify_key(&tampered);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn revoke_key_blocks_verification() {
+        let store = test_store();
+        let created = store.create_key("revoke-me", Role::Analyst, None).unwrap();
+
+        store.revoke_key(&created.info.prefix).unwrap();
+
+        let result = store.verify_key(&created.plaintext_token);
+        assert!(matches!(result, Err(AuthError::KeyRevoked { .. })));
+    }
+
+    #[test]
+    fn expired_key_fails_verification() {
+        let store = test_store();
+        // Create a key that expired 1 second ago (by using a tiny duration and then
+        // manually backdating the expiry).
+        let created = store.create_key("expired", Role::Reader, None).unwrap();
+
+        // Manually set expires_at to the past.
+        let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        store
+            .conn
+            .execute(
+                "UPDATE api_keys SET expires_at = ?1 WHERE id = ?2",
+                params![past, created.info.id],
+            )
+            .unwrap();
+
+        let result = store.verify_key(&created.plaintext_token);
+        assert!(matches!(result, Err(AuthError::KeyExpired { .. })));
+    }
+
+    #[test]
+    fn verify_updates_last_used() {
+        let store = test_store();
+        let created = store.create_key("track-me", Role::Analyst, None).unwrap();
+
+        // Before verification, last_used should be None.
+        let keys = store.list_keys(false).unwrap();
+        assert!(keys[0].last_used.is_none());
+
+        // After verification, last_used should be set.
+        store.verify_key(&created.plaintext_token).unwrap();
+        let keys = store.list_keys(false).unwrap();
+        assert!(keys[0].last_used.is_some());
+    }
+
+    #[test]
+    fn list_keys_active_only() {
+        let store = test_store();
+        let created = store.create_key("keep", Role::Admin, None).unwrap();
+        let revoked = store.create_key("remove", Role::Reader, None).unwrap();
+        store.revoke_key(&revoked.info.prefix).unwrap();
+
+        let active = store.list_keys(true).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].prefix, created.info.prefix);
+
+        let all = store.list_keys(false).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn revoke_nonexistent_prefix() {
+        let store = test_store();
+        let result = store.revoke_key("ZZZZZZZZ");
+        assert!(matches!(result, Err(AuthError::KeyNotFound { .. })));
+    }
+
+    #[test]
+    fn revoke_already_revoked() {
+        let store = test_store();
+        let created = store
+            .create_key("double-revoke", Role::Analyst, None)
+            .unwrap();
+        store.revoke_key(&created.info.prefix).unwrap();
+
+        let result = store.revoke_key(&created.info.prefix);
+        assert!(matches!(result, Err(AuthError::KeyRevoked { .. })));
+    }
+
+    #[test]
+    fn duplicate_name_allowed() {
+        let store = test_store();
+        let a = store.create_key("same-name", Role::Admin, None).unwrap();
+        let b = store.create_key("same-name", Role::Reader, None).unwrap();
+        assert_ne!(a.info.prefix, b.info.prefix);
+    }
+
+    #[test]
+    fn create_key_with_expiry() {
+        let store = test_store();
+        let created = store
+            .create_key(
+                "expiring",
+                Role::Analyst,
+                Some(Duration::from_secs(86400 * 90)),
+            )
+            .unwrap();
+        assert!(created.info.expires_at.is_some());
+    }
+
+    #[test]
+    fn malformed_token_rejected() {
+        let store = test_store();
+        let result = store.verify_key("not-a-fleet-token");
+        assert!(matches!(result, Err(AuthError::MalformedToken(_))));
+    }
+}
