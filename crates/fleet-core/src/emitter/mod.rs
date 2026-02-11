@@ -86,3 +86,284 @@ pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
 
     Ok(EmittedQuery { sql, params })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser;
+    use insta::assert_snapshot;
+
+    const SRC: &str = "/data/**/*.parquet";
+
+    /// Parse a DSL string and emit SQL; format both for snapshot comparison.
+    fn emit_dsl(input: &str) -> String {
+        let query = parser::parse(input).expect("parse should succeed");
+        let result = emit(&query, SRC).expect("emit should succeed");
+        format_result(&result)
+    }
+
+    /// Parse and emit, expecting an `EmitError`; return its Display string.
+    fn emit_dsl_err(input: &str) -> String {
+        let query = parser::parse(input).expect("parse should succeed");
+        let err = emit(&query, SRC).expect_err("emit should fail");
+        err.to_string()
+    }
+
+    fn format_result(result: &EmittedQuery) -> String {
+        use std::fmt::Write as _;
+        let mut out = result.sql.clone();
+        if !result.params.is_empty() {
+            out.push_str("\n---\nparams:");
+            for (i, p) in result.params.iter().enumerate() {
+                let _ = write!(out, "\n  {i}: {p}");
+            }
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // search only
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_single_field_filter() {
+        assert_snapshot!(emit_dsl("service:nginx"));
+    }
+
+    #[test]
+    fn search_multiple_filters() {
+        assert_snapshot!(emit_dsl("service:nginx level:error"));
+    }
+
+    #[test]
+    fn search_comparison_gt() {
+        assert_snapshot!(emit_dsl("status:>400"));
+    }
+
+    #[test]
+    fn search_comparison_gte() {
+        assert_snapshot!(emit_dsl("status:>=400"));
+    }
+
+    #[test]
+    fn search_comparison_lt() {
+        assert_snapshot!(emit_dsl("status:<300"));
+    }
+
+    #[test]
+    fn search_comparison_ne() {
+        assert_snapshot!(emit_dsl("status:!=200"));
+    }
+
+    #[test]
+    fn search_in_list() {
+        assert_snapshot!(emit_dsl("status:200,301,404"));
+    }
+
+    #[test]
+    fn search_glob() {
+        assert_snapshot!(emit_dsl("path:glob:/api/*"));
+    }
+
+    #[test]
+    fn search_regex() {
+        assert_snapshot!(emit_dsl(r"host:regex:web-\d+"));
+    }
+
+    #[test]
+    fn search_time_filter() {
+        assert_snapshot!(emit_dsl("last:2h"));
+    }
+
+    #[test]
+    fn search_time_filter_days() {
+        assert_snapshot!(emit_dsl("last:7d"));
+    }
+
+    #[test]
+    fn search_bare_text() {
+        assert_snapshot!(emit_dsl("error"));
+    }
+
+    #[test]
+    fn search_negated_text() {
+        assert_snapshot!(emit_dsl("-debug"));
+    }
+
+    #[test]
+    fn search_quoted_phrase() {
+        assert_snapshot!(emit_dsl(r#""connection refused""#));
+    }
+
+    #[test]
+    fn search_wildcard_no_filter() {
+        assert_snapshot!(emit_dsl("*"));
+    }
+
+    #[test]
+    fn search_kitchen_sink() {
+        assert_snapshot!(emit_dsl(
+            r#"service:nginx level:error last:2h "connection refused" -debug"#
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // single pipe stages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_stats_no_group() {
+        assert_snapshot!(emit_dsl("* | stats count()"));
+    }
+
+    #[test]
+    fn pipe_stats_with_group() {
+        assert_snapshot!(emit_dsl("* | stats count() by host"));
+    }
+
+    #[test]
+    fn pipe_stats_with_alias() {
+        assert_snapshot!(emit_dsl("* | stats count() as total by host"));
+    }
+
+    #[test]
+    fn pipe_stats_multiple_aggs() {
+        assert_snapshot!(emit_dsl("* | stats count(), avg(duration) by host"));
+    }
+
+    #[test]
+    fn pipe_stats_avg() {
+        assert_snapshot!(emit_dsl("* | stats avg(duration)"));
+    }
+
+    #[test]
+    fn pipe_where() {
+        assert_snapshot!(emit_dsl("* | where status > 400"));
+    }
+
+    #[test]
+    fn pipe_sort_asc() {
+        assert_snapshot!(emit_dsl("* | sort host"));
+    }
+
+    #[test]
+    fn pipe_sort_desc() {
+        assert_snapshot!(emit_dsl("* | sort -count"));
+    }
+
+    #[test]
+    fn pipe_sort_timestamp() {
+        assert_snapshot!(emit_dsl("* | sort @timestamp"));
+    }
+
+    #[test]
+    fn pipe_limit() {
+        assert_snapshot!(emit_dsl("* | limit 20"));
+    }
+
+    #[test]
+    fn pipe_table() {
+        assert_snapshot!(emit_dsl("* | table host, service, message"));
+    }
+
+    // -----------------------------------------------------------------------
+    // multi-stage pipelines (CTE flushing)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_stats_then_where() {
+        assert_snapshot!(emit_dsl(
+            "service:nginx | stats count() by host | where count > 10"
+        ));
+    }
+
+    #[test]
+    fn multi_stats_then_sort_then_limit() {
+        assert_snapshot!(emit_dsl(
+            "service:nginx | stats count() by host | sort -count | limit 10"
+        ));
+    }
+
+    #[test]
+    fn multi_full_pipeline() {
+        assert_snapshot!(emit_dsl(
+            "service:nginx last:2h | stats count() by host | where count > 10 | sort -count | limit 5"
+        ));
+    }
+
+    #[test]
+    fn multi_double_stats() {
+        assert_snapshot!(emit_dsl(
+            "* | stats count() by host | stats count() as num_hosts"
+        ));
+    }
+
+    #[test]
+    fn multi_stats_then_table() {
+        assert_snapshot!(emit_dsl(
+            "service:nginx | stats avg(duration) by status | table status, avg_duration"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // expressions in where
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expr_compound_and() {
+        assert_snapshot!(emit_dsl("* | where status > 400 and status < 500"));
+    }
+
+    #[test]
+    fn expr_compound_or() {
+        assert_snapshot!(emit_dsl("* | where status == 404 or status == 500"));
+    }
+
+    #[test]
+    fn expr_in_list() {
+        assert_snapshot!(emit_dsl("* | where status in (200, 301, 404)"));
+    }
+
+    #[test]
+    fn expr_negation() {
+        assert_snapshot!(emit_dsl("* | where not status > 400"));
+    }
+
+    #[test]
+    fn expr_arithmetic() {
+        assert_snapshot!(emit_dsl("* | where duration * 2 > 1000"));
+    }
+
+    // -----------------------------------------------------------------------
+    // edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_query() {
+        assert_snapshot!(emit_dsl(""));
+    }
+
+    #[test]
+    fn timestamp_mapping() {
+        assert_snapshot!(emit_dsl("* | sort @timestamp"));
+    }
+
+    #[test]
+    fn field_filter_with_numeric_coercion() {
+        assert_snapshot!(emit_dsl("status:200"));
+    }
+
+    #[test]
+    fn field_filter_with_float_coercion() {
+        assert_snapshot!(emit_dsl("score:3.14"));
+    }
+
+    // -----------------------------------------------------------------------
+    // error cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_unknown_function() {
+        assert_snapshot!(emit_dsl_err("* | stats bogus()"));
+    }
+}

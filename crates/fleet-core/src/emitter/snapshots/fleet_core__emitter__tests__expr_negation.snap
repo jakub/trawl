@@ -1,0 +1,10 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | where not status > 400\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')
+WHERE (NOT ("status" > ?))
+---
+params:
+  0: 400

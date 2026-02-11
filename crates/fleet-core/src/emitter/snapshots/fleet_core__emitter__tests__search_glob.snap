@@ -1,0 +1,10 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"path:glob:/api/*\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')
+WHERE "path" GLOB ?
+---
+params:
+  0: 'glob:/api/*'

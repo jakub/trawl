@@ -1,0 +1,11 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"service:nginx | stats avg(duration) by status | table status, avg_duration\")"
+---
+SELECT "status", "avg_duration"
+FROM read_parquet('/data/**/*.parquet')
+WHERE "service" = ?
+GROUP BY "status"
+---
+params:
+  0: 'nginx'

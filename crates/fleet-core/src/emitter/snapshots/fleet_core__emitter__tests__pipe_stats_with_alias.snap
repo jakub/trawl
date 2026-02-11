@@ -1,0 +1,7 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | stats count() as total by host\")"
+---
+SELECT "host", COUNT(*) AS "total"
+FROM read_parquet('/data/**/*.parquet')
+GROUP BY "host"

@@ -1,0 +1,7 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | limit 20\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')
+LIMIT 20

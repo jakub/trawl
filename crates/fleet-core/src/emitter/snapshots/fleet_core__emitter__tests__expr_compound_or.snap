@@ -1,0 +1,11 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | where status == 404 or status == 500\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')
+WHERE (("status" = ?) OR ("status" = ?))
+---
+params:
+  0: 404
+  1: 500

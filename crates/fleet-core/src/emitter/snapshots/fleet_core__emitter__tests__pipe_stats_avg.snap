@@ -1,0 +1,6 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | stats avg(duration)\")"
+---
+SELECT AVG("duration") AS "avg_duration"
+FROM read_parquet('/data/**/*.parquet')

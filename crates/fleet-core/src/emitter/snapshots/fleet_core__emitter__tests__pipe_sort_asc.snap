@@ -1,0 +1,7 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | sort host\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')
+ORDER BY "host" ASC

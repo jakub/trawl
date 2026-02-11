@@ -1,0 +1,6 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"*\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')

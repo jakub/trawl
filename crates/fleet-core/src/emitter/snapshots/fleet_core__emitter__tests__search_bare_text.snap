@@ -1,0 +1,10 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"error\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')
+WHERE "message" ILIKE ?
+---
+params:
+  0: '%error%'

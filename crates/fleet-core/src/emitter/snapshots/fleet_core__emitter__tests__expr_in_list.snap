@@ -1,0 +1,12 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | where status in (200, 301, 404)\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')
+WHERE ("status" IN (?, ?, ?))
+---
+params:
+  0: 200
+  1: 301
+  2: 404

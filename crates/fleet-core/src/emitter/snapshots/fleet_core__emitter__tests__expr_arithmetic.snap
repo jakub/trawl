@@ -1,0 +1,11 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | where duration * 2 > 1000\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet')
+WHERE (("duration" * ?) > ?)
+---
+params:
+  0: 2
+  1: 1000
