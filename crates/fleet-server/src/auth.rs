@@ -20,23 +20,47 @@ use crate::error::ServerError;
 /// On success, injects [`VerifiedKey`] into request extensions.
 /// Returns 401 on missing/invalid/expired/revoked tokens.
 pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, ServerError> {
+    let path = request.uri().path().to_owned();
+
     let auth_db_path = request
         .extensions()
         .get::<Arc<PathBuf>>()
         .cloned()
         .ok_or_else(|| ServerError::Internal("auth_db_path not in extensions".into()))?;
 
-    let token = extract_bearer_token(request.headers())
-        .ok_or_else(|| ServerError::Unauthorized("missing or invalid Authorization header".into()))?
-        .to_owned();
+    let Some(raw_token) = extract_bearer_token(request.headers()) else {
+        tracing::warn!(path = %path, "auth failed: missing or malformed Authorization header");
+        return Err(ServerError::Unauthorized(
+            "missing or invalid Authorization header".into(),
+        ));
+    };
+    let token = raw_token.to_owned();
 
-    let verified = tokio::task::spawn_blocking(move || {
+    let verified = match tokio::task::spawn_blocking(move || {
         let store = KeyStore::open(&*auth_db_path)?;
         store.verify_key(&token)
     })
     .await
-    .map_err(|e| ServerError::Internal(format!("auth task panicked: {e}")))?
-    .map_err(ServerError::Auth)?;
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(auth_err)) => {
+            tracing::warn!(path = %path, "auth failed: invalid or revoked token");
+            return Err(ServerError::Auth(auth_err));
+        }
+        Err(join_err) => {
+            tracing::error!(path = %path, error = %join_err, "auth task panicked");
+            return Err(ServerError::Internal(format!(
+                "auth task panicked: {join_err}"
+            )));
+        }
+    };
+
+    tracing::info!(
+        key_name = %verified.name,
+        role = %verified.role,
+        path = %path,
+        "authenticated"
+    );
 
     let mut request = request;
     request.extensions_mut().insert(verified);

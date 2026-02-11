@@ -30,11 +30,25 @@ impl ExecutorPool {
 
     /// Execute a DSL query, blocking on semaphore acquisition if at capacity.
     pub async fn execute(&self, dsl: &str) -> Result<QueryResult, ServerError> {
+        let available = self.semaphore.available_permits();
+        if available == 0 {
+            tracing::warn!(
+                max_concurrent = self.semaphore.available_permits() + 1,
+                "executor pool at capacity, query queued"
+            );
+        }
+
+        let wait_start = std::time::Instant::now();
         let _permit = self
             .semaphore
             .acquire()
             .await
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
+
+        let wait_ms = wait_start.elapsed().as_millis();
+        if wait_ms > 0 {
+            tracing::debug!(wait_ms, "semaphore permit acquired");
+        }
 
         let dsl = dsl.to_owned();
         let data_path = Arc::clone(&self.data_path);

@@ -1,11 +1,13 @@
 //! HTTP transport via axum.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::middleware;
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
+use tower_http::trace::TraceLayer;
 
 use crate::auth::auth_middleware;
 use crate::handlers;
@@ -29,6 +31,38 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(authenticated)
         .merge(public)
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                    )
+                })
+                .on_response(
+                    |response: &axum::http::Response<_>,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        tracing::info!(
+                            status = response.status().as_u16(),
+                            latency_ms = latency.as_millis(),
+                            "response"
+                        );
+                    },
+                )
+                .on_failure(
+                    |error: tower_http::classify::ServerErrorsFailureClass,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        tracing::error!(
+                            error = %error,
+                            latency_ms = latency.as_millis(),
+                            "request failed"
+                        );
+                    },
+                ),
+        )
         .layer(axum::Extension(auth_db_path))
         .with_state(state)
 }

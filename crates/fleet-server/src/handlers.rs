@@ -69,11 +69,43 @@ pub async fn query(
         "executing query"
     );
 
-    let result = state.pool.execute(&req.query).await?;
+    let start = std::time::Instant::now();
+    let result = match state.pool.execute(&req.query).await {
+        Ok(r) => r,
+        Err(e) => {
+            let elapsed = start.elapsed().as_millis();
+            match &e {
+                ServerError::Engine(
+                    fleet_engine::error::EngineError::Parse(_)
+                    | fleet_engine::error::EngineError::Emit(_),
+                ) => {
+                    tracing::warn!(
+                        user = %verified.name,
+                        query = %req.query,
+                        duration_ms = elapsed,
+                        error = %e,
+                        "query failed: bad request"
+                    );
+                }
+                _ => {
+                    tracing::error!(
+                        user = %verified.name,
+                        query = %req.query,
+                        duration_ms = elapsed,
+                        error = %e,
+                        "query failed: engine error"
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
 
+    let elapsed = start.elapsed().as_millis();
     tracing::info!(
         user = %verified.name,
         rows = result.row_count(),
+        duration_ms = elapsed,
         "query complete"
     );
 
