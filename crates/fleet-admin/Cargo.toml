@@ -15,6 +15,7 @@ path = "src/main.rs"
 fleet-auth = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
+rcgen = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

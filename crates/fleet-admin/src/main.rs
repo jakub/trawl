@@ -4,6 +4,8 @@ use std::process;
 use clap::{Parser, Subcommand, ValueEnum};
 use fleet_auth::store::KeyStore;
 
+const DEFAULT_TLS_DIR: &str = "~/.fleet/tls";
+
 mod commands;
 
 /// fleet administration tool.
@@ -24,6 +26,24 @@ enum Command {
     Keys {
         #[command(subcommand)]
         action: KeysAction,
+    },
+    /// Manage TLS certificates.
+    Tls {
+        #[command(subcommand)]
+        action: TlsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TlsAction {
+    /// Generate a new self-signed TLS certificate.
+    Generate {
+        /// Output directory for cert.pem and key.pem.
+        #[arg(long, default_value = DEFAULT_TLS_DIR)]
+        output_dir: String,
+        /// Additional Subject Alternative Names (hostnames or IPs).
+        #[arg(long)]
+        san: Vec<String>,
     },
 }
 
@@ -107,6 +127,12 @@ fn main() {
             } => commands::keys::create(&store, &name, role.into(), expires.as_deref()),
             KeysAction::List { all } => commands::keys::list(&store, all),
             KeysAction::Revoke { prefix } => commands::keys::revoke(&store, &prefix),
+        },
+        Command::Tls { action } => match action {
+            TlsAction::Generate { output_dir, san } => {
+                let dir = resolve_db_path(&output_dir);
+                commands::tls::generate(&dir, &san)
+            }
         },
     };
 
