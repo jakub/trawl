@@ -8,13 +8,17 @@ use fleet_engine::value::{QueryResult, Value};
 #[derive(Parser)]
 #[command(name = "fleet", version, about)]
 struct Cli {
-    /// Daemon URL (e.g. `http://localhost:8080`). Enables daemon mode.
+    /// Daemon URL (e.g. `https://localhost:8080`). Enables daemon mode.
     #[arg(long, env = "FLEET_URL")]
     url: Option<String>,
 
     /// API key for daemon authentication (required with --url).
     #[arg(long, env = "FLEET_TOKEN")]
     token: Option<String>,
+
+    /// Accept self-signed TLS certificates (like `curl -k`).
+    #[arg(long, env = "FLEET_INSECURE")]
+    insecure: bool,
 
     /// Parquet glob path for embedded mode (e.g. "/data/**/*.parquet").
     /// Used when --url is not set.
@@ -67,14 +71,18 @@ async fn main() {
     }
 }
 
-/// Connect to the daemon and execute the query over HTTP.
+/// Connect to the daemon and execute the query over HTTPS.
 async fn run_daemon_mode(url: &str, cli: &Cli) -> QueryResult {
     let token = cli.token.as_deref().unwrap_or_else(|| {
         eprintln!("fleet: --token is required when using --url");
         process::exit(1);
     });
 
-    let client = fleet_client::HttpClient::new(url, token);
+    let client = if cli.insecure {
+        fleet_client::HttpClient::new_insecure(url, token)
+    } else {
+        fleet_client::HttpClient::new(url, token)
+    };
     match client.query(&cli.query).await {
         Ok(r) => r,
         Err(e) => {

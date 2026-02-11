@@ -28,6 +28,36 @@ impl HttpClient {
         }
     }
 
+    /// Create a client that accepts self-signed / invalid TLS certificates.
+    ///
+    /// Use this for development or when connecting to a daemon with an
+    /// auto-generated self-signed cert.
+    pub fn new_insecure(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            token: token.into(),
+            client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(120))
+                .danger_accept_invalid_certs(true)
+                .build()
+                .expect("failed to build HTTP client"),
+        }
+    }
+
+    /// Create a client with a pre-configured `reqwest::Client`.
+    pub fn with_client(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        client: Client,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            token: token.into(),
+            client,
+        }
+    }
+
     /// Execute a DSL query against the daemon.
     pub async fn query(&self, dsl: &str) -> Result<QueryResult, ClientError> {
         let url = format!("{}/api/v1/query", self.base_url);
