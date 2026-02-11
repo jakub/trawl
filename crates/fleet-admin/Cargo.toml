@@ -12,8 +12,9 @@ name = "fleet-admin"
 path = "src/main.rs"
 
 [dependencies]
-fleet-client = { workspace = true }
-fleet-core = { workspace = true }
+fleet-auth = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
 
 [lints]
 workspace = true

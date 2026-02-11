@@ -23,7 +23,7 @@ argon2 = { version = "0.5", features = ["std"] }
 base64ct = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chumsky = "0.12"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 duckdb = { version = "1.4", features = ["bundled"] }
 insta = "1"

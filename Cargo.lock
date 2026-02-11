@@ -774,8 +774,9 @@ dependencies = [
 name = "fleet-admin"
 version = "0.1.0"
 dependencies = [
- "fleet-client",
- "fleet-core",
+ "clap",
+ "comfy-table",
+ "fleet-auth",
 ]
 
 [[package]]
