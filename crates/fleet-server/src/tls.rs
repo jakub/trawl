@@ -6,10 +6,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use rustls::ServerConfig;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::TlsAcceptor;
 
 const DEFAULT_TLS_DIR: &str = ".fleet/tls";
 const CERT_FILENAME: &str = "cert.pem";
@@ -163,6 +165,50 @@ fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
     );
 
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
+}
+
+/// Background task that polls cert/key files for changes and sends a new
+/// [`TlsAcceptor`] through the watch channel when they change.
+///
+/// Runs until the watch receiver is dropped (i.e. the server shuts down).
+pub async fn cert_reload_task(
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    interval: Duration,
+    tx: tokio::sync::watch::Sender<TlsAcceptor>,
+) {
+    let mut last_modified = file_mtime(&cert_path);
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let current_modified = file_mtime(&cert_path);
+        if current_modified == last_modified {
+            continue;
+        }
+
+        tracing::info!("TLS certificate file changed, reloading");
+
+        match build_server_config(Some(&cert_path), Some(&key_path)) {
+            Ok((config, _)) => {
+                let acceptor = TlsAcceptor::from(config);
+                if tx.send(acceptor).is_err() {
+                    // Receiver dropped — server is shutting down.
+                    break;
+                }
+                last_modified = current_modified;
+                tracing::info!("TLS certificate reloaded successfully");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to reload TLS certificate, keeping current");
+            }
+        }
+    }
+}
+
+/// Get a file's modification time, or `None` if the file doesn't exist.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 #[cfg(test)]

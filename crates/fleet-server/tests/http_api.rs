@@ -109,6 +109,7 @@ async fn setup() -> TestServer {
             log_file: None,
             tls_cert_path: Some(cert_path),
             tls_key_path: Some(key_path),
+            tls_reload_interval_secs: 0,
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig { db_path: auth_db },

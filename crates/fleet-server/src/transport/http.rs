@@ -140,6 +140,25 @@ pub async fn serve(
 
     tracing::info!(addr = %addr, "HTTPS server listening");
 
+    // Watch channel for cert hot-reload. The accept loop reads the latest
+    // acceptor from the receiver before each TLS handshake.
+    let (tls_tx, tls_rx) = tokio::sync::watch::channel(tls_acceptor);
+
+    // Spawn cert file watcher if reload is enabled and cert paths are configured.
+    let reload_interval = config.tls_reload_interval_secs;
+    if reload_interval > 0 {
+        if let (Some(cert), Some(key)) = (&config.tls_cert_path, &config.tls_key_path) {
+            let cert = cert.clone();
+            let key = key.clone();
+            tokio::spawn(tls::cert_reload_task(
+                cert,
+                key,
+                Duration::from_secs(reload_interval),
+                tls_tx,
+            ));
+        }
+    }
+
     // Shutdown coordination: Notify fires on SIGINT/SIGTERM.
     let notify = Arc::new(tokio::sync::Notify::new());
     let n_signal = Arc::clone(&notify);
@@ -161,7 +180,7 @@ pub async fn serve(
                     crate::error::ServerError::Internal(format!("accept error: {e}"))
                 })?;
 
-                let tls_acceptor = tls_acceptor.clone();
+                let tls_acceptor = tls_rx.borrow().clone();
                 let tower_service = app.clone();
 
                 connections.spawn(async move {

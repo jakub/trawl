@@ -51,6 +51,11 @@ pub struct ServerConfig {
 
     /// Path to TLS private key (PEM). If omitted, a self-signed key is auto-generated.
     pub tls_key_path: Option<PathBuf>,
+
+    /// How often to check cert files for changes, in seconds (default: 300).
+    /// Set to 0 to disable automatic cert reload.
+    #[serde(default = "default_tls_reload_interval_secs")]
+    pub tls_reload_interval_secs: u64,
 }
 
 /// Parquet data source settings.
@@ -93,6 +98,10 @@ fn default_max_concurrent_requests() -> usize {
 
 fn default_shutdown_drain_secs() -> u64 {
     30
+}
+
+fn default_tls_reload_interval_secs() -> u64 {
+    300 // 5 minutes
 }
 
 /// Portable CPU count without pulling in the `num_cpus` crate.
