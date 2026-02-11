@@ -29,6 +29,20 @@ pub enum ServerError {
     Internal(String),
 }
 
+impl ServerError {
+    /// Return a sanitized error message safe for logs and tracker history.
+    ///
+    /// Database internals and internal error details are redacted to prevent
+    /// information disclosure. Parse/emit errors (client mistakes) are preserved.
+    pub fn safe_message(&self) -> String {
+        match self {
+            Self::Engine(EngineError::Database(_)) => "query execution failed".to_owned(),
+            Self::Internal(_) => "internal error".to_owned(),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
@@ -82,5 +96,29 @@ mod tests {
         let err = ServerError::Internal("something broke".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn safe_message_redacts_database_errors() {
+        let err = ServerError::Engine(EngineError::Database(duckdb::Error::InvalidColumnName(
+            "secret_column".into(),
+        )));
+        assert_eq!(err.safe_message(), "query execution failed");
+    }
+
+    #[test]
+    fn safe_message_preserves_parse_errors() {
+        let err = ServerError::Engine(EngineError::Parse(vec![fleet_core::parser::ParseError {
+            message: "bad syntax".into(),
+            span: 0..3,
+            label: None,
+        }]));
+        assert!(err.safe_message().contains("bad syntax"));
+    }
+
+    #[test]
+    fn safe_message_redacts_internal_errors() {
+        let err = ServerError::Internal("db connection string leaked".into());
+        assert_eq!(err.safe_message(), "internal error");
     }
 }

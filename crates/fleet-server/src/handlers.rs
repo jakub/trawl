@@ -91,6 +91,10 @@ pub async fn query(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::Query) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
     tracing::info!(
         user = %verified.name,
         role = %verified.role,
@@ -116,7 +120,10 @@ pub async fn query(
             Ok(Json(qr.into()))
         }
         Ok(Err(e)) => {
-            state.tracker.fail(query_id, &e.to_string());
+            // SECURITY: use safe_message() to redact database internals
+            // from tracker history and logs.
+            let safe_msg = e.safe_message();
+            state.tracker.fail(query_id, &safe_msg);
             match &e {
                 ServerError::Engine(
                     fleet_engine::error::EngineError::Parse(_)
@@ -126,7 +133,7 @@ pub async fn query(
                         user = %verified.name,
                         query = %req.query,
                         query_id,
-                        error = %e,
+                        error = %safe_msg,
                         "query failed: bad request"
                     );
                 }
@@ -135,7 +142,7 @@ pub async fn query(
                         user = %verified.name,
                         query = %req.query,
                         query_id,
-                        error = %e,
+                        error = %safe_msg,
                         "query failed: engine error"
                     );
                 }
