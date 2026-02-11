@@ -19,14 +19,16 @@ use crate::error::ServerError;
 pub struct ExecutorPool {
     data_path: Arc<str>,
     semaphore: Arc<Semaphore>,
+    max_result_rows: usize,
 }
 
 impl ExecutorPool {
     /// Create a pool with the given concurrency limit and parquet data path.
-    pub fn new(data_path: String, max_concurrent: usize) -> Self {
+    pub fn new(data_path: String, max_concurrent: usize, max_result_rows: usize) -> Self {
         Self {
             data_path: Arc::from(data_path),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_result_rows,
         }
     }
 
@@ -58,6 +60,7 @@ impl ExecutorPool {
 
         let dsl = dsl.to_owned();
         let data_path = Arc::clone(&self.data_path);
+        let max_result_rows = self.max_result_rows;
 
         // Channel for the blocking task to send back its interrupt handle
         // before starting the actual query.
@@ -69,7 +72,7 @@ impl ExecutorPool {
             // Send interrupt handle to async side before running the query.
             let _ = interrupt_tx.send(executor.interrupt_handle());
             executor
-                .run_query(&dsl, &data_path)
+                .run_query(&dsl, &data_path, max_result_rows)
                 .map_err(ServerError::from)
         });
 
@@ -112,7 +115,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_rejects_invalid_dsl() {
-        let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 2);
+        let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 2, 100_000);
         let result = pool
             .execute("totally broken {{{ query", Duration::from_secs(10))
             .await;
@@ -121,7 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_respects_concurrency_limit() {
-        let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 1);
+        let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 1, 100_000);
         // just verifying it doesn't panic with a single permit
         let _ = pool.execute("service:test", Duration::from_secs(10)).await;
     }

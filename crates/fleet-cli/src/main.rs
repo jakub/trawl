@@ -94,7 +94,8 @@ fn run_embedded_mode(data: &str, query: &str) -> QueryResult {
         }
     };
 
-    match executor.run_query(query, data) {
+    // CLI has no server-side row limit — use usize::MAX.
+    match executor.run_query(query, data, usize::MAX) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("fleet: {e}");

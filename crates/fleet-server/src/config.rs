@@ -27,6 +27,10 @@ pub struct ServerConfig {
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
 
+    /// Maximum number of rows a query can return before being rejected.
+    #[serde(default = "default_max_result_rows")]
+    pub max_result_rows: usize,
+
     /// Optional log file path. When set, logs are written to both stdout and this file.
     pub log_file: Option<PathBuf>,
 }
@@ -55,6 +59,10 @@ fn default_timeout_secs() -> u64 {
 
 fn default_max_concurrent_queries() -> usize {
     num_cpus()
+}
+
+fn default_max_result_rows() -> usize {
+    100_000
 }
 
 /// Portable CPU count without pulling in the `num_cpus` crate.

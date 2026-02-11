@@ -16,6 +16,10 @@ pub enum EngineError {
     /// `DuckDB` returned an error during execution.
     #[error("database error: {0}")]
     Database(#[from] duckdb::Error),
+
+    /// Query produced more rows than the configured limit.
+    #[error("result too large: query returned more than {0} rows")]
+    ResultTooLarge(usize),
 }
 
 fn format_parse_errors(errors: &[ParseError]) -> String {

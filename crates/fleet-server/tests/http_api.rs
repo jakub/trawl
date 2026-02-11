@@ -84,6 +84,7 @@ async fn setup() -> TestServer {
             http_addr: addr.clone(),
             timeout_secs: 10,
             max_concurrent_queries: 2,
+            max_result_rows: 100_000,
             log_file: None,
         },
         data: DataConfig { path: data_glob },

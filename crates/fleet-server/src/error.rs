@@ -46,10 +46,10 @@ impl ServerError {
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            // Parse errors are client mistakes.
-            Self::Engine(EngineError::Parse(_) | EngineError::Emit(_)) => {
-                (StatusCode::BAD_REQUEST, self.to_string())
-            }
+            // Parse/emit errors and result-too-large are client mistakes.
+            Self::Engine(
+                EngineError::Parse(_) | EngineError::Emit(_) | EngineError::ResultTooLarge(_),
+            ) => (StatusCode::BAD_REQUEST, self.to_string()),
             // Database errors are server-side — don't leak details.
             Self::Engine(EngineError::Database(_)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

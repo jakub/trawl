@@ -47,6 +47,7 @@ impl AppState {
             pool: ExecutorPool::new(
                 config.data.path.clone(),
                 config.server.max_concurrent_queries,
+                config.server.max_result_rows,
             ),
             auth_db_path: Arc::new(config.auth.db_path.clone()),
             start_time: Instant::now(),

@@ -32,7 +32,14 @@ impl Executor {
     }
 
     /// Execute a pre-emitted query (SQL + params) against `DuckDB`.
-    pub fn execute_emitted(&self, query: &EmittedQuery) -> Result<QueryResult, EngineError> {
+    ///
+    /// `max_rows` caps the number of result rows to prevent unbounded memory
+    /// allocation. Returns [`EngineError::ResultTooLarge`] if exceeded.
+    pub fn execute_emitted(
+        &self,
+        query: &EmittedQuery,
+        max_rows: usize,
+    ) -> Result<QueryResult, EngineError> {
         let mut stmt = self.conn.prepare(&query.sql)?;
 
         let params = bind_params(&query.params);
@@ -52,6 +59,9 @@ impl Executor {
 
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
+            if rows.len() >= max_rows {
+                return Err(EngineError::ResultTooLarge(max_rows));
+            }
             let mut cells = Vec::with_capacity(col_count);
             for i in 0..col_count {
                 cells.push(extract_value(row, i));
@@ -66,10 +76,15 @@ impl Executor {
     ///
     /// `source` is the parquet glob path passed to `read_parquet()`,
     /// e.g. `"/data/**/*.parquet"`.
-    pub fn run_query(&self, dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
+    pub fn run_query(
+        &self,
+        dsl: &str,
+        source: &str,
+        max_rows: usize,
+    ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit(&ast, source)?;
-        self.execute_emitted(&emitted)
+        self.execute_emitted(&emitted, max_rows)
     }
 
     /// Introspect the schema of the data source without reading row data.
