@@ -30,11 +30,15 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}..{}] {}",
+            self.span.start, self.span.end, self.message
+        )?;
         if let Some(label) = &self.label {
-            write!(f, "{} ({})", self.message, label)
-        } else {
-            write!(f, "{}", self.message)
+            write!(f, " (while parsing {label})")?;
         }
+        Ok(())
     }
 }
 
@@ -51,15 +55,50 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
         Ok(query) => Ok(query),
         Err(errors) => Err(errors
             .into_iter()
-            .map(|e| {
-                let span = e.span();
-                ParseError {
-                    message: e.to_string(),
-                    span: span.start..span.end,
-                    label: e.contexts().next().map(|(l, _)| l.to_string()),
-                }
-            })
+            .map(|e| rich_to_parse_error(&e, input))
             .collect()),
+    }
+}
+
+/// Convert a chumsky `Rich` error into our `ParseError` with a human-friendly message.
+fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
+    let span = e.span();
+    let offset = span.start;
+
+    // build a useful message from expected/found
+    let found = if offset >= input.len() {
+        "end of input".to_string()
+    } else {
+        let ch = &input[offset..];
+        let end = ch.char_indices().nth(1).map_or(ch.len(), |(idx, _)| idx);
+        format!("'{}'", &ch[..end])
+    };
+
+    let expected: Vec<String> = e
+        .expected()
+        .map(|exp| match exp {
+            chumsky::error::RichPattern::Token(c) => format!("'{}'", &**c),
+            chumsky::error::RichPattern::Label(l) => l.to_string(),
+            chumsky::error::RichPattern::Identifier(id) => format!("`{id}`"),
+            chumsky::error::RichPattern::Any => "any token".to_string(),
+            chumsky::error::RichPattern::SomethingElse => "something else".to_string(),
+            chumsky::error::RichPattern::EndOfInput => "end of input".to_string(),
+            _ => "unknown".to_string(),
+        })
+        .collect();
+
+    let message = if expected.is_empty() {
+        format!("unexpected {found}")
+    } else {
+        format!("found {found}, expected {}", expected.join(" or "))
+    };
+
+    let label = e.contexts().next().map(|(l, _)| l.to_string());
+
+    ParseError {
+        message,
+        span: span.start..span.end,
+        label,
     }
 }
 
@@ -181,5 +220,54 @@ mod tests {
         let query = parse("").unwrap();
         assert_eq!(query.search.tokens.len(), 0);
         assert_eq!(query.pipeline.len(), 0);
+    }
+
+    // --- error case tests ---
+
+    #[test]
+    fn test_error_invalid_pipe_stage() {
+        let result = parse("service:nginx | bogus");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn test_error_missing_stats_agg() {
+        let result = parse("service:nginx | stats");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_unclosed_paren() {
+        let result = parse("service:nginx | where (count > 10");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_unclosed_quote() {
+        let result = parse(r#""unterminated string"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_message_has_span() {
+        let result = parse("| badstage");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        // errors should have valid span information
+        for error in &errors {
+            assert!(error.span.start <= error.span.end);
+        }
+    }
+
+    #[test]
+    fn test_error_display() {
+        let result = parse("| badstage");
+        let errors = result.unwrap_err();
+        let msg = errors[0].to_string();
+        // should contain span info and the error description
+        assert!(msg.contains('['));
+        assert!(msg.contains(']'));
     }
 }
