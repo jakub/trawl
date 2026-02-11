@@ -64,10 +64,18 @@ async fn main() {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    match format {
+    let write_result = match format {
         OutputFormat::Table => render_table(&result, &mut out),
         OutputFormat::Json => render_json(&result, &mut out),
         OutputFormat::Csv => render_csv(&result, &mut out),
+    };
+
+    if let Err(e) = write_result {
+        // Broken pipe is expected (e.g. `fleet query ... | head`), exit quietly.
+        if e.kind() != io::ErrorKind::BrokenPipe {
+            eprintln!("fleet: write error: {e}");
+        }
+        process::exit(1);
     }
 }
 
@@ -114,10 +122,10 @@ fn run_embedded_mode(data: &str, query: &str) -> QueryResult {
 
 // -- output formatters -------------------------------------------------------
 
-fn render_table(result: &QueryResult, out: &mut impl Write) {
+fn render_table(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     if result.is_empty() {
-        let _ = writeln!(out, "no results");
-        return;
+        writeln!(out, "no results")?;
+        return Ok(());
     }
 
     let mut table = comfy_table::Table::new();
@@ -134,29 +142,32 @@ fn render_table(result: &QueryResult, out: &mut impl Write) {
         table.add_row(cells);
     }
 
-    let _ = writeln!(out, "{table}");
-    let _ = writeln!(out, "{} row(s)", result.row_count());
+    writeln!(out, "{table}")?;
+    writeln!(out, "{} row(s)", result.row_count())?;
+    Ok(())
 }
 
-fn render_json(result: &QueryResult, out: &mut impl Write) {
+fn render_json(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
             map.insert(col.name.clone(), value_to_json(val));
         }
-        let _ = serde_json::to_writer(&mut *out, &map);
-        let _ = writeln!(out);
+        serde_json::to_writer(&mut *out, &map).map_err(io::Error::other)?;
+        writeln!(out)?;
     }
+    Ok(())
 }
 
-fn render_csv(result: &QueryResult, out: &mut impl Write) {
-    let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
-    let _ = writeln!(out, "{}", headers.join(","));
+fn render_csv(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
+    let headers: Vec<String> = result.columns.iter().map(|c| csv_escape(&c.name)).collect();
+    writeln!(out, "{}", headers.join(","))?;
 
     for row in &result.rows {
         let cells: Vec<String> = row.iter().map(|v| csv_escape(&v.to_string())).collect();
-        let _ = writeln!(out, "{}", cells.join(","));
+        writeln!(out, "{}", cells.join(","))?;
     }
+    Ok(())
 }
 
 fn value_to_json(val: &Value) -> serde_json::Value {
@@ -170,9 +181,17 @@ fn value_to_json(val: &Value) -> serde_json::Value {
 }
 
 fn csv_escape(s: &str) -> String {
+    // Prevent CSV injection: prefix formula-triggering characters with a
+    // single quote so spreadsheet apps don't interpret cells as formulas.
+    let s = if s.starts_with(['=', '+', '-', '@']) {
+        format!("'{s}")
+    } else {
+        s.to_owned()
+    };
+
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        s.to_owned()
+        s
     }
 }
