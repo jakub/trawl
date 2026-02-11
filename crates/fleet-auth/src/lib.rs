@@ -12,6 +12,9 @@ pub mod keys;
 /// Role definitions and permission checking.
 pub mod roles;
 
+/// Token generation, hashing, and verification.
+pub mod token;
+
 pub use error::AuthError;
 pub use keys::{ApiKeyInfo, CreatedKey, VerifiedKey};
 pub use roles::{Permission, Role};
