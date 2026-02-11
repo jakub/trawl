@@ -80,55 +80,76 @@ impl KeyStore {
     /// Create a new API key.
     ///
     /// Returns the key info AND the plaintext token (which must be shown to
-    /// the user immediately and never stored).
+    /// the user immediately and never stored). Retries on prefix collision
+    /// (UNIQUE constraint violation).
     pub fn create_key(
         &self,
         name: &str,
         role: Role,
         expires_in: Option<Duration>,
     ) -> Result<CreatedKey, AuthError> {
-        let generated = token::generate_token();
-        let hash = token::hash_token(&generated.plaintext)?;
+        /// Maximum retry attempts for prefix collision (48-bit prefix space
+        /// means collisions are astronomically unlikely, but handle gracefully).
+        const MAX_RETRIES: usize = 3;
+
         let now = Utc::now().to_rfc3339();
         let expires_at = expires_in.map(|d| {
             let delta = chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX);
             (Utc::now() + delta).to_rfc3339()
         });
 
-        self.conn.execute(
-            "INSERT INTO api_keys (prefix, name, hash, role, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![generated.prefix, name, hash, role.as_str(), now, expires_at,],
-        )?;
+        for _ in 0..MAX_RETRIES {
+            let generated = token::generate_token();
+            let hash = token::hash_token(&generated.plaintext)?;
 
-        let id = self.conn.last_insert_rowid();
+            match self.conn.execute(
+                "INSERT INTO api_keys (prefix, name, hash, role, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![generated.prefix, name, hash, role.as_str(), now, expires_at,],
+            ) {
+                Ok(_) => {
+                    let id = self.conn.last_insert_rowid();
+                    return Ok(CreatedKey {
+                        info: ApiKeyInfo {
+                            id,
+                            prefix: generated.prefix,
+                            name: name.to_owned(),
+                            role,
+                            active: true,
+                            created_at: now,
+                            expires_at,
+                            last_used: None,
+                            revoked_at: None,
+                        },
+                        plaintext_token: generated.plaintext,
+                    });
+                }
+                // Prefix collision — retry with a new token.
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
 
-        Ok(CreatedKey {
-            info: ApiKeyInfo {
-                id,
-                prefix: generated.prefix,
-                name: name.to_owned(),
-                role,
-                active: true,
-                created_at: now,
-                expires_at,
-                last_used: None,
-                revoked_at: None,
-            },
-            plaintext_token: generated.plaintext,
-        })
+        Err(AuthError::Hash(
+            "failed to generate unique token prefix after retries".into(),
+        ))
     }
 
     /// Verify a plaintext token.
     ///
-    /// Returns the verified identity if valid, or an appropriate error if
-    /// invalid/expired/revoked. Updates `last_used` timestamp on success.
+    /// Returns the verified identity if valid, or [`AuthError::InvalidKey`] if
+    /// the token is invalid for any reason. Deliberately returns a single opaque
+    /// error to prevent enumeration oracles — callers cannot distinguish between
+    /// "not found", "revoked", "expired", or "wrong token".
+    ///
+    /// Updates `last_used` timestamp on success.
     pub fn verify_key(&self, plaintext: &str) -> Result<VerifiedKey, AuthError> {
         let prefix = token::extract_prefix(plaintext).ok_or_else(|| {
             AuthError::MalformedToken("token must start with flt_ and be at least 12 chars".into())
         })?;
 
-        // Look up all keys with this prefix (should be exactly 0 or 1 due to UNIQUE).
+        // Look up the key by prefix (exactly 0 or 1 due to UNIQUE constraint).
         let mut stmt = self.conn.prepare(
             "SELECT id, prefix, name, hash, role, active, expires_at
              FROM api_keys WHERE prefix = ?1",
@@ -148,30 +169,27 @@ impl KeyStore {
             })
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
-                    AuthError::InvalidKey("no matching key found".into())
+                    AuthError::InvalidKey("authentication failed".into())
                 }
                 other => AuthError::Database(other),
             })?;
 
         let (id, db_prefix, name, hash, role_str, active, expires_at) = row;
 
-        // Check active (not revoked).
-        if !active {
-            return Err(AuthError::KeyRevoked { prefix: db_prefix });
-        }
+        // SECURITY: always verify the hash FIRST (constant-time via argon2),
+        // then check state. Return the same opaque error regardless of which
+        // check fails — prevents enumeration oracles.
+        let hash_valid = token::verify_token(plaintext, &hash)?;
 
-        // Check expiry.
-        if let Some(ref exp) = expires_at {
-            if let Ok(exp_time) = chrono::DateTime::parse_from_rfc3339(exp) {
-                if Utc::now() > exp_time {
-                    return Err(AuthError::KeyExpired { prefix: db_prefix });
-                }
-            }
-        }
+        let is_revoked = !active;
 
-        // Verify the token against the stored hash.
-        if !token::verify_token(plaintext, &hash)? {
-            return Err(AuthError::InvalidKey("token does not match".into()));
+        let is_expired = expires_at
+            .as_ref()
+            .and_then(|exp| chrono::DateTime::parse_from_rfc3339(exp).ok())
+            .is_some_and(|exp_time| Utc::now() > exp_time);
+
+        if !hash_valid || is_revoked || is_expired {
+            return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
         // Update last_used timestamp.
@@ -364,15 +382,14 @@ mod tests {
 
         store.revoke_key(&created.info.prefix).unwrap();
 
+        // Returns opaque InvalidKey — does NOT reveal that the key was revoked.
         let result = store.verify_key(&created.plaintext_token);
-        assert!(matches!(result, Err(AuthError::KeyRevoked { .. })));
+        assert!(matches!(result, Err(AuthError::InvalidKey(_))));
     }
 
     #[test]
     fn expired_key_fails_verification() {
         let store = test_store();
-        // Create a key that expired 1 second ago (by using a tiny duration and then
-        // manually backdating the expiry).
         let created = store.create_key("expired", Role::Reader, None).unwrap();
 
         // Manually set expires_at to the past.
@@ -385,8 +402,9 @@ mod tests {
             )
             .unwrap();
 
+        // Returns opaque InvalidKey — does NOT reveal that the key expired.
         let result = store.verify_key(&created.plaintext_token);
-        assert!(matches!(result, Err(AuthError::KeyExpired { .. })));
+        assert!(matches!(result, Err(AuthError::InvalidKey(_))));
     }
 
     #[test]
