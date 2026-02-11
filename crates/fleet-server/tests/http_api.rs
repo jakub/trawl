@@ -89,6 +89,8 @@ async fn setup() -> TestServer {
             max_concurrent_requests: 256,
             shutdown_drain_secs: 5,
             log_file: None,
+            tls_cert_path: None,
+            tls_key_path: None,
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig { db_path: auth_db },

@@ -12,10 +12,10 @@ pub struct Config {
     pub auth: AuthConfig,
 }
 
-/// HTTP listener settings.
+/// HTTPS listener settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    /// Address to bind the HTTP listener (e.g. "127.0.0.1:8080").
+    /// Address to bind the HTTPS listener (e.g. "127.0.0.1:8080").
     #[serde(default = "default_http_addr")]
     pub http_addr: String,
 
@@ -45,6 +45,12 @@ pub struct ServerConfig {
 
     /// Optional log file path. When set, logs are written to both stdout and this file.
     pub log_file: Option<PathBuf>,
+
+    /// Path to TLS certificate (PEM). If omitted, a self-signed cert is auto-generated.
+    pub tls_cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key (PEM). If omitted, a self-signed key is auto-generated.
+    pub tls_key_path: Option<PathBuf>,
 }
 
 /// Parquet data source settings.
@@ -131,6 +137,12 @@ impl Config {
         if let Some(log_file) = &self.server.log_file {
             self.server.log_file = Some(PathBuf::from(expand_tilde(&log_file.to_string_lossy())));
         }
+        if let Some(cert) = &self.server.tls_cert_path {
+            self.server.tls_cert_path = Some(PathBuf::from(expand_tilde(&cert.to_string_lossy())));
+        }
+        if let Some(key) = &self.server.tls_key_path {
+            self.server.tls_key_path = Some(PathBuf::from(expand_tilde(&key.to_string_lossy())));
+        }
     }
 
     /// Return warnings about potentially dangerous configuration.
@@ -138,11 +150,11 @@ impl Config {
     /// Called after tracing is initialized so these can be logged.
     pub fn warnings(&self) -> Vec<String> {
         let mut warns = Vec::new();
-        if self.server.http_addr.starts_with("0.0.0.0") {
-            warns.push(format!(
-                "binding to all interfaces ({}) — ensure a TLS-terminating reverse proxy is in front",
-                self.server.http_addr
-            ));
+        if self.server.tls_cert_path.is_none() {
+            warns.push(
+                "no TLS certificate configured — using auto-generated self-signed certificate"
+                    .into(),
+            );
         }
         warns
     }
@@ -162,6 +174,12 @@ impl Config {
         if self.server.max_concurrent_queries == 0 {
             return Err(ConfigError::Validation(
                 "server.max_concurrent_queries must be > 0".into(),
+            ));
+        }
+
+        if self.server.tls_cert_path.is_some() != self.server.tls_key_path.is_some() {
+            return Err(ConfigError::Validation(
+                "tls_cert_path and tls_key_path must both be set or both omitted".into(),
             ));
         }
 
@@ -209,6 +227,8 @@ db_path = "/var/lib/fleet/auth.db"
         assert!(config.server.max_concurrent_queries > 0);
         assert_eq!(config.data.path, "/var/lib/fleet/data/**/*.parquet");
         assert!(config.server.log_file.is_none());
+        assert!(config.server.tls_cert_path.is_none());
+        assert!(config.server.tls_key_path.is_none());
     }
 
     #[test]
@@ -277,5 +297,72 @@ db_path = "/tmp/auth.db"
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("max_concurrent_queries"));
+    }
+
+    #[test]
+    fn parse_tls_config() {
+        let toml = r#"
+[server]
+tls_cert_path = "/etc/fleet/cert.pem"
+tls_key_path = "/etc/fleet/key.pem"
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.server.tls_cert_path.as_deref(),
+            Some(std::path::Path::new("/etc/fleet/cert.pem"))
+        );
+        assert_eq!(
+            config.server.tls_key_path.as_deref(),
+            Some(std::path::Path::new("/etc/fleet/key.pem"))
+        );
+    }
+
+    #[test]
+    fn validation_rejects_partial_tls_config() {
+        let toml = r#"
+[server]
+tls_cert_path = "/etc/fleet/cert.pem"
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("tls_cert_path"));
+    }
+
+    #[test]
+    fn warning_when_no_tls_cert_configured() {
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let warns = config.warnings();
+        assert!(warns.iter().any(|w| w.contains("self-signed")));
+    }
+
+    #[test]
+    fn no_warning_when_tls_cert_configured() {
+        let toml = r#"
+[server]
+tls_cert_path = "/etc/fleet/cert.pem"
+tls_key_path = "/etc/fleet/key.pem"
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let warns = config.warnings();
+        assert!(warns.is_empty());
     }
 }
