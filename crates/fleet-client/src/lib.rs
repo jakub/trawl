@@ -4,5 +4,8 @@
 //! management, authentication, query submission, and result streaming
 //! across all supported transports.
 
-/// Client connection management and transport selection.
 pub mod connection;
+pub mod error;
+
+pub use connection::HttpClient;
+pub use error::ClientError;
