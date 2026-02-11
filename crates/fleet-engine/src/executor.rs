@@ -9,7 +9,7 @@ use fleet_core::emitter::{self, EmittedQuery, SqlValue};
 use fleet_core::parser;
 
 use crate::error::EngineError;
-use crate::value::{Column, QueryResult, Value};
+use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value};
 
 /// Query executor backed by an in-memory `DuckDB` connection.
 #[derive(Debug)]
@@ -63,6 +63,33 @@ impl Executor {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit(&ast, source)?;
         self.execute_emitted(&emitted)
+    }
+
+    /// Introspect the schema of the data source without reading row data.
+    ///
+    /// Runs `DESCRIBE SELECT * FROM read_parquet(source)` to get column
+    /// names and types, plus a glob count for file volume.
+    pub fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError> {
+        // Get column names and types from the parquet schema.
+        let describe_sql = format!("DESCRIBE SELECT * FROM read_parquet('{source}')");
+        let mut stmt = self.conn.prepare(&describe_sql)?;
+        let mut rows = stmt.query([])?;
+
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let data_type: String = row.get(1)?;
+            columns.push(SchemaColumn { name, data_type });
+        }
+
+        // Count matching files.
+        let glob_sql = format!("SELECT count(*)::BIGINT FROM glob('{source}')");
+        let file_count: i64 = self.conn.query_row(&glob_sql, [], |row| row.get(0))?;
+
+        Ok(SchemaResult {
+            columns,
+            file_count: u64::try_from(file_count).unwrap_or(0),
+        })
     }
 }
 

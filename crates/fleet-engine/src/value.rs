@@ -51,3 +51,23 @@ impl QueryResult {
         self.rows.is_empty()
     }
 }
+
+// -- schema introspection types -----------------------------------------------
+
+/// A column descriptor from schema introspection (name + `DuckDB` type).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchemaColumn {
+    /// Column name as declared in the parquet file(s).
+    pub name: String,
+    /// `DuckDB` logical type (e.g. "VARCHAR", "TIMESTAMP", "BIGINT").
+    pub data_type: String,
+}
+
+/// The result of a schema introspection query.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchemaResult {
+    /// Columns discovered in the data source.
+    pub columns: Vec<SchemaColumn>,
+    /// Number of parquet files matching the configured glob.
+    pub file_count: u64,
+}
