@@ -16,5 +16,8 @@ fleet-auth = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
 
+[dev-dependencies]
+insta = { workspace = true }
+
 [lints]
 workspace = true

@@ -185,4 +185,56 @@ mod tests {
         let ts = "2026-02-10T12:00:00Z";
         assert_eq!(format_timestamp(ts), "2026-02-10 12:00:00");
     }
+
+    fn test_keys() -> Vec<ApiKeyInfo> {
+        vec![
+            ApiKeyInfo {
+                id: 1,
+                prefix: "dGhpcyBp".into(),
+                name: "web-frontend".into(),
+                role: Role::Analyst,
+                active: true,
+                created_at: "2026-02-10T12:00:00+00:00".into(),
+                expires_at: Some("2026-05-11T12:00:00+00:00".into()),
+                last_used: Some("2026-02-10T14:30:00+00:00".into()),
+                revoked_at: None,
+            },
+            ApiKeyInfo {
+                id: 2,
+                prefix: "YW5vdGhl".into(),
+                name: "cli-readonly".into(),
+                role: Role::Reader,
+                active: true,
+                created_at: "2026-02-09T08:00:00+00:00".into(),
+                expires_at: None,
+                last_used: None,
+                revoked_at: None,
+            },
+            ApiKeyInfo {
+                id: 3,
+                prefix: "cmV2b2tl".into(),
+                name: "old-key".into(),
+                role: Role::Admin,
+                active: false,
+                created_at: "2026-01-01T00:00:00+00:00".into(),
+                expires_at: None,
+                last_used: Some("2026-02-01T10:00:00+00:00".into()),
+                revoked_at: Some("2026-02-05T09:00:00+00:00".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn snapshot_keys_table() {
+        let keys = test_keys();
+        let table = format_keys_table(&keys);
+        insta::assert_snapshot!(table.to_string());
+    }
+
+    #[test]
+    fn snapshot_keys_table_active_only() {
+        let keys: Vec<_> = test_keys().into_iter().filter(|k| k.active).collect();
+        let table = format_keys_table(&keys);
+        insta::assert_snapshot!(table.to_string());
+    }
 }
