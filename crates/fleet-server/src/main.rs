@@ -4,6 +4,9 @@ use clap::Parser;
 use fleet_server::config::Config;
 use fleet_server::state::AppState;
 use fleet_server::transport::http;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 /// fleetd — the fleet daemon.
 #[derive(Parser)]
@@ -16,19 +19,13 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "fleet_server=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
     let config_path = resolve_path(&cli.config);
-
-    tracing::info!(config = %config_path.display(), "loading configuration");
     let config = Config::from_file(&config_path)?;
 
+    init_tracing(&config)?;
+
+    tracing::info!(config = %config_path.display(), "configuration loaded");
     tracing::info!(
         http_addr = %config.server.http_addr,
         data_path = %config.data.path,
@@ -38,6 +35,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::from_config(&config);
     http::serve(state, &config.server.http_addr).await?;
+
+    Ok(())
+}
+
+/// Initialize the tracing subscriber with stdout and an optional log file.
+fn init_tracing(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let make_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| "fleet_server=info".into());
+
+    let stdout_layer = fmt::layer().with_filter(make_filter());
+
+    if let Some(log_path) = &config.server.log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        let file_layer = fmt::layer()
+            .with_ansi(false)
+            .with_writer(file)
+            .with_filter(make_filter());
+        tracing_subscriber::registry()
+            .with(stdout_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        tracing_subscriber::registry().with(stdout_layer).init();
+    }
 
     Ok(())
 }

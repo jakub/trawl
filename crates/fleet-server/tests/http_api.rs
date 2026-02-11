@@ -77,6 +77,7 @@ async fn setup() -> (String, String) {
             http_addr: addr.clone(),
             timeout_secs: 10,
             max_concurrent_queries: 2,
+            log_file: None,
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig { db_path: auth_db },

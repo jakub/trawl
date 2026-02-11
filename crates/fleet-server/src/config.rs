@@ -26,6 +26,9 @@ pub struct ServerConfig {
     /// Maximum concurrent queries (bounds the executor pool).
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
+
+    /// Optional log file path. When set, logs are written to both stdout and this file.
+    pub log_file: Option<PathBuf>,
 }
 
 /// Parquet data source settings.
@@ -137,6 +140,7 @@ db_path = "/var/lib/fleet/auth.db"
         assert_eq!(config.server.timeout_secs, 30);
         assert!(config.server.max_concurrent_queries > 0);
         assert_eq!(config.data.path, "/var/lib/fleet/data/**/*.parquet");
+        assert!(config.server.log_file.is_none());
     }
 
     #[test]
@@ -146,6 +150,7 @@ db_path = "/var/lib/fleet/auth.db"
 http_addr = "0.0.0.0:9090"
 timeout_secs = 60
 max_concurrent_queries = 8
+log_file = "/var/log/fleetd.log"
 
 [data]
 path = "/data/**/*.parquet"
@@ -157,6 +162,10 @@ db_path = "~/.fleet/auth.db"
         assert_eq!(config.server.http_addr, "0.0.0.0:9090");
         assert_eq!(config.server.timeout_secs, 60);
         assert_eq!(config.server.max_concurrent_queries, 8);
+        assert_eq!(
+            config.server.log_file.as_deref(),
+            Some(std::path::Path::new("/var/log/fleetd.log"))
+        );
     }
 
     #[test]
