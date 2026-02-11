@@ -133,6 +133,20 @@ impl Config {
         }
     }
 
+    /// Return warnings about potentially dangerous configuration.
+    ///
+    /// Called after tracing is initialized so these can be logged.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warns = Vec::new();
+        if self.server.http_addr.starts_with("0.0.0.0") {
+            warns.push(format!(
+                "binding to all interfaces ({}) — ensure a TLS-terminating reverse proxy is in front",
+                self.server.http_addr
+            ));
+        }
+        warns
+    }
+
     /// Validate configuration values.
     fn validate(&self) -> Result<(), ConfigError> {
         if self.data.path.is_empty() {

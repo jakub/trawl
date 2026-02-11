@@ -26,6 +26,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing(&config)?;
 
     tracing::info!(config = %config_path.display(), "configuration loaded");
+
+    for warn in config.warnings() {
+        tracing::warn!("{warn}");
+    }
+
     tracing::info!(
         http_addr = %config.server.http_addr,
         data_path = %config.data.path,
@@ -54,7 +59,10 @@ fn init_tracing(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             .create(true)
             .append(true)
             .open(log_path)?;
+        // JSON format for file logs: machine-parseable and inherently
+        // escapes control characters (prevents log injection).
         let file_layer = fmt::layer()
+            .json()
             .with_ansi(false)
             .with_writer(file)
             .with_filter(make_filter());
