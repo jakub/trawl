@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use fleet_auth::roles::Role;
 use fleet_auth::store::KeyStore;
 use fleet_client::HttpClient;
-use fleet_server::config::{AuthConfig, Config, DataConfig, ServerConfig};
+use fleet_server::config::{AuthConfig, Config, DataConfig, IngestConfig, ServerConfig};
 use fleet_server::state::AppState;
 use fleet_server::transport::http;
 
@@ -114,6 +114,7 @@ async fn setup() -> TestServer {
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig { db_path: auth_db },
+        ingest: IngestConfig::default(),
     };
 
     let state = AppState::from_config(&config).expect("failed to create app state");

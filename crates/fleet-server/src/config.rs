@@ -10,6 +10,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub data: DataConfig,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub ingest: IngestConfig,
 }
 
 /// HTTPS listener settings.
@@ -69,6 +71,68 @@ pub struct ServerConfig {
 pub struct DataConfig {
     /// Glob path passed to `DuckDB` `read_parquet()` (e.g. "/var/lib/fleet/data/**/*.parquet").
     pub path: String,
+}
+
+impl DataConfig {
+    /// Extract the base directory from the glob path.
+    ///
+    /// Strips `**/*.parquet` (or any glob suffix) to get the root directory
+    /// that the query engine reads from. Compaction writes parquet files here.
+    pub fn base_dir(&self) -> PathBuf {
+        // Walk backwards to find the first path component without glob chars.
+        let path = Path::new(&self.path);
+        let mut base = PathBuf::new();
+        for component in path.components() {
+            let s = component.as_os_str().to_string_lossy();
+            if s.contains('*') || s.contains('?') || s.contains('[') {
+                break;
+            }
+            base.push(component);
+        }
+        base
+    }
+}
+
+/// Log ingestion pipeline settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestConfig {
+    /// Whether the ingest endpoint is enabled.
+    #[serde(default = "default_ingest_enabled")]
+    pub enabled: bool,
+
+    /// Maximum request body size for ingest (bytes). Default: 16 MB.
+    #[serde(default = "default_ingest_max_body_bytes")]
+    pub max_body_bytes: usize,
+
+    /// WAL directory path. Defaults to `{data.base_dir}/wal/`.
+    pub wal_dir: Option<PathBuf>,
+
+    /// How often the compaction task runs (seconds). Default: 10.
+    #[serde(default = "default_compaction_interval_secs")]
+    pub compaction_interval_secs: u64,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ingest_enabled(),
+            max_body_bytes: default_ingest_max_body_bytes(),
+            wal_dir: None,
+            compaction_interval_secs: default_compaction_interval_secs(),
+        }
+    }
+}
+
+fn default_ingest_enabled() -> bool {
+    true
+}
+
+fn default_ingest_max_body_bytes() -> usize {
+    16 * 1024 * 1024 // 16 MB
+}
+
+fn default_compaction_interval_secs() -> u64 {
+    10
 }
 
 /// Authentication database settings.
@@ -158,6 +222,17 @@ impl Config {
         if let Some(key) = &self.server.tls_key_path {
             self.server.tls_key_path = Some(PathBuf::from(expand_tilde(&key.to_string_lossy())));
         }
+        if let Some(wal_dir) = &self.ingest.wal_dir {
+            self.ingest.wal_dir = Some(PathBuf::from(expand_tilde(&wal_dir.to_string_lossy())));
+        }
+    }
+
+    /// Resolve the WAL directory: explicit config value or `{data.base_dir}/wal/`.
+    pub fn wal_dir(&self) -> PathBuf {
+        self.ingest
+            .wal_dir
+            .clone()
+            .unwrap_or_else(|| self.data.base_dir().join("wal"))
     }
 
     /// Return warnings about potentially dangerous configuration.
@@ -392,6 +467,31 @@ db_path = "/tmp/auth.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.server.cors_allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn base_dir_strips_glob() {
+        let data = DataConfig {
+            path: "/var/lib/fleet/data/**/*.parquet".into(),
+        };
+        assert_eq!(data.base_dir(), std::path::Path::new("/var/lib/fleet/data"));
+    }
+
+    #[test]
+    fn ingest_defaults_when_omitted() {
+        let toml = r#"
+[server]
+[data]
+path = "/data/**/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ingest.enabled);
+        assert_eq!(config.ingest.max_body_bytes, 16 * 1024 * 1024);
+        assert!(config.ingest.wal_dir.is_none());
+        assert_eq!(config.ingest.compaction_interval_secs, 10);
+        assert_eq!(config.wal_dir(), std::path::Path::new("/data/wal"));
     }
 
     #[test]
