@@ -1,0 +1,5 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl_err(\"* | extract kv\")"
+---
+unsupported operation: extract kv is not yet implemented

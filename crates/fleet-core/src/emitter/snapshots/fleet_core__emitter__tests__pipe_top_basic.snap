@@ -1,0 +1,13 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | top 10 host\")"
+---
+WITH _s0 AS (
+  SELECT "host", COUNT(*) AS "count"
+  FROM read_parquet('/data/**/*.parquet')
+  GROUP BY "host"
+)
+SELECT *
+FROM "_s0"
+ORDER BY "count" DESC
+LIMIT 10

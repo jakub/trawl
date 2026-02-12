@@ -1,0 +1,13 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | rare 3 service\")"
+---
+WITH _s0 AS (
+  SELECT "service", COUNT(*) AS "count"
+  FROM read_parquet('/data/**/*.parquet')
+  GROUP BY "service"
+)
+SELECT *
+FROM "_s0"
+ORDER BY "count" ASC
+LIMIT 3

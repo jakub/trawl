@@ -77,8 +77,14 @@ pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
     // translate search stage into WHERE clauses
     search::emit_search(&query.search, &mut state);
 
-    // walk pipe stages
-    for stage in &query.pipeline {
+    // walk pipe stages — validate that pivot is terminal if present
+    let stage_count = query.pipeline.len();
+    for (i, stage) in query.pipeline.iter().enumerate() {
+        if matches!(stage.node, crate::ast::PipeStage::Pivot(_)) && i != stage_count - 1 {
+            return Err(EmitError::UnsupportedOperation {
+                message: "pivot must be the last stage in the pipeline".to_string(),
+            });
+        }
         pipeline::process_stage(&stage.node, &mut state)?;
     }
 
@@ -406,5 +412,194 @@ mod tests {
         let query = parser::parse("*").unwrap();
         let result = emit(&query, "~/.fleet/data/*.parquet");
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // top / rare
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_top_basic() {
+        assert_snapshot!(emit_dsl("* | top 10 host"));
+    }
+
+    #[test]
+    fn pipe_top_with_by() {
+        assert_snapshot!(emit_dsl("* | top 5 uri by host"));
+    }
+
+    #[test]
+    fn pipe_top_with_search() {
+        assert_snapshot!(emit_dsl("service:nginx | top 10 uri"));
+    }
+
+    #[test]
+    fn pipe_rare_basic() {
+        assert_snapshot!(emit_dsl("* | rare 3 service"));
+    }
+
+    #[test]
+    fn pipe_rare_with_by() {
+        assert_snapshot!(emit_dsl("* | rare 5 status by host"));
+    }
+
+    // -----------------------------------------------------------------------
+    // drop
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_drop_single() {
+        assert_snapshot!(emit_dsl("* | drop message"));
+    }
+
+    #[test]
+    fn pipe_drop_multiple() {
+        assert_snapshot!(emit_dsl("* | drop message, raw, src_ip"));
+    }
+
+    #[test]
+    fn multi_stats_then_drop() {
+        assert_snapshot!(emit_dsl(
+            "* | stats count(), avg(duration) by host | drop avg_duration"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // let
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_let_arithmetic() {
+        assert_snapshot!(emit_dsl("* | let duration_ms = duration * 1000"));
+    }
+
+    #[test]
+    fn pipe_let_function_call() {
+        assert_snapshot!(emit_dsl("* | let host_lower = lower(host)"));
+    }
+
+    #[test]
+    fn multi_let_then_where() {
+        assert_snapshot!(emit_dsl(
+            "* | let duration_ms = duration * 1000 | where duration_ms > 500"
+        ));
+    }
+
+    #[test]
+    fn multi_let_chained() {
+        assert_snapshot!(emit_dsl("* | let x = duration * 1000 | let y = x + 100"));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_extract_named_group() {
+        assert_snapshot!(emit_dsl(
+            r#"* | extract "(?P<ip>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)" from message"#
+        ));
+    }
+
+    #[test]
+    fn pipe_extract_default_field() {
+        assert_snapshot!(emit_dsl(
+            r#"* | extract "(?P<method>[A-Z]+) (?P<path>/[^ ]+)""#
+        ));
+    }
+
+    #[test]
+    fn multi_extract_then_where() {
+        assert_snapshot!(emit_dsl(
+            r#"service:nginx | extract "(?P<code>[0-9]{3})" from message | where code == "500""#
+        ));
+    }
+
+    #[test]
+    fn error_extract_no_named_groups() {
+        assert_snapshot!(emit_dsl_err(r#"* | extract "([0-9]+)" from message"#));
+    }
+
+    #[test]
+    fn error_extract_kv_not_implemented() {
+        assert_snapshot!(emit_dsl_err("* | extract kv"));
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_dedup_single_field() {
+        assert_snapshot!(emit_dsl("* | dedup host"));
+    }
+
+    #[test]
+    fn pipe_dedup_multiple_fields() {
+        assert_snapshot!(emit_dsl("* | dedup host, service"));
+    }
+
+    #[test]
+    fn multi_search_then_dedup() {
+        assert_snapshot!(emit_dsl("service:nginx | dedup host"));
+    }
+
+    // -----------------------------------------------------------------------
+    // timechart
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_timechart_explicit_span() {
+        assert_snapshot!(emit_dsl("* | timechart span=5m count()"));
+    }
+
+    #[test]
+    fn pipe_timechart_with_by() {
+        assert_snapshot!(emit_dsl("* | timechart span=1h count() by service"));
+    }
+
+    #[test]
+    fn pipe_timechart_auto_bucket_1h() {
+        assert_snapshot!(emit_dsl("last:1h | timechart count()"));
+    }
+
+    #[test]
+    fn pipe_timechart_auto_bucket_7d() {
+        assert_snapshot!(emit_dsl("last:7d | timechart count()"));
+    }
+
+    #[test]
+    fn pipe_timechart_multiple_aggs() {
+        assert_snapshot!(emit_dsl(
+            "* | timechart span=5m count(), avg(duration) by service"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // pivot
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_pivot_basic() {
+        assert_snapshot!(emit_dsl("* | pivot count() on status by host"));
+    }
+
+    #[test]
+    fn pipe_pivot_no_by() {
+        assert_snapshot!(emit_dsl("* | pivot count() on service"));
+    }
+
+    #[test]
+    fn pipe_pivot_with_search() {
+        assert_snapshot!(emit_dsl(
+            "service:nginx | pivot avg(duration) on status by host"
+        ));
+    }
+
+    #[test]
+    fn error_pivot_not_terminal() {
+        assert_snapshot!(emit_dsl_err(
+            "* | pivot count() on status | where count > 5"
+        ));
     }
 }

@@ -10,6 +10,13 @@ struct Cte {
     sql: String,
 }
 
+/// `DuckDB` PIVOT specification — set when `pivot` is the terminal stage.
+pub(crate) struct PivotSpec {
+    pub agg_sql: String,
+    pub on_field: String,
+    pub by_fields: Vec<String>,
+}
+
 /// Accumulates SQL clauses as the emitter walks the AST.
 ///
 /// The emitter pushes clauses into the state, and flushes to CTEs when
@@ -27,6 +34,8 @@ pub(crate) struct EmitterState {
     /// The time filter from the search stage, used by `timechart` auto-bucketing.
     /// Not reset on CTE flush — this is query-wide context.
     pub(crate) time_filter: Option<FleetDuration>,
+    /// Set by `pivot` stage — overrides normal `build_select()` in `finalize()`.
+    pivot: Option<PivotSpec>,
     ctes: Vec<Cte>,
     params: Vec<SqlValue>,
 }
@@ -71,6 +80,7 @@ impl EmitterState {
             has_aggregation: false,
             has_projection: false,
             time_filter: None,
+            pivot: None,
             ctes: Vec::new(),
             params: Vec::new(),
         })
@@ -151,10 +161,25 @@ impl EmitterState {
         sql
     }
 
+    /// Set pivot mode — overrides normal SELECT in finalize.
+    pub(crate) fn set_pivot(&mut self, agg_sql: String, on_field: String, by_fields: Vec<String>) {
+        self.pivot = Some(PivotSpec {
+            agg_sql,
+            on_field,
+            by_fields,
+        });
+    }
+
     /// Produce the final SQL string including any accumulated CTEs.
     pub(crate) fn finalize(&self) -> String {
+        let body = if let Some(pivot) = &self.pivot {
+            self.build_pivot(pivot)
+        } else {
+            self.build_select()
+        };
+
         if self.ctes.is_empty() {
-            return self.build_select();
+            return body;
         }
 
         let mut sql = String::from("WITH ");
@@ -164,7 +189,6 @@ impl EmitterState {
             }
             sql.push_str(&cte.name);
             sql.push_str(" AS (\n");
-            // indent the CTE body
             for line in cte.sql.lines() {
                 sql.push_str("  ");
                 sql.push_str(line);
@@ -173,7 +197,27 @@ impl EmitterState {
             sql.push(')');
         }
         sql.push('\n');
-        sql.push_str(&self.build_select());
+        sql.push_str(&body);
+        sql
+    }
+
+    /// Build a `DuckDB` PIVOT statement from the current source.
+    fn build_pivot(&self, pivot: &PivotSpec) -> String {
+        let on_field = super::fields::quote_field(&pivot.on_field);
+        let mut sql = format!(
+            "PIVOT {}\nON {on_field}\nUSING {}",
+            self.source, pivot.agg_sql
+        );
+
+        if !pivot.by_fields.is_empty() {
+            let quoted: Vec<String> = pivot
+                .by_fields
+                .iter()
+                .map(|f| super::fields::quote_field(f))
+                .collect();
+            let _ = write!(sql, "\nGROUP BY {}", quoted.join(", "));
+        }
+
         sql
     }
 

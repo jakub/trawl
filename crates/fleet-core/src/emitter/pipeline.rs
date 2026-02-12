@@ -1,6 +1,7 @@
-use crate::ast::{PipeStage, SortDirection};
+use crate::ast::{ExtractMode, FleetDuration, PipeStage, SortDirection};
 
 use super::EmitError;
+use super::SqlValue;
 use super::expr::emit_expr;
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
@@ -23,6 +24,26 @@ pub(crate) fn process_stage(pipe: &PipeStage, ctx: &mut EmitterState) -> Result<
             process_table(t, ctx);
             Ok(())
         }
+        PipeStage::Top(t) => {
+            process_top(t, ctx);
+            Ok(())
+        }
+        PipeStage::Rare(r) => {
+            process_rare(r, ctx);
+            Ok(())
+        }
+        PipeStage::Drop(d) => {
+            process_drop(d, ctx);
+            Ok(())
+        }
+        PipeStage::Let(l) => process_let(l, ctx),
+        PipeStage::Extract(e) => process_extract(e, ctx),
+        PipeStage::Dedup(d) => {
+            process_dedup(d, ctx);
+            Ok(())
+        }
+        PipeStage::Timechart(t) => process_timechart(t, ctx),
+        PipeStage::Pivot(p) => process_pivot(p, ctx),
     }
 }
 
@@ -129,4 +150,252 @@ fn extract_field_name(arg: Option<&crate::ast::Spanned<crate::ast::Expr>>) -> Op
         },
         None => None,
     }
+}
+
+/// Desugar `top N field` → stats `count()` by field | sort -count | limit N.
+fn process_top(top: &crate::ast::TopStage, ctx: &mut EmitterState) {
+    process_frequency(top.count, &top.field, &top.by, "DESC", ctx);
+}
+
+/// Desugar `rare N field` → stats `count()` by field | sort count | limit N.
+fn process_rare(rare: &crate::ast::RareStage, ctx: &mut EmitterState) {
+    process_frequency(rare.count, &rare.field, &rare.by, "ASC", ctx);
+}
+
+/// Shared logic for `top` and `rare` — frequency analysis desugaring.
+fn process_frequency(
+    count: u64,
+    field: &str,
+    by: &[String],
+    sort_dir: &str,
+    ctx: &mut EmitterState,
+) {
+    if ctx.has_aggregation || ctx.has_projection {
+        ctx.flush_to_cte();
+    }
+
+    let field_quoted = quote_field(field);
+    let mut select_items = vec![field_quoted.clone()];
+    let mut group_items = vec![field_quoted];
+
+    for by_field in by {
+        let q = quote_field(by_field);
+        select_items.push(q.clone());
+        group_items.push(q);
+    }
+
+    select_items.push("COUNT(*) AS \"count\"".to_string());
+
+    ctx.select = select_items;
+    ctx.group_by = group_items;
+    ctx.has_aggregation = true;
+
+    // flush aggregation to CTE, then sort+limit on the result
+    ctx.flush_to_cte();
+    ctx.order_by.push(format!("\"count\" {sort_dir}"));
+    ctx.limit = Some(count);
+}
+
+fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
+    if ctx.has_aggregation || ctx.has_projection {
+        ctx.flush_to_cte();
+    }
+
+    let excluded: Vec<String> = drop_stage.fields.iter().map(|f| quote_field(f)).collect();
+    ctx.select = vec![format!("* EXCLUDE ({})", excluded.join(", "))];
+    ctx.has_projection = true;
+}
+
+fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
+    // always flush: the computed expression may add ? params to SELECT,
+    // which must not interleave with WHERE params from prior stages
+    ctx.flush_to_cte();
+
+    let expr_sql = emit_expr(&let_stage.expr, ctx)?;
+    let alias = quote_field(&let_stage.field);
+
+    ctx.select = vec!["*".to_string(), format!("({expr_sql}) AS {alias}")];
+    ctx.has_projection = true;
+
+    Ok(())
+}
+
+fn process_extract(
+    extract: &crate::ast::ExtractStage,
+    ctx: &mut EmitterState,
+) -> Result<(), EmitError> {
+    // always flush: regexp_extract params in SELECT must not interleave
+    // with WHERE params from prior stages (DuckDB binds ? left to right)
+    ctx.flush_to_cte();
+
+    let source = match &extract.source_field {
+        Some(f) => quote_field(f),
+        None => quote_field("message"),
+    };
+
+    match &extract.mode {
+        ExtractMode::Regex(pattern) => {
+            let re = regex::Regex::new(pattern).map_err(|e| EmitError::UnsupportedOperation {
+                message: format!("invalid regex in extract: {e}"),
+            })?;
+
+            let group_names: Vec<&str> = re.capture_names().flatten().collect();
+
+            if group_names.is_empty() {
+                return Err(EmitError::UnsupportedOperation {
+                    message: "extract regex must contain at least one named capture group \
+                              (?P<name>...)"
+                        .to_string(),
+                });
+            }
+
+            let mut select_items = vec!["*".to_string()];
+            for (i, name) in group_names.iter().enumerate() {
+                let group_idx = i + 1;
+                let placeholder = ctx.push_param(SqlValue::String(pattern.clone()));
+                let alias = quote_field(name);
+                select_items.push(format!(
+                    "regexp_extract({source}, {placeholder}, {group_idx}) AS {alias}"
+                ));
+            }
+
+            ctx.select = select_items;
+            ctx.has_projection = true;
+        }
+        ExtractMode::KeyValue => {
+            return Err(EmitError::UnsupportedOperation {
+                message: "extract kv is not yet implemented".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn process_dedup(dedup: &crate::ast::DedupStage, ctx: &mut EmitterState) {
+    // always flush current state to CTE first
+    ctx.flush_to_cte();
+
+    // add ROW_NUMBER() partitioned by dedup fields, ordered by timestamp DESC
+    let partition_fields: Vec<String> = dedup.fields.iter().map(|f| quote_field(f)).collect();
+    let partition_clause = partition_fields.join(", ");
+
+    ctx.select = vec![
+        "*".to_string(),
+        format!(
+            "ROW_NUMBER() OVER (PARTITION BY {partition_clause} ORDER BY \"timestamp\" DESC) \
+             AS \"_rn\""
+        ),
+    ];
+    ctx.has_projection = true;
+
+    // flush the window function CTE
+    ctx.flush_to_cte();
+
+    // filter to keep only the first row per partition, drop _rn
+    ctx.push_where("\"_rn\" = 1".to_string());
+    ctx.select = vec!["* EXCLUDE (\"_rn\")".to_string()];
+    ctx.has_projection = true;
+}
+
+fn process_timechart(
+    tc: &crate::ast::TimechartStage,
+    ctx: &mut EmitterState,
+) -> Result<(), EmitError> {
+    if ctx.has_aggregation || ctx.has_projection {
+        ctx.flush_to_cte();
+    }
+
+    let interval = match &tc.span {
+        Some(d) => d.to_interval_string(),
+        None => auto_bucket_interval(ctx.time_filter.as_ref()),
+    };
+
+    let bucket_expr = format!("time_bucket(INTERVAL '{interval}', \"timestamp\") AS \"_time\"");
+
+    let mut select_items = vec![bucket_expr];
+    let mut group_items = vec!["\"_time\"".to_string()];
+
+    for field in &tc.group_by {
+        let q = quote_field(field);
+        select_items.push(q.clone());
+        group_items.push(q);
+    }
+
+    for agg in &tc.aggregations {
+        let arg_strings: Vec<String> = agg
+            .args
+            .iter()
+            .map(|a| emit_expr(a, ctx))
+            .collect::<Result<_, _>>()?;
+
+        let sql_func = translate_function(&agg.function, &arg_strings)?;
+
+        let first_arg_name = extract_field_name(agg.args.first());
+        let alias = match &agg.alias {
+            Some(a) => quote_field(a),
+            None => default_agg_alias(&agg.function, first_arg_name.as_deref()),
+        };
+
+        select_items.push(format!("{sql_func} AS {alias}"));
+    }
+
+    ctx.select = select_items;
+    ctx.group_by = group_items;
+    ctx.order_by.push("\"_time\" ASC".to_string());
+    ctx.has_aggregation = true;
+
+    Ok(())
+}
+
+/// Auto-bucketing heuristic: map time filter duration to a reasonable bucket span.
+fn auto_bucket_interval(time_filter: Option<&crate::ast::FleetDuration>) -> String {
+    let seconds = time_filter.map_or(3600, FleetDuration::to_seconds);
+
+    if seconds <= 3600 {
+        "1 minutes"
+    } else if seconds <= 21_600 {
+        "5 minutes"
+    } else if seconds <= 86_400 {
+        "15 minutes"
+    } else if seconds <= 604_800 {
+        "1 hours"
+    } else if seconds <= 2_592_000 {
+        "6 hours"
+    } else {
+        "1 hours"
+    }
+    .to_string()
+}
+
+fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
+    ctx.flush_to_cte();
+
+    // narrow source to only columns needed by PIVOT — without explicit GROUP BY,
+    // DuckDB treats ALL non-ON columns as implicit row identifiers
+    let mut needed = vec![quote_field(&pivot.on_field)];
+    for f in &pivot.by {
+        needed.push(quote_field(f));
+    }
+    for arg in &pivot.aggregation.args {
+        if let crate::ast::Expr::FieldRef(name) = &arg.node {
+            needed.push(quote_field(name));
+        }
+    }
+    ctx.select = needed;
+    ctx.has_projection = true;
+    ctx.flush_to_cte();
+
+    let arg_strings: Vec<String> = pivot
+        .aggregation
+        .args
+        .iter()
+        .map(|a| emit_expr(a, ctx))
+        .collect::<Result<_, _>>()?;
+
+    let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings)?;
+
+    ctx.set_pivot(agg_sql, pivot.on_field.clone(), pivot.by.clone());
+
+    Ok(())
 }

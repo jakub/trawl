@@ -1,0 +1,19 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"service:nginx | pivot avg(duration) on status by host\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet')
+  WHERE "service" = ?
+), _s1 AS (
+  SELECT "status", "host", "duration"
+  FROM "_s0"
+)
+PIVOT "_s1"
+ON "status"
+USING AVG("duration")
+GROUP BY "host"
+---
+params:
+  0: 'nginx'

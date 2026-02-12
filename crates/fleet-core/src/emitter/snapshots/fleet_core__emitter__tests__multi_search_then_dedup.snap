@@ -1,0 +1,18 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"service:nginx | dedup host\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet')
+  WHERE "service" = ?
+), _s1 AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY "host" ORDER BY "timestamp" DESC) AS "_rn"
+  FROM "_s0"
+)
+SELECT * EXCLUDE ("_rn")
+FROM "_s1"
+WHERE "_rn" = 1
+---
+params:
+  0: 'nginx'

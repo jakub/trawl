@@ -1,0 +1,17 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | let x = duration * 1000 | let y = x + 100\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet')
+), _s1 AS (
+  SELECT *, (("duration" * ?)) AS "x"
+  FROM "_s0"
+)
+SELECT *, (("x" + ?)) AS "y"
+FROM "_s1"
+---
+params:
+  0: 1000
+  1: 100

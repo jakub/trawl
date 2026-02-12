@@ -1,0 +1,13 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | extract \"(?P<ip>[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+)\" from message\"#)"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet')
+)
+SELECT *, regexp_extract("message", ?, 1) AS "ip"
+FROM "_s0"
+---
+params:
+  0: '(?P<ip>[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)'

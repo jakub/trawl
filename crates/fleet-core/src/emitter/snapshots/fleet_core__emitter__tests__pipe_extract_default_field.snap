@@ -1,0 +1,14 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | extract \"(?P<method>[A-Z]+) (?P<path>/[^ ]+)\"\"#)"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet')
+)
+SELECT *, regexp_extract("message", ?, 1) AS "method", regexp_extract("message", ?, 2) AS "path"
+FROM "_s0"
+---
+params:
+  0: '(?P<method>[A-Z]+) (?P<path>/[^ ]+)'
+  1: '(?P<method>[A-Z]+) (?P<path>/[^ ]+)'

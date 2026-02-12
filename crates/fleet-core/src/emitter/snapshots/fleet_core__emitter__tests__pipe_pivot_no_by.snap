@@ -1,0 +1,14 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | pivot count() on service\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet')
+), _s1 AS (
+  SELECT "service"
+  FROM "_s0"
+)
+PIVOT "_s1"
+ON "service"
+USING COUNT(*)

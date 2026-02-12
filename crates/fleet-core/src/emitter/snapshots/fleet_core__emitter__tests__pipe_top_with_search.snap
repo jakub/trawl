@@ -1,0 +1,17 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"service:nginx | top 10 uri\")"
+---
+WITH _s0 AS (
+  SELECT "uri", COUNT(*) AS "count"
+  FROM read_parquet('/data/**/*.parquet')
+  WHERE "service" = ?
+  GROUP BY "uri"
+)
+SELECT *
+FROM "_s0"
+ORDER BY "count" DESC
+LIMIT 10
+---
+params:
+  0: 'nginx'
