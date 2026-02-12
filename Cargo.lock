@@ -966,15 +966,18 @@ name = "fleet-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "clap",
  "dashmap",
  "duckdb",
+ "flate2",
  "fleet-auth",
  "fleet-client",
  "fleet-core",
  "fleet-engine",
  "hyper",
  "hyper-util",
+ "rand 0.8.5",
  "rcgen",
  "rustls",
  "rustls-pki-types",
