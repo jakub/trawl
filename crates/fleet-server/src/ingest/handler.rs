@@ -45,14 +45,15 @@ pub async fn ingest(
         return Err(ServerError::Ingest("empty request body".into()));
     }
 
-    // Validate ndjson and extract service name from first line.
-    let (service, line_count) = validate_ndjson(&raw)?;
+    // Parse events from either ndjson or JSON array format.
+    // Always produces ndjson bytes for the WAL regardless of input format.
+    let (service, line_count, ndjson) = parse_events(&raw)?;
 
-    // Write to WAL atomically.
+    // Write ndjson to WAL atomically.
     let service_clone = service.clone();
     let wal_path = tokio::task::spawn_blocking({
         let wal_writer = Arc::clone(wal_writer);
-        move || wal_writer.write(&service_clone, &raw)
+        move || wal_writer.write(&service_clone, &ndjson)
     })
     .await
     .map_err(|e| ServerError::Internal(format!("WAL write task panicked: {e}")))?
@@ -89,13 +90,73 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, ServerError> {
     Ok(decompressed)
 }
 
-/// Validate ndjson: each line must parse as JSON with a `service` field.
+/// Parse events from either ndjson or JSON array format.
 ///
-/// Returns the service name (from the first line) and total line count.
-fn validate_ndjson(data: &[u8]) -> Result<(String, usize), ServerError> {
+/// Returns `(service_name, event_count, ndjson_bytes)`. The returned bytes
+/// are always ndjson regardless of input format, ready for the WAL.
+fn parse_events(data: &[u8]) -> Result<(String, usize, Vec<u8>), ServerError> {
     let text = std::str::from_utf8(data)
         .map_err(|e| ServerError::Ingest(format!("body is not valid UTF-8: {e}")))?;
 
+    let trimmed = text.trim_start();
+
+    // Detect format: JSON array (vector batches) vs ndjson (line-delimited).
+    if trimmed.starts_with('[') {
+        parse_json_array(trimmed)
+    } else {
+        parse_ndjson(trimmed, data)
+    }
+}
+
+/// Parse a JSON array of events (vector's default batch format).
+///
+/// Converts to ndjson for WAL storage.
+fn parse_json_array(text: &str) -> Result<(String, usize, Vec<u8>), ServerError> {
+    let parsed: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| ServerError::Ingest(format!("invalid JSON array: {e}")))?;
+
+    let arr = parsed
+        .as_array()
+        .ok_or_else(|| ServerError::Ingest("expected JSON array".into()))?;
+
+    if arr.is_empty() {
+        return Err(ServerError::Ingest("empty event array".into()));
+    }
+
+    let mut service: Option<String> = None;
+    let mut ndjson = Vec::new();
+
+    for (i, event) in arr.iter().enumerate() {
+        let obj = event
+            .as_object()
+            .ok_or_else(|| ServerError::Ingest(format!("event {}: expected JSON object", i + 1)))?;
+
+        let svc = obj
+            .get("service")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ServerError::Ingest(format!("event {}: missing 'service' field", i + 1))
+            })?;
+
+        if service.is_none() {
+            service = Some(svc.to_owned());
+        }
+
+        // Write each event as a ndjson line.
+        serde_json::to_writer(&mut ndjson, event)
+            .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
+        ndjson.push(b'\n');
+    }
+
+    let service = service.expect("non-empty array guarantees at least one service");
+    Ok((service, arr.len(), ndjson))
+}
+
+/// Parse ndjson (newline-delimited JSON objects).
+///
+/// If the input is already valid ndjson, returns the original bytes
+/// to avoid a redundant serialize round-trip.
+fn parse_ndjson(text: &str, original: &[u8]) -> Result<(String, usize, Vec<u8>), ServerError> {
     let mut service: Option<String> = None;
     let mut count = 0;
 
@@ -127,7 +188,7 @@ fn validate_ndjson(data: &[u8]) -> Result<(String, usize), ServerError> {
     }
 
     let service = service.ok_or_else(|| ServerError::Ingest("no valid events in body".into()))?;
-    Ok((service, count))
+    Ok((service, count, original.to_vec()))
 }
 
 #[cfg(test)]
@@ -135,38 +196,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_ndjson_valid() {
+    fn parse_ndjson_format() {
         let data = br#"{"service":"nginx","message":"ok"}
 {"service":"nginx","message":"error"}
 "#;
-        let (service, count) = validate_ndjson(data).unwrap();
+        let (service, count, _ndjson) = parse_events(data).unwrap();
         assert_eq!(service, "nginx");
         assert_eq!(count, 2);
     }
 
     #[test]
-    fn validate_ndjson_missing_service() {
+    fn parse_json_array_format() {
+        let data = br#"[{"service":"nginx","message":"ok"},{"service":"nginx","message":"error"}]"#;
+        let (service, count, ndjson) = parse_events(data).unwrap();
+        assert_eq!(service, "nginx");
+        assert_eq!(count, 2);
+        // WAL output should be ndjson, not a JSON array.
+        let text = std::str::from_utf8(&ndjson).unwrap();
+        assert!(!text.starts_with('['));
+        assert_eq!(text.lines().count(), 2);
+    }
+
+    #[test]
+    fn parse_missing_service() {
         let data = br#"{"message":"no service field"}"#;
-        let err = validate_ndjson(data).unwrap_err();
+        let err = parse_events(data).unwrap_err();
         assert!(err.to_string().contains("missing 'service'"));
     }
 
     #[test]
-    fn validate_ndjson_invalid_json() {
+    fn parse_invalid_json() {
         let data = b"not json at all";
-        let err = validate_ndjson(data).unwrap_err();
+        let err = parse_events(data).unwrap_err();
         assert!(err.to_string().contains("invalid JSON"));
     }
 
     #[test]
-    fn validate_ndjson_empty_lines_skipped() {
+    fn parse_ndjson_empty_lines_skipped() {
         let data = br#"
 {"service":"test","message":"hello"}
 
 {"service":"test","message":"world"}
 "#;
-        let (service, count) = validate_ndjson(data).unwrap();
+        let (service, count, _) = parse_events(data).unwrap();
         assert_eq!(service, "test");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_empty_json_array_rejected() {
+        let data = b"[]";
+        let err = parse_events(data).unwrap_err();
+        assert!(err.to_string().contains("empty"));
     }
 }
