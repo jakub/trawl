@@ -3,6 +3,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+
 /// The four roles in the fleet permission model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,6 +86,21 @@ impl FromStr for Role {
             "ingest" => Ok(Self::Ingest),
             other => Err(format!("unknown role: {other}")),
         }
+    }
+}
+
+impl ToSql for Role {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for Role {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse::<Self>()
+            .map_err(|e| rusqlite::types::FromSqlError::Other(e.into()))
     }
 }
 

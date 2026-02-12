@@ -31,13 +31,6 @@ pub struct KeyStore {
     conn: rusqlite::Connection,
 }
 
-/// Parse a role string from the database into a [`Role`] enum.
-fn parse_role(role_str: String) -> Result<Role, AuthError> {
-    role_str
-        .parse()
-        .map_err(|_| AuthError::UnknownRole(role_str))
-}
-
 impl KeyStore {
     /// Open (or create) the auth database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuthError> {
@@ -169,7 +162,7 @@ impl KeyStore {
             match self.conn.execute(
                 "INSERT INTO api_keys (prefix, name, hash, role, created_at, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![generated.prefix, name, hash, role.as_str(), now, expires_at,],
+                params![generated.prefix, name, hash, &role, now, expires_at,],
             ) {
                 Ok(_) => {
                     let id = self.conn.last_insert_rowid();
@@ -229,7 +222,7 @@ impl KeyStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Role>(4)?,
                     row.get::<_, bool>(5)?,
                     row.get::<_, Option<String>>(6)?,
                 ))
@@ -237,7 +230,7 @@ impl KeyStore {
             .optional()
             .map_err(AuthError::Database)?;
 
-        let Some((id, db_prefix, name, hash, role_str, active, expires_at)) = row else {
+        let Some((id, db_prefix, name, hash, role, active, expires_at)) = row else {
             // SECURITY: run argon2 against a dummy hash to equalize timing
             // with the real-prefix path. The verification will always fail.
             let _ = token::verify_token(plaintext, &DUMMY_HASH);
@@ -267,8 +260,6 @@ impl KeyStore {
             params![now, id],
         )?;
 
-        let role = parse_role(role_str)?;
-
         Ok(VerifiedKey {
             id,
             prefix: db_prefix,
@@ -292,49 +283,21 @@ impl KeyStore {
         let mut stmt = self.conn.prepare(sql)?;
         let keys = stmt
             .query_map([], |row| {
-                let role_str: String = row.get(3)?;
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    role_str,
-                    row.get::<_, bool>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                ))
+                Ok(ApiKeyInfo {
+                    id: row.get(0)?,
+                    prefix: row.get(1)?,
+                    name: row.get(2)?,
+                    role: row.get(3)?,
+                    active: row.get(4)?,
+                    created_at: row.get(5)?,
+                    expires_at: row.get(6)?,
+                    last_used: row.get(7)?,
+                    revoked_at: row.get(8)?,
+                })
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        keys.into_iter()
-            .map(
-                |(
-                    id,
-                    prefix,
-                    name,
-                    role_str,
-                    active,
-                    created_at,
-                    expires_at,
-                    last_used,
-                    revoked_at,
-                )| {
-                    let role = parse_role(role_str)?;
-                    Ok(ApiKeyInfo {
-                        id,
-                        prefix,
-                        name,
-                        role,
-                        active,
-                        created_at,
-                        expires_at,
-                        last_used,
-                        revoked_at,
-                    })
-                },
-            )
-            .collect()
+        Ok(keys)
     }
 
     /// Revoke a key by its prefix.
@@ -370,48 +333,20 @@ impl KeyStore {
              FROM api_keys WHERE prefix = ?1",
         )?;
         stmt.query_row(params![prefix], |row| {
-            let role_str: String = row.get(3)?;
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                role_str,
-                row.get::<_, bool>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-            ))
+            Ok(ApiKeyInfo {
+                id: row.get(0)?,
+                prefix: row.get(1)?,
+                name: row.get(2)?,
+                role: row.get(3)?,
+                active: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                last_used: row.get(7)?,
+                revoked_at: row.get(8)?,
+            })
         })
         .optional()
         .map_err(AuthError::Database)?
-        .map(
-            |(
-                id,
-                prefix,
-                name,
-                role_str,
-                active,
-                created_at,
-                expires_at,
-                last_used,
-                revoked_at,
-            )|
-             -> Result<ApiKeyInfo, AuthError> {
-                Ok(ApiKeyInfo {
-                    id,
-                    prefix,
-                    name,
-                    role: parse_role(role_str)?,
-                    active,
-                    created_at,
-                    expires_at,
-                    last_used,
-                    revoked_at,
-                })
-            },
-        )
-        .transpose()?
         .ok_or_else(|| AuthError::KeyNotFound {
             prefix: prefix.to_owned(),
         })
