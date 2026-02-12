@@ -26,6 +26,16 @@ impl Executor {
         Ok(Self { conn })
     }
 
+    /// Create a new executor sharing the same underlying database.
+    ///
+    /// The cloned connection benefits from `DuckDB`'s internal metadata
+    /// caching (parquet file stats, column statistics) accumulated by
+    /// other connections to the same database.
+    pub fn try_clone(&self) -> Result<Self, EngineError> {
+        let conn = self.conn.try_clone()?;
+        Ok(Self { conn })
+    }
+
     /// Get an interrupt handle for cancelling in-flight queries from another thread.
     pub fn interrupt_handle(&self) -> Arc<duckdb::InterruptHandle> {
         self.conn.interrupt_handle()
