@@ -124,11 +124,14 @@ pub async fn query(
                     );
                 }
                 _ => {
+                    // Log the raw error for operator debugging; the safe
+                    // (redacted) version is what reaches the client and tracker.
                     tracing::error!(
                         user = %verified.name,
                         query = %req.query,
                         query_id,
-                        error = %safe_msg,
+                        error = %e,
+                        safe_error = %safe_msg,
                         "query failed: engine error"
                     );
                 }
