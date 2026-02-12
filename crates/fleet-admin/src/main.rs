@@ -51,7 +51,7 @@ enum TlsAction {
 enum KeysAction {
     /// Create a new API key.
     Create {
-        /// Role for the key (admin, analyst, reader).
+        /// Role for the key (admin, analyst, reader, ingest).
         #[arg(long)]
         role: CliRole,
         /// Human-readable name for the key.
@@ -80,6 +80,7 @@ enum CliRole {
     Admin,
     Analyst,
     Reader,
+    Ingest,
 }
 
 impl From<CliRole> for fleet_auth::Role {
@@ -88,6 +89,7 @@ impl From<CliRole> for fleet_auth::Role {
             CliRole::Admin => Self::Admin,
             CliRole::Analyst => Self::Analyst,
             CliRole::Reader => Self::Reader,
+            CliRole::Ingest => Self::Ingest,
         }
     }
 }
