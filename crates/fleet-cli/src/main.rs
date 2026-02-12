@@ -90,7 +90,11 @@ async fn run_daemon_mode(url: &str, cli: &Cli) -> QueryResult {
         fleet_client::HttpClient::new_insecure(url, token)
     } else {
         fleet_client::HttpClient::new(url, token)
-    };
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("fleet: {e}");
+        process::exit(1);
+    });
     match client.query(&cli.query).await {
         Ok(r) => r,
         Err(e) => {
@@ -160,11 +164,15 @@ fn render_json(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
 }
 
 fn render_csv(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
-    let headers: Vec<String> = result.columns.iter().map(|c| csv_escape(&c.name)).collect();
+    let headers: Vec<String> = result
+        .columns
+        .iter()
+        .map(|c| csv_escape_string(&c.name))
+        .collect();
     writeln!(out, "{}", headers.join(","))?;
 
     for row in &result.rows {
-        let cells: Vec<String> = row.iter().map(|v| csv_escape(&v.to_string())).collect();
+        let cells: Vec<String> = row.iter().map(csv_escape_value).collect();
         writeln!(out, "{}", cells.join(","))?;
     }
     Ok(())
@@ -180,18 +188,80 @@ fn value_to_json(val: &Value) -> serde_json::Value {
     }
 }
 
-fn csv_escape(s: &str) -> String {
+/// Escape a value for CSV output, applying formula injection protection
+/// only to string values (numeric types are inherently safe).
+fn csv_escape_value(val: &Value) -> String {
+    match val {
+        Value::Null => String::new(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => csv_escape_string(s),
+    }
+}
+
+/// Escape a string for CSV, preventing formula injection and quoting
+/// as needed for commas, quotes, and newlines.
+fn csv_escape_string(s: &str) -> String {
     // Prevent CSV injection: prefix formula-triggering characters with a
     // single quote so spreadsheet apps don't interpret cells as formulas.
-    let s = if s.starts_with(['=', '+', '-', '@']) {
+    let s = if s.starts_with(['=', '+', '-', '@', '\t']) {
         format!("'{s}")
     } else {
         s.to_owned()
     };
 
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_negative_number_not_prefixed() {
+        assert_eq!(csv_escape_value(&Value::Integer(-42)), "-42");
+    }
+
+    #[test]
+    fn csv_negative_float_not_prefixed() {
+        assert_eq!(csv_escape_value(&Value::Float(-1.5)), "-1.5");
+    }
+
+    #[test]
+    fn csv_formula_string_prefixed() {
+        assert_eq!(csv_escape_value(&Value::String("=cmd".into())), "'=cmd");
+    }
+
+    #[test]
+    fn csv_tab_prefixed() {
+        assert_eq!(csv_escape_value(&Value::String("\tfoo".into())), "'\tfoo");
+    }
+
+    #[test]
+    fn csv_at_sign_prefixed() {
+        assert_eq!(csv_escape_value(&Value::String("@sum".into())), "'@sum");
+    }
+
+    #[test]
+    fn csv_null_empty() {
+        assert_eq!(csv_escape_value(&Value::Null), "");
+    }
+
+    #[test]
+    fn csv_string_with_comma() {
+        assert_eq!(csv_escape_value(&Value::String("a,b".into())), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_string_with_quotes() {
+        assert_eq!(
+            csv_escape_value(&Value::String(r#"say "hi""#.into())),
+            r#""say ""hi""""#
+        );
     }
 }
