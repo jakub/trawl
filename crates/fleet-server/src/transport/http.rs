@@ -39,18 +39,18 @@ pub fn router(state: AppState) -> Router {
     let cors_origins = state.cors_allowed_origins.clone();
     let ingest_enabled = state.wal_writer.is_some();
 
-    // Routes that require authentication — nested under /api/v1 so the
-    // auth middleware is structurally bound to this subtree.
+    // Query routes: authentication + default body limit (128 KB).
     let authenticated = Router::new()
         .route("/query", post(handlers::query))
         .route("/schema", get(handlers::schema))
         .route("/queries", get(handlers::queries))
-        .layer(middleware::from_fn(auth_middleware));
+        .layer(middleware::from_fn(auth_middleware))
+        .layer(RequestBodyLimitLayer::new(max_body));
 
     // Shared key store injected into extensions for the auth middleware.
     let key_store = Arc::clone(&state.key_store);
 
-    // Ingest route gets a separate, larger body limit (16 MB default vs 128 KB).
+    // Ingest route: authentication + larger body limit (16 MB default).
     let ingest_routes = if ingest_enabled {
         let ingest_body_limit = state.ingest_max_body_bytes.unwrap_or(16 * 1024 * 1024);
         Router::new()
@@ -67,7 +67,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(handlers::health))
         // -- security hardening layers (outermost applied first) --
         .layer(CatchPanicLayer::new())
-        .layer(RequestBodyLimitLayer::new(max_body))
         .layer(ConcurrencyLimitLayer::new(max_conns))
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
