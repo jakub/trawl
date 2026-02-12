@@ -8,6 +8,7 @@ use fleet_auth::KeyStore;
 use fleet_engine::value::SchemaResult;
 
 use crate::config::Config;
+use crate::ingest::wal::WalWriter;
 use crate::pool::ExecutorPool;
 use crate::tracker::QueryTracker;
 
@@ -39,6 +40,10 @@ pub struct AppState {
     pub shutdown_drain_secs: u64,
     /// Allowed CORS origins (empty = no CORS headers sent).
     pub cors_allowed_origins: Vec<String>,
+    /// WAL writer for ingested events (None if ingest is disabled).
+    pub wal_writer: Option<Arc<WalWriter>>,
+    /// Max body size for ingest requests (None if ingest disabled).
+    pub ingest_max_body_bytes: Option<usize>,
 }
 
 /// A cached schema result with an expiry timestamp.
@@ -61,6 +66,13 @@ impl AppState {
     pub fn from_config(config: &Config) -> Result<Self, fleet_auth::AuthError> {
         let key_store = KeyStore::open(&config.auth.db_path)?;
 
+        let wal_writer = if config.ingest.enabled {
+            let writer = WalWriter::new(config.wal_dir());
+            Some(Arc::new(writer))
+        } else {
+            None
+        };
+
         Ok(Self {
             pool: ExecutorPool::new(
                 config.data.path.clone(),
@@ -77,6 +89,12 @@ impl AppState {
             max_concurrent_requests: config.server.max_concurrent_requests,
             shutdown_drain_secs: config.server.shutdown_drain_secs,
             cors_allowed_origins: config.server.cors_allowed_origins.clone(),
+            wal_writer,
+            ingest_max_body_bytes: if config.ingest.enabled {
+                Some(config.ingest.max_body_bytes)
+            } else {
+                None
+            },
         })
     }
 }

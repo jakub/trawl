@@ -39,7 +39,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let state = AppState::from_config(&config)?;
+
+    // Spawn ingest compaction task if ingestion is enabled.
+    let compaction_handle = if config.ingest.enabled {
+        let wal_dir = config.wal_dir();
+
+        // Ensure the WAL directory exists at startup.
+        if let Some(writer) = &state.wal_writer {
+            writer.ensure_dir().map_err(|e| {
+                format!("failed to create WAL directory {}: {e}", wal_dir.display())
+            })?;
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let data_dir = config.data.base_dir();
+        let interval = std::time::Duration::from_secs(config.ingest.compaction_interval_secs);
+
+        tracing::info!(
+            wal_dir = %wal_dir.display(),
+            data_dir = %data_dir.display(),
+            interval_secs = config.ingest.compaction_interval_secs,
+            "ingest pipeline enabled"
+        );
+
+        let handle = fleet_server::ingest::compaction::spawn_compaction(
+            wal_dir,
+            data_dir,
+            interval,
+            shutdown_rx,
+        );
+        Some((handle, shutdown_tx))
+    } else {
+        tracing::info!("ingest pipeline disabled");
+        None
+    };
+
     http::serve(state, &config.server).await?;
+
+    // Signal compaction task to shut down.
+    if let Some((_handle, shutdown_tx)) = compaction_handle {
+        let _ = shutdown_tx.send(true);
+    }
 
     Ok(())
 }

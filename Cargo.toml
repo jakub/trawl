@@ -28,6 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 comfy-table = "7"
 duckdb = { version = "1.4", features = ["bundled"] }
+flate2 = "1"
 insta = "1"
 rand = "0.8"
 regex = "1"

@@ -27,6 +27,7 @@ use tower_http::trace::TraceLayer;
 use crate::auth::auth_middleware;
 use crate::config::ServerConfig;
 use crate::handlers;
+use crate::ingest;
 use crate::shutdown::shutdown_signal;
 use crate::state::AppState;
 use crate::tls;
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> Router {
     let max_body = state.max_request_body_bytes;
     let max_conns = state.max_concurrent_requests;
     let cors_origins = state.cors_allowed_origins.clone();
+    let ingest_enabled = state.wal_writer.is_some();
 
     // Routes that require authentication — nested under /api/v1 so the
     // auth middleware is structurally bound to this subtree.
@@ -48,8 +50,20 @@ pub fn router(state: AppState) -> Router {
     // Shared key store injected into extensions for the auth middleware.
     let key_store = Arc::clone(&state.key_store);
 
+    // Ingest route gets a separate, larger body limit (16 MB default vs 128 KB).
+    let ingest_routes = if ingest_enabled {
+        let ingest_body_limit = state.ingest_max_body_bytes.unwrap_or(16 * 1024 * 1024);
+        Router::new()
+            .route("/ingest", post(ingest::handler::ingest))
+            .layer(middleware::from_fn(auth_middleware))
+            .layer(RequestBodyLimitLayer::new(ingest_body_limit))
+    } else {
+        Router::new()
+    };
+
     let mut app = Router::new()
         .nest("/api/v1", authenticated)
+        .nest("/api/v1", ingest_routes)
         .route("/api/v1/health", get(handlers::health))
         // -- security hardening layers (outermost applied first) --
         .layer(CatchPanicLayer::new())

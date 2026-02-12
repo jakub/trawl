@@ -7,6 +7,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod handlers;
+pub mod ingest;
 pub mod pool;
 pub mod shutdown;
 pub mod state;
