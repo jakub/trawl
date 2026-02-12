@@ -36,14 +36,30 @@ pub fn generate(output_dir: &Path, extra_san: &[String]) -> Result<(), String> {
 
     fs::write(&cert_path, &cert_pem)
         .map_err(|e| format!("failed to write {}: {e}", cert_path.display()))?;
-    fs::write(&key_path, &key_pem)
-        .map_err(|e| format!("failed to write {}: {e}", key_path.display()))?;
 
+    // Write the private key with restricted permissions from the start to
+    // avoid a TOCTOU window where the key is world-readable.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("failed to set key permissions: {e}"))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut key_file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)
+            .map_err(|e| format!("failed to create {}: {e}", key_path.display()))?;
+        key_file
+            .write_all(key_pem.as_bytes())
+            .map_err(|e| format!("failed to write {}: {e}", key_path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(&key_path, &key_pem)
+            .map_err(|e| format!("failed to write {}: {e}", key_path.display()))?;
     }
 
     println!("cert: {}", cert_path.display());

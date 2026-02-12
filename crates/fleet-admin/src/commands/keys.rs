@@ -131,13 +131,14 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         .map_err(|_| format!("invalid duration number: {num_str}"))?;
 
     let seconds = match unit {
-        "s" => num,
-        "m" => num * 60,
-        "h" => num * 3600,
-        "d" => num * 86400,
-        "w" => num * 604_800,
+        "s" => Some(num),
+        "m" => num.checked_mul(60),
+        "h" => num.checked_mul(3600),
+        "d" => num.checked_mul(86400),
+        "w" => num.checked_mul(604_800),
         _ => return Err(format!("unknown duration unit: {unit} (use s/m/h/d/w)")),
-    };
+    }
+    .ok_or_else(|| format!("duration too large: {s}"))?;
 
     Ok(Duration::from_secs(seconds))
 }
@@ -172,6 +173,15 @@ mod tests {
     #[test]
     fn parse_duration_invalid_number() {
         assert!(parse_duration("abcd").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_overflow() {
+        let err = parse_duration("999999999999999999w").unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "expected 'too large', got: {err}"
+        );
     }
 
     #[test]
