@@ -42,12 +42,26 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+/// Maximum query length in bytes. Prevents denial-of-service via pathological parser input.
+const MAX_QUERY_LEN: usize = 65_536;
+
 /// Parse a fleet DSL query string into a structured AST.
 ///
 /// # Errors
 ///
 /// Returns a list of parse errors if the input is not valid fleet DSL.
 pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
+    if input.len() > MAX_QUERY_LEN {
+        return Err(vec![ParseError {
+            message: format!(
+                "query too long ({} bytes, max {MAX_QUERY_LEN})",
+                input.len()
+            ),
+            span: 0..input.len(),
+            label: None,
+        }]);
+    }
+
     let parser = query_parser();
     let result = parser.parse(input);
 
@@ -271,6 +285,29 @@ mod tests {
         // overflowing integers must produce a parse error, not a panic
         let result = parse("x | where count > 99999999999999999999999");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_query_length_limit_exceeded() {
+        let long_query = "a".repeat(65_537);
+        let result = parse(&long_query);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors[0].message.contains("query too long"));
+    }
+
+    #[test]
+    fn test_query_at_length_limit_not_rejected_for_length() {
+        // exactly at limit — should NOT fail with "query too long"
+        // (may fail for syntax reasons, which is fine)
+        let query = "a".repeat(65_536);
+        let result = parse(&query);
+        if let Err(errors) = &result {
+            assert!(
+                !errors.iter().any(|e| e.message.contains("query too long")),
+                "should not be rejected for length at exact limit"
+            );
+        }
     }
 
     #[test]
