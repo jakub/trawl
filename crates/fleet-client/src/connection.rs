@@ -3,6 +3,7 @@
 use fleet_engine::value::QueryResult;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::error::ClientError;
 
@@ -10,7 +11,7 @@ use crate::error::ClientError;
 #[derive(Clone)]
 pub struct HttpClient {
     base_url: String,
-    token: String,
+    token: Zeroizing<String>,
     client: Client,
 }
 
@@ -34,7 +35,7 @@ impl HttpClient {
             .map_err(sanitize_reqwest_error)?;
         Ok(Self {
             base_url: base_url.into(),
-            token: token.into(),
+            token: Zeroizing::new(token.into()),
             client,
         })
     }
@@ -55,7 +56,7 @@ impl HttpClient {
             .map_err(sanitize_reqwest_error)?;
         Ok(Self {
             base_url: base_url.into(),
-            token: token.into(),
+            token: Zeroizing::new(token.into()),
             client,
         })
     }
@@ -68,7 +69,7 @@ impl HttpClient {
     ) -> Self {
         Self {
             base_url: base_url.into(),
-            token: token.into(),
+            token: Zeroizing::new(token.into()),
             client,
         }
     }
@@ -124,7 +125,7 @@ impl HttpClient {
         req: reqwest::RequestBuilder,
     ) -> Result<T, ClientError> {
         let resp = req
-            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Authorization", format!("Bearer {}", self.token.as_str()))
             .send()
             .await
             .map_err(sanitize_reqwest_error)?;
