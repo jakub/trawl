@@ -30,3 +30,23 @@ pub(crate) fn coerce_filter_value(s: &str) -> SqlValue {
     }
     SqlValue::String(s.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_field_escapes_embedded_quotes() {
+        assert_eq!(quote_field(r#"field"name"#), r#""field""name""#);
+    }
+
+    #[test]
+    fn quote_field_maps_timestamp() {
+        assert_eq!(quote_field("@timestamp"), "\"timestamp\"");
+    }
+
+    #[test]
+    fn quote_field_simple() {
+        assert_eq!(quote_field("host"), "\"host\"");
+    }
+}

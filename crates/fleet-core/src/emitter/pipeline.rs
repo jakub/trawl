@@ -111,7 +111,8 @@ fn process_limit(limit_stage: &crate::ast::LimitStage, ctx: &mut EmitterState) {
 }
 
 fn process_table(table_stage: &crate::ast::TableStage, ctx: &mut EmitterState) {
-    if ctx.has_projection {
+    // flush if prior aggregation or projection would be clobbered
+    if ctx.has_aggregation || ctx.has_projection {
         ctx.flush_to_cte();
     }
 

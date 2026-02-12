@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn search_regex() {
-        assert_snapshot!(emit_dsl(r"host:regex:web-\d+"));
+        assert_snapshot!(emit_dsl(r"host:/web-\d+/"));
     }
 
     #[test]

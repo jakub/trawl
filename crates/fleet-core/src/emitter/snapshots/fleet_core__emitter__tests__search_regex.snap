@@ -1,10 +1,10 @@
 ---
 source: crates/fleet-core/src/emitter/mod.rs
-expression: "emit_dsl(r\"host:regex:web-\\d+\")"
+expression: "emit_dsl(r\"host:/web-\\d+/\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet')
-WHERE "host" = ?
+WHERE regexp_matches("host", ?)
 ---
 params:
-  0: 'regex:web-\d+'
+  0: 'web-\d+'
