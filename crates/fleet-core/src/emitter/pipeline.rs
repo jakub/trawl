@@ -30,8 +30,8 @@ fn process_stats(
     agg_stage: &crate::ast::StatsStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    // if we already have an aggregation, flush first
-    if ctx.has_aggregation {
+    // flush if a prior aggregation or projection would be clobbered
+    if ctx.has_aggregation || ctx.has_projection {
         ctx.flush_to_cte();
     }
 
@@ -74,8 +74,8 @@ fn process_where(
     where_stage: &crate::ast::WhereStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    // if we have aggregation, flush so the WHERE applies to the CTE output
-    if ctx.has_aggregation {
+    // flush if prior aggregation or projection so WHERE applies to CTE output
+    if ctx.has_aggregation || ctx.has_projection {
         ctx.flush_to_cte();
     }
 
@@ -86,7 +86,8 @@ fn process_where(
 }
 
 fn process_sort(sort_stage: &crate::ast::SortStage, ctx: &mut EmitterState) {
-    if !ctx.order_by.is_empty() {
+    // flush if prior aggregation, projection, or existing order
+    if ctx.has_aggregation || ctx.has_projection || !ctx.order_by.is_empty() {
         ctx.flush_to_cte();
     }
 
@@ -101,7 +102,8 @@ fn process_sort(sort_stage: &crate::ast::SortStage, ctx: &mut EmitterState) {
 }
 
 fn process_limit(limit_stage: &crate::ast::LimitStage, ctx: &mut EmitterState) {
-    if ctx.limit.is_some() {
+    // flush if prior aggregation, projection, or existing limit
+    if ctx.has_aggregation || ctx.has_projection || ctx.limit.is_some() {
         ctx.flush_to_cte();
     }
 

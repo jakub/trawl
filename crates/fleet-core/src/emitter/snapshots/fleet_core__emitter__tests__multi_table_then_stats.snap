@@ -1,0 +1,11 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | table host, service | stats count() by host\")"
+---
+WITH _s0 AS (
+  SELECT "host", "service"
+  FROM read_parquet('/data/**/*.parquet')
+)
+SELECT "host", COUNT(*) AS "count"
+FROM "_s0"
+GROUP BY "host"

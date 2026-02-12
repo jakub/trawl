@@ -305,6 +305,11 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn multi_table_then_stats() {
+        assert_snapshot!(emit_dsl("* | table host, service | stats count() by host"));
+    }
+
     // -----------------------------------------------------------------------
     // expressions in where
     // -----------------------------------------------------------------------

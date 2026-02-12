@@ -2,10 +2,14 @@
 source: crates/fleet-core/src/emitter/mod.rs
 expression: "emit_dsl(\"service:nginx | stats count() by host | sort -count | limit 10\")"
 ---
-SELECT "host", COUNT(*) AS "count"
-FROM read_parquet('/data/**/*.parquet')
-WHERE "service" = ?
-GROUP BY "host"
+WITH _s0 AS (
+  SELECT "host", COUNT(*) AS "count"
+  FROM read_parquet('/data/**/*.parquet')
+  WHERE "service" = ?
+  GROUP BY "host"
+)
+SELECT *
+FROM "_s0"
 ORDER BY "count" DESC
 LIMIT 10
 ---
