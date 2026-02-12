@@ -59,7 +59,12 @@ impl Executor {
         // after DuckDB resolves table-valued functions like read_parquet()
         let mut result_rows = stmt.query(param_refs.as_slice())?;
 
-        let stmt_ref = result_rows.as_ref().unwrap();
+        let stmt_ref =
+            result_rows
+                .as_ref()
+                .ok_or(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    "statement unavailable after query execution".into(),
+                )))?;
         let col_count = stmt_ref.column_count();
         let columns: Vec<Column> = stmt_ref
             .column_names()

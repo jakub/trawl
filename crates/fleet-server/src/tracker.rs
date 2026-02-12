@@ -1,7 +1,7 @@
 //! Query lifecycle tracking — active queries, history ring buffer, and timeout recording.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -168,13 +168,13 @@ impl QueryTracker {
 
     /// Recent completed queries (most recent first).
     pub fn recent(&self) -> Vec<CompletedQuery> {
-        let history = self.history.lock().expect("history lock poisoned");
+        let history = self.history.lock();
         history.iter().rev().cloned().collect()
     }
 
     /// Push a completed query into the ring buffer, evicting the oldest if full.
     fn push_history(&self, entry: CompletedQuery) {
-        let mut history = self.history.lock().expect("history lock poisoned");
+        let mut history = self.history.lock();
         if history.len() >= self.max_history {
             history.pop_front();
         }

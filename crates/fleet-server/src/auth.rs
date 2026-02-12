@@ -4,7 +4,9 @@
 //! token against the `KeyStore` in a blocking task, and injects the
 //! [`VerifiedKey`] into request extensions for downstream handlers.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use axum::extract::Request;
 use axum::http::HeaderMap;
@@ -36,9 +38,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
     let token = raw_token.to_owned();
 
     let verified = match tokio::task::spawn_blocking(move || {
-        let store = key_store
-            .lock()
-            .expect("key store mutex poisoned — auth task panicked previously");
+        let store = key_store.lock();
         store.verify_key(&token)
     })
     .await

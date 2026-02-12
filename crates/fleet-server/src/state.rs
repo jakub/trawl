@@ -1,7 +1,9 @@
 //! Shared application state for axum handlers.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::time::Instant;
 
 use fleet_auth::KeyStore;

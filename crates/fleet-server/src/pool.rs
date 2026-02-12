@@ -11,8 +11,10 @@
 //! interrupted task completes.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use chrono::Timelike as _;
@@ -54,8 +56,8 @@ pub struct ExecutorPool {
 
 impl std::fmt::Debug for ExecutorPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let active = self.active_interrupts.lock().map_or(0, |v| v.len());
-        let idle = self.idle.lock().map_or(0, |v| v.len());
+        let active = self.active_interrupts.lock().len();
+        let idle = self.idle.lock().len();
         f.debug_struct("ExecutorPool")
             .field("base_dir", &self.base_dir)
             .field("fallback_glob", &self.fallback_glob)
@@ -98,7 +100,10 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
     let start = now - chrono::Duration::seconds(i64::try_from(total_secs).unwrap_or(i64::MAX));
 
     let mut globs = Vec::new();
-    let mut cursor = start.date_naive().and_hms_opt(start.hour(), 0, 0).unwrap();
+    let mut cursor = start
+        .date_naive()
+        .and_hms_opt(start.hour(), 0, 0)
+        .expect("valid hour from Timelike::hour()");
     let end = now.naive_utc();
     let base = base_dir.trim_end_matches('/');
 
@@ -153,7 +158,7 @@ impl ExecutorPool {
     /// empty (e.g. after a task panic lost an executor), creates a fresh
     /// replacement that won't share the cached database.
     fn take_executor(&self) -> Executor {
-        let mut pool = self.idle.lock().unwrap();
+        let mut pool = self.idle.lock();
         pool.pop().unwrap_or_else(|| {
             tracing::warn!("executor pool unexpectedly empty, creating replacement");
             Executor::new().expect("failed to create replacement DuckDB connection")
@@ -162,7 +167,7 @@ impl ExecutorPool {
 
     /// Return an executor to the pool for reuse.
     fn return_executor(&self, executor: Executor) {
-        self.idle.lock().unwrap().push(executor);
+        self.idle.lock().push(executor);
     }
 
     /// Execute a DSL query, blocking on semaphore acquisition if at capacity.
@@ -222,7 +227,6 @@ impl ExecutorPool {
             let h = Arc::clone(handle);
             self.active_interrupts
                 .lock()
-                .unwrap()
                 .insert(query_id, Box::new(move || h.interrupt()));
         }
 
@@ -246,7 +250,7 @@ impl ExecutorPool {
                 tokio::spawn(async move {
                     match task.await {
                         Ok((executor, _)) => {
-                            idle.lock().unwrap().push(executor);
+                            idle.lock().push(executor);
                         }
                         Err(e) => {
                             tracing::warn!("timed-out query task panicked: {e}");
@@ -258,7 +262,7 @@ impl ExecutorPool {
         };
 
         // Deregister this query's interrupt handle.
-        self.active_interrupts.lock().unwrap().remove(&query_id);
+        self.active_interrupts.lock().remove(&query_id);
 
         result
     }
@@ -267,7 +271,7 @@ impl ExecutorPool {
     /// to cancel in-flight `DuckDB` operations before draining connections.
     pub fn cancel_all(&self) {
         let handles = {
-            let mut guard = self.active_interrupts.lock().unwrap();
+            let mut guard = self.active_interrupts.lock();
             std::mem::take(&mut *guard)
         };
         let count = handles.len();
@@ -322,10 +326,10 @@ mod tests {
 
         // Run two sequential queries — both should succeed and the pool
         // should have the same number of idle executors before and after.
-        let idle_before = pool.idle.lock().unwrap().len();
+        let idle_before = pool.idle.lock().len();
         let _ = pool.execute("service:test", Duration::from_secs(10)).await;
         let _ = pool.execute("service:test", Duration::from_secs(10)).await;
-        let idle_after = pool.idle.lock().unwrap().len();
+        let idle_after = pool.idle.lock().len();
 
         assert_eq!(
             idle_before, idle_after,
