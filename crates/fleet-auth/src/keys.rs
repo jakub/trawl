@@ -30,13 +30,22 @@ pub struct ApiKeyInfo {
 
 /// The result of creating a new API key.
 /// The plaintext token is included ONCE — it is never stored or retrievable.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CreatedKey {
     /// Key metadata.
     pub info: ApiKeyInfo,
     /// The full plaintext token — show to the user immediately, never store.
     /// Wrapped in [`Zeroizing`] to clear from memory on drop.
     pub plaintext_token: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for CreatedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedKey")
+            .field("info", &self.info)
+            .field("plaintext_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A verified API key identity — the result of successful authentication.
@@ -51,4 +60,36 @@ pub struct VerifiedKey {
     pub name: String,
     /// The role granted by this key.
     pub role: Role,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn created_key_debug_redacts_token() {
+        let key = CreatedKey {
+            info: ApiKeyInfo {
+                id: 1,
+                prefix: "abcd1234".into(),
+                name: "test-key".into(),
+                role: Role::Admin,
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                expires_at: None,
+                last_used: None,
+                revoked_at: None,
+            },
+            plaintext_token: Zeroizing::new("flt_supersecrettoken12345".into()),
+        };
+        let debug = format!("{key:?}");
+        assert!(
+            debug.contains("<redacted>"),
+            "should contain redaction marker"
+        );
+        assert!(
+            !debug.contains("supersecret"),
+            "must not contain actual token"
+        );
+    }
 }
