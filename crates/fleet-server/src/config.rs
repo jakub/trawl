@@ -69,27 +69,49 @@ pub struct ServerConfig {
 /// Parquet data source settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DataConfig {
-    /// Glob path passed to `DuckDB` `read_parquet()` (e.g. "/var/lib/fleet/data/**/*.parquet").
+    /// Directory containing parquet files (e.g. "/var/lib/fleet/data").
+    ///
+    /// Accepts either a bare directory path or a glob pattern for backwards
+    /// compatibility. If the path contains glob characters (`*`, `?`, `[`),
+    /// they are stripped to derive the base directory.
     pub path: String,
 }
 
 impl DataConfig {
-    /// Extract the base directory from the glob path.
-    ///
-    /// Strips `**/*.parquet` (or any glob suffix) to get the root directory
-    /// that the query engine reads from. Compaction writes parquet files here.
+    /// The base directory where parquet files live.
     pub fn base_dir(&self) -> PathBuf {
-        // Walk backwards to find the first path component without glob chars.
-        let path = Path::new(&self.path);
-        let mut base = PathBuf::new();
-        for component in path.components() {
-            let s = component.as_os_str().to_string_lossy();
-            if s.contains('*') || s.contains('?') || s.contains('[') {
-                break;
+        if self.has_glob() {
+            // Legacy glob path — strip glob components.
+            let path = Path::new(&self.path);
+            let mut base = PathBuf::new();
+            for component in path.components() {
+                let s = component.as_os_str().to_string_lossy();
+                if s.contains('*') || s.contains('?') || s.contains('[') {
+                    break;
+                }
+                base.push(component);
             }
-            base.push(component);
+            base
+        } else {
+            PathBuf::from(&self.path)
         }
-        base
+    }
+
+    /// Return the glob pattern for `read_parquet()`.
+    ///
+    /// If the configured path is already a glob, returns it as-is.
+    /// If it's a bare directory, appends `**/*.parquet`.
+    pub fn parquet_glob(&self) -> String {
+        if self.has_glob() {
+            self.path.clone()
+        } else {
+            format!("{}/**/*.parquet", self.path.trim_end_matches('/'))
+        }
+    }
+
+    /// Whether the configured path contains glob characters.
+    fn has_glob(&self) -> bool {
+        self.path.contains('*') || self.path.contains('?') || self.path.contains('[')
     }
 }
 
@@ -478,11 +500,43 @@ db_path = "/tmp/auth.db"
     }
 
     #[test]
+    fn base_dir_bare_directory() {
+        let data = DataConfig {
+            path: "/var/lib/fleet/data".into(),
+        };
+        assert_eq!(data.base_dir(), std::path::Path::new("/var/lib/fleet/data"));
+    }
+
+    #[test]
+    fn parquet_glob_from_directory() {
+        let data = DataConfig {
+            path: "/var/lib/fleet/data".into(),
+        };
+        assert_eq!(data.parquet_glob(), "/var/lib/fleet/data/**/*.parquet");
+    }
+
+    #[test]
+    fn parquet_glob_passthrough_existing_glob() {
+        let data = DataConfig {
+            path: "/data/**/*.parquet".into(),
+        };
+        assert_eq!(data.parquet_glob(), "/data/**/*.parquet");
+    }
+
+    #[test]
+    fn parquet_glob_strips_trailing_slash() {
+        let data = DataConfig {
+            path: "/var/lib/fleet/data/".into(),
+        };
+        assert_eq!(data.parquet_glob(), "/var/lib/fleet/data/**/*.parquet");
+    }
+
+    #[test]
     fn ingest_defaults_when_omitted() {
         let toml = r#"
 [server]
 [data]
-path = "/data/**/*.parquet"
+path = "/data"
 [auth]
 db_path = "/tmp/auth.db"
 "#;
