@@ -37,22 +37,20 @@ pub fn router(state: AppState) -> Router {
     let max_conns = state.max_concurrent_requests;
     let cors_origins = state.cors_allowed_origins.clone();
 
-    // Routes that require authentication.
+    // Routes that require authentication — nested under /api/v1 so the
+    // auth middleware is structurally bound to this subtree.
     let authenticated = Router::new()
-        .route("/api/v1/query", post(handlers::query))
-        .route("/api/v1/schema", get(handlers::schema))
-        .route("/api/v1/queries", get(handlers::queries))
+        .route("/query", post(handlers::query))
+        .route("/schema", get(handlers::schema))
+        .route("/queries", get(handlers::queries))
         .layer(middleware::from_fn(auth_middleware));
-
-    // Routes that are public (no auth required).
-    let public = Router::new().route("/api/v1/health", get(handlers::health));
 
     // Shared key store injected into extensions for the auth middleware.
     let key_store = Arc::clone(&state.key_store);
 
     let mut app = Router::new()
-        .merge(authenticated)
-        .merge(public)
+        .nest("/api/v1", authenticated)
+        .route("/api/v1/health", get(handlers::health))
         // -- security hardening layers (outermost applied first) --
         .layer(CatchPanicLayer::new())
         .layer(RequestBodyLimitLayer::new(max_body))
