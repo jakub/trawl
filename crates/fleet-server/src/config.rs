@@ -56,6 +56,12 @@ pub struct ServerConfig {
     /// Set to 0 to disable automatic cert reload.
     #[serde(default = "default_tls_reload_interval_secs")]
     pub tls_reload_interval_secs: u64,
+
+    /// Allowed CORS origins (e.g. `["https://fleet.example.com"]`).
+    /// Empty list (default) means no CORS headers are sent, so the browser's
+    /// same-origin policy blocks all cross-origin requests.
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// Parquet data source settings.
@@ -373,5 +379,36 @@ db_path = "/tmp/auth.db"
         let config: Config = toml::from_str(toml).unwrap();
         let warns = config.warnings();
         assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn cors_defaults_to_empty() {
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.server.cors_allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn cors_parses_origins() {
+        let toml = r#"
+[server]
+cors_allowed_origins = ["https://fleet.example.com", "https://admin.example.com"]
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.cors_allowed_origins.len(), 2);
+        assert_eq!(
+            config.server.cors_allowed_origins[0],
+            "https://fleet.example.com"
+        );
     }
 }

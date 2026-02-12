@@ -37,6 +37,8 @@ pub struct AppState {
     pub max_concurrent_requests: usize,
     /// Graceful shutdown drain timeout in seconds.
     pub shutdown_drain_secs: u64,
+    /// Allowed CORS origins (empty = no CORS headers sent).
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// A cached schema result with an expiry timestamp.
@@ -74,6 +76,7 @@ impl AppState {
             max_request_body_bytes: config.server.max_request_body_bytes,
             max_concurrent_requests: config.server.max_concurrent_requests,
             shutdown_drain_secs: config.server.shutdown_drain_secs,
+            cors_allowed_origins: config.server.cors_allowed_origins.clone(),
         })
     }
 }

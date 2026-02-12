@@ -35,6 +35,7 @@ use crate::tls;
 pub fn router(state: AppState) -> Router {
     let max_body = state.max_request_body_bytes;
     let max_conns = state.max_concurrent_requests;
+    let cors_origins = state.cors_allowed_origins.clone();
 
     // Routes that require authentication.
     let authenticated = Router::new()
@@ -49,7 +50,7 @@ pub fn router(state: AppState) -> Router {
     // Shared key store injected into extensions for the auth middleware.
     let key_store = Arc::clone(&state.key_store);
 
-    Router::new()
+    let mut app = Router::new()
         .merge(authenticated)
         .merge(public)
         // -- security hardening layers (outermost applied first) --
@@ -63,46 +64,53 @@ pub fn router(state: AppState) -> Router {
         .layer(SetResponseHeaderLayer::overriding(
             header::STRICT_TRANSPORT_SECURITY,
             HeaderValue::from_static("max-age=63072000; includeSubDomains"),
-        ))
-        .layer(
+        ));
+
+    // Only add CORS headers when origins are explicitly configured.
+    // Empty list = no CORS layer = browser same-origin policy denies cross-origin.
+    if !cors_origins.is_empty() {
+        let origins: Vec<HeaderValue> =
+            cors_origins.iter().filter_map(|o| o.parse().ok()).collect();
+        app = app.layer(
             CorsLayer::new()
+                .allow_origin(origins)
                 .allow_methods([Method::GET, Method::POST])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
-        )
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|request: &axum::http::Request<_>| {
-                    tracing::info_span!(
-                        "http_request",
-                        method = %request.method(),
-                        path = %request.uri().path(),
-                    )
-                })
-                .on_response(
-                    |response: &axum::http::Response<_>,
-                     latency: Duration,
-                     _span: &tracing::Span| {
-                        tracing::info!(
-                            status = response.status().as_u16(),
-                            latency_ms = latency.as_millis(),
-                            "response"
-                        );
-                    },
+        );
+    }
+
+    app.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
                 )
-                .on_failure(
-                    |error: tower_http::classify::ServerErrorsFailureClass,
-                     latency: Duration,
-                     _span: &tracing::Span| {
-                        tracing::error!(
-                            error = %error,
-                            latency_ms = latency.as_millis(),
-                            "request failed"
-                        );
-                    },
-                ),
-        )
-        .layer(axum::Extension(key_store))
-        .with_state(state)
+            })
+            .on_response(
+                |response: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
+                    tracing::info!(
+                        status = response.status().as_u16(),
+                        latency_ms = latency.as_millis(),
+                        "response"
+                    );
+                },
+            )
+            .on_failure(
+                |error: tower_http::classify::ServerErrorsFailureClass,
+                 latency: Duration,
+                 _span: &tracing::Span| {
+                    tracing::error!(
+                        error = %error,
+                        latency_ms = latency.as_millis(),
+                        "request failed"
+                    );
+                },
+            ),
+    )
+    .layer(axum::Extension(key_store))
+    .with_state(state)
 }
 
 /// Start the HTTPS server with graceful shutdown.
