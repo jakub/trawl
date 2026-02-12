@@ -197,6 +197,14 @@ pub enum PipeStage {
     Sort(SortStage),
     Limit(LimitStage),
     Table(TableStage),
+    Top(TopStage),
+    Rare(RareStage),
+    Drop(DropStage),
+    Let(LetStage),
+    Extract(ExtractStage),
+    Dedup(DedupStage),
+    Timechart(TimechartStage),
+    Pivot(PivotStage),
 }
 
 impl fmt::Display for PipeStage {
@@ -207,6 +215,14 @@ impl fmt::Display for PipeStage {
             Self::Sort(_) => write!(f, "sort"),
             Self::Limit(_) => write!(f, "limit"),
             Self::Table(_) => write!(f, "table"),
+            Self::Top(_) => write!(f, "top"),
+            Self::Rare(_) => write!(f, "rare"),
+            Self::Drop(_) => write!(f, "drop"),
+            Self::Let(_) => write!(f, "let"),
+            Self::Extract(_) => write!(f, "extract"),
+            Self::Dedup(_) => write!(f, "dedup"),
+            Self::Timechart(_) => write!(f, "timechart"),
+            Self::Pivot(_) => write!(f, "pivot"),
         }
     }
 }
@@ -272,6 +288,74 @@ pub struct LimitStage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableStage {
     pub fields: Vec<String>,
+}
+
+/// `top 10 host` — frequency analysis (most common values).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopStage {
+    pub count: u64,
+    pub field: String,
+    pub by: Vec<String>,
+}
+
+/// `rare 5 status` — inverse frequency analysis (least common values).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RareStage {
+    pub count: u64,
+    pub field: String,
+    pub by: Vec<String>,
+}
+
+/// `drop message, raw` — exclude specific columns from output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropStage {
+    pub fields: Vec<String>,
+}
+
+/// `let duration_ms = duration * 1000` — computed/derived field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LetStage {
+    pub field: String,
+    pub expr: Spanned<Expr>,
+}
+
+/// The mode of extraction for `extract`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtractMode {
+    /// Named-group regex extraction.
+    Regex(String),
+    /// Key-value pair extraction (`extract kv`).
+    KeyValue,
+}
+
+/// `extract "(?P<ip>\\d+)" from message` — regex-based field extraction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractStage {
+    pub mode: ExtractMode,
+    /// Source field for extraction. `None` defaults to `message`.
+    pub source_field: Option<String>,
+}
+
+/// `dedup host, service` — deduplicate rows by field(s), keeping most recent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DedupStage {
+    pub fields: Vec<String>,
+}
+
+/// `timechart span=5m count() by service` — time-bucketed aggregation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimechartStage {
+    pub span: Option<FleetDuration>,
+    pub aggregations: Vec<AggExpr>,
+    pub group_by: Vec<String>,
+}
+
+/// `pivot count() on status by host` — pivot table transformation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PivotStage {
+    pub aggregation: AggExpr,
+    pub on_field: String,
+    pub by: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

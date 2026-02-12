@@ -6,11 +6,14 @@
 use chumsky::prelude::*;
 
 use crate::ast::{
-    AggExpr, LimitStage, PipeStage, SortDirection, SortField, SortStage, Spanned, StatsStage,
-    TableStage, WhereStage,
+    AggExpr, DedupStage, DropStage, ExtractMode, ExtractStage, LetStage, LimitStage, PipeStage,
+    PivotStage, RareStage, SortDirection, SortField, SortStage, Spanned, StatsStage, TableStage,
+    TimechartStage, TopStage, WhereStage,
 };
 use crate::parser::expr::expr;
-use crate::parser::primitives::{ParserExtra, ParserInput, field_name, keyword, spanned, uint};
+use crate::parser::primitives::{
+    ParserExtra, ParserInput, duration, field_name, keyword, quoted_string, spanned, uint,
+};
 
 /// Parse an aggregation expression like `count()`, `avg(duration)`,
 /// or `count() as total`.
@@ -127,15 +130,209 @@ fn table_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("table stage")
 }
 
+/// Parse a `top` stage: `top N field [by field(, field)*]`
+fn top_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+    keyword("top")
+        .padded()
+        .ignore_then(uint())
+        .then(field_name().padded())
+        .then(
+            keyword("by")
+                .padded()
+                .ignore_then(
+                    field_name()
+                        .separated_by(just(',').padded())
+                        .at_least(1)
+                        .collect::<Vec<_>>(),
+                )
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .map(|((count, field), by)| PipeStage::Top(TopStage { count, field, by }))
+        .labelled("top stage")
+}
+
+/// Parse a `rare` stage: `rare N field [by field(, field)*]`
+fn rare_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("rare")
+        .padded()
+        .ignore_then(uint())
+        .then(field_name().padded())
+        .then(
+            keyword("by")
+                .padded()
+                .ignore_then(
+                    field_name()
+                        .separated_by(just(',').padded())
+                        .at_least(1)
+                        .collect::<Vec<_>>(),
+                )
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .map(|((count, field), by)| PipeStage::Rare(RareStage { count, field, by }))
+        .labelled("rare stage")
+}
+
+/// Parse a `drop` stage: `drop field(, field)*`
+fn drop_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("drop")
+        .padded()
+        .ignore_then(
+            field_name()
+                .separated_by(just(',').padded())
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|fields| PipeStage::Drop(DropStage { fields }))
+        .labelled("drop stage")
+}
+
+/// Parse a `let` stage: `let field = expr`
+fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+    keyword("let")
+        .padded()
+        .ignore_then(field_name())
+        .then_ignore(just('=').padded())
+        .then(expr())
+        .map(|(field, expr)| PipeStage::Let(LetStage { field, expr }))
+        .labelled("let stage")
+}
+
+/// Parse an `extract` stage: `extract "pattern" [from field]` or `extract kv [from field]`
+fn extract_stage<'src>()
+-> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+    let from_clause = keyword("from").padded().ignore_then(field_name()).or_not();
+
+    let kv_mode = keyword("extract")
+        .padded()
+        .ignore_then(keyword("kv"))
+        .ignore_then(from_clause.clone())
+        .map(|source_field| {
+            PipeStage::Extract(ExtractStage {
+                mode: ExtractMode::KeyValue,
+                source_field,
+            })
+        });
+
+    let regex_mode = keyword("extract")
+        .padded()
+        .ignore_then(quoted_string())
+        .then(from_clause)
+        .map(|(pattern, source_field)| {
+            PipeStage::Extract(ExtractStage {
+                mode: ExtractMode::Regex(pattern),
+                source_field,
+            })
+        });
+
+    choice((kv_mode, regex_mode)).labelled("extract stage")
+}
+
+/// Parse a `dedup` stage: `dedup field(, field)*`
+fn dedup_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("dedup")
+        .padded()
+        .ignore_then(
+            field_name()
+                .separated_by(just(',').padded())
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|fields| PipeStage::Dedup(DedupStage { fields }))
+        .labelled("dedup stage")
+}
+
+/// Parse a `timechart` stage: `timechart [span=DURATION] agg(, agg)* [by field(, field)*]`
+fn timechart_stage<'src>()
+-> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+    keyword("timechart")
+        .padded()
+        .ignore_then(
+            keyword("span")
+                .then_ignore(just('='))
+                .ignore_then(duration())
+                .padded()
+                .or_not(),
+        )
+        .then(
+            agg_expr()
+                .separated_by(just(',').padded())
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .then(
+            keyword("by")
+                .padded()
+                .ignore_then(
+                    field_name()
+                        .separated_by(just(',').padded())
+                        .at_least(1)
+                        .collect::<Vec<_>>(),
+                )
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .map(|((span, aggregations), group_by)| {
+            PipeStage::Timechart(TimechartStage {
+                span,
+                aggregations,
+                group_by,
+            })
+        })
+        .labelled("timechart stage")
+}
+
+/// Parse a `pivot` stage: `pivot agg on field [by field(, field)*]`
+fn pivot_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("pivot")
+        .padded()
+        .ignore_then(agg_expr())
+        .then_ignore(keyword("on").padded())
+        .then(field_name())
+        .then(
+            keyword("by")
+                .padded()
+                .ignore_then(
+                    field_name()
+                        .separated_by(just(',').padded())
+                        .at_least(1)
+                        .collect::<Vec<_>>(),
+                )
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .map(|((aggregation, on_field), by)| {
+            PipeStage::Pivot(PivotStage {
+                aggregation,
+                on_field,
+                by,
+            })
+        })
+        .labelled("pivot stage")
+}
+
 /// Parse a single pipe stage.
 fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     choice((
         stats_stage(),
+        timechart_stage(),
         where_stage(),
         sort_stage(),
         limit_stage(),
+        let_stage(),
+        extract_stage(),
         table_stage(),
+        top_stage(),
+        rare_stage(),
+        dedup_stage(),
+        drop_stage(),
+        pivot_stage(),
     ))
     .labelled("pipe stage")
 }
