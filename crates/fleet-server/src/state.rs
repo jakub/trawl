@@ -17,23 +17,44 @@ use crate::tracker::QueryTracker;
 /// Shared state injected into handlers via axum's `State` extractor.
 #[derive(Debug, Clone)]
 pub struct AppState {
-    /// Bounded executor pool for query execution.
-    pub pool: ExecutorPool,
-    /// Path to the `SQLite` auth database (kept for admin commands).
-    pub auth_db_path: Arc<PathBuf>,
-    /// Shared `KeyStore` connection, opened once at startup.
-    pub key_store: Arc<Mutex<KeyStore>>,
+    /// Query execution resources.
+    pub query: QueryState,
+    /// Authentication resources.
+    pub auth: AuthState,
+    /// Ingest pipeline resources.
+    pub ingest: IngestState,
     /// Server start time (for health endpoint uptime).
     pub start_time: Instant,
+}
+
+/// Query execution state: pool, tracker, timeout, and schema cache.
+#[derive(Debug, Clone)]
+pub struct QueryState {
+    /// Bounded executor pool for query execution.
+    pub pool: ExecutorPool,
+    /// Query timeout in seconds.
+    pub timeout_secs: u64,
+    /// Query lifecycle tracker (active + history).
+    pub tracker: Arc<QueryTracker>,
     /// Cached schema introspection result with TTL.
     ///
     /// Uses `Mutex` (not `RwLock`) to prevent thundering herd: only one
     /// request refreshes the cache while others wait on the lock.
     pub schema_cache: Arc<tokio::sync::Mutex<Option<CachedSchema>>>,
-    /// Query lifecycle tracker (active + history).
-    pub tracker: Arc<QueryTracker>,
-    /// Query timeout in seconds.
-    pub timeout_secs: u64,
+}
+
+/// Authentication state: key store and database path.
+#[derive(Debug, Clone)]
+pub struct AuthState {
+    /// Shared `KeyStore` connection, opened once at startup.
+    pub key_store: Arc<Mutex<KeyStore>>,
+    /// Path to the `SQLite` auth database (kept for admin commands).
+    pub db_path: Arc<PathBuf>,
+}
+
+/// Ingest pipeline state.
+#[derive(Debug, Clone)]
+pub struct IngestState {
     /// WAL writer for ingested events (None if ingest is disabled).
     pub wal_writer: Option<Arc<WalWriter>>,
 }
@@ -84,18 +105,22 @@ impl AppState {
         };
 
         let state = Self {
-            pool: ExecutorPool::new(
-                config.data.base_dir().to_string_lossy().into_owned(),
-                config.server.max_concurrent_queries,
-                config.server.max_result_rows,
-            ),
-            auth_db_path: Arc::new(config.auth.db_path.clone()),
-            key_store: Arc::new(Mutex::new(key_store)),
+            query: QueryState {
+                pool: ExecutorPool::new(
+                    config.data.base_dir().to_string_lossy().into_owned(),
+                    config.server.max_concurrent_queries,
+                    config.server.max_result_rows,
+                ),
+                timeout_secs: config.server.timeout_secs,
+                tracker: Arc::new(QueryTracker::new()),
+                schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            },
+            auth: AuthState {
+                key_store: Arc::new(Mutex::new(key_store)),
+                db_path: Arc::new(config.auth.db_path.clone()),
+            },
+            ingest: IngestState { wal_writer },
             start_time: Instant::now(),
-            schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            tracker: Arc::new(QueryTracker::new()),
-            timeout_secs: config.server.timeout_secs,
-            wal_writer,
         };
 
         let http = HttpConfig {

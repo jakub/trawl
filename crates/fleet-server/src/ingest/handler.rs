@@ -60,6 +60,7 @@ pub async fn ingest(
     }
 
     let wal_writer = state
+        .ingest
         .wal_writer
         .as_ref()
         .ok_or_else(|| ServerError::Internal("ingest not enabled".into()))?;

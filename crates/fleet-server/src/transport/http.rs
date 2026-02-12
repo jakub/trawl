@@ -37,7 +37,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let max_body = http.max_request_body_bytes;
     let max_conns = http.max_concurrent_requests;
     let cors_origins = &http.cors_allowed_origins;
-    let ingest_enabled = state.wal_writer.is_some();
+    let ingest_enabled = state.ingest.wal_writer.is_some();
 
     // Query routes: authentication + default body limit (128 KB).
     let authenticated = Router::new()
@@ -48,7 +48,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .layer(RequestBodyLimitLayer::new(max_body));
 
     // Shared key store injected into extensions for the auth middleware.
-    let key_store = Arc::clone(&state.key_store);
+    let key_store = Arc::clone(&state.auth.key_store);
 
     // Ingest route: authentication + larger body limit (16 MB default).
     let ingest_routes = if ingest_enabled {
@@ -152,7 +152,7 @@ pub async fn serve(
     }
 
     let tls_acceptor = TlsAcceptor::from(tls_config);
-    let pool = state.pool.clone();
+    let pool = state.query.pool.clone();
     let app = router(state, http);
 
     let listener = TcpListener::bind(addr)

@@ -77,15 +77,15 @@ pub async fn query(
         "executing query"
     );
 
-    let query_id = state.tracker.start(&verified, &req.query);
-    let timeout = std::time::Duration::from_secs(state.timeout_secs);
+    let query_id = state.query.tracker.start(&verified, &req.query);
+    let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
-    let result = state.pool.execute(&req.query, timeout).await;
+    let result = state.query.pool.execute(&req.query, timeout).await;
 
     match result {
         Ok(qr) => {
             let rows = qr.row_count();
-            state.tracker.complete(query_id, rows);
+            state.query.tracker.complete(query_id, rows);
             tracing::info!(
                 user = %verified.name,
                 rows,
@@ -95,12 +95,12 @@ pub async fn query(
             Ok(Json(qr))
         }
         Err(ServerError::Timeout) => {
-            state.tracker.timeout(query_id);
+            state.query.tracker.timeout(query_id);
             tracing::warn!(
                 user = %verified.name,
                 query = %req.query,
                 query_id,
-                timeout_secs = state.timeout_secs,
+                timeout_secs = state.query.timeout_secs,
                 "query timed out"
             );
             Err(ServerError::Timeout)
@@ -109,7 +109,7 @@ pub async fn query(
             // SECURITY: use safe_message() to redact database internals
             // from tracker history and logs.
             let safe_msg = e.safe_message();
-            state.tracker.fail(query_id, &safe_msg);
+            state.query.tracker.fail(query_id, &safe_msg);
             match &e {
                 ServerError::Engine(
                     fleet_engine::error::EngineError::Parse(_)
@@ -161,7 +161,7 @@ pub async fn schema(
 
     // Hold the mutex for the full check-then-refresh cycle to prevent
     // thundering herd: only one request refreshes while others wait.
-    let mut cache = state.schema_cache.lock().await;
+    let mut cache = state.query.schema_cache.lock().await;
 
     if let Some(cached) = &*cache {
         if cached.cached_at.elapsed().as_secs() < SCHEMA_CACHE_TTL_SECS {
@@ -182,7 +182,7 @@ pub async fn schema(
 
     tracing::info!(user = %verified.name, "refreshing schema cache");
     let start = std::time::Instant::now();
-    let result = state.pool.describe_schema().await?;
+    let result = state.query.pool.describe_schema().await?;
     let elapsed = start.elapsed().as_millis();
 
     tracing::info!(
@@ -223,8 +223,8 @@ pub async fn queries(
     }
 
     Ok(Json(QueriesResponse {
-        active: state.tracker.active(),
-        recent: state.tracker.recent(),
+        active: state.query.tracker.active(),
+        recent: state.query.tracker.recent(),
     }))
 }
 

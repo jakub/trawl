@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let wal_dir = config.wal_dir();
 
         // Ensure the WAL directory exists at startup.
-        if let Some(writer) = &state.wal_writer {
+        if let Some(writer) = &state.ingest.wal_writer {
             writer.ensure_dir().map_err(|e| {
                 format!("failed to create WAL directory {}: {e}", wal_dir.display())
             })?;
