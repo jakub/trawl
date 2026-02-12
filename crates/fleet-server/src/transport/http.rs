@@ -138,6 +138,7 @@ pub async fn serve(
     }
 
     let tls_acceptor = TlsAcceptor::from(tls_config);
+    let pool = state.pool.clone();
     let app = router(state);
 
     let listener = TcpListener::bind(addr)
@@ -221,6 +222,9 @@ pub async fn serve(
             }
         }
     }
+
+    // Interrupt active DuckDB queries so they don't block the drain.
+    pool.cancel_all();
 
     // Drain in-flight connections with a deadline.
     tracing::info!(
