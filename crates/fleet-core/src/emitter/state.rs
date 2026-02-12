@@ -47,10 +47,16 @@ pub(crate) struct EmitterState {
 pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
     if !source
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"/_.*?{}[]-~".contains(&b))
+        .all(|b| b.is_ascii_alphanumeric() || b"/_.*?{}[]-".contains(&b))
     {
         return Err(super::EmitError::UnsupportedOperation {
             message: format!("source path contains invalid characters: {source}"),
+        });
+    }
+    // reject path traversal via .. components
+    if source.split('/').any(|component| component == "..") {
+        return Err(super::EmitError::UnsupportedOperation {
+            message: format!("source path contains path traversal: {source}"),
         });
     }
     Ok(())

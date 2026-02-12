@@ -408,10 +408,19 @@ mod tests {
     }
 
     #[test]
-    fn accepts_tilde_source() {
+    fn rejects_tilde_source() {
         let query = parser::parse("*").unwrap();
         let result = emit(&query, "~/.fleet/data/*.parquet");
-        assert!(result.is_ok());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_dotdot_source() {
+        let query = parser::parse("*").unwrap();
+        let result = emit(&query, "/data/../etc/passwd/*.parquet");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("path traversal"));
     }
 
     // -----------------------------------------------------------------------
