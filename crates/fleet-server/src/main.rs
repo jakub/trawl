@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting fleetd"
     );
 
-    let state = AppState::from_config(&config)?;
+    let (state, http_config) = AppState::from_config(&config)?;
 
     // Spawn ingest compaction task if ingestion is enabled.
     let compaction_handle = if config.ingest.enabled {
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    http::serve(state, &config.server).await?;
+    http::serve(state, &http_config, &config.server).await?;
 
     // Signal compaction task to shut down.
     if let Some((_handle, shutdown_tx)) = compaction_handle {
@@ -119,10 +119,5 @@ fn init_tracing(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Resolve a path, expanding `~` to the home directory.
 fn resolve_path(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
+    PathBuf::from(shellexpand::tilde(path).as_ref())
 }

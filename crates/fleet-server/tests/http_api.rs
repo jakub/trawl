@@ -117,12 +117,14 @@ async fn setup() -> TestServer {
         ingest: IngestConfig::default(),
     };
 
-    let state = AppState::from_config(&config).expect("failed to create app state");
+    let (state, http_config) = AppState::from_config(&config).expect("failed to create app state");
 
     // Spawn the HTTPS server in a background task.
     let server_config = config.server.clone();
     tokio::spawn(async move {
-        http::serve(state, &server_config).await.unwrap();
+        http::serve(state, &http_config, &server_config)
+            .await
+            .unwrap();
     });
 
     // Give the server a moment to start and bind.

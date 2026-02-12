@@ -29,14 +29,14 @@ use crate::config::ServerConfig;
 use crate::handlers;
 use crate::ingest;
 use crate::shutdown::shutdown_signal;
-use crate::state::AppState;
+use crate::state::{AppState, HttpConfig};
 use crate::tls;
 
 /// Build the axum router with all routes and middleware.
-pub fn router(state: AppState) -> Router {
-    let max_body = state.max_request_body_bytes;
-    let max_conns = state.max_concurrent_requests;
-    let cors_origins = state.cors_allowed_origins.clone();
+pub fn router(state: AppState, http: &HttpConfig) -> Router {
+    let max_body = http.max_request_body_bytes;
+    let max_conns = http.max_concurrent_requests;
+    let cors_origins = &http.cors_allowed_origins;
     let ingest_enabled = state.wal_writer.is_some();
 
     // Query routes: authentication + default body limit (128 KB).
@@ -52,7 +52,7 @@ pub fn router(state: AppState) -> Router {
 
     // Ingest route: authentication + larger body limit (16 MB default).
     let ingest_routes = if ingest_enabled {
-        let ingest_body_limit = state.ingest_max_body_bytes.unwrap_or(16 * 1024 * 1024);
+        let ingest_body_limit = http.ingest_max_body_bytes.unwrap_or(16 * 1024 * 1024);
         Router::new()
             .route("/ingest", post(ingest::handler::ingest))
             .layer(middleware::from_fn(auth_middleware))
@@ -132,9 +132,10 @@ pub fn router(state: AppState) -> Router {
 /// `shutdown_drain_secs`.
 pub async fn serve(
     state: AppState,
+    http: &HttpConfig,
     config: &ServerConfig,
 ) -> Result<(), crate::error::ServerError> {
-    let drain_secs = state.shutdown_drain_secs;
+    let drain_secs = http.shutdown_drain_secs;
     let addr = &config.http_addr;
 
     // Build TLS config (loads or auto-generates cert).
@@ -152,7 +153,7 @@ pub async fn serve(
 
     let tls_acceptor = TlsAcceptor::from(tls_config);
     let pool = state.pool.clone();
-    let app = router(state);
+    let app = router(state, http);
 
     let listener = TcpListener::bind(addr)
         .await

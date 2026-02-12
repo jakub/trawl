@@ -34,6 +34,16 @@ pub struct AppState {
     pub tracker: Arc<QueryTracker>,
     /// Query timeout in seconds.
     pub timeout_secs: u64,
+    /// WAL writer for ingested events (None if ingest is disabled).
+    pub wal_writer: Option<Arc<WalWriter>>,
+}
+
+/// HTTP transport config consumed at router/server construction time.
+///
+/// These fields are only needed when building the axum router and TLS
+/// listener — no handler accesses them, so they stay out of `AppState`.
+#[derive(Debug, Clone)]
+pub struct HttpConfig {
     /// Maximum request body size in bytes.
     pub max_request_body_bytes: usize,
     /// Maximum concurrent HTTP requests.
@@ -42,8 +52,6 @@ pub struct AppState {
     pub shutdown_drain_secs: u64,
     /// Allowed CORS origins (empty = no CORS headers sent).
     pub cors_allowed_origins: Vec<String>,
-    /// WAL writer for ingested events (None if ingest is disabled).
-    pub wal_writer: Option<Arc<WalWriter>>,
     /// Max body size for ingest requests (None if ingest disabled).
     pub ingest_max_body_bytes: Option<usize>,
 }
@@ -65,7 +73,7 @@ impl AppState {
     ///
     /// Opens the auth database once at startup. Returns an error if the
     /// database cannot be opened or initialized.
-    pub fn from_config(config: &Config) -> Result<Self, fleet_auth::AuthError> {
+    pub fn from_config(config: &Config) -> Result<(Self, HttpConfig), fleet_auth::AuthError> {
         let key_store = KeyStore::open(&config.auth.db_path)?;
 
         let wal_writer = if config.ingest.enabled {
@@ -75,7 +83,7 @@ impl AppState {
             None
         };
 
-        Ok(Self {
+        let state = Self {
             pool: ExecutorPool::new(
                 config.data.base_dir().to_string_lossy().into_owned(),
                 config.server.max_concurrent_queries,
@@ -87,16 +95,21 @@ impl AppState {
             schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
             tracker: Arc::new(QueryTracker::new()),
             timeout_secs: config.server.timeout_secs,
+            wal_writer,
+        };
+
+        let http = HttpConfig {
             max_request_body_bytes: config.server.max_request_body_bytes,
             max_concurrent_requests: config.server.max_concurrent_requests,
             shutdown_drain_secs: config.server.shutdown_drain_secs,
             cors_allowed_origins: config.server.cors_allowed_origins.clone(),
-            wal_writer,
             ingest_max_body_bytes: if config.ingest.enabled {
                 Some(config.ingest.max_body_bytes)
             } else {
                 None
             },
-        })
+        };
+
+        Ok((state, http))
     }
 }
