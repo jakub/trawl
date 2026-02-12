@@ -61,9 +61,10 @@ fn emit_search_token(token: &SearchToken, state: &mut EmitterState) {
         }
         SearchToken::TimeFilter(tf) => {
             let interval = tf.duration.to_interval_string();
-            // cast to TIMESTAMP to avoid TIMESTAMPTZ arithmetic requiring ICU
+            // CAST handles both old VARCHAR parquet files and new native TIMESTAMP files.
+            // ::TIMESTAMP on now() avoids TIMESTAMPTZ arithmetic requiring ICU.
             state.push_where(format!(
-                "\"timestamp\" >= now()::TIMESTAMP - INTERVAL '{interval}'"
+                "CAST(\"timestamp\" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '{interval}'"
             ));
             state.time_filter = Some(tf.duration);
         }

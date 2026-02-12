@@ -4,7 +4,7 @@ expression: "emit_dsl(r#\"service:nginx level:error last:2h \"connection refused
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet')
-WHERE "service" = ? AND "level" = ? AND "timestamp" >= now()::TIMESTAMP - INTERVAL '2 hours' AND "message" ILIKE ? AND "message" NOT ILIKE ?
+WHERE "service" = ? AND "level" = ? AND CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "message" ILIKE ? AND "message" NOT ILIKE ?
 ---
 params:
   0: 'nginx'

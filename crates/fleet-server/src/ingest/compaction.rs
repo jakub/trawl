@@ -126,9 +126,12 @@ fn compact_service_blocking(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Read all WAL files into a temp table.
+    // Read all WAL files into a temp table, casting timestamp to native TIMESTAMP
+    // so parquet row group statistics enable predicate pushdown for time filters.
     conn.execute_batch(&format!(
-        "CREATE TABLE wal_batch AS SELECT * FROM read_json_auto([{file_list_sql}])"
+        "CREATE TABLE wal_batch AS \
+         SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
+         FROM read_json_auto([{file_list_sql}])"
     ))
     .map_err(|e| format!("read_json_auto failed: {e}"))?;
 

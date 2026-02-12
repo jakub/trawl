@@ -283,8 +283,8 @@ fn process_dedup(dedup: &crate::ast::DedupStage, ctx: &mut EmitterState) {
     ctx.select = vec![
         "*".to_string(),
         format!(
-            "ROW_NUMBER() OVER (PARTITION BY {partition_clause} ORDER BY \"timestamp\" DESC) \
-             AS \"_rn\""
+            "ROW_NUMBER() OVER (PARTITION BY {partition_clause} ORDER BY \
+             CAST(\"timestamp\" AS TIMESTAMP) DESC) AS \"_rn\""
         ),
     ];
     ctx.has_projection = true;
@@ -311,7 +311,9 @@ fn process_timechart(
         None => auto_bucket_interval(ctx.time_filter.as_ref()),
     };
 
-    let bucket_expr = format!("time_bucket(INTERVAL '{interval}', \"timestamp\") AS \"_time\"");
+    let bucket_expr = format!(
+        "time_bucket(INTERVAL '{interval}', CAST(\"timestamp\" AS TIMESTAMP)) AS \"_time\""
+    );
 
     let mut select_items = vec![bucket_expr];
     let mut group_items = vec!["\"_time\"".to_string()];
