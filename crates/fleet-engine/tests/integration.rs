@@ -179,6 +179,113 @@ fn time_filter_large_window() {
     assert_eq!(result.row_count(), 13);
 }
 
+// -- Phase 7: Extended DSL stages --
+
+#[test]
+fn top_by_service() {
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("* | top 3 service", &glob).unwrap();
+    // nginx=6, sshd=4, systemd=2 (kernel excluded by limit)
+    assert_eq!(result.row_count(), 3);
+    assert_eq!(result.columns[0].name, "service");
+    assert_eq!(result.columns[1].name, "count");
+    // first row = highest count = nginx
+    assert_eq!(result.rows[0][0], Value::String("nginx".to_string()));
+}
+
+#[test]
+fn rare_by_service() {
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("* | rare 2 service", &glob).unwrap();
+    // kernel=1, systemd=2 (ascending order)
+    assert_eq!(result.row_count(), 2);
+    assert_eq!(result.columns[0].name, "service");
+    // first row = lowest count = kernel
+    assert_eq!(result.rows[0][0], Value::String("kernel".to_string()));
+}
+
+#[test]
+fn drop_columns() {
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("* | drop message, src_ip", &glob)
+        .unwrap();
+    assert_eq!(result.row_count(), 13);
+    let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(!col_names.contains(&"message"));
+    assert!(!col_names.contains(&"src_ip"));
+}
+
+#[test]
+fn let_computed_column() {
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("service:nginx | let duration_ms = duration * 1000", &glob)
+        .unwrap();
+    assert_eq!(result.row_count(), 6);
+    let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(col_names.contains(&"duration_ms"));
+}
+
+#[test]
+fn extract_ip_from_message() {
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max(
+            r#"service:sshd | extract "from (?P<extracted_ip>[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+)" from message"#,
+            &glob,
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 4);
+    let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(col_names.contains(&"extracted_ip"));
+}
+
+#[test]
+fn dedup_single_field() {
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("* | dedup host", &glob).unwrap();
+    // 4 unique hosts: web01, web02, bastion, db01
+    assert_eq!(result.row_count(), 4);
+    // _rn helper column should be excluded from output
+    let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(!col_names.contains(&"_rn"));
+}
+
+#[test]
+fn dedup_multiple_fields() {
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("* | dedup host, service", &glob)
+        .unwrap();
+    // 6 unique combos: web01+nginx, web01+systemd, web02+nginx,
+    // bastion+sshd, db01+systemd, db01+kernel
+    assert_eq!(result.row_count(), 6);
+}
+
+#[test]
+fn timechart_minute_buckets() {
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("* | timechart span=1m count()", &glob)
+        .unwrap();
+    // 3 minute buckets: 10:00 (6 nginx), 10:01 (4 sshd), 10:02 (3 system)
+    assert_eq!(result.row_count(), 3);
+    assert_eq!(result.columns[0].name, "_time");
+    assert_eq!(result.columns[1].name, "count");
+}
+
+#[test]
+fn pivot_on_service() {
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("* | pivot count() on service", &glob)
+        .unwrap();
+    // no GROUP BY → single aggregated row with dynamic columns per service
+    assert_eq!(result.row_count(), 1);
+    assert!(result.columns.len() >= 4); // at least nginx, sshd, systemd, kernel
+}
+
 // -- JSON source tests (validates read_json_auto pipeline) --
 
 fn setup_json() -> (Executor, String) {
