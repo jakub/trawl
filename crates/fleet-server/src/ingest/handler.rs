@@ -15,6 +15,36 @@ use crate::error::ServerError;
 use crate::ingest::types::IngestResponse;
 use crate::state::AppState;
 
+/// Maximum service name length.
+const MAX_SERVICE_NAME_LEN: usize = 128;
+
+/// Validate a service name from an ingest event.
+///
+/// Only alphanumeric, dash, underscore, and dot are allowed.
+/// Prevents path traversal in WAL directory structure and log injection.
+fn validate_service_name(service: &str) -> Result<(), ServerError> {
+    if service.is_empty() {
+        return Err(ServerError::Ingest("service name cannot be empty".into()));
+    }
+    if service.len() > MAX_SERVICE_NAME_LEN {
+        return Err(ServerError::Ingest(format!(
+            "service name too long ({} chars, max {MAX_SERVICE_NAME_LEN})",
+            service.len()
+        )));
+    }
+    if !service
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Err(ServerError::Ingest(
+            "service name contains invalid characters \
+             (only alphanumeric, dash, underscore, dot allowed)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /api/v1/ingest` — accept ndjson events into the WAL.
 ///
 /// Expects `Content-Type: application/x-ndjson` (or `application/json`).
@@ -139,6 +169,7 @@ fn parse_json_array(text: &str) -> Result<(String, usize, Vec<u8>), ServerError>
             })?;
 
         if service.is_none() {
+            validate_service_name(svc)?;
             service = Some(svc.to_owned());
         }
 
@@ -181,6 +212,7 @@ fn parse_ndjson(text: &str, original: &[u8]) -> Result<(String, usize, Vec<u8>),
             })?;
 
         if service.is_none() {
+            validate_service_name(svc)?;
             service = Some(svc.to_owned());
         }
 
@@ -248,5 +280,51 @@ mod tests {
         let data = b"[]";
         let err = parse_events(data).unwrap_err();
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn parse_rejects_path_traversal_service() {
+        let data = br#"{"service":"../../etc/passwd","message":"pwned"}"#;
+        let err = parse_events(data).unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn parse_rejects_slash_in_service() {
+        let data = br#"{"service":"foo/bar","message":"nope"}"#;
+        let err = parse_events(data).unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn parse_rejects_empty_service_name() {
+        let data = br#"{"service":"","message":"empty"}"#;
+        let err = parse_events(data).unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn parse_rejects_long_service_name() {
+        let name = "a".repeat(129);
+        let data = format!(r#"{{"service":"{name}","message":"long"}}"#);
+        let err = parse_events(data.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn parse_accepts_valid_service_names() {
+        for name in ["nginx", "my-app", "app_v2", "host.name.prod", "A1-B2_c3.d"] {
+            let data = format!(r#"{{"service":"{name}","message":"ok"}}"#);
+            let (service, count, _) = parse_events(data.as_bytes()).unwrap();
+            assert_eq!(service, name);
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn parse_json_array_rejects_bad_service() {
+        let data = br#"[{"service":"../evil","message":"nope"}]"#;
+        let err = parse_events(data).unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
     }
 }
