@@ -1,5 +1,7 @@
 use std::fmt::Write as _;
 
+use crate::ast::FleetDuration;
+
 use super::SqlValue;
 
 /// A single CTE in the emitted SQL.
@@ -22,6 +24,9 @@ pub(crate) struct EmitterState {
     pub(crate) limit: Option<u64>,
     pub(crate) has_aggregation: bool,
     pub(crate) has_projection: bool,
+    /// The time filter from the search stage, used by `timechart` auto-bucketing.
+    /// Not reset on CTE flush — this is query-wide context.
+    pub(crate) time_filter: Option<FleetDuration>,
     ctes: Vec<Cte>,
     params: Vec<SqlValue>,
 }
@@ -65,6 +70,7 @@ impl EmitterState {
             limit: None,
             has_aggregation: false,
             has_projection: false,
+            time_filter: None,
             ctes: Vec::new(),
             params: Vec::new(),
         })

@@ -123,6 +123,34 @@ pub struct FleetDuration {
     pub unit: TimeUnit,
 }
 
+impl FleetDuration {
+    /// Convert to total seconds for comparison and heuristic purposes.
+    #[must_use]
+    pub fn to_seconds(&self) -> u64 {
+        self.quantity
+            * match self.unit {
+                TimeUnit::Seconds => 1,
+                TimeUnit::Minutes => 60,
+                TimeUnit::Hours => 3600,
+                TimeUnit::Days => 86_400,
+                TimeUnit::Weeks => 604_800,
+            }
+    }
+
+    /// Format as a `DuckDB` interval string like `"2 hours"`.
+    #[must_use]
+    pub fn to_interval_string(&self) -> String {
+        let unit = match self.unit {
+            TimeUnit::Seconds => "seconds",
+            TimeUnit::Minutes => "minutes",
+            TimeUnit::Hours => "hours",
+            TimeUnit::Days => "days",
+            TimeUnit::Weeks => "weeks",
+        };
+        format!("{} {unit}", self.quantity)
+    }
+}
+
 impl fmt::Display for FleetDuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}{}", self.quantity, self.unit)

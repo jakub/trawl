@@ -60,11 +60,12 @@ fn emit_search_token(token: &SearchToken, state: &mut EmitterState) {
             }
         }
         SearchToken::TimeFilter(tf) => {
-            let interval = duration_to_interval(&tf.duration);
+            let interval = tf.duration.to_interval_string();
             // cast to TIMESTAMP to avoid TIMESTAMPTZ arithmetic requiring ICU
             state.push_where(format!(
                 "\"timestamp\" >= now()::TIMESTAMP - INTERVAL '{interval}'"
             ));
+            state.time_filter = Some(tf.duration);
         }
         SearchToken::QuotedSearch(qs) => {
             let pattern = format!("%{}%", qs.phrase);
@@ -85,15 +86,4 @@ fn filter_op_to_sql(op: FilterOp) -> &'static str {
         FilterOp::Glob => "GLOB",
         FilterOp::Regex => "~",
     }
-}
-
-fn duration_to_interval(d: &crate::ast::FleetDuration) -> String {
-    let unit = match d.unit {
-        crate::ast::TimeUnit::Seconds => "seconds",
-        crate::ast::TimeUnit::Minutes => "minutes",
-        crate::ast::TimeUnit::Hours => "hours",
-        crate::ast::TimeUnit::Days => "days",
-        crate::ast::TimeUnit::Weeks => "weeks",
-    };
-    format!("{} {unit}", d.quantity)
 }
