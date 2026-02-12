@@ -171,7 +171,11 @@ impl EmitterState {
     }
 
     /// Produce the final SQL string including any accumulated CTEs.
-    pub(crate) fn finalize(&self) -> String {
+    ///
+    /// For PIVOT queries, inlines all `?` params directly into the SQL
+    /// and clears the param list — `DuckDB` doesn't support parameterized
+    /// PIVOT statements.
+    pub(crate) fn finalize(&mut self) -> String {
         let body = if let Some(pivot) = &self.pivot {
             self.build_pivot(pivot)
         } else {
@@ -198,6 +202,13 @@ impl EmitterState {
         }
         sql.push('\n');
         sql.push_str(&body);
+
+        if self.pivot.is_some() {
+            let inlined = Self::inline_params(&sql, &self.params);
+            self.params.clear();
+            return inlined;
+        }
+
         sql
     }
 
@@ -219,6 +230,38 @@ impl EmitterState {
         }
 
         sql
+    }
+
+    /// Replace `?` placeholders with literal values for engines that
+    /// don't support parameterized queries (e.g. `DuckDB` PIVOT).
+    fn inline_params(sql: &str, params: &[SqlValue]) -> String {
+        let mut result = String::with_capacity(sql.len());
+        let mut param_idx = 0;
+        for ch in sql.chars() {
+            if ch == '?' && param_idx < params.len() {
+                match &params[param_idx] {
+                    SqlValue::String(s) => {
+                        result.push('\'');
+                        // escape single quotes by doubling them
+                        result.push_str(&s.replace('\'', "''"));
+                        result.push('\'');
+                    }
+                    SqlValue::Int(i) => {
+                        let _ = write!(result, "{i}");
+                    }
+                    SqlValue::Float(f) => {
+                        let _ = write!(result, "{f}");
+                    }
+                    SqlValue::Bool(b) => {
+                        result.push_str(if *b { "TRUE" } else { "FALSE" });
+                    }
+                }
+                param_idx += 1;
+            } else {
+                result.push(ch);
+            }
+        }
+        result
     }
 
     /// Consume the state and return the accumulated parameters.
