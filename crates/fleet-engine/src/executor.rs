@@ -92,8 +92,10 @@ impl Executor {
     /// Runs `DESCRIBE SELECT * FROM read_parquet(source)` to get column
     /// names and types, plus a glob count for file volume.
     pub fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError> {
-        // Get column names and types from the parquet schema.
-        // SECURITY: parameterized to prevent SQL injection via config paths.
+        // Validate source path before interpolation — DuckDB doesn't truly
+        // parameterize table-valued function arguments.
+        emitter::validate_source_path(source)?;
+
         let mut stmt = self
             .conn
             .prepare("DESCRIBE SELECT * FROM read_parquet(?)")?;
@@ -176,18 +178,23 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> Value {
 ///
 /// `DuckDB` stores timestamps as integer offsets from the Unix epoch.
 /// The `TimeUnit` indicates the resolution.
+/// Convert a temporal value to microseconds based on its `TimeUnit`.
+const fn to_micros(unit: TimeUnit, val: i64) -> i64 {
+    match unit {
+        TimeUnit::Second => val * 1_000_000,
+        TimeUnit::Millisecond => val * 1_000,
+        TimeUnit::Microsecond => val,
+        TimeUnit::Nanosecond => val / 1_000,
+    }
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_lossless
 )]
 fn format_timestamp(unit: TimeUnit, val: i64) -> String {
-    let micros = match unit {
-        TimeUnit::Second => val * 1_000_000,
-        TimeUnit::Millisecond => val * 1_000,
-        TimeUnit::Microsecond => val,
-        TimeUnit::Nanosecond => val / 1_000,
-    };
+    let micros = to_micros(unit, val);
 
     let (total_secs, sub_secs) = if micros >= 0 {
         (micros / 1_000_000, (micros % 1_000_000) as u32)
@@ -230,12 +237,7 @@ fn format_date(days: i32) -> String {
 
 /// Convert a time value to HH:MM:SS.
 fn format_time(unit: TimeUnit, val: i64) -> String {
-    let micros = match unit {
-        TimeUnit::Second => val * 1_000_000,
-        TimeUnit::Millisecond => val * 1_000,
-        TimeUnit::Microsecond => val,
-        TimeUnit::Nanosecond => val / 1_000,
-    };
+    let micros = to_micros(unit, val);
     let total_secs = micros / 1_000_000;
     let h = total_secs / 3600;
     let m = (total_secs % 3600) / 60;
