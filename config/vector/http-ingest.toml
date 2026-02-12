@@ -1,0 +1,49 @@
+# fleet / vector — HTTP ingest sink
+#
+# ships logs to fleetd's HTTP ingest endpoint instead of writing
+# ndjson files to disk. fleetd handles WAL and parquet compaction.
+#
+# replaces the file sink in other vector configs. pair with any
+# source/transform config (homelab.toml, docker.toml, etc.) by
+# updating their sink inputs.
+#
+# prerequisites:
+#   1. create an ingest API key:
+#      fleet-admin key create --name vector --role ingest
+#   2. set FLEET_INGEST_TOKEN in the environment
+#
+# usage:
+#   FLEET_INGEST_TOKEN=flt_... vector --config config/vector/http-ingest.toml
+
+# ============================================================================
+# SINK — HTTP POST to fleetd ingest endpoint
+# ============================================================================
+#
+# vector batches events and POST's them as ndjson to fleetd.
+# fleetd writes to WAL, then compacts to parquet in the background.
+
+[sinks.fleet_ingest]
+type = "http"
+inputs = [
+  "normalize_docker",
+  "normalize_journal",
+  "normalize_syslog",
+  "normalize_nginx",
+]
+uri = "https://127.0.0.1:5514/api/v1/ingest"
+method = "post"
+compression = "gzip"
+
+[sinks.fleet_ingest.encoding]
+codec = "json"
+
+[sinks.fleet_ingest.auth]
+strategy = "bearer"
+token = "${FLEET_INGEST_TOKEN}"
+
+[sinks.fleet_ingest.tls]
+verify_certificate = false  # self-signed cert in dev/homelab
+
+[sinks.fleet_ingest.batch]
+max_bytes = 1048576   # 1 MB batches
+timeout_secs = 5
