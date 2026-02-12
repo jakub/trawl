@@ -607,4 +607,33 @@ mod tests {
             "* | pivot count() on status | where count > 5"
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // list-format source paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_source_emits_read_parquet_list() {
+        let query = parser::parse("*").unwrap();
+        let result = emit(
+            &query,
+            "['/data/2026-02-12/14/*.parquet', '/data/2026-02-12/15/*.parquet']",
+        )
+        .unwrap();
+        assert_snapshot!(format_result(&result));
+    }
+
+    #[test]
+    fn list_source_rejects_invalid_path() {
+        let query = parser::parse("*").unwrap();
+        let err = emit(&query, "['/data/ok/*.parquet', '/data/bad;drop/*.parquet']").unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn list_source_rejects_malformed_list() {
+        let query = parser::parse("*").unwrap();
+        let err = emit(&query, "[not-quoted]").unwrap_err();
+        assert!(err.to_string().contains("invalid source list element"));
+    }
 }

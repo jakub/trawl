@@ -56,18 +56,49 @@ pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
     Ok(())
 }
 
+/// Validate a list-format source for `read_parquet()`.
+///
+/// Expected format: `['path1', 'path2', ...]`. Each individual path
+/// inside the list must pass [`validate_source_path`].
+fn validate_source_list(source: &str) -> Result<(), super::EmitError> {
+    let inner = source
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| super::EmitError::UnsupportedOperation {
+            message: "invalid source list format".to_string(),
+        })?;
+
+    for segment in inner.split(", ") {
+        let path = segment
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .ok_or_else(|| super::EmitError::UnsupportedOperation {
+                message: format!("invalid source list element: {segment}"),
+            })?;
+        validate_source_path(path)?;
+    }
+
+    Ok(())
+}
+
 impl EmitterState {
     pub(crate) fn new(source: &str) -> Result<Self, super::EmitError> {
-        validate_source_path(source)?;
-
-        let ext = std::path::Path::new(source)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let reader = if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("ndjson") {
-            format!("read_json_auto('{source}')")
+        // List-format source: ['path1', 'path2', ...] — used for
+        // time-scoped queries that target specific hour-directories.
+        let reader = if source.starts_with('[') {
+            validate_source_list(source)?;
+            format!("read_parquet({source})")
         } else {
-            format!("read_parquet('{source}')")
+            validate_source_path(source)?;
+            let ext = std::path::Path::new(source)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("ndjson") {
+                format!("read_json_auto('{source}')")
+            } else {
+                format!("read_parquet('{source}')")
+            }
         };
         Ok(Self {
             step: 0,
