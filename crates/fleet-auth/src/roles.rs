@@ -3,7 +3,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// The three roles in the fleet permission model.
+/// The four roles in the fleet permission model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -13,6 +13,8 @@ pub enum Role {
     Analyst,
     /// Query execution and schema inspection (same as analyst for now).
     Reader,
+    /// Write-only log ingestion (used by vector/agents).
+    Ingest,
 }
 
 /// Discrete permissions that can be checked against a role.
@@ -26,11 +28,13 @@ pub enum Permission {
     KeyManage,
     /// Manage server configuration.
     ServerManage,
+    /// Write events via the ingest endpoint.
+    Ingest,
 }
 
 impl Role {
     /// All defined roles.
-    pub const ALL: [Self; 3] = [Self::Admin, Self::Analyst, Self::Reader];
+    pub const ALL: [Self; 4] = [Self::Admin, Self::Analyst, Self::Reader, Self::Ingest];
 
     /// Check whether this role grants the given permission.
     pub fn has_permission(self, perm: Permission) -> bool {
@@ -48,6 +52,7 @@ impl Role {
             ],
             // analyst and reader are identical for now — differentiated in phase 7+
             Self::Analyst | Self::Reader => &[Permission::Query, Permission::SchemaRead],
+            Self::Ingest => &[Permission::Ingest],
         }
     }
 
@@ -57,6 +62,7 @@ impl Role {
             Self::Admin => "admin",
             Self::Analyst => "analyst",
             Self::Reader => "reader",
+            Self::Ingest => "ingest",
         }
     }
 }
@@ -75,6 +81,7 @@ impl FromStr for Role {
             "admin" => Ok(Self::Admin),
             "analyst" => Ok(Self::Analyst),
             "reader" => Ok(Self::Reader),
+            "ingest" => Ok(Self::Ingest),
             other => Err(format!("unknown role: {other}")),
         }
     }
@@ -102,6 +109,15 @@ mod tests {
     fn analyst_cannot_manage_keys_or_server() {
         assert!(!Role::Analyst.has_permission(Permission::KeyManage));
         assert!(!Role::Analyst.has_permission(Permission::ServerManage));
+    }
+
+    #[test]
+    fn ingest_has_only_ingest_permission() {
+        assert!(Role::Ingest.has_permission(Permission::Ingest));
+        assert!(!Role::Ingest.has_permission(Permission::Query));
+        assert!(!Role::Ingest.has_permission(Permission::SchemaRead));
+        assert!(!Role::Ingest.has_permission(Permission::KeyManage));
+        assert!(!Role::Ingest.has_permission(Permission::ServerManage));
     }
 
     #[test]

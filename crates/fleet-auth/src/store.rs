@@ -17,7 +17,7 @@ use crate::roles::Role;
 use crate::token;
 
 /// Current schema version. Bumped when migrations are needed.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Pre-computed dummy argon2id hash used to equalize timing when a prefix
 /// lookup returns no rows. Generated once at process start so that the
@@ -57,17 +57,47 @@ impl KeyStore {
 
     /// Run schema migrations.
     fn initialize(&self) -> Result<(), AuthError> {
+        // Bootstrap: create schema_version table if this is a fresh database.
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL
-            );
+            );",
+        )?;
 
-            CREATE TABLE IF NOT EXISTS api_keys (
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
+
+        let current_version = if count == 0 {
+            // Fresh database — create tables at current schema version.
+            self.create_tables_v2()?;
+            self.conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![SCHEMA_VERSION],
+            )?;
+            SCHEMA_VERSION
+        } else {
+            self.conn
+                .query_row("SELECT version FROM schema_version", [], |row| row.get(0))?
+        };
+
+        // Run migrations for existing databases.
+        if current_version < 2 {
+            self.migrate_v1_to_v2()?;
+        }
+
+        Ok(())
+    }
+
+    /// Create the `api_keys` table at schema v2 (includes 'ingest' role).
+    fn create_tables_v2(&self) -> Result<(), AuthError> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS api_keys (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 prefix      TEXT    NOT NULL UNIQUE,
                 name        TEXT    NOT NULL,
                 hash        TEXT    NOT NULL,
-                role        TEXT    NOT NULL CHECK (role IN ('admin', 'analyst', 'reader')),
+                role        TEXT    NOT NULL CHECK (role IN ('admin', 'analyst', 'reader', 'ingest')),
                 active      INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT    NOT NULL,
                 expires_at  TEXT,
@@ -77,18 +107,37 @@ impl KeyStore {
 
             CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (prefix);",
         )?;
+        Ok(())
+    }
 
-        // Insert schema version if not already set.
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
-        if count == 0 {
-            self.conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?1)",
-                params![SCHEMA_VERSION],
-            )?;
-        }
+    /// Migrate from schema v1 → v2: recreate `api_keys` with updated CHECK constraint.
+    fn migrate_v1_to_v2(&self) -> Result<(), AuthError> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS api_keys_v2 (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                prefix      TEXT    NOT NULL UNIQUE,
+                name        TEXT    NOT NULL,
+                hash        TEXT    NOT NULL,
+                role        TEXT    NOT NULL CHECK (role IN ('admin', 'analyst', 'reader', 'ingest')),
+                active      INTEGER NOT NULL DEFAULT 1,
+                created_at  TEXT    NOT NULL,
+                expires_at  TEXT,
+                last_used   TEXT,
+                revoked_at  TEXT
+            );
 
+            INSERT INTO api_keys_v2 (id, prefix, name, hash, role, active, created_at, expires_at, last_used, revoked_at)
+                SELECT id, prefix, name, hash, role, active, created_at, expires_at, last_used, revoked_at
+                FROM api_keys;
+
+            DROP TABLE api_keys;
+
+            ALTER TABLE api_keys_v2 RENAME TO api_keys;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (prefix);
+
+            UPDATE schema_version SET version = 2;",
+        )?;
         Ok(())
     }
 
@@ -513,6 +562,16 @@ mod tests {
 
         let result = store.revoke_key(&created.info.prefix);
         assert!(matches!(result, Err(AuthError::KeyRevoked { .. })));
+    }
+
+    #[test]
+    fn create_ingest_key() {
+        let store = test_store();
+        let created = store.create_key("vector", Role::Ingest, None).unwrap();
+
+        assert_eq!(created.info.role, Role::Ingest);
+        let verified = store.verify_key(&created.plaintext_token).unwrap();
+        assert_eq!(verified.role, Role::Ingest);
     }
 
     #[test]
