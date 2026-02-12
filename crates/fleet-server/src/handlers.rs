@@ -4,7 +4,7 @@ use axum::extract::State;
 use axum::{Extension, Json};
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
-use fleet_engine::value::{QueryResult, SchemaColumn, Value};
+use fleet_engine::value::{QueryResult, SchemaColumn};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
@@ -17,32 +17,6 @@ use crate::state::{AppState, CachedSchema, SCHEMA_CACHE_TTL_SECS};
 pub struct QueryRequest {
     /// The fleet DSL query string.
     pub query: String,
-}
-
-/// Query response body.
-#[derive(Debug, Serialize)]
-pub struct QueryResponse {
-    /// Column names.
-    pub columns: Vec<String>,
-    /// Row data (each row is a list of JSON values).
-    pub rows: Vec<Vec<serde_json::Value>>,
-    /// Total number of rows returned.
-    pub row_count: usize,
-}
-
-impl From<QueryResult> for QueryResponse {
-    fn from(result: QueryResult) -> Self {
-        let row_count = result.row_count();
-        Self {
-            columns: result.columns.into_iter().map(|c| c.name).collect(),
-            rows: result
-                .rows
-                .into_iter()
-                .map(|row| row.into_iter().map(value_to_json).collect())
-                .collect(),
-            row_count,
-        }
-    }
 }
 
 /// Health check response body.
@@ -91,7 +65,7 @@ pub async fn query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<QueryRequest>,
-) -> Result<Json<QueryResponse>, ServerError> {
+) -> Result<Json<QueryResult>, ServerError> {
     if !verified.role.has_permission(Permission::Query) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
@@ -118,7 +92,7 @@ pub async fn query(
                 query_id,
                 "query complete"
             );
-            Ok(Json(qr.into()))
+            Ok(Json(qr))
         }
         Err(ServerError::Timeout) => {
             state.tracker.timeout(query_id);
@@ -256,16 +230,4 @@ pub async fn queries(
 pub struct QueriesResponse {
     pub active: Vec<crate::tracker::ActiveQuerySnapshot>,
     pub recent: Vec<crate::tracker::CompletedQuery>,
-}
-
-// -- helpers -----------------------------------------------------------------
-
-fn value_to_json(val: Value) -> serde_json::Value {
-    match val {
-        Value::Null => serde_json::Value::Null,
-        Value::Boolean(b) => serde_json::Value::Bool(b),
-        Value::Integer(i) => serde_json::json!(i),
-        Value::Float(f) => serde_json::json!(f),
-        Value::String(s) => serde_json::Value::String(s),
-    }
 }

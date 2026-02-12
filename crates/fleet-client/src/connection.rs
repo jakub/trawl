@@ -1,6 +1,6 @@
 //! HTTP client for communicating with fleetd.
 
-use fleet_engine::value::{Column, QueryResult, Value};
+use fleet_engine::value::QueryResult;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -85,8 +85,7 @@ impl HttpClient {
             query: dsl.to_owned(),
         };
         let req = self.client.post(&url).json(&body);
-        let json: QueryResponse = self.send_authenticated(req).await?;
-        Ok(json.into())
+        self.send_authenticated(req).await
     }
 
     /// Check daemon health (unauthenticated).
@@ -168,14 +167,6 @@ struct QueryRequest {
 }
 
 #[derive(Deserialize)]
-struct QueryResponse {
-    columns: Vec<String>,
-    rows: Vec<Vec<serde_json::Value>>,
-    #[allow(dead_code)]
-    row_count: usize,
-}
-
-#[derive(Deserialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -242,41 +233,4 @@ pub struct CompletedQuerySnapshot {
     pub error: Option<String>,
     /// Whether the query exceeded the timeout.
     pub timed_out: bool,
-}
-
-impl From<QueryResponse> for QueryResult {
-    fn from(resp: QueryResponse) -> Self {
-        Self {
-            columns: resp
-                .columns
-                .into_iter()
-                .map(|name| Column { name })
-                .collect(),
-            rows: resp
-                .rows
-                .into_iter()
-                .map(|row| row.into_iter().map(json_to_value).collect())
-                .collect(),
-        }
-    }
-}
-
-fn json_to_value(val: serde_json::Value) -> Value {
-    match val {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Boolean(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Integer(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::Float(f)
-            } else {
-                Value::String(n.to_string())
-            }
-        }
-        serde_json::Value::String(s) => Value::String(s),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            Value::String(val.to_string())
-        }
-    }
 }

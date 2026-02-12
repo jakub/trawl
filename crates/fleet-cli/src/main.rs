@@ -155,7 +155,12 @@ fn render_json(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
-            map.insert(col.name.clone(), value_to_json(val));
+            // Value's custom Serialize impl maps directly to JSON primitives,
+            // so this conversion is infallible.
+            map.insert(
+                col.name.clone(),
+                serde_json::to_value(val).expect("Value serialization is infallible"),
+            );
         }
         serde_json::to_writer(&mut *out, &map).map_err(io::Error::other)?;
         writeln!(out)?;
@@ -176,16 +181,6 @@ fn render_csv(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
         writeln!(out, "{}", cells.join(","))?;
     }
     Ok(())
-}
-
-fn value_to_json(val: &Value) -> serde_json::Value {
-    match val {
-        Value::Null => serde_json::Value::Null,
-        Value::Boolean(b) => serde_json::Value::Bool(*b),
-        Value::Integer(i) => serde_json::json!(i),
-        Value::Float(f) => serde_json::json!(f),
-        Value::String(s) => serde_json::Value::String(s.clone()),
-    }
 }
 
 /// Escape a value for CSV output, applying formula injection protection
