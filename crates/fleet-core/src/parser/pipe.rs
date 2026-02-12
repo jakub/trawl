@@ -12,7 +12,7 @@ use crate::ast::{
 };
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, duration, field_name, keyword, quoted_string, spanned, uint,
+    ParserExtra, ParserInput, duration, field_name, keyword, raw_quoted_string, spanned, uint,
 };
 
 /// Parse an aggregation expression like `count()`, `avg(duration)`,
@@ -219,7 +219,7 @@ fn extract_stage<'src>()
 
     let regex_mode = keyword("extract")
         .padded()
-        .ignore_then(quoted_string())
+        .ignore_then(raw_quoted_string())
         .then(from_clause)
         .map(|(pattern, source_field)| {
             PipeStage::Extract(ExtractStage {

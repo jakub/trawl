@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn pipe_extract_named_group() {
         assert_snapshot!(emit_dsl(
-            r#"* | extract "(?P<ip>[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)" from message"#
+            r#"* | extract "(?P<ip>[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)" from message"#
         ));
     }
 

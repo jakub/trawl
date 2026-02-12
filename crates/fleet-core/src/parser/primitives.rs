@@ -99,6 +99,24 @@ pub(crate) fn quoted_string<'src>()
         .labelled("quoted string")
 }
 
+/// Parse a double-quoted string without escape processing.
+///
+/// Only `\"` is recognized (to allow literal quotes inside the string);
+/// all other backslash sequences are passed through verbatim. This is
+/// used for regex patterns in `extract` where `\d`, `\w` etc. should
+/// not require double-escaping.
+pub(crate) fn raw_quoted_string<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    let escaped_quote = just('\\').then(just('"')).to('"');
+
+    none_of("\"")
+        .or(escaped_quote)
+        .repeated()
+        .collect::<String>()
+        .delimited_by(just('"'), just('"'))
+        .labelled("quoted string")
+}
+
 // ---------------------------------------------------------------------------
 // identifiers and field names
 // ---------------------------------------------------------------------------
