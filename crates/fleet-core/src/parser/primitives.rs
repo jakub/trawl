@@ -266,6 +266,9 @@ pub(crate) fn bare_value<'src>()
         .labelled("value")
 }
 
+/// Maximum regex pattern length to prevent compilation-based denial-of-service.
+const MAX_REGEX_LEN: usize = 1024;
+
 /// Parse a regex pattern delimited by `/`: `/pattern/`. Validates syntax.
 pub(crate) fn regex_pattern<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
@@ -275,6 +278,15 @@ pub(crate) fn regex_pattern<'src>()
         .collect::<String>()
         .delimited_by(just('/'), just('/'))
         .try_map(|pattern, span| {
+            if pattern.len() > MAX_REGEX_LEN {
+                return Err(Rich::custom(
+                    span,
+                    format!(
+                        "regex pattern too long ({} chars, max {MAX_REGEX_LEN})",
+                        pattern.len()
+                    ),
+                ));
+            }
             regex::Regex::new(&pattern)
                 .map_err(|e| Rich::custom(span, format!("invalid regex: {e}")))?;
             Ok(pattern)
@@ -475,5 +487,17 @@ mod tests {
                 .into_result()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_regex_pattern_length_limit_exceeded() {
+        let long_pattern = format!("/{}/", "a".repeat(1025));
+        assert!(regex_pattern().parse(&long_pattern).into_result().is_err());
+    }
+
+    #[test]
+    fn test_regex_pattern_at_length_limit() {
+        let pattern = format!("/{}/", "a".repeat(1024));
+        assert!(regex_pattern().parse(&pattern).into_result().is_ok());
     }
 }
