@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::process;
 
 use clap::{Parser, ValueEnum};
+use fleet_engine::QueryEngine;
 use fleet_engine::value::{QueryResult, Value};
 
 /// fleet — search your logs with a pipeline DSL.

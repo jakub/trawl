@@ -6,6 +6,7 @@
 
 mod common;
 
+use fleet_engine::QueryEngine;
 use fleet_engine::error::EngineError;
 use fleet_engine::executor::Executor;
 use fleet_engine::value::{QueryResult, Value};

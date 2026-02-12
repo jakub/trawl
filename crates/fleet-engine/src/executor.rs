@@ -45,7 +45,7 @@ impl Executor {
     ///
     /// `max_rows` caps the number of result rows to prevent unbounded memory
     /// allocation. Returns [`EngineError::ResultTooLarge`] if exceeded.
-    pub fn execute_emitted(
+    fn execute_emitted_inner(
         &self,
         query: &EmittedQuery,
         max_rows: usize,
@@ -86,12 +86,34 @@ impl Executor {
 
         Ok(QueryResult { columns, rows })
     }
+}
 
-    /// Full pipeline: parse DSL, emit SQL, execute against `DuckDB`.
-    ///
-    /// `source` is the parquet glob path passed to `read_parquet()`,
-    /// e.g. `"/data/**/*.parquet"`.
-    pub fn run_query(
+/// Trait for executing fleet DSL queries against a data backend.
+pub trait QueryEngine {
+    /// Full pipeline: parse DSL, emit SQL, execute.
+    fn run_query(
+        &self,
+        dsl: &str,
+        source: &str,
+        max_rows: usize,
+    ) -> Result<QueryResult, EngineError>;
+
+    /// Execute a pre-emitted query (SQL + params).
+    fn execute_emitted(
+        &self,
+        query: &EmittedQuery,
+        max_rows: usize,
+    ) -> Result<QueryResult, EngineError>;
+}
+
+/// Trait for schema introspection of the data source.
+pub trait SchemaIntrospector {
+    /// Describe the schema without reading row data.
+    fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError>;
+}
+
+impl QueryEngine for Executor {
+    fn run_query(
         &self,
         dsl: &str,
         source: &str,
@@ -99,14 +121,20 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit(&ast, source)?;
-        self.execute_emitted(&emitted, max_rows)
+        self.execute_emitted_inner(&emitted, max_rows)
     }
 
-    /// Introspect the schema of the data source without reading row data.
-    ///
-    /// Runs `DESCRIBE SELECT * FROM read_parquet(source)` to get column
-    /// names and types, plus a glob count for file volume.
-    pub fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError> {
+    fn execute_emitted(
+        &self,
+        query: &EmittedQuery,
+        max_rows: usize,
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_emitted_inner(query, max_rows)
+    }
+}
+
+impl SchemaIntrospector for Executor {
+    fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError> {
         // Validate source path before interpolation — DuckDB doesn't truly
         // parameterize table-valued function arguments.
         emitter::validate_source_path(source)?;
