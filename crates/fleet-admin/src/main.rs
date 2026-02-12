@@ -97,7 +97,7 @@ impl From<CliRole> for fleet_auth::Role {
 fn main() {
     let cli = Cli::parse();
 
-    let db_path = resolve_db_path(&cli.db);
+    let db_path = PathBuf::from(shellexpand::tilde(&cli.db).as_ref());
 
     // Ensure parent directory exists.
     if let Some(parent) = db_path.parent() {
@@ -132,7 +132,7 @@ fn main() {
         },
         Command::Tls { action } => match action {
             TlsAction::Generate { output_dir, san } => {
-                let dir = resolve_db_path(&output_dir);
+                let dir = PathBuf::from(shellexpand::tilde(&output_dir).as_ref());
                 commands::tls::generate(&dir, &san)
             }
         },
@@ -142,19 +142,4 @@ fn main() {
         eprintln!("fleet-admin: {e}");
         process::exit(1);
     }
-}
-
-/// Resolve the database path, expanding `~` to the home directory.
-fn resolve_db_path(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
-
-/// Get the user's home directory.
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
 }

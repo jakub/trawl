@@ -205,12 +205,7 @@ fn num_cpus() -> usize {
 
 /// Expand a leading `~/` to `$HOME/`.
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{rest}", home.to_string_lossy());
-        }
-    }
-    path.to_owned()
+    shellexpand::tilde(path).into_owned()
 }
 
 impl Config {
