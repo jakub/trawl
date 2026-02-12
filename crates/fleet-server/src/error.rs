@@ -24,6 +24,10 @@ pub enum ServerError {
     #[error("query timed out")]
     Timeout,
 
+    /// Ingest validation error (bad ndjson, missing fields).
+    #[error("ingest error: {0}")]
+    Ingest(String),
+
     /// Internal server error (task panics, unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
@@ -38,6 +42,7 @@ impl ServerError {
         match self {
             Self::Engine(EngineError::Database(_)) => "query execution failed".to_owned(),
             Self::Internal(_) => "internal error".to_owned(),
+            Self::Ingest(_) => "ingest error".to_owned(),
             other => other.to_string(),
         }
     }
@@ -57,6 +62,7 @@ impl IntoResponse for ServerError {
             ),
             // Auth errors are deliberately opaque.
             Self::Auth(_) => (StatusCode::UNAUTHORIZED, "authentication failed".to_owned()),
+            Self::Ingest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "query timed out".to_owned()),
             Self::Internal(_) => {
