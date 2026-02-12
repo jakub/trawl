@@ -139,7 +139,7 @@ async fn setup() -> TestServer {
 #[tokio::test]
 async fn health_returns_ok() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, "unused");
+    let client = HttpClient::new_insecure(&server.url, "unused").unwrap();
     let health = client.health().await.unwrap();
     assert_eq!(health["status"], "ok");
 }
@@ -147,7 +147,7 @@ async fn health_returns_ok() {
 #[tokio::test]
 async fn query_returns_results() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client.query("*").await.unwrap();
     assert_eq!(result.row_count(), 3);
 }
@@ -155,7 +155,7 @@ async fn query_returns_results() {
 #[tokio::test]
 async fn query_with_filter() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client.query("service:nginx").await.unwrap();
     assert_eq!(result.row_count(), 2);
 }
@@ -163,7 +163,7 @@ async fn query_with_filter() {
 #[tokio::test]
 async fn query_with_stats_pipeline() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client.query("* | stats count() by service").await.unwrap();
     // nginx: 2, postgres: 1 → 2 rows
     assert_eq!(result.row_count(), 2);
@@ -172,7 +172,7 @@ async fn query_with_stats_pipeline() {
 #[tokio::test]
 async fn query_rejects_missing_auth() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, "");
+    let client = HttpClient::new_insecure(&server.url, "").unwrap();
 
     let result = client.query("*").await;
     assert!(result.is_err());
@@ -188,7 +188,8 @@ async fn query_rejects_missing_auth() {
 #[tokio::test]
 async fn query_rejects_invalid_token() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234");
+    let client =
+        HttpClient::new_insecure(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234").unwrap();
 
     let result = client.query("*").await;
     assert!(result.is_err());
@@ -204,7 +205,7 @@ async fn query_rejects_invalid_token() {
 #[tokio::test]
 async fn query_rejects_bad_dsl() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = client.query("| | | broken {{{").await;
     assert!(result.is_err());
@@ -222,7 +223,7 @@ async fn query_rejects_bad_dsl() {
 #[tokio::test]
 async fn schema_returns_columns() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let schema = client.schema().await.unwrap();
     assert!(!schema.columns.is_empty());
@@ -240,7 +241,7 @@ async fn schema_returns_columns() {
 #[tokio::test]
 async fn schema_caching_works() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let first = client.schema().await.unwrap();
     assert!(!first.cached, "first call should not be cached");
@@ -254,8 +255,8 @@ async fn schema_caching_works() {
 #[tokio::test]
 async fn queries_shows_history() {
     let server = setup().await;
-    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token);
-    let admin = HttpClient::new_insecure(&server.url, &server.admin_token);
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     // Run a query so there's something in history.
     analyst.query("*").await.unwrap();
@@ -272,7 +273,7 @@ async fn queries_shows_history() {
 #[tokio::test]
 async fn queries_rejects_non_admin() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = client.queries().await;
     assert!(result.is_err());
