@@ -131,8 +131,8 @@ async fn setup() -> TestServer {
 
     TestServer {
         url: format!("https://{addr}"),
-        analyst_token: analyst.plaintext_token,
-        admin_token: admin.plaintext_token,
+        analyst_token: analyst.plaintext_token.to_string(),
+        admin_token: admin.plaintext_token.to_string(),
     }
 }
 

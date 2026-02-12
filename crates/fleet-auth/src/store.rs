@@ -31,6 +31,13 @@ pub struct KeyStore {
     conn: rusqlite::Connection,
 }
 
+/// Parse a role string from the database into a [`Role`] enum.
+fn parse_role(role_str: String) -> Result<Role, AuthError> {
+    role_str
+        .parse()
+        .map_err(|_| AuthError::UnknownRole(role_str))
+}
+
 impl KeyStore {
     /// Open (or create) the auth database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuthError> {
@@ -129,7 +136,7 @@ impl KeyStore {
                             last_used: None,
                             revoked_at: None,
                         },
-                        plaintext_token: generated.plaintext,
+                        plaintext_token: generated.plaintext.clone(),
                     });
                 }
                 // Prefix collision — retry with a new token.
@@ -211,9 +218,7 @@ impl KeyStore {
             params![now, id],
         )?;
 
-        let role: Role = role_str
-            .parse()
-            .map_err(|_| AuthError::UnknownRole(role_str))?;
+        let role = parse_role(role_str)?;
 
         Ok(VerifiedKey {
             id,
@@ -266,9 +271,7 @@ impl KeyStore {
                     last_used,
                     revoked_at,
                 )| {
-                    let role: Role = role_str
-                        .parse()
-                        .map_err(|_| AuthError::UnknownRole(role_str))?;
+                    let role = parse_role(role_str)?;
                     Ok(ApiKeyInfo {
                         id,
                         prefix,
@@ -312,13 +315,57 @@ impl KeyStore {
             });
         }
 
-        // Return the updated key info.
-        let keys = self.list_keys(false)?;
-        keys.into_iter()
-            .find(|k| k.prefix == prefix)
-            .ok_or_else(|| AuthError::KeyNotFound {
-                prefix: prefix.to_owned(),
-            })
+        // Return the updated key info with a direct query.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, prefix, name, role, active, created_at, expires_at, last_used, revoked_at
+             FROM api_keys WHERE prefix = ?1",
+        )?;
+        stmt.query_row(params![prefix], |row| {
+            let role_str: String = row.get(3)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                role_str,
+                row.get::<_, bool>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .optional()
+        .map_err(AuthError::Database)?
+        .map(
+            |(
+                id,
+                prefix,
+                name,
+                role_str,
+                active,
+                created_at,
+                expires_at,
+                last_used,
+                revoked_at,
+            )|
+             -> Result<ApiKeyInfo, AuthError> {
+                Ok(ApiKeyInfo {
+                    id,
+                    prefix,
+                    name,
+                    role: parse_role(role_str)?,
+                    active,
+                    created_at,
+                    expires_at,
+                    last_used,
+                    revoked_at,
+                })
+            },
+        )
+        .transpose()?
+        .ok_or_else(|| AuthError::KeyNotFound {
+            prefix: prefix.to_owned(),
+        })
     }
 }
 

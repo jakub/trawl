@@ -29,13 +29,6 @@ pub enum AuthError {
         prefix: String,
     },
 
-    /// The key exists but has expired.
-    #[error("key has expired: {prefix}")]
-    KeyExpired {
-        /// The prefix of the expired key.
-        prefix: String,
-    },
-
     /// The token format is invalid (missing prefix, wrong length, etc.).
     #[error("malformed token: {0}")]
     MalformedToken(String),

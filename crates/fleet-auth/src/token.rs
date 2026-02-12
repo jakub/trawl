@@ -7,6 +7,7 @@
 use base64ct::Base64UrlUnpadded;
 use base64ct::Encoding as _;
 use rand::RngCore as _;
+use zeroize::Zeroizing;
 
 use crate::error::AuthError;
 
@@ -23,7 +24,8 @@ const PREFIX_LENGTH: usize = 8;
 #[derive(Debug, Clone)]
 pub struct GeneratedToken {
     /// The full token string: `flt_` + 32 bytes base64url.
-    pub plaintext: String,
+    /// Wrapped in [`Zeroizing`] to clear from memory on drop.
+    pub plaintext: Zeroizing<String>,
     /// The first 8 chars of the base64url portion, used for identification.
     pub prefix: String,
 }
@@ -35,7 +37,7 @@ pub fn generate_token() -> GeneratedToken {
 
     let encoded = Base64UrlUnpadded::encode_string(&bytes);
     let prefix = encoded[..PREFIX_LENGTH].to_owned();
-    let plaintext = format!("{TOKEN_PREFIX}{encoded}");
+    let plaintext = Zeroizing::new(format!("{TOKEN_PREFIX}{encoded}"));
 
     GeneratedToken { plaintext, prefix }
 }
@@ -56,10 +58,13 @@ pub fn extract_prefix(token: &str) -> Option<&str> {
 /// Returns the PHC-formatted hash string (includes algorithm, params, salt, hash).
 pub fn hash_token(plaintext: &str) -> Result<String, AuthError> {
     use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher as _};
+    use argon2::{Algorithm, Argon2, Params, PasswordHasher as _, Version};
 
     let salt = SaltString::generate(&mut rand::rngs::OsRng);
-    let argon2 = Argon2::default();
+    // 128 MiB memory, 3 iterations, 4 lanes — stronger than default for
+    // long-lived admin credentials. key creation is rare so cost is negligible.
+    let params = Params::new(128 * 1024, 3, 4, None).expect("valid argon2 params");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     argon2
         .hash_password(plaintext.as_bytes(), &salt)

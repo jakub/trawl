@@ -1,5 +1,7 @@
 //! API key data types — metadata, creation results, verified identity.
 
+use zeroize::Zeroizing;
+
 use crate::roles::Role;
 
 /// Metadata about an API key, as stored in the database.
@@ -33,7 +35,8 @@ pub struct CreatedKey {
     /// Key metadata.
     pub info: ApiKeyInfo,
     /// The full plaintext token — show to the user immediately, never store.
-    pub plaintext_token: String,
+    /// Wrapped in [`Zeroizing`] to clear from memory on drop.
+    pub plaintext_token: Zeroizing<String>,
 }
 
 /// A verified API key identity — the result of successful authentication.
