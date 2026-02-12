@@ -26,19 +26,25 @@ pub(crate) struct EmitterState {
     params: Vec<SqlValue>,
 }
 
+/// Validate a source path for use in `DuckDB` table-valued functions.
+///
+/// `DuckDB`'s `read_parquet()`/`read_json_auto()` don't support parameterized
+/// paths, so the path must be sanitized before interpolation into SQL.
+pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
+    if !source
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/_.*?{}[]-~".contains(&b))
+    {
+        return Err(super::EmitError::UnsupportedOperation {
+            message: format!("source path contains invalid characters: {source}"),
+        });
+    }
+    Ok(())
+}
+
 impl EmitterState {
     pub(crate) fn new(source: &str) -> Result<Self, super::EmitError> {
-        // Validate source path to prevent SQL injection in table-valued functions.
-        // DuckDB's read_parquet()/read_json_auto() don't support parameterized paths,
-        // so we must sanitize the path before interpolation.
-        if !source
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/_.*?{}[]-~".contains(&b))
-        {
-            return Err(super::EmitError::UnsupportedOperation {
-                message: format!("source path contains invalid characters: {source}"),
-            });
-        }
+        validate_source_path(source)?;
 
         let ext = std::path::Path::new(source)
             .extension()

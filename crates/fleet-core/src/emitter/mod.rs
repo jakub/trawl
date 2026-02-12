@@ -13,6 +13,8 @@ mod state;
 use crate::ast::Query;
 use state::EmitterState;
 
+pub use state::validate_source_path;
+
 use std::fmt;
 
 /// The result of emitting SQL from a parsed query.
