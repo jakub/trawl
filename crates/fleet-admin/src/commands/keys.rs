@@ -126,6 +126,9 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     }
 
     let (num_str, unit) = s.split_at(s.len() - 1);
+    if num_str.is_empty() {
+        return Err(format!("missing numeric value in duration: {s}"));
+    }
     let num: u64 = num_str
         .parse()
         .map_err(|_| format!("invalid duration number: {num_str}"))?;
@@ -173,6 +176,15 @@ mod tests {
     #[test]
     fn parse_duration_invalid_number() {
         assert!(parse_duration("abcd").is_err());
+    }
+
+    #[test]
+    fn parse_duration_unit_only() {
+        let err = parse_duration("d").unwrap_err();
+        assert!(
+            err.contains("missing numeric"),
+            "expected 'missing numeric', got: {err}"
+        );
     }
 
     #[test]

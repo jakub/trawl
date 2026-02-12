@@ -16,6 +16,7 @@ fleet-auth = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
 rcgen = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

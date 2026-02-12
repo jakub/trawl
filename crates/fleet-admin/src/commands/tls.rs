@@ -21,9 +21,20 @@ pub fn generate(output_dir: &Path, extra_san: &[String]) -> Result<(), String> {
         subject_alt_names.join(", ")
     );
 
-    let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(subject_alt_names)
-            .map_err(|e| format!("certificate generation failed: {e}"))?;
+    // Explicit ECDSA P-256 key + 2-year validity for auditability.
+    let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("key generation failed: {e}"))?;
+
+    let mut params = rcgen::CertificateParams::new(subject_alt_names)
+        .map_err(|e| format!("certificate params failed: {e}"))?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "fleet self-signed");
+    params.not_before = time::OffsetDateTime::now_utc();
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(730);
+
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| format!("certificate generation failed: {e}"))?;
 
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
