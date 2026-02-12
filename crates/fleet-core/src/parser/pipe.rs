@@ -231,7 +231,10 @@ fn extract_stage<'src>()
     choice((kv_mode, regex_mode)).labelled("extract stage")
 }
 
-/// Parse a `dedup` stage: `dedup field(, field)*`
+/// Parse a `dedup` stage: `dedup [field(, field)*]`
+///
+/// Bare `dedup` (no fields) removes exact duplicate rows.
+/// With fields, keeps the most recent row per unique field combination.
 fn dedup_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("dedup")
@@ -240,7 +243,9 @@ fn dedup_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
             field_name()
                 .separated_by(just(',').padded())
                 .at_least(1)
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
+                .or_not()
+                .map(Option::unwrap_or_default),
         )
         .map(|fields| PipeStage::Dedup(DedupStage { fields }))
         .labelled("dedup stage")

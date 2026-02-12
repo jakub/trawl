@@ -276,26 +276,32 @@ fn process_dedup(dedup: &crate::ast::DedupStage, ctx: &mut EmitterState) {
     // always flush current state to CTE first
     ctx.flush_to_cte();
 
-    // add ROW_NUMBER() partitioned by dedup fields, ordered by timestamp DESC
-    let partition_fields: Vec<String> = dedup.fields.iter().map(|f| quote_field(f)).collect();
-    let partition_clause = partition_fields.join(", ");
+    if dedup.fields.is_empty() {
+        // bare `dedup` — exact row deduplication
+        ctx.select = vec!["DISTINCT *".to_string()];
+        ctx.has_projection = true;
+    } else {
+        // `dedup field, ...` — keep most recent row per unique field combination
+        let partition_fields: Vec<String> = dedup.fields.iter().map(|f| quote_field(f)).collect();
+        let partition_clause = partition_fields.join(", ");
 
-    ctx.select = vec![
-        "*".to_string(),
-        format!(
-            "ROW_NUMBER() OVER (PARTITION BY {partition_clause} ORDER BY \
-             CAST(\"timestamp\" AS TIMESTAMP) DESC) AS \"_rn\""
-        ),
-    ];
-    ctx.has_projection = true;
+        ctx.select = vec![
+            "*".to_string(),
+            format!(
+                "ROW_NUMBER() OVER (PARTITION BY {partition_clause} ORDER BY \
+                 CAST(\"timestamp\" AS TIMESTAMP) DESC) AS \"_rn\""
+            ),
+        ];
+        ctx.has_projection = true;
 
-    // flush the window function CTE
-    ctx.flush_to_cte();
+        // flush the window function CTE
+        ctx.flush_to_cte();
 
-    // filter to keep only the first row per partition, drop _rn
-    ctx.push_where("\"_rn\" = 1".to_string());
-    ctx.select = vec!["* EXCLUDE (\"_rn\")".to_string()];
-    ctx.has_projection = true;
+        // filter to keep only the first row per partition, drop _rn
+        ctx.push_where("\"_rn\" = 1".to_string());
+        ctx.select = vec!["* EXCLUDE (\"_rn\")".to_string()];
+        ctx.has_projection = true;
+    }
 }
 
 fn process_timechart(

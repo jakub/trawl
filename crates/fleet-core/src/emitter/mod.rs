@@ -530,6 +530,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn pipe_dedup_bare() {
+        assert_snapshot!(emit_dsl("* | dedup"));
+    }
+
+    #[test]
     fn pipe_dedup_single_field() {
         assert_snapshot!(emit_dsl("* | dedup host"));
     }
