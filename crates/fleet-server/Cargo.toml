@@ -22,6 +22,7 @@ clap = { workspace = true }
 duckdb = { workspace = true }
 flate2 = { workspace = true }
 hyper = { workspace = true }
+parking_lot = { workspace = true }
 rand = { workspace = true }
 hyper-util = { workspace = true }
 rcgen = { workspace = true }
