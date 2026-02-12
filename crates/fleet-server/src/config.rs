@@ -214,6 +214,19 @@ fn expand_tilde(path: &str) -> String {
 }
 
 impl Config {
+    /// Parse configuration from a TOML string.
+    ///
+    /// Resolves paths (tilde expansion) and validates, same as [`from_file`].
+    pub fn from_toml(contents: &str) -> Result<Self, ConfigError> {
+        let mut config: Self = toml::from_str(contents).map_err(|e| ConfigError::Parse {
+            path: PathBuf::from("<inline>"),
+            source: e,
+        })?;
+        config.resolve_paths();
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Load configuration from a TOML file.
     ///
     /// All paths in the config are resolved (tilde-expanded) after parsing.
@@ -222,13 +235,13 @@ impl Config {
             path: path.as_ref().to_owned(),
             source: e,
         })?;
-        let mut config: Self = toml::from_str(&contents).map_err(|e| ConfigError::Parse {
-            path: path.as_ref().to_owned(),
-            source: e,
-        })?;
-        config.resolve_paths();
-        config.validate()?;
-        Ok(config)
+        Self::from_toml(&contents).map_err(|e| match e {
+            ConfigError::Parse { source, .. } => ConfigError::Parse {
+                path: path.as_ref().to_owned(),
+                source,
+            },
+            other => other,
+        })
     }
 
     /// Expand `~` to `$HOME` in all path fields.
