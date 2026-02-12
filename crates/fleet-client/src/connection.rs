@@ -26,33 +26,38 @@ impl std::fmt::Debug for HttpClient {
 
 impl HttpClient {
     /// Create a new client targeting the given daemon URL with an API key.
-    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        Self {
+    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, ClientError> {
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(sanitize_reqwest_error)?;
+        Ok(Self {
             base_url: base_url.into(),
             token: token.into(),
-            client: Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("failed to build HTTP client"),
-        }
+            client,
+        })
     }
 
     /// Create a client that accepts self-signed / invalid TLS certificates.
     ///
     /// Use this for development or when connecting to a daemon with an
     /// auto-generated self-signed cert.
-    pub fn new_insecure(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        Self {
+    pub fn new_insecure(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(120))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(sanitize_reqwest_error)?;
+        Ok(Self {
             base_url: base_url.into(),
             token: token.into(),
-            client: Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(120))
-                .danger_accept_invalid_certs(true)
-                .build()
-                .expect("failed to build HTTP client"),
-        }
+            client,
+        })
     }
 
     /// Create a client with a pre-configured `reqwest::Client`.
@@ -68,9 +73,14 @@ impl HttpClient {
         }
     }
 
+    /// Build a full URL for an API endpoint, normalizing trailing slashes.
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url.trim_end_matches('/'))
+    }
+
     /// Execute a DSL query against the daemon.
     pub async fn query(&self, dsl: &str) -> Result<QueryResult, ClientError> {
-        let url = format!("{}/api/v1/query", self.base_url);
+        let url = self.endpoint("/api/v1/query");
         let body = QueryRequest {
             query: dsl.to_owned(),
         };
@@ -81,14 +91,14 @@ impl HttpClient {
 
     /// Check daemon health (unauthenticated).
     pub async fn health(&self) -> Result<serde_json::Value, ClientError> {
-        let url = format!("{}/api/v1/health", self.base_url);
+        let url = self.endpoint("/api/v1/health");
 
         let resp = self
             .client
             .get(&url)
             .send()
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(sanitize_reqwest_error)?;
 
         resp.json()
             .await
@@ -97,14 +107,14 @@ impl HttpClient {
 
     /// Fetch schema introspection from the daemon.
     pub async fn schema(&self) -> Result<SchemaResponse, ClientError> {
-        let url = format!("{}/api/v1/schema", self.base_url);
+        let url = self.endpoint("/api/v1/schema");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
     }
 
     /// Fetch active and recent queries from the daemon (admin only).
     pub async fn queries(&self) -> Result<QueriesResponse, ClientError> {
-        let url = format!("{}/api/v1/queries", self.base_url);
+        let url = self.endpoint("/api/v1/queries");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
     }
@@ -118,7 +128,7 @@ impl HttpClient {
             .header("Authorization", format!("Bearer {}", self.token))
             .send()
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(sanitize_reqwest_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -132,6 +142,21 @@ impl HttpClient {
         resp.json()
             .await
             .map_err(|e| ClientError::Parse(e.to_string()))
+    }
+}
+
+/// Categorize a reqwest error without exposing raw details that might
+/// contain tokens or internal URLs.
+#[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_reqwest_error)`
+fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
+    if e.is_timeout() {
+        ClientError::Network("request timed out".into())
+    } else if e.is_connect() {
+        ClientError::Network("connection failed".into())
+    } else if e.is_builder() {
+        ClientError::Network("invalid request configuration".into())
+    } else {
+        ClientError::Network("request failed".into())
     }
 }
 
