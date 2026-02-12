@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting fleetd"
     );
 
-    let state = AppState::from_config(&config);
+    let state = AppState::from_config(&config)?;
     http::serve(state, &config.server).await?;
 
     Ok(())

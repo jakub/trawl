@@ -115,7 +115,7 @@ async fn setup() -> TestServer {
         auth: AuthConfig { db_path: auth_db },
     };
 
-    let state = AppState::from_config(&config);
+    let state = AppState::from_config(&config).expect("failed to create app state");
 
     // Spawn the HTTPS server in a background task.
     let server_config = config.server.clone();

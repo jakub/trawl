@@ -4,8 +4,7 @@
 //! token against the `KeyStore` in a blocking task, and injects the
 //! [`VerifiedKey`] into request extensions for downstream handlers.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::Request;
 use axum::http::HeaderMap;
@@ -22,11 +21,11 @@ use crate::error::ServerError;
 pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, ServerError> {
     let path = request.uri().path().to_owned();
 
-    let auth_db_path = request
+    let key_store = request
         .extensions()
-        .get::<Arc<PathBuf>>()
+        .get::<Arc<Mutex<KeyStore>>>()
         .cloned()
-        .ok_or_else(|| ServerError::Internal("auth_db_path not in extensions".into()))?;
+        .ok_or_else(|| ServerError::Internal("key_store not in extensions".into()))?;
 
     let Some(raw_token) = extract_bearer_token(request.headers()) else {
         tracing::warn!(path = %path, "auth failed: missing or malformed Authorization header");
@@ -37,7 +36,9 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
     let token = raw_token.to_owned();
 
     let verified = match tokio::task::spawn_blocking(move || {
-        let store = KeyStore::open(&*auth_db_path)?;
+        let store = key_store
+            .lock()
+            .expect("key store mutex poisoned — auth task panicked previously");
         store.verify_key(&token)
     })
     .await

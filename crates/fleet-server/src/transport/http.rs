@@ -46,8 +46,8 @@ pub fn router(state: AppState) -> Router {
     // Routes that are public (no auth required).
     let public = Router::new().route("/api/v1/health", get(handlers::health));
 
-    // Auth db path is injected into extensions so the auth middleware can find it.
-    let auth_db_path = Arc::clone(&state.auth_db_path);
+    // Shared key store injected into extensions for the auth middleware.
+    let key_store = Arc::clone(&state.key_store);
 
     Router::new()
         .merge(authenticated)
@@ -101,7 +101,7 @@ pub fn router(state: AppState) -> Router {
                     },
                 ),
         )
-        .layer(axum::Extension(auth_db_path))
+        .layer(axum::Extension(key_store))
         .with_state(state)
 }
 
