@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use rustls::ServerConfig;
 use rustls_pki_types::pem::PemObject;
@@ -170,6 +170,9 @@ fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
 /// Background task that polls cert/key files for changes and sends a new
 /// [`TlsAcceptor`] through the watch channel when they change.
 ///
+/// Uses content-based comparison instead of mtime to avoid TOCTOU races
+/// between the change check and file read.
+///
 /// Runs until the watch receiver is dropped (i.e. the server shuts down).
 pub async fn cert_reload_task(
     cert_path: PathBuf,
@@ -177,17 +180,34 @@ pub async fn cert_reload_task(
     interval: Duration,
     tx: tokio::sync::watch::Sender<TlsAcceptor>,
 ) {
-    let mut last_modified = file_mtime(&cert_path);
+    // Seed with the current file contents so we only reload on actual changes.
+    let mut last_cert = fs::read(&cert_path).ok();
+    let mut last_key = fs::read(&key_path).ok();
 
     loop {
         tokio::time::sleep(interval).await;
 
-        let current_modified = file_mtime(&cert_path);
-        if current_modified == last_modified {
+        let current_cert = match fs::read(&cert_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read cert file, skipping reload");
+                continue;
+            }
+        };
+        let current_key = match fs::read(&key_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read key file, skipping reload");
+                continue;
+            }
+        };
+
+        if last_cert.as_deref() == Some(&current_cert) && last_key.as_deref() == Some(&current_key)
+        {
             continue;
         }
 
-        tracing::info!("TLS certificate file changed, reloading");
+        tracing::info!("TLS certificate files changed, reloading");
 
         match build_server_config(Some(&cert_path), Some(&key_path)) {
             Ok((config, _)) => {
@@ -196,7 +216,8 @@ pub async fn cert_reload_task(
                     // Receiver dropped — server is shutting down.
                     break;
                 }
-                last_modified = current_modified;
+                last_cert = Some(current_cert);
+                last_key = Some(current_key);
                 tracing::info!("TLS certificate reloaded successfully");
             }
             Err(e) => {
@@ -204,11 +225,6 @@ pub async fn cert_reload_task(
             }
         }
     }
-}
-
-/// Get a file's modification time, or `None` if the file doesn't exist.
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 #[cfg(test)]
