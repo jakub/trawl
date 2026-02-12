@@ -141,19 +141,17 @@ fn compact_service_blocking(
     std::fs::create_dir_all(&output_dir)
         .map_err(|e| format!("failed to create output dir: {e}"))?;
 
-    let output_path = output_dir.join(format!("{service}.parquet"));
-
-    // Write parquet. If the file already exists, append to it.
-    let mode = if output_path.exists() {
-        ", FILE_SIZE_BYTES '500MB', OVERWRITE true"
-    } else {
-        ""
-    };
+    // Use a unique filename per compaction batch so we never need to append.
+    // The query engine globs **/*.parquet, so multiple files per hour is fine.
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_millis();
+    let output_path = output_dir.join(format!("{service}_{millis}.parquet"));
 
     conn.execute_batch(&format!(
-        "COPY wal_batch TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY{})",
+        "COPY wal_batch TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
         output_path.display(),
-        mode
     ))
     .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
 
