@@ -7,11 +7,21 @@ use serde::{Deserialize, Serialize};
 use crate::error::ClientError;
 
 /// HTTP client for the fleet daemon API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpClient {
     base_url: String,
     token: String,
     client: Client,
+}
+
+impl std::fmt::Debug for HttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpClient")
+            .field("base_url", &self.base_url)
+            .field("token", &"<redacted>")
+            .field("client", &self.client)
+            .finish()
+    }
 }
 
 impl HttpClient {
@@ -61,34 +71,11 @@ impl HttpClient {
     /// Execute a DSL query against the daemon.
     pub async fn query(&self, dsl: &str) -> Result<QueryResult, ClientError> {
         let url = format!("{}/api/v1/query", self.base_url);
-
         let body = QueryRequest {
             query: dsl.to_owned(),
         };
-
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let message = resp
-                .json::<ErrorResponse>()
-                .await
-                .map_or_else(|_| "unknown error".into(), |e| e.error);
-            return Err(ClientError::Server { status, message });
-        }
-
-        let json: QueryResponse = resp
-            .json()
-            .await
-            .map_err(|e| ClientError::Parse(e.to_string()))?;
-
+        let req = self.client.post(&url).json(&body);
+        let json: QueryResponse = self.send_authenticated(req).await?;
         Ok(json.into())
     }
 
@@ -111,36 +98,23 @@ impl HttpClient {
     /// Fetch schema introspection from the daemon.
     pub async fn schema(&self) -> Result<SchemaResponse, ClientError> {
         let url = format!("{}/api/v1/schema", self.base_url);
-
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .send()
-            .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let message = resp
-                .json::<ErrorResponse>()
-                .await
-                .map_or_else(|_| "unknown error".into(), |e| e.error);
-            return Err(ClientError::Server { status, message });
-        }
-
-        resp.json()
-            .await
-            .map_err(|e| ClientError::Parse(e.to_string()))
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
     }
 
     /// Fetch active and recent queries from the daemon (admin only).
     pub async fn queries(&self) -> Result<QueriesResponse, ClientError> {
         let url = format!("{}/api/v1/queries", self.base_url);
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
 
-        let resp = self
-            .client
-            .get(&url)
+    /// Send an authenticated request, check for errors, and deserialize the response.
+    async fn send_authenticated<T: serde::de::DeserializeOwned>(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<T, ClientError> {
+        let resp = req
             .header("Authorization", format!("Bearer {}", self.token))
             .send()
             .await
