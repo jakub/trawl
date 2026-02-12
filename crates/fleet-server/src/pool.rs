@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::Timelike as _;
+use fleet_core::ast::SearchToken;
 use fleet_engine::executor::Executor;
 use fleet_engine::value::{QueryResult, SchemaResult};
 use tokio::sync::Semaphore;
@@ -31,7 +33,10 @@ type InterruptMap = HashMap<u64, Box<dyn Fn() + Send + Sync>>;
 /// database, sharing cached metadata.
 #[derive(Clone)]
 pub struct ExecutorPool {
-    data_path: Arc<str>,
+    /// Base directory for parquet data (e.g. `/var/lib/fleet/data`).
+    base_dir: Arc<str>,
+    /// Full recursive glob for queries without a time filter.
+    fallback_glob: Arc<str>,
     semaphore: Arc<Semaphore>,
     max_result_rows: usize,
     /// Monotonic ID counter for tracking active query handles.
@@ -52,7 +57,8 @@ impl std::fmt::Debug for ExecutorPool {
         let active = self.active_interrupts.lock().map_or(0, |v| v.len());
         let idle = self.idle.lock().map_or(0, |v| v.len());
         f.debug_struct("ExecutorPool")
-            .field("data_path", &self.data_path)
+            .field("base_dir", &self.base_dir)
+            .field("fallback_glob", &self.fallback_glob)
             .field("semaphore", &self.semaphore)
             .field("max_result_rows", &self.max_result_rows)
             .field("next_id", &self.next_id)
@@ -62,13 +68,61 @@ impl std::fmt::Debug for ExecutorPool {
     }
 }
 
+/// Compute the `read_parquet()` source argument, scoped to relevant
+/// hour-directories when the query contains a time filter.
+///
+/// Returns a `DuckDB` list literal like `['path/14/*.parquet', 'path/15/*.parquet']`
+/// when time-scoping is possible, or falls back to the recursive glob.
+fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
+    let Ok(ast) = fleet_core::parser::parse(dsl) else {
+        return fallback_glob.to_owned();
+    };
+
+    let time_filter = ast.search.tokens.iter().find_map(|t| {
+        if let SearchToken::TimeFilter(tf) = &t.node {
+            Some(tf.duration)
+        } else {
+            None
+        }
+    });
+
+    let Some(duration) = time_filter else {
+        return fallback_glob.to_owned();
+    };
+
+    // Pad by 1 hour to account for WAL delay: events ingested at T may
+    // land in the compaction directory for T + ~20s.
+    let total_secs = duration.to_seconds().saturating_add(3600);
+
+    let now = chrono::Utc::now();
+    let start = now - chrono::Duration::seconds(i64::try_from(total_secs).unwrap_or(i64::MAX));
+
+    let mut globs = Vec::new();
+    let mut cursor = start.date_naive().and_hms_opt(start.hour(), 0, 0).unwrap();
+    let end = now.naive_utc();
+    let base = base_dir.trim_end_matches('/');
+
+    while cursor <= end {
+        let day = cursor.format("%Y-%m-%d");
+        let hour = cursor.format("%H");
+        globs.push(format!("'{base}/{day}/{hour}/*.parquet'"));
+        cursor += chrono::Duration::hours(1);
+    }
+
+    if globs.is_empty() {
+        return fallback_glob.to_owned();
+    }
+
+    format!("[{}]", globs.join(", "))
+}
+
 impl ExecutorPool {
-    /// Create a pool with the given concurrency limit and parquet data path.
+    /// Create a pool with the given concurrency limit and base data directory.
     ///
     /// Pre-creates `max_concurrent` executors sharing the same in-memory
     /// `DuckDB` database. Panics if the database cannot be initialized
     /// (fatal at startup — the server cannot function without `DuckDB`).
-    pub fn new(data_path: String, max_concurrent: usize, max_result_rows: usize) -> Self {
+    pub fn new(base_dir: String, max_concurrent: usize, max_result_rows: usize) -> Self {
         let root = Executor::new().expect("failed to create DuckDB connection at startup");
         let mut executors = Vec::with_capacity(max_concurrent);
         for _ in 1..max_concurrent {
@@ -79,8 +133,12 @@ impl ExecutorPool {
         }
         executors.push(root);
 
+        let fallback_glob: Arc<str> =
+            Arc::from(format!("{}/**/*.parquet", base_dir.trim_end_matches('/')));
+
         Self {
-            data_path: Arc::from(data_path),
+            base_dir: Arc::from(base_dir),
+            fallback_glob,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             max_result_rows,
             next_id: Arc::new(AtomicU64::new(0)),
@@ -136,7 +194,8 @@ impl ExecutorPool {
         let executor = self.take_executor();
 
         let dsl = dsl.to_owned();
-        let data_path = Arc::clone(&self.data_path);
+        let base_dir = Arc::clone(&self.base_dir);
+        let fallback_glob = Arc::clone(&self.fallback_glob);
         let max_result_rows = self.max_result_rows;
 
         // Channel for the blocking task to send back its interrupt handle
@@ -147,8 +206,9 @@ impl ExecutorPool {
             let _permit = permit; // hold permit until this task completes
             // Send interrupt handle to async side before running the query.
             let _ = interrupt_tx.send(executor.interrupt_handle());
+            let source = compute_source(&base_dir, &dsl, &fallback_glob);
             let result = executor
-                .run_query(&dsl, &data_path, max_result_rows)
+                .run_query(&dsl, &source, max_result_rows)
                 .map_err(ServerError::from);
             (executor, result)
         });
@@ -225,13 +285,11 @@ impl ExecutorPool {
     /// queries are lightweight metadata-only operations, cached server-side
     /// with a 60s TTL (see [`crate::state::SCHEMA_CACHE_TTL_SECS`]).
     pub async fn describe_schema(&self) -> Result<SchemaResult, ServerError> {
-        let data_path = Arc::clone(&self.data_path);
+        let glob = Arc::clone(&self.fallback_glob);
 
         tokio::task::spawn_blocking(move || {
             let executor = Executor::new()?;
-            executor
-                .describe_schema(&data_path)
-                .map_err(ServerError::from)
+            executor.describe_schema(&glob).map_err(ServerError::from)
         })
         .await
         .map_err(|e| ServerError::Internal(format!("schema task panicked: {e}")))?
@@ -244,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_rejects_invalid_dsl() {
-        let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 2, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000);
         let result = pool
             .execute("totally broken {{{ query", Duration::from_secs(10))
             .await;
@@ -253,14 +311,14 @@ mod tests {
 
     #[tokio::test]
     async fn pool_respects_concurrency_limit() {
-        let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 1, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000);
         // just verifying it doesn't panic with a single permit
         let _ = pool.execute("service:test", Duration::from_secs(10)).await;
     }
 
     #[tokio::test]
     async fn pool_reuses_executors() {
-        let pool = ExecutorPool::new("nonexistent/**/*.parquet".into(), 2, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000);
 
         // Run two sequential queries — both should succeed and the pool
         // should have the same number of idle executors before and after.
@@ -273,5 +331,56 @@ mod tests {
             idle_before, idle_after,
             "executors should be returned to pool"
         );
+    }
+
+    #[test]
+    fn compute_source_no_time_filter_returns_fallback() {
+        let source = compute_source("/data", "service:nginx", "/data/**/*.parquet");
+        assert_eq!(source, "/data/**/*.parquet");
+    }
+
+    #[test]
+    fn compute_source_bad_dsl_returns_fallback() {
+        let source = compute_source("/data", "broken {{{ query", "/data/**/*.parquet");
+        assert_eq!(source, "/data/**/*.parquet");
+    }
+
+    #[test]
+    fn compute_source_with_time_filter_returns_list() {
+        let source = compute_source("/data", "service:nginx last:1h", "/data/**/*.parquet");
+        // Should be a list of hour-directory globs, not the fallback.
+        assert!(
+            source.starts_with('['),
+            "expected list format, got: {source}"
+        );
+        assert!(source.ends_with(']'), "expected list format, got: {source}");
+        assert!(
+            source.contains("*.parquet"),
+            "expected parquet globs, got: {source}"
+        );
+        // With 1h + 1h padding, should have ~2-3 hour entries.
+        let count = source.matches("*.parquet").count();
+        assert!(
+            (2..=4).contains(&count),
+            "expected 2-4 hour globs for last:1h, got {count}: {source}"
+        );
+    }
+
+    #[test]
+    fn compute_source_strips_trailing_slash() {
+        let source = compute_source("/data/", "last:1h", "/data/**/*.parquet");
+        assert!(!source.contains("//"), "double slashes in source: {source}");
+    }
+
+    #[test]
+    fn fallback_glob_derived_from_base_dir() {
+        let pool = ExecutorPool::new("/var/lib/fleet/data".into(), 1, 100_000);
+        assert_eq!(&*pool.fallback_glob, "/var/lib/fleet/data/**/*.parquet");
+    }
+
+    #[test]
+    fn fallback_glob_strips_trailing_slash() {
+        let pool = ExecutorPool::new("/var/lib/fleet/data/".into(), 1, 100_000);
+        assert_eq!(&*pool.fallback_glob, "/var/lib/fleet/data/**/*.parquet");
     }
 }

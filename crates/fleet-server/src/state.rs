@@ -75,7 +75,7 @@ impl AppState {
 
         Ok(Self {
             pool: ExecutorPool::new(
-                config.data.parquet_glob(),
+                config.data.base_dir().to_string_lossy().into_owned(),
                 config.server.max_concurrent_queries,
                 config.server.max_result_rows,
             ),
