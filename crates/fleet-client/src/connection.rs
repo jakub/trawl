@@ -97,7 +97,7 @@ impl HttpClient {
     }
 
     /// Check daemon health (unauthenticated).
-    pub async fn health(&self) -> Result<serde_json::Value, ClientError> {
+    pub async fn health(&self) -> Result<HealthResponse, ClientError> {
         let url = self.endpoint("/api/v1/health");
 
         let resp = self
@@ -187,6 +187,13 @@ struct QueryRequest {
 #[derive(Deserialize)]
 struct ErrorResponse {
     error: String,
+}
+
+/// Health check response from the daemon.
+#[derive(Debug, Deserialize)]
+pub struct HealthResponse {
+    /// Status string, typically `"ok"`.
+    pub status: String,
 }
 
 /// Schema introspection response from the daemon.
@@ -325,6 +332,15 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["query"], "service:nginx | stats count()");
+    }
+
+    // ── serde: HealthResponse ────────────────────────────────────────────
+
+    #[test]
+    fn health_response_deserializes() {
+        let json = r#"{"status": "ok"}"#;
+        let resp: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "ok");
     }
 
     // ── serde: SchemaResponse ───────────────────────────────────────────
