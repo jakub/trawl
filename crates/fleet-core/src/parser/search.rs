@@ -10,7 +10,7 @@ use crate::ast::{
     TimeFilter,
 };
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, bare_value, duration, field_name, filter_op, quoted_string,
+    ParserExtra, ParserInput, bare_value, duration, field_name, filter_op, keyword, quoted_string,
     regex_pattern, spanned,
 };
 
@@ -146,14 +146,43 @@ fn search_token<'src>()
     .labelled("search token")
 }
 
-/// Parse the full search stage: whitespace-separated tokens (implicit AND).
+/// Intermediate enum for parsing OR-separated groups.
+#[derive(Clone)]
+enum TokenOrSep<T> {
+    Token(T),
+    Or,
+}
+
+/// Parse the full search stage: OR-separated groups of AND-joined tokens.
+///
+/// `a b OR c d` → groups: `[[a, b], [c, d]]`
+/// Implicit AND (whitespace) binds tighter than explicit OR.
 pub(crate) fn search_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchStage, ParserExtra<'src>> + Clone {
-    spanned(search_token())
+    // OR keyword must be tried BEFORE text_search() to prevent "OR"
+    // being consumed as a bare text search term.
+    let or_marker = keyword("OR").or(keyword("or")).to(TokenOrSep::Or);
+
+    let token = spanned(search_token()).map(TokenOrSep::Token);
+
+    choice((or_marker, token))
         .padded()
         .repeated()
-        .collect()
-        .map(|tokens| SearchStage { tokens })
+        .collect::<Vec<_>>()
+        .map(|items| {
+            let mut groups: Vec<Vec<_>> = vec![vec![]];
+            for item in items {
+                match item {
+                    TokenOrSep::Or => groups.push(vec![]),
+                    TokenOrSep::Token(t) => {
+                        groups.last_mut().expect("groups always non-empty").push(t);
+                    }
+                }
+            }
+            // Remove empty groups (trailing OR, leading OR, double OR).
+            groups.retain(|g| !g.is_empty());
+            SearchStage { groups }
+        })
         .labelled("search stage")
 }
 
@@ -165,9 +194,9 @@ mod tests {
     #[test]
     fn test_time_filter() {
         let result = search_stage().parse("last:2h").into_result().unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::TimeFilter(TimeFilter {
                 duration: FleetDuration {
                     quantity: 2,
@@ -183,9 +212,9 @@ mod tests {
             .parse(r#""connection refused""#)
             .into_result()
             .unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::QuotedSearch(QuotedSearch {
                 phrase: "connection refused".to_string(),
             })
@@ -195,9 +224,9 @@ mod tests {
     #[test]
     fn test_field_filter_simple() {
         let result = search_stage().parse("service:nginx").into_result().unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
@@ -209,9 +238,9 @@ mod tests {
     #[test]
     fn test_field_filter_with_op() {
         let result = search_stage().parse("status:>=400").into_result().unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "status".to_string(),
                 op: FilterOp::Gte,
@@ -226,9 +255,9 @@ mod tests {
             .parse("status:200,301,404")
             .into_result()
             .unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "status".to_string(),
                 op: FilterOp::Eq,
@@ -244,9 +273,9 @@ mod tests {
     #[test]
     fn test_field_filter_glob() {
         let result = search_stage().parse("path:/api/*").into_result().unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "path".to_string(),
                 op: FilterOp::Glob,
@@ -261,9 +290,9 @@ mod tests {
             .parse("message:/error.*/")
             .into_result()
             .unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "message".to_string(),
                 op: FilterOp::Regex,
@@ -279,9 +308,9 @@ mod tests {
             .parse(r#"service:"kernel""#)
             .into_result()
             .unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
@@ -297,9 +326,9 @@ mod tests {
             .parse(r#"service:"Activity Monitor""#)
             .into_result()
             .unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
@@ -311,9 +340,9 @@ mod tests {
     #[test]
     fn test_negated_text_search() {
         let result = search_stage().parse("-debug").into_result().unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::TextSearch(TextSearch {
                 term: "debug".to_string(),
                 negated: true,
@@ -327,16 +356,16 @@ mod tests {
             .parse("service:nginx level:error last:2h")
             .into_result()
             .unwrap();
-        assert_eq!(result.tokens.len(), 3);
+        assert_eq!(result.groups[0].len(), 3);
     }
 
     #[test]
     fn test_bare_word_not_mistaken_for_field() {
         // "NOT" should parse as text search, not fail as field_filter.
         let result = search_stage().parse("NOT").into_result().unwrap();
-        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::TextSearch(TextSearch {
                 term: "NOT".to_string(),
                 negated: false,
@@ -351,16 +380,16 @@ mod tests {
             .parse("NOT level:error")
             .into_result()
             .unwrap();
-        assert_eq!(result.tokens.len(), 2);
+        assert_eq!(result.groups[0].len(), 2);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::TextSearch(TextSearch {
                 term: "NOT".to_string(),
                 negated: false,
             })
         );
         assert_eq!(
-            result.tokens[1].node,
+            result.groups[0][1].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "level".to_string(),
                 op: FilterOp::Eq,
@@ -375,13 +404,67 @@ mod tests {
             .parse("-debug service:nginx")
             .into_result()
             .unwrap();
-        assert_eq!(result.tokens.len(), 2);
+        assert_eq!(result.groups[0].len(), 2);
         assert_eq!(
-            result.tokens[0].node,
+            result.groups[0][0].node,
             SearchToken::TextSearch(TextSearch {
                 term: "debug".to_string(),
                 negated: true,
             })
         );
+    }
+
+    #[test]
+    fn test_or_two_groups() {
+        let result = search_stage()
+            .parse("service:kernel OR service:fleetd")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups.len(), 2);
+        assert_eq!(result.groups[0].len(), 1);
+        assert_eq!(result.groups[1].len(), 1);
+        assert_eq!(
+            result.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "service".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("kernel".to_string()),
+            })
+        );
+        assert_eq!(
+            result.groups[1][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "service".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("fleetd".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_or_implicit_and_binds_tighter() {
+        // "a b OR c d" → [[a, b], [c, d]]
+        let result = search_stage()
+            .parse("service:nginx level:error OR service:postgres level:warn")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups.len(), 2);
+        assert_eq!(result.groups[0].len(), 2);
+        assert_eq!(result.groups[1].len(), 2);
+    }
+
+    #[test]
+    fn test_or_lowercase() {
+        let result = search_stage()
+            .parse("service:a or service:b")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups.len(), 2);
+    }
+
+    #[test]
+    fn test_empty_query_groups() {
+        let result = search_stage().parse("").into_result().unwrap();
+        assert!(result.groups.is_empty());
     }
 }

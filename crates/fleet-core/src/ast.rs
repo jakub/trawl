@@ -39,10 +39,23 @@ pub struct Query {
 // Search stage (everything before the first `|`)
 // ---------------------------------------------------------------------------
 
-/// The implicit search stage — a list of search tokens combined with AND.
+/// The implicit search stage — OR-separated groups of AND-joined tokens.
+///
+/// `a b OR c d` → groups: `[[a, b], [c, d]]`
+/// Queries without OR have a single group (backward-compatible).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchStage {
-    pub tokens: Vec<Spanned<SearchToken>>,
+    pub groups: Vec<Vec<Spanned<SearchToken>>>,
+}
+
+impl SearchStage {
+    /// All tokens across all groups, flattened.
+    ///
+    /// Convenience for consumers that don't care about OR grouping
+    /// (e.g. extracting time filters, counting tokens in tests).
+    pub fn all_tokens(&self) -> impl Iterator<Item = &Spanned<SearchToken>> {
+        self.groups.iter().flat_map(|g| g.iter())
+    }
 }
 
 /// A single token in the search stage.

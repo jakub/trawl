@@ -138,22 +138,22 @@ mod tests {
     #[test]
     fn test_simple_field_filter() {
         let query = parse("service:nginx").unwrap();
-        assert_eq!(query.search.tokens.len(), 1);
+        assert_eq!(query.search.groups[0].len(), 1);
         assert_eq!(query.pipeline.len(), 0);
     }
 
     #[test]
     fn test_multi_token_search() {
         let query = parse("service:nginx level:error last:2h").unwrap();
-        assert_eq!(query.search.tokens.len(), 3);
+        assert_eq!(query.search.groups[0].len(), 3);
     }
 
     #[test]
     fn test_quoted_search() {
         let query = parse(r#""connection refused""#).unwrap();
-        assert_eq!(query.search.tokens.len(), 1);
+        assert_eq!(query.search.groups[0].len(), 1);
         assert_eq!(
-            query.search.tokens[0].node,
+            query.search.groups[0][0].node,
             SearchToken::QuotedSearch(QuotedSearch {
                 phrase: "connection refused".to_string(),
             })
@@ -163,9 +163,9 @@ mod tests {
     #[test]
     fn test_negated_text_search() {
         let query = parse("-debug service:nginx").unwrap();
-        assert_eq!(query.search.tokens.len(), 2);
+        assert_eq!(query.search.groups[0].len(), 2);
         assert_eq!(
-            query.search.tokens[0].node,
+            query.search.groups[0][0].node,
             SearchToken::TextSearch(TextSearch {
                 term: "debug".to_string(),
                 negated: true,
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_search_with_stats() {
         let query = parse("service:nginx last:1h | stats count() by host").unwrap();
-        assert_eq!(query.search.tokens.len(), 2);
+        assert_eq!(query.search.groups[0].len(), 2);
         assert_eq!(query.pipeline.len(), 1);
         assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
     }
@@ -185,7 +185,7 @@ mod tests {
     fn test_full_pipeline() {
         let query = parse("service:nginx | stats count() by host | where count > 10 | sort -count")
             .unwrap();
-        assert_eq!(query.search.tokens.len(), 1);
+        assert_eq!(query.search.groups[0].len(), 1);
         assert_eq!(query.pipeline.len(), 3);
         assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
         assert!(matches!(query.pipeline[1].node, PipeStage::Where(_)));
@@ -221,7 +221,7 @@ mod tests {
         let query =
             parse("status:>=400 last:24h | stats count() by host, uri | sort -count | limit 20")
                 .unwrap();
-        assert_eq!(query.search.tokens.len(), 2);
+        assert_eq!(query.search.groups[0].len(), 2);
         assert_eq!(query.pipeline.len(), 3);
         assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
         assert!(matches!(query.pipeline[1].node, PipeStage::Sort(_)));
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn test_empty_query() {
         let query = parse("").unwrap();
-        assert_eq!(query.search.tokens.len(), 0);
+        assert!(query.search.groups.is_empty());
         assert_eq!(query.pipeline.len(), 0);
     }
 

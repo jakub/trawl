@@ -295,9 +295,8 @@ mod tests {
     #[tokio::test]
     async fn pool_rejects_invalid_dsl() {
         let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000);
-        let result = pool
-            .execute("totally broken {{{ query", Duration::from_secs(10))
-            .await;
+        // Must start with `|` to trigger a parse error — bare text is valid DSL.
+        let result = pool.execute("| | invalid", Duration::from_secs(10)).await;
         assert!(result.is_err());
     }
 

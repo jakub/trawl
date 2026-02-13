@@ -152,6 +152,17 @@ impl EmitterState {
         self.where_clauses.push(clause);
     }
 
+    /// Run a closure that may push WHERE clauses, capturing them separately.
+    ///
+    /// Swaps the WHERE buffer, runs the closure, then restores the original.
+    /// Parameters pushed during the closure are kept (ordering is preserved).
+    /// Used by multi-group (OR) search emission to collect per-group clauses.
+    pub(crate) fn collect_where_clauses(&mut self, f: impl FnOnce(&mut Self)) -> Vec<String> {
+        let original = std::mem::take(&mut self.where_clauses);
+        f(self);
+        std::mem::replace(&mut self.where_clauses, original)
+    }
+
     /// Conditionally flush the current state to a CTE based on the given condition.
     pub(crate) fn flush_if(&mut self, condition: FlushCondition) {
         let should_flush = match condition {

@@ -219,6 +219,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn search_or_two_services() {
+        assert_snapshot!(emit_dsl("service:kernel OR service:fleetd"));
+    }
+
+    #[test]
+    fn search_or_with_stats() {
+        assert_snapshot!(emit_dsl("service:kernel OR service:fleetd | stats count()"));
+    }
+
+    #[test]
+    fn search_or_multi_token_groups() {
+        assert_snapshot!(emit_dsl(
+            "service:nginx level:error OR service:postgres level:warn"
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // single pipe stages
     // -----------------------------------------------------------------------

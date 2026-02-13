@@ -5,9 +5,37 @@ use super::fields::{coerce_filter_value, quote_field};
 use super::state::EmitterState;
 
 /// Translate the search stage tokens into WHERE clauses on the emitter state.
+///
+/// For single-group queries, emits tokens directly (same as before).
+/// For multi-group (OR) queries, collects each group's clauses and
+/// combines them as `(a AND b) OR (c AND d)`.
 pub(crate) fn emit_search(search: &SearchStage, state: &mut EmitterState) {
-    for token in &search.tokens {
-        emit_search_token(&token.node, state);
+    match search.groups.len() {
+        0 => {}
+        1 => {
+            // single group — emit directly (backward-compatible)
+            for token in &search.groups[0] {
+                emit_search_token(&token.node, state);
+            }
+        }
+        _ => {
+            // multi-group (OR) — collect each group's WHERE clauses separately
+            let mut group_conditions = Vec::new();
+            for group in &search.groups {
+                let clauses = state.collect_where_clauses(|s| {
+                    for token in group {
+                        emit_search_token(&token.node, s);
+                    }
+                });
+                if !clauses.is_empty() {
+                    let joined = clauses.join(" AND ");
+                    group_conditions.push(format!("({joined})"));
+                }
+            }
+            if !group_conditions.is_empty() {
+                state.push_where(group_conditions.join(" OR "));
+            }
+        }
     }
 }
 

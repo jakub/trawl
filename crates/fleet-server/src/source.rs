@@ -12,13 +12,17 @@ use fleet_core::ast::{FieldFilter, FilterOp, FilterValue, SearchToken};
 /// so we widen the file selection window by one hour.
 const TIME_FILTER_PADDING_SECS: u64 = 3600;
 
-/// Extract an exact service name from the search tokens, if present.
+/// Extract an exact service name from the search stage, if present.
 ///
-/// Only returns `Some` for simple equality filters (`service:nginx`).
-/// Glob, regex, and other operators are ignored — we can't narrow the
-/// file glob safely for those.
-fn extract_service_filter(tokens: &[fleet_core::ast::Spanned<SearchToken>]) -> Option<&str> {
-    tokens.iter().find_map(|t| {
+/// Only returns `Some` for single-group queries with a simple equality
+/// filter (`service:nginx`). Multi-group (OR) queries can't be narrowed
+/// to one service safely, and glob/regex operators are also ignored.
+fn extract_service_filter(search: &fleet_core::ast::SearchStage) -> Option<&str> {
+    // Can't narrow when OR is involved — different groups may target different services.
+    if search.groups.len() != 1 {
+        return None;
+    }
+    search.groups[0].iter().find_map(|t| {
         if let SearchToken::FieldFilter(FieldFilter {
             field,
             op: FilterOp::Eq,
@@ -49,7 +53,7 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
         return fallback_glob.to_owned();
     };
 
-    let service = extract_service_filter(&ast.search.tokens);
+    let service = extract_service_filter(&ast.search);
     let file_pattern = service.map_or_else(
         || "*.parquet".to_owned(),
         |s| {
@@ -60,7 +64,7 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
         },
     );
 
-    let time_filter = ast.search.tokens.iter().find_map(|t| {
+    let time_filter = ast.search.all_tokens().find_map(|t| {
         if let SearchToken::TimeFilter(tf) = &t.node {
             Some(tf.duration)
         } else {
