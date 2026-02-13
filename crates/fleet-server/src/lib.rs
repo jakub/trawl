@@ -9,6 +9,7 @@ pub mod error;
 pub mod handlers;
 pub mod ingest;
 pub mod pool;
+pub mod rate_limit;
 pub mod shutdown;
 pub mod state;
 pub mod tls;

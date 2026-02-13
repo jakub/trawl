@@ -28,6 +28,10 @@ pub enum ServerError {
     #[error("ingest error: {0}")]
     Ingest(String),
 
+    /// Rate limit exceeded (429).
+    #[error("rate limit exceeded")]
+    RateLimited,
+
     /// Internal server error (task panics, unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
@@ -43,6 +47,7 @@ impl ServerError {
             Self::Engine(EngineError::Database(_)) => "query execution failed".to_owned(),
             Self::Internal(_) => "internal error".to_owned(),
             Self::Ingest(_) => "ingest error".to_owned(),
+            Self::RateLimited => "rate limit exceeded".to_owned(),
             other => other.to_string(),
         }
     }
@@ -65,6 +70,10 @@ impl IntoResponse for ServerError {
             Self::Ingest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "query timed out".to_owned()),
+            Self::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded".to_owned(),
+            ),
             Self::Internal(_) => {
                 tracing::error!(error = %self, "internal server error");
                 (
