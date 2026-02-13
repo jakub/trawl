@@ -201,7 +201,7 @@ fn csv_escape_value(val: &Value) -> String {
 fn csv_escape_string(s: &str) -> String {
     // Prevent CSV injection: prefix formula-triggering characters with a
     // single quote so spreadsheet apps don't interpret cells as formulas.
-    let s = if s.starts_with(['=', '+', '-', '@', '\t']) {
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '|']) {
         format!("'{s}")
     } else {
         s.to_owned()
@@ -241,6 +241,11 @@ mod tests {
     #[test]
     fn csv_at_sign_prefixed() {
         assert_eq!(csv_escape_value(&Value::String("@sum".into())), "'@sum");
+    }
+
+    #[test]
+    fn csv_pipe_prefixed() {
+        assert_eq!(csv_escape_value(&Value::String("|cmd".into())), "'|cmd");
     }
 
     #[test]

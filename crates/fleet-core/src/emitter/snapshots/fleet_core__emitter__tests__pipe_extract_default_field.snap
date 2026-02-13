@@ -11,4 +11,3 @@ FROM "_s0"
 ---
 params:
   0: '(?P<method>[A-Z]+) (?P<path>/[^ ]+)'
-  1: '(?P<method>[A-Z]+) (?P<path>/[^ ]+)'

@@ -250,9 +250,9 @@ fn process_extract(
             }
 
             let mut select_items = vec!["*".to_string()];
+            let placeholder = ctx.push_param(SqlValue::String(pattern.clone()));
             for (i, name) in group_names.iter().enumerate() {
                 let group_idx = i + 1;
-                let placeholder = ctx.push_param(SqlValue::String(pattern.clone()));
                 let alias = quote_field(name);
                 select_items.push(format!(
                     "regexp_extract({source}, {placeholder}, {group_idx}) AS {alias}"

@@ -45,6 +45,11 @@ pub(crate) struct EmitterState {
 /// `DuckDB`'s `read_parquet()`/`read_json_auto()` don't support parameterized
 /// paths, so the path must be sanitized before interpolation into SQL.
 pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
+    if source.is_empty() {
+        return Err(super::EmitError::UnsupportedOperation {
+            message: "source path cannot be empty".to_string(),
+        });
+    }
     if !source
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"/_.*?{}[]-".contains(&b))
