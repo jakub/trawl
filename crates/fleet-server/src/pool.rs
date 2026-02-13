@@ -333,9 +333,26 @@ impl ExecutorPool {
             // Send interrupt handle to async side before running the query.
             let _ = interrupt_tx.send(executor.interrupt_handle());
             let source = compute_source(&base_dir, &dsl, &fallback_glob);
-            let result = executor
-                .run_query(&dsl, &source, max_result_rows)
-                .map_err(ServerError::from);
+            // catch_unwind ensures the executor is always returned to the
+            // pool even if DuckDB panics (e.g. corrupt parquet file).
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                executor
+                    .run_query(&dsl, &source, max_result_rows)
+                    .map_err(ServerError::from)
+            }));
+            let result = match result {
+                Ok(r) => r,
+                Err(payload) => {
+                    let msg = match payload.downcast_ref::<&str>() {
+                        Some(s) => (*s).to_owned(),
+                        None => match payload.downcast_ref::<String>() {
+                            Some(s) => s.clone(),
+                            None => "unknown panic".to_owned(),
+                        },
+                    };
+                    Err(ServerError::Internal(format!("query panicked: {msg}")))
+                }
+            };
             (executor, result)
         });
 
