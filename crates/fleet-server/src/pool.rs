@@ -101,6 +101,11 @@ fn extract_service_filter(tokens: &[fleet_core::ast::Spanned<SearchToken>]) -> O
 /// hour-directories when the query contains a time filter and/or
 /// narrowed to a single service file when `service:X` is present.
 ///
+/// Supports two-tier parquet layout: day-level files for consolidated
+/// historical dates and hour-level files for today/unconsolidated dates.
+/// Checks for day-level files with a cheap `stat()` before falling back
+/// to hourly expansion.
+///
 /// Returns a `DuckDB` list literal like `['path/14/*.parquet', 'path/15/*.parquet']`
 /// when time-scoping is possible, or falls back to the recursive glob.
 fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
@@ -132,6 +137,7 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
 
     let now = chrono::Utc::now();
     let start = now - chrono::Duration::seconds(i64::try_from(total_secs).unwrap_or(i64::MAX));
+    let today = now.format("%Y-%m-%d").to_string();
 
     let mut globs = Vec::new();
     let mut cursor = start
@@ -141,10 +147,29 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
     let end = now.naive_utc();
 
     while cursor <= end {
-        let day = cursor.format("%Y-%m-%d");
-        let hour = cursor.format("%H");
-        globs.push(format!("'{base}/{day}/{hour}/{file_pattern}'"));
-        cursor += chrono::Duration::hours(1);
+        let day = cursor.format("%Y-%m-%d").to_string();
+
+        if day == today {
+            // Today stays hourly — emit one glob per hour in range.
+            let hour = cursor.format("%H");
+            globs.push(format!("'{base}/{day}/{hour}/{file_pattern}'"));
+            cursor += chrono::Duration::hours(1);
+        } else {
+            // Historical date — check for consolidated day-level file.
+            if has_day_level_files(base, &day, &file_pattern) {
+                globs.push(format!("'{base}/{day}/{file_pattern}'"));
+            } else {
+                // Not yet consolidated — expand to all 24 hours.
+                for h in 0..24_u32 {
+                    globs.push(format!("'{base}/{day}/{h:02}/{file_pattern}'"));
+                }
+            }
+
+            // Skip to next day (advance cursor past remaining hours of this day).
+            cursor = (cursor.date() + chrono::Duration::days(1))
+                .and_hms_opt(0, 0, 0)
+                .expect("valid midnight from date + 1 day");
+        }
     }
 
     if globs.is_empty() {
@@ -152,6 +177,28 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
     }
 
     format!("[{}]", globs.join(", "))
+}
+
+/// Check if a date directory has day-level parquet files (consolidated).
+///
+/// For a known service, does a single `stat()`. For wildcards, checks
+/// if the date directory contains any direct `.parquet` files.
+fn has_day_level_files(base: &str, day: &str, file_pattern: &str) -> bool {
+    let day_dir = std::path::Path::new(base).join(day);
+
+    if file_pattern == "*.parquet" {
+        // Wildcard: check if any .parquet files exist directly in date dir.
+        let Ok(entries) = std::fs::read_dir(&day_dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            let p = e.path();
+            !p.is_dir() && p.extension().is_some_and(|ext| ext == "parquet")
+        })
+    } else {
+        // Known service: single stat() call.
+        day_dir.join(file_pattern).exists()
+    }
 }
 
 impl ExecutorPool {
@@ -501,5 +548,133 @@ mod tests {
         // No active queries — cancel_all should be a no-op.
         pool.cancel_all();
         assert!(pool.active_interrupts.lock().is_empty());
+    }
+
+    #[test]
+    fn compute_source_prefers_day_level_for_historical_service() {
+        // Create a temp data dir with a consolidated day-level file.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let day_dir = tmp.path().join(&yesterday);
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "service:nginx last:48h", &fallback);
+
+        // Should include day-level path for yesterday (no /HH/ component).
+        let expected_day_glob = format!("'{base}/{yesterday}/nginx.parquet'");
+        assert!(
+            source.contains(&expected_day_glob),
+            "expected day-level glob for {yesterday}, got: {source}"
+        );
+    }
+
+    #[test]
+    fn compute_source_falls_back_to_hourly_when_no_day_file() {
+        // Create a temp data dir with only hourly files (no day-level).
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        // Create hour dirs but no day-level file.
+        let hour_dir = tmp.path().join(&yesterday).join("14");
+        std::fs::create_dir_all(&hour_dir).unwrap();
+        std::fs::write(hour_dir.join("nginx.parquet"), b"data").unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "service:nginx last:48h", &fallback);
+
+        // Should expand to hourly globs for yesterday (24 entries).
+        let hourly_pattern = format!("{base}/{yesterday}/00/nginx.parquet");
+        assert!(
+            source.contains(&hourly_pattern),
+            "expected hourly fallback for {yesterday}, got: {source}"
+        );
+    }
+
+    #[test]
+    fn compute_source_wildcard_detects_day_level() {
+        // Wildcard service with consolidated day-level files.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let day_dir = tmp.path().join(&yesterday);
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
+        std::fs::write(day_dir.join("postgres.parquet"), b"data").unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "last:48h", &fallback);
+
+        // Should use day-level glob (*.parquet at date level).
+        let expected_day_glob = format!("'{base}/{yesterday}/*.parquet'");
+        assert!(
+            source.contains(&expected_day_glob),
+            "expected day-level wildcard glob for {yesterday}, got: {source}"
+        );
+    }
+
+    #[test]
+    fn has_day_level_files_service_specific() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day_dir = tmp.path().join("2026-01-15");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
+
+        assert!(has_day_level_files(
+            tmp.path().to_str().unwrap(),
+            "2026-01-15",
+            "nginx.parquet"
+        ));
+        assert!(!has_day_level_files(
+            tmp.path().to_str().unwrap(),
+            "2026-01-15",
+            "postgres.parquet"
+        ));
+    }
+
+    #[test]
+    fn has_day_level_files_wildcard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day_dir = tmp.path().join("2026-01-15");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        // No files yet.
+        assert!(!has_day_level_files(
+            tmp.path().to_str().unwrap(),
+            "2026-01-15",
+            "*.parquet"
+        ));
+
+        // Add a parquet file.
+        std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
+        assert!(has_day_level_files(
+            tmp.path().to_str().unwrap(),
+            "2026-01-15",
+            "*.parquet"
+        ));
+    }
+
+    #[test]
+    fn has_day_level_files_ignores_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day_dir = tmp.path().join("2026-01-15");
+        let hour_dir = day_dir.join("00");
+        std::fs::create_dir_all(&hour_dir).unwrap();
+        std::fs::write(hour_dir.join("nginx.parquet"), b"data").unwrap();
+
+        // Hour subdir files should not count as day-level.
+        assert!(!has_day_level_files(
+            tmp.path().to_str().unwrap(),
+            "2026-01-15",
+            "*.parquet"
+        ));
     }
 }
