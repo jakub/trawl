@@ -28,6 +28,7 @@ use crate::auth::auth_middleware;
 use crate::config::ServerConfig;
 use crate::handlers;
 use crate::ingest;
+use crate::rate_limit::{RateLimitState, rate_limit_middleware};
 use crate::shutdown::shutdown_signal;
 use crate::state::{AppState, HttpConfig};
 use crate::tls;
@@ -38,23 +39,26 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let max_conns = http.max_concurrent_requests;
     let cors_origins = &http.cors_allowed_origins;
     let ingest_enabled = state.ingest.wal_writer.is_some();
+    let rate_state = RateLimitState::from_config(&http.rate_limit);
 
-    // Query routes: authentication + default body limit (128 KB).
+    // Query routes: body limit → auth → rate limit (axum onion: first layer = innermost).
     let authenticated = Router::new()
         .route("/query", post(handlers::query))
         .route("/schema", get(handlers::schema))
         .route("/queries", get(handlers::queries))
+        .layer(middleware::from_fn(rate_limit_middleware))
         .layer(middleware::from_fn(auth_middleware))
         .layer(RequestBodyLimitLayer::new(max_body));
 
     // Shared key store injected into extensions for the auth middleware.
     let key_store = Arc::clone(&state.auth.key_store);
 
-    // Ingest route: authentication + larger body limit (16 MB default).
+    // Ingest route: body limit → auth → rate limit.
     let ingest_routes = if ingest_enabled {
         let ingest_body_limit = http.ingest_max_body_bytes.unwrap_or(16 * 1024 * 1024);
         Router::new()
             .route("/ingest", post(ingest::handler::ingest))
+            .layer(middleware::from_fn(rate_limit_middleware))
             .layer(middleware::from_fn(auth_middleware))
             .layer(RequestBodyLimitLayer::new(ingest_body_limit))
     } else {
@@ -120,6 +124,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
                 },
             ),
     )
+    .layer(axum::Extension(rate_state))
     .layer(axum::Extension(key_store))
     .with_state(state)
 }
