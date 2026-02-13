@@ -25,6 +25,24 @@ const SCHEMA_VERSION: i64 = 2;
 static DUMMY_HASH: LazyLock<String> =
     LazyLock::new(|| token::hash_token("dummy-timing-equalization").expect("failed to hash dummy"));
 
+/// Map a row from the `api_keys` table to an [`ApiKeyInfo`].
+///
+/// Expects columns in order: id, prefix, name, role, active, `created_at`,
+/// `expires_at`, `last_used`, `revoked_at`.
+fn row_to_api_key_info(row: &rusqlite::Row<'_>) -> Result<ApiKeyInfo, rusqlite::Error> {
+    Ok(ApiKeyInfo {
+        id: row.get(0)?,
+        prefix: row.get(1)?,
+        name: row.get(2)?,
+        role: row.get(3)?,
+        active: row.get(4)?,
+        created_at: row.get(5)?,
+        expires_at: row.get(6)?,
+        last_used: row.get(7)?,
+        revoked_at: row.get(8)?,
+    })
+}
+
 /// `SQLite`-backed storage for API keys.
 #[derive(Debug)]
 pub struct KeyStore {
@@ -336,19 +354,7 @@ impl KeyStore {
 
         let mut stmt = self.conn.prepare(sql)?;
         let keys = stmt
-            .query_map([], |row| {
-                Ok(ApiKeyInfo {
-                    id: row.get(0)?,
-                    prefix: row.get(1)?,
-                    name: row.get(2)?,
-                    role: row.get(3)?,
-                    active: row.get(4)?,
-                    created_at: row.get(5)?,
-                    expires_at: row.get(6)?,
-                    last_used: row.get(7)?,
-                    revoked_at: row.get(8)?,
-                })
-            })?
+            .query_map([], row_to_api_key_info)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(keys)
@@ -388,24 +394,12 @@ impl KeyStore {
             "SELECT id, prefix, name, role, active, created_at, expires_at, last_used, revoked_at
              FROM api_keys WHERE prefix = ?1",
         )?;
-        stmt.query_row(params![prefix], |row| {
-            Ok(ApiKeyInfo {
-                id: row.get(0)?,
-                prefix: row.get(1)?,
-                name: row.get(2)?,
-                role: row.get(3)?,
-                active: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                last_used: row.get(7)?,
-                revoked_at: row.get(8)?,
+        stmt.query_row(params![prefix], row_to_api_key_info)
+            .optional()
+            .map_err(AuthError::Database)?
+            .ok_or_else(|| AuthError::KeyNotFound {
+                prefix: prefix.to_owned(),
             })
-        })
-        .optional()
-        .map_err(AuthError::Database)?
-        .ok_or_else(|| AuthError::KeyNotFound {
-            prefix: prefix.to_owned(),
-        })
     }
 }
 

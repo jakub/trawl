@@ -36,7 +36,7 @@ pub enum Permission {
 
 impl Role {
     /// All defined roles.
-    pub const ALL: [Self; 4] = [Self::Admin, Self::Analyst, Self::Reader, Self::Ingest];
+    pub const ALL: &[Self] = &[Self::Admin, Self::Analyst, Self::Reader, Self::Ingest];
 
     /// Check whether this role grants the given permission.
     pub fn has_permission(self, perm: Permission) -> bool {
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn display_roundtrip() {
-        for role in Role::ALL {
+        for &role in Role::ALL {
             let s = role.to_string();
             let parsed: Role = s.parse().unwrap();
             assert_eq!(role, parsed);
