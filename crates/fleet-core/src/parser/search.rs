@@ -56,6 +56,9 @@ fn filter_value<'src>()
         )
         .map(|pat| (FilterOp::Regex, FilterValue::Literal(pat)));
 
+    // quoted value: service:"Activity Monitor" → strips quotes
+    let quoted_val = quoted_string().map(|s| (FilterOp::Eq, FilterValue::Literal(s)));
+
     // bare value(s), possibly comma-separated
     let bare_vals = bare_value()
         .separated_by(just(','))
@@ -75,7 +78,7 @@ fn filter_value<'src>()
             }
         });
 
-    choice((with_op, regex_val, bare_vals)).labelled("filter value")
+    choice((with_op, regex_val, quoted_val, bare_vals)).labelled("filter value")
 }
 
 /// Parse a `field:value` filter, including `field:>100`, `field:200,301,404`,
@@ -265,6 +268,42 @@ mod tests {
                 field: "message".to_string(),
                 op: FilterOp::Regex,
                 value: FilterValue::Literal("error.*".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_field_filter_quoted_value() {
+        // service:"kernel" should strip quotes.
+        let result = search_stage()
+            .parse(r#"service:"kernel""#)
+            .into_result()
+            .unwrap();
+        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(
+            result.tokens[0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "service".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("kernel".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_field_filter_quoted_value_with_spaces() {
+        // service:"Activity Monitor" — quotes allow spaces in field values.
+        let result = search_stage()
+            .parse(r#"service:"Activity Monitor""#)
+            .into_result()
+            .unwrap();
+        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(
+            result.tokens[0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "service".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("Activity Monitor".to_string()),
             })
         );
     }
