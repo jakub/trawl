@@ -162,10 +162,12 @@ fn compact_service_blocking(
 
     if merged {
         // Merge: union existing parquet rows with new WAL batch.
+        // BY NAME handles heterogeneous schemas (different events have
+        // different fields) — missing columns become NULL in parquet.
         conn.execute_batch(&format!(
             "CREATE TABLE merged AS \
              SELECT * FROM read_parquet('{}') \
-             UNION ALL \
+             UNION ALL BY NAME \
              SELECT * FROM wal_batch",
             canonical_path.display(),
         ))
