@@ -465,4 +465,41 @@ mod tests {
         let pool = ExecutorPool::new("/var/lib/fleet/data/".into(), 1, 100_000);
         assert_eq!(&*pool.fallback_glob, "/var/lib/fleet/data/**/*.parquet");
     }
+
+    #[tokio::test]
+    async fn pool_timeout_returns_error() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000);
+        // 1ns timeout — the blocking task can't possibly complete this fast.
+        let result = pool.execute("*", Duration::from_nanos(1)).await;
+        assert!(
+            matches!(result, Err(ServerError::Timeout)),
+            "expected Timeout, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_executor_reclaimed_after_timeout() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000);
+        let idle_before = pool.idle.lock().len();
+
+        // Trigger a timeout.
+        let _ = pool.execute("*", Duration::from_nanos(1)).await;
+
+        // Wait briefly for the async reclamation task to complete.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let idle_after = pool.idle.lock().len();
+        assert_eq!(
+            idle_before, idle_after,
+            "executor should be reclaimed after timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_all_clears_interrupts() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000);
+        // No active queries — cancel_all should be a no-op.
+        pool.cancel_all();
+        assert!(pool.active_interrupts.lock().is_empty());
+    }
 }

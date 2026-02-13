@@ -93,6 +93,70 @@ struct TestServer {
     ingest_token: String,
 }
 
+/// Set up a test server with custom rate limiting for rate limit tests.
+async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let data_glob = ensure_fixtures(tmp.path());
+    let auth_db = tmp.path().join("auth.db");
+
+    let store = KeyStore::open(&auth_db).unwrap();
+    let analyst = store.create_key("test-key", Role::Analyst, None).unwrap();
+    let admin = store.create_key("admin-key", Role::Admin, None).unwrap();
+    let ingest = store.create_key("ingest-key", Role::Ingest, None).unwrap();
+    drop(store);
+
+    let (cert_path, key_path) = generate_test_cert(tmp.path());
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = Config {
+        server: ServerConfig {
+            http_addr: addr.clone(),
+            timeout_secs: 10,
+            max_concurrent_queries: 2,
+            max_result_rows: 100_000,
+            max_request_body_bytes: 128 * 1024,
+            max_concurrent_requests: 256,
+            shutdown_drain_secs: 5,
+            log_file: None,
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            tls_reload_interval_secs: 0,
+            cors_allowed_origins: vec![],
+            schema_cache_ttl_secs: 60,
+            max_query_history: 1000,
+            rate_limit,
+        },
+        data: DataConfig { path: data_glob },
+        auth: AuthConfig { db_path: auth_db },
+        ingest: {
+            let wal_dir = tmp.path().join("wal");
+            std::fs::create_dir_all(&wal_dir).unwrap();
+            IngestConfig {
+                wal_dir: Some(wal_dir),
+                ..IngestConfig::default()
+            }
+        },
+    };
+
+    let (state, http_config) = AppState::from_config(&config).expect("failed to create app state");
+    let server_config = config.server.clone();
+    tokio::spawn(async move {
+        http::serve(state, &http_config, &server_config)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    std::mem::forget(tmp);
+
+    TestServer {
+        url: format!("https://{addr}"),
+        analyst_token: analyst.plaintext_token.to_string(),
+        admin_token: admin.plaintext_token.to_string(),
+        ingest_token: ingest.plaintext_token.to_string(),
+    }
+}
+
 /// Set up a test server with fixtures and return a `TestServer` handle.
 async fn setup() -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
@@ -381,4 +445,33 @@ async fn ingest_rejects_analyst_role() {
         .unwrap();
 
     assert_eq!(resp.status(), 401);
+}
+
+// -- rate limit tests --------------------------------------------------------
+
+#[tokio::test]
+async fn rate_limit_returns_429() {
+    let server = setup_with_rate_limit(RateLimitConfig {
+        admin: 0,
+        analyst: 2, // burst of 2
+        reader: 0,
+        ingest: 0,
+    })
+    .await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // First 2 should succeed (burst capacity).
+    client.query("*").await.unwrap();
+    client.query("*").await.unwrap();
+
+    // 3rd should be rate limited.
+    let result = client.query("*").await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    match err {
+        fleet_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 429, "expected 429 Too Many Requests");
+        }
+        other => panic!("expected 429 rate limit error, got: {other:?}"),
+    }
 }
