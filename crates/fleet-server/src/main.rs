@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_path(&cli.config);
     let config = Config::from_file(&config_path)?;
 
-    let wal_handle = init_tracing(&config)?;
+    let telemetry = init_tracing(&config)?;
 
     tracing::info!(event_type = "lifecycle", config = %config_path.display(), "configuration loaded");
 
@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (state, http_config) = AppState::from_config(&config)?;
 
     // Activate internal telemetry by injecting the WAL writer.
-    if let Some(handle) = &wal_handle {
+    if let Some((handle, _)) = &telemetry {
         if let Some(writer) = &state.ingest.wal_writer {
             handle.set(Arc::clone(writer));
         }
@@ -86,9 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Spawn telemetry flush task (1-second interval).
-    let telemetry_handle = wal_handle.map(|handle| {
+    let telemetry_handle = telemetry.map(|(_, layer)| {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let layer = WalLayer::new(handle);
         let join =
             telemetry::spawn_flush_task(layer, std::time::Duration::from_secs(1), shutdown_rx);
         (join, shutdown_tx)
@@ -112,12 +111,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Initialize the tracing subscriber.
 ///
 /// When internal telemetry is enabled, registers a [`WalLayer`] that
-/// replaces the JSON file logger. Returns the [`WalHandle`] for deferred
-/// writer injection (the WAL writer doesn't exist yet at init time).
+/// replaces the JSON file logger. Returns both the [`WalHandle`] (for
+/// deferred writer injection) and a [`WalLayer`] clone (sharing the same
+/// buffer) for the flush task.
 ///
 /// When telemetry is disabled and `log_file` is configured, falls back
 /// to the legacy JSON file layer.
-fn init_tracing(config: &Config) -> Result<Option<WalHandle>, Box<dyn std::error::Error>> {
+fn init_tracing(
+    config: &Config,
+) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
     let make_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| "fleet_server=info".into());
 
@@ -127,12 +129,13 @@ fn init_tracing(config: &Config) -> Result<Option<WalHandle>, Box<dyn std::error
     if use_telemetry {
         // WAL layer replaces the JSON file logger.
         let handle = WalHandle::new();
-        let wal_layer = WalLayer::new(handle.clone()).with_filter(make_filter());
+        let wal_layer = WalLayer::new(handle.clone());
+        let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>
         tracing_subscriber::registry()
             .with(stdout_layer)
-            .with(wal_layer)
+            .with(wal_layer.with_filter(make_filter()))
             .init();
-        Ok(Some(handle))
+        Ok(Some((handle, flush_layer)))
     } else if let Some(log_path) = &config.server.log_file {
         // Legacy: JSON file logger.
         if let Some(parent) = log_path.parent() {
