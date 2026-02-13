@@ -333,6 +333,17 @@ impl ExecutorPool {
             // Send interrupt handle to async side before running the query.
             let _ = interrupt_tx.send(executor.interrupt_handle());
             let source = compute_source(&base_dir, &dsl, &fallback_glob);
+            let file_globs: usize = if source.starts_with('[') {
+                source.matches(',').count() + 1
+            } else {
+                1
+            };
+            tracing::debug!(
+                event_type = "query_source",
+                file_globs,
+                source = %source,
+                "computed query source"
+            );
             // catch_unwind ensures the executor is always returned to the
             // pool even if DuckDB panics (e.g. corrupt parquet file).
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
