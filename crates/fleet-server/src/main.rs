@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use fleet_server::config::Config;
 use fleet_server::state::AppState;
+use fleet_server::telemetry::{self, WalHandle, WalLayer};
 use fleet_server::transport::http;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -23,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_path(&cli.config);
     let config = Config::from_file(&config_path)?;
 
-    init_tracing(&config)?;
+    let wal_handle = init_tracing(&config)?;
 
     tracing::info!(config = %config_path.display(), "configuration loaded");
 
@@ -39,6 +41,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (state, http_config) = AppState::from_config(&config)?;
+
+    // Activate internal telemetry by injecting the WAL writer.
+    if let Some(handle) = &wal_handle {
+        if let Some(writer) = &state.ingest.wal_writer {
+            handle.set(Arc::clone(writer));
+        }
+    }
 
     // Spawn ingest compaction task if ingestion is enabled.
     let compaction_handle = if config.ingest.enabled {
@@ -74,9 +83,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Spawn telemetry flush task (1-second interval).
+    let telemetry_handle = wal_handle.map(|handle| {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let layer = WalLayer::new(handle);
+        let join =
+            telemetry::spawn_flush_task(layer, std::time::Duration::from_secs(1), shutdown_rx);
+        (join, shutdown_tx)
+    });
+
     http::serve(state, &http_config, &config.server).await?;
 
-    // Signal compaction task to shut down.
+    // Shutdown ordering: flush telemetry first so final events reach WAL,
+    // then signal compaction (which may compact those final files).
+    if let Some((_handle, shutdown_tx)) = &telemetry_handle {
+        let _ = shutdown_tx.send(true);
+    }
+
     if let Some((_handle, shutdown_tx)) = compaction_handle {
         let _ = shutdown_tx.send(true);
     }
@@ -84,14 +107,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Initialize the tracing subscriber with stdout and an optional log file.
-fn init_tracing(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+/// Initialize the tracing subscriber.
+///
+/// When internal telemetry is enabled, registers a [`WalLayer`] that
+/// replaces the JSON file logger. Returns the [`WalHandle`] for deferred
+/// writer injection (the WAL writer doesn't exist yet at init time).
+///
+/// When telemetry is disabled and `log_file` is configured, falls back
+/// to the legacy JSON file layer.
+fn init_tracing(config: &Config) -> Result<Option<WalHandle>, Box<dyn std::error::Error>> {
     let make_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| "fleet_server=info".into());
 
     let stdout_layer = fmt::layer().with_filter(make_filter());
+    let use_telemetry = config.internal_telemetry_enabled();
 
-    if let Some(log_path) = &config.server.log_file {
+    if use_telemetry {
+        // WAL layer replaces the JSON file logger.
+        let handle = WalHandle::new();
+        let wal_layer = WalLayer::new(handle.clone()).with_filter(make_filter());
+        tracing_subscriber::registry()
+            .with(stdout_layer)
+            .with(wal_layer)
+            .init();
+        Ok(Some(handle))
+    } else if let Some(log_path) = &config.server.log_file {
+        // Legacy: JSON file logger.
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -99,8 +140,6 @@ fn init_tracing(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             .create(true)
             .append(true)
             .open(log_path)?;
-        // JSON format for file logs: machine-parseable and inherently
-        // escapes control characters (prevents log injection).
         let file_layer = fmt::layer()
             .json()
             .with_ansi(false)
@@ -110,11 +149,11 @@ fn init_tracing(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             .with(stdout_layer)
             .with(file_layer)
             .init();
+        Ok(None)
     } else {
         tracing_subscriber::registry().with(stdout_layer).init();
+        Ok(None)
     }
-
-    Ok(())
 }
 
 /// Resolve a path, expanding `~` to the home directory.
