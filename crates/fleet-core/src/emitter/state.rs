@@ -17,6 +17,19 @@ pub(crate) struct PivotSpec {
     pub by_fields: Vec<String>,
 }
 
+/// When to flush accumulated state to a CTE before processing a new stage.
+#[derive(Clone, Copy)]
+pub(crate) enum FlushCondition {
+    /// Flush if any prior aggregation or projection would be clobbered.
+    IfModified,
+    /// Flush if modified OR if there's an existing ORDER BY.
+    IfModifiedOrOrdered,
+    /// Flush if modified OR if there's an existing LIMIT.
+    IfModifiedOrLimited,
+    /// Always flush (stage requires clean state for param ordering).
+    Always,
+}
+
 /// Accumulates SQL clauses as the emitter walks the AST.
 ///
 /// The emitter pushes clauses into the state, and flushes to CTEs when
@@ -137,6 +150,23 @@ impl EmitterState {
     /// Append a WHERE clause fragment (will be AND-joined with others).
     pub(crate) fn push_where(&mut self, clause: String) {
         self.where_clauses.push(clause);
+    }
+
+    /// Conditionally flush the current state to a CTE based on the given condition.
+    pub(crate) fn flush_if(&mut self, condition: FlushCondition) {
+        let should_flush = match condition {
+            FlushCondition::IfModified => self.has_aggregation || self.has_projection,
+            FlushCondition::IfModifiedOrOrdered => {
+                self.has_aggregation || self.has_projection || !self.order_by.is_empty()
+            }
+            FlushCondition::IfModifiedOrLimited => {
+                self.has_aggregation || self.has_projection || self.limit.is_some()
+            }
+            FlushCondition::Always => true,
+        };
+        if should_flush {
+            self.flush_to_cte();
+        }
     }
 
     /// Flush the current state into a CTE and reset for the next stage.

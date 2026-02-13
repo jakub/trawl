@@ -5,7 +5,7 @@ use super::SqlValue;
 use super::expr::emit_expr;
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
-use super::state::EmitterState;
+use super::state::{EmitterState, FlushCondition};
 
 /// Process a single pipe stage, mutating the emitter state.
 pub(crate) fn process_stage(pipe: &PipeStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
@@ -51,10 +51,7 @@ fn process_stats(
     agg_stage: &crate::ast::StatsStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    // flush if a prior aggregation or projection would be clobbered
-    if ctx.has_aggregation || ctx.has_projection {
-        ctx.flush_to_cte();
-    }
+    ctx.flush_if(FlushCondition::IfModified);
 
     let mut select_items = Vec::new();
 
@@ -95,10 +92,7 @@ fn process_where(
     where_stage: &crate::ast::WhereStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    // flush if prior aggregation or projection so WHERE applies to CTE output
-    if ctx.has_aggregation || ctx.has_projection {
-        ctx.flush_to_cte();
-    }
+    ctx.flush_if(FlushCondition::IfModified);
 
     let clause = emit_expr(&where_stage.condition, ctx)?;
     ctx.push_where(clause);
@@ -107,10 +101,7 @@ fn process_where(
 }
 
 fn process_sort(sort_stage: &crate::ast::SortStage, ctx: &mut EmitterState) {
-    // flush if prior aggregation, projection, or existing order
-    if ctx.has_aggregation || ctx.has_projection || !ctx.order_by.is_empty() {
-        ctx.flush_to_cte();
-    }
+    ctx.flush_if(FlushCondition::IfModifiedOrOrdered);
 
     for field in &sort_stage.fields {
         let quoted = quote_field(&field.field);
@@ -123,19 +114,13 @@ fn process_sort(sort_stage: &crate::ast::SortStage, ctx: &mut EmitterState) {
 }
 
 fn process_limit(limit_stage: &crate::ast::LimitStage, ctx: &mut EmitterState) {
-    // flush if prior aggregation, projection, or existing limit
-    if ctx.has_aggregation || ctx.has_projection || ctx.limit.is_some() {
-        ctx.flush_to_cte();
-    }
+    ctx.flush_if(FlushCondition::IfModifiedOrLimited);
 
     ctx.limit = Some(limit_stage.count);
 }
 
 fn process_table(table_stage: &crate::ast::TableStage, ctx: &mut EmitterState) {
-    // flush if prior aggregation or projection would be clobbered
-    if ctx.has_aggregation || ctx.has_projection {
-        ctx.flush_to_cte();
-    }
+    ctx.flush_if(FlushCondition::IfModified);
 
     ctx.select = table_stage.fields.iter().map(|f| quote_field(f)).collect();
     ctx.has_projection = true;
@@ -170,9 +155,7 @@ fn process_frequency(
     sort_dir: &str,
     ctx: &mut EmitterState,
 ) {
-    if ctx.has_aggregation || ctx.has_projection {
-        ctx.flush_to_cte();
-    }
+    ctx.flush_if(FlushCondition::IfModified);
 
     let field_quoted = quote_field(field);
     let mut select_items = vec![field_quoted.clone()];
@@ -197,9 +180,7 @@ fn process_frequency(
 }
 
 fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
-    if ctx.has_aggregation || ctx.has_projection {
-        ctx.flush_to_cte();
-    }
+    ctx.flush_if(FlushCondition::IfModified);
 
     let excluded: Vec<String> = drop_stage.fields.iter().map(|f| quote_field(f)).collect();
     ctx.select = vec![format!("* EXCLUDE ({})", excluded.join(", "))];
@@ -209,7 +190,7 @@ fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
 fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
     // always flush: the computed expression may add ? params to SELECT,
     // which must not interleave with WHERE params from prior stages
-    ctx.flush_to_cte();
+    ctx.flush_if(FlushCondition::Always);
 
     let expr_sql = emit_expr(&let_stage.expr, ctx)?;
     let alias = quote_field(&let_stage.field);
@@ -226,7 +207,7 @@ fn process_extract(
 ) -> Result<(), EmitError> {
     // always flush: regexp_extract params in SELECT must not interleave
     // with WHERE params from prior stages (DuckDB binds ? left to right)
-    ctx.flush_to_cte();
+    ctx.flush_if(FlushCondition::Always);
 
     let source = match &extract.source_field {
         Some(f) => quote_field(f),
@@ -273,8 +254,7 @@ fn process_extract(
 }
 
 fn process_dedup(dedup: &crate::ast::DedupStage, ctx: &mut EmitterState) {
-    // always flush current state to CTE first
-    ctx.flush_to_cte();
+    ctx.flush_if(FlushCondition::Always);
 
     if dedup.fields.is_empty() {
         // bare `dedup` — exact row deduplication
@@ -308,9 +288,7 @@ fn process_timechart(
     tc: &crate::ast::TimechartStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    if ctx.has_aggregation || ctx.has_projection {
-        ctx.flush_to_cte();
-    }
+    ctx.flush_if(FlushCondition::IfModified);
 
     let interval = match &tc.span {
         Some(d) => d.to_interval_string(),
