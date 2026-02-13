@@ -536,4 +536,58 @@ mod tests {
         let result = store.verify_key("not-a-fleet-token");
         assert!(matches!(result, Err(AuthError::MalformedToken(_))));
     }
+
+    #[test]
+    fn migrate_v1_to_v2_preserves_keys() {
+        // Manually create a v1 database (without 'ingest' in CHECK constraint).
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (1);
+
+             CREATE TABLE api_keys (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 prefix      TEXT    NOT NULL UNIQUE,
+                 name        TEXT    NOT NULL,
+                 hash        TEXT    NOT NULL,
+                 role        TEXT    NOT NULL CHECK (role IN ('admin', 'analyst', 'reader')),
+                 active      INTEGER NOT NULL DEFAULT 1,
+                 created_at  TEXT    NOT NULL,
+                 expires_at  TEXT,
+                 last_used   TEXT,
+                 revoked_at  TEXT
+             );",
+        )
+        .unwrap();
+
+        // Insert a key using v1 schema.
+        let generated = token::generate_token();
+        let hash = token::hash_token(&generated.plaintext).unwrap();
+        conn.execute(
+            "INSERT INTO api_keys (prefix, name, hash, role, created_at)
+             VALUES (?1, ?2, ?3, 'analyst', datetime('now'))",
+            params![generated.prefix, "v1-key", hash],
+        )
+        .unwrap();
+
+        // Now wrap in KeyStore and trigger migration via initialize().
+        let store = KeyStore { conn };
+        store.initialize().unwrap();
+
+        // Schema version should be 2.
+        let version: i64 = store
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+
+        // The v1 key should still verify correctly.
+        let verified = store.verify_key(&generated.plaintext).unwrap();
+        assert_eq!(verified.name, "v1-key");
+        assert_eq!(verified.role, Role::Analyst);
+
+        // New 'ingest' role should now be accepted.
+        let ingest_key = store.create_key("ingester", Role::Ingest, None).unwrap();
+        assert_eq!(ingest_key.info.role, Role::Ingest);
+    }
 }

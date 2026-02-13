@@ -318,3 +318,48 @@ fn json_stats_pipeline() {
     assert!(result.row_count() > 0);
     assert_eq!(result.columns[0].name, "service");
 }
+
+// -- error path tests --------------------------------------------------------
+
+#[test]
+fn invalid_dsl_returns_parse_error() {
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("| | | broken {{{", &glob);
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), EngineError::Parse(_)));
+}
+
+#[test]
+fn missing_source_returns_error() {
+    let exec = Executor::new().expect("executor should initialize");
+    let result = exec.run_query_max("*", "/nonexistent/path/**/*.parquet");
+    // DuckDB returns an IO error for missing files — should propagate.
+    assert!(result.is_err());
+}
+
+// -- schema introspection tests ----------------------------------------------
+
+#[test]
+fn describe_schema_returns_columns() {
+    use fleet_engine::SchemaIntrospector;
+
+    let (exec, glob) = setup();
+    let schema = exec.describe_schema(&glob).unwrap();
+
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"timestamp"), "missing timestamp column");
+    assert!(names.contains(&"host"), "missing host column");
+    assert!(names.contains(&"service"), "missing service column");
+    assert!(names.contains(&"level"), "missing level column");
+    assert!(names.contains(&"message"), "missing message column");
+    assert!(schema.file_count > 0, "should find fixture files");
+}
+
+#[test]
+fn describe_schema_missing_source() {
+    use fleet_engine::SchemaIntrospector;
+
+    let exec = Executor::new().expect("executor should initialize");
+    let result = exec.describe_schema("/nonexistent/path/**/*.parquet");
+    assert!(result.is_err());
+}
