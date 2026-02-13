@@ -597,7 +597,7 @@ fn remove_stale_tmp(path: &Path, max_age: Duration) {
             if let Ok(mtime) = meta.modified() {
                 if SystemTime::now().duration_since(mtime).unwrap_or_default() > max_age {
                     let _ = std::fs::remove_file(path);
-                    tracing::debug!(path = %path.display(), "removed stale tmp file");
+                    tracing::debug!(event_type = "tmp_cleanup", path = %path.display(), "removed stale tmp file");
                 }
             }
         }

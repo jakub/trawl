@@ -233,7 +233,7 @@ pub async fn serve(
                     let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::debug!(event_type = "tls_handshake_failed", peer = %peer_addr, error = %e, "TLS handshake failed");
+                            tracing::warn!(event_type = "tls_handshake_failed", peer = %peer_addr, error = %e, "TLS handshake failed");
                             return;
                         }
                     };
@@ -258,13 +258,13 @@ pub async fn serve(
                     tokio::select! {
                         result = conn.as_mut() => {
                             if let Err(e) = result {
-                                tracing::debug!(peer = %peer_addr, error = %e, "connection error");
+                                tracing::debug!(event_type = "connection_error", peer = %peer_addr, error = %e, "connection error");
                             }
                         }
                         () = n_conn.notified() => {
                             conn.as_mut().graceful_shutdown();
                             if let Err(e) = conn.await {
-                                tracing::debug!(peer = %peer_addr, error = %e, "connection error during shutdown");
+                                tracing::debug!(event_type = "connection_error", peer = %peer_addr, error = %e, "connection error during shutdown");
                             }
                         }
                     }

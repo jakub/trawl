@@ -391,7 +391,7 @@ impl ExecutorPool {
                             idle.lock().push(executor);
                         }
                         Err(e) => {
-                            tracing::warn!("timed-out query task panicked: {e}");
+                            tracing::warn!(event_type = "task_panic", error = %e, "timed-out query task panicked");
                         }
                     }
                 });

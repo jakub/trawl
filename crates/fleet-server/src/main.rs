@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(event_type = "lifecycle", config = %config_path.display(), "configuration loaded");
 
     for warn in config.warnings() {
-        tracing::warn!("{warn}");
+        tracing::warn!(event_type = "config_warning", "{warn}");
     }
 
     tracing::info!(
@@ -102,14 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some((handle, shutdown_tx)) = telemetry_handle {
         let _ = shutdown_tx.send(true);
         if let Err(e) = handle.await {
-            tracing::warn!(error = %e, "telemetry task panicked during shutdown");
+            tracing::warn!(event_type = "task_panic", error = %e, "telemetry task panicked during shutdown");
         }
     }
 
     if let Some((handle, shutdown_tx)) = compaction_handle {
         let _ = shutdown_tx.send(true);
         if let Err(e) = handle.await {
-            tracing::warn!(error = %e, "compaction task panicked during shutdown");
+            tracing::warn!(event_type = "task_panic", error = %e, "compaction task panicked during shutdown");
         }
     }
 

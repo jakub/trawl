@@ -193,7 +193,7 @@ pub async fn schema(
         }
     }
 
-    tracing::info!(user = %verified.name, "refreshing schema cache");
+    tracing::info!(event_type = "schema_refresh", user = %verified.name, "refreshing schema cache");
     let start = std::time::Instant::now();
     let result = state.query.pool.describe_schema().await?;
     let elapsed = start.elapsed().as_millis();
