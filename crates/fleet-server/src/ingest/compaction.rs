@@ -20,6 +20,7 @@ pub fn spawn_compaction(
     wal_dir: PathBuf,
     data_dir: PathBuf,
     interval: Duration,
+    daily_rollup: bool,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -29,13 +30,14 @@ pub fn spawn_compaction(
             wal_dir = %wal_dir.display(),
             data_dir = %data_dir.display(),
             interval_secs = interval.as_secs(),
+            daily_rollup,
             "compaction task started"
         );
 
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    if let Err(e) = compact_once(&wal_dir, &data_dir, interval).await {
+                    if let Err(e) = compact_once(&wal_dir, &data_dir, interval, daily_rollup).await {
                         tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
                     }
                 }
@@ -49,7 +51,12 @@ pub fn spawn_compaction(
 }
 
 /// Run one compaction cycle.
-async fn compact_once(wal_dir: &Path, data_dir: &Path, min_age: Duration) -> Result<(), String> {
+async fn compact_once(
+    wal_dir: &Path,
+    data_dir: &Path,
+    min_age: Duration,
+    daily_rollup: bool,
+) -> Result<(), String> {
     // Remove orphaned .parquet.tmp files from interrupted compaction runs.
     cleanup_stale_tmp_files(data_dir, min_age * 2);
 
@@ -95,6 +102,213 @@ async fn compact_once(wal_dir: &Path, data_dir: &Path, min_age: Duration) -> Res
             }
         }
     }
+
+    // After WAL compaction, consolidate older days' hourly files into
+    // per-service daily files. This dramatically reduces file count for
+    // long lookback queries.
+    if daily_rollup {
+        if let Err(e) = rollup_once(data_dir).await {
+            tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Consolidate hourly per-service parquet files into daily files.
+///
+/// For each date-directory older than today, collects all
+/// `{hour}/{service}.parquet` files, merges them (sorted by timestamp)
+/// into `{date}/{service}.parquet`, then removes the hourly sources.
+async fn rollup_once(data_dir: &Path) -> Result<(), String> {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let date_dirs =
+        std::fs::read_dir(data_dir).map_err(|e| format!("failed to read data_dir: {e}"))?;
+
+    for entry in date_dirs.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+
+        // Skip today — it stays hourly for fast writes.
+        if dir_name == today {
+            continue;
+        }
+
+        // Skip directories that aren't date-formatted (e.g. "wal").
+        if !looks_like_date(&dir_name) {
+            continue;
+        }
+
+        // Collect hourly subdirs. If none exist, this day is already consolidated.
+        let hour_dirs = collect_hour_dirs(&path);
+        if hour_dirs.is_empty() {
+            continue;
+        }
+
+        // Group all parquet files across hour-dirs by service name.
+        let service_files = collect_service_files(&hour_dirs);
+        if service_files.is_empty() {
+            continue;
+        }
+
+        for (service, files) in &service_files {
+            let day_dir = path.clone();
+            let svc = service.clone();
+            let files = files.clone();
+
+            match tokio::task::spawn_blocking(move || rollup_day_blocking(&day_dir, &svc, &files))
+                .await
+                .map_err(|e| format!("rollup task panicked: {e}"))?
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::error!(
+                        event_type = "rollup_error",
+                        compact_service = %service,
+                        error = %e,
+                        "rollup failed for service, will retry next tick"
+                    );
+                }
+            }
+        }
+
+        // Remove empty hour-directories after all services are rolled up.
+        for hour_dir in &hour_dirs {
+            if is_dir_empty(hour_dir) {
+                let _ = std::fs::remove_dir(hour_dir);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a directory name looks like a date (YYYY-MM-DD).
+fn looks_like_date(name: &str) -> bool {
+    name.len() == 10
+        && name.as_bytes().get(4) == Some(&b'-')
+        && name.as_bytes().get(7) == Some(&b'-')
+        && name[..4].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Collect subdirectories that look like hour directories (00-23).
+fn collect_hour_dirs(day_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(day_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                let name = p.file_name()?.to_str()?;
+                if name.len() == 2 && name.bytes().all(|b| b.is_ascii_digit()) {
+                    return Some(p);
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// Collect `{service}.parquet` files across all hour-dirs, grouped by service.
+fn collect_service_files(hour_dirs: &[PathBuf]) -> HashMap<String, Vec<PathBuf>> {
+    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
+
+    for hour_dir in hour_dirs {
+        let Ok(entries) = std::fs::read_dir(hour_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "parquet") {
+                if let Some(service) = path.file_stem().and_then(|s| s.to_str()) {
+                    groups.entry(service.to_owned()).or_default().push(path);
+                }
+            }
+        }
+    }
+
+    groups
+}
+
+/// Check if a directory is empty.
+fn is_dir_empty(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+}
+
+/// Blocking: merge hourly parquet files for one service into a daily file.
+///
+/// Opens an in-memory `DuckDB` connection, reads all hourly files via
+/// `read_parquet([list], union_by_name=true)`, sorts by timestamp for
+/// optimal row group statistics, writes to `.tmp`, then atomic-renames.
+fn rollup_day_blocking(
+    day_dir: &Path,
+    service: &str,
+    hourly_files: &[PathBuf],
+) -> Result<(), String> {
+    let conn =
+        duckdb::Connection::open_in_memory().map_err(|e| format!("DuckDB open failed: {e}"))?;
+
+    // Build file list for read_parquet.
+    let mut file_list_parts = Vec::with_capacity(hourly_files.len() + 1);
+    for f in hourly_files {
+        file_list_parts.push(format!("'{}'", f.to_string_lossy()));
+    }
+
+    // If a day-level file already exists (e.g. late-arriving data after a
+    // previous rollup), include it in the merge.
+    let canonical_path = day_dir.join(format!("{service}.parquet"));
+    if canonical_path.exists() {
+        file_list_parts.push(format!("'{}'", canonical_path.to_string_lossy()));
+    }
+
+    let file_list_sql = file_list_parts.join(", ");
+    let tmp_path = day_dir.join(format!("{service}.parquet.tmp"));
+
+    // Read, merge, sort by timestamp, and write to tmp file.
+    conn.execute_batch(&format!(
+        "COPY (\
+             SELECT * FROM read_parquet([{file_list_sql}], union_by_name=true) \
+             ORDER BY \"timestamp\"\
+         ) TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+        tmp_path.to_string_lossy(),
+    ))
+    .map_err(|e| format!("rollup COPY failed: {e}"))?;
+
+    // Atomic rename.
+    std::fs::rename(&tmp_path, &canonical_path)
+        .map_err(|e| format!("rollup rename failed: {e}"))?;
+
+    // Delete hourly source files.
+    for f in hourly_files {
+        if let Err(e) = std::fs::remove_file(f) {
+            tracing::warn!(
+                event_type = "rollup_error",
+                file = %f.display(),
+                error = %e,
+                "failed to delete hourly file after rollup"
+            );
+        }
+    }
+
+    tracing::info!(
+        event_type = "rollup_complete",
+        compact_service = %service,
+        output = %canonical_path.display(),
+        hourly_files = hourly_files.len(),
+        "daily rollup complete"
+    );
 
     Ok(())
 }
@@ -211,35 +425,56 @@ fn compact_service_blocking(
     Ok(())
 }
 
-/// Remove stale `.parquet.tmp` files left by interrupted compaction runs.
+/// Remove stale `.parquet.tmp` files left by interrupted compaction or
+/// rollup runs.
 ///
-/// Walks `data_dir/{date}/{hour}/` looking for `.tmp` files older than
-/// `max_age`. These are inert (don't match `*.parquet` globs) but should
-/// be cleaned up to avoid disk waste.
+/// Checks both `data_dir/{date}/{hour}/` (hourly compaction) and
+/// `data_dir/{date}/` (daily rollup) for `.tmp` files older than
+/// `max_age`. These are inert (don't match `*.parquet` globs) but
+/// should be cleaned up to avoid disk waste.
 fn cleanup_stale_tmp_files(data_dir: &Path, max_age: Duration) {
     let Ok(days) = std::fs::read_dir(data_dir) else {
         return;
     };
     for day_entry in days.flatten() {
-        let Ok(hours) = std::fs::read_dir(day_entry.path()) else {
+        let day_path = day_entry.path();
+        if !day_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&day_path) else {
             continue;
         };
-        for hour_entry in hours.flatten() {
-            let Ok(files) = std::fs::read_dir(hour_entry.path()) else {
-                continue;
-            };
-            for file in files.flatten() {
-                let path = file.path();
-                if path.extension().is_some_and(|ext| ext == "tmp") {
-                    if let Ok(meta) = file.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            if SystemTime::now().duration_since(mtime).unwrap_or_default() > max_age
-                            {
-                                let _ = std::fs::remove_file(&path);
-                                tracing::debug!(path = %path.display(), "removed stale tmp file");
-                            }
-                        }
-                    }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Hour subdirectory — check its contents.
+                cleanup_tmp_in_dir(&path, max_age);
+            } else {
+                // Day-level file (from rollup).
+                remove_stale_tmp(&path, max_age);
+            }
+        }
+    }
+}
+
+/// Remove `.tmp` files in a single directory that are older than `max_age`.
+fn cleanup_tmp_in_dir(dir: &Path, max_age: Duration) {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for file in files.flatten() {
+        remove_stale_tmp(&file.path(), max_age);
+    }
+}
+
+/// Remove a single `.tmp` file if older than `max_age`.
+fn remove_stale_tmp(path: &Path, max_age: Duration) {
+    if path.extension().is_some_and(|ext| ext == "tmp") {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(mtime) = meta.modified() {
+                if SystemTime::now().duration_since(mtime).unwrap_or_default() > max_age {
+                    let _ = std::fs::remove_file(path);
+                    tracing::debug!(path = %path.display(), "removed stale tmp file");
                 }
             }
         }
@@ -450,5 +685,210 @@ mod tests {
 
         assert!(!stale.exists(), "stale .tmp should be removed");
         assert!(fresh.exists(), "fresh .tmp should be kept");
+    }
+
+    #[test]
+    fn cleanup_removes_day_level_stale_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let day_dir = data_dir.join("2026-01-01");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        // Day-level stale .tmp from interrupted rollup.
+        let stale = day_dir.join("nginx.parquet.tmp");
+        std::fs::write(&stale, b"stale").unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        cleanup_stale_tmp_files(&data_dir, Duration::from_millis(25));
+        assert!(!stale.exists(), "day-level stale .tmp should be removed");
+    }
+
+    #[test]
+    fn looks_like_date_valid() {
+        assert!(looks_like_date("2026-02-13"));
+        assert!(looks_like_date("2025-01-01"));
+    }
+
+    #[test]
+    fn looks_like_date_invalid() {
+        assert!(!looks_like_date("wal"));
+        assert!(!looks_like_date("00"));
+        assert!(!looks_like_date("2026-1-01"));
+        assert!(!looks_like_date(""));
+    }
+
+    /// Helper: create a parquet file with the given rows in a specific hour-dir.
+    fn write_hourly_parquet(
+        data_dir: &Path,
+        date: &str,
+        hour: &str,
+        service: &str,
+        records: &[&str],
+    ) -> PathBuf {
+        let wal_dir = data_dir.join("_wal_tmp");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let wal_files: Vec<PathBuf> = records
+            .iter()
+            .map(|r| write_wal_file(&wal_dir, service, &[r]))
+            .collect();
+
+        // Use DuckDB directly to write parquet (simpler than going through compact).
+        let hour_dir = data_dir.join(date).join(hour);
+        std::fs::create_dir_all(&hour_dir).unwrap();
+        let out = hour_dir.join(format!("{service}.parquet"));
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let file_list = wal_files
+            .iter()
+            .map(|p| format!("'{}'", p.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM read_json_auto([{file_list}])) \
+             TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+            out.to_string_lossy(),
+        ))
+        .unwrap();
+
+        // Clean up temp wal files.
+        let _ = std::fs::remove_dir_all(&wal_dir);
+
+        out
+    }
+
+    #[test]
+    fn rollup_day_blocking_merges_hourly_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r2 = r#"{"timestamp":"2026-01-15T02:30:00Z","service":"nginx","msg":"b"}"#;
+        let r3 = r#"{"timestamp":"2026-01-15T02:45:00Z","service":"nginx","msg":"c"}"#;
+
+        let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
+        let f2 = write_hourly_parquet(&data_dir, date, "02", "nginx", &[r2, r3]);
+
+        let day_dir = data_dir.join(date);
+        rollup_day_blocking(&day_dir, "nginx", &[f1.clone(), f2.clone()]).unwrap();
+
+        // Day-level file should exist.
+        let daily = day_dir.join("nginx.parquet");
+        assert!(daily.exists(), "daily parquet should exist");
+
+        // Hourly files should be deleted.
+        assert!(!f1.exists(), "hourly file 1 should be deleted");
+        assert!(!f2.exists(), "hourly file 2 should be deleted");
+
+        // Verify row count.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    daily.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "daily file should contain all 3 rows");
+    }
+
+    #[test]
+    fn rollup_day_blocking_merges_with_existing_daily() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        // First rollup: create initial daily file.
+        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
+        let day_dir = data_dir.join(date);
+        rollup_day_blocking(&day_dir, "nginx", &[f1]).unwrap();
+
+        // Late-arriving data creates a new hourly file.
+        let r2 = r#"{"timestamp":"2026-01-15T03:00:00Z","service":"nginx","msg":"late"}"#;
+        let f2 = write_hourly_parquet(&data_dir, date, "03", "nginx", &[r2]);
+
+        // Second rollup: should merge existing daily + new hourly.
+        rollup_day_blocking(&day_dir, "nginx", &[f2]).unwrap();
+
+        let daily = day_dir.join("nginx.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    daily.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "daily file should contain original + late row");
+    }
+
+    #[test]
+    fn rollup_day_blocking_sorts_by_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        // Write records in reverse order across hours.
+        let r1 = r#"{"timestamp":"2026-01-15T23:00:00Z","service":"nginx","msg":"late"}"#;
+        let r2 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"early"}"#;
+        let f1 = write_hourly_parquet(&data_dir, date, "23", "nginx", &[r1]);
+        let f2 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r2]);
+
+        let day_dir = data_dir.join(date);
+        rollup_day_blocking(&day_dir, "nginx", &[f1, f2]).unwrap();
+
+        // Verify rows are sorted by timestamp (ascending).
+        let daily = day_dir.join("nginx.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let first_msg: String = conn
+            .query_row(
+                &format!(
+                    "SELECT msg FROM read_parquet('{}') ORDER BY \"timestamp\" LIMIT 1",
+                    daily.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_msg, "early", "rows should be sorted by timestamp");
+    }
+
+    #[test]
+    fn collect_hour_dirs_finds_valid_hours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day = tmp.path().join("2026-01-15");
+        std::fs::create_dir_all(day.join("00")).unwrap();
+        std::fs::create_dir_all(day.join("14")).unwrap();
+        std::fs::create_dir_all(day.join("23")).unwrap();
+        // Not an hour directory.
+        std::fs::write(day.join("nginx.parquet"), b"data").unwrap();
+
+        let dirs = collect_hour_dirs(&day);
+        assert_eq!(dirs.len(), 3, "should find 3 hour directories");
+    }
+
+    #[test]
+    fn collect_service_files_groups_correctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h00 = tmp.path().join("00");
+        let h01 = tmp.path().join("01");
+        std::fs::create_dir_all(&h00).unwrap();
+        std::fs::create_dir_all(&h01).unwrap();
+        std::fs::write(h00.join("nginx.parquet"), b"data").unwrap();
+        std::fs::write(h00.join("postgres.parquet"), b"data").unwrap();
+        std::fs::write(h01.join("nginx.parquet"), b"data").unwrap();
+
+        let groups = collect_service_files(&[h00, h01]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups["nginx"].len(), 2);
+        assert_eq!(groups["postgres"].len(), 1);
     }
 }

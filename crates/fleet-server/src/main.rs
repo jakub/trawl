@@ -77,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             wal_dir,
             data_dir,
             interval,
+            config.ingest.daily_rollup,
             shutdown_rx,
         );
         Some((handle, shutdown_tx))
