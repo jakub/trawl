@@ -81,7 +81,9 @@ pub async fn query(
     let query_id = state.query.tracker.start(&verified, &req.query);
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
+    let start = std::time::Instant::now();
     let result = state.query.pool.execute(&req.query, timeout).await;
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     match result {
         Ok(qr) => {
@@ -92,6 +94,7 @@ pub async fn query(
                 user = %verified.name,
                 rows,
                 query_id,
+                duration_ms,
                 "query complete"
             );
             Ok(Json(qr))
@@ -103,6 +106,7 @@ pub async fn query(
                 user = %verified.name,
                 query = %req.query,
                 query_id,
+                duration_ms,
                 timeout_secs = state.query.timeout_secs,
                 "query timed out"
             );
@@ -124,6 +128,7 @@ pub async fn query(
                         user = %verified.name,
                         query = %req.query,
                         query_id,
+                        duration_ms,
                         error = %safe_msg,
                         "query failed: bad request"
                     );
@@ -137,6 +142,7 @@ pub async fn query(
                         user = %verified.name,
                         query = %req.query,
                         query_id,
+                        duration_ms,
                         error = %e,
                         safe_error = %safe_msg,
                         "query failed: engine error"
