@@ -3,7 +3,9 @@
 //! Uses a manual TLS accept loop with hyper for per-connection control
 //! and future mTLS support.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -23,6 +25,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
+
+/// Monotonic request counter for correlating events within a single request.
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 use crate::auth::auth_middleware;
 use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};
@@ -99,8 +104,16 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     app.layer(
         TraceLayer::new_for_http()
             .make_span_with(|request: &axum::http::Request<_>| {
+                let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+                let peer_addr = request
+                    .extensions()
+                    .get::<SocketAddr>()
+                    .copied()
+                    .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
                 tracing::info_span!(
                     "http_request",
+                    request_id,
+                    peer_addr = %peer_addr,
                     method = %request.method(),
                     path = %request.uri().path(),
                 )
@@ -223,7 +236,8 @@ pub async fn serve(
                     let io = TokioIo::new(tls_stream);
 
                     let hyper_service =
-                        hyper::service::service_fn(move |req: Request<Incoming>| {
+                        hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                            req.extensions_mut().insert(peer_addr);
                             let mut svc = tower_service.clone();
                             async move { svc.call(req).await }
                         });
