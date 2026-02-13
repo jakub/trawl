@@ -22,6 +22,7 @@
 //! re-enter `on_event` and loop forever.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -89,6 +90,8 @@ struct WalLayerInner {
     buffer: Mutex<Vec<u8>>,
     /// Cached hostname, resolved once at layer creation.
     host: String,
+    /// Bytes lost due to WAL write failures (accumulated, reset on report).
+    dropped_bytes: AtomicU64,
 }
 
 impl std::fmt::Debug for WalLayer {
@@ -112,6 +115,7 @@ impl WalLayer {
                 handle,
                 buffer: Mutex::new(Vec::with_capacity(8192)),
                 host,
+                dropped_bytes: AtomicU64::new(0),
             }),
         }
     }
@@ -141,6 +145,20 @@ impl WalLayerInner {
         if let Err(e) = writer.write("fleetd", &data) {
             // MUST NOT use tracing here — infinite recursion.
             eprintln!("[fleet-telemetry] WAL write failed: {e}");
+            self.dropped_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        } else {
+            // Report any previously dropped bytes. Safe from recursion:
+            // on_event only buffers, the tracing event will be picked up
+            // on the NEXT flush cycle.
+            let prev = self.dropped_bytes.swap(0, Ordering::Relaxed);
+            if prev > 0 {
+                tracing::warn!(
+                    event_type = "telemetry_dropped",
+                    dropped_bytes = prev,
+                    "telemetry events were lost due to WAL write failure"
+                );
+            }
         }
     }
 }
