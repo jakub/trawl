@@ -80,9 +80,17 @@ fn filter_value<'src>()
 
 /// Parse a `field:value` filter, including `field:>100`, `field:200,301,404`,
 /// `field:/pattern/`, and glob auto-detection.
+///
+/// Uses `.rewind()` lookahead on `field_name:` so that bare words like `NOT`
+/// don't commit the parser — if the colon is missing, `choice()` backtracks
+/// to `text_search()` instead.
 fn field_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
+    // lookahead: check ident+colon without consuming, so choice() can backtrack
     field_name()
+        .then(just(':'))
+        .rewind()
+        .ignore_then(field_name())
         .then_ignore(just(':'))
         .then(filter_value())
         .map(|(field, (op, value))| SearchToken::FieldFilter(FieldFilter { field, op, value }))
@@ -281,6 +289,45 @@ mod tests {
             .into_result()
             .unwrap();
         assert_eq!(result.tokens.len(), 3);
+    }
+
+    #[test]
+    fn test_bare_word_not_mistaken_for_field() {
+        // "NOT" should parse as text search, not fail as field_filter.
+        let result = search_stage().parse("NOT").into_result().unwrap();
+        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(
+            result.tokens[0].node,
+            SearchToken::TextSearch(TextSearch {
+                term: "NOT".to_string(),
+                negated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_not_before_field_filter() {
+        // "NOT level:error" — NOT is text search, level:error is field filter.
+        let result = search_stage()
+            .parse("NOT level:error")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.tokens.len(), 2);
+        assert_eq!(
+            result.tokens[0].node,
+            SearchToken::TextSearch(TextSearch {
+                term: "NOT".to_string(),
+                negated: false,
+            })
+        );
+        assert_eq!(
+            result.tokens[1].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "level".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("error".to_string()),
+            })
+        );
     }
 
     #[test]
