@@ -125,6 +125,28 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
         return format!("{base}/**/{file_pattern}");
     }
 
+    // Filter out globs whose parent directory doesn't exist on disk.
+    // This avoids sending DuckDB a list of entirely nonexistent paths,
+    // which would trigger a "No files found" error before the executor
+    // safety net catches it.
+    let globs: Vec<String> = globs
+        .into_iter()
+        .filter(|g| {
+            // globs are formatted as 'path/to/file_pattern' — strip quotes
+            // and check the parent dir.
+            let path = g.trim_matches('\'');
+            std::path::Path::new(path)
+                .parent()
+                .is_some_and(std::path::Path::exists)
+        })
+        .collect();
+
+    if globs.is_empty() {
+        // All glob dirs were nonexistent — fall back to recursive glob.
+        // The SQL time filter still provides correctness.
+        return format!("{base}/**/{file_pattern}");
+    }
+
     format!("[{}]", globs.join(", "))
 }
 
@@ -203,7 +225,20 @@ mod tests {
 
     #[test]
     fn with_time_filter_returns_list() {
-        let source = compute_source("/data", "last:1h", "/data/**/*.parquet");
+        // Create temp dir with today's hour directories so the filter doesn't prune them.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let now = chrono::Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        // Create hour dirs for current and recent hours.
+        for h_offset in 0..=3 {
+            let h = (now - chrono::Duration::hours(h_offset))
+                .format("%H")
+                .to_string();
+            std::fs::create_dir_all(tmp.path().join(&today).join(&h)).unwrap();
+        }
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "last:1h", &fallback);
         // Should be a list of hour-directory globs, not the fallback.
         assert!(
             source.starts_with('['),
@@ -224,7 +259,19 @@ mod tests {
 
     #[test]
     fn service_and_time_filter_compose() {
-        let source = compute_source("/data", "service:nginx last:1h", "/data/**/*.parquet");
+        // Create temp dir with today's hour directories.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let now = chrono::Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        for h_offset in 0..=3 {
+            let h = (now - chrono::Duration::hours(h_offset))
+                .format("%H")
+                .to_string();
+            std::fs::create_dir_all(tmp.path().join(&today).join(&h)).unwrap();
+        }
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "service:nginx last:1h", &fallback);
         assert!(
             source.starts_with('['),
             "expected list format, got: {source}"
@@ -285,11 +332,11 @@ mod tests {
         let fallback = format!("{base}/**/*.parquet");
         let source = compute_source(base, "service:nginx last:48h", &fallback);
 
-        // Should expand to hourly globs for yesterday (24 entries).
-        let hourly_pattern = format!("{base}/{yesterday}/00/nginx.parquet");
+        // Only hour 14 exists on disk, so only that glob survives filtering.
+        let hourly_pattern = format!("{base}/{yesterday}/14/nginx.parquet");
         assert!(
             source.contains(&hourly_pattern),
-            "expected hourly fallback for {yesterday}, got: {source}"
+            "expected hourly glob for existing dir, got: {source}"
         );
     }
 
@@ -413,16 +460,16 @@ mod tests {
         let fallback = format!("{base}/**/*.parquet");
         let source = compute_source(base, "last:48h", &fallback);
 
-        // Should include BOTH day-level glob and hourly expansion.
+        // Should include BOTH day-level glob and the existing hourly dir.
         let day_glob = format!("'{base}/{yesterday}/*.parquet'");
-        let hourly_glob = format!("'{base}/{yesterday}/00/*.parquet'");
+        let hourly_glob = format!("'{base}/{yesterday}/14/*.parquet'");
         assert!(
             source.contains(&day_glob),
             "expected day-level glob in mixed state, got: {source}"
         );
         assert!(
             source.contains(&hourly_glob),
-            "expected hourly globs in mixed state, got: {source}"
+            "expected hourly glob for existing dir in mixed state, got: {source}"
         );
     }
 
