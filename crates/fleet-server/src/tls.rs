@@ -153,13 +153,25 @@ fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
     // Persist so the cert is stable across daemon restarts.
     fs::create_dir_all(&tls_dir).map_err(TlsError::Write)?;
     fs::write(&cert_path, &cert_pem).map_err(TlsError::Write)?;
-    fs::write(&key_path, &key_pem).map_err(TlsError::Write)?;
 
+    // Write the private key with restricted permissions from the start
+    // to avoid a TOCTOU window where the key is world-readable.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)
             .map_err(TlsError::Write)?;
+        f.write_all(key_pem.as_bytes()).map_err(TlsError::Write)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&key_path, &key_pem).map_err(TlsError::Write)?;
     }
 
     tracing::info!(

@@ -7,6 +7,24 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Sanitize a service name for use in filenames.
+///
+/// Only alphanumeric, dash, and underscore survive; everything else
+/// (including dots) becomes underscore. Shared between WAL writer
+/// and query planner so file patterns match at query time.
+pub fn sanitize_service_for_filename(service: &str) -> String {
+    service
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Atomic WAL file writer for ingest events.
 #[derive(Debug)]
 pub struct WalWriter {
@@ -54,18 +72,7 @@ impl WalWriter {
         let random: u16 = rand::random();
         let hex = format!("{random:04x}");
 
-        // Sanitize service name: only alphanumeric, dash, underscore.
-        let safe_service: String = service
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-
+        let safe_service = sanitize_service_for_filename(service);
         format!("{safe_service}_{millis}_{hex}")
     }
 }
@@ -109,5 +116,27 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
             .collect();
         assert!(tmp_files.is_empty(), "no .tmp files should remain");
+    }
+
+    #[test]
+    fn sanitize_preserves_valid_chars() {
+        assert_eq!(
+            sanitize_service_for_filename("nginx-proxy_v2"),
+            "nginx-proxy_v2"
+        );
+    }
+
+    #[test]
+    fn sanitize_replaces_dots() {
+        assert_eq!(sanitize_service_for_filename("api.v2"), "api_v2");
+        assert_eq!(
+            sanitize_service_for_filename("host.name.prod"),
+            "host_name_prod"
+        );
+    }
+
+    #[test]
+    fn sanitize_replaces_special_chars() {
+        assert_eq!(sanitize_service_for_filename("a/b:c d"), "a_b_c_d");
     }
 }

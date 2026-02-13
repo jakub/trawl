@@ -7,6 +7,10 @@ pub enum AuthError {
     #[error("auth database error: {0}")]
     Database(#[from] rusqlite::Error),
 
+    /// Filesystem I/O error (e.g. setting database file permissions).
+    #[error("auth I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     /// Password hashing or verification failed.
     #[error("token hashing error: {0}")]
     Hash(String),

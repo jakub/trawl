@@ -98,12 +98,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
     // then signal compaction (which may compact those final files).
-    if let Some((_handle, shutdown_tx)) = &telemetry_handle {
+    // Await each handle to ensure the task completes before the runtime drops.
+    if let Some((handle, shutdown_tx)) = telemetry_handle {
         let _ = shutdown_tx.send(true);
+        if let Err(e) = handle.await {
+            tracing::warn!(error = %e, "telemetry task panicked during shutdown");
+        }
     }
 
-    if let Some((_handle, shutdown_tx)) = compaction_handle {
+    if let Some((handle, shutdown_tx)) = compaction_handle {
         let _ = shutdown_tx.send(true);
+        if let Err(e) = handle.await {
+            tracing::warn!(error = %e, "compaction task panicked during shutdown");
+        }
     }
 
     Ok(())

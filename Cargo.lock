@@ -933,6 +933,7 @@ dependencies = [
  "rand 0.8.5",
  "rusqlite",
  "serde",
+ "tempfile",
  "thiserror",
  "zeroize",
 ]
@@ -1005,6 +1006,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.5",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
  "serde",

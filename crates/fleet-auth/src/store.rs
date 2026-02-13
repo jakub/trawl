@@ -33,11 +33,44 @@ pub struct KeyStore {
 
 impl KeyStore {
     /// Open (or create) the auth database at the given path.
+    ///
+    /// On unix, ensures the file has mode 0600 (owner-only access) to
+    /// protect stored argon2 hashes from local users.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuthError> {
+        Self::ensure_restricted_permissions(path.as_ref())?;
         let conn = rusqlite::Connection::open(path)?;
         let store = Self { conn };
         store.initialize()?;
         Ok(store)
+    }
+
+    /// Ensure the database file has restricted permissions on unix.
+    ///
+    /// Pre-creates with mode 0600 if new, or tightens existing perms.
+    fn ensure_restricted_permissions(path: &Path) -> Result<(), AuthError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if path.exists() {
+                // Ensure existing file isn't world-readable.
+                let perms = std::fs::metadata(path)?.permissions();
+                if perms.mode() & 0o077 != 0 {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                }
+            } else {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Pre-create with restricted permissions so rusqlite inherits them.
+                drop(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(path)?,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Open an in-memory database (for testing).
@@ -589,5 +622,42 @@ mod tests {
         // New 'ingest' role should now be accepted.
         let ingest_key = store.create_key("ingester", Role::Ingest, None).unwrap();
         assert_eq!(ingest_key.info.role, Role::Ingest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_db_created_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("auth.db");
+
+        let _store = KeyStore::open(&db_path).unwrap();
+
+        let perms = std::fs::metadata(&db_path).unwrap().permissions();
+        let mode = perms.mode() & 0o777;
+        assert_eq!(mode, 0o600, "auth.db should be owner-only, got {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_db_fixes_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("auth.db");
+
+        // Create with world-readable permissions.
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _store = KeyStore::open(&db_path).unwrap();
+
+        let perms = std::fs::metadata(&db_path).unwrap().permissions();
+        let mode = perms.mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "auth.db should be tightened to owner-only, got {mode:o}"
+        );
     }
 }

@@ -114,7 +114,15 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
     };
 
     let service = extract_service_filter(&ast.search.tokens);
-    let file_pattern = service.map_or_else(|| "*.parquet".to_owned(), |s| format!("{s}.parquet"));
+    let file_pattern = service.map_or_else(
+        || "*.parquet".to_owned(),
+        |s| {
+            format!(
+                "{}.parquet",
+                crate::ingest::wal::sanitize_service_for_filename(s)
+            )
+        },
+    );
 
     let time_filter = ast.search.tokens.iter().find_map(|t| {
         if let SearchToken::TimeFilter(tf) = &t.node {
@@ -752,6 +760,34 @@ mod tests {
         assert!(
             source.contains(&hourly_glob),
             "expected hourly globs in mixed state, got: {source}"
+        );
+    }
+
+    #[test]
+    fn compute_source_sanitizes_dotted_service() {
+        // Dotted service name should be sanitized to match WAL/compaction filenames.
+        let source = compute_source("/data", "service:api.v2", "/data/**/*.parquet");
+        assert_eq!(
+            source, "/data/**/api_v2.parquet",
+            "dots should be replaced with underscores in file pattern"
+        );
+    }
+
+    #[test]
+    fn compute_source_sanitized_service_with_time_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "service:host.name last:1h", &fallback);
+
+        // Should use sanitized filename pattern.
+        assert!(
+            source.contains("host_name.parquet"),
+            "expected sanitized service in time-scoped glob, got: {source}"
+        );
+        assert!(
+            !source.contains("host.name.parquet"),
+            "should not contain unsanitized service name, got: {source}"
         );
     }
 }

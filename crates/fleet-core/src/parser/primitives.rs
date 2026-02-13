@@ -191,7 +191,10 @@ pub(crate) fn time_unit<'src>()
     .labelled("time unit")
 }
 
-/// Parse a duration like `2h`, `5m`, `30s`. Rejects zero-duration values.
+/// Parse a duration like `2h`, `5m`, `30s`.
+///
+/// Rejects zero-duration values and durations large enough to overflow
+/// `u64` when converted to seconds.
 pub(crate) fn duration<'src>()
 -> impl Parser<'src, ParserInput<'src>, FleetDuration, ParserExtra<'src>> + Clone {
     uint()
@@ -199,6 +202,16 @@ pub(crate) fn duration<'src>()
         .try_map(|(quantity, unit), span| {
             if quantity == 0 {
                 return Err(Rich::custom(span, "duration must be greater than zero"));
+            }
+            let multiplier = match unit {
+                TimeUnit::Seconds => 1,
+                TimeUnit::Minutes => 60,
+                TimeUnit::Hours => 3600,
+                TimeUnit::Days => 86_400,
+                TimeUnit::Weeks => 604_800,
+            };
+            if quantity.checked_mul(multiplier).is_none() {
+                return Err(Rich::custom(span, "duration too large"));
             }
             Ok(FleetDuration { quantity, unit })
         })
@@ -476,6 +489,25 @@ mod tests {
         assert!(duration().parse("0h").into_result().is_err());
         assert!(duration().parse("0s").into_result().is_err());
         assert!(duration().parse("0d").into_result().is_err());
+    }
+
+    #[test]
+    fn test_duration_overflow_rejected() {
+        // This quantity * 604800 (weeks) would overflow u64.
+        assert!(
+            duration()
+                .parse("99999999999999999w")
+                .into_result()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_duration_large_but_safe() {
+        // ~2739 years in days — fits in u64 (1_000_000 * 86_400 = 86_400_000_000).
+        let d = duration().parse("1000000d").into_result().unwrap();
+        assert_eq!(d.quantity, 1_000_000);
+        assert_eq!(d.to_seconds(), 86_400_000_000);
     }
 
     #[test]

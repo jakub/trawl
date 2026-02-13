@@ -124,17 +124,25 @@ pub struct FleetDuration {
 }
 
 impl FleetDuration {
+    /// Seconds-per-unit multiplier for this duration's time unit.
+    #[must_use]
+    pub const fn unit_multiplier(&self) -> u64 {
+        match self.unit {
+            TimeUnit::Seconds => 1,
+            TimeUnit::Minutes => 60,
+            TimeUnit::Hours => 3600,
+            TimeUnit::Days => 86_400,
+            TimeUnit::Weeks => 604_800,
+        }
+    }
+
     /// Convert to total seconds for comparison and heuristic purposes.
+    ///
+    /// Safe from overflow: the parser rejects durations whose
+    /// `quantity * unit_multiplier()` would exceed `u64::MAX`.
     #[must_use]
     pub fn to_seconds(&self) -> u64 {
-        self.quantity
-            * match self.unit {
-                TimeUnit::Seconds => 1,
-                TimeUnit::Minutes => 60,
-                TimeUnit::Hours => 3600,
-                TimeUnit::Days => 86_400,
-                TimeUnit::Weeks => 604_800,
-            }
+        self.quantity * self.unit_multiplier()
     }
 
     /// Format as a `DuckDB` interval string like `"2 hours"`.
