@@ -166,6 +166,12 @@ pub struct IngestConfig {
     /// How often the compaction task runs (seconds). Default: 10.
     #[serde(default = "default_compaction_interval_secs")]
     pub compaction_interval_secs: u64,
+
+    /// Write internal server events to the ingest pipeline as `service:fleetd`.
+    /// Enables querying server telemetry via the fleet DSL for dashboards
+    /// and audit trails. Default: true (when ingest is enabled).
+    #[serde(default = "default_internal_telemetry")]
+    pub internal_telemetry: bool,
 }
 
 impl Default for IngestConfig {
@@ -175,6 +181,7 @@ impl Default for IngestConfig {
             max_body_bytes: default_ingest_max_body_bytes(),
             wal_dir: None,
             compaction_interval_secs: default_compaction_interval_secs(),
+            internal_telemetry: default_internal_telemetry(),
         }
     }
 }
@@ -206,6 +213,8 @@ pub const DEFAULT_MAX_QUERY_HISTORY: usize = 1000;
 pub const DEFAULT_INGEST_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default compaction interval (seconds).
 pub const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 10;
+/// Default internal telemetry (enabled).
+pub const DEFAULT_INTERNAL_TELEMETRY: bool = true;
 /// Default admin rate limit (requests/minute).
 pub const DEFAULT_RATE_ADMIN: u32 = 100;
 /// Default analyst rate limit (requests/minute).
@@ -227,6 +236,10 @@ fn default_ingest_max_body_bytes() -> usize {
 
 fn default_compaction_interval_secs() -> u64 {
     DEFAULT_COMPACTION_INTERVAL_SECS
+}
+
+fn default_internal_telemetry() -> bool {
+    DEFAULT_INTERNAL_TELEMETRY
 }
 
 /// Authentication database settings.
@@ -383,7 +396,26 @@ impl Config {
                     .into(),
             );
         }
+        if self.ingest.internal_telemetry && self.server.log_file.is_some() {
+            warns.push(
+                "log_file is deprecated when internal_telemetry is enabled — \
+                 server events now flow through the ingest pipeline as service:fleetd"
+                    .into(),
+            );
+        }
+        if self.ingest.internal_telemetry && !self.ingest.enabled {
+            warns.push(
+                "internal_telemetry requires ingest to be enabled — telemetry disabled".into(),
+            );
+        }
         warns
+    }
+
+    /// Whether internal telemetry is effectively enabled.
+    ///
+    /// Requires both `ingest.enabled` and `ingest.internal_telemetry` to be true.
+    pub fn internal_telemetry_enabled(&self) -> bool {
+        self.ingest.enabled && self.ingest.internal_telemetry
     }
 
     /// Validate configuration values.
@@ -660,6 +692,7 @@ db_path = "/tmp/auth.db"
         assert_eq!(config.ingest.max_body_bytes, 16 * 1024 * 1024);
         assert!(config.ingest.wal_dir.is_none());
         assert_eq!(config.ingest.compaction_interval_secs, 10);
+        assert!(config.ingest.internal_telemetry);
         assert_eq!(config.wal_dir(), std::path::Path::new("/data/wal"));
     }
 
@@ -716,5 +749,72 @@ db_path = "/tmp/auth.db"
         assert_eq!(config.server.rate_limit.analyst, 0);
         assert_eq!(config.server.rate_limit.reader, 10);
         assert_eq!(config.server.rate_limit.ingest, 500);
+    }
+
+    #[test]
+    fn internal_telemetry_defaults_to_true() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ingest.internal_telemetry);
+        assert!(config.internal_telemetry_enabled());
+    }
+
+    #[test]
+    fn internal_telemetry_disabled_explicitly() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[ingest]
+internal_telemetry = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ingest.internal_telemetry);
+        assert!(!config.internal_telemetry_enabled());
+    }
+
+    #[test]
+    fn internal_telemetry_requires_ingest_enabled() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[ingest]
+enabled = false
+internal_telemetry = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.internal_telemetry_enabled());
+        let warns = config.warnings();
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("internal_telemetry requires ingest"))
+        );
+    }
+
+    #[test]
+    fn internal_telemetry_warns_log_file_deprecated() {
+        let toml = r#"
+[server]
+log_file = "/var/log/fleetd.log"
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let warns = config.warnings();
+        assert!(warns.iter().any(|w| w.contains("log_file is deprecated")));
     }
 }
