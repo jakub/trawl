@@ -5,8 +5,11 @@
 //!
 //! The tracing subscriber is initialized before the WAL writer exists (we
 //! need tracing for config-loading logs). [`WalHandle`] wraps an
-//! [`OnceLock`] — the layer registers at init time but silently drops
-//! events until [`WalHandle::set`] injects the writer after startup.
+//! [`OnceLock`] — the layer registers at init time and buffers events
+//! in memory until [`WalHandle::set`] injects the writer after startup.
+//! This ensures bootstrap events (config loading, cert generation, etc.)
+//! are captured rather than silently dropped. A 1 MiB cap prevents
+//! unbounded growth if the writer is never set.
 //!
 //! ## Buffering
 //!
@@ -252,7 +255,11 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        if self.inner.handle.get().is_none() {
+        // Pre-init cap: if the writer isn't set yet and the buffer is
+        // already over 1 MiB, drop this event to prevent unbounded growth
+        // (e.g. if telemetry is disabled and the writer is never injected).
+        const PRE_INIT_CAP: usize = 1024 * 1024;
+        if self.inner.handle.get().is_none() && self.inner.buffer.lock().len() >= PRE_INIT_CAP {
             return;
         }
 
@@ -432,13 +439,43 @@ mod tests {
     }
 
     #[test]
-    fn wal_layer_skips_when_no_writer() {
-        let handle = WalHandle::new();
-        let layer = WalLayer::new(handle);
+    fn wal_layer_buffers_before_writer_set() {
+        use tracing_subscriber::prelude::*;
 
-        // No writer set — buffer should stay empty even after flush.
-        layer.flush();
-        assert_eq!(layer.inner.buffer.lock().len(), 0);
+        let handle = WalHandle::new();
+        let layer = WalLayer::new(handle.clone());
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Emit event before writer is available — should be buffered.
+        tracing::info!(event_type = "bootstrap", "pre-init event");
+        assert!(!layer_ref.inner.buffer.lock().is_empty());
+
+        // Flush without writer — buffer should be retained (not drained).
+        layer_ref.flush();
+        assert!(!layer_ref.inner.buffer.lock().is_empty());
+
+        // Now inject the writer and flush — buffer should drain.
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+        handle.set(Arc::clone(&writer));
+
+        layer_ref.flush();
+        assert!(layer_ref.inner.buffer.lock().is_empty());
+
+        // Verify the bootstrap event reached the WAL.
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["event_type"], "bootstrap");
     }
 
     #[test]
