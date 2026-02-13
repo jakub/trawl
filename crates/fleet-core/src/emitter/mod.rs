@@ -354,6 +354,11 @@ mod tests {
     }
 
     #[test]
+    fn expr_not_equal() {
+        assert_snapshot!(emit_dsl("* | where count != 1"));
+    }
+
+    #[test]
     fn expr_in_list() {
         assert_snapshot!(emit_dsl("* | where status in (200, 301, 404)"));
     }
