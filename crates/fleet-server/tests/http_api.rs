@@ -113,6 +113,8 @@ async fn setup() -> TestServer {
             tls_key_path: Some(key_path),
             tls_reload_interval_secs: 0,
             cors_allowed_origins: vec![],
+            schema_cache_ttl_secs: 60,
+            max_query_history: 1000,
             rate_limit: RateLimitConfig::default(),
         },
         data: DataConfig { path: data_glob },

@@ -65,6 +65,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
 
+    /// Schema cache TTL in seconds (default: 60). Controls how long
+    /// `GET /schema` results are cached before re-introspecting.
+    #[serde(default = "default_schema_cache_ttl_secs")]
+    pub schema_cache_ttl_secs: u64,
+
+    /// Maximum number of completed queries kept in the history ring buffer
+    /// (default: 1000). Visible via `GET /queries` (admin only).
+    #[serde(default = "default_max_query_history")]
+    pub max_query_history: usize,
+
     /// Per-role rate limiting (requests per minute). 0 = disabled.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -188,6 +198,10 @@ pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
 /// Default TLS certificate reload interval (seconds). 0 = disabled.
 pub const DEFAULT_TLS_RELOAD_INTERVAL_SECS: u64 = 300;
+/// Default schema cache TTL (seconds).
+pub const DEFAULT_SCHEMA_CACHE_TTL_SECS: u64 = 60;
+/// Default query history ring buffer capacity.
+pub const DEFAULT_MAX_QUERY_HISTORY: usize = 1000;
 /// Default ingest request body size limit (16 MB).
 pub const DEFAULT_INGEST_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default compaction interval (seconds).
@@ -252,6 +266,14 @@ fn default_shutdown_drain_secs() -> u64 {
 
 fn default_tls_reload_interval_secs() -> u64 {
     DEFAULT_TLS_RELOAD_INTERVAL_SECS
+}
+
+fn default_schema_cache_ttl_secs() -> u64 {
+    DEFAULT_SCHEMA_CACHE_TTL_SECS
+}
+
+fn default_max_query_history() -> usize {
+    DEFAULT_MAX_QUERY_HISTORY
 }
 
 fn default_rate_admin() -> u32 {

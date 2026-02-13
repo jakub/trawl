@@ -63,7 +63,7 @@ pub struct ActiveQuerySnapshot {
 }
 
 /// Default ring buffer capacity for query history.
-const DEFAULT_MAX_HISTORY: usize = 1000;
+const DEFAULT_MAX_HISTORY: usize = crate::config::DEFAULT_MAX_QUERY_HISTORY;
 
 /// Convert an `Instant` elapsed time to milliseconds as u64.
 /// Saturates at `u64::MAX` (which is ~584 million years, so... fine).
@@ -80,11 +80,16 @@ impl Default for QueryTracker {
 impl QueryTracker {
     /// Create a new tracker with the default history capacity.
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_HISTORY)
+    }
+
+    /// Create a new tracker with a custom history capacity.
+    pub fn with_capacity(max_history: usize) -> Self {
         Self {
             active: DashMap::new(),
-            history: Mutex::new(VecDeque::with_capacity(DEFAULT_MAX_HISTORY)),
+            history: Mutex::new(VecDeque::with_capacity(max_history)),
             next_id: AtomicU64::new(1),
-            max_history: DEFAULT_MAX_HISTORY,
+            max_history,
         }
     }
 

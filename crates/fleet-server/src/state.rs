@@ -36,6 +36,8 @@ pub struct QueryState {
     pub timeout_secs: u64,
     /// Query lifecycle tracker (active + history).
     pub tracker: Arc<QueryTracker>,
+    /// Schema cache TTL in seconds.
+    pub schema_cache_ttl_secs: u64,
     /// Cached schema introspection result with TTL.
     ///
     /// Uses `Mutex` (not `RwLock`) to prevent thundering herd: only one
@@ -88,9 +90,6 @@ pub struct CachedSchema {
     pub cached_at: Instant,
 }
 
-/// How long schema cache entries are valid (seconds).
-pub const SCHEMA_CACHE_TTL_SECS: u64 = 60;
-
 impl AppState {
     /// Construct app state from a validated [`Config`].
     ///
@@ -114,7 +113,8 @@ impl AppState {
                     config.server.max_result_rows,
                 ),
                 timeout_secs: config.server.timeout_secs,
-                tracker: Arc::new(QueryTracker::new()),
+                tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
+                schema_cache_ttl_secs: config.server.schema_cache_ttl_secs,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
             },
             auth: AuthState {

@@ -8,7 +8,7 @@ use fleet_engine::value::{QueryResult, SchemaColumn};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
-use crate::state::{AppState, CachedSchema, SCHEMA_CACHE_TTL_SECS};
+use crate::state::{AppState, CachedSchema};
 
 // -- request/response types --------------------------------------------------
 
@@ -150,7 +150,7 @@ pub async fn health() -> Json<HealthResponse> {
 /// `GET /api/v1/schema` — introspect the data source schema.
 ///
 /// Returns column names and types from the configured parquet data.
-/// Results are cached for [`SCHEMA_CACHE_TTL_SECS`] seconds.
+/// Results are cached for `schema_cache_ttl_secs` seconds (default: 60).
 pub async fn schema(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -164,7 +164,7 @@ pub async fn schema(
     let mut cache = state.query.schema_cache.lock().await;
 
     if let Some(cached) = &*cache {
-        if cached.cached_at.elapsed().as_secs() < SCHEMA_CACHE_TTL_SECS {
+        if cached.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs {
             tracing::debug!(user = %verified.name, "serving schema from cache");
             return Ok(Json(SchemaResponse {
                 columns: cached
