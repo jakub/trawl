@@ -212,6 +212,14 @@ impl KeyStore {
             ) {
                 Ok(_) => {
                     let id = self.conn.last_insert_rowid();
+                    tracing::info!(
+                        event_type = "key_created",
+                        key_id = id,
+                        prefix = %generated.prefix,
+                        name,
+                        role = %role,
+                        "API key created"
+                    );
                     return Ok(CreatedKey {
                         info: ApiKeyInfo {
                             id,
@@ -372,6 +380,8 @@ impl KeyStore {
                 prefix: prefix.to_owned(),
             });
         }
+
+        tracing::info!(event_type = "key_revoked", prefix, "API key revoked");
 
         // Return the updated key info with a direct query.
         let mut stmt = self.conn.prepare(
