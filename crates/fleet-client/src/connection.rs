@@ -26,18 +26,14 @@ impl std::fmt::Debug for HttpClient {
 }
 
 impl HttpClient {
+    /// Long timeout for analytical queries over large parquet sets.
+    /// The server enforces its own `query_timeout_sec`; this prevents
+    /// client-side network timeouts on slow connections.
+    const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// Create a new client targeting the given daemon URL with an API key.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, ClientError> {
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .map_err(sanitize_reqwest_error)?;
-        Ok(Self {
-            base_url: base_url.into(),
-            token: Zeroizing::new(token.into()),
-            client,
-        })
+        Self::build(base_url, token, false)
     }
 
     /// Create a client that accepts self-signed / invalid TLS certificates.
@@ -48,17 +44,7 @@ impl HttpClient {
         base_url: impl Into<String>,
         token: impl Into<String>,
     ) -> Result<Self, ClientError> {
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(120))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(sanitize_reqwest_error)?;
-        Ok(Self {
-            base_url: base_url.into(),
-            token: Zeroizing::new(token.into()),
-            client,
-        })
+        Self::build(base_url, token, true)
     }
 
     /// Create a client with a pre-configured `reqwest::Client`.
@@ -68,15 +54,36 @@ impl HttpClient {
         client: Client,
     ) -> Self {
         Self {
-            base_url: base_url.into(),
+            base_url: normalize_base_url(base_url.into()),
             token: Zeroizing::new(token.into()),
             client,
         }
     }
 
-    /// Build a full URL for an API endpoint, normalizing trailing slashes.
+    fn build(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        accept_invalid_certs: bool,
+    ) -> Result<Self, ClientError> {
+        let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Self::DEFAULT_TIMEOUT);
+
+        if accept_invalid_certs {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        let client = builder.build().map_err(sanitize_reqwest_error)?;
+        Ok(Self {
+            base_url: normalize_base_url(base_url.into()),
+            token: Zeroizing::new(token.into()),
+            client,
+        })
+    }
+
+    /// Build a full URL for an API endpoint.
     fn endpoint(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url.trim_end_matches('/'))
+        format!("{}{path}", self.base_url)
     }
 
     /// Execute a DSL query against the daemon.
@@ -142,6 +149,16 @@ impl HttpClient {
         resp.json()
             .await
             .map_err(|e| ClientError::Parse(e.to_string()))
+    }
+}
+
+/// Strip trailing slashes so `endpoint()` can simply concatenate.
+fn normalize_base_url(url: String) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if trimmed.len() == url.len() {
+        url
+    } else {
+        trimmed.to_owned()
     }
 }
 
