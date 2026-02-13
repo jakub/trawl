@@ -9,6 +9,7 @@ mod functions;
 mod pipeline;
 mod search;
 mod state;
+mod validate;
 
 use crate::ast::Query;
 use state::EmitterState;
@@ -73,6 +74,9 @@ impl std::error::Error for EmitError {}
 /// `source` is the parquet glob path, e.g. `"/data/**/*.parquet"`.
 pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
     let mut state = EmitterState::new(source)?;
+
+    // pre-validate pipeline stages before mutating emission state
+    validate::validate_pipeline(&query.pipeline)?;
 
     // translate search stage into WHERE clauses
     search::emit_search(&query.search, &mut state);
