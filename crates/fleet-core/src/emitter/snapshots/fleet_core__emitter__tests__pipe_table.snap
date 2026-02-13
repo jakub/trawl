@@ -3,4 +3,4 @@ source: crates/fleet-core/src/emitter/mod.rs
 expression: "emit_dsl(\"* | table host, service, message\")"
 ---
 SELECT "host", "service", "message"
-FROM read_parquet('/data/**/*.parquet')
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)

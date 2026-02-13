@@ -4,7 +4,7 @@ expression: "emit_dsl(\"* | let host_lower = lower(host)\")"
 ---
 WITH _s0 AS (
   SELECT *
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
 SELECT *, (LOWER("host")) AS "host_lower"
 FROM "_s0"

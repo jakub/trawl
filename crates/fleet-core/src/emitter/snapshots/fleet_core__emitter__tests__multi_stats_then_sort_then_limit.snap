@@ -4,7 +4,7 @@ expression: "emit_dsl(\"service:nginx | stats count() by host | sort -count | li
 ---
 WITH _s0 AS (
   SELECT "host", COUNT(*) AS "count"
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
   WHERE "service" = ?
   GROUP BY "host"
 )

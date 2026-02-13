@@ -93,7 +93,7 @@ impl EmitterState {
         // time-scoped queries that target specific hour-directories.
         let reader = if source.starts_with('[') {
             validate_source_list(source)?;
-            format!("read_parquet({source})")
+            format!("read_parquet({source}, union_by_name=true)")
         } else {
             validate_source_path(source)?;
             let ext = std::path::Path::new(source)
@@ -103,7 +103,7 @@ impl EmitterState {
             if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("ndjson") {
                 format!("read_json_auto('{source}')")
             } else {
-                format!("read_parquet('{source}')")
+                format!("read_parquet('{source}', union_by_name=true)")
             }
         };
         Ok(Self {

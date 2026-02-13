@@ -4,7 +4,7 @@ expression: "emit_dsl(\"service:nginx | pivot avg(duration) on status by host\")
 ---
 WITH _s0 AS (
   SELECT *
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
   WHERE "service" = 'nginx'
 ), _s1 AS (
   SELECT "status", "host", "duration"

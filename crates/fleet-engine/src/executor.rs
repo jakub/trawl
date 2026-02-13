@@ -141,7 +141,7 @@ impl SchemaIntrospector for Executor {
 
         let mut stmt = self
             .conn
-            .prepare("DESCRIBE SELECT * FROM read_parquet(?)")?;
+            .prepare("DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)")?;
         let mut rows = stmt.query([source])?;
 
         let mut columns = Vec::new();

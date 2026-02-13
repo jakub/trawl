@@ -4,7 +4,7 @@ expression: "emit_dsl(r#\"service:nginx | extract \"(?P<code>[0-9]{3})\" from me
 ---
 WITH _s0 AS (
   SELECT *
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
   WHERE "service" = ?
 ), _s1 AS (
   SELECT *, regexp_extract("message", ?, 1) AS "code"

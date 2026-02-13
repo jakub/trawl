@@ -4,7 +4,7 @@ expression: "emit_dsl(\"* | rare 5 status by host\")"
 ---
 WITH _s0 AS (
   SELECT "status", "host", COUNT(*) AS "count"
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
   GROUP BY "status", "host"
 )
 SELECT *

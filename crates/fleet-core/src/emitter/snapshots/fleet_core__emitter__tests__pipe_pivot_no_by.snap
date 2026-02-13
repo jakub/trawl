@@ -4,7 +4,7 @@ expression: "emit_dsl(\"* | pivot count() on service\")"
 ---
 WITH _s0 AS (
   SELECT *
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 ), _s1 AS (
   SELECT "service"
   FROM "_s0"

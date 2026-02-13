@@ -4,7 +4,7 @@ expression: "emit_dsl(\"* | stats count(), avg(duration) by host | drop avg_dura
 ---
 WITH _s0 AS (
   SELECT "host", COUNT(*) AS "count", AVG("duration") AS "avg_duration"
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
   GROUP BY "host"
 )
 SELECT * EXCLUDE ("avg_duration")

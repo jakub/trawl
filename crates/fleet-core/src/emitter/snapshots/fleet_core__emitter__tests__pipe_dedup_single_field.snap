@@ -4,7 +4,7 @@ expression: "emit_dsl(\"* | dedup host\")"
 ---
 WITH _s0 AS (
   SELECT *
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 ), _s1 AS (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY "host" ORDER BY CAST("timestamp" AS TIMESTAMP) DESC) AS "_rn"
   FROM "_s0"

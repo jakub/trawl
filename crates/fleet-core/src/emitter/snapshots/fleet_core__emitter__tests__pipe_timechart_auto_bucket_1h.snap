@@ -3,7 +3,7 @@ source: crates/fleet-core/src/emitter/mod.rs
 expression: "emit_dsl(\"last:1h | timechart count()\")"
 ---
 SELECT time_bucket(INTERVAL '1 minutes', CAST("timestamp" AS TIMESTAMP)) AS "_time", COUNT(*) AS "count"
-FROM read_parquet('/data/**/*.parquet')
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 WHERE CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '1 hours'
 GROUP BY "_time"
 ORDER BY "_time" ASC

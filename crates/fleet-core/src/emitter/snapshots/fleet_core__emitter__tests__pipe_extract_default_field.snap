@@ -4,7 +4,7 @@ expression: "emit_dsl(r#\"* | extract \"(?P<method>[A-Z]+) (?P<path>/[^ ]+)\"\"#
 ---
 WITH _s0 AS (
   SELECT *
-  FROM read_parquet('/data/**/*.parquet')
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
 SELECT *, regexp_extract("message", ?, 1) AS "method", regexp_extract("message", ?, 2) AS "path"
 FROM "_s0"

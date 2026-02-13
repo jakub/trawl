@@ -3,5 +3,5 @@ source: crates/fleet-core/src/emitter/mod.rs
 expression: "emit_dsl(\"last:7d\")"
 ---
 SELECT *
-FROM read_parquet('/data/**/*.parquet')
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 WHERE CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '7 days'
