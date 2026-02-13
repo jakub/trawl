@@ -90,3 +90,237 @@ fn percentile(name: &str, args: &[String], p: f64) -> Result<String, EmitError> 
         args[0]
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // ── translate_function: aggregates ──────────────────────────────────
+
+    #[test]
+    fn translate_count_no_args() {
+        assert_eq!(translate_function("count", &[]).unwrap(), "COUNT(*)");
+    }
+
+    #[test]
+    fn translate_count_with_field() {
+        assert_eq!(
+            translate_function("count", &args(&["host"])).unwrap(),
+            "COUNT(host)"
+        );
+    }
+
+    #[test]
+    fn translate_avg() {
+        assert_eq!(
+            translate_function("avg", &args(&["duration"])).unwrap(),
+            "AVG(duration)"
+        );
+    }
+
+    #[test]
+    fn translate_sum() {
+        assert_eq!(
+            translate_function("sum", &args(&["bytes"])).unwrap(),
+            "SUM(bytes)"
+        );
+    }
+
+    #[test]
+    fn translate_min() {
+        assert_eq!(
+            translate_function("min", &args(&["latency"])).unwrap(),
+            "MIN(latency)"
+        );
+    }
+
+    #[test]
+    fn translate_max() {
+        assert_eq!(
+            translate_function("max", &args(&["latency"])).unwrap(),
+            "MAX(latency)"
+        );
+    }
+
+    #[test]
+    fn translate_dc() {
+        assert_eq!(
+            translate_function("dc", &args(&["host"])).unwrap(),
+            "COUNT(DISTINCT host)"
+        );
+    }
+
+    #[test]
+    fn translate_distinct_count() {
+        assert_eq!(
+            translate_function("distinct_count", &args(&["host"])).unwrap(),
+            "COUNT(DISTINCT host)"
+        );
+    }
+
+    #[test]
+    fn translate_p50() {
+        assert_eq!(
+            translate_function("p50", &args(&["duration"])).unwrap(),
+            "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration)"
+        );
+    }
+
+    #[test]
+    fn translate_p90() {
+        assert_eq!(
+            translate_function("p90", &args(&["duration"])).unwrap(),
+            "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY duration)"
+        );
+    }
+
+    #[test]
+    fn translate_p95() {
+        assert_eq!(
+            translate_function("p95", &args(&["duration"])).unwrap(),
+            "PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration)"
+        );
+    }
+
+    #[test]
+    fn translate_p99() {
+        assert_eq!(
+            translate_function("p99", &args(&["duration"])).unwrap(),
+            "PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration)"
+        );
+    }
+
+    // ── translate_function: scalars ─────────────────────────────────────
+
+    #[test]
+    fn translate_lower() {
+        assert_eq!(
+            translate_function("lower", &args(&["host"])).unwrap(),
+            "LOWER(host)"
+        );
+    }
+
+    #[test]
+    fn translate_upper() {
+        assert_eq!(
+            translate_function("upper", &args(&["host"])).unwrap(),
+            "UPPER(host)"
+        );
+    }
+
+    #[test]
+    fn translate_length() {
+        assert_eq!(
+            translate_function("length", &args(&["msg"])).unwrap(),
+            "LENGTH(msg)"
+        );
+    }
+
+    #[test]
+    fn translate_len_alias() {
+        assert_eq!(
+            translate_function("len", &args(&["msg"])).unwrap(),
+            "LENGTH(msg)"
+        );
+    }
+
+    #[test]
+    fn translate_coalesce() {
+        assert_eq!(
+            translate_function("coalesce", &args(&["a", "b", "c"])).unwrap(),
+            "COALESCE(a, b, c)"
+        );
+    }
+
+    // ── translate_function: error cases ─────────────────────────────────
+
+    #[test]
+    fn translate_unknown_function() {
+        let err = translate_function("bogus", &[]).unwrap_err();
+        assert_eq!(
+            err,
+            EmitError::UnknownFunction {
+                name: "bogus".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn translate_avg_no_args_errors() {
+        let err = translate_function("avg", &[]).unwrap_err();
+        assert!(matches!(err, EmitError::InvalidAggregation { .. }));
+    }
+
+    #[test]
+    fn translate_avg_too_many_args_errors() {
+        let err = translate_function("avg", &args(&["a", "b"])).unwrap_err();
+        assert!(matches!(err, EmitError::InvalidAggregation { .. }));
+    }
+
+    #[test]
+    fn translate_coalesce_no_args_errors() {
+        let err = translate_function("coalesce", &[]).unwrap_err();
+        assert!(matches!(err, EmitError::InvalidAggregation { .. }));
+    }
+
+    #[test]
+    fn translate_p99_no_args_errors() {
+        let err = translate_function("p99", &[]).unwrap_err();
+        assert!(matches!(err, EmitError::InvalidAggregation { .. }));
+    }
+
+    // ── is_aggregate_function ───────────────────────────────────────────
+
+    #[test]
+    fn aggregates_detected() {
+        for name in [
+            "count",
+            "avg",
+            "sum",
+            "min",
+            "max",
+            "dc",
+            "distinct_count",
+            "p50",
+            "p90",
+            "p95",
+            "p99",
+        ] {
+            assert!(is_aggregate_function(name), "{name} should be aggregate");
+        }
+    }
+
+    #[test]
+    fn scalars_not_aggregate() {
+        for name in ["lower", "upper", "length", "len", "coalesce", "bogus"] {
+            assert!(
+                !is_aggregate_function(name),
+                "{name} should not be aggregate"
+            );
+        }
+    }
+
+    // ── default_agg_alias ───────────────────────────────────────────────
+
+    #[test]
+    fn alias_count_no_arg() {
+        assert_eq!(default_agg_alias("count", None), "\"count\"");
+    }
+
+    #[test]
+    fn alias_avg_with_field() {
+        assert_eq!(
+            default_agg_alias("avg", Some("duration")),
+            "\"avg_duration\""
+        );
+    }
+
+    #[test]
+    fn alias_dc_with_field() {
+        assert_eq!(default_agg_alias("dc", Some("host")), "\"dc_host\"");
+    }
+}

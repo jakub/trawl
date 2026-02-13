@@ -49,4 +49,53 @@ mod tests {
     fn quote_field_simple() {
         assert_eq!(quote_field("host"), "\"host\"");
     }
+
+    // ── coerce_filter_value ─────────────────────────────────────────────
+
+    #[test]
+    fn coerce_integer() {
+        assert_eq!(coerce_filter_value("42"), SqlValue::Int(42));
+    }
+
+    #[test]
+    fn coerce_negative_integer() {
+        assert_eq!(coerce_filter_value("-1"), SqlValue::Int(-1));
+    }
+
+    #[test]
+    fn coerce_zero() {
+        assert_eq!(coerce_filter_value("0"), SqlValue::Int(0));
+    }
+
+    #[test]
+    fn coerce_float() {
+        assert_eq!(coerce_filter_value("1.23"), SqlValue::Float(1.23));
+    }
+
+    #[test]
+    fn coerce_negative_float() {
+        assert_eq!(coerce_filter_value("-0.5"), SqlValue::Float(-0.5));
+    }
+
+    #[test]
+    fn coerce_string_fallback() {
+        assert_eq!(
+            coerce_filter_value("hello"),
+            SqlValue::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn coerce_empty_string() {
+        assert_eq!(coerce_filter_value(""), SqlValue::String(String::new()));
+    }
+
+    #[test]
+    fn coerce_i64_overflow_becomes_float() {
+        // 2^63 overflows i64 but parses as f64
+        assert_eq!(
+            coerce_filter_value("9999999999999999999"),
+            SqlValue::Float(9_999_999_999_999_999_999.0)
+        );
+    }
 }

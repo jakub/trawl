@@ -459,4 +459,283 @@ mod tests {
         assert!(matches!(result[2].node, PipeStage::Sort(_)));
         assert!(matches!(result[3].node, PipeStage::Limit(_)));
     }
+
+    // ── top ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_top_basic() {
+        let input = "| top 5 host";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Top(t) => {
+                assert_eq!(t.count, 5);
+                assert_eq!(t.field, "host");
+                assert!(t.by.is_empty());
+            }
+            other => panic!("expected Top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_top_with_by() {
+        let input = "| top 3 host by service";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Top(t) => {
+                assert_eq!(t.count, 3);
+                assert_eq!(t.field, "host");
+                assert_eq!(t.by, vec!["service".to_string()]);
+            }
+            other => panic!("expected Top, got {other:?}"),
+        }
+    }
+
+    // ── rare ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rare_basic() {
+        let input = "| rare 5 status";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Rare(r) => {
+                assert_eq!(r.count, 5);
+                assert_eq!(r.field, "status");
+                assert!(r.by.is_empty());
+            }
+            other => panic!("expected Rare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rare_with_by() {
+        let input = "| rare 3 status by service, host";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Rare(r) => {
+                assert_eq!(r.count, 3);
+                assert_eq!(r.field, "status");
+                assert_eq!(r.by, vec!["service".to_string(), "host".to_string()]);
+            }
+            other => panic!("expected Rare, got {other:?}"),
+        }
+    }
+
+    // ── drop ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_drop_single() {
+        let input = "| drop host";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Drop(d) => {
+                assert_eq!(d.fields, vec!["host".to_string()]);
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_drop_multiple() {
+        let input = "| drop host, status, uri";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Drop(d) => {
+                assert_eq!(
+                    d.fields,
+                    vec!["host".to_string(), "status".to_string(), "uri".to_string()]
+                );
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    // ── let ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_let_arithmetic() {
+        let input = "| let duration_ms = duration * 1000";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Let(l) => {
+                assert_eq!(l.field, "duration_ms");
+                assert!(matches!(l.expr.node, Expr::Binary { .. }));
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_let_function_call() {
+        let input = "| let lower_host = lower(host)";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Let(l) => {
+                assert_eq!(l.field, "lower_host");
+                match &l.expr.node {
+                    Expr::FunctionCall { name, args } => {
+                        assert_eq!(name, "lower");
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected FunctionCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    // ── extract ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_regex() {
+        let input = r#"| extract "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message"#;
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Extract(e) => {
+                assert!(matches!(e.mode, ExtractMode::Regex(_)));
+                assert_eq!(e.source_field, Some("message".to_string()));
+            }
+            other => panic!("expected Extract, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_kv() {
+        let input = "| extract kv";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Extract(e) => {
+                assert_eq!(e.mode, ExtractMode::KeyValue);
+                assert_eq!(e.source_field, None);
+            }
+            other => panic!("expected Extract, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_kv_from_field() {
+        let input = "| extract kv from raw";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Extract(e) => {
+                assert_eq!(e.mode, ExtractMode::KeyValue);
+                assert_eq!(e.source_field, Some("raw".to_string()));
+            }
+            other => panic!("expected Extract, got {other:?}"),
+        }
+    }
+
+    // ── dedup ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dedup_bare() {
+        let input = "| dedup";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Dedup(d) => {
+                assert!(d.fields.is_empty());
+            }
+            other => panic!("expected Dedup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dedup_single_field() {
+        let input = "| dedup host";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Dedup(d) => {
+                assert_eq!(d.fields, vec!["host".to_string()]);
+            }
+            other => panic!("expected Dedup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dedup_multiple_fields() {
+        let input = "| dedup host, service";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Dedup(d) => {
+                assert_eq!(d.fields, vec!["host".to_string(), "service".to_string()]);
+            }
+            other => panic!("expected Dedup, got {other:?}"),
+        }
+    }
+
+    // ── timechart ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_timechart_with_span() {
+        let input = "| timechart span=1h count()";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Timechart(tc) => {
+                assert!(tc.span.is_some());
+                assert_eq!(tc.span.as_ref().unwrap().quantity, 1);
+                assert_eq!(tc.aggregations.len(), 1);
+                assert_eq!(tc.aggregations[0].function, "count");
+                assert!(tc.group_by.is_empty());
+            }
+            other => panic!("expected Timechart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_timechart_with_by() {
+        let input = "| timechart count() by service";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Timechart(tc) => {
+                assert!(tc.span.is_none());
+                assert_eq!(tc.aggregations.len(), 1);
+                assert_eq!(tc.group_by, vec!["service".to_string()]);
+            }
+            other => panic!("expected Timechart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_timechart_multiple_aggs() {
+        let input = "| timechart span=5m count(), avg(duration)";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Timechart(tc) => {
+                assert_eq!(tc.aggregations.len(), 2);
+                assert_eq!(tc.aggregations[0].function, "count");
+                assert_eq!(tc.aggregations[1].function, "avg");
+            }
+            other => panic!("expected Timechart, got {other:?}"),
+        }
+    }
+
+    // ── pivot ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pivot_basic() {
+        let input = "| pivot count() on service";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Pivot(p) => {
+                assert_eq!(p.aggregation.function, "count");
+                assert_eq!(p.on_field, "service");
+                assert!(p.by.is_empty());
+            }
+            other => panic!("expected Pivot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pivot_with_by() {
+        let input = "| pivot avg(duration) on service by host";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Pivot(p) => {
+                assert_eq!(p.aggregation.function, "avg");
+                assert_eq!(p.on_field, "service");
+                assert_eq!(p.by, vec!["host".to_string()]);
+            }
+            other => panic!("expected Pivot, got {other:?}"),
+        }
+    }
 }
