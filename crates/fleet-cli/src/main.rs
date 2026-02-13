@@ -40,10 +40,35 @@ enum OutputFormat {
     Csv,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum CliError {
+    #[error("{0}")]
+    Engine(#[from] fleet_engine::error::EngineError),
+    #[error("{0}")]
+    Client(#[from] fleet_client::ClientError),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Usage(String),
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
+    if let Err(e) = run(&cli).await {
+        // Broken pipe is expected (e.g. `fleet query ... | head`), exit quietly.
+        if let CliError::Io(ref io_err) = e {
+            if io_err.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(1);
+            }
+        }
+        eprintln!("fleet: {e}");
+        process::exit(1);
+    }
+}
+
+async fn run(cli: &Cli) -> Result<(), CliError> {
     let format = cli.format.unwrap_or_else(|| {
         if io::stdout().is_terminal() {
             OutputFormat::Table
@@ -53,75 +78,48 @@ async fn main() {
     });
 
     let result = if let Some(url) = &cli.url {
-        run_daemon_mode(url, &cli).await
+        run_daemon_mode(url, cli).await?
     } else if let Some(data) = &cli.data {
-        run_embedded_mode(data, &cli.query)
+        run_embedded_mode(data, &cli.query)?
     } else {
-        eprintln!("fleet: provide --url (daemon mode) or --data (embedded mode)");
-        process::exit(1);
+        return Err(CliError::Usage(
+            "provide --url (daemon mode) or --data (embedded mode)".into(),
+        ));
     };
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    let write_result = match format {
-        OutputFormat::Table => render_table(&result, &mut out),
-        OutputFormat::Json => render_json(&result, &mut out),
-        OutputFormat::Csv => render_csv(&result, &mut out),
-    };
-
-    if let Err(e) = write_result {
-        // Broken pipe is expected (e.g. `fleet query ... | head`), exit quietly.
-        if e.kind() != io::ErrorKind::BrokenPipe {
-            eprintln!("fleet: write error: {e}");
-        }
-        process::exit(1);
+    match format {
+        OutputFormat::Table => render_table(&result, &mut out)?,
+        OutputFormat::Json => render_ndjson(&result, &mut out)?,
+        OutputFormat::Csv => render_csv(&result, &mut out)?,
     }
+
+    Ok(())
 }
 
 /// Connect to the daemon and execute the query over HTTPS.
-async fn run_daemon_mode(url: &str, cli: &Cli) -> QueryResult {
-    let token = cli.token.as_deref().unwrap_or_else(|| {
-        eprintln!("fleet: --token is required when using --url");
-        process::exit(1);
-    });
+async fn run_daemon_mode(url: &str, cli: &Cli) -> Result<QueryResult, CliError> {
+    let token = cli
+        .token
+        .as_deref()
+        .ok_or_else(|| CliError::Usage("--token is required when using --url".into()))?;
 
     let client = if cli.insecure {
-        fleet_client::HttpClient::new_insecure(url, token)
+        fleet_client::HttpClient::new_insecure(url, token)?
     } else {
-        fleet_client::HttpClient::new(url, token)
-    }
-    .unwrap_or_else(|e| {
-        eprintln!("fleet: {e}");
-        process::exit(1);
-    });
-    match client.query(&cli.query).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("fleet: {e}");
-            process::exit(1);
-        }
-    }
+        fleet_client::HttpClient::new(url, token)?
+    };
+
+    Ok(client.query(&cli.query).await?)
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
-fn run_embedded_mode(data: &str, query: &str) -> QueryResult {
-    let executor = match fleet_engine::executor::Executor::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("fleet: failed to initialize engine: {e}");
-            process::exit(1);
-        }
-    };
-
+fn run_embedded_mode(data: &str, query: &str) -> Result<QueryResult, CliError> {
+    let executor = fleet_engine::executor::Executor::new()?;
     // CLI has no server-side row limit — use usize::MAX.
-    match executor.run_query(query, data, usize::MAX) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("fleet: {e}");
-            process::exit(1);
-        }
-    }
+    Ok(executor.run_query(query, data, usize::MAX)?)
 }
 
 // -- output formatters -------------------------------------------------------
@@ -151,7 +149,7 @@ fn render_table(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-fn render_json(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
+fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
