@@ -24,6 +24,8 @@ pub fn spawn_compaction(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!(
+            event_type = "lifecycle",
+            action = "compaction_start",
             wal_dir = %wal_dir.display(),
             data_dir = %data_dir.display(),
             interval_secs = interval.as_secs(),
@@ -34,11 +36,11 @@ pub fn spawn_compaction(
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
                     if let Err(e) = compact_once(&wal_dir, &data_dir, interval).await {
-                        tracing::error!(error = %e, "compaction tick failed");
+                        tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    tracing::info!("compaction task shutting down");
+                    tracing::info!(event_type = "lifecycle", action = "compaction_stop", "compaction task shutting down");
                     break;
                 }
             }
@@ -62,8 +64,9 @@ async fn compact_once(wal_dir: &Path, data_dir: &Path, min_age: Duration) -> Res
 
     for (service, wal_files) in &groups {
         tracing::debug!(
-            service = %service,
-            files = wal_files.len(),
+            event_type = "compaction_start",
+            compact_service = %service,
+            wal_files = wal_files.len(),
             "compacting service batch"
         );
 
@@ -73,6 +76,7 @@ async fn compact_once(wal_dir: &Path, data_dir: &Path, min_age: Duration) -> Res
                 for f in wal_files {
                     if let Err(e) = std::fs::remove_file(f) {
                         tracing::warn!(
+                            event_type = "compaction_error",
                             file = %f.display(),
                             error = %e,
                             "failed to delete consumed WAL file"
@@ -83,7 +87,8 @@ async fn compact_once(wal_dir: &Path, data_dir: &Path, min_age: Duration) -> Res
             Err(e) => {
                 // Leave WAL files for retry on next tick.
                 tracing::error!(
-                    service = %service,
+                    event_type = "compaction_error",
+                    compact_service = %service,
                     error = %e,
                     "compaction failed, will retry next tick"
                 );
@@ -193,7 +198,8 @@ fn compact_service_blocking(
         .map_err(|e| format!("atomic rename failed: {e}"))?;
 
     tracing::info!(
-        service = %service,
+        event_type = "compaction_complete",
+        compact_service = %service,
         output = %canonical_path.display(),
         wal_files = wal_files.len(),
         merged,

@@ -166,7 +166,10 @@ impl ExecutorPool {
     fn take_executor(&self) -> Executor {
         let mut pool = self.idle.lock();
         pool.pop().unwrap_or_else(|| {
-            tracing::warn!("executor pool unexpectedly empty, creating replacement");
+            tracing::warn!(
+                event_type = "pool_pressure",
+                "executor pool unexpectedly empty, creating replacement"
+            );
             Executor::new().expect("failed to create replacement DuckDB connection")
         })
     }
@@ -185,6 +188,7 @@ impl ExecutorPool {
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
+                event_type = "pool_pressure",
                 max_concurrent = self.semaphore.available_permits() + 1,
                 "executor pool at capacity, query queued"
             );
@@ -199,7 +203,11 @@ impl ExecutorPool {
 
         let wait_ms = wait_start.elapsed().as_millis();
         if wait_ms > 0 {
-            tracing::debug!(wait_ms, "semaphore permit acquired");
+            tracing::debug!(
+                event_type = "pool_acquired",
+                wait_ms,
+                "semaphore permit acquired"
+            );
         }
 
         let executor = self.take_executor();
@@ -285,7 +293,11 @@ impl ExecutorPool {
             callback();
         }
         if count > 0 {
-            tracing::info!(count, "interrupted active queries for shutdown");
+            tracing::info!(
+                event_type = "lifecycle",
+                count,
+                "interrupted active queries for shutdown"
+            );
         }
     }
 

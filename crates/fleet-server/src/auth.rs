@@ -30,7 +30,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
         .ok_or_else(|| ServerError::Internal("key_store not in extensions".into()))?;
 
     let Some(raw_token) = extract_bearer_token(request.headers()) else {
-        tracing::warn!(path = %path, "auth failed: missing or malformed Authorization header");
+        tracing::warn!(event_type = "auth_failure", path = %path, reason = "missing_header", "auth failed: missing or malformed Authorization header");
         return Err(ServerError::Unauthorized(
             "missing or invalid Authorization header".into(),
         ));
@@ -45,11 +45,11 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
     {
         Ok(Ok(v)) => v,
         Ok(Err(auth_err)) => {
-            tracing::warn!(path = %path, "auth failed: invalid or revoked token");
+            tracing::warn!(event_type = "auth_failure", path = %path, reason = "invalid_token", "auth failed: invalid or revoked token");
             return Err(ServerError::Auth(auth_err));
         }
         Err(join_err) => {
-            tracing::error!(path = %path, error = %join_err, "auth task panicked");
+            tracing::error!(event_type = "auth_failure", path = %path, reason = "task_panic", error = %join_err, "auth task panicked");
             return Err(ServerError::Internal(format!(
                 "auth task panicked: {join_err}"
             )));
@@ -57,7 +57,8 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
     };
 
     tracing::info!(
-        key_name = %verified.name,
+        event_type = "auth_success",
+        user = %verified.name,
         role = %verified.role,
         path = %path,
         "authenticated"

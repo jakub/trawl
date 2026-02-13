@@ -123,6 +123,7 @@ fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
 
     if cert_path.exists() && key_path.exists() {
         tracing::info!(
+            event_type = "lifecycle",
             cert = %cert_path.display(),
             key = %key_path.display(),
             "loading existing self-signed TLS certificate"
@@ -131,7 +132,10 @@ fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
         return Ok((c, k, false));
     }
 
-    tracing::info!("no TLS certificate found, generating self-signed certificate");
+    tracing::info!(
+        event_type = "lifecycle",
+        "no TLS certificate found, generating self-signed certificate"
+    );
 
     let subject_alt_names = vec![
         "localhost".to_owned(),
@@ -159,6 +163,7 @@ fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
     }
 
     tracing::info!(
+        event_type = "lifecycle",
         cert = %cert_path.display(),
         key = %key_path.display(),
         "self-signed TLS certificate generated"
@@ -207,7 +212,10 @@ pub async fn cert_reload_task(
             continue;
         }
 
-        tracing::info!("TLS certificate files changed, reloading");
+        tracing::info!(
+            event_type = "tls_reload",
+            "TLS certificate files changed, reloading"
+        );
 
         match build_server_config(Some(&cert_path), Some(&key_path)) {
             Ok((config, _)) => {
@@ -218,10 +226,13 @@ pub async fn cert_reload_task(
                 }
                 last_cert = Some(current_cert);
                 last_key = Some(current_key);
-                tracing::info!("TLS certificate reloaded successfully");
+                tracing::info!(
+                    event_type = "tls_reload",
+                    "TLS certificate reloaded successfully"
+                );
             }
             Err(e) => {
-                tracing::error!(error = %e, "failed to reload TLS certificate, keeping current");
+                tracing::error!(event_type = "tls_reload_error", error = %e, "failed to reload TLS certificate, keeping current");
             }
         }
     }

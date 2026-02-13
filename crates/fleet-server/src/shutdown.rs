@@ -24,10 +24,10 @@ pub async fn shutdown_signal() {
 
     tokio::select! {
         () = ctrl_c => {
-            tracing::info!("received SIGINT, shutting down");
+            tracing::info!(event_type = "shutdown_signal", "received SIGINT, shutting down");
         }
         () = terminate => {
-            tracing::info!("received SIGTERM, shutting down");
+            tracing::info!(event_type = "shutdown_signal", "received SIGTERM, shutting down");
         }
     }
 }

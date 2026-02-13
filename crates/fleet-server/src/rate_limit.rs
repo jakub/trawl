@@ -81,6 +81,7 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
     if let Some(limiter) = rate_state.limiter_for_role(verified.role) {
         if limiter.check_key(&verified.prefix).is_err() {
             tracing::warn!(
+                event_type = "rate_limit_exceeded",
                 user = %verified.name,
                 role = %verified.role,
                 prefix = %verified.prefix,

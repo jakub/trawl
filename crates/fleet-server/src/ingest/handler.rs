@@ -91,8 +91,9 @@ pub async fn ingest(
     .map_err(|e| ServerError::Internal(format!("WAL write failed: {e}")))?;
 
     tracing::info!(
+        event_type = "ingest_complete",
         user = %verified.name,
-        service = %service,
+        ingest_service = %service,
         events = line_count,
         path = %wal_path.display(),
         "ingested events to WAL"

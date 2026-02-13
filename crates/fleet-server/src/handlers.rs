@@ -71,6 +71,7 @@ pub async fn query(
     }
 
     tracing::info!(
+        event_type = "query_start",
         user = %verified.name,
         role = %verified.role,
         query = %req.query,
@@ -87,6 +88,7 @@ pub async fn query(
             let rows = qr.row_count();
             state.query.tracker.complete(query_id, rows);
             tracing::info!(
+                event_type = "query_complete",
                 user = %verified.name,
                 rows,
                 query_id,
@@ -97,6 +99,7 @@ pub async fn query(
         Err(ServerError::Timeout) => {
             state.query.tracker.timeout(query_id);
             tracing::warn!(
+                event_type = "query_timeout",
                 user = %verified.name,
                 query = %req.query,
                 query_id,
@@ -116,6 +119,8 @@ pub async fn query(
                     | fleet_engine::error::EngineError::Emit(_),
                 ) => {
                     tracing::warn!(
+                        event_type = "query_failed",
+                        error_type = "parse",
                         user = %verified.name,
                         query = %req.query,
                         query_id,
@@ -127,6 +132,8 @@ pub async fn query(
                     // Log the raw error for operator debugging; the safe
                     // (redacted) version is what reaches the client and tracker.
                     tracing::error!(
+                        event_type = "query_failed",
+                        error_type = "engine",
                         user = %verified.name,
                         query = %req.query,
                         query_id,
@@ -165,7 +172,7 @@ pub async fn schema(
 
     if let Some(cached) = &*cache {
         if cached.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs {
-            tracing::debug!(user = %verified.name, "serving schema from cache");
+            tracing::debug!(event_type = "schema_cache_hit", user = %verified.name, "serving schema from cache");
             return Ok(Json(SchemaResponse {
                 columns: cached
                     .result
@@ -186,6 +193,7 @@ pub async fn schema(
     let elapsed = start.elapsed().as_millis();
 
     tracing::info!(
+        event_type = "schema_complete",
         user = %verified.name,
         columns = result.columns.len(),
         file_count = result.file_count,

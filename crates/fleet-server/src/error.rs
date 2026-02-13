@@ -75,7 +75,7 @@ impl IntoResponse for ServerError {
                 "rate limit exceeded".to_owned(),
             ),
             Self::Internal(_) => {
-                tracing::error!(error = %self, "internal server error");
+                tracing::error!(event_type = "internal_error", error = %self, "internal server error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_owned(),

@@ -27,13 +27,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let wal_handle = init_tracing(&config)?;
 
-    tracing::info!(config = %config_path.display(), "configuration loaded");
+    tracing::info!(event_type = "lifecycle", config = %config_path.display(), "configuration loaded");
 
     for warn in config.warnings() {
         tracing::warn!("{warn}");
     }
 
     tracing::info!(
+        event_type = "lifecycle",
         https_addr = %config.server.http_addr,
         data_path = %config.data.path,
         max_queries = config.server.max_concurrent_queries,
@@ -65,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let interval = std::time::Duration::from_secs(config.ingest.compaction_interval_secs);
 
         tracing::info!(
+            event_type = "lifecycle",
             wal_dir = %wal_dir.display(),
             data_dir = %data_dir.display(),
             interval_secs = config.ingest.compaction_interval_secs,
@@ -79,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         Some((handle, shutdown_tx))
     } else {
-        tracing::info!("ingest pipeline disabled");
+        tracing::info!(event_type = "lifecycle", "ingest pipeline disabled");
         None
     };
 

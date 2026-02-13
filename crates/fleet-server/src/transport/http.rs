@@ -121,6 +121,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             .on_response(
                 |response: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
                     tracing::info!(
+                        event_type = "http_response",
                         status = response.status().as_u16(),
                         latency_ms = latency.as_millis(),
                         "response"
@@ -132,6 +133,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
                  latency: Duration,
                  _span: &tracing::Span| {
                     tracing::error!(
+                        event_type = "http_failure",
                         error = %error,
                         latency_ms = latency.as_millis(),
                         "request failed"
@@ -144,6 +146,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     .with_state(state)
 }
 
+#[allow(clippy::too_many_lines)] // accept loop + shutdown drain are cohesive
 /// Start the HTTPS server with graceful shutdown.
 ///
 /// Binds a TCP listener, wraps connections in TLS via `tokio-rustls`,
@@ -167,6 +170,7 @@ pub async fn serve(
 
     if self_signed {
         tracing::warn!(
+            event_type = "lifecycle",
             "using auto-generated self-signed certificate — clients must use --insecure or trust the cert"
         );
     }
@@ -179,7 +183,7 @@ pub async fn serve(
         .await
         .map_err(|e| crate::error::ServerError::Internal(format!("failed to bind {addr}: {e}")))?;
 
-    tracing::info!(addr = %addr, "HTTPS server listening");
+    tracing::info!(event_type = "lifecycle", addr = %addr, "HTTPS server listening");
 
     // Watch channel for cert hot-reload. The accept loop reads the latest
     // acceptor from the receiver before each TLS handshake.
@@ -252,7 +256,7 @@ pub async fn serve(
                 });
             }
             () = n_accept.notified() => {
-                tracing::info!("shutdown: stopping accept loop");
+                tracing::info!(event_type = "lifecycle", "shutdown: stopping accept loop");
                 break;
             }
         }
@@ -263,6 +267,7 @@ pub async fn serve(
 
     // Drain in-flight connections with a deadline.
     tracing::info!(
+        event_type = "lifecycle",
         drain_secs,
         connections = connections.len(),
         "shutdown: draining in-flight connections"
@@ -275,12 +280,13 @@ pub async fn serve(
         .is_err()
     {
         tracing::warn!(
+            event_type = "lifecycle",
             remaining = connections.len(),
             "shutdown drain timeout exceeded, aborting remaining connections"
         );
         connections.abort_all();
     }
 
-    tracing::info!("HTTPS server stopped");
+    tracing::info!(event_type = "lifecycle", "HTTPS server stopped");
     Ok(())
 }
