@@ -25,7 +25,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::auth_middleware;
-use crate::config::ServerConfig;
+use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};
 use crate::handlers;
 use crate::ingest;
 use crate::rate_limit::{RateLimitState, rate_limit_middleware};
@@ -55,7 +55,9 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
 
     // Ingest route: body limit → auth → rate limit.
     let ingest_routes = if ingest_enabled {
-        let ingest_body_limit = http.ingest_max_body_bytes.unwrap_or(16 * 1024 * 1024);
+        let ingest_body_limit = http
+            .ingest_max_body_bytes
+            .unwrap_or(DEFAULT_INGEST_MAX_BODY_BYTES);
         Router::new()
             .route("/ingest", post(ingest::handler::ingest))
             .layer(middleware::from_fn(rate_limit_middleware))

@@ -169,16 +169,50 @@ impl Default for IngestConfig {
     }
 }
 
+// -- default constants -------------------------------------------------------
+// Centralized so they can be referenced from other modules (e.g. http.rs
+// fallback) and grepped easily. The `default_*` functions exist only because
+// serde's `#[serde(default = "...")]` requires a function path.
+
+/// Default HTTPS listen address.
+pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
+/// Default query execution timeout (seconds).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Default maximum rows a query can return.
+pub const DEFAULT_MAX_RESULT_ROWS: usize = 100_000;
+/// Default maximum request body size (128 KB).
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
+/// Default maximum concurrent HTTP requests.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
+/// Default graceful shutdown drain timeout (seconds).
+pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
+/// Default TLS certificate reload interval (seconds). 0 = disabled.
+pub const DEFAULT_TLS_RELOAD_INTERVAL_SECS: u64 = 300;
+/// Default ingest request body size limit (16 MB).
+pub const DEFAULT_INGEST_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Default compaction interval (seconds).
+pub const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 10;
+/// Default admin rate limit (requests/minute).
+pub const DEFAULT_RATE_ADMIN: u32 = 100;
+/// Default analyst rate limit (requests/minute).
+pub const DEFAULT_RATE_ANALYST: u32 = 60;
+/// Default reader rate limit (requests/minute).
+pub const DEFAULT_RATE_READER: u32 = 30;
+/// Default ingest rate limit (requests/minute).
+pub const DEFAULT_RATE_INGEST: u32 = 1000;
+/// Fallback CPU count when `available_parallelism()` fails.
+const FALLBACK_CPU_COUNT: usize = 4;
+
 fn default_ingest_enabled() -> bool {
     true
 }
 
 fn default_ingest_max_body_bytes() -> usize {
-    16 * 1024 * 1024 // 16 MB
+    DEFAULT_INGEST_MAX_BODY_BYTES
 }
 
 fn default_compaction_interval_secs() -> u64 {
-    10
+    DEFAULT_COMPACTION_INTERVAL_SECS
 }
 
 /// Authentication database settings.
@@ -189,11 +223,11 @@ pub struct AuthConfig {
 }
 
 fn default_http_addr() -> String {
-    "127.0.0.1:8080".to_owned()
+    DEFAULT_HTTP_ADDR.to_owned()
 }
 
 fn default_timeout_secs() -> u64 {
-    30
+    DEFAULT_TIMEOUT_SECS
 }
 
 fn default_max_concurrent_queries() -> usize {
@@ -201,48 +235,48 @@ fn default_max_concurrent_queries() -> usize {
 }
 
 fn default_max_result_rows() -> usize {
-    100_000
+    DEFAULT_MAX_RESULT_ROWS
 }
 
 fn default_max_request_body_bytes() -> usize {
-    128 * 1024 // 128 KB
+    DEFAULT_MAX_REQUEST_BODY_BYTES
 }
 
 fn default_max_concurrent_requests() -> usize {
-    256
+    DEFAULT_MAX_CONCURRENT_REQUESTS
 }
 
 fn default_shutdown_drain_secs() -> u64 {
-    30
+    DEFAULT_SHUTDOWN_DRAIN_SECS
 }
 
 fn default_tls_reload_interval_secs() -> u64 {
-    300 // 5 minutes
+    DEFAULT_TLS_RELOAD_INTERVAL_SECS
 }
 
 fn default_rate_admin() -> u32 {
-    100
+    DEFAULT_RATE_ADMIN
 }
 
 fn default_rate_analyst() -> u32 {
-    60
+    DEFAULT_RATE_ANALYST
 }
 
 fn default_rate_reader() -> u32 {
-    30
+    DEFAULT_RATE_READER
 }
 
 fn default_rate_ingest() -> u32 {
-    1000
+    DEFAULT_RATE_INGEST
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            admin: default_rate_admin(),
-            analyst: default_rate_analyst(),
-            reader: default_rate_reader(),
-            ingest: default_rate_ingest(),
+            admin: DEFAULT_RATE_ADMIN,
+            analyst: DEFAULT_RATE_ANALYST,
+            reader: DEFAULT_RATE_READER,
+            ingest: DEFAULT_RATE_INGEST,
         }
     }
 }
@@ -251,7 +285,7 @@ impl Default for RateLimitConfig {
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZero::get)
-        .unwrap_or(4)
+        .unwrap_or(FALLBACK_CPU_COUNT)
 }
 
 /// Expand a leading `~/` to `$HOME/`.

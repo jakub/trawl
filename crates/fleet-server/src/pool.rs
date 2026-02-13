@@ -26,6 +26,11 @@ use tokio::sync::Semaphore;
 
 use crate::error::ServerError;
 
+/// Time filter padding (seconds) to account for WAL compaction delay.
+/// Events ingested at time T may land in the hourly partition for T + ~20s,
+/// so we widen the file selection window by one hour.
+const TIME_FILTER_PADDING_SECS: u64 = 3600;
+
 /// Type-erased interrupt callback, keyed by monotonic query ID.
 type InterruptMap = HashMap<u64, Box<dyn Fn() + Send + Sync>>;
 
@@ -93,9 +98,9 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
         return fallback_glob.to_owned();
     };
 
-    // Pad by 1 hour to account for WAL delay: events ingested at T may
-    // land in the compaction directory for T + ~20s.
-    let total_secs = duration.to_seconds().saturating_add(3600);
+    let total_secs = duration
+        .to_seconds()
+        .saturating_add(TIME_FILTER_PADDING_SECS);
 
     let now = chrono::Utc::now();
     let start = now - chrono::Duration::seconds(i64::try_from(total_secs).unwrap_or(i64::MAX));
