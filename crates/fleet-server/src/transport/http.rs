@@ -110,12 +110,18 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
                     .get::<SocketAddr>()
                     .copied()
                     .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+                let user_agent = request
+                    .headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
                 tracing::info_span!(
                     "http_request",
                     request_id,
                     peer_addr = %peer_addr,
                     method = %request.method(),
                     path = %request.uri().path(),
+                    user_agent = %user_agent,
                 )
             })
             .on_response(
