@@ -329,11 +329,13 @@ fn invalid_dsl_returns_parse_error() {
 }
 
 #[test]
-fn missing_source_returns_error() {
+fn missing_source_returns_empty_result() {
     let exec = Executor::new().expect("executor should initialize");
-    let result = exec.run_query_max("*", "/nonexistent/path/**/*.parquet");
-    // DuckDB returns an IO error for missing files — should propagate.
-    assert!(result.is_err());
+    let result = exec
+        .run_query_max("*", "/nonexistent/path/**/*.parquet")
+        .expect("no-files-found should return empty result, not error");
+    // A glob matching zero files is semantically "no data", not an error.
+    assert!(result.is_empty());
 }
 
 // -- schema introspection tests ----------------------------------------------

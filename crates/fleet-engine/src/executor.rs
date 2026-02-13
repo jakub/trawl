@@ -62,14 +62,24 @@ impl Executor {
         query: &EmittedQuery,
         max_rows: usize,
     ) -> Result<QueryResult, EngineError> {
-        let mut stmt = self.conn.prepare(&query.sql)?;
+        let mut stmt = match self.conn.prepare(&query.sql) {
+            Ok(s) => s,
+            Err(e) if is_no_files_error(&e) => return Ok(QueryResult::empty()),
+            Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
+            Err(e) => return Err(e.into()),
+        };
 
         let params = bind_params(&query.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
 
         // start query execution — column metadata is only available
         // after DuckDB resolves table-valued functions like read_parquet()
-        let mut result_rows = stmt.query(param_refs.as_slice())?;
+        let mut result_rows = match stmt.query(param_refs.as_slice()) {
+            Ok(r) => r,
+            Err(e) if is_no_files_error(&e) => return Ok(QueryResult::empty()),
+            Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
+            Err(e) => return Err(e.into()),
+        };
 
         let stmt_ref =
             result_rows
@@ -129,6 +139,39 @@ impl Executor {
             file_count: u64::try_from(file_count).unwrap_or(0),
         })
     }
+}
+
+/// Check if a `DuckDB` error is the "No files found" error from `read_parquet()`
+/// when a glob matches zero files. Semantically this means "no data" — not a
+/// server error.
+fn is_no_files_error(e: &duckdb::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("No files found that match the pattern")
+}
+
+/// Check if a `DuckDB` error is a binder error about a missing column. This is
+/// a user error (querying a nonexistent field), not a server error.
+fn is_binder_column_error(e: &duckdb::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("Binder Error") && (msg.contains("column") || msg.contains("not found"))
+}
+
+/// Remap a `DuckDB` binder error about missing columns to `EngineError::Emit`
+/// so it surfaces as HTTP 400 instead of 500.
+fn remap_binder_error(e: &duckdb::Error) -> EngineError {
+    let msg = e.to_string();
+    // try to extract the field name from the error message
+    let user_msg = if let Some(start) = msg.find('"') {
+        if let Some(end) = msg[start + 1..].find('"') {
+            let field = &msg[start + 1..start + 1 + end];
+            format!("unknown field: {field}")
+        } else {
+            format!("unknown field in query: {msg}")
+        }
+    } else {
+        format!("unknown field in query: {msg}")
+    };
+    EngineError::Emit(fleet_core::emitter::EmitError::UnsupportedOperation { message: user_msg })
 }
 
 /// Convert fleet-core `SqlValue` params into duckdb `ToSql` trait objects.

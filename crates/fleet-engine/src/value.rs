@@ -161,6 +161,18 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
+    /// An empty result set with no columns or rows.
+    ///
+    /// Used when source narrowing yields zero matching files — semantically
+    /// equivalent to "no matching data".
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+
     /// Number of result rows.
     pub fn row_count(&self) -> usize {
         self.rows.len()
