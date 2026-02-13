@@ -85,11 +85,12 @@ fn generate_test_cert(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     (cert_path, key_path)
 }
 
-/// Test server handle with analyst and admin tokens.
+/// Test server handle with analyst, admin, and ingest tokens.
 struct TestServer {
     url: String,
     analyst_token: String,
     admin_token: String,
+    ingest_token: String,
 }
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
@@ -98,10 +99,11 @@ async fn setup() -> TestServer {
     let data_glob = ensure_fixtures(tmp.path());
     let auth_db = tmp.path().join("auth.db");
 
-    // Create API keys for both roles.
+    // Create API keys for all test roles.
     let store = KeyStore::open(&auth_db).unwrap();
     let analyst = store.create_key("test-key", Role::Analyst, None).unwrap();
     let admin = store.create_key("admin-key", Role::Admin, None).unwrap();
+    let ingest = store.create_key("ingest-key", Role::Ingest, None).unwrap();
     drop(store);
 
     // Generate ephemeral self-signed cert.
@@ -130,7 +132,14 @@ async fn setup() -> TestServer {
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig { db_path: auth_db },
-        ingest: IngestConfig::default(),
+        ingest: {
+            let wal_dir = tmp.path().join("wal");
+            std::fs::create_dir_all(&wal_dir).unwrap();
+            IngestConfig {
+                wal_dir: Some(wal_dir),
+                ..IngestConfig::default()
+            }
+        },
     };
 
     let (state, http_config) = AppState::from_config(&config).expect("failed to create app state");
@@ -153,6 +162,7 @@ async fn setup() -> TestServer {
         url: format!("https://{addr}"),
         analyst_token: analyst.plaintext_token.to_string(),
         admin_token: admin.plaintext_token.to_string(),
+        ingest_token: ingest.plaintext_token.to_string(),
     }
 }
 
@@ -304,4 +314,71 @@ async fn queries_rejects_non_admin() {
         }
         other => panic!("expected 401 for non-admin, got: {other:?}"),
     }
+}
+
+// -- ingest endpoint tests ---------------------------------------------------
+
+/// Build a raw reqwest client that accepts self-signed certs.
+fn raw_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn ingest_accepts_ndjson() {
+    let server = setup().await;
+    let client = raw_client();
+
+    let ndjson = r#"{"service":"test-svc","host":"web01","message":"hello"}
+{"service":"test-svc","host":"web02","message":"world"}
+"#;
+
+    let resp = client
+        .post(format!("{}/api/v1/ingest", server.url))
+        .header("authorization", format!("Bearer {}", server.ingest_token))
+        .header("content-type", "application/x-ndjson")
+        .body(ndjson)
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "ingest failed: {body}");
+    assert_eq!(body["accepted"], 2);
+}
+
+#[tokio::test]
+async fn ingest_rejects_missing_auth() {
+    let server = setup().await;
+    let client = raw_client();
+
+    let resp = client
+        .post(format!("{}/api/v1/ingest", server.url))
+        .header("content-type", "application/x-ndjson")
+        .body(r#"{"service":"x","message":"y"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn ingest_rejects_analyst_role() {
+    let server = setup().await;
+    let client = raw_client();
+
+    let resp = client
+        .post(format!("{}/api/v1/ingest", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .header("content-type", "application/x-ndjson")
+        .body(r#"{"service":"x","message":"y"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
 }

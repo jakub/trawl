@@ -45,6 +45,7 @@ hostname = "0.4.2"
 
 [dev-dependencies]
 fleet-client = { workspace = true }
+reqwest = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
