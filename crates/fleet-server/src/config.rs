@@ -64,6 +64,30 @@ pub struct ServerConfig {
     /// same-origin policy blocks all cross-origin requests.
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+
+    /// Per-role rate limiting (requests per minute). 0 = disabled.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+}
+
+/// Per-role rate limits in requests per minute.
+///
+/// Each role gets an independent rate limiter keyed by API key prefix.
+/// Set a value to 0 to disable rate limiting for that role.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    /// Admin rate limit (requests/minute). Default: 100.
+    #[serde(default = "default_rate_admin")]
+    pub admin: u32,
+    /// Analyst rate limit (requests/minute). Default: 60.
+    #[serde(default = "default_rate_analyst")]
+    pub analyst: u32,
+    /// Reader rate limit (requests/minute). Default: 30.
+    #[serde(default = "default_rate_reader")]
+    pub reader: u32,
+    /// Ingest rate limit (requests/minute). Default: 1000.
+    #[serde(default = "default_rate_ingest")]
+    pub ingest: u32,
 }
 
 /// Parquet data source settings.
@@ -194,6 +218,33 @@ fn default_shutdown_drain_secs() -> u64 {
 
 fn default_tls_reload_interval_secs() -> u64 {
     300 // 5 minutes
+}
+
+fn default_rate_admin() -> u32 {
+    100
+}
+
+fn default_rate_analyst() -> u32 {
+    60
+}
+
+fn default_rate_reader() -> u32 {
+    30
+}
+
+fn default_rate_ingest() -> u32 {
+    1000
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            admin: default_rate_admin(),
+            analyst: default_rate_analyst(),
+            reader: default_rate_reader(),
+            ingest: default_rate_ingest(),
+        }
+    }
 }
 
 /// Portable CPU count without pulling in the `num_cpus` crate.
@@ -572,5 +623,42 @@ db_path = "/tmp/auth.db"
             config.server.cors_allowed_origins[0],
             "https://fleet.example.com"
         );
+    }
+
+    #[test]
+    fn rate_limit_defaults() {
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.rate_limit.admin, 100);
+        assert_eq!(config.server.rate_limit.analyst, 60);
+        assert_eq!(config.server.rate_limit.reader, 30);
+        assert_eq!(config.server.rate_limit.ingest, 1000);
+    }
+
+    #[test]
+    fn rate_limit_custom_values() {
+        let toml = r#"
+[server]
+[server.rate_limit]
+admin = 200
+analyst = 0
+reader = 10
+ingest = 500
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.rate_limit.admin, 200);
+        assert_eq!(config.server.rate_limit.analyst, 0);
+        assert_eq!(config.server.rate_limit.reader, 10);
+        assert_eq!(config.server.rate_limit.ingest, 500);
     }
 }

@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use fleet_auth::roles::Role;
 use fleet_auth::store::KeyStore;
 use fleet_client::HttpClient;
-use fleet_server::config::{AuthConfig, Config, DataConfig, IngestConfig, ServerConfig};
+use fleet_server::config::{
+    AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, ServerConfig,
+};
 use fleet_server::state::AppState;
 use fleet_server::transport::http;
 
@@ -111,6 +113,7 @@ async fn setup() -> TestServer {
             tls_key_path: Some(key_path),
             tls_reload_interval_secs: 0,
             cors_allowed_origins: vec![],
+            rate_limit: RateLimitConfig::default(),
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig { db_path: auth_db },

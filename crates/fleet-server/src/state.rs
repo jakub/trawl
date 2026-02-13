@@ -9,7 +9,7 @@ use std::time::Instant;
 use fleet_auth::KeyStore;
 use fleet_engine::value::SchemaResult;
 
-use crate::config::Config;
+use crate::config::{Config, RateLimitConfig};
 use crate::ingest::wal::WalWriter;
 use crate::pool::ExecutorPool;
 use crate::tracker::QueryTracker;
@@ -75,6 +75,8 @@ pub struct HttpConfig {
     pub cors_allowed_origins: Vec<String>,
     /// Max body size for ingest requests (None if ingest disabled).
     pub ingest_max_body_bytes: Option<usize>,
+    /// Per-role rate limiting config.
+    pub rate_limit: RateLimitConfig,
 }
 
 /// A cached schema result with an expiry timestamp.
@@ -133,6 +135,7 @@ impl AppState {
             } else {
                 None
             },
+            rate_limit: config.server.rate_limit.clone(),
         };
 
         Ok((state, http))
