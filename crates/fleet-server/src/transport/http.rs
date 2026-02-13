@@ -228,11 +228,12 @@ pub async fn serve(
                 let tls_acceptor = tls_rx.borrow().clone();
                 let tower_service = app.clone();
 
+                let n_conn = Arc::clone(&notify);
                 connections.spawn(async move {
                     let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                            tracing::debug!(event_type = "tls_handshake_failed", peer = %peer_addr, error = %e, "TLS handshake failed");
                             return;
                         }
                     };
@@ -246,12 +247,26 @@ pub async fn serve(
                             async move { svc.call(req).await }
                         });
 
-                    if let Err(e) =
-                        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                            .serve_connection_with_upgrades(io, hyper_service)
-                            .await
-                    {
-                        tracing::debug!(peer = %peer_addr, error = %e, "connection error");
+                    let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                    let conn_fut = builder.serve_connection_with_upgrades(io, hyper_service);
+                    let mut conn = std::pin::pin!(conn_fut);
+
+                    // Poll the connection, but initiate graceful shutdown
+                    // when the server-wide signal fires. This closes idle
+                    // keep-alive connections instead of waiting for the
+                    // drain timeout.
+                    tokio::select! {
+                        result = conn.as_mut() => {
+                            if let Err(e) = result {
+                                tracing::debug!(peer = %peer_addr, error = %e, "connection error");
+                            }
+                        }
+                        () = n_conn.notified() => {
+                            conn.as_mut().graceful_shutdown();
+                            if let Err(e) = conn.await {
+                                tracing::debug!(peer = %peer_addr, error = %e, "connection error during shutdown");
+                            }
+                        }
                     }
                 });
             }
