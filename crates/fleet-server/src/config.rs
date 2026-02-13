@@ -172,6 +172,13 @@ pub struct IngestConfig {
     /// and audit trails. Default: true (when ingest is enabled).
     #[serde(default = "default_internal_telemetry")]
     pub internal_telemetry: bool,
+
+    /// Consolidate per-service hourly parquet files into daily files for
+    /// older dates. Runs on the compaction tick; skips today's directory.
+    /// Dramatically reduces file count for long lookback queries.
+    /// Default: true.
+    #[serde(default = "default_daily_rollup")]
+    pub daily_rollup: bool,
 }
 
 impl Default for IngestConfig {
@@ -182,6 +189,7 @@ impl Default for IngestConfig {
             wal_dir: None,
             compaction_interval_secs: default_compaction_interval_secs(),
             internal_telemetry: default_internal_telemetry(),
+            daily_rollup: default_daily_rollup(),
         }
     }
 }
@@ -215,6 +223,8 @@ pub const DEFAULT_INGEST_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 10;
 /// Default internal telemetry (enabled).
 pub const DEFAULT_INTERNAL_TELEMETRY: bool = true;
+/// Default daily rollup (enabled).
+pub const DEFAULT_DAILY_ROLLUP: bool = true;
 /// Default admin rate limit (requests/minute).
 pub const DEFAULT_RATE_ADMIN: u32 = 100;
 /// Default analyst rate limit (requests/minute).
@@ -240,6 +250,10 @@ fn default_compaction_interval_secs() -> u64 {
 
 fn default_internal_telemetry() -> bool {
     DEFAULT_INTERNAL_TELEMETRY
+}
+
+fn default_daily_rollup() -> bool {
+    DEFAULT_DAILY_ROLLUP
 }
 
 /// Authentication database settings.
@@ -693,6 +707,7 @@ db_path = "/tmp/auth.db"
         assert!(config.ingest.wal_dir.is_none());
         assert_eq!(config.ingest.compaction_interval_secs, 10);
         assert!(config.ingest.internal_telemetry);
+        assert!(config.ingest.daily_rollup);
         assert_eq!(config.wal_dir(), std::path::Path::new("/data/wal"));
     }
 
@@ -816,5 +831,20 @@ db_path = "/tmp/auth.db"
         let config: Config = toml::from_str(toml).unwrap();
         let warns = config.warnings();
         assert!(warns.iter().any(|w| w.contains("log_file is deprecated")));
+    }
+
+    #[test]
+    fn daily_rollup_disabled_explicitly() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[ingest]
+daily_rollup = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ingest.daily_rollup);
     }
 }
