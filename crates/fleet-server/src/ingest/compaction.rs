@@ -62,43 +62,41 @@ async fn compact_once(
 
     let files = scan_wal_files(wal_dir, min_age).map_err(|e| format!("scan failed: {e}"))?;
 
-    if files.is_empty() {
-        return Ok(());
-    }
+    if !files.is_empty() {
+        // Group WAL files by service prefix.
+        let groups = group_by_service(files);
 
-    // Group WAL files by service prefix.
-    let groups = group_by_service(files);
+        for (service, wal_files) in &groups {
+            tracing::debug!(
+                event_type = "compaction_start",
+                compact_service = %service,
+                wal_files = wal_files.len(),
+                "compacting service batch"
+            );
 
-    for (service, wal_files) in &groups {
-        tracing::debug!(
-            event_type = "compaction_start",
-            compact_service = %service,
-            wal_files = wal_files.len(),
-            "compacting service batch"
-        );
-
-        match compact_service_batch(wal_files, data_dir, service).await {
-            Ok(()) => {
-                // Clean up consumed WAL files.
-                for f in wal_files {
-                    if let Err(e) = std::fs::remove_file(f) {
-                        tracing::warn!(
-                            event_type = "compaction_error",
-                            file = %f.display(),
-                            error = %e,
-                            "failed to delete consumed WAL file"
-                        );
+            match compact_service_batch(wal_files, data_dir, service).await {
+                Ok(()) => {
+                    // Clean up consumed WAL files.
+                    for f in wal_files {
+                        if let Err(e) = std::fs::remove_file(f) {
+                            tracing::warn!(
+                                event_type = "compaction_error",
+                                file = %f.display(),
+                                error = %e,
+                                "failed to delete consumed WAL file"
+                            );
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                // Leave WAL files for retry on next tick.
-                tracing::error!(
-                    event_type = "compaction_error",
-                    compact_service = %service,
-                    error = %e,
-                    "compaction failed, will retry next tick"
-                );
+                Err(e) => {
+                    // Leave WAL files for retry on next tick.
+                    tracing::error!(
+                        event_type = "compaction_error",
+                        compact_service = %service,
+                        error = %e,
+                        "compaction failed, will retry next tick"
+                    );
+                }
             }
         }
     }
@@ -145,6 +143,18 @@ async fn rollup_once(data_dir: &Path) -> Result<(), String> {
         // Skip directories that aren't date-formatted (e.g. "wal").
         if !looks_like_date(&dir_name) {
             continue;
+        }
+
+        // Recover any interrupted rollups from previous runs before
+        // starting new ones. This ensures crash-orphaned hourly files
+        // are cleaned up without re-merging already-consolidated data.
+        if let Err(e) = recover_rollup_markers(&path) {
+            tracing::error!(
+                event_type = "rollup_error",
+                date = %dir_name,
+                error = %e,
+                "rollup recovery failed"
+            );
         }
 
         // Collect hourly subdirs. If none exist, this day is already consolidated.
@@ -247,11 +257,118 @@ fn is_dir_empty(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Path for the rollup marker file that tracks in-progress merges.
+///
+/// The marker lists hourly file paths being merged, enabling crash
+/// recovery without re-reading already-consolidated data.
+fn rollup_marker_path(day_dir: &Path, service: &str) -> PathBuf {
+    day_dir.join(format!(".rollup-{service}"))
+}
+
+/// Write a rollup marker listing the hourly files being merged.
+fn write_rollup_marker(
+    day_dir: &Path,
+    service: &str,
+    hourly_files: &[PathBuf],
+) -> Result<(), String> {
+    let marker = rollup_marker_path(day_dir, service);
+    let content = hourly_files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&marker, content).map_err(|e| format!("failed to write rollup marker: {e}"))
+}
+
+/// Delete the rollup marker after successful cleanup.
+fn delete_rollup_marker(day_dir: &Path, service: &str) {
+    let marker = rollup_marker_path(day_dir, service);
+    let _ = std::fs::remove_file(marker);
+}
+
+/// Recover from interrupted rollup operations in a date directory.
+///
+/// Checks for `.rollup-{service}` marker files and completes the
+/// interrupted operation:
+/// - If canonical `.parquet` exists: crash after rename — delete
+///   hourly source files listed in marker.
+/// - If `.parquet.tmp` exists: crash after write but before rename —
+///   rename `.tmp` to canonical, then delete hourlies.
+/// - If neither exists: stale marker, just remove it.
+fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(day_dir) else {
+        return Ok(());
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        let Some(service) = name.strip_prefix(".rollup-") else {
+            continue;
+        };
+
+        let canonical = day_dir.join(format!("{service}.parquet"));
+        let tmp = day_dir.join(format!("{service}.parquet.tmp"));
+
+        // Read hourly file paths from marker.
+        let marker_content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read rollup marker: {e}"))?;
+        let hourly_files: Vec<PathBuf> = marker_content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect();
+
+        if canonical.exists() {
+            // Crash after rename — just clean up hourlies.
+            tracing::info!(
+                event_type = "rollup_recovery",
+                compact_service = %service,
+                "recovering rollup: canonical exists, deleting hourly files"
+            );
+            for f in &hourly_files {
+                let _ = std::fs::remove_file(f);
+            }
+        } else if tmp.exists() {
+            // Crash after write but before rename — complete the rename.
+            tracing::info!(
+                event_type = "rollup_recovery",
+                compact_service = %service,
+                "recovering rollup: renaming tmp to canonical"
+            );
+            std::fs::rename(&tmp, &canonical)
+                .map_err(|e| format!("rollup recovery rename failed: {e}"))?;
+            for f in &hourly_files {
+                let _ = std::fs::remove_file(f);
+            }
+        } else {
+            // Neither exists — stale marker.
+            tracing::warn!(
+                event_type = "rollup_recovery",
+                compact_service = %service,
+                "removing stale rollup marker (no tmp or canonical file)"
+            );
+        }
+
+        // Remove the marker.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    Ok(())
+}
+
 /// Blocking: merge hourly parquet files for one service into a daily file.
 ///
 /// Opens an in-memory `DuckDB` connection, reads all hourly files via
 /// `read_parquet([list], union_by_name=true)`, sorts by timestamp for
 /// optimal row group statistics, writes to `.tmp`, then atomic-renames.
+///
+/// Uses a `.rollup-{service}` marker file for crash safety: the marker
+/// lists which hourly files are being merged, enabling recovery without
+/// re-reading already-consolidated data.
 fn rollup_day_blocking(
     day_dir: &Path,
     service: &str,
@@ -286,6 +403,9 @@ fn rollup_day_blocking(
     ))
     .map_err(|e| format!("rollup COPY failed: {e}"))?;
 
+    // Write marker BEFORE rename so recovery knows which hourlies to clean up.
+    write_rollup_marker(day_dir, service, hourly_files)?;
+
     // Atomic rename.
     std::fs::rename(&tmp_path, &canonical_path)
         .map_err(|e| format!("rollup rename failed: {e}"))?;
@@ -301,6 +421,9 @@ fn rollup_day_blocking(
             );
         }
     }
+
+    // Remove marker — rollup fully complete.
+    delete_rollup_marker(day_dir, service);
 
     tracing::info!(
         event_type = "rollup_complete",
@@ -890,5 +1013,126 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups["nginx"].len(), 2);
         assert_eq!(groups["postgres"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rollup_runs_without_wal_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Create hourly parquet files for a historical date (not today).
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let r1 = format!(r#"{{"timestamp":"{yesterday}T01:00:00Z","service":"nginx","msg":"a"}}"#);
+        write_hourly_parquet(&data_dir, &yesterday, "01", "nginx", &[&r1]);
+
+        // WAL dir is empty — compact_once should still run rollup.
+        compact_once(&wal_dir, &data_dir, Duration::from_secs(1), true)
+            .await
+            .unwrap();
+
+        // Day-level file should exist from rollup.
+        let daily = data_dir.join(&yesterday).join("nginx.parquet");
+        assert!(
+            daily.exists(),
+            "rollup should run even when WAL dir is empty"
+        );
+    }
+
+    #[test]
+    fn rollup_marker_written_and_cleaned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
+
+        let day_dir = data_dir.join(date);
+        let marker = day_dir.join(".rollup-nginx");
+
+        rollup_day_blocking(&day_dir, "nginx", &[f1]).unwrap();
+
+        // Marker should be cleaned up after successful rollup.
+        assert!(!marker.exists(), "marker should be removed after rollup");
+        // Canonical file should exist.
+        assert!(day_dir.join("nginx.parquet").exists());
+    }
+
+    #[test]
+    fn rollup_recovery_after_rename_crash() {
+        // Simulate crash after rename but before hourly deletion:
+        // canonical exists, marker exists, hourly files still present.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
+
+        let day_dir = data_dir.join(date);
+        let canonical = day_dir.join("nginx.parquet");
+        let marker = day_dir.join(".rollup-nginx");
+
+        // Simulate: canonical was written (via rename), marker exists, hourly survives.
+        std::fs::write(&canonical, b"consolidated data").unwrap();
+        write_rollup_marker(&day_dir, "nginx", std::slice::from_ref(&f1)).unwrap();
+        assert!(marker.exists());
+        assert!(f1.exists());
+
+        // Recovery should delete hourlies and marker without touching canonical.
+        recover_rollup_markers(&day_dir).unwrap();
+
+        assert!(canonical.exists(), "canonical should survive recovery");
+        assert!(!f1.exists(), "hourly file should be deleted by recovery");
+        assert!(!marker.exists(), "marker should be removed after recovery");
+    }
+
+    #[test]
+    fn rollup_recovery_after_tmp_crash() {
+        // Simulate crash after .tmp write but before rename:
+        // .tmp exists, marker exists, no canonical yet.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
+
+        let day_dir = data_dir.join(date);
+        let canonical = day_dir.join("nginx.parquet");
+        let tmp_file = day_dir.join("nginx.parquet.tmp");
+        let marker = day_dir.join(".rollup-nginx");
+
+        // Simulate: .tmp was written, marker exists, no canonical yet.
+        std::fs::write(&tmp_file, b"merged data").unwrap();
+        write_rollup_marker(&day_dir, "nginx", std::slice::from_ref(&f1)).unwrap();
+        assert!(!canonical.exists());
+        assert!(tmp_file.exists());
+
+        // Recovery should rename .tmp to canonical, delete hourlies and marker.
+        recover_rollup_markers(&day_dir).unwrap();
+
+        assert!(canonical.exists(), "canonical should exist after recovery");
+        assert!(!tmp_file.exists(), ".tmp should be gone after recovery");
+        assert!(!f1.exists(), "hourly file should be deleted by recovery");
+        assert!(!marker.exists(), "marker should be removed after recovery");
+    }
+
+    #[test]
+    fn rollup_recovery_stale_marker() {
+        // Stale marker: neither canonical nor .tmp exists.
+        let tmp = tempfile::tempdir().unwrap();
+        let day_dir = tmp.path().join("2026-01-15");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let marker = day_dir.join(".rollup-nginx");
+        std::fs::write(&marker, "/nonexistent/path.parquet").unwrap();
+
+        recover_rollup_markers(&day_dir).unwrap();
+        assert!(!marker.exists(), "stale marker should be removed");
     }
 }

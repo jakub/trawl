@@ -155,11 +155,16 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
             globs.push(format!("'{base}/{day}/{hour}/{file_pattern}'"));
             cursor += chrono::Duration::hours(1);
         } else {
-            // Historical date — check for consolidated day-level file.
-            if has_day_level_files(base, &day, &file_pattern) {
+            // Historical date — check for consolidated day-level file
+            // and/or remaining hourly directories. Both can coexist
+            // during partial rollup (one service consolidated, another not).
+            let has_day = has_day_level_files(base, &day, &file_pattern);
+            let has_hours = has_hour_dirs(base, &day);
+
+            if has_day {
                 globs.push(format!("'{base}/{day}/{file_pattern}'"));
-            } else {
-                // Not yet consolidated — expand to all 24 hours.
+            }
+            if has_hours || !has_day {
                 for h in 0..24_u32 {
                     globs.push(format!("'{base}/{day}/{h:02}/{file_pattern}'"));
                 }
@@ -199,6 +204,26 @@ fn has_day_level_files(base: &str, day: &str, file_pattern: &str) -> bool {
         // Known service: single stat() call.
         day_dir.join(file_pattern).exists()
     }
+}
+
+/// Check if a date directory still has hourly subdirectories (00-23).
+///
+/// Used to detect mixed-state dirs where some services are consolidated
+/// at day level while others remain in hourly dirs.
+fn has_hour_dirs(base: &str, day: &str) -> bool {
+    let day_dir = std::path::Path::new(base).join(day);
+    let Ok(entries) = std::fs::read_dir(&day_dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let p = e.path();
+        if !p.is_dir() {
+            return false;
+        }
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 impl ExecutorPool {
@@ -676,5 +701,57 @@ mod tests {
             "2026-01-15",
             "*.parquet"
         ));
+    }
+
+    #[test]
+    fn has_hour_dirs_detects_hour_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day_dir = tmp.path().join("2026-01-15");
+
+        // No dir at all.
+        assert!(!has_hour_dirs(tmp.path().to_str().unwrap(), "2026-01-15"));
+
+        // Dir exists but empty.
+        std::fs::create_dir_all(&day_dir).unwrap();
+        assert!(!has_hour_dirs(tmp.path().to_str().unwrap(), "2026-01-15"));
+
+        // Hour subdir present.
+        std::fs::create_dir_all(day_dir.join("01")).unwrap();
+        assert!(has_hour_dirs(tmp.path().to_str().unwrap(), "2026-01-15"));
+    }
+
+    #[test]
+    fn compute_source_wildcard_mixed_state() {
+        // Mixed state: day-level file for one service + hourly dir for another.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let day_dir = tmp.path().join(&yesterday);
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        // nginx consolidated at day level.
+        std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
+
+        // postgres still in hourly dirs.
+        let hour_dir = day_dir.join("14");
+        std::fs::create_dir_all(&hour_dir).unwrap();
+        std::fs::write(hour_dir.join("postgres.parquet"), b"data").unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "last:48h", &fallback);
+
+        // Should include BOTH day-level glob and hourly expansion.
+        let day_glob = format!("'{base}/{yesterday}/*.parquet'");
+        let hourly_glob = format!("'{base}/{yesterday}/00/*.parquet'");
+        assert!(
+            source.contains(&day_glob),
+            "expected day-level glob in mixed state, got: {source}"
+        );
+        assert!(
+            source.contains(&hourly_glob),
+            "expected hourly globs in mixed state, got: {source}"
+        );
     }
 }
