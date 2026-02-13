@@ -12,6 +12,7 @@ pub mod pool;
 pub mod rate_limit;
 pub mod shutdown;
 pub mod state;
+pub mod telemetry;
 pub mod tls;
 pub mod tracker;
 pub mod transport;
