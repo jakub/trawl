@@ -39,6 +39,10 @@ impl KeyStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuthError> {
         Self::ensure_restricted_permissions(path.as_ref())?;
         let conn = rusqlite::Connection::open(path)?;
+        // WAL mode: better crash safety + allows concurrent reads during writes
+        // (e.g. fleet-admin revoking a key while daemon is authenticating).
+        // busy_timeout: retry on SQLITE_BUSY instead of failing immediately.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         let store = Self { conn };
         store.initialize()?;
         Ok(store)
@@ -76,6 +80,8 @@ impl KeyStore {
     /// Open an in-memory database (for testing).
     pub fn open_in_memory() -> Result<Self, AuthError> {
         let conn = rusqlite::Connection::open_in_memory()?;
+        // WAL not applicable for in-memory, but set busy_timeout for consistency.
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         let store = Self { conn };
         store.initialize()?;
         Ok(store)
@@ -120,7 +126,7 @@ impl KeyStore {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS api_keys (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                prefix      TEXT    NOT NULL UNIQUE,
+                prefix      TEXT    NOT NULL,
                 name        TEXT    NOT NULL,
                 hash        TEXT    NOT NULL,
                 role        TEXT    NOT NULL CHECK (role IN ('admin', 'analyst', 'reader', 'ingest')),
@@ -131,17 +137,22 @@ impl KeyStore {
                 revoked_at  TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (prefix);",
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (prefix);",
         )?;
         Ok(())
     }
 
     /// Migrate from schema v1 → v2: recreate `api_keys` with updated CHECK constraint.
+    ///
+    /// Wrapped in an explicit transaction so a crash mid-migration can't
+    /// leave the database in a half-migrated state with keys destroyed.
     fn migrate_v1_to_v2(&self) -> Result<(), AuthError> {
         self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS api_keys_v2 (
+            "BEGIN;
+
+            CREATE TABLE IF NOT EXISTS api_keys_v2 (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                prefix      TEXT    NOT NULL UNIQUE,
+                prefix      TEXT    NOT NULL,
                 name        TEXT    NOT NULL,
                 hash        TEXT    NOT NULL,
                 role        TEXT    NOT NULL CHECK (role IN ('admin', 'analyst', 'reader', 'ingest')),
@@ -162,7 +173,9 @@ impl KeyStore {
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys (prefix);
 
-            UPDATE schema_version SET version = 2;",
+            UPDATE schema_version SET version = 2;
+
+            COMMIT;",
         )?;
         Ok(())
     }
