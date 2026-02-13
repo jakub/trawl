@@ -6,7 +6,6 @@
 
 mod common;
 
-use fleet_engine::QueryEngine;
 use fleet_engine::error::EngineError;
 use fleet_engine::executor::Executor;
 use fleet_engine::value::{QueryResult, Value};
@@ -341,8 +340,6 @@ fn missing_source_returns_error() {
 
 #[test]
 fn describe_schema_returns_columns() {
-    use fleet_engine::SchemaIntrospector;
-
     let (exec, glob) = setup();
     let schema = exec.describe_schema(&glob).unwrap();
 
@@ -357,8 +354,6 @@ fn describe_schema_returns_columns() {
 
 #[test]
 fn describe_schema_missing_source() {
-    use fleet_engine::SchemaIntrospector;
-
     let exec = Executor::new().expect("executor should initialize");
     let result = exec.describe_schema("/nonexistent/path/**/*.parquet");
     assert!(result.is_err());

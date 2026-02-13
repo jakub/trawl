@@ -21,7 +21,6 @@ use chrono::Timelike as _;
 use fleet_core::ast::{FieldFilter, FilterOp, FilterValue, SearchToken};
 use fleet_engine::executor::Executor;
 use fleet_engine::value::{QueryResult, SchemaResult};
-use fleet_engine::{QueryEngine, SchemaIntrospector};
 use tokio::sync::Semaphore;
 
 use crate::error::ServerError;

@@ -7,5 +7,3 @@
 pub mod error;
 pub mod executor;
 pub mod value;
-
-pub use executor::{QueryEngine, SchemaIntrospector};
