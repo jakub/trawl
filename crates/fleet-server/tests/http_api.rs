@@ -22,10 +22,14 @@ fn free_port() -> u16 {
 }
 
 /// Generate test parquet fixtures using `DuckDB`.
+///
+/// Creates per-service parquet files matching the compaction naming
+/// convention (`{service}.parquet`), so service-scoped glob narrowing
+/// works correctly in integration tests.
 fn ensure_fixtures(dir: &std::path::Path) -> String {
     let parquet_dir = dir.join("parquet");
-    let file_path = parquet_dir.join("logs.parquet");
-    if file_path.exists() {
+    let nginx_path = parquet_dir.join("nginx.parquet");
+    if nginx_path.exists() {
         return format!("{}/**/*.parquet", parquet_dir.display());
     }
 
@@ -51,9 +55,16 @@ fn ensure_fixtures(dir: &std::path::Path) -> String {
     )
     .unwrap();
 
+    // Write per-service parquet files to match compaction naming convention.
+    let postgres_path = parquet_dir.join("postgres.parquet");
     conn.execute_batch(&format!(
-        "COPY logs TO '{}' (FORMAT PARQUET)",
-        file_path.display()
+        "COPY (SELECT * FROM logs WHERE service = 'nginx') TO '{}' (FORMAT PARQUET)",
+        nginx_path.display()
+    ))
+    .unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM logs WHERE service = 'postgres') TO '{}' (FORMAT PARQUET)",
+        postgres_path.display()
     ))
     .unwrap();
 
@@ -244,7 +255,7 @@ async fn schema_returns_columns() {
     assert!(names.contains(&"service"), "missing service column");
     assert!(names.contains(&"level"), "missing level column");
     assert!(names.contains(&"message"), "missing message column");
-    assert_eq!(schema.file_count, 1);
+    assert_eq!(schema.file_count, 2);
 }
 
 #[tokio::test]

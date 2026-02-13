@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use std::time::Duration;
 
 use chrono::Timelike as _;
-use fleet_core::ast::SearchToken;
+use fleet_core::ast::{FieldFilter, FilterOp, FilterValue, SearchToken};
 use fleet_engine::executor::Executor;
 use fleet_engine::value::{QueryResult, SchemaResult};
 use fleet_engine::{QueryEngine, SchemaIntrospector};
@@ -76,8 +76,30 @@ impl std::fmt::Debug for ExecutorPool {
     }
 }
 
+/// Extract an exact service name from the search tokens, if present.
+///
+/// Only returns `Some` for simple equality filters (`service:nginx`).
+/// Glob, regex, and other operators are ignored — we can't narrow the
+/// file glob safely for those.
+fn extract_service_filter(tokens: &[fleet_core::ast::Spanned<SearchToken>]) -> Option<&str> {
+    tokens.iter().find_map(|t| {
+        if let SearchToken::FieldFilter(FieldFilter {
+            field,
+            op: FilterOp::Eq,
+            value: FilterValue::Literal(s),
+        }) = &t.node
+        {
+            if field == "service" {
+                return Some(s.as_str());
+            }
+        }
+        None
+    })
+}
+
 /// Compute the `read_parquet()` source argument, scoped to relevant
-/// hour-directories when the query contains a time filter.
+/// hour-directories when the query contains a time filter and/or
+/// narrowed to a single service file when `service:X` is present.
 ///
 /// Returns a `DuckDB` list literal like `['path/14/*.parquet', 'path/15/*.parquet']`
 /// when time-scoping is possible, or falls back to the recursive glob.
@@ -85,6 +107,9 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
     let Ok(ast) = fleet_core::parser::parse(dsl) else {
         return fallback_glob.to_owned();
     };
+
+    let service = extract_service_filter(&ast.search.tokens);
+    let file_pattern = service.map_or_else(|| "*.parquet".to_owned(), |s| format!("{s}.parquet"));
 
     let time_filter = ast.search.tokens.iter().find_map(|t| {
         if let SearchToken::TimeFilter(tf) = &t.node {
@@ -94,8 +119,11 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
         }
     });
 
+    let base = base_dir.trim_end_matches('/');
+
     let Some(duration) = time_filter else {
-        return fallback_glob.to_owned();
+        // No time filter — use recursive glob, possibly service-narrowed.
+        return format!("{base}/**/{file_pattern}");
     };
 
     let total_secs = duration
@@ -111,17 +139,16 @@ fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
         .and_hms_opt(start.hour(), 0, 0)
         .expect("valid hour from Timelike::hour()");
     let end = now.naive_utc();
-    let base = base_dir.trim_end_matches('/');
 
     while cursor <= end {
         let day = cursor.format("%Y-%m-%d");
         let hour = cursor.format("%H");
-        globs.push(format!("'{base}/{day}/{hour}/*.parquet'"));
+        globs.push(format!("'{base}/{day}/{hour}/{file_pattern}'"));
         cursor += chrono::Duration::hours(1);
     }
 
     if globs.is_empty() {
-        return fallback_glob.to_owned();
+        return format!("{base}/**/{file_pattern}");
     }
 
     format!("[{}]", globs.join(", "))
@@ -356,8 +383,23 @@ mod tests {
     }
 
     #[test]
-    fn compute_source_no_time_filter_returns_fallback() {
+    fn compute_source_no_time_filter_returns_recursive_glob() {
+        // No time filter, no service → broad glob.
+        let source = compute_source("/data", "level:error", "/data/**/*.parquet");
+        assert_eq!(source, "/data/**/*.parquet");
+    }
+
+    #[test]
+    fn compute_source_service_filter_narrows_glob() {
+        // Exact service filter → narrow to service-specific file.
         let source = compute_source("/data", "service:nginx", "/data/**/*.parquet");
+        assert_eq!(source, "/data/**/nginx.parquet");
+    }
+
+    #[test]
+    fn compute_source_service_glob_keeps_wildcard() {
+        // Glob operator on service → can't narrow, keep *.parquet.
+        let source = compute_source("/data", "service:ng*", "/data/**/*.parquet");
         assert_eq!(source, "/data/**/*.parquet");
     }
 
@@ -369,7 +411,7 @@ mod tests {
 
     #[test]
     fn compute_source_with_time_filter_returns_list() {
-        let source = compute_source("/data", "service:nginx last:1h", "/data/**/*.parquet");
+        let source = compute_source("/data", "last:1h", "/data/**/*.parquet");
         // Should be a list of hour-directory globs, not the fallback.
         assert!(
             source.starts_with('['),
@@ -385,6 +427,24 @@ mod tests {
         assert!(
             (2..=4).contains(&count),
             "expected 2-4 hour globs for last:1h, got {count}: {source}"
+        );
+    }
+
+    #[test]
+    fn compute_source_service_and_time_filter_compose() {
+        let source = compute_source("/data", "service:nginx last:1h", "/data/**/*.parquet");
+        assert!(
+            source.starts_with('['),
+            "expected list format, got: {source}"
+        );
+        // Should narrow to nginx.parquet, not *.parquet.
+        assert!(
+            source.contains("nginx.parquet"),
+            "expected service-scoped globs, got: {source}"
+        );
+        assert!(
+            !source.contains("*.parquet"),
+            "should not contain wildcard when service is known, got: {source}"
         );
     }
 
