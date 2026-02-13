@@ -99,19 +99,12 @@ fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
     table
 }
 
-/// Format an ISO 8601 timestamp for display (truncate to seconds, drop timezone).
+/// Format an RFC 3339 timestamp for display (truncate to seconds, drop timezone).
 fn format_timestamp(ts: &str) -> String {
-    // RFC 3339 format: "2026-02-10T12:00:00.123456789+00:00"
-    // We want: "2026-02-10 12:00:00"
-    let s = ts.replace('T', " ");
-    // Strip timezone offset or Z suffix.
-    let s = s.split('+').next().unwrap_or(&s);
-    let s = s.split('Z').next().unwrap_or(s);
-    // Strip sub-second precision (everything after the seconds).
-    match s.find('.') {
-        Some(dot) => s[..dot].to_owned(),
-        None => s.to_owned(),
-    }
+    chrono::DateTime::parse_from_rfc3339(ts).map_or_else(
+        |_| ts.to_owned(),
+        |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+    )
 }
 
 /// Parse a human-readable duration string (e.g., "90d", "24h", "52w").
