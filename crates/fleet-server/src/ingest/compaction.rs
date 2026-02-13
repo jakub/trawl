@@ -425,11 +425,16 @@ fn rollup_day_blocking(
     // Remove marker — rollup fully complete.
     delete_rollup_marker(day_dir, service);
 
+    let output_bytes = std::fs::metadata(&canonical_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     tracing::info!(
         event_type = "rollup_complete",
         compact_service = %service,
         output = %canonical_path.display(),
         hourly_files = hourly_files.len(),
+        output_bytes,
         "daily rollup complete"
     );
 
@@ -449,6 +454,18 @@ async fn compact_service_batch(
     tokio::task::spawn_blocking(move || compact_service_blocking(&wal_files, &data_dir, &service))
         .await
         .map_err(|e| format!("compaction task panicked: {e}"))?
+}
+
+/// Count rows in a `DuckDB` table. Used to capture row counts before
+/// dropping temporary tables.
+fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
+    conn.query_row(
+        &format!("SELECT count(*)::BIGINT FROM \"{table}\""),
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| u64::try_from(n).unwrap_or(0))
+    .map_err(|e| format!("count_rows failed: {e}"))
 }
 
 /// Blocking compaction: open `DuckDB`, read ndjson, write parquet.
@@ -497,7 +514,7 @@ fn compact_service_blocking(
 
     let merged = canonical_path.exists();
 
-    if merged {
+    let rows: u64 = if merged {
         // Merge: union existing parquet rows with new WAL batch.
         // BY NAME handles heterogeneous schemas (different events have
         // different fields) — missing columns become NULL in parquet.
@@ -516,8 +533,10 @@ fn compact_service_blocking(
         ))
         .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
 
+        let count = count_rows(&conn, "merged")?;
         conn.execute_batch("DROP TABLE IF EXISTS merged")
             .map_err(|e| format!("DROP TABLE failed: {e}"))?;
+        count
     } else {
         // Fresh write: no existing file to merge with.
         conn.execute_batch(&format!(
@@ -525,7 +544,9 @@ fn compact_service_blocking(
             tmp_path.display(),
         ))
         .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
-    }
+
+        count_rows(&conn, "wal_batch")?
+    };
 
     conn.execute_batch("DROP TABLE IF EXISTS wal_batch")
         .map_err(|e| format!("DROP TABLE failed: {e}"))?;
@@ -536,12 +557,18 @@ fn compact_service_blocking(
     std::fs::rename(&tmp_path, &canonical_path)
         .map_err(|e| format!("atomic rename failed: {e}"))?;
 
+    let output_bytes = std::fs::metadata(&canonical_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     tracing::info!(
         event_type = "compaction_complete",
         compact_service = %service,
         output = %canonical_path.display(),
         wal_files = wal_files.len(),
         merged,
+        rows,
+        output_bytes,
         "compaction complete"
     );
 
