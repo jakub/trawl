@@ -66,11 +66,14 @@ pub async fn ingest(
         .ok_or_else(|| ServerError::Internal("ingest not enabled".into()))?;
 
     // Decompress gzip if Content-Encoding header is set.
-    let raw = if is_gzip(&headers) {
+    let compressed = is_gzip(&headers);
+    let wire_bytes = body.len();
+    let raw = if compressed {
         decompress_gzip(&body)?
     } else {
         body.to_vec()
     };
+    let body_bytes = raw.len();
 
     if raw.is_empty() {
         return Err(ServerError::Ingest("empty request body".into()));
@@ -95,6 +98,9 @@ pub async fn ingest(
         user = %verified.name,
         ingest_service = %service,
         events = line_count,
+        body_bytes,
+        wire_bytes,
+        compressed,
         path = %wal_path.display(),
         "ingested events to WAL"
     );
