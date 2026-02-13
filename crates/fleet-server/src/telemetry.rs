@@ -87,6 +87,8 @@ pub struct WalLayer {
 struct WalLayerInner {
     handle: WalHandle,
     buffer: Mutex<Vec<u8>>,
+    /// Cached hostname, resolved once at layer creation.
+    host: String,
 }
 
 impl std::fmt::Debug for WalLayer {
@@ -101,10 +103,15 @@ impl std::fmt::Debug for WalLayer {
 impl WalLayer {
     /// Create a new layer backed by the given handle.
     pub fn new(handle: WalHandle) -> Self {
+        let host = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_default();
         Self {
             inner: Arc::new(WalLayerInner {
                 handle,
                 buffer: Mutex::new(Vec::with_capacity(8192)),
+                host,
             }),
         }
     }
@@ -270,6 +277,7 @@ where
             json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         );
         record.insert("service".into(), json!("fleetd"));
+        record.insert("host".into(), json!(&self.inner.host));
         record.insert("level".into(), json!(metadata.level().as_str()));
         record.insert("target".into(), json!(metadata.target()));
         record.insert("event_type".into(), json!(event_type));
