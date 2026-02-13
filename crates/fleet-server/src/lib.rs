@@ -12,6 +12,7 @@ pub mod ingest;
 pub mod pool;
 pub mod rate_limit;
 pub mod shutdown;
+pub(crate) mod source;
 pub mod state;
 pub mod telemetry;
 pub mod tls;
