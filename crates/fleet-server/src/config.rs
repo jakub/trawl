@@ -256,11 +256,24 @@ fn default_daily_rollup() -> bool {
     DEFAULT_DAILY_ROLLUP
 }
 
+/// Default key audit polling interval (seconds).
+pub const DEFAULT_AUDIT_INTERVAL_SECS: u64 = 30;
+
 /// Authentication database settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     /// Path to the `SQLite` auth database.
     pub db_path: PathBuf,
+
+    /// How often to poll the auth database for key changes (seconds).
+    /// Detects keys created/revoked by fleet-admin and emits audit events.
+    /// Set to 0 to disable. Default: 30.
+    #[serde(default = "default_audit_interval_secs")]
+    pub audit_interval_secs: u64,
+}
+
+fn default_audit_interval_secs() -> u64 {
+    DEFAULT_AUDIT_INTERVAL_SECS
 }
 
 fn default_http_addr() -> String {

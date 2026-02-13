@@ -128,7 +128,10 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
             rate_limit,
         },
         data: DataConfig { path: data_glob },
-        auth: AuthConfig { db_path: auth_db },
+        auth: AuthConfig {
+            db_path: auth_db,
+            audit_interval_secs: 0,
+        },
         ingest: {
             let wal_dir = tmp.path().join("wal");
             std::fs::create_dir_all(&wal_dir).unwrap();
@@ -195,7 +198,10 @@ async fn setup() -> TestServer {
             rate_limit: RateLimitConfig::default(),
         },
         data: DataConfig { path: data_glob },
-        auth: AuthConfig { db_path: auth_db },
+        auth: AuthConfig {
+            db_path: auth_db,
+            audit_interval_secs: 0,
+        },
         ingest: {
             let wal_dir = tmp.path().join("wal");
             std::fs::create_dir_all(&wal_dir).unwrap();

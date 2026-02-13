@@ -86,6 +86,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Spawn key audit polling task if enabled.
+    let audit_handle = if config.auth.audit_interval_secs > 0 {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let interval = std::time::Duration::from_secs(config.auth.audit_interval_secs);
+        let handle = fleet_server::audit::spawn_audit_task(
+            Arc::clone(&state.auth.key_store),
+            interval,
+            shutdown_rx,
+        );
+        Some((handle, shutdown_tx))
+    } else {
+        None
+    };
+
     // Spawn telemetry flush task (1-second interval).
     let telemetry_handle = telemetry.map(|(_, layer)| {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -110,6 +124,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = shutdown_tx.send(true);
         if let Err(e) = handle.await {
             tracing::warn!(event_type = "task_panic", error = %e, "compaction task panicked during shutdown");
+        }
+    }
+
+    if let Some((handle, shutdown_tx)) = audit_handle {
+        let _ = shutdown_tx.send(true);
+        if let Err(e) = handle.await {
+            tracing::warn!(event_type = "task_panic", error = %e, "audit task panicked during shutdown");
         }
     }
 
