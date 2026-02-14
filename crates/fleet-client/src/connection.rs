@@ -183,6 +183,44 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
+    /// List all saved queries for the authenticated user.
+    pub async fn list_saved(&self) -> Result<ListSavedResponse, ClientError> {
+        let url = self.endpoint("/api/v1/saved");
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Create a new saved query.
+    pub async fn create_saved(
+        &self,
+        name: &str,
+        query: &str,
+    ) -> Result<SavedQueryResponse, ClientError> {
+        let url = self.endpoint("/api/v1/saved");
+        let body = serde_json::json!({ "name": name, "query": query });
+        let req = self.client.post(&url).json(&body);
+        self.send_authenticated(req).await
+    }
+
+    /// Update an existing saved query's content.
+    pub async fn update_saved(
+        &self,
+        id: i64,
+        query: &str,
+    ) -> Result<SavedQueryResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{id}"));
+        let body = serde_json::json!({ "query": query });
+        let req = self.client.put(&url).json(&body);
+        self.send_authenticated(req).await
+    }
+
+    /// Delete a saved query.
+    pub async fn delete_saved(&self, id: i64) -> Result<DeleteSavedResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{id}"));
+        let req = self.client.delete(&url);
+        self.send_authenticated(req).await
+    }
+
     /// Send an authenticated request, check for errors, and deserialize the response.
     async fn send_authenticated<T: serde::de::DeserializeOwned>(
         &self,
@@ -377,6 +415,35 @@ pub struct HistoryEntryResponse {
     pub row_count: usize,
     /// Query status ("success", "error", "timeout").
     pub status: String,
+}
+
+/// Response from the list saved queries endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ListSavedResponse {
+    /// Saved queries (sorted by name).
+    pub queries: Vec<SavedQueryResponse>,
+}
+
+/// A single saved query.
+#[derive(Debug, Deserialize)]
+pub struct SavedQueryResponse {
+    /// Saved query ID.
+    pub id: i64,
+    /// Query name.
+    pub name: String,
+    /// The DSL query string.
+    pub query: String,
+    /// When the query was created (ISO 8601 UTC).
+    pub created_at: String,
+    /// When the query was last updated (ISO 8601 UTC).
+    pub updated_at: String,
+}
+
+/// Response from the delete saved query endpoint.
+#[derive(Debug, Deserialize)]
+pub struct DeleteSavedResponse {
+    /// Whether the query was successfully deleted.
+    pub deleted: bool,
 }
 
 // -- internal request types --------------------------------------------------
