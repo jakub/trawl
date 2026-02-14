@@ -34,6 +34,15 @@ struct Args {
 fn main() -> Result<()> {
     color_eyre::install()?;
 
+    // Set up tracing (logs to stderr, won't interfere with TUI)
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("fleet_tui=debug")),
+        )
+        .init();
+
     let args = Args::parse();
 
     // Load config from file (or defaults).

@@ -208,13 +208,26 @@ impl App {
 
     /// Handle key events when editor is focused.
     fn handle_editor_key(&mut self, key: event::KeyEvent) {
+        // Debug: log the key event to see what we're receiving
+        tracing::debug!(
+            "editor key: modifiers={:?}, code={:?}",
+            key.modifiers,
+            key.code
+        );
+
         match (key.modifiers, key.code) {
             // Switch to results: Tab
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.focus = Focus::Results;
             }
+            // Execute query: F5 (easier than Ctrl+Enter which varies by terminal)
+            (KeyModifiers::NONE, KeyCode::F(5)) => {
+                tracing::info!("executing query with F5");
+                self.execute_query();
+            }
             // Execute query: Ctrl+Enter
-            (KeyModifiers::CONTROL, KeyCode::Enter) => {
+            (_, KeyCode::Enter) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                tracing::info!("executing query with ctrl+enter");
                 self.execute_query();
             }
             // Clear editor: Ctrl+L
