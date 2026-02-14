@@ -481,3 +481,238 @@ async fn rate_limit_returns_429() {
         other => panic!("expected 429 rate limit error, got: {other:?}"),
     }
 }
+
+// ── new endpoint tests (cancellation, validation, pagination, stats, field values) ──
+
+#[tokio::test]
+async fn cancel_query_by_admin() {
+    let server = setup().await;
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    // Spawn a slow query in the background.
+    let analyst_clone = analyst.clone();
+    let slow_query = tokio::spawn(async move {
+        // This query will take a while (timechart with small span).
+        let _ = analyst_clone.query("* | timechart span=1s count()").await;
+    });
+
+    // Give it a moment to start.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Admin cancels query ID 1 (first query).
+    // May or may not catch it depending on timing — just verify the endpoint works.
+    let _cancel_resp = admin.cancel_query(1).await.unwrap();
+
+    // Wait for the spawned task to finish.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), slow_query).await;
+}
+
+#[tokio::test]
+async fn cancel_query_nonexistent_returns_false() {
+    let server = setup().await;
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let resp = admin.cancel_query(9999).await.unwrap();
+    assert!(!resp.cancelled);
+    assert_eq!(resp.query_id, 9999);
+}
+
+#[tokio::test]
+async fn cancel_query_by_non_admin_fails() {
+    let server = setup().await;
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // Analyst tries to cancel a query they don't own.
+    let result = analyst.cancel_query(1).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn validate_query_valid() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let resp = client
+        .validate("service:nginx | stats count()")
+        .await
+        .unwrap();
+    assert!(resp.valid);
+    assert!(resp.errors.is_empty());
+}
+
+#[tokio::test]
+async fn validate_query_syntax_error() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let resp = client
+        .validate("service:nginx | bad_command")
+        .await
+        .unwrap();
+    assert!(!resp.valid);
+    assert!(!resp.errors.is_empty());
+}
+
+#[tokio::test]
+async fn validate_query_unknown_function() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let resp = client.validate("* | stats unknown_func()").await.unwrap();
+    assert!(!resp.valid);
+    assert!(resp.errors.iter().any(|e| e.contains("unknown")));
+}
+
+#[tokio::test]
+async fn query_pagination_limit_offset() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // We have 3 rows total. Request 2 rows starting at offset 1.
+    let resp = client.query_paginated("*", Some(2), Some(1)).await.unwrap();
+    assert_eq!(resp.pagination.limit, 2);
+    assert_eq!(resp.pagination.offset, 1);
+    assert_eq!(resp.pagination.returned, 2);
+    assert_eq!(resp.result.row_count(), 2);
+}
+
+#[tokio::test]
+async fn query_pagination_offset_beyond_results() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let resp = client
+        .query_paginated("*", Some(10), Some(100))
+        .await
+        .unwrap();
+    assert_eq!(resp.pagination.offset, 100);
+    assert_eq!(resp.pagination.returned, 0);
+    assert_eq!(resp.result.row_count(), 0);
+}
+
+#[tokio::test]
+async fn query_pagination_defaults() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // No limit/offset specified — defaults should apply.
+    let resp = client.query_paginated("*", None, None).await.unwrap();
+    assert_eq!(resp.pagination.offset, 0);
+    assert_eq!(resp.pagination.returned, 3);
+}
+
+#[tokio::test]
+async fn stats_endpoint_admin_only() {
+    let server = setup().await;
+    let _admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    // Admin can access stats.
+    let resp = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{}/api/v1/stats", server.url))
+        .header("Authorization", format!("Bearer {}", server.admin_token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let stats: serde_json::Value = resp.json().await.unwrap();
+    assert!(stats.get("uptime_secs").is_some());
+    assert!(stats.get("total_queries").is_some());
+    assert!(stats.get("active_queries").is_some());
+    assert!(stats.get("pool_available").is_some());
+    assert!(stats.get("pool_capacity").is_some());
+}
+
+#[tokio::test]
+async fn stats_endpoint_analyst_forbidden() {
+    let server = setup().await;
+
+    let resp = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{}/api/v1/stats", server.url))
+        .header("Authorization", format!("Bearer {}", server.analyst_token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401); // Unauthorized
+}
+
+#[tokio::test]
+async fn field_values_endpoint() {
+    let server = setup().await;
+
+    let resp = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!(
+            "{}/api/v1/schema/values/service?limit=5",
+            server.url
+        ))
+        .header("Authorization", format!("Bearer {}", server.analyst_token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let data: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(data["field"], "service");
+    let values = data["values"].as_array().unwrap();
+    assert!(!values.is_empty());
+    assert!(values.iter().any(|v| v == "nginx"));
+}
+
+#[tokio::test]
+async fn field_values_cached() {
+    let server = setup().await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    // First request should populate cache.
+    let resp1 = client
+        .get(format!("{}/api/v1/schema/values/service", server.url))
+        .header("Authorization", format!("Bearer {}", server.analyst_token))
+        .send()
+        .await
+        .unwrap();
+    let data1: serde_json::Value = resp1.json().await.unwrap();
+    assert_eq!(data1["cached"], false);
+
+    // Second request should hit cache.
+    let resp2 = client
+        .get(format!("{}/api/v1/schema/values/service", server.url))
+        .header("Authorization", format!("Bearer {}", server.analyst_token))
+        .send()
+        .await
+        .unwrap();
+    let data2: serde_json::Value = resp2.json().await.unwrap();
+    assert_eq!(data2["cached"], true);
+}
+
+#[tokio::test]
+async fn field_values_invalid_field_name() {
+    let server = setup().await;
+
+    let resp = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{}/api/v1/schema/values/bad;name", server.url))
+        .header("Authorization", format!("Bearer {}", server.analyst_token))
+        .send()
+        .await
+        .unwrap();
+
+    // Should reject invalid field name.
+    assert_eq!(resp.status(), 400);
+}
