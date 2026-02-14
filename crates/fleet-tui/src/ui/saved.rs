@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::app::App;
 
@@ -63,9 +63,18 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Span::raw(" saved queries"),
         ]);
 
-        let list = List::new(items).block(block.title_bottom(footer).borders(Borders::ALL));
+        let list = List::new(items)
+            .block(block.title_bottom(footer).borders(Borders::ALL))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("► ");
 
-        frame.render_widget(list, area);
+        let mut list_state = ListState::default().with_selected(Some(app.saved_selected_index));
+
+        frame.render_stateful_widget(list, area, &mut list_state);
     } else {
         // Saved queries not loaded
         let text = Line::from("Saved queries not available");

@@ -32,6 +32,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         Line::from("  F4          - toggle saved queries"),
         Line::from("  F9          - toggle live tail mode"),
         Line::from("  Ctrl+Q      - quit"),
+        Line::from("  Ctrl+S      - save current query"),
         Line::from("  Ctrl+T      - new tab"),
         Line::from("  Ctrl+W      - close tab"),
         Line::from("  Shift+Tab   - cycle tabs"),
@@ -57,6 +58,15 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         Line::from(""),
         Line::from("  ↑/↓         - navigate history"),
         Line::from("  Enter       - load query into editor"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Saved Queries",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from("  ↑/↓         - navigate saved queries"),
+        Line::from("  Enter       - load query into editor"),
+        Line::from("  Backspace   - delete saved query"),
         Line::from(""),
         Line::from(Span::styled(
             "Note: Press Esc to close any sidebar",

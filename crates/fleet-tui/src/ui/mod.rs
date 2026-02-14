@@ -9,6 +9,7 @@ use crate::state::{Focus, Sidebar};
 pub mod editor;
 pub mod help;
 pub mod history;
+pub mod popup;
 pub mod results;
 pub mod saved;
 pub mod schema;
@@ -49,6 +50,9 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
             Sidebar::Saved => saved::render(app, frame),
         }
     }
+
+    // Render popup overlay (if any) — renders on top of everything.
+    popup::render(app, frame);
 
     // Set cursor position based on focus.
     if app.sidebar.is_none() && app.focus == Focus::Editor {

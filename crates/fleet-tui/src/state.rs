@@ -25,6 +25,23 @@ pub enum Sidebar {
     Saved,
 }
 
+/// Active popup overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Popup {
+    /// Confirm deletion of saved query.
+    ConfirmDelete {
+        /// ID of the saved query to delete.
+        saved_id: i64,
+        /// Name of the query being deleted.
+        name: String,
+    },
+    /// Text input for saving current query.
+    SaveQuery {
+        /// Current input text.
+        input: String,
+    },
+}
+
 /// Status of a tab's current query.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used when query execution is implemented

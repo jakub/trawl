@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::state::{Focus, Sidebar, Tab, TabStatus};
+use crate::state::{Focus, Popup, Sidebar, Tab, TabStatus};
 use crate::ui;
 
 /// Result of an async query execution.
@@ -40,6 +40,8 @@ pub struct App {
     pub focus: Focus,
     /// Active sidebar (if any).
     pub sidebar: Option<Sidebar>,
+    /// Active popup (if any).
+    pub popup: Option<Popup>,
     /// Cached schema response (fetched at startup).
     pub schema_cache: Option<SchemaResponse>,
     /// Cached history response (fetched at startup).
@@ -48,6 +50,8 @@ pub struct App {
     pub saved_cache: Option<ListSavedResponse>,
     /// Selected index in history sidebar.
     pub history_selected_index: usize,
+    /// Selected index in saved queries sidebar.
+    pub saved_selected_index: usize,
     /// Whether to quit the application.
     pub should_quit: bool,
     /// Whether live tail mode is active.
@@ -71,10 +75,12 @@ impl App {
             active_tab_idx: 0,
             focus: Focus::Editor,
             sidebar: None,
+            popup: None,
             schema_cache: None,
             history_cache: None,
             saved_cache: None,
             history_selected_index: 0,
+            saved_selected_index: 0,
             should_quit: false,
             live_mode: false,
             live_task: None,
@@ -176,6 +182,12 @@ impl App {
 
     /// Handle a key event.
     pub fn handle_key(&mut self, key: event::KeyEvent) {
+        // Popups take priority over everything else.
+        if self.popup.is_some() {
+            self.handle_popup_key(key);
+            return;
+        }
+
         // Global keybindings (work regardless of focus).
         match (key.modifiers, key.code) {
             // Quit: Ctrl+Q
@@ -233,15 +245,27 @@ impl App {
                 self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
                 return;
             }
+            // Save current query: Ctrl+S
+            (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
+                let query = self.active_tab().editor.text();
+                if !query.trim().is_empty() {
+                    self.popup = Some(Popup::SaveQuery {
+                        input: String::new(),
+                    });
+                }
+                return;
+            }
             _ => {}
         }
 
         // If sidebar is open, handle sidebar-specific keys.
         if let Some(sidebar) = self.sidebar {
-            if sidebar == Sidebar::History {
-                self.handle_history_key(key);
-            } else {
-                // Other sidebars don't handle keys yet
+            match sidebar {
+                Sidebar::History => self.handle_history_key(key),
+                Sidebar::Saved => self.handle_saved_key(key),
+                _ => {
+                    // Other sidebars don't handle keys yet
+                }
             }
             return;
         }
@@ -397,14 +421,169 @@ impl App {
         }
     }
 
+    /// Handle key events when saved queries sidebar is focused.
+    fn handle_saved_key(&mut self, key: event::KeyEvent) {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                if let Some(saved) = &self.saved_cache {
+                    if !saved.queries.is_empty() {
+                        self.saved_selected_index = self.saved_selected_index.saturating_sub(1);
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                if let Some(saved) = &self.saved_cache {
+                    if !saved.queries.is_empty() {
+                        let max_index = saved.queries.len().saturating_sub(1);
+                        self.saved_selected_index = (self.saved_selected_index + 1).min(max_index);
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                // Load selected query into editor
+                let query_text = self
+                    .saved_cache
+                    .as_ref()
+                    .and_then(|s| s.queries.get(self.saved_selected_index))
+                    .map(|entry| entry.query.clone());
+
+                if let Some(query) = query_text {
+                    let tab = self.active_tab_mut();
+                    // Clear editor and set query
+                    tab.editor.clear();
+                    // Insert the query text line by line
+                    for (i, line) in query.lines().enumerate() {
+                        if i > 0 {
+                            tab.editor.insert_newline();
+                        }
+                        for ch in line.chars() {
+                            tab.editor.insert_char(ch);
+                        }
+                    }
+                    // Move cursor to end
+                    tab.editor.move_to_line_end();
+                    // Close sidebar
+                    self.sidebar = None;
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace | KeyCode::Delete) => {
+                // Show confirmation popup for delete
+                if let Some(saved) = &self.saved_cache {
+                    if let Some(query) = saved.queries.get(self.saved_selected_index) {
+                        self.popup = Some(Popup::ConfirmDelete {
+                            saved_id: query.id,
+                            name: query.name.clone(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle key events when a popup is open.
+    fn handle_popup_key(&mut self, key: event::KeyEvent) {
+        if let Some(popup) = &self.popup {
+            match popup {
+                Popup::ConfirmDelete { saved_id, name } => {
+                    match (key.modifiers, key.code) {
+                        // Confirm deletion: Y or Enter
+                        (KeyModifiers::NONE, KeyCode::Char('y' | 'Y') | KeyCode::Enter) => {
+                            let saved_id = *saved_id;
+                            let name_copy = name.clone();
+                            self.popup = None;
+                            // Spawn async task to delete
+                            self.delete_saved_query(saved_id, name_copy);
+                        }
+                        // Cancel: N, Esc, or any other key
+                        _ => {
+                            self.popup = None;
+                        }
+                    }
+                }
+                Popup::SaveQuery { input } => {
+                    let mut current_input = input.clone();
+                    match (key.modifiers, key.code) {
+                        // Confirm save: Enter
+                        (KeyModifiers::NONE, KeyCode::Enter) if !current_input.is_empty() => {
+                            self.popup = None;
+                            self.save_current_query(current_input);
+                        }
+                        // Cancel: Esc
+                        (KeyModifiers::NONE, KeyCode::Esc) => {
+                            self.popup = None;
+                        }
+                        // Backspace
+                        (KeyModifiers::NONE, KeyCode::Backspace) => {
+                            current_input.pop();
+                            self.popup = Some(Popup::SaveQuery {
+                                input: current_input,
+                            });
+                        }
+                        // Regular character input
+                        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+                            current_input.push(c);
+                            self.popup = Some(Popup::SaveQuery {
+                                input: current_input,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Delete a saved query by ID.
+    fn delete_saved_query(&mut self, saved_id: i64, _name: String) {
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            match client.delete_saved(saved_id).await {
+                Ok(_) => {
+                    tracing::info!("deleted saved query {saved_id}");
+                    // TODO: Refresh saved queries cache
+                }
+                Err(e) => {
+                    tracing::error!("failed to delete saved query: {e}");
+                    // TODO: Show error to user
+                }
+            }
+        });
+    }
+
+    /// Save the current query with the given name.
+    fn save_current_query(&mut self, name: String) {
+        let query = self.active_tab().editor.text();
+        if query.trim().is_empty() {
+            return;
+        }
+
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            match client.create_saved(&name, &query).await {
+                Ok(_) => {
+                    tracing::info!("saved query '{name}'");
+                    // TODO: Refresh saved queries cache
+                }
+                Err(e) => {
+                    tracing::error!("failed to save query: {e}");
+                    // TODO: Show error to user
+                }
+            }
+        });
+    }
+
     /// Toggle a sidebar (close if already open, open otherwise).
     fn toggle_sidebar(&mut self, sidebar: Sidebar) {
         if self.sidebar == Some(sidebar) {
             self.sidebar = None;
         } else {
-            // Reset selection when opening history sidebar
-            if sidebar == Sidebar::History {
-                self.history_selected_index = 0;
+            // Reset selection when opening sidebars
+            match sidebar {
+                Sidebar::History => self.history_selected_index = 0,
+                Sidebar::Saved => self.saved_selected_index = 0,
+                _ => {}
             }
             self.sidebar = Some(sidebar);
         }
