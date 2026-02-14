@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
 use clap::Parser;
 use fleet_server::config::Config;
 use fleet_server::state::AppState;
@@ -86,6 +89,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Spawn retention task (always-on with defaults).
+    let retention_handle = {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = fleet_server::retention::spawn_retention(
+            config.data.base_dir(),
+            config.retention.clone(),
+            shutdown_rx,
+        );
+        (handle, shutdown_tx)
+    };
+
     // Spawn key audit polling task if enabled.
     let audit_handle = if config.auth.audit_interval_secs > 0 {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -111,30 +125,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     http::serve(state, &http_config, &config.server).await?;
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
-    // then signal compaction (which may compact those final files).
-    // Await each handle to ensure the task completes before the runtime drops.
-    if let Some((handle, shutdown_tx)) = telemetry_handle {
-        let _ = shutdown_tx.send(true);
-        if let Err(e) = handle.await {
-            tracing::warn!(event_type = "task_panic", error = %e, "telemetry task panicked during shutdown");
-        }
-    }
-
-    if let Some((handle, shutdown_tx)) = compaction_handle {
-        let _ = shutdown_tx.send(true);
-        if let Err(e) = handle.await {
-            tracing::warn!(event_type = "task_panic", error = %e, "compaction task panicked during shutdown");
-        }
-    }
-
-    if let Some((handle, shutdown_tx)) = audit_handle {
-        let _ = shutdown_tx.send(true);
-        if let Err(e) = handle.await {
-            tracing::warn!(event_type = "task_panic", error = %e, "audit task panicked during shutdown");
-        }
-    }
+    // then compaction (may compact those final files), then retention, then audit.
+    shutdown_task(telemetry_handle, "telemetry").await;
+    shutdown_task(compaction_handle, "compaction").await;
+    shutdown_task(Some(retention_handle), "retention").await;
+    shutdown_task(audit_handle, "audit").await;
 
     Ok(())
+}
+
+/// Signal a background task to shut down and await its completion.
+async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name: &str) {
+    if let Some((handle, shutdown_tx)) = task {
+        let _ = shutdown_tx.send(true);
+        if let Err(e) = handle.await {
+            tracing::warn!(event_type = "task_panic", task = name, error = %e, "task panicked during shutdown");
+        }
+    }
 }
 
 /// Initialize the tracing subscriber.
