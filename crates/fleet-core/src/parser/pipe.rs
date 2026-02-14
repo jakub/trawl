@@ -7,8 +7,8 @@ use chumsky::prelude::*;
 
 use crate::ast::{
     AggExpr, DedupStage, DropStage, ExtractMode, ExtractStage, LetStage, LimitStage, PipeStage,
-    PivotStage, RareStage, SortDirection, SortField, SortStage, Spanned, StatsStage, TableStage,
-    TimechartStage, TopStage, WhereStage,
+    PivotStage, RareStage, RenameStage, SortDirection, SortField, SortStage, Spanned, StatsStage,
+    TableStage, TailStage, TimechartStage, TopStage, WhereStage,
 };
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
@@ -123,6 +123,16 @@ fn head_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .ignore_then(uint())
         .map(|count| PipeStage::Limit(LimitStage { count }))
         .labelled("head stage")
+}
+
+/// Parse a `tail` stage: `tail N` — last N rows.
+fn tail_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("tail")
+        .padded()
+        .ignore_then(uint())
+        .map(|count| PipeStage::Tail(TailStage { count }))
+        .labelled("tail stage")
 }
 
 /// Parse a `table` stage: `table field(, field)*`
@@ -373,6 +383,25 @@ fn pivot_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("pivot stage")
 }
 
+/// Parse a `rename` stage: `rename old AS new [, old2 AS new2]*`
+fn rename_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    let rename_pair = field_name()
+        .then_ignore(keyword("as").padded())
+        .then(field_name());
+
+    keyword("rename")
+        .padded()
+        .ignore_then(
+            rename_pair
+                .separated_by(just(',').padded())
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|renames| PipeStage::Rename(RenameStage { renames }))
+        .labelled("rename stage")
+}
+
 /// Parse a single pipe stage.
 fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
@@ -383,6 +412,7 @@ fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         sort_stage(),
         limit_stage(),
         head_stage(),
+        tail_stage(),
         let_stage(),
         eval_stage(),
         extract_stage(),
@@ -393,6 +423,7 @@ fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         rare_stage(),
         dedup_stage(),
         drop_stage(),
+        rename_stage(),
         pivot_stage(),
     ))
     .labelled("pipe stage")
@@ -879,6 +910,53 @@ mod tests {
                 assert_eq!(p.by, vec!["host".to_string()]);
             }
             other => panic!("expected Pivot, got {other:?}"),
+        }
+    }
+
+    // ── tail ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tail() {
+        let input = "| tail 5";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Tail(t) => assert_eq!(t.count, 5),
+            other => panic!("expected Tail, got {other:?}"),
+        }
+    }
+
+    // ── rename ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rename_single() {
+        let input = "| rename service as svc";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Rename(r) => {
+                assert_eq!(r.renames, vec![("service".to_string(), "svc".to_string())]);
+            }
+            other => panic!("expected Rename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rename_multiple() {
+        let input = "| rename service as svc, host as hostname";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Rename(r) => {
+                assert_eq!(
+                    r.renames,
+                    vec![
+                        ("service".to_string(), "svc".to_string()),
+                        ("host".to_string(), "hostname".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Rename, got {other:?}"),
         }
     }
 }

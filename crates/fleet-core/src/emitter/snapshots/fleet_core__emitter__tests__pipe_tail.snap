@@ -1,0 +1,8 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | tail 5\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+ORDER BY "timestamp" DESC
+LIMIT 5

@@ -1,0 +1,6 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | rename service as svc, host as hostname\")"
+---
+SELECT * EXCLUDE ("service", "host"), "service" AS "svc", "host" AS "hostname"
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)

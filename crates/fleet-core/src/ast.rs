@@ -226,6 +226,8 @@ pub enum PipeStage {
     Dedup(DedupStage),
     Timechart(TimechartStage),
     Pivot(PivotStage),
+    Tail(TailStage),
+    Rename(RenameStage),
 }
 
 impl fmt::Display for PipeStage {
@@ -244,6 +246,8 @@ impl fmt::Display for PipeStage {
             Self::Dedup(_) => write!(f, "dedup"),
             Self::Timechart(_) => write!(f, "timechart"),
             Self::Pivot(_) => write!(f, "pivot"),
+            Self::Tail(_) => write!(f, "tail"),
+            Self::Rename(_) => write!(f, "rename"),
         }
     }
 }
@@ -377,6 +381,18 @@ pub struct PivotStage {
     pub aggregation: AggExpr,
     pub on_field: String,
     pub by: Vec<String>,
+}
+
+/// `tail 5` — last N rows (inverse of `limit`/`head`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailStage {
+    pub count: u64,
+}
+
+/// `rename old AS new` — rename columns in the output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenameStage {
+    pub renames: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------

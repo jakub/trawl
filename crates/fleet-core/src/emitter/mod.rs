@@ -644,6 +644,34 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // tail
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_tail() {
+        assert_snapshot!(emit_dsl("* | tail 5"));
+    }
+
+    #[test]
+    fn pipe_tail_after_sort() {
+        assert_snapshot!(emit_dsl("* | sort service | tail 3"));
+    }
+
+    // -----------------------------------------------------------------------
+    // rename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_rename_single() {
+        assert_snapshot!(emit_dsl("* | rename service as svc"));
+    }
+
+    #[test]
+    fn pipe_rename_multiple() {
+        assert_snapshot!(emit_dsl("* | rename service as svc, host as hostname"));
+    }
+
+    // -----------------------------------------------------------------------
     // list-format source paths
     // -----------------------------------------------------------------------
 

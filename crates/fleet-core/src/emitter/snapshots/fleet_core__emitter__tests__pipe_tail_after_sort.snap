@@ -1,0 +1,8 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | sort service | tail 3\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+ORDER BY "service" ASC
+LIMIT 3

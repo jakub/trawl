@@ -44,6 +44,14 @@ pub(crate) fn process_stage(pipe: &PipeStage, ctx: &mut EmitterState) -> Result<
         }
         PipeStage::Timechart(t) => process_timechart(t, ctx),
         PipeStage::Pivot(p) => process_pivot(p, ctx),
+        PipeStage::Tail(t) => {
+            process_tail(t, ctx);
+            Ok(())
+        }
+        PipeStage::Rename(r) => {
+            process_rename(r, ctx);
+            Ok(())
+        }
     }
 }
 
@@ -352,6 +360,39 @@ fn auto_bucket_interval(time_filter: Option<&crate::ast::FleetDuration>) -> Stri
         "1 hours"
     }
     .to_string()
+}
+
+fn process_tail(tail: &crate::ast::TailStage, ctx: &mut EmitterState) {
+    ctx.flush_if(FlushCondition::IfModifiedOrLimited);
+
+    // if no explicit sort exists, default to timestamp DESC so "tail"
+    // means "last N chronologically". otherwise, respect the existing
+    // sort order and just limit.
+    if ctx.order_by.is_empty() {
+        ctx.order_by.push("\"timestamp\" DESC".to_string());
+    }
+    ctx.limit = Some(tail.count);
+}
+
+fn process_rename(rename: &crate::ast::RenameStage, ctx: &mut EmitterState) {
+    ctx.flush_if(FlushCondition::IfModified);
+
+    let excluded: Vec<String> = rename
+        .renames
+        .iter()
+        .map(|(old, _)| quote_field(old))
+        .collect();
+    let aliases: Vec<String> = rename
+        .renames
+        .iter()
+        .map(|(old, new)| format!("{} AS {}", quote_field(old), quote_field(new)))
+        .collect();
+
+    ctx.select = vec![
+        format!("* EXCLUDE ({})", excluded.join(", ")),
+        aliases.join(", "),
+    ];
+    ctx.has_projection = true;
 }
 
 fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
