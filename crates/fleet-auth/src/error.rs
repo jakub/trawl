@@ -40,4 +40,20 @@ pub enum AuthError {
     /// Invalid role string.
     #[error("unknown role: {0}")]
     UnknownRole(String),
+
+    /// A saved query with this name already exists for this user.
+    #[error("a saved query named '{name}' already exists")]
+    DuplicateName {
+        /// The duplicate name.
+        name: String,
+    },
+
+    /// Resource not found (saved query, etc.).
+    #[error("{resource} not found: id={id}")]
+    NotFound {
+        /// The resource ID.
+        id: i64,
+        /// The resource type.
+        resource: String,
+    },
 }

@@ -18,6 +18,9 @@ pub mod store;
 /// `SQLite`-backed query history storage.
 pub mod history;
 
+/// `SQLite`-backed saved queries storage.
+pub mod saved;
+
 /// Token generation, hashing, and verification.
 pub mod token;
 
@@ -25,4 +28,5 @@ pub use error::AuthError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use keys::{ApiKeyInfo, CreatedKey, VerifiedKey};
 pub use roles::{Permission, Role};
+pub use saved::{SavedQuery, SavedQueryStore};
 pub use store::KeyStore;

@@ -20,6 +20,14 @@ pub enum ServerError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// Bad request (invalid input, duplicate name, etc.).
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
+    /// Resource not found (or unauthorized access).
+    #[error("not found: {0}")]
+    NotFound(String),
+
     /// Query execution exceeded the configured timeout.
     #[error("query timed out")]
     Timeout,
@@ -47,6 +55,8 @@ impl ServerError {
             Self::Engine(EngineError::Database(_)) => "query execution failed".to_owned(),
             Self::Internal(_) => "internal error".to_owned(),
             Self::Ingest(_) => "ingest error".to_owned(),
+            Self::BadRequest(_) => "bad request".to_owned(),
+            Self::NotFound(_) => "not found".to_owned(),
             Self::RateLimited => "rate limit exceeded".to_owned(),
             other => other.to_string(),
         }
@@ -67,8 +77,9 @@ impl IntoResponse for ServerError {
             ),
             // Auth errors are deliberately opaque.
             Self::Auth(_) => (StatusCode::UNAUTHORIZED, "authentication failed".to_owned()),
-            Self::Ingest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            Self::Ingest(msg) | Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "query timed out".to_owned()),
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,

@@ -12,7 +12,7 @@ use axum::extract::Request;
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware;
 use axum::response::Response;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
@@ -59,6 +59,14 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/queries/{id}", delete(handlers::cancel_query))
         .route("/stats", get(handlers::stats))
         .route("/history", get(handlers::history))
+        .route(
+            "/saved",
+            get(handlers::list_saved).post(handlers::create_saved),
+        )
+        .route(
+            "/saved/{id}",
+            put(handlers::update_saved).delete(handlers::delete_saved),
+        )
         .layer(middleware::from_fn(rate_limit_middleware))
         .layer(middleware::from_fn(auth_middleware))
         .layer(RequestBodyLimitLayer::new(max_body));

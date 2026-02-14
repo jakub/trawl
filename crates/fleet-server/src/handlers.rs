@@ -3,6 +3,7 @@
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use fleet_auth::HistoryEntry;
+use fleet_auth::SavedQuery;
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
 use fleet_engine::value::{QueryResult, SchemaColumn};
@@ -589,6 +590,178 @@ impl From<HistoryEntry> for HistoryEntryResponse {
             duration_ms: entry.duration_ms,
             row_count: entry.row_count,
             status: entry.status,
+        }
+    }
+}
+
+/// `GET /api/v1/saved` — list user's saved queries.
+pub async fn list_saved(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<ListSavedResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::Query) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = state
+        .auth
+        .key_store
+        .lock()
+        .get_key_id_by_prefix(&verified.prefix)
+        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+
+    let queries = state
+        .auth
+        .saved
+        .lock()
+        .list(key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to list saved queries: {e}")))?;
+
+    Ok(Json(ListSavedResponse {
+        queries: queries.into_iter().map(SavedQueryResponse::from).collect(),
+    }))
+}
+
+/// `POST /api/v1/saved` — create a new saved query.
+pub async fn create_saved(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Json(req): Json<CreateSavedRequest>,
+) -> Result<Json<SavedQueryResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::Query) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = state
+        .auth
+        .key_store
+        .lock()
+        .get_key_id_by_prefix(&verified.prefix)
+        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+
+    let saved = state
+        .auth
+        .saved
+        .lock()
+        .create(key_id, &req.name, &req.query)
+        .map_err(|e| match e {
+            fleet_auth::AuthError::DuplicateName { name } => {
+                ServerError::BadRequest(format!("a saved query named '{name}' already exists"))
+            }
+            e => ServerError::Internal(format!("failed to create saved query: {e}")),
+        })?;
+
+    Ok(Json(SavedQueryResponse::from(saved)))
+}
+
+/// `PUT /api/v1/saved/{id}` — update an existing saved query.
+pub async fn update_saved(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateSavedRequest>,
+) -> Result<Json<SavedQueryResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::Query) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = state
+        .auth
+        .key_store
+        .lock()
+        .get_key_id_by_prefix(&verified.prefix)
+        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+
+    let saved = state
+        .auth
+        .saved
+        .lock()
+        .update(id, key_id, &req.query)
+        .map_err(|e| match e {
+            fleet_auth::AuthError::NotFound { .. } => {
+                ServerError::NotFound("saved query not found or unauthorized".into())
+            }
+            e => ServerError::Internal(format!("failed to update saved query: {e}")),
+        })?;
+
+    Ok(Json(SavedQueryResponse::from(saved)))
+}
+
+/// `DELETE /api/v1/saved/{id}` — delete a saved query.
+pub async fn delete_saved(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path(id): Path<i64>,
+) -> Result<Json<DeleteSavedResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::Query) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = state
+        .auth
+        .key_store
+        .lock()
+        .get_key_id_by_prefix(&verified.prefix)
+        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+
+    state
+        .auth
+        .saved
+        .lock()
+        .delete(id, key_id)
+        .map_err(|e| match e {
+            fleet_auth::AuthError::NotFound { .. } => {
+                ServerError::NotFound("saved query not found or unauthorized".into())
+            }
+            e => ServerError::Internal(format!("failed to delete saved query: {e}")),
+        })?;
+
+    Ok(Json(DeleteSavedResponse { deleted: true }))
+}
+
+/// Response for listing saved queries.
+#[derive(Debug, Serialize)]
+pub struct ListSavedResponse {
+    pub queries: Vec<SavedQueryResponse>,
+}
+
+/// Request body for creating a saved query.
+#[derive(Debug, Deserialize)]
+pub struct CreateSavedRequest {
+    pub name: String,
+    pub query: String,
+}
+
+/// Request body for updating a saved query.
+#[derive(Debug, Deserialize)]
+pub struct UpdateSavedRequest {
+    pub query: String,
+}
+
+/// A single saved query in the response.
+#[derive(Debug, Serialize)]
+pub struct SavedQueryResponse {
+    pub id: i64,
+    pub name: String,
+    pub query: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Response for deleting a saved query.
+#[derive(Debug, Serialize)]
+pub struct DeleteSavedResponse {
+    pub deleted: bool,
+}
+
+impl From<SavedQuery> for SavedQueryResponse {
+    fn from(saved: SavedQuery) -> Self {
+        Self {
+            id: saved.id,
+            name: saved.name,
+            query: saved.query,
+            created_at: saved.created_at,
+            updated_at: saved.updated_at,
         }
     }
 }

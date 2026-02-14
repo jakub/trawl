@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicU64;
 use parking_lot::Mutex;
 use std::time::Instant;
 
-use fleet_auth::{HistoryStore, KeyStore};
+use fleet_auth::{HistoryStore, KeyStore, SavedQueryStore};
 use fleet_engine::value::SchemaResult;
 
 use crate::config::{Config, RateLimitConfig};
@@ -51,13 +51,15 @@ pub struct QueryState {
     pub field_values_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedFieldValues>>>,
 }
 
-/// Authentication state: key store, history store, and database path.
+/// Authentication state: key store, history store, saved queries, and database path.
 #[derive(Debug, Clone)]
 pub struct AuthState {
     /// Shared `KeyStore` connection, opened once at startup.
     pub key_store: Arc<Mutex<KeyStore>>,
     /// Shared `HistoryStore` connection for query history persistence.
     pub history: Arc<Mutex<HistoryStore>>,
+    /// Shared `SavedQueryStore` connection for saved queries.
+    pub saved: Arc<Mutex<SavedQueryStore>>,
     /// Path to the `SQLite` auth database (kept for admin commands).
     pub db_path: Arc<PathBuf>,
 }
@@ -115,6 +117,7 @@ impl AppState {
     pub fn from_config(config: &Config) -> Result<(Self, HttpConfig), fleet_auth::AuthError> {
         let key_store = KeyStore::open(&config.auth.db_path)?;
         let history = HistoryStore::open(&config.auth.db_path)?;
+        let saved = SavedQueryStore::open(&config.auth.db_path)?;
 
         let wal_writer = if config.ingest.enabled {
             let writer = WalWriter::new(config.wal_dir());
@@ -139,6 +142,7 @@ impl AppState {
             auth: AuthState {
                 key_store: Arc::new(Mutex::new(key_store)),
                 history: Arc::new(Mutex::new(history)),
+                saved: Arc::new(Mutex::new(saved)),
                 db_path: Arc::new(config.auth.db_path.clone()),
             },
             ingest: IngestState { wal_writer },
