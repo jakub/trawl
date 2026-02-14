@@ -74,7 +74,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             .title(" Results ")
             .border_style(border_style);
 
-        let text = Line::from("no results yet — execute a query with ctrl+enter");
+        let text = Line::from("no results yet — execute a query with F5");
         let paragraph = Paragraph::new(text).block(block);
         frame.render_widget(paragraph, area);
     }

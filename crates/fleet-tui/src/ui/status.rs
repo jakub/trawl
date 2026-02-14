@@ -38,7 +38,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
 
     // Right: keybindings hint
-    let hints = " F1: help | ctrl+q: quit ";
+    let hints = " F5: execute | F1: help | ctrl+q: quit ";
 
     // Calculate padding before moving status_text.
     #[allow(clippy::cast_possible_truncation)] // Terminal width is always < u16::MAX
