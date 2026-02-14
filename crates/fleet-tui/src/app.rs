@@ -228,6 +228,11 @@ impl App {
                 }
                 return;
             }
+            // Cycle tabs: Shift+Tab
+            (KeyModifiers::SHIFT, KeyCode::BackTab) if self.tabs.len() > 1 => {
+                self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
+                return;
+            }
             _ => {}
         }
 

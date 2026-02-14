@@ -34,6 +34,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         Line::from("  Ctrl+Q      - quit"),
         Line::from("  Ctrl+T      - new tab"),
         Line::from("  Ctrl+W      - close tab"),
+        Line::from("  Shift+Tab   - cycle tabs"),
         Line::from(""),
         Line::from(Span::styled("Editor", Style::default().fg(Color::Yellow))),
         Line::from(""),
