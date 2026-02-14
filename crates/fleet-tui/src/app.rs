@@ -549,20 +549,46 @@ pub async fn run(config: &Config) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Fetch schema before starting (blocks, but only ~100ms).
+    // Fetch schema, history, and saved queries in parallel (non-blocking startup).
     tracing::info!("fetching schema, history, and saved queries");
-    let schema = client.schema().await.ok(); // Ignore errors, optional
-    let history = client.history(Some(100), None).await.ok(); // Last 100 queries
-    let saved = client.list_saved().await.ok(); // Saved queries
-    if let Some(ref s) = schema {
-        tracing::info!("schema fetched: {} columns", s.columns.len());
-    }
-    if let Some(ref h) = history {
-        tracing::info!("history fetched: {} entries", h.entries.len());
-    }
-    if let Some(ref sq) = saved {
-        tracing::info!("saved queries fetched: {} entries", sq.queries.len());
-    }
+    let (schema_result, history_result, saved_result) = tokio::join!(
+        client.schema(),
+        client.history(Some(100), None),
+        client.list_saved()
+    );
+
+    let schema = match schema_result {
+        Ok(s) => {
+            tracing::info!("schema fetched: {} columns", s.columns.len());
+            Some(s)
+        }
+        Err(e) => {
+            tracing::warn!("failed to fetch schema: {}", e);
+            None
+        }
+    };
+
+    let history = match history_result {
+        Ok(h) => {
+            tracing::info!("history fetched: {} entries", h.entries.len());
+            Some(h)
+        }
+        Err(e) => {
+            tracing::warn!("failed to fetch history: {}", e);
+            None
+        }
+    };
+
+    let saved = match saved_result {
+        Ok(sq) => {
+            tracing::info!("saved queries fetched: {} entries", sq.queries.len());
+            Some(sq)
+        }
+        Err(e) => {
+            tracing::warn!("failed to fetch saved queries: {}", e);
+            None
+        }
+    };
 
     // Create app with schema, history, and saved queries.
     let mut app = App::new(client);
