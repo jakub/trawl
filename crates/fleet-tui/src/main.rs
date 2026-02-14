@@ -31,7 +31,8 @@ struct Args {
     config: Option<String>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     color_eyre::install()?;
 
     // Set up tracing (logs to stderr, won't interfere with TUI)
