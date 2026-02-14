@@ -20,39 +20,52 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let tab = app.active_tab();
 
-    if let Some(_response) = &tab.result {
-        // TEMPORARY: Hardcoded test table to debug rendering issue
-        let header = Row::new(vec![
-            Cell::from("Test Col 1"),
-            Cell::from("Test Col 2"),
-            Cell::from("Test Col 3"),
-        ])
-        .style(
+    if let Some(response) = &tab.result {
+        let result = &response.result;
+
+        // Build table header - style the Row, not individual Cells
+        let header_cells: Vec<Cell<'_>> = result
+            .columns
+            .iter()
+            .map(|col| Cell::from(col.name.clone()))
+            .collect();
+        let header = Row::new(header_cells).style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Yellow),
         );
 
-        let rows = vec![
-            Row::new(vec![
-                Cell::from("Row 1 Val 1"),
-                Cell::from("Row 1 Val 2"),
-                Cell::from("Row 1 Val 3"),
-            ]),
-            Row::new(vec![
-                Cell::from("Row 2 Val 1"),
-                Cell::from("Row 2 Val 2"),
-                Cell::from("Row 2 Val 3"),
-            ]),
-        ];
+        // Build table rows
+        let rows: Vec<Row<'_>> = result
+            .rows
+            .iter()
+            .skip(tab.scroll_offset)
+            .take(area.height.saturating_sub(4) as usize)
+            .map(|row_data| {
+                let cells: Vec<Cell<'_>> = row_data
+                    .iter()
+                    .map(|value| Cell::from(value_to_string(value)))
+                    .collect();
+                Row::new(cells)
+            })
+            .collect();
 
-        let widths = vec![
-            Constraint::Length(15),
-            Constraint::Length(15),
-            Constraint::Length(15),
-        ];
+        // Fixed width columns
+        let widths: Vec<Constraint> = result
+            .columns
+            .iter()
+            .map(|_| Constraint::Length(15))
+            .collect();
 
-        let title = " Results (test) ".to_string();
+        let title = format!(
+            " Results ({} rows{}) ",
+            result.rows.len(),
+            if response.truncated {
+                ", truncated"
+            } else {
+                ""
+            }
+        );
 
         let block = Block::default()
             .borders(Borders::ALL)
