@@ -8,8 +8,8 @@ pub mod connection;
 pub mod error;
 
 pub use connection::{
-    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, HealthResponse, HttpClient,
-    PaginationMeta, QueriesResponse, QueryResponse, SchemaColumnResponse, SchemaResponse,
-    ValidationResponse,
+    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, HealthResponse,
+    HistoryEntryResponse, HistoryResponse, HttpClient, PaginationMeta, QueriesResponse,
+    QueryResponse, SchemaColumnResponse, SchemaResponse, ValidationResponse,
 };
 pub use error::ClientError;

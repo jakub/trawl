@@ -1,16 +1,16 @@
-//! History sidebar (F3).
+//! Query history sidebar (F3).
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use crate::app::App;
 
 /// Render the history sidebar.
-pub fn render(_app: &App, frame: &mut Frame<'_>) {
-    let area = centered_rect(60, 70, frame.area());
+pub fn render(app: &App, frame: &mut Frame<'_>) {
+    let area = centered_rect(80, 80, frame.area());
 
     frame.render_widget(Clear, area);
 
@@ -19,17 +19,90 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         .borders(Borders::ALL)
         .style(Style::default().bg(Color::Black).fg(Color::White));
 
-    let text = Line::from("query history not yet implemented");
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .alignment(Alignment::Center);
+    if let Some(history) = &app.history_cache {
+        if history.entries.is_empty() {
+            let text = Line::from("No query history yet");
+            let paragraph = Paragraph::new(text)
+                .block(block)
+                .alignment(Alignment::Center);
+            frame.render_widget(paragraph, area);
+            return;
+        }
 
-    frame.render_widget(paragraph, area);
+        // Build list of history entries
+        let items: Vec<ListItem<'_>> = history
+            .entries
+            .iter()
+            .map(|entry| {
+                // Format: "[timestamp] query (duration, rows, status)"
+                let status_style = match entry.status.as_str() {
+                    "success" => Style::default().fg(Color::Green),
+                    "error" => Style::default().fg(Color::Red),
+                    "timeout" => Style::default().fg(Color::Yellow),
+                    _ => Style::default().fg(Color::Gray),
+                };
+
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", &entry.executed_at[11..19]), // HH:MM:SS
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        truncate_query(&entry.query, 60),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!(
+                            "({}ms, {} rows, {})",
+                            entry.duration_ms, entry.row_count, entry.status
+                        ),
+                        status_style,
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+
+        let footer = Line::from(vec![
+            Span::raw("Total: "),
+            Span::styled(
+                history.total.to_string(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" queries | Showing most recent "),
+            Span::styled(
+                history.entries.len().to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]);
+
+        let list = List::new(items).block(block.title_bottom(footer).borders(Borders::ALL));
+
+        frame.render_widget(list, area);
+    } else {
+        // History not loaded
+        let text = Line::from("History not available");
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .alignment(Alignment::Center);
+
+        frame.render_widget(paragraph, area);
+    }
+}
+
+/// Truncate query string to max length with ellipsis.
+fn truncate_query(query: &str, max_len: usize) -> String {
+    if query.len() <= max_len {
+        query.to_owned()
+    } else {
+        format!("{}...", &query[..max_len.saturating_sub(3)])
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    use ratatui::layout::{Constraint, Direction, Layout};
-
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

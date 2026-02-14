@@ -5,7 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use fleet_client::{HttpClient, QueryResponse, SchemaResponse};
+use fleet_client::{HistoryResponse, HttpClient, QueryResponse, SchemaResponse};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
@@ -39,8 +39,10 @@ pub struct App {
     pub focus: Focus,
     /// Active sidebar (if any).
     pub sidebar: Option<Sidebar>,
-    /// Cached schema response (fetched on first F2 press).
+    /// Cached schema response (fetched at startup).
     pub schema_cache: Option<SchemaResponse>,
+    /// Cached history response (fetched on first F3 press).
+    pub history_cache: Option<HistoryResponse>,
     /// Whether to quit the application.
     pub should_quit: bool,
     /// Channel for receiving query results from background tasks.
@@ -61,6 +63,7 @@ impl App {
             focus: Focus::Editor,
             sidebar: None,
             schema_cache: None,
+            history_cache: None,
             should_quit: false,
             query_rx,
             query_tx,
@@ -289,15 +292,20 @@ pub async fn run(config: &Config) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Fetch schema before starting (blocks, but only ~100ms).
-    tracing::info!("fetching schema");
-    let schema = client.schema().await.ok(); // Ignore errors, schema is optional
+    tracing::info!("fetching schema and history");
+    let schema = client.schema().await.ok(); // Ignore errors, optional
+    let history = client.history(Some(100), None).await.ok(); // Last 100 queries
     if let Some(ref s) = schema {
         tracing::info!("schema fetched: {} columns", s.columns.len());
     }
+    if let Some(ref h) = history {
+        tracing::info!("history fetched: {} entries", h.entries.len());
+    }
 
-    // Create app with schema.
+    // Create app with schema and history.
     let mut app = App::new(client);
     app.schema_cache = schema;
+    app.history_cache = history;
 
     // Event loop.
     let result = run_event_loop(&mut terminal, &mut app);
