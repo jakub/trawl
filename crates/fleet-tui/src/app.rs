@@ -302,10 +302,7 @@ impl App {
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
                 let tab = self.active_tab_mut();
-                if let Some(result) = &tab.result {
-                    let max_scroll = result.result.row_count().saturating_sub(1);
-                    tab.scroll_offset = (tab.scroll_offset + 1).min(max_scroll);
-                }
+                tab.scroll_offset = tab.scroll_offset.saturating_add(1);
             }
             (KeyModifiers::NONE, KeyCode::PageUp) => {
                 let tab = self.active_tab_mut();
@@ -313,19 +310,15 @@ impl App {
             }
             (KeyModifiers::NONE, KeyCode::PageDown) => {
                 let tab = self.active_tab_mut();
-                if let Some(result) = &tab.result {
-                    let max_scroll = result.result.row_count().saturating_sub(1);
-                    tab.scroll_offset = (tab.scroll_offset + 10).min(max_scroll);
-                }
+                tab.scroll_offset = tab.scroll_offset.saturating_add(10);
             }
             (KeyModifiers::NONE, KeyCode::Home) => {
                 self.active_tab_mut().scroll_offset = 0;
             }
             (KeyModifiers::NONE, KeyCode::End) => {
                 let tab = self.active_tab_mut();
-                if let Some(result) = &tab.result {
-                    tab.scroll_offset = result.result.row_count().saturating_sub(1);
-                }
+                // Set to max value, render will clamp to proper bounds
+                tab.scroll_offset = usize::MAX;
             }
             // Horizontal scrolling
             (KeyModifiers::NONE, KeyCode::Left) => {
@@ -334,11 +327,7 @@ impl App {
             }
             (KeyModifiers::NONE, KeyCode::Right) => {
                 let tab = self.active_tab_mut();
-                if let Some(result) = &tab.result {
-                    let max_scroll = result.result.columns.len().saturating_sub(1);
-                    tab.horizontal_scroll_offset =
-                        (tab.horizontal_scroll_offset + 1).min(max_scroll);
-                }
+                tab.horizontal_scroll_offset = tab.horizontal_scroll_offset.saturating_add(1);
             }
             _ => {}
         }
