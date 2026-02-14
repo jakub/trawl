@@ -39,6 +39,11 @@ crates/
 - **cargo-nextest** for testing, **cargo-insta** for snapshot tests
 - **cargo-deny** for license/vulnerability auditing
 
+## using fleet
+
+- We are running a development server at https://localhost:5514 with a self-signed cert. You need to use the --insecure flag. 
+- Environment variables FLEET_URL (https://localhost:5514) AND FLEET_TOKEN (with an admin-scoped token) should be already set. Environment variables override the config files in ~/.config/fleet/
+
 ## docs
 
 - `docs/overview.md` — project overview and architecture thesis

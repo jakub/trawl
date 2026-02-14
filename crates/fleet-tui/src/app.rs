@@ -5,7 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use fleet_client::{HistoryResponse, HttpClient, QueryResponse, SchemaResponse};
+use fleet_client::{HistoryResponse, HttpClient, ListSavedResponse, QueryResponse, SchemaResponse};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
@@ -41,8 +41,10 @@ pub struct App {
     pub sidebar: Option<Sidebar>,
     /// Cached schema response (fetched at startup).
     pub schema_cache: Option<SchemaResponse>,
-    /// Cached history response (fetched on first F3 press).
+    /// Cached history response (fetched at startup).
     pub history_cache: Option<HistoryResponse>,
+    /// Cached saved queries (fetched at startup).
+    pub saved_cache: Option<ListSavedResponse>,
     /// Whether to quit the application.
     pub should_quit: bool,
     /// Channel for receiving query results from background tasks.
@@ -64,6 +66,7 @@ impl App {
             sidebar: None,
             schema_cache: None,
             history_cache: None,
+            saved_cache: None,
             should_quit: false,
             query_rx,
             query_tx,
@@ -292,20 +295,25 @@ pub async fn run(config: &Config) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Fetch schema before starting (blocks, but only ~100ms).
-    tracing::info!("fetching schema and history");
+    tracing::info!("fetching schema, history, and saved queries");
     let schema = client.schema().await.ok(); // Ignore errors, optional
     let history = client.history(Some(100), None).await.ok(); // Last 100 queries
+    let saved = client.list_saved().await.ok(); // Saved queries
     if let Some(ref s) = schema {
         tracing::info!("schema fetched: {} columns", s.columns.len());
     }
     if let Some(ref h) = history {
         tracing::info!("history fetched: {} entries", h.entries.len());
     }
+    if let Some(ref sq) = saved {
+        tracing::info!("saved queries fetched: {} entries", sq.queries.len());
+    }
 
-    // Create app with schema and history.
+    // Create app with schema, history, and saved queries.
     let mut app = App::new(client);
     app.schema_cache = schema;
     app.history_cache = history;
+    app.saved_cache = saved;
 
     // Event loop.
     let result = run_event_loop(&mut terminal, &mut app);
