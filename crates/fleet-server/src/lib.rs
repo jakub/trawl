@@ -11,6 +11,7 @@ pub mod handlers;
 pub mod ingest;
 pub mod pool;
 pub mod rate_limit;
+pub mod retention;
 pub mod shutdown;
 pub(crate) mod source;
 pub mod state;
