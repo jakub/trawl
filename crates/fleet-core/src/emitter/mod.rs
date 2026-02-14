@@ -15,6 +15,7 @@ use crate::ast::Query;
 use state::EmitterState;
 
 pub use state::validate_source_path;
+pub use validate::validate_pipeline;
 
 use std::fmt;
 

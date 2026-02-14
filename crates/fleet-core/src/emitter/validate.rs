@@ -57,7 +57,7 @@ const KNOWN_FUNCTIONS: &[&str] = &[
 /// messages are intentionally identical to those produced during emission
 /// so that callers see consistent diagnostics regardless of which layer
 /// catches the problem.
-pub(crate) fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError> {
+pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError> {
     for stage in stages {
         match &stage.node {
             PipeStage::Stats(s) => {

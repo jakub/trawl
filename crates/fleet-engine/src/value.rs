@@ -182,6 +182,22 @@ impl QueryResult {
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+
+    /// Apply offset/limit pagination to result rows (post-executor).
+    ///
+    /// This is a convenience method for client-side pagination. If `offset`
+    /// exceeds the number of rows, the result will be empty. The `limit` is
+    /// capped at the remaining rows after the offset.
+    #[must_use]
+    pub fn paginate(mut self, offset: usize, limit: usize) -> Self {
+        if offset >= self.rows.len() {
+            self.rows.clear();
+        } else {
+            let end = (offset + limit).min(self.rows.len());
+            self.rows = self.rows.drain(offset..end).collect();
+        }
+        self
+    }
 }
 
 // -- schema introspection types -----------------------------------------------

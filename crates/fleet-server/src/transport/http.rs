@@ -12,7 +12,7 @@ use axum::Router;
 use axum::extract::Request;
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
@@ -49,8 +49,10 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     // Query routes: body limit → auth → rate limit (axum onion: first layer = innermost).
     let authenticated = Router::new()
         .route("/query", post(handlers::query))
+        .route("/validate", post(handlers::validate_query))
         .route("/schema", get(handlers::schema))
         .route("/queries", get(handlers::queries))
+        .route("/queries/:id", delete(handlers::cancel_query))
         .layer(middleware::from_fn(rate_limit_middleware))
         .layer(middleware::from_fn(auth_middleware))
         .layer(RequestBodyLimitLayer::new(max_body));

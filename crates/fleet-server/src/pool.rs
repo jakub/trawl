@@ -271,6 +271,23 @@ impl ExecutorPool {
         }
     }
 
+    /// Cancel a specific query by ID. Returns true if the query was found
+    /// and interrupted, false if the query had already completed or the ID
+    /// was invalid.
+    pub fn cancel_by_id(&self, query_id: u64) -> bool {
+        if let Some(callback) = self.active_interrupts.lock().remove(&query_id) {
+            callback();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get the configured maximum result rows limit.
+    pub fn max_result_rows(&self) -> usize {
+        self.max_result_rows
+    }
+
     /// Introspect the data source schema.
     ///
     /// Uses a fresh connection rather than a pooled executor since schema

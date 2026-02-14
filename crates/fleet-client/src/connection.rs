@@ -88,9 +88,23 @@ impl HttpClient {
 
     /// Execute a DSL query against the daemon.
     pub async fn query(&self, dsl: &str) -> Result<QueryResult, ClientError> {
+        // Use query_paginated with no limits for backward compatibility.
+        let response = self.query_paginated(dsl, None, None).await?;
+        Ok(response.result)
+    }
+
+    /// Execute a DSL query with optional pagination.
+    pub async fn query_paginated(
+        &self,
+        dsl: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<QueryResponse, ClientError> {
         let url = self.endpoint("/api/v1/query");
-        let body = QueryRequest {
+        let body = QueryRequestPaginated {
             query: dsl.to_owned(),
+            limit,
+            offset,
         };
         let req = self.client.post(&url).json(&body);
         self.send_authenticated(req).await
@@ -123,6 +137,24 @@ impl HttpClient {
     pub async fn queries(&self) -> Result<QueriesResponse, ClientError> {
         let url = self.endpoint("/api/v1/queries");
         let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Cancel a running query by ID (admin or owner only).
+    pub async fn cancel_query(&self, query_id: u64) -> Result<CancelResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/queries/{query_id}"));
+        let req = self.client.delete(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Validate a DSL query without executing it.
+    ///
+    /// Checks syntax and semantic rules (function names, arity, regex patterns)
+    /// but does NOT validate field existence.
+    pub async fn validate(&self, dsl: &str) -> Result<ValidationResponse, ClientError> {
+        let url = self.endpoint("/api/v1/validate");
+        let body = serde_json::json!({ "query": dsl });
+        let req = self.client.post(&url).json(&body);
         self.send_authenticated(req).await
     }
 
@@ -178,11 +210,6 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
 }
 
 // -- wire types --------------------------------------------------------------
-
-#[derive(Serialize)]
-struct QueryRequest {
-    query: String,
-}
 
 #[derive(Deserialize)]
 struct ErrorResponse {
@@ -260,6 +287,58 @@ pub struct CompletedQuerySnapshot {
     pub timed_out: bool,
 }
 
+/// Response from the cancel query endpoint.
+#[derive(Debug, Deserialize)]
+pub struct CancelResponse {
+    /// Whether the query was found and cancelled.
+    pub cancelled: bool,
+    /// The query ID that was requested for cancellation.
+    pub query_id: u64,
+}
+
+/// Response from the validate endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ValidationResponse {
+    /// Whether the query is valid.
+    pub valid: bool,
+    /// Validation error messages (empty if valid).
+    pub errors: Vec<String>,
+}
+
+/// Query response with pagination metadata.
+#[derive(Debug, Deserialize)]
+pub struct QueryResponse {
+    /// The query result (columns + rows).
+    #[serde(flatten)]
+    pub result: QueryResult,
+    /// Whether results were truncated due to `max_result_rows`.
+    pub truncated: bool,
+    /// Pagination metadata.
+    pub pagination: PaginationMeta,
+}
+
+/// Pagination metadata for query responses.
+#[derive(Debug, Deserialize)]
+pub struct PaginationMeta {
+    /// The limit applied to this response.
+    pub limit: usize,
+    /// The offset applied to this response.
+    pub offset: usize,
+    /// The number of rows actually returned.
+    pub returned: usize,
+}
+
+// -- internal request types --------------------------------------------------
+
+#[derive(Serialize)]
+struct QueryRequestPaginated {
+    query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,15 +402,32 @@ mod tests {
         let _ = client; // ensure client builds
     }
 
-    // ── serde: QueryRequest ─────────────────────────────────────────────
+    // ── serde: QueryRequestPaginated ────────────────────────────────────
 
     #[test]
-    fn query_request_serializes() {
-        let req = QueryRequest {
+    fn query_request_paginated_serializes() {
+        let req = QueryRequestPaginated {
             query: "service:nginx | stats count()".to_string(),
+            limit: Some(10),
+            offset: Some(5),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["query"], "service:nginx | stats count()");
+        assert_eq!(json["limit"], 10);
+        assert_eq!(json["offset"], 5);
+    }
+
+    #[test]
+    fn query_request_paginated_omits_none() {
+        let req = QueryRequestPaginated {
+            query: "service:nginx".to_string(),
+            limit: None,
+            offset: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["query"], "service:nginx");
+        assert!(json.get("limit").is_none());
+        assert!(json.get("offset").is_none());
     }
 
     // ── serde: HealthResponse ────────────────────────────────────────────
