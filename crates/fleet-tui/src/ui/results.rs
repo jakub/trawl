@@ -48,15 +48,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 })
                 .collect();
 
-        // Calculate column widths - use fixed minimum width to prevent truncation.
-        // With many columns, percentage-based widths become too narrow (e.g., 2% = 2 chars).
+        // Calculate column widths - use fixed length to prevent ratatui layout issues.
+        // With many columns, Min constraints can cause layout engine to lock up.
         let widths: Vec<Constraint> = result
             .columns
             .iter()
-            .map(|col| {
-                // Give each column at least 10 chars, or length of column name + 2.
-                let min_width = col.name.len().max(10) as u16 + 2;
-                Constraint::Min(min_width)
+            .map(|_col| {
+                // Fixed width per column (table will be horizontally scrollable).
+                Constraint::Length(15)
             })
             .collect();
 
