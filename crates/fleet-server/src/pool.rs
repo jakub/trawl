@@ -297,11 +297,12 @@ impl ExecutorPool {
 
     /// Get the total pool capacity (max concurrent queries).
     pub fn capacity(&self) -> usize {
-        // Semaphore doesn't expose max permits, so we store it.
-        // For now, we can use available_permits() when pool is idle,
-        // but we should actually store max_concurrent at construction.
-        // Let me check the struct definition.
         self.max_concurrent
+    }
+
+    /// Get the fallback glob pattern for queries.
+    pub fn fallback_glob(&self) -> &Arc<str> {
+        &self.fallback_glob
     }
 
     /// Introspect the data source schema.

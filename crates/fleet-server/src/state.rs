@@ -1,5 +1,6 @@
 //! Shared application state for axum handlers.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -46,6 +47,8 @@ pub struct QueryState {
     /// Uses `Mutex` (not `RwLock`) to prevent thundering herd: only one
     /// request refreshes the cache while others wait on the lock.
     pub schema_cache: Arc<tokio::sync::Mutex<Option<CachedSchema>>>,
+    /// Cached field value samples for autocomplete (shared TTL with schema cache).
+    pub field_values_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedFieldValues>>>,
 }
 
 /// Authentication state: key store and database path.
@@ -93,6 +96,15 @@ pub struct CachedSchema {
     pub cached_at: Instant,
 }
 
+/// A cached field value sample with an expiry timestamp.
+#[derive(Debug, Clone)]
+pub struct CachedFieldValues {
+    /// Sampled distinct values for the field.
+    pub values: Vec<String>,
+    /// When this cache entry was created.
+    pub cached_at: Instant,
+}
+
 impl AppState {
     /// Construct app state from a validated [`Config`].
     ///
@@ -119,6 +131,7 @@ impl AppState {
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
                 schema_cache_ttl_secs: config.server.schema_cache_ttl_secs,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
+                field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             },
             auth: AuthState {
                 key_store: Arc::new(Mutex::new(key_store)),

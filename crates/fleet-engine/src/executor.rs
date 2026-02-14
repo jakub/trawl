@@ -139,6 +139,59 @@ impl Executor {
             file_count: u64::try_from(file_count).unwrap_or(0),
         })
     }
+
+    /// Sample distinct values for a field (for autocomplete).
+    ///
+    /// Returns up to `limit` distinct values for the specified field, ordered
+    /// lexicographically. Only string values are returned; numeric/timestamp
+    /// fields are skipped.
+    ///
+    /// # Security
+    ///
+    /// The field name is validated to prevent SQL injection. Only alphanumeric
+    /// characters, underscores, and dots are allowed.
+    pub fn sample_field_values(
+        &self,
+        source: &str,
+        field: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, EngineError> {
+        // Validate field name to prevent SQL injection.
+        if !field
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        {
+            return Err(EngineError::Emit(
+                fleet_core::emitter::EmitError::UnsupportedOperation {
+                    message: format!("invalid field name: {field}"),
+                },
+            ));
+        }
+
+        fleet_core::emitter::validate_source_path(source)?;
+
+        // Use DuckDB identifier quoting for safety.
+        let sql = format!(
+            r#"SELECT DISTINCT "{field}" FROM read_parquet(?, union_by_name=true)
+               WHERE "{field}" IS NOT NULL
+               ORDER BY 1
+               LIMIT ?"#
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut rows = stmt.query(duckdb::params![source, limit_i64])?;
+
+        let mut values = Vec::new();
+        while let Some(row) = rows.next()? {
+            // Only return string values (skip numeric/timestamp fields).
+            if let Ok(val) = row.get::<_, String>(0) {
+                values.push(val);
+            }
+        }
+
+        Ok(values)
+    }
 }
 
 /// Check if a `DuckDB` error is the "No files found" error from `read_parquet()`

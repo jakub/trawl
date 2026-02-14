@@ -1,6 +1,6 @@
 //! HTTP request handlers for the fleet API.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
@@ -8,7 +8,7 @@ use fleet_engine::value::{QueryResult, SchemaColumn};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
-use crate::state::{AppState, CachedSchema};
+use crate::state::{AppState, CachedFieldValues, CachedSchema};
 
 // -- request/response types --------------------------------------------------
 
@@ -427,4 +427,74 @@ pub struct StatsResponse {
     pub active_queries: usize,
     pub pool_available: usize,
     pub pool_capacity: usize,
+}
+
+/// `GET /api/v1/schema/values/{field}` — sample distinct values for autocomplete.
+pub async fn field_values(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path(field): Path<String>,
+    Query(params): Query<FieldValuesParams>,
+) -> Result<Json<FieldValuesResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let limit = params.limit.unwrap_or(10).min(100); // cap at 100
+    let cache_ttl = state.query.schema_cache_ttl_secs;
+
+    // Check cache.
+    {
+        let cache = state.query.field_values_cache.lock().await;
+        if let Some(cached) = cache.get(&field) {
+            if cached.cached_at.elapsed().as_secs() < cache_ttl {
+                return Ok(Json(FieldValuesResponse {
+                    field: field.clone(),
+                    values: cached.values.clone(),
+                    cached: true,
+                }));
+            }
+        }
+    }
+
+    // Cache miss — sample from parquet.
+    let glob = state.query.pool.fallback_glob().to_string();
+    let field_clone = field.clone();
+
+    let values = tokio::task::spawn_blocking(move || {
+        let executor = fleet_engine::executor::Executor::new()?;
+        executor.sample_field_values(&glob, &field_clone, limit)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("task panicked: {e}")))?
+    .map_err(ServerError::from)?;
+
+    // Update cache.
+    state.query.field_values_cache.lock().await.insert(
+        field.clone(),
+        CachedFieldValues {
+            values: values.clone(),
+            cached_at: std::time::Instant::now(),
+        },
+    );
+
+    Ok(Json(FieldValuesResponse {
+        field,
+        values,
+        cached: false,
+    }))
+}
+
+/// Query parameters for the field values endpoint.
+#[derive(Debug, Deserialize)]
+pub struct FieldValuesParams {
+    pub limit: Option<usize>,
+}
+
+/// Response for the field values endpoint.
+#[derive(Debug, Serialize)]
+pub struct FieldValuesResponse {
+    pub field: String,
+    pub values: Vec<String>,
+    pub cached: bool,
 }
