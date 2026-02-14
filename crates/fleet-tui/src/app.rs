@@ -5,7 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use fleet_client::{HttpClient, QueryResponse};
+use fleet_client::{HttpClient, QueryResponse, SchemaResponse};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
@@ -39,6 +39,8 @@ pub struct App {
     pub focus: Focus,
     /// Active sidebar (if any).
     pub sidebar: Option<Sidebar>,
+    /// Cached schema response (fetched on first F2 press).
+    pub schema_cache: Option<SchemaResponse>,
     /// Whether to quit the application.
     pub should_quit: bool,
     /// Channel for receiving query results from background tasks.
@@ -58,6 +60,7 @@ impl App {
             active_tab_idx: 0,
             focus: Focus::Editor,
             sidebar: None,
+            schema_cache: None,
             should_quit: false,
             query_rx,
             query_tx,
@@ -267,7 +270,7 @@ impl App {
 }
 
 /// Run the TUI application.
-pub fn run(config: &Config) -> Result<()> {
+pub async fn run(config: &Config) -> Result<()> {
     // Load token.
     let token = config.load_token()?;
 
@@ -285,8 +288,16 @@ pub fn run(config: &Config) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app.
+    // Fetch schema before starting (blocks, but only ~100ms).
+    tracing::info!("fetching schema");
+    let schema = client.schema().await.ok(); // Ignore errors, schema is optional
+    if let Some(ref s) = schema {
+        tracing::info!("schema fetched: {} columns", s.columns.len());
+    }
+
+    // Create app with schema.
     let mut app = App::new(client);
+    app.schema_cache = schema;
 
     // Event loop.
     let result = run_event_loop(&mut terminal, &mut app);

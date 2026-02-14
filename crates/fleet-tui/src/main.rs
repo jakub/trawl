@@ -56,5 +56,5 @@ async fn main() -> Result<()> {
     config.apply_overrides(args.url, args.token_file, args.insecure);
 
     // Run the TUI.
-    app::run(&config)
+    app::run(&config).await
 }
