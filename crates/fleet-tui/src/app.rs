@@ -86,7 +86,7 @@ impl App {
     /// Execute a query in the background.
     pub fn execute_query(&mut self) {
         let tab = self.active_tab_mut();
-        let query = tab.editor.lines().join("\n").trim().to_owned();
+        let query = tab.editor.text().trim().to_owned();
 
         if query.is_empty() {
             return;
@@ -250,9 +250,22 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.active_tab_mut().clear();
             }
-            // Pass other keys to the textarea widget.
+            // Handle text editing.
             _ => {
-                self.active_tab_mut().editor.input(key);
+                let editor = &mut self.active_tab_mut().editor;
+                match key.code {
+                    KeyCode::Char(ch) => editor.insert_char(ch),
+                    KeyCode::Enter => editor.insert_newline(),
+                    KeyCode::Backspace => editor.delete_char_before(),
+                    KeyCode::Delete => editor.delete_char_at(),
+                    KeyCode::Left => editor.move_left(),
+                    KeyCode::Right => editor.move_right(),
+                    KeyCode::Up => editor.move_up(),
+                    KeyCode::Down => editor.move_down(),
+                    KeyCode::Home => editor.move_to_line_start(),
+                    KeyCode::End => editor.move_to_line_end(),
+                    _ => {}
+                }
             }
         }
     }

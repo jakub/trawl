@@ -54,11 +54,8 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     if app.sidebar.is_none() && app.focus == Focus::Editor {
         // Show cursor in editor.
         let tab = app.active_tab();
-        let cursor = tab.editor.cursor();
+        let (row, col) = tab.editor.cursor;
         #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
-        frame.set_cursor_position((
-            chunks[1].x + cursor.1 as u16 + 1,
-            chunks[1].y + cursor.0 as u16 + 1,
-        ));
+        frame.set_cursor_position((chunks[1].x + col as u16 + 1, chunks[1].y + row as u16 + 1));
     }
 }
