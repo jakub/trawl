@@ -5,20 +5,31 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use fleet_client::HttpClient;
+use fleet_client::{HttpClient, QueryResponse};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::state::{Focus, Sidebar, Tab};
+use crate::state::{Focus, Sidebar, Tab, TabStatus};
 use crate::ui;
+
+/// Result of an async query execution.
+#[derive(Debug)]
+struct QueryResult {
+    /// Index of the tab that requested the query.
+    tab_idx: usize,
+    /// Query execution result.
+    result: Result<QueryResponse, String>,
+    /// Execution duration.
+    duration: Duration,
+}
 
 /// Main TUI application state.
 pub struct App {
     /// HTTP client for API calls.
-    #[allow(dead_code)] // Used for query execution (upcoming task)
     pub client: HttpClient,
     /// Open tabs.
     pub tabs: Vec<Tab>,
@@ -30,11 +41,17 @@ pub struct App {
     pub sidebar: Option<Sidebar>,
     /// Whether to quit the application.
     pub should_quit: bool,
+    /// Channel for receiving query results from background tasks.
+    query_rx: mpsc::UnboundedReceiver<QueryResult>,
+    /// Sender for spawning queries.
+    query_tx: mpsc::UnboundedSender<QueryResult>,
 }
 
 impl App {
     /// Create a new app with the given client.
     pub fn new(client: HttpClient) -> Self {
+        let (query_tx, query_rx) = mpsc::unbounded_channel();
+
         Self {
             client,
             tabs: vec![Tab::new(0)],
@@ -42,6 +59,8 @@ impl App {
             focus: Focus::Editor,
             sidebar: None,
             should_quit: false,
+            query_rx,
+            query_tx,
         }
     }
 
@@ -53,6 +72,74 @@ impl App {
     /// Get the currently active tab mutably.
     pub fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active_tab_idx]
+    }
+
+    /// Execute a query in the background.
+    pub fn execute_query(&mut self) {
+        let tab = self.active_tab_mut();
+        let query = tab.editor.lines().join("\n").trim().to_owned();
+
+        if query.is_empty() {
+            return;
+        }
+
+        // Update tab status to running.
+        tab.status = TabStatus::Running {
+            start: Instant::now(),
+        };
+
+        // Spawn background task to execute query.
+        let client = self.client.clone();
+        let tx = self.query_tx.clone();
+        let tab_idx = self.active_tab_idx;
+
+        tokio::spawn(async move {
+            let start = Instant::now();
+            let result = client.query(&query).await.map_err(|e| e.to_string());
+            let duration = start.elapsed();
+
+            // Convert QueryResult to QueryResponse (map the result).
+            let result = result.map(|r| QueryResponse {
+                result: r,
+                truncated: false,
+                pagination: fleet_client::PaginationMeta {
+                    limit: 0,
+                    offset: 0,
+                    returned: 0,
+                },
+            });
+
+            let _ = tx.send(QueryResult {
+                tab_idx,
+                result,
+                duration,
+            });
+        });
+    }
+
+    /// Poll for query results and update tabs.
+    pub fn poll_query_results(&mut self) {
+        while let Ok(query_result) = self.query_rx.try_recv() {
+            if query_result.tab_idx >= self.tabs.len() {
+                // Tab was closed while query was running.
+                continue;
+            }
+
+            let tab = &mut self.tabs[query_result.tab_idx];
+
+            match query_result.result {
+                Ok(response) => {
+                    tab.result = Some(response);
+                    #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
+                    let duration_ms = query_result.duration.as_millis() as u64;
+                    tab.status = TabStatus::Success { duration_ms };
+                    tab.scroll_offset = 0; // Reset scroll to top.
+                }
+                Err(message) => {
+                    tab.status = TabStatus::Error { message };
+                }
+            }
+        }
     }
 
     /// Handle a key event.
@@ -128,8 +215,7 @@ impl App {
             }
             // Execute query: Ctrl+Enter
             (KeyModifiers::CONTROL, KeyCode::Enter) => {
-                // TODO: execute query
-                tracing::info!("execute query (not yet implemented)");
+                self.execute_query();
             }
             // Clear editor: Ctrl+L
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
@@ -199,6 +285,9 @@ fn run_event_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        // Poll for query results from background tasks.
+        app.poll_query_results();
+
         // Draw UI.
         terminal.draw(|f| ui::render(app, f))?;
 
