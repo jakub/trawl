@@ -18,9 +18,16 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    // Add [LIVE] indicator if streaming
+    let title = if app.live_mode {
+        " Query Editor [LIVE] "
+    } else {
+        " Query Editor "
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Query Editor ")
+        .title(title)
         .border_style(border_style);
 
     let tab = app.active_tab();

@@ -19,8 +19,10 @@ chrono = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true }
+futures = "0.3"
 ratatui = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 shellexpand = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

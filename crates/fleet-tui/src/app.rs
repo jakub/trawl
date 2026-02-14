@@ -6,6 +6,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fleet_client::{HistoryResponse, HttpClient, ListSavedResponse, QueryResponse, SchemaResponse};
+use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
@@ -47,6 +48,10 @@ pub struct App {
     pub saved_cache: Option<ListSavedResponse>,
     /// Whether to quit the application.
     pub should_quit: bool,
+    /// Whether live tail mode is active.
+    pub live_mode: bool,
+    /// Handle to the live streaming task (if active).
+    live_task: Option<tokio::task::JoinHandle<()>>,
     /// Channel for receiving query results from background tasks.
     query_rx: mpsc::UnboundedReceiver<QueryResult>,
     /// Sender for spawning queries.
@@ -68,6 +73,8 @@ impl App {
             history_cache: None,
             saved_cache: None,
             should_quit: false,
+            live_mode: false,
+            live_task: None,
             query_rx,
             query_tx,
         }
@@ -187,6 +194,11 @@ impl App {
                 self.toggle_sidebar(Sidebar::Saved);
                 return;
             }
+            // Toggle live tail: F9
+            (KeyModifiers::NONE, KeyCode::F(9)) => {
+                self.toggle_live_mode();
+                return;
+            }
             // Close sidebar: Esc (if sidebar is open)
             (KeyModifiers::NONE, KeyCode::Esc) if self.sidebar.is_some() => {
                 self.sidebar = None;
@@ -285,6 +297,127 @@ impl App {
         } else {
             self.sidebar = Some(sidebar);
         }
+    }
+
+    /// Toggle live tail mode (F9).
+    fn toggle_live_mode(&mut self) {
+        if self.live_mode {
+            // Stop streaming
+            self.stop_live_stream();
+        } else {
+            // Start streaming
+            self.start_live_stream();
+        }
+    }
+
+    /// Start live streaming with the current query.
+    fn start_live_stream(&mut self) {
+        let query = self.active_tab().editor.text().trim().to_owned();
+
+        if query.is_empty() {
+            tracing::warn!("cannot start live stream with empty query");
+            return;
+        }
+
+        tracing::info!("starting live stream for query: {}", query);
+
+        // Cancel any existing stream
+        if let Some(task) = self.live_task.take() {
+            task.abort();
+        }
+
+        let client = self.client.clone();
+        let tx = self.query_tx.clone();
+        let tab_idx = self.active_tab_idx;
+
+        // Spawn background task to stream results
+        let task = tokio::spawn(async move {
+            tracing::info!("live stream task started");
+
+            // Start SSE stream (5 second interval)
+            let resp = match client.stream(&query, Some(5)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("failed to start stream: {}", e);
+                    let _ = tx.send(QueryResult {
+                        tab_idx,
+                        result: Err(e.to_string()),
+                        duration: Duration::from_secs(0),
+                    });
+                    return;
+                }
+            };
+
+            // Read SSE events from response body
+            let mut stream = resp.bytes_stream();
+
+            let mut buffer = String::new();
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("stream error: {}", e);
+                        break;
+                    }
+                };
+
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Parse SSE events from buffer
+                while let Some(pos) = buffer.find("\n\n") {
+                    let event_text = buffer[..pos].to_owned();
+                    buffer.drain(..pos + 2);
+
+                    // Parse event (format: "data: <json>")
+                    for line in event_text.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            // Parse JSON result
+                            match serde_json::from_str::<fleet_engine::value::QueryResult>(data) {
+                                Ok(result) => {
+                                    tracing::debug!(
+                                        "received stream result: {} rows",
+                                        result.row_count()
+                                    );
+                                    let _ = tx.send(QueryResult {
+                                        tab_idx,
+                                        result: Ok(QueryResponse {
+                                            result,
+                                            truncated: false,
+                                            pagination: fleet_client::PaginationMeta {
+                                                limit: 0,
+                                                offset: 0,
+                                                returned: 0,
+                                            },
+                                        }),
+                                        duration: Duration::from_secs(0),
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!("failed to parse stream result: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::info!("live stream task ended");
+        });
+
+        self.live_task = Some(task);
+        self.live_mode = true;
+    }
+
+    /// Stop live streaming.
+    fn stop_live_stream(&mut self) {
+        tracing::info!("stopping live stream");
+
+        if let Some(task) = self.live_task.take() {
+            task.abort();
+        }
+
+        self.live_mode = false;
     }
 }
 

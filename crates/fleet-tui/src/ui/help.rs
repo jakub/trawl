@@ -30,6 +30,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         Line::from("  F2          - toggle schema browser"),
         Line::from("  F3          - toggle query history"),
         Line::from("  F4          - toggle saved queries"),
+        Line::from("  F9          - toggle live tail mode"),
         Line::from("  Ctrl+Q      - quit"),
         Line::from("  Ctrl+T      - new tab"),
         Line::from("  Ctrl+W      - close tab"),
