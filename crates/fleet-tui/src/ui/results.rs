@@ -23,20 +23,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     if let Some(response) = &tab.result {
         let result = &response.result;
 
-        // DEBUG: Log column names to see if they're corrupted
-        tracing::info!("Column count: {}", result.columns.len());
-        for (i, col) in result.columns.iter().enumerate() {
-            tracing::info!("Column {}: {:?}", i, col.name);
-        }
-        if let Some(first_row) = result.rows.first() {
-            tracing::info!("First row value count: {}", first_row.len());
-            for (i, val) in first_row.iter().enumerate() {
-                tracing::info!("Value {}: {:?}", i, value_to_string(val));
-            }
-        }
-
-        // TEMPORARY: Only render first 5 columns to test if column count is the issue
-        let num_cols = 5.min(result.columns.len());
+        // Calculate how many columns fit on screen (assume ~20 chars per column + borders)
+        let col_width = 20;
+        let max_cols = (area.width as usize).saturating_sub(2) / col_width; // -2 for borders
+        let num_cols = max_cols.max(3).min(result.columns.len()); // Show at least 3, up to what fits
 
         let header_row = Row::new(
             result
@@ -71,8 +61,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         let widths: Vec<Constraint> = (0..num_cols).map(|_| Constraint::Length(20)).collect();
 
         let title = format!(
-            " Results ({} rows{}) ",
+            " Results ({} rows, showing {}/{} cols{}) ",
             result.rows.len(),
+            num_cols,
+            result.columns.len(),
             if response.truncated {
                 ", truncated"
             } else {
