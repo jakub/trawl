@@ -50,6 +50,14 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         Line::from("  Home/End    - jump to top/bottom"),
         Line::from(""),
         Line::from(Span::styled(
+            "Query History",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from("  ↑/↓         - navigate history"),
+        Line::from("  Enter       - load query into editor"),
+        Line::from(""),
+        Line::from(Span::styled(
             "Note: Press Esc to close any sidebar",
             Style::default().fg(Color::DarkGray),
         )),

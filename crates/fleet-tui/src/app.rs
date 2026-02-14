@@ -46,6 +46,8 @@ pub struct App {
     pub history_cache: Option<HistoryResponse>,
     /// Cached saved queries (fetched at startup).
     pub saved_cache: Option<ListSavedResponse>,
+    /// Selected index in history sidebar.
+    pub history_selected_index: usize,
     /// Whether to quit the application.
     pub should_quit: bool,
     /// Whether live tail mode is active.
@@ -72,6 +74,7 @@ impl App {
             schema_cache: None,
             history_cache: None,
             saved_cache: None,
+            history_selected_index: 0,
             should_quit: false,
             live_mode: false,
             live_task: None,
@@ -228,8 +231,13 @@ impl App {
             _ => {}
         }
 
-        // If sidebar is open, don't process focus-specific keys.
-        if self.sidebar.is_some() {
+        // If sidebar is open, handle sidebar-specific keys.
+        if let Some(sidebar) = self.sidebar {
+            if sidebar == Sidebar::History {
+                self.handle_history_key(key);
+            } else {
+                // Other sidebars don't handle keys yet
+            }
             return;
         }
 
@@ -333,11 +341,66 @@ impl App {
         }
     }
 
+    /// Handle key events when history sidebar is focused.
+    fn handle_history_key(&mut self, key: event::KeyEvent) {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                if let Some(history) = &self.history_cache {
+                    if !history.entries.is_empty() {
+                        self.history_selected_index = self.history_selected_index.saturating_sub(1);
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                if let Some(history) = &self.history_cache {
+                    if !history.entries.is_empty() {
+                        let max_index = history.entries.len().saturating_sub(1);
+                        self.history_selected_index =
+                            (self.history_selected_index + 1).min(max_index);
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                // Load selected query into editor
+                // First, extract the query string (to avoid borrow issues)
+                let query_text = self
+                    .history_cache
+                    .as_ref()
+                    .and_then(|h| h.entries.get(self.history_selected_index))
+                    .map(|entry| entry.query.clone());
+
+                if let Some(query) = query_text {
+                    let tab = self.active_tab_mut();
+                    // Clear editor and set query
+                    tab.editor.clear();
+                    // Insert the query text line by line
+                    for (i, line) in query.lines().enumerate() {
+                        if i > 0 {
+                            tab.editor.insert_newline();
+                        }
+                        for ch in line.chars() {
+                            tab.editor.insert_char(ch);
+                        }
+                    }
+                    // Move cursor to end
+                    tab.editor.move_to_line_end();
+                    // Close sidebar
+                    self.sidebar = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Toggle a sidebar (close if already open, open otherwise).
     fn toggle_sidebar(&mut self, sidebar: Sidebar) {
         if self.sidebar == Some(sidebar) {
             self.sidebar = None;
         } else {
+            // Reset selection when opening history sidebar
+            if sidebar == Sidebar::History {
+                self.history_selected_index = 0;
+            }
             self.sidebar = Some(sidebar);
         }
     }
