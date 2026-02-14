@@ -44,7 +44,10 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         Line::from(Span::styled("Results", Style::default().fg(Color::Yellow))),
         Line::from(""),
         Line::from("  Tab         - switch to editor"),
-        Line::from("  ←/→ (soon)  - scroll columns (wide tables)"),
+        Line::from("  ↑/↓         - scroll rows"),
+        Line::from("  ←/→         - scroll columns"),
+        Line::from("  PgUp/PgDn   - page up/down"),
+        Line::from("  Home/End    - jump to top/bottom"),
         Line::from(""),
         Line::from(Span::styled(
             "Note: Press Esc to close any sidebar",

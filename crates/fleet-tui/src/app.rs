@@ -161,7 +161,8 @@ impl App {
                     #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
                     let duration_ms = query_result.duration.as_millis() as u64;
                     tab.status = TabStatus::Success { duration_ms };
-                    tab.scroll_offset = 0; // Reset scroll to top.
+                    tab.scroll_offset = 0; // Reset vertical scroll to top.
+                    tab.horizontal_scroll_offset = 0; // Reset horizontal scroll to left.
                 }
                 Err(message) => {
                     tab.status = TabStatus::Error { message };
@@ -289,10 +290,58 @@ impl App {
 
     /// Handle key events when results are focused.
     fn handle_results_key(&mut self, key: event::KeyEvent) {
-        if let (KeyModifiers::NONE, KeyCode::Tab) = (key.modifiers, key.code) {
-            self.focus = Focus::Editor;
+        match (key.modifiers, key.code) {
+            // Switch back to editor
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.focus = Focus::Editor;
+            }
+            // Vertical scrolling
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                let tab = self.active_tab_mut();
+                tab.scroll_offset = tab.scroll_offset.saturating_sub(1);
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                let tab = self.active_tab_mut();
+                if let Some(result) = &tab.result {
+                    let max_scroll = result.result.row_count().saturating_sub(1);
+                    tab.scroll_offset = (tab.scroll_offset + 1).min(max_scroll);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::PageUp) => {
+                let tab = self.active_tab_mut();
+                tab.scroll_offset = tab.scroll_offset.saturating_sub(10);
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) => {
+                let tab = self.active_tab_mut();
+                if let Some(result) = &tab.result {
+                    let max_scroll = result.result.row_count().saturating_sub(1);
+                    tab.scroll_offset = (tab.scroll_offset + 10).min(max_scroll);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Home) => {
+                self.active_tab_mut().scroll_offset = 0;
+            }
+            (KeyModifiers::NONE, KeyCode::End) => {
+                let tab = self.active_tab_mut();
+                if let Some(result) = &tab.result {
+                    tab.scroll_offset = result.result.row_count().saturating_sub(1);
+                }
+            }
+            // Horizontal scrolling
+            (KeyModifiers::NONE, KeyCode::Left) => {
+                let tab = self.active_tab_mut();
+                tab.horizontal_scroll_offset = tab.horizontal_scroll_offset.saturating_sub(1);
+            }
+            (KeyModifiers::NONE, KeyCode::Right) => {
+                let tab = self.active_tab_mut();
+                if let Some(result) = &tab.result {
+                    let max_scroll = result.result.columns.len().saturating_sub(1);
+                    tab.horizontal_scroll_offset =
+                        (tab.horizontal_scroll_offset + 1).min(max_scroll);
+                }
+            }
+            _ => {}
         }
-        // TODO: scroll, filter, export, etc.
     }
 
     /// Toggle a sidebar (close if already open, open otherwise).

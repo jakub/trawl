@@ -190,8 +190,10 @@ pub struct Tab {
     pub editor: SimpleEditor,
     /// Last query result (if any).
     pub result: Option<QueryResponse>,
-    /// Vertical scroll offset in results pane.
+    /// Vertical scroll offset in results pane (row index).
     pub scroll_offset: usize,
+    /// Horizontal scroll offset in results pane (column index).
+    pub horizontal_scroll_offset: usize,
     /// Current query status.
     pub status: TabStatus,
 }
@@ -204,6 +206,7 @@ impl Tab {
             editor: SimpleEditor::new(),
             result: None,
             scroll_offset: 0,
+            horizontal_scroll_offset: 0,
             status: TabStatus::Idle,
         }
     }
@@ -213,6 +216,7 @@ impl Tab {
         self.editor.clear();
         self.result = None;
         self.scroll_offset = 0;
+        self.horizontal_scroll_offset = 0;
         self.status = TabStatus::Idle;
     }
 }
