@@ -115,15 +115,21 @@ sort -count                     # descending
 sort status, -count             # multi-field
 ```
 
-**limit** — cap result count
+**limit** / **head** — cap result count
 ```
 limit 20
+head 20                          # SPL alias for limit
 ```
 
-**table** — select output columns
+**tail** — last N rows (defaults to timestamp DESC if no prior sort)
+```
+tail 5
+```
+
+**table** / **fields** — select output columns
 ```
 table host, status
-table status, avg_duration
+fields host, status              # SPL alias for table
 ```
 
 **top** — most frequent values
@@ -144,25 +150,31 @@ drop message
 drop host, raw
 ```
 
-**let** — computed/derived fields
+**let** / **eval** — computed/derived fields
 ```
 let duration_ms = duration * 1000
-let status_class = status / 100
+eval status_class = status / 100 # SPL alias for let
 let is_error = status >= 400
 ```
 
-**extract** — field extraction
+**extract** / **rex** — field extraction
 
 regex (named groups):
 ```
 extract "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message
-extract "(?P<code>[A-Z]+)" from raw
+rex "(?P<code>[A-Z]+)" from raw  # SPL alias for extract
 ```
 
 key-value pairs:
 ```
 extract kv                      # from 'message' field
 extract kv from raw             # from specific field
+```
+
+**rename** — rename columns
+```
+rename service as svc
+rename service as svc, host as hostname
 ```
 
 **dedup** — remove duplicates (keeps most recent)
@@ -187,7 +199,7 @@ pivot avg(duration) on service by host
 
 ### expressions (in `where`, `let`, aggregations)
 
-**literals**: `42`, `3.14`, `"string"`, `true`, `false`, `null`
+**literals**: `42`, `1.5`, `"string"`, `true`, `false`, `null`
 
 **field refs**: `host`, `host.name`, `@timestamp`
 
@@ -222,8 +234,35 @@ pivot avg(duration) on service by host
 - `p95(field)` — 95th percentile
 - `p99(field)` — 99th percentile
 
-**string functions** (in expressions)
-- `lower(field)` — lowercase conversion
+**positional / collection**
+- `first(field)` — first value
+- `last(field)` — last value
+- `values(field)` / `list(field)` — list of distinct values
+- `median(field)` — median value
+- `stddev(field)` — standard deviation
+
+### scalar functions (in `let`/`eval`, `where`, expressions)
+
+**string**
+- `lower(field)` — lowercase
+- `upper(field)` — uppercase
+- `length(field)` / `len(field)` — string length
+- `trim(field)` / `ltrim(field)` / `rtrim(field)` — whitespace trimming
+- `replace(field, old, new)` — string replacement
+- `substr(field, start[, len])` — substring extraction
+
+**numeric**
+- `abs(x)` — absolute value
+- `ceil(x)` / `ceiling(x)` — round up
+- `floor(x)` — round down
+- `round(x[, n])` — round to n decimal places
+
+**conditional / type**
+- `if(cond, then, else)` — ternary conditional
+- `isnull(x)` / `isnotnull(x)` — null checks
+- `coalesce(a, b, ...)` — first non-null value
+- `typeof(x)` — value type name
+- `now()` — current timestamp
 
 ### example queries
 
@@ -232,13 +271,13 @@ pivot avg(duration) on service by host
 level:error last:1h | stats count() by service | sort -count
 
 # slow requests by endpoint
-status:200 last:24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | limit 10
+status:200 last:24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10
 
 # 4xx/5xx rate by host
 status:>=400 last:2h | stats count() by host, status | where count > 10
 
 # extract IPs and count
-"connection from" | extract "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message | stats count() by ip | sort -count
+"connection from" | rex "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message | stats count() by ip | sort -count
 
 # time series of error rate
 level:error OR level:fatal | timechart span=5m count() by service
@@ -248,4 +287,13 @@ service:monitoring | dedup host, alert_name
 
 # pivot status codes by host
 last:1h | pivot count() on status by host
+
+# last 5 events with renamed columns
+* | rename service as svc, host as hostname | tail 5
+
+# conditional field + null handling
+* | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10
+
+# distinct values per group
+* | stats values(level), first(message) by service | head 10
 ```
