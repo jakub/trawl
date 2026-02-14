@@ -23,34 +23,35 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     if let Some(response) = &tab.result {
         let result = &response.result;
 
-        // Build table header - style the Row, not individual Cells
-        let header_cells: Vec<Cell<'_>> = result
-            .columns
-            .iter()
-            .map(|col| Cell::from(col.name.clone()))
-            .collect();
-        let header = Row::new(header_cells).style(
+        // Build table using the EXACT pattern that worked with hardcoded data
+        let header_row = Row::new(
+            result
+                .columns
+                .iter()
+                .map(|col| Cell::from(col.name.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Yellow),
         );
 
-        // Build table rows
-        let rows: Vec<Row<'_>> = result
+        let data_rows: Vec<Row<'_>> = result
             .rows
             .iter()
             .skip(tab.scroll_offset)
             .take(area.height.saturating_sub(4) as usize)
             .map(|row_data| {
-                let cells: Vec<Cell<'_>> = row_data
-                    .iter()
-                    .map(|value| Cell::from(value_to_string(value)))
-                    .collect();
-                Row::new(cells)
+                Row::new(
+                    row_data
+                        .iter()
+                        .map(|value| Cell::from(value_to_string(value)))
+                        .collect::<Vec<_>>(),
+                )
             })
             .collect();
 
-        // Fixed width columns
         let widths: Vec<Constraint> = result
             .columns
             .iter()
@@ -73,8 +74,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             .border_style(border_style);
 
         let table = Table::default()
-            .rows(rows)
-            .header(header)
+            .rows(data_rows)
+            .header(header_row)
             .block(block)
             .widths(widths);
 
@@ -93,7 +94,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 /// Convert a Value to a string for display.
-#[allow(dead_code)] // Temporarily unused during testing
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_owned(),
