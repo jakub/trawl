@@ -718,3 +718,28 @@ async fn field_values_invalid_field_name() {
     // Should reject invalid field name.
     assert_eq!(resp.status(), 400);
 }
+
+// -- request ID tests --------------------------------------------------------
+
+#[tokio::test]
+async fn response_includes_ulid_request_id() {
+    let server = setup().await;
+    let client = raw_client();
+
+    let resp = client
+        .get(format!("{}/api/v1/health", server.url))
+        .send()
+        .await
+        .unwrap();
+
+    let header = resp
+        .headers()
+        .get("x-request-id")
+        .expect("missing x-request-id header");
+    let value = header.to_str().unwrap();
+    assert_eq!(value.len(), 26, "request ID should be a 26-char ULID");
+    assert!(
+        value.chars().all(|c| c.is_ascii_alphanumeric()),
+        "request ID should be alphanumeric crockford base32"
+    );
+}

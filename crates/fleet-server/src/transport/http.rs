@@ -5,13 +5,13 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
 use axum::extract::Request;
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware;
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -25,9 +25,11 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
+use ulid::Ulid;
 
-/// Monotonic request counter for correlating events within a single request.
-static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+/// ULID-based request ID stored in request extensions for tracing and response headers.
+#[derive(Clone, Debug)]
+struct RequestId(String);
 
 use crate::auth::auth_middleware;
 use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};
@@ -109,7 +111,10 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     app.layer(
         TraceLayer::new_for_http()
             .make_span_with(|request: &axum::http::Request<_>| {
-                let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+                let request_id = request
+                    .extensions()
+                    .get::<RequestId>()
+                    .map_or("unknown", |r| r.0.as_str());
                 let peer_addr = request
                     .extensions()
                     .get::<SocketAddr>()
@@ -152,9 +157,24 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
                 },
             ),
     )
+    .layer(middleware::from_fn(request_id_middleware))
     .layer(axum::Extension(rate_state))
     .layer(axum::Extension(key_store))
     .with_state(state)
+}
+
+/// Generate a ULID request ID, stash it in extensions, and set `X-Request-Id` on the response.
+async fn request_id_middleware(mut request: Request, next: middleware::Next) -> Response {
+    let id = Ulid::new().to_string();
+    request.extensions_mut().insert(RequestId(id.clone()));
+
+    let mut response = next.run(request).await;
+
+    if let Ok(val) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-request-id", val);
+    }
+
+    response
 }
 
 #[allow(clippy::too_many_lines)] // accept loop + shutdown drain are cohesive

@@ -589,7 +589,11 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let span = tracing::info_span!("request", request_id = 7u64, peer_addr = "1.2.3.4");
+        let span = tracing::info_span!(
+            "request",
+            request_id = "01HZEXAMPLE000000000000000",
+            peer_addr = "1.2.3.4"
+        );
         let _enter = span.enter();
 
         tracing::info!(
@@ -610,7 +614,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
 
         // Span fields should be inherited.
-        assert_eq!(parsed["request_id"], 7);
+        assert_eq!(parsed["request_id"], "01HZEXAMPLE000000000000000");
         assert_eq!(parsed["peer_addr"], "1.2.3.4");
         // Event fields should also be present.
         assert_eq!(parsed["rows"], 10);
