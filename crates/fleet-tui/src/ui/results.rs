@@ -27,7 +27,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         let header_cells: Vec<Cell<'_>> = result
             .columns
             .iter()
-            .map(|col| Cell::from(col.name.as_str()).style(Style::default().fg(Color::Yellow)))
+            .map(|col| {
+                Cell::from(Line::from(col.name.as_str())).style(Style::default().fg(Color::Yellow))
+            })
             .collect();
         let header = Row::new(header_cells)
             .style(Style::default().add_modifier(Modifier::BOLD))
@@ -42,7 +44,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .map(|row_data| {
                     let cells: Vec<Cell<'_>> = row_data
                         .iter()
-                        .map(|value| Cell::from(value_to_string(value)))
+                        .map(|value| Cell::from(Line::from(value_to_string(value))))
                         .collect();
                     Row::new(cells).height(1)
                 })
@@ -74,7 +76,11 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             .title(title)
             .border_style(border_style);
 
-        let table = Table::new(rows, widths).header(header).block(block);
+        let table = Table::default()
+            .rows(rows)
+            .header(header)
+            .block(block)
+            .widths(widths);
 
         frame.render_widget(table, area);
     } else {
