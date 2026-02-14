@@ -35,11 +35,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             }
         }
 
-        // Build table using the EXACT pattern that worked with hardcoded data
+        // TEMPORARY: Only render first 5 columns to test if column count is the issue
+        let num_cols = 5.min(result.columns.len());
+
         let header_row = Row::new(
             result
                 .columns
                 .iter()
+                .take(num_cols)
                 .map(|col| Cell::from(col.name.as_str()))
                 .collect::<Vec<_>>(),
         )
@@ -58,17 +61,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 Row::new(
                     row_data
                         .iter()
+                        .take(num_cols)
                         .map(|value| Cell::from(value_to_string(value)))
                         .collect::<Vec<_>>(),
                 )
             })
             .collect();
 
-        let widths: Vec<Constraint> = result
-            .columns
-            .iter()
-            .map(|_| Constraint::Length(15))
-            .collect();
+        let widths: Vec<Constraint> = (0..num_cols).map(|_| Constraint::Length(20)).collect();
 
         let title = format!(
             " Results ({} rows{}) ",
