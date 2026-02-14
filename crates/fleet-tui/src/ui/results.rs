@@ -23,6 +23,18 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     if let Some(response) = &tab.result {
         let result = &response.result;
 
+        // DEBUG: Log column names to see if they're corrupted
+        tracing::info!("Column count: {}", result.columns.len());
+        for (i, col) in result.columns.iter().enumerate() {
+            tracing::info!("Column {}: {:?}", i, col.name);
+        }
+        if let Some(first_row) = result.rows.first() {
+            tracing::info!("First row value count: {}", first_row.len());
+            for (i, val) in first_row.iter().enumerate() {
+                tracing::info!("Value {}: {:?}", i, value_to_string(val));
+            }
+        }
+
         // Build table using the EXACT pattern that worked with hardcoded data
         let header_row = Row::new(
             result
