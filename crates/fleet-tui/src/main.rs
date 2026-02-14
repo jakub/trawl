@@ -34,10 +34,17 @@ struct Args {
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let _args = Args::parse();
+    let args = Args::parse();
 
-    // TODO: load config, create client, run TUI event loop
-    println!("fleet TUI skeleton — not yet implemented");
+    // Load config from file (or defaults).
+    let mut config = config::Config::load(args.config.as_deref())?;
 
-    Ok(())
+    // Apply environment variable overrides.
+    config.apply_env_overrides();
+
+    // Apply CLI argument overrides.
+    config.apply_overrides(args.url, args.token_file, args.insecure);
+
+    // Run the TUI.
+    app::run(&config)
 }

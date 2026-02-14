@@ -1,3 +1,219 @@
 //! TUI application state machine and event loop.
 
-// TODO: implement App struct and event loop
+use color_eyre::eyre::Result;
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use fleet_client::HttpClient;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use std::io;
+use std::time::Duration;
+
+use crate::config::Config;
+use crate::state::{Focus, Sidebar, Tab};
+use crate::ui;
+
+/// Main TUI application state.
+pub struct App {
+    /// HTTP client for API calls.
+    #[allow(dead_code)] // Used for query execution (upcoming task)
+    pub client: HttpClient,
+    /// Open tabs.
+    pub tabs: Vec<Tab>,
+    /// Index of the active tab.
+    pub active_tab_idx: usize,
+    /// Which pane has focus.
+    pub focus: Focus,
+    /// Active sidebar (if any).
+    pub sidebar: Option<Sidebar>,
+    /// Whether to quit the application.
+    pub should_quit: bool,
+}
+
+impl App {
+    /// Create a new app with the given client.
+    pub fn new(client: HttpClient) -> Self {
+        Self {
+            client,
+            tabs: vec![Tab::new(0)],
+            active_tab_idx: 0,
+            focus: Focus::Editor,
+            sidebar: None,
+            should_quit: false,
+        }
+    }
+
+    /// Get the currently active tab.
+    pub fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active_tab_idx]
+    }
+
+    /// Get the currently active tab mutably.
+    pub fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab_idx]
+    }
+
+    /// Handle a key event.
+    pub fn handle_key(&mut self, key: event::KeyEvent) {
+        // Global keybindings (work regardless of focus).
+        match (key.modifiers, key.code) {
+            // Quit: Ctrl+Q
+            (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
+                self.should_quit = true;
+                return;
+            }
+            // Toggle help: F1
+            (KeyModifiers::NONE, KeyCode::F(1)) => {
+                self.toggle_sidebar(Sidebar::Help);
+                return;
+            }
+            // Toggle schema: F2
+            (KeyModifiers::NONE, KeyCode::F(2)) => {
+                self.toggle_sidebar(Sidebar::Schema);
+                return;
+            }
+            // Toggle history: F3
+            (KeyModifiers::NONE, KeyCode::F(3)) => {
+                self.toggle_sidebar(Sidebar::History);
+                return;
+            }
+            // Toggle saved queries: F4
+            (KeyModifiers::NONE, KeyCode::F(4)) => {
+                self.toggle_sidebar(Sidebar::Saved);
+                return;
+            }
+            // Close sidebar: Esc (if sidebar is open)
+            (KeyModifiers::NONE, KeyCode::Esc) if self.sidebar.is_some() => {
+                self.sidebar = None;
+                return;
+            }
+            // New tab: Ctrl+T
+            (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
+                let new_id = self.tabs.len();
+                self.tabs.push(Tab::new(new_id));
+                self.active_tab_idx = new_id;
+                return;
+            }
+            // Close tab: Ctrl+W
+            (KeyModifiers::CONTROL, KeyCode::Char('w')) if self.tabs.len() > 1 => {
+                self.tabs.remove(self.active_tab_idx);
+                if self.active_tab_idx >= self.tabs.len() {
+                    self.active_tab_idx = self.tabs.len() - 1;
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // If sidebar is open, don't process focus-specific keys.
+        if self.sidebar.is_some() {
+            return;
+        }
+
+        // Focus-specific keybindings.
+        match self.focus {
+            Focus::Editor => self.handle_editor_key(key),
+            Focus::Results => self.handle_results_key(key),
+        }
+    }
+
+    /// Handle key events when editor is focused.
+    fn handle_editor_key(&mut self, key: event::KeyEvent) {
+        match (key.modifiers, key.code) {
+            // Switch to results: Tab
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.focus = Focus::Results;
+            }
+            // Execute query: Ctrl+Enter
+            (KeyModifiers::CONTROL, KeyCode::Enter) => {
+                // TODO: execute query
+                tracing::info!("execute query (not yet implemented)");
+            }
+            // Clear editor: Ctrl+L
+            (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
+                self.active_tab_mut().clear();
+            }
+            // Pass other keys to the textarea widget.
+            _ => {
+                self.active_tab_mut().editor.input(key);
+            }
+        }
+    }
+
+    /// Handle key events when results are focused.
+    fn handle_results_key(&mut self, key: event::KeyEvent) {
+        if let (KeyModifiers::NONE, KeyCode::Tab) = (key.modifiers, key.code) {
+            self.focus = Focus::Editor;
+        }
+        // TODO: scroll, filter, export, etc.
+    }
+
+    /// Toggle a sidebar (close if already open, open otherwise).
+    fn toggle_sidebar(&mut self, sidebar: Sidebar) {
+        if self.sidebar == Some(sidebar) {
+            self.sidebar = None;
+        } else {
+            self.sidebar = Some(sidebar);
+        }
+    }
+}
+
+/// Run the TUI application.
+pub fn run(config: &Config) -> Result<()> {
+    // Load token.
+    let token = config.load_token()?;
+
+    // Create HTTP client.
+    let client = if config.server.insecure {
+        HttpClient::new_insecure(&config.server.url, token)?
+    } else {
+        HttpClient::new(&config.server.url, token)?
+    };
+
+    // Set up terminal.
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app.
+    let mut app = App::new(client);
+
+    // Event loop.
+    let result = run_event_loop(&mut terminal, &mut app);
+
+    // Restore terminal.
+    disable_raw_mode()?;
+    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+/// Main event loop.
+fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    loop {
+        // Draw UI.
+        terminal.draw(|f| ui::render(app, f))?;
+
+        // Poll for events (100ms timeout).
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                app.handle_key(key);
+            }
+        }
+
+        // Check quit flag.
+        if app.should_quit {
+            break;
+        }
+    }
+
+    Ok(())
+}
