@@ -37,13 +37,18 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         Line::from(Span::styled("Editor", Style::default().fg(Color::Yellow))),
         Line::from(""),
         Line::from("  Tab         - switch to results"),
-        Line::from("  Ctrl+Enter  - execute query"),
+        Line::from("  F5          - execute query"),
         Line::from("  Ctrl+L      - clear editor"),
         Line::from(""),
         Line::from(Span::styled("Results", Style::default().fg(Color::Yellow))),
         Line::from(""),
         Line::from("  Tab         - switch to editor"),
+        Line::from("  ←/→ (soon)  - scroll columns (wide tables)"),
         Line::from(""),
+        Line::from(Span::styled(
+            "Note: Press Esc to close any sidebar",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     let paragraph = Paragraph::new(help_text)
