@@ -18,7 +18,7 @@ struct Args {
     #[arg(short, long, env = "FLEET_URL")]
     url: Option<String>,
 
-    /// API token file (default: ~/.config/fleet/token)
+    /// API token file (default: ~/.config/fleet/token, or use `FLEET_TOKEN` env var)
     #[arg(short = 'k', long, env = "FLEET_TOKEN_FILE")]
     token_file: Option<String>,
 

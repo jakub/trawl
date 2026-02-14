@@ -169,8 +169,14 @@ impl Config {
         PathBuf::from(expanded.as_ref())
     }
 
-    /// Load the API token from the token file.
+    /// Load the API token from the token file or `FLEET_TOKEN` env var.
     pub fn load_token(&self) -> Result<String> {
+        // Check env var first (takes precedence over file).
+        if let Ok(token) = std::env::var("FLEET_TOKEN") {
+            return Ok(token.trim().to_owned());
+        }
+
+        // Fall back to token file.
         let path = self.token_path();
         let token = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read token from {}", path.display()))?;
