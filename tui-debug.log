@@ -1,78 +1,179 @@
-   Compiling hyper v1.8.1
-   Compiling tower v0.5.3
-   Compiling tokio-util v0.7.18
-   Compiling tokio-rustls v0.26.4
-   Compiling tower-http v0.6.8
-   Compiling h2 v0.4.13
-   Compiling hyper-util v0.1.20
-   Compiling hyper-rustls v0.27.7
-   Compiling reqwest v0.12.28
-   Compiling libduckdb-sys v1.4.4
-   Compiling duckdb v1.4.4
-   Compiling fleet-engine v0.1.0 (/Users/jakub/code/fleet/crates/fleet-engine)
-   Compiling fleet-client v0.1.0 (/Users/jakub/code/fleet/crates/fleet-client)
    Compiling fleet-tui v0.1.0 (/Users/jakub/code/fleet/crates/fleet-tui)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 37s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.15s
      Running `target/debug/fleet-tui --insecure`
-[2m2026-02-14T23:06:33.271946Z[0m [34mDEBUG[0m [2mfleet_tui::config[0m[2m:[0m config file not found at /Users/jakub/.config/fleet/config.toml, using defaults
-[2m2026-02-14T23:06:33.273996Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m fetching schema, history, and saved queries
-[2m2026-02-14T23:06:34.522809Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m schema fetched: 59 columns
-[2m2026-02-14T23:06:34.522860Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m history fetched: 12 entries
-[2m2026-02-14T23:06:34.522869Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved queries fetched: 0 entries
-[2m2026-02-14T23:06:35.446384Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 10
-[2m2026-02-14T23:06:36.470692Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 20
-[2m2026-02-14T23:06:37.496817Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 30
-[2m2026-02-14T23:06:38.521408Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 40
-[2m2026-02-14T23:06:39.549414Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 50
-[2m2026-02-14T23:06:40.574270Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 60
-[2m2026-02-14T23:06:41.600247Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 70
-[2m2026-02-14T23:06:42.624841Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 80
-[2m2026-02-14T23:06:43.649411Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 90
-[2m2026-02-14T23:06:43.728550Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
-[2m2026-02-14T23:06:43.904935Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:06:43.955600Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('r')
-[2m2026-02-14T23:06:44.146564Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('v')
-[2m2026-02-14T23:06:44.237096Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('i')
-[2m2026-02-14T23:06:44.358444Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('c')
-[2m2026-02-14T23:06:44.421401Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:06:44.421464Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 100
-[2m2026-02-14T23:06:44.662953Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(':')
-[2m2026-02-14T23:06:44.975102Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('f')
-[2m2026-02-14T23:06:45.061097Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
-[2m2026-02-14T23:06:45.160813Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:06:45.263139Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 110
-[2m2026-02-14T23:06:45.320099Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:06:45.388333Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
-[2m2026-02-14T23:06:45.746584Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('d')
-[2m2026-02-14T23:06:46.157233Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 120
-[2m2026-02-14T23:06:46.483436Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
-[2m2026-02-14T23:06:47.099330Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 130
-[2m2026-02-14T23:06:47.575637Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('|')
-[2m2026-02-14T23:06:48.088937Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 140
-[2m2026-02-14T23:06:48.285012Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
-[2m2026-02-14T23:06:48.543219Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('h')
-[2m2026-02-14T23:06:48.611707Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:06:48.669400Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
-[2m2026-02-14T23:06:48.762310Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('d')
-[2m2026-02-14T23:06:48.813075Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
-[2m2026-02-14T23:06:48.915730Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 150
-[2m2026-02-14T23:06:48.994792Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('1')
-[2m2026-02-14T23:06:49.069573Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('0')
-[2m2026-02-14T23:06:49.891968Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 160
-[2m2026-02-14T23:06:50.918990Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 170
-[2m2026-02-14T23:06:51.947256Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 180
-[2m2026-02-14T23:06:52.973451Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 190
-[2m2026-02-14T23:06:53.999424Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 200
-[2m2026-02-14T23:06:55.025430Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 210
-[2m2026-02-14T23:06:55.835131Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=F(5)
-[2m2026-02-14T23:06:55.835192Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m executing query with F5
-[2m2026-02-14T23:06:55.835320Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m background task started for query: service:fleetd | head 10
-[2m2026-02-14T23:06:56.040546Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 220
-[2m2026-02-14T23:06:57.065981Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 230
-[2m2026-02-14T23:06:58.091013Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 240
-[2m2026-02-14T23:06:58.796912Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m query completed in 2.961540334s, result: true
-[2m2026-02-14T23:06:58.809792Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
-[2m2026-02-14T23:06:59.122605Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 250
-[2m2026-02-14T23:06:59.717068Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Tab
-[2m2026-02-14T23:07:00.071303Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 260
-[2m2026-02-14T23:07:00.985927Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 270
+[2m2026-02-14T23:08:22.673928Z[0m [34mDEBUG[0m [2mfleet_tui::config[0m[2m:[0m config file not found at /Users/jakub/.config/fleet/config.toml, using defaults
+[2m2026-02-14T23:08:22.676093Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m fetching schema, history, and saved queries
+[2m2026-02-14T23:08:23.711631Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m schema fetched: 60 columns
+[2m2026-02-14T23:08:23.711689Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m history fetched: 15 entries
+[2m2026-02-14T23:08:23.711697Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved queries fetched: 0 entries
+[2m2026-02-14T23:08:24.635614Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 10
+[2m2026-02-14T23:08:25.660973Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 20
+[2m2026-02-14T23:08:26.655522Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 30
+[2m2026-02-14T23:08:27.647159Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 40
+[2m2026-02-14T23:08:28.666821Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 50
+[2m2026-02-14T23:08:29.521033Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 60
+[2m2026-02-14T23:08:30.432954Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 70
+[2m2026-02-14T23:08:31.191789Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 80
+[2m2026-02-14T23:08:32.155227Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 90
+[2m2026-02-14T23:08:33.210477Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 100
+[2m2026-02-14T23:08:33.261304Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
+[2m2026-02-14T23:08:33.395863Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:08:33.458708Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('r')
+[2m2026-02-14T23:08:33.616157Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('v')
+[2m2026-02-14T23:08:33.737472Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('i')
+[2m2026-02-14T23:08:33.805959Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('c')
+[2m2026-02-14T23:08:33.896735Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:08:33.896943Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 110
+[2m2026-02-14T23:08:34.229385Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(':')
+[2m2026-02-14T23:08:34.393049Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('f')
+[2m2026-02-14T23:08:34.488995Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
+[2m2026-02-14T23:08:34.567547Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:08:34.706685Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:08:34.706737Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 120
+[2m2026-02-14T23:08:35.170377Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('d')
+[2m2026-02-14T23:08:35.683530Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 130
+[2m2026-02-14T23:08:35.875040Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:08:36.017696Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:08:36.216454Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('d')
+[2m2026-02-14T23:08:36.354563Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:08:36.559092Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 140
+[2m2026-02-14T23:08:37.529134Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('|')
+[2m2026-02-14T23:08:37.529186Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 150
+[2m2026-02-14T23:08:38.584545Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 160
+[2m2026-02-14T23:08:38.913458Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:08:39.530552Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 170
+[2m2026-02-14T23:08:40.415670Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
+[2m2026-02-14T23:08:40.518327Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 180
+[2m2026-02-14T23:08:40.629082Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
+[2m2026-02-14T23:08:40.666203Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
+[2m2026-02-14T23:08:40.984883Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:08:41.079135Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:08:41.284362Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 190
+[2m2026-02-14T23:08:41.454624Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('1')
+[2m2026-02-14T23:08:41.506124Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('0')
+[2m2026-02-14T23:08:42.224668Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 200
+[2m2026-02-14T23:08:42.980435Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=F(5)
+[2m2026-02-14T23:08:42.980489Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m executing query with F5
+[2m2026-02-14T23:08:42.986902Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m background task started for query: service:fleetd | last 10
+[2m2026-02-14T23:08:43.186364Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 210
+[2m2026-02-14T23:08:43.295652Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m query completed in 308.645708ms, result: false
+[2m2026-02-14T23:08:43.390991Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:08:44.235490Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 220
+[2m2026-02-14T23:08:44.420990Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:08:44.571785Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:08:44.695808Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:08:44.827092Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:08:44.962399Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:08:44.962448Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 230
+[2m2026-02-14T23:08:45.093092Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:08:45.223101Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:08:45.585279Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:08:45.654177Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
+[2m2026-02-14T23:08:45.704136Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('i')
+[2m2026-02-14T23:08:45.704184Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 240
+[2m2026-02-14T23:08:45.896978Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
+[2m2026-02-14T23:08:46.112553Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:08:46.412490Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('1')
+[2m2026-02-14T23:08:46.483255Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('0')
+[2m2026-02-14T23:08:46.585912Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 250
+[2m2026-02-14T23:08:47.482261Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=F(5)
+[2m2026-02-14T23:08:47.482363Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m executing query with F5
+[2m2026-02-14T23:08:47.482494Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m background task started for query: service:fleetd | tail 10
+[2m2026-02-14T23:08:47.586403Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 260
+[2m2026-02-14T23:08:47.825143Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m query completed in 342.604125ms, result: true
+[2m2026-02-14T23:08:47.894353Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:08:48.632491Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 270
+[2m2026-02-14T23:08:49.673304Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 280
+[2m2026-02-14T23:08:50.641754Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m starting live stream for query: service:fleetd | tail 10
+[2m2026-02-14T23:08:50.641823Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 290
+[2m2026-02-14T23:08:50.641897Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m live stream task started
+[2m2026-02-14T23:08:51.669723Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 300
+[2m2026-02-14T23:08:52.338441Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:08:52.338519Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:08:52.338553Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:08:52.338588Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:08:52.338621Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:08:52.338652Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:08:52.338679Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:08:52.338716Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:08:52.338742Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:08:52.338767Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:08:52.703253Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 310
+[2m2026-02-14T23:08:53.752706Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 320
+[2m2026-02-14T23:08:54.799699Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 330
+[2m2026-02-14T23:08:55.830371Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 340
+[2m2026-02-14T23:08:56.860693Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 350
+[2m2026-02-14T23:08:57.344819Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:08:57.344896Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:08:57.344921Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:08:57.344969Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:08:57.345011Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:08:57.345069Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:08:57.345158Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
+[2m2026-02-14T23:08:57.345184Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:08:57.345219Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
+[2m2026-02-14T23:08:57.345258Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:08:57.898310Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 360
+[2m2026-02-14T23:08:58.968887Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 370
+[2m2026-02-14T23:09:00.004224Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 380
+[2m2026-02-14T23:09:01.034850Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 390
+[2m2026-02-14T23:09:02.064128Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 400
+[2m2026-02-14T23:09:02.342193Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:09:02.342264Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:09:02.342305Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:02.342323Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:09:02.342341Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:09:02.342357Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:02.342388Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
+[2m2026-02-14T23:09:02.342421Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:09:02.342450Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
+[2m2026-02-14T23:09:02.342474Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:09:03.101467Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 410
+[2m2026-02-14T23:09:04.151018Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 420
+[2m2026-02-14T23:09:05.180332Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 430
+[2m2026-02-14T23:09:06.210210Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 440
+[2m2026-02-14T23:09:07.239334Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 450
+[2m2026-02-14T23:09:07.340840Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:09:07.340920Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
+[2m2026-02-14T23:09:07.340947Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:09:07.340975Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "query_source", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:07.340995Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:09:07.341016Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:07.341036Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "stream_start", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:07.341057Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:09:07.341076Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:09:07.341097Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:08.286545Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 460
+[2m2026-02-14T23:09:09.338200Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 470
+[2m2026-02-14T23:09:10.368080Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 480
+[2m2026-02-14T23:09:11.397094Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 490
+[2m2026-02-14T23:09:12.343398Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:09:12.343479Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
+[2m2026-02-14T23:09:12.343497Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:09:12.343515Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "query_source", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:12.343620Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:09:12.343646Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:12.343663Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "stream_start", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:12.343679Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:09:12.343695Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:09:12.343709Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:12.427326Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 500
+[2m2026-02-14T23:09:13.479703Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 510
+[2m2026-02-14T23:09:14.510919Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 520
+[2m2026-02-14T23:09:15.540752Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 530
+[2m2026-02-14T23:09:16.571135Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 540
+[2m2026-02-14T23:09:17.342603Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "query_source", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:17.342670Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:09:17.342697Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:09:17.342724Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:17.342746Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "query_source", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:17.342770Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
+[2m2026-02-14T23:09:17.342792Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
+[2m2026-02-14T23:09:17.342822Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
+[2m2026-02-14T23:09:17.342842Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
+[2m2026-02-14T23:09:17.342864Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
+[2m2026-02-14T23:09:17.601415Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 550
+[2m2026-02-14T23:09:18.724754Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 560
+[2m2026-02-14T23:09:19.771023Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 570
+[2m2026-02-14T23:09:20.442256Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(CONTROL), code=Char('w')
+[2m2026-02-14T23:09:20.750789Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 580

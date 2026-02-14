@@ -311,6 +311,7 @@ impl App {
     }
 
     /// Start live streaming with the current query.
+    #[allow(clippy::too_many_lines)] // SSE parsing requires detailed logic
     fn start_live_stream(&mut self) {
         let query = self.active_tab().editor.text().trim().to_owned();
 
@@ -325,6 +326,13 @@ impl App {
         if let Some(task) = self.live_task.take() {
             task.abort();
         }
+
+        // Get column names from existing result (if any) for the stream
+        let existing_columns = self
+            .active_tab()
+            .result
+            .as_ref()
+            .map(|r| r.result.columns.clone());
 
         let client = self.client.clone();
         let tx = self.query_tx.clone();
@@ -352,6 +360,8 @@ impl App {
             let mut stream = resp.bytes_stream();
 
             let mut buffer = String::new();
+            let mut accumulated_rows: Vec<Vec<fleet_engine::value::Value>> = Vec::new();
+            let columns = existing_columns;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
@@ -364,41 +374,86 @@ impl App {
 
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                // Parse SSE events from buffer
+                // Parse SSE events from buffer (events are separated by \n\n)
                 while let Some(pos) = buffer.find("\n\n") {
                     let event_text = buffer[..pos].to_owned();
                     buffer.drain(..pos + 2);
 
-                    // Parse event (format: "data: <json>")
+                    // Parse SSE event structure
+                    let mut event_type = None;
+                    let mut event_data = None;
+
                     for line in event_text.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            // Parse JSON result
-                            match serde_json::from_str::<fleet_engine::value::QueryResult>(data) {
-                                Ok(result) => {
+                        if let Some(event) = line.strip_prefix("event: ") {
+                            event_type = Some(event.to_owned());
+                        } else if let Some(data) = line.strip_prefix("data: ") {
+                            event_data = Some(data.to_owned());
+                        }
+                    }
+
+                    // Only process "data" events (individual rows from query result)
+                    if event_type.as_deref() == Some("data") {
+                        if let Some(data) = event_data {
+                            // Parse JSON row (array of values)
+                            match serde_json::from_str::<Vec<fleet_engine::value::Value>>(&data) {
+                                Ok(row) => {
+                                    accumulated_rows.push(row);
                                     tracing::debug!(
-                                        "received stream result: {} rows",
-                                        result.row_count()
+                                        "received stream row, total: {}",
+                                        accumulated_rows.len()
                                     );
-                                    let _ = tx.send(QueryResult {
-                                        tab_idx,
-                                        result: Ok(QueryResponse {
-                                            result,
-                                            truncated: false,
-                                            pagination: fleet_client::PaginationMeta {
-                                                limit: 0,
-                                                offset: 0,
-                                                returned: 0,
-                                            },
-                                        }),
-                                        duration: Duration::from_secs(0),
-                                    });
                                 }
                                 Err(e) => {
-                                    tracing::warn!("failed to parse stream result: {}", e);
+                                    tracing::warn!("failed to parse stream row: {}", e);
                                 }
                             }
                         }
+                    } else if event_type.as_deref() == Some("error") {
+                        // Handle error events
+                        if let Some(data) = event_data {
+                            tracing::error!("stream error event: {}", data);
+                        }
                     }
+                    // Ignore other event types (keep-alive, etc.)
+                }
+
+                // Periodically send accumulated rows (every second or when we have enough)
+                if !accumulated_rows.is_empty() && accumulated_rows.len() >= 10 {
+                    // Use existing columns or generate generic ones
+                    let cols = if let Some(ref cols) = columns {
+                        cols.clone()
+                    } else if !accumulated_rows.is_empty() {
+                        // Generate column names (col_0, col_1, etc.)
+                        let col_count = accumulated_rows[0].len();
+                        (0..col_count)
+                            .map(|i| fleet_engine::value::Column {
+                                name: format!("col_{i}"),
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let result = fleet_engine::value::QueryResult {
+                        columns: cols,
+                        rows: std::mem::take(&mut accumulated_rows),
+                    };
+
+                    tracing::debug!("sending batch of {} rows", result.row_count());
+
+                    let _ = tx.send(QueryResult {
+                        tab_idx,
+                        result: Ok(QueryResponse {
+                            result,
+                            truncated: false,
+                            pagination: fleet_client::PaginationMeta {
+                                limit: 0,
+                                offset: 0,
+                                returned: 0,
+                            },
+                        }),
+                        duration: Duration::from_secs(0),
+                    });
                 }
             }
 
