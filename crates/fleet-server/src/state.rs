@@ -42,6 +42,8 @@ pub struct QueryState {
     pub tracker: Arc<QueryTracker>,
     /// Schema cache TTL in seconds.
     pub schema_cache_ttl_secs: u64,
+    /// Maximum rows for export responses (bypasses `max_result_rows`).
+    pub max_export_rows: usize,
     /// Cached schema introspection result with TTL.
     ///
     /// Uses `Mutex` (not `RwLock`) to prevent thundering herd: only one
@@ -136,6 +138,7 @@ impl AppState {
                 timeout_secs: config.server.timeout_secs,
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
                 schema_cache_ttl_secs: config.server.schema_cache_ttl_secs,
+                max_export_rows: config.server.max_export_rows,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             },

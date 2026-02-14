@@ -1,12 +1,14 @@
 //! HTTP request handlers for the fleet API.
 
 use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::response::IntoResponse;
 use axum::{Extension, Json};
 use fleet_auth::HistoryEntry;
 use fleet_auth::SavedQuery;
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
-use fleet_engine::value::{QueryResult, SchemaColumn};
+use fleet_engine::value::{QueryResult, SchemaColumn, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
@@ -763,5 +765,129 @@ impl From<SavedQuery> for SavedQueryResponse {
             created_at: saved.created_at,
             updated_at: saved.updated_at,
         }
+    }
+}
+
+/// `POST /api/v1/export` — export query results as CSV.
+///
+/// Bypasses `max_result_rows` in favor of `max_export_rows` to support larger downloads.
+pub async fn export(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<ExportParams>,
+    Json(req): Json<ExportRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    if !verified.role.has_permission(Permission::Query) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    // Validate format (only CSV for now).
+    let format = params.format.as_deref().unwrap_or("csv");
+    if format != "csv" {
+        return Err(ServerError::BadRequest(
+            "only CSV format is supported".into(),
+        ));
+    }
+
+    // Get max_export_rows from state.
+    let max_export_rows = state.query.max_export_rows;
+    let limit = req.limit.unwrap_or(max_export_rows).min(max_export_rows);
+
+    tracing::info!(
+        event_type = "export_start",
+        user = %verified.name,
+        role = %verified.role,
+        query = %req.query,
+        limit,
+        "executing export"
+    );
+
+    let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
+    let result = state.query.pool.execute(&req.query, timeout).await?;
+
+    // Limit rows to max_export_rows.
+    let limited = result.paginate(0, limit);
+
+    // Generate CSV.
+    let csv = generate_csv(&limited);
+
+    // Return CSV response with proper headers.
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"export.csv\"",
+            ),
+        ],
+        csv,
+    ))
+}
+
+/// Query parameters for the export endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ExportParams {
+    pub format: Option<String>,
+}
+
+/// Request body for the export endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ExportRequest {
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Generate RFC 4180-compliant CSV from query results.
+///
+/// Quotes fields containing commas, newlines, or quotes.
+/// Escapes quotes by doubling them.
+fn generate_csv(result: &QueryResult) -> String {
+    let mut csv = String::new();
+
+    // Header row.
+    for (i, col) in result.columns.iter().enumerate() {
+        if i > 0 {
+            csv.push(',');
+        }
+        csv.push_str(&quote_csv_field(&col.name));
+    }
+    csv.push('\n');
+
+    // Data rows.
+    for row in &result.rows {
+        for (i, value) in row.iter().enumerate() {
+            if i > 0 {
+                csv.push(',');
+            }
+            csv.push_str(&quote_csv_field(&value_to_string(value)));
+        }
+        csv.push('\n');
+    }
+
+    csv
+}
+
+/// Quote a CSV field if it contains special characters (comma, newline, quote).
+/// Escape quotes by doubling them.
+fn quote_csv_field(s: &str) -> String {
+    let needs_quoting = s.contains(',') || s.contains('\n') || s.contains('"');
+
+    if needs_quoting || s.is_empty() {
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Convert a Value to a string for CSV export.
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => s.clone(),
     }
 }

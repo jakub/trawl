@@ -35,6 +35,11 @@ pub struct ServerConfig {
     #[serde(default = "default_max_result_rows")]
     pub max_result_rows: usize,
 
+    /// Maximum number of rows allowed in export responses (default: 1M).
+    /// Exports bypass `max_result_rows` to support larger downloads.
+    #[serde(default = "default_max_export_rows")]
+    pub max_export_rows: usize,
+
     /// Maximum request body size in bytes (default: 128 KB).
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
@@ -238,6 +243,8 @@ pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default maximum rows a query can return.
 pub const DEFAULT_MAX_RESULT_ROWS: usize = 100_000;
+/// Default maximum rows for export responses (1M).
+pub const DEFAULT_MAX_EXPORT_ROWS: usize = 1_000_000;
 /// Default maximum request body size (128 KB).
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 /// Default maximum concurrent HTTP requests.
@@ -329,6 +336,10 @@ fn default_max_concurrent_queries() -> usize {
 
 fn default_max_result_rows() -> usize {
     DEFAULT_MAX_RESULT_ROWS
+}
+
+fn default_max_export_rows() -> usize {
+    DEFAULT_MAX_EXPORT_ROWS
 }
 
 fn default_max_request_body_bytes() -> usize {

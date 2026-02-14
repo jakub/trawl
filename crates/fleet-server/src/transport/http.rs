@@ -67,6 +67,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             "/saved/{id}",
             put(handlers::update_saved).delete(handlers::delete_saved),
         )
+        .route("/export", post(handlers::export))
         .layer(middleware::from_fn(rate_limit_middleware))
         .layer(middleware::from_fn(auth_middleware))
         .layer(RequestBodyLimitLayer::new(max_body));

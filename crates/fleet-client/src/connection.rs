@@ -221,6 +221,37 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
+    /// Export query results as CSV.
+    ///
+    /// Returns raw CSV bytes suitable for writing to a file.
+    pub async fn export(&self, query: &str, limit: Option<usize>) -> Result<Vec<u8>, ClientError> {
+        let url = self.endpoint("/api/v1/export?format=csv");
+        let body = serde_json::json!({ "query": query, "limit": limit });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await
+            .map_err(sanitize_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let message = resp
+                .json::<ErrorResponse>()
+                .await
+                .map_or_else(|_| "unknown error".into(), |e| e.error);
+            return Err(ClientError::Server { status, message });
+        }
+
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| ClientError::Parse(e.to_string()))
+    }
+
     /// Send an authenticated request, check for errors, and deserialize the response.
     async fn send_authenticated<T: serde::de::DeserializeOwned>(
         &self,
