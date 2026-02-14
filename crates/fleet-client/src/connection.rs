@@ -158,6 +158,31 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
+    /// Fetch query history with pagination.
+    pub async fn history(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<HistoryResponse, ClientError> {
+        let mut url = self.endpoint("/api/v1/history");
+
+        // Build query string if parameters are provided.
+        let mut params = vec![];
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        if let Some(o) = offset {
+            params.push(format!("offset={o}"));
+        }
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
     /// Send an authenticated request, check for errors, and deserialize the response.
     async fn send_authenticated<T: serde::de::DeserializeOwned>(
         &self,
@@ -326,6 +351,32 @@ pub struct PaginationMeta {
     pub offset: usize,
     /// The number of rows actually returned.
     pub returned: usize,
+}
+
+/// Response from the history endpoint.
+#[derive(Debug, Deserialize)]
+pub struct HistoryResponse {
+    /// Query history entries (most recent first).
+    pub entries: Vec<HistoryEntryResponse>,
+    /// Total number of history entries for this user.
+    pub total: usize,
+}
+
+/// A single query history entry.
+#[derive(Debug, Deserialize)]
+pub struct HistoryEntryResponse {
+    /// History entry ID.
+    pub id: i64,
+    /// The DSL query string.
+    pub query: String,
+    /// When the query was executed (ISO 8601 UTC).
+    pub executed_at: String,
+    /// Execution duration in milliseconds.
+    pub duration_ms: u64,
+    /// Number of rows returned.
+    pub row_count: usize,
+    /// Query status ("success", "error", "timeout").
+    pub status: String,
 }
 
 // -- internal request types --------------------------------------------------

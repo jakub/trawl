@@ -2,6 +2,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
+use fleet_auth::HistoryEntry;
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
 use fleet_engine::value::{QueryResult, SchemaColumn};
@@ -141,6 +142,23 @@ pub async fn query(
             let returned = paginated.row_count();
 
             state.query.tracker.complete(query_id, total);
+
+            // Auto-save successful queries to history (per user preference).
+            if let Ok(key_id) = state
+                .auth
+                .key_store
+                .lock()
+                .get_key_id_by_prefix(&verified.prefix)
+            {
+                let _ = state.auth.history.lock().record_query(
+                    key_id,
+                    &req.query,
+                    duration_ms,
+                    total,
+                    "success",
+                );
+            }
+
             tracing::info!(
                 event_type = "query_complete",
                 user = %verified.name,
@@ -497,4 +515,80 @@ pub struct FieldValuesResponse {
     pub field: String,
     pub values: Vec<String>,
     pub cached: bool,
+}
+
+/// `GET /api/v1/history` — retrieve user's query history with pagination.
+pub async fn history(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<HistoryParams>,
+) -> Result<Json<HistoryResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::Query) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    // Get the key_id for this user's prefix.
+    let key_id = state
+        .auth
+        .key_store
+        .lock()
+        .get_key_id_by_prefix(&verified.prefix)
+        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let offset = params.offset.unwrap_or(0);
+
+    let page = state
+        .auth
+        .history
+        .lock()
+        .get_user_history(key_id, limit, offset)
+        .map_err(|e| ServerError::Internal(format!("history query failed: {e}")))?;
+
+    Ok(Json(HistoryResponse {
+        entries: page
+            .entries
+            .into_iter()
+            .map(HistoryEntryResponse::from)
+            .collect(),
+        total: page.total,
+    }))
+}
+
+/// Query parameters for the history endpoint.
+#[derive(Debug, Deserialize)]
+pub struct HistoryParams {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// Response for the history endpoint.
+#[derive(Debug, Serialize)]
+pub struct HistoryResponse {
+    pub entries: Vec<HistoryEntryResponse>,
+    pub total: usize,
+}
+
+/// A single history entry in the response.
+#[derive(Debug, Serialize)]
+pub struct HistoryEntryResponse {
+    pub id: i64,
+    pub query: String,
+    pub executed_at: String,
+    pub duration_ms: u64,
+    pub row_count: usize,
+    pub status: String,
+}
+
+impl From<HistoryEntry> for HistoryEntryResponse {
+    fn from(entry: HistoryEntry) -> Self {
+        Self {
+            id: entry.id,
+            query: entry.query,
+            executed_at: entry.executed_at,
+            duration_ms: entry.duration_ms,
+            row_count: entry.row_count,
+            status: entry.status,
+        }
+    }
 }

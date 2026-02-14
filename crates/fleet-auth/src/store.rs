@@ -360,6 +360,23 @@ impl KeyStore {
         Ok(keys)
     }
 
+    /// Get the internal database ID for a key by its prefix.
+    ///
+    /// Used by history recording to store the FK relationship to `api_keys(id)`.
+    /// Returns `KeyNotFound` if no key with this prefix exists.
+    pub fn get_key_id_by_prefix(&self, prefix: &str) -> Result<i64, AuthError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM api_keys WHERE prefix = ?1",
+                params![prefix],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AuthError::KeyNotFound {
+                prefix: prefix.to_owned(),
+            })
+    }
+
     /// Revoke a key by its prefix.
     pub fn revoke_key(&self, prefix: &str) -> Result<ApiKeyInfo, AuthError> {
         let now = Utc::now().to_rfc3339();
@@ -654,6 +671,22 @@ mod tests {
         let perms = std::fs::metadata(&db_path).unwrap().permissions();
         let mode = perms.mode() & 0o777;
         assert_eq!(mode, 0o600, "auth.db should be owner-only, got {mode:o}");
+    }
+
+    #[test]
+    fn get_key_id_by_prefix() {
+        let store = test_store();
+        let created = store.create_key("test-key", Role::Analyst, None).unwrap();
+
+        let key_id = store.get_key_id_by_prefix(&created.info.prefix).unwrap();
+        assert_eq!(key_id, created.info.id);
+    }
+
+    #[test]
+    fn get_key_id_nonexistent_prefix() {
+        let store = test_store();
+        let result = store.get_key_id_by_prefix("ZZZZZZZZ");
+        assert!(matches!(result, Err(AuthError::KeyNotFound { .. })));
     }
 
     #[cfg(unix)]

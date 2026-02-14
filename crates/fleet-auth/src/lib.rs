@@ -15,10 +15,14 @@ pub mod roles;
 /// `SQLite`-backed key storage.
 pub mod store;
 
+/// `SQLite`-backed query history storage.
+pub mod history;
+
 /// Token generation, hashing, and verification.
 pub mod token;
 
 pub use error::AuthError;
+pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use keys::{ApiKeyInfo, CreatedKey, VerifiedKey};
 pub use roles::{Permission, Role};
 pub use store::KeyStore;
