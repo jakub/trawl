@@ -51,7 +51,7 @@ impl WalWriter {
     ///
     /// Returns the final path of the WAL file on success.
     pub fn write(&self, service: &str, events: &[u8]) -> std::io::Result<PathBuf> {
-        let filename = Self::generate_filename(service);
+        let filename = Self::generate_filename(service)?;
         let tmp_path = self.wal_dir.join(format!("{filename}.tmp"));
         let final_path = self.wal_dir.join(format!("{filename}.ndjson"));
 
@@ -62,10 +62,10 @@ impl WalWriter {
     }
 
     /// Generate a unique filename: `{service}_{unix_millis}_{4_hex_random}`.
-    fn generate_filename(service: &str) -> String {
+    fn generate_filename(service: &str) -> std::io::Result<String> {
         let millis = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("system clock before epoch")
+            .map_err(std::io::Error::other)?
             .as_millis();
 
         // 4 hex chars of randomness to avoid collisions within the same ms.
@@ -73,7 +73,7 @@ impl WalWriter {
         let hex = format!("{random:04x}");
 
         let safe_service = sanitize_service_for_filename(service);
-        format!("{safe_service}_{millis}_{hex}")
+        Ok(format!("{safe_service}_{millis}_{hex}"))
     }
 }
 
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn filename_sanitizes_service_name() {
-        let name = WalWriter::generate_filename("my/bad service");
+        let name = WalWriter::generate_filename("my/bad service").unwrap();
         assert!(!name.contains('/'));
         assert!(name.starts_with("my_bad_service_"));
     }

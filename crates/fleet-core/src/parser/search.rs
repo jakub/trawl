@@ -66,7 +66,10 @@ fn filter_value<'src>()
         .collect::<Vec<_>>()
         .map(|vals| {
             if vals.len() == 1 {
-                let val = vals.into_iter().next().unwrap();
+                let val = vals
+                    .into_iter()
+                    .next()
+                    .expect("at_least(1) guarantees a value");
                 let op = if has_glob_chars(&val) {
                     FilterOp::Glob
                 } else {
