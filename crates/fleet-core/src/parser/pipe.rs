@@ -115,6 +115,16 @@ fn limit_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("limit stage")
 }
 
+/// Parse a `head` stage: alias for `limit N`.
+fn head_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("head")
+        .padded()
+        .ignore_then(uint())
+        .map(|count| PipeStage::Limit(LimitStage { count }))
+        .labelled("head stage")
+}
+
 /// Parse a `table` stage: `table field(, field)*`
 fn table_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
@@ -128,6 +138,21 @@ fn table_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         )
         .map(|fields| PipeStage::Table(TableStage { fields }))
         .labelled("table stage")
+}
+
+/// Parse a `fields` stage: alias for `table field(, field)*`.
+fn fields_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("fields")
+        .padded()
+        .ignore_then(
+            field_name()
+                .separated_by(just(',').padded())
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|fields| PipeStage::Table(TableStage { fields }))
+        .labelled("fields stage")
 }
 
 /// Parse a `top` stage: `top N field [by field(, field)*]`
@@ -201,12 +226,28 @@ fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserEx
         .labelled("let stage")
 }
 
-/// Parse an `extract` stage: `extract "pattern" [from field]` or `extract kv [from field]`
-fn extract_stage<'src>()
--> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+/// Parse an `eval` stage: alias for `let field = expr`.
+fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("eval")
+        .padded()
+        .ignore_then(field_name())
+        .then_ignore(just('=').padded())
+        .then(expr())
+        .map(|(field, expr)| PipeStage::Let(LetStage { field, expr }))
+        .labelled("eval stage")
+}
+
+/// Parse an extract/rex stage from a given keyword.
+///
+/// Both `extract` and `rex` support the same syntax:
+/// `KEYWORD "pattern" [from field]` or `KEYWORD kv [from field]`
+fn extract_like_stage<'src>(
+    kw: &'static str,
+) -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     let from_clause = keyword("from").padded().ignore_then(field_name()).or_not();
 
-    let kv_mode = keyword("extract")
+    let kv_mode = keyword(kw)
         .padded()
         .ignore_then(keyword("kv"))
         .ignore_then(from_clause.clone())
@@ -217,7 +258,7 @@ fn extract_stage<'src>()
             })
         });
 
-    let regex_mode = keyword("extract")
+    let regex_mode = keyword(kw)
         .padded()
         .ignore_then(raw_quoted_string())
         .then(from_clause)
@@ -229,6 +270,17 @@ fn extract_stage<'src>()
         });
 
     choice((kv_mode, regex_mode)).labelled("extract stage")
+}
+
+/// Parse an `extract` stage: `extract "pattern" [from field]` or `extract kv [from field]`
+fn extract_stage<'src>()
+-> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+    extract_like_stage("extract")
+}
+
+/// Parse a `rex` stage: alias for `extract`.
+fn rex_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+    extract_like_stage("rex")
 }
 
 /// Parse a `dedup` stage: `dedup [field(, field)*]`
@@ -330,9 +382,13 @@ fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         where_stage(),
         sort_stage(),
         limit_stage(),
+        head_stage(),
         let_stage(),
+        eval_stage(),
         extract_stage(),
+        rex_stage(),
         table_stage(),
+        fields_stage(),
         top_stage(),
         rare_stage(),
         dedup_stage(),
@@ -458,6 +514,93 @@ mod tests {
         assert!(matches!(result[1].node, PipeStage::Where(_)));
         assert!(matches!(result[2].node, PipeStage::Sort(_)));
         assert!(matches!(result[3].node, PipeStage::Limit(_)));
+    }
+
+    // ── head (alias for limit) ────────────────────────────────────────
+
+    #[test]
+    fn test_head() {
+        let input = "| head 10";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Limit(lim) => assert_eq!(lim.count, 10),
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    // ── fields (alias for table) ────────────────────────────────────
+
+    #[test]
+    fn test_fields() {
+        let input = "| fields host, service, level";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Table(t) => {
+                assert_eq!(
+                    t.fields,
+                    vec![
+                        "host".to_string(),
+                        "service".to_string(),
+                        "level".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    // ── splunk eval alias (alias for let) ───────────────────────────
+
+    #[test]
+    fn test_splunk_eval_alias() {
+        let input = "| eval msg_len = length(message)";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Let(l) => {
+                assert_eq!(l.field, "msg_len");
+                match &l.expr.node {
+                    Expr::FunctionCall { name, args } => {
+                        assert_eq!(name, "length");
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected FunctionCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    // ── rex (alias for extract) ─────────────────────────────────────
+
+    #[test]
+    fn test_rex_regex() {
+        let input = r#"| rex "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message"#;
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Extract(e) => {
+                assert!(matches!(e.mode, ExtractMode::Regex(_)));
+                assert_eq!(e.source_field, Some("message".to_string()));
+            }
+            other => panic!("expected Extract, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rex_kv() {
+        let input = "| rex kv from raw";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Extract(e) => {
+                assert_eq!(e.mode, ExtractMode::KeyValue);
+                assert_eq!(e.source_field, Some("raw".to_string()));
+            }
+            other => panic!("expected Extract, got {other:?}"),
+        }
     }
 
     // ── top ─────────────────────────────────────────────────────────────
