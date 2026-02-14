@@ -29,6 +29,7 @@ dashmap = "6"
 comfy-table = "7"
 duckdb = { version = "1.4", features = ["bundled"] }
 flate2 = "1"
+fs4 = "0.13"
 governor = "0.10"
 hostname = "0.4"
 insta = "1"

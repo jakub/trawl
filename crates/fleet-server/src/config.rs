@@ -12,6 +12,8 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub ingest: IngestConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 /// HTTPS listener settings.
@@ -194,6 +196,37 @@ impl Default for IngestConfig {
     }
 }
 
+/// Data retention policy settings.
+///
+/// Both policies are always-on with sensible defaults. Set either to 0
+/// to disable that specific policy. If both are 0, the retention task
+/// spawns but performs no deletions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    /// Delete date directories older than this many days. 0 = disabled.
+    #[serde(default = "default_retention_max_age_days")]
+    pub max_age_days: u64,
+
+    /// If free disk space drops below this many bytes, delete oldest
+    /// data first regardless of age. 0 = disabled.
+    #[serde(default = "default_retention_min_free_disk_bytes")]
+    pub min_free_disk_bytes: u64,
+
+    /// How often the retention task runs (seconds).
+    #[serde(default = "default_retention_interval_secs")]
+    pub retention_interval_secs: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_age_days: DEFAULT_RETENTION_MAX_AGE_DAYS,
+            min_free_disk_bytes: DEFAULT_RETENTION_MIN_FREE_DISK_BYTES,
+            retention_interval_secs: DEFAULT_RETENTION_INTERVAL_SECS,
+        }
+    }
+}
+
 // -- default constants -------------------------------------------------------
 // Centralized so they can be referenced from other modules (e.g. http.rs
 // fallback) and grepped easily. The `default_*` functions exist only because
@@ -225,6 +258,12 @@ pub const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 10;
 pub const DEFAULT_INTERNAL_TELEMETRY: bool = true;
 /// Default daily rollup (enabled).
 pub const DEFAULT_DAILY_ROLLUP: bool = true;
+/// Default retention max age (days).
+pub const DEFAULT_RETENTION_MAX_AGE_DAYS: u64 = 90;
+/// Default retention minimum free disk space (bytes). 1 GiB.
+pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 1_073_741_824;
+/// Default retention check interval (seconds). 1 hour.
+pub const DEFAULT_RETENTION_INTERVAL_SECS: u64 = 3600;
 /// Default admin rate limit (requests/minute).
 pub const DEFAULT_RATE_ADMIN: u32 = 100;
 /// Default analyst rate limit (requests/minute).
@@ -330,6 +369,18 @@ fn default_rate_reader() -> u32 {
 
 fn default_rate_ingest() -> u32 {
     DEFAULT_RATE_INGEST
+}
+
+fn default_retention_max_age_days() -> u64 {
+    DEFAULT_RETENTION_MAX_AGE_DAYS
+}
+
+fn default_retention_min_free_disk_bytes() -> u64 {
+    DEFAULT_RETENTION_MIN_FREE_DISK_BYTES
+}
+
+fn default_retention_interval_secs() -> u64 {
+    DEFAULT_RETENTION_INTERVAL_SECS
 }
 
 impl Default for RateLimitConfig {
@@ -859,5 +910,56 @@ daily_rollup = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ingest.daily_rollup);
+    }
+
+    #[test]
+    fn retention_defaults_when_omitted() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.retention.max_age_days, 90);
+        assert_eq!(config.retention.min_free_disk_bytes, 1_073_741_824);
+        assert_eq!(config.retention.retention_interval_secs, 3600);
+    }
+
+    #[test]
+    fn retention_custom_values() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[retention]
+max_age_days = 30
+min_free_disk_bytes = 0
+retention_interval_secs = 1800
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.retention.max_age_days, 30);
+        assert_eq!(config.retention.min_free_disk_bytes, 0);
+        assert_eq!(config.retention.retention_interval_secs, 1800);
+    }
+
+    #[test]
+    fn retention_both_disabled() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[retention]
+max_age_days = 0
+min_free_disk_bytes = 0
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.retention.max_age_days, 0);
+        assert_eq!(config.retention.min_free_disk_bytes, 0);
     }
 }

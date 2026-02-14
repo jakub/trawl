@@ -21,6 +21,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 duckdb = { workspace = true }
 flate2 = { workspace = true }
+fs4 = { workspace = true }
 governor = { workspace = true }
 hyper = { workspace = true }
 parking_lot = { workspace = true }
