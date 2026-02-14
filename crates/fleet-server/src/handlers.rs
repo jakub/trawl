@@ -100,6 +100,11 @@ pub async fn query(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
+    // Increment total query counter for stats.
+    state
+        .total_queries
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // Validate pagination parameters.
     let max_rows = state.query.pool.max_result_rows();
     let limit = req.limit.unwrap_or(max_rows).min(max_rows);
@@ -392,4 +397,34 @@ pub async fn validate_query(
 pub struct ValidationResponse {
     pub valid: bool,
     pub errors: Vec<String>,
+}
+
+/// `GET /api/v1/stats` — server statistics and metrics (admin only).
+pub async fn stats(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<StatsResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::ServerManage) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    Ok(Json(StatsResponse {
+        uptime_secs: state.start_time.elapsed().as_secs(),
+        total_queries: state
+            .total_queries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        active_queries: state.query.tracker.active().len(),
+        pool_available: state.query.pool.available_permits(),
+        pool_capacity: state.query.pool.capacity(),
+    }))
+}
+
+/// Response for the stats endpoint.
+#[derive(Debug, Serialize)]
+pub struct StatsResponse {
+    pub uptime_secs: u64,
+    pub total_queries: u64,
+    pub active_queries: usize,
+    pub pool_available: usize,
+    pub pool_capacity: usize,
 }

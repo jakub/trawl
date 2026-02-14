@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use parking_lot::Mutex;
 use std::time::Instant;
@@ -23,8 +24,10 @@ pub struct AppState {
     pub auth: AuthState,
     /// Ingest pipeline resources.
     pub ingest: IngestState,
-    /// Server start time (for health endpoint uptime).
+    /// Server start time (for uptime calculation).
     pub start_time: Instant,
+    /// Total queries executed since startup (for stats endpoint).
+    pub total_queries: Arc<AtomicU64>,
 }
 
 /// Query execution state: pool, tracker, timeout, and schema cache.
@@ -123,6 +126,7 @@ impl AppState {
             },
             ingest: IngestState { wal_writer },
             start_time: Instant::now(),
+            total_queries: Arc::new(AtomicU64::new(0)),
         };
 
         let http = HttpConfig {

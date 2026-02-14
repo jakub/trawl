@@ -39,6 +39,7 @@ use crate::state::{AppState, HttpConfig};
 use crate::tls;
 
 /// Build the axum router with all routes and middleware.
+#[allow(clippy::too_many_lines)]
 pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let max_body = http.max_request_body_bytes;
     let max_conns = http.max_concurrent_requests;
@@ -53,6 +54,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/schema", get(handlers::schema))
         .route("/queries", get(handlers::queries))
         .route("/queries/:id", delete(handlers::cancel_query))
+        .route("/stats", get(handlers::stats))
         .layer(middleware::from_fn(rate_limit_middleware))
         .layer(middleware::from_fn(auth_middleware))
         .layer(RequestBodyLimitLayer::new(max_body));

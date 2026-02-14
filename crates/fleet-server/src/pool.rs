@@ -39,6 +39,7 @@ pub struct ExecutorPool {
     /// Full recursive glob for queries without a time filter.
     fallback_glob: Arc<str>,
     semaphore: Arc<Semaphore>,
+    max_concurrent: usize,
     max_result_rows: usize,
     /// Monotonic ID counter for tracking active query handles.
     next_id: Arc<AtomicU64>,
@@ -93,6 +94,7 @@ impl ExecutorPool {
             base_dir: Arc::from(base_dir),
             fallback_glob,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
             max_result_rows,
             next_id: Arc::new(AtomicU64::new(0)),
             active_interrupts: Arc::new(Mutex::new(HashMap::new())),
@@ -286,6 +288,20 @@ impl ExecutorPool {
     /// Get the configured maximum result rows limit.
     pub fn max_result_rows(&self) -> usize {
         self.max_result_rows
+    }
+
+    /// Get the number of available query slots.
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    /// Get the total pool capacity (max concurrent queries).
+    pub fn capacity(&self) -> usize {
+        // Semaphore doesn't expose max permits, so we store it.
+        // For now, we can use available_permits() when pool is idle,
+        // but we should actually store max_concurrent at construction.
+        // Let me check the struct definition.
+        self.max_concurrent
     }
 
     /// Introspect the data source schema.
