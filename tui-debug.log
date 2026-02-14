@@ -377,3 +377,7 @@
 [2m2026-02-14T22:50:11.950464Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 3690
 [2m2026-02-14T22:50:12.976214Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 3700
 [2m2026-02-14T22:50:14.000899Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 3710
+[2m2026-02-14T22:50:15.030348Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 3720
+[2m2026-02-14T22:50:16.071082Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 3730
+[2m2026-02-14T22:50:17.096762Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 3740
+[2m2026-02-14T22:50:18.120800Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 3750
