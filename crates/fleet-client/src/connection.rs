@@ -252,6 +252,45 @@ impl HttpClient {
             .map_err(|e| ClientError::Parse(e.to_string()))
     }
 
+    /// Stream live query results via Server-Sent Events.
+    ///
+    /// Returns a response handle that can be used to read SSE events.
+    /// The caller is responsible for parsing the SSE event stream.
+    ///
+    /// # Parameters
+    /// - `query`: DSL query string to execute repeatedly
+    /// - `interval_secs`: Interval between query executions (1-60 seconds)
+    pub async fn stream(
+        &self,
+        query: &str,
+        interval_secs: Option<u64>,
+    ) -> Result<reqwest::Response, ClientError> {
+        let url = self.endpoint("/api/v1/stream");
+
+        let mut req = self.client.get(&url).query(&[("query", query)]);
+
+        if let Some(interval) = interval_secs {
+            req = req.query(&[("interval", interval.to_string())]);
+        }
+
+        let resp = req
+            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .send()
+            .await
+            .map_err(sanitize_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let message = resp
+                .json::<ErrorResponse>()
+                .await
+                .map_or_else(|_| "unknown error".into(), |e| e.error);
+            return Err(ClientError::Server { status, message });
+        }
+
+        Ok(resp)
+    }
+
     /// Send an authenticated request, check for errors, and deserialize the response.
     async fn send_authenticated<T: serde::de::DeserializeOwned>(
         &self,

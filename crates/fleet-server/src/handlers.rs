@@ -3,6 +3,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{Extension, Json};
 use fleet_auth::HistoryEntry;
 use fleet_auth::SavedQuery;
@@ -10,6 +11,8 @@ use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
 use fleet_engine::value::{QueryResult, SchemaColumn, Value};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::time::Duration;
 
 use crate::error::ServerError;
 use crate::state::{AppState, CachedFieldValues, CachedSchema};
@@ -890,4 +893,74 @@ fn value_to_string(value: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
     }
+}
+
+/// `GET /api/v1/stream` — stream query results via Server-Sent Events (SSE).
+///
+/// Re-executes the query at regular intervals and streams new results.
+/// Used for live tail mode in the TUI (F9 toggle).
+pub async fn stream_query(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<StreamParams>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ServerError> {
+    if !verified.role.has_permission(Permission::Query) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let query_dsl = params.query.clone();
+    let interval_secs = params.interval.unwrap_or(5).clamp(1, 60);
+
+    tracing::info!(
+        event_type = "stream_start",
+        user = %verified.name,
+        query = %query_dsl,
+        interval = interval_secs,
+        "starting SSE stream"
+    );
+
+    // Create SSE event stream using async-stream for cleaner async code.
+    let pool = state.query.pool.clone();
+    let timeout = Duration::from_secs(state.query.timeout_secs);
+
+    let event_stream = async_stream::stream! {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+
+        loop {
+            interval.tick().await;
+
+            match pool.execute(&query_dsl, timeout).await {
+                Ok(result) => {
+                    // Emit each row as a data event.
+                    for row in &result.rows {
+                        if let Ok(json) = serde_json::to_string(&row) {
+                            yield Ok(Event::default().event("data").data(json));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = e.safe_message();
+                    tracing::warn!(
+                        event_type = "stream_query_error",
+                        error = %error_msg,
+                        "stream query failed"
+                    );
+                    let error_json = serde_json::json!({ "error": error_msg }).to_string();
+                    yield Ok(Event::default().event("error").data(error_json));
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+}
+
+/// Query parameters for the stream endpoint.
+#[derive(Debug, Deserialize)]
+pub struct StreamParams {
+    /// The DSL query to execute repeatedly.
+    pub query: String,
+    /// Interval in seconds (1-60, default 5).
+    #[serde(default)]
+    pub interval: Option<u64>,
 }
