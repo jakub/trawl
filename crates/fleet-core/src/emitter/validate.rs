@@ -10,6 +10,7 @@ use super::EmitError;
 
 /// Known function names accepted by the emitter.
 const KNOWN_FUNCTIONS: &[&str] = &[
+    // aggregates
     "count",
     "avg",
     "sum",
@@ -21,11 +22,33 @@ const KNOWN_FUNCTIONS: &[&str] = &[
     "p90",
     "p95",
     "p99",
+    "first",
+    "last",
+    "values",
+    "list",
+    "median",
+    "stddev",
+    // scalars
     "lower",
     "upper",
     "length",
     "len",
     "coalesce",
+    "if",
+    "replace",
+    "substr",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "isnull",
+    "isnotnull",
+    "abs",
+    "ceil",
+    "ceiling",
+    "floor",
+    "round",
+    "now",
+    "typeof",
 ];
 
 /// Validate all pipe stages before emission begins.
@@ -79,7 +102,31 @@ fn validate_function(agg: &AggExpr) -> Result<(), EmitError> {
             });
         }
         // count() accepts 0 or 1 args; coalesce() accepts 1+
-        "count" | "coalesce" => {}
+        // now() takes 0 args
+        "now" if argc != 0 => {
+            return Err(EmitError::InvalidAggregation {
+                message: format!("{name}() requires exactly 0 argument(s)"),
+            });
+        }
+        // 3-arg functions
+        "if" | "replace" if argc != 3 => {
+            return Err(EmitError::InvalidAggregation {
+                message: format!("{name}() requires exactly 3 argument(s)"),
+            });
+        }
+        // 2-3 arg functions
+        "substr" if !(2..=3).contains(&argc) => {
+            return Err(EmitError::InvalidAggregation {
+                message: format!("{name}() requires 2 to 3 arguments"),
+            });
+        }
+        // 1-2 arg functions
+        "round" if !(1..=2).contains(&argc) => {
+            return Err(EmitError::InvalidAggregation {
+                message: format!("{name}() requires 1 to 2 arguments"),
+            });
+        }
+        "count" | "coalesce" | "now" | "if" | "replace" | "substr" | "round" => {}
         // everything else requires exactly 1 arg
         _ if argc != 1 => {
             return Err(EmitError::InvalidAggregation {

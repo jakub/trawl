@@ -31,6 +31,43 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
             }
             Ok(format!("COALESCE({})", args.join(", ")))
         }
+        // new scalar functions
+        "if" => require_n_args(name, args, 3, |a| {
+            format!("IF({}, {}, {})", a[0], a[1], a[2])
+        }),
+        "replace" => require_n_args(name, args, 3, |a| {
+            format!("REPLACE({}, {}, {})", a[0], a[1], a[2])
+        }),
+        "substr" => require_range_args(name, args, 2, 3, |a| {
+            if a.len() == 2 {
+                format!("SUBSTR({}, {})", a[0], a[1])
+            } else {
+                format!("SUBSTR({}, {}, {})", a[0], a[1], a[2])
+            }
+        }),
+        "trim" => require_one_arg(name, args, |a| format!("TRIM({a})")),
+        "ltrim" => require_one_arg(name, args, |a| format!("LTRIM({a})")),
+        "rtrim" => require_one_arg(name, args, |a| format!("RTRIM({a})")),
+        "isnull" => require_one_arg(name, args, |a| format!("({a} IS NULL)")),
+        "isnotnull" => require_one_arg(name, args, |a| format!("({a} IS NOT NULL)")),
+        "abs" => require_one_arg(name, args, |a| format!("ABS({a})")),
+        "ceil" | "ceiling" => require_one_arg(name, args, |a| format!("CEIL({a})")),
+        "floor" => require_one_arg(name, args, |a| format!("FLOOR({a})")),
+        "round" => require_range_args(name, args, 1, 2, |a| {
+            if a.len() == 1 {
+                format!("ROUND({})", a[0])
+            } else {
+                format!("ROUND({}, {})", a[0], a[1])
+            }
+        }),
+        "now" => require_n_args(name, args, 0, |_| "now()".to_string()),
+        "typeof" => require_one_arg(name, args, |a| format!("TYPEOF({a})")),
+        // new aggregate functions
+        "first" => require_one_arg(name, args, |a| format!("FIRST({a})")),
+        "last" => require_one_arg(name, args, |a| format!("LAST({a})")),
+        "values" | "list" => require_one_arg(name, args, |a| format!("LIST(DISTINCT {a})")),
+        "median" => require_one_arg(name, args, |a| format!("MEDIAN({a})")),
+        "stddev" => require_one_arg(name, args, |a| format!("STDDEV({a})")),
         _ => Err(EmitError::UnknownFunction {
             name: name.to_string(),
         }),
@@ -53,6 +90,12 @@ pub(crate) fn is_aggregate_function(name: &str) -> bool {
             | "p90"
             | "p95"
             | "p99"
+            | "first"
+            | "last"
+            | "values"
+            | "list"
+            | "median"
+            | "stddev"
     )
 }
 
@@ -77,6 +120,35 @@ fn require_one_arg(
         });
     }
     Ok(f(&args[0]))
+}
+
+fn require_n_args(
+    name: &str,
+    args: &[String],
+    n: usize,
+    f: impl FnOnce(&[String]) -> String,
+) -> Result<String, EmitError> {
+    if args.len() != n {
+        return Err(EmitError::InvalidAggregation {
+            message: format!("{name}() requires exactly {n} argument(s)"),
+        });
+    }
+    Ok(f(args))
+}
+
+fn require_range_args(
+    name: &str,
+    args: &[String],
+    min: usize,
+    max: usize,
+    f: impl FnOnce(&[String]) -> String,
+) -> Result<String, EmitError> {
+    if args.len() < min || args.len() > max {
+        return Err(EmitError::InvalidAggregation {
+            message: format!("{name}() requires {min} to {max} arguments"),
+        });
+    }
+    Ok(f(args))
 }
 
 fn percentile(name: &str, args: &[String], p: f64) -> Result<String, EmitError> {
@@ -236,6 +308,172 @@ mod tests {
         );
     }
 
+    // ── translate_function: new scalars ────────────────────────────────
+
+    #[test]
+    fn translate_if() {
+        assert_eq!(
+            translate_function("if", &args(&["x > 0", "'pos'", "'neg'"])).unwrap(),
+            "IF(x > 0, 'pos', 'neg')"
+        );
+    }
+
+    #[test]
+    fn translate_replace() {
+        assert_eq!(
+            translate_function("replace", &args(&["msg", "'foo'", "'bar'"])).unwrap(),
+            "REPLACE(msg, 'foo', 'bar')"
+        );
+    }
+
+    #[test]
+    fn translate_substr_two_args() {
+        assert_eq!(
+            translate_function("substr", &args(&["msg", "1"])).unwrap(),
+            "SUBSTR(msg, 1)"
+        );
+    }
+
+    #[test]
+    fn translate_substr_three_args() {
+        assert_eq!(
+            translate_function("substr", &args(&["msg", "1", "5"])).unwrap(),
+            "SUBSTR(msg, 1, 5)"
+        );
+    }
+
+    #[test]
+    fn translate_trim() {
+        assert_eq!(
+            translate_function("trim", &args(&["msg"])).unwrap(),
+            "TRIM(msg)"
+        );
+    }
+
+    #[test]
+    fn translate_isnull() {
+        assert_eq!(
+            translate_function("isnull", &args(&["x"])).unwrap(),
+            "(x IS NULL)"
+        );
+    }
+
+    #[test]
+    fn translate_isnotnull() {
+        assert_eq!(
+            translate_function("isnotnull", &args(&["x"])).unwrap(),
+            "(x IS NOT NULL)"
+        );
+    }
+
+    #[test]
+    fn translate_abs() {
+        assert_eq!(translate_function("abs", &args(&["x"])).unwrap(), "ABS(x)");
+    }
+
+    #[test]
+    fn translate_ceil() {
+        assert_eq!(
+            translate_function("ceil", &args(&["x"])).unwrap(),
+            "CEIL(x)"
+        );
+    }
+
+    #[test]
+    fn translate_ceiling_alias() {
+        assert_eq!(
+            translate_function("ceiling", &args(&["x"])).unwrap(),
+            "CEIL(x)"
+        );
+    }
+
+    #[test]
+    fn translate_floor() {
+        assert_eq!(
+            translate_function("floor", &args(&["x"])).unwrap(),
+            "FLOOR(x)"
+        );
+    }
+
+    #[test]
+    fn translate_round_one_arg() {
+        assert_eq!(
+            translate_function("round", &args(&["x"])).unwrap(),
+            "ROUND(x)"
+        );
+    }
+
+    #[test]
+    fn translate_round_two_args() {
+        assert_eq!(
+            translate_function("round", &args(&["x", "2"])).unwrap(),
+            "ROUND(x, 2)"
+        );
+    }
+
+    #[test]
+    fn translate_now() {
+        assert_eq!(translate_function("now", &[]).unwrap(), "now()");
+    }
+
+    #[test]
+    fn translate_typeof() {
+        assert_eq!(
+            translate_function("typeof", &args(&["x"])).unwrap(),
+            "TYPEOF(x)"
+        );
+    }
+
+    // ── translate_function: new aggregates ───────────────────────────────
+
+    #[test]
+    fn translate_first() {
+        assert_eq!(
+            translate_function("first", &args(&["msg"])).unwrap(),
+            "FIRST(msg)"
+        );
+    }
+
+    #[test]
+    fn translate_last() {
+        assert_eq!(
+            translate_function("last", &args(&["msg"])).unwrap(),
+            "LAST(msg)"
+        );
+    }
+
+    #[test]
+    fn translate_values() {
+        assert_eq!(
+            translate_function("values", &args(&["level"])).unwrap(),
+            "LIST(DISTINCT level)"
+        );
+    }
+
+    #[test]
+    fn translate_list_alias() {
+        assert_eq!(
+            translate_function("list", &args(&["level"])).unwrap(),
+            "LIST(DISTINCT level)"
+        );
+    }
+
+    #[test]
+    fn translate_median() {
+        assert_eq!(
+            translate_function("median", &args(&["dur"])).unwrap(),
+            "MEDIAN(dur)"
+        );
+    }
+
+    #[test]
+    fn translate_stddev() {
+        assert_eq!(
+            translate_function("stddev", &args(&["dur"])).unwrap(),
+            "STDDEV(dur)"
+        );
+    }
+
     // ── translate_function: error cases ─────────────────────────────────
 
     #[test]
@@ -289,6 +527,12 @@ mod tests {
             "p90",
             "p95",
             "p99",
+            "first",
+            "last",
+            "values",
+            "list",
+            "median",
+            "stddev",
         ] {
             assert!(is_aggregate_function(name), "{name} should be aggregate");
         }
@@ -296,7 +540,29 @@ mod tests {
 
     #[test]
     fn scalars_not_aggregate() {
-        for name in ["lower", "upper", "length", "len", "coalesce", "bogus"] {
+        for name in [
+            "lower",
+            "upper",
+            "length",
+            "len",
+            "coalesce",
+            "if",
+            "replace",
+            "substr",
+            "trim",
+            "ltrim",
+            "rtrim",
+            "isnull",
+            "isnotnull",
+            "abs",
+            "ceil",
+            "ceiling",
+            "floor",
+            "round",
+            "now",
+            "typeof",
+            "bogus",
+        ] {
             assert!(
                 !is_aggregate_function(name),
                 "{name} should not be aggregate"
