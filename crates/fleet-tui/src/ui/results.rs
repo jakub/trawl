@@ -24,10 +24,11 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         let result = &response.result;
 
         // Build table header from column names.
-        let header_cells = result
+        let header_cells: Vec<Cell<'_>> = result
             .columns
             .iter()
-            .map(|col| Cell::from(col.name.as_str()).style(Style::default().fg(Color::Yellow)));
+            .map(|col| Cell::from(col.name.as_str()).style(Style::default().fg(Color::Yellow)))
+            .collect();
         let header = Row::new(header_cells)
             .style(Style::default().add_modifier(Modifier::BOLD))
             .height(1);
@@ -39,15 +40,25 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .skip(tab.scroll_offset)
                 .take(area.height.saturating_sub(4) as usize) // Leave room for borders + header
                 .map(|row_data| {
-                    let cells = row_data.iter().map(|value| Cell::from(value_to_string(value)));
+                    let cells: Vec<Cell<'_>> = row_data
+                        .iter()
+                        .map(|value| Cell::from(value_to_string(value)))
+                        .collect();
                     Row::new(cells).height(1)
                 })
                 .collect();
 
-        // Calculate column widths (equal width for now).
-        let col_count = result.columns.len().max(1);
-        #[allow(clippy::cast_possible_truncation)] // Column count < u16::MAX
-        let widths = vec![Constraint::Percentage(100 / col_count as u16); col_count];
+        // Calculate column widths - use fixed minimum width to prevent truncation.
+        // With many columns, percentage-based widths become too narrow (e.g., 2% = 2 chars).
+        let widths: Vec<Constraint> = result
+            .columns
+            .iter()
+            .map(|col| {
+                // Give each column at least 10 chars, or length of column name + 2.
+                let min_width = col.name.len().max(10) as u16 + 2;
+                Constraint::Min(min_width)
+            })
+            .collect();
 
         let title = format!(
             " Results ({} rows{}) ",
