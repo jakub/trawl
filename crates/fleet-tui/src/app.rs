@@ -94,9 +94,15 @@ impl App {
         let tab_idx = self.active_tab_idx;
 
         tokio::spawn(async move {
+            tracing::info!("background task started for query: {}", query);
             let start = Instant::now();
             let result = client.query(&query).await.map_err(|e| e.to_string());
             let duration = start.elapsed();
+            tracing::info!(
+                "query completed in {:?}, result: {:?}",
+                duration,
+                result.is_ok()
+            );
 
             // Convert QueryResult to QueryResponse (map the result).
             let result = result.map(|r| QueryResponse {
@@ -120,6 +126,7 @@ impl App {
     /// Poll for query results and update tabs.
     pub fn poll_query_results(&mut self) {
         while let Ok(query_result) = self.query_rx.try_recv() {
+            tracing::info!("received query result for tab {}", query_result.tab_idx);
             if query_result.tab_idx >= self.tabs.len() {
                 // Tab was closed while query was running.
                 continue;
@@ -297,7 +304,13 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
+    let mut iteration = 0u64;
     loop {
+        iteration += 1;
+        if iteration % 10 == 0 {
+            tracing::debug!("event loop iteration {}", iteration);
+        }
+
         // Poll for query results from background tasks.
         app.poll_query_results();
 
