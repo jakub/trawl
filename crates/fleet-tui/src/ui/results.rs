@@ -34,9 +34,12 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
         // Calculate visible column range based on horizontal scroll
         let total_cols = result.columns.len();
-        let h_scroll = tab
-            .horizontal_scroll_offset
-            .min(total_cols.saturating_sub(1));
+        let h_scroll = if total_cols <= max_cols_on_screen {
+            0 // All columns fit, no scrolling needed
+        } else {
+            tab.horizontal_scroll_offset
+                .min(total_cols.saturating_sub(max_cols_on_screen))
+        };
         let visible_cols = max_cols_on_screen.min(total_cols - h_scroll);
 
         // Build header with visible columns
@@ -58,7 +61,12 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         // Calculate visible row range based on vertical scroll
         let max_visible_rows = area.height.saturating_sub(4) as usize; // -4 for borders and header
         let total_rows = result.row_count();
-        let v_scroll = tab.scroll_offset.min(total_rows.saturating_sub(1));
+        let v_scroll = if total_rows <= max_visible_rows {
+            0 // All rows fit, no scrolling needed
+        } else {
+            tab.scroll_offset
+                .min(total_rows.saturating_sub(max_visible_rows))
+        };
 
         // Build data rows with visible columns
         let data_rows: Vec<Row<'_>> = result
