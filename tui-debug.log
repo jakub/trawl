@@ -1,179 +1,534 @@
    Compiling fleet-tui v0.1.0 (/Users/jakub/code/fleet/crates/fleet-tui)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.15s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.06s
      Running `target/debug/fleet-tui --insecure`
-[2m2026-02-14T23:08:22.673928Z[0m [34mDEBUG[0m [2mfleet_tui::config[0m[2m:[0m config file not found at /Users/jakub/.config/fleet/config.toml, using defaults
-[2m2026-02-14T23:08:22.676093Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m fetching schema, history, and saved queries
-[2m2026-02-14T23:08:23.711631Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m schema fetched: 60 columns
-[2m2026-02-14T23:08:23.711689Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m history fetched: 15 entries
-[2m2026-02-14T23:08:23.711697Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved queries fetched: 0 entries
-[2m2026-02-14T23:08:24.635614Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 10
-[2m2026-02-14T23:08:25.660973Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 20
-[2m2026-02-14T23:08:26.655522Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 30
-[2m2026-02-14T23:08:27.647159Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 40
-[2m2026-02-14T23:08:28.666821Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 50
-[2m2026-02-14T23:08:29.521033Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 60
-[2m2026-02-14T23:08:30.432954Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 70
-[2m2026-02-14T23:08:31.191789Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 80
-[2m2026-02-14T23:08:32.155227Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 90
-[2m2026-02-14T23:08:33.210477Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 100
-[2m2026-02-14T23:08:33.261304Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
-[2m2026-02-14T23:08:33.395863Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:08:33.458708Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('r')
-[2m2026-02-14T23:08:33.616157Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('v')
-[2m2026-02-14T23:08:33.737472Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('i')
-[2m2026-02-14T23:08:33.805959Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('c')
-[2m2026-02-14T23:08:33.896735Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:08:33.896943Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 110
-[2m2026-02-14T23:08:34.229385Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(':')
-[2m2026-02-14T23:08:34.393049Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('f')
-[2m2026-02-14T23:08:34.488995Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
-[2m2026-02-14T23:08:34.567547Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:08:34.706685Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
-[2m2026-02-14T23:08:34.706737Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 120
-[2m2026-02-14T23:08:35.170377Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('d')
-[2m2026-02-14T23:08:35.683530Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 130
-[2m2026-02-14T23:08:35.875040Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
-[2m2026-02-14T23:08:36.017696Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
-[2m2026-02-14T23:08:36.216454Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('d')
-[2m2026-02-14T23:08:36.354563Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
-[2m2026-02-14T23:08:36.559092Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 140
-[2m2026-02-14T23:08:37.529134Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('|')
-[2m2026-02-14T23:08:37.529186Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 150
-[2m2026-02-14T23:08:38.584545Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 160
-[2m2026-02-14T23:08:38.913458Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
-[2m2026-02-14T23:08:39.530552Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 170
-[2m2026-02-14T23:08:40.415670Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
-[2m2026-02-14T23:08:40.518327Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 180
-[2m2026-02-14T23:08:40.629082Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
-[2m2026-02-14T23:08:40.666203Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
-[2m2026-02-14T23:08:40.984883Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
-[2m2026-02-14T23:08:41.079135Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
-[2m2026-02-14T23:08:41.284362Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 190
-[2m2026-02-14T23:08:41.454624Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('1')
-[2m2026-02-14T23:08:41.506124Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('0')
-[2m2026-02-14T23:08:42.224668Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 200
-[2m2026-02-14T23:08:42.980435Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=F(5)
-[2m2026-02-14T23:08:42.980489Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m executing query with F5
-[2m2026-02-14T23:08:42.986902Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m background task started for query: service:fleetd | last 10
-[2m2026-02-14T23:08:43.186364Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 210
-[2m2026-02-14T23:08:43.295652Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m query completed in 308.645708ms, result: false
-[2m2026-02-14T23:08:43.390991Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
-[2m2026-02-14T23:08:44.235490Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 220
-[2m2026-02-14T23:08:44.420990Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
-[2m2026-02-14T23:08:44.571785Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
-[2m2026-02-14T23:08:44.695808Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
-[2m2026-02-14T23:08:44.827092Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
-[2m2026-02-14T23:08:44.962399Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
-[2m2026-02-14T23:08:44.962448Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 230
-[2m2026-02-14T23:08:45.093092Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
-[2m2026-02-14T23:08:45.223101Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
-[2m2026-02-14T23:08:45.585279Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
-[2m2026-02-14T23:08:45.654177Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
-[2m2026-02-14T23:08:45.704136Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('i')
-[2m2026-02-14T23:08:45.704184Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 240
-[2m2026-02-14T23:08:45.896978Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
-[2m2026-02-14T23:08:46.112553Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
-[2m2026-02-14T23:08:46.412490Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('1')
-[2m2026-02-14T23:08:46.483255Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('0')
-[2m2026-02-14T23:08:46.585912Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 250
-[2m2026-02-14T23:08:47.482261Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=F(5)
-[2m2026-02-14T23:08:47.482363Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m executing query with F5
-[2m2026-02-14T23:08:47.482494Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m background task started for query: service:fleetd | tail 10
-[2m2026-02-14T23:08:47.586403Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 260
-[2m2026-02-14T23:08:47.825143Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m query completed in 342.604125ms, result: true
-[2m2026-02-14T23:08:47.894353Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
-[2m2026-02-14T23:08:48.632491Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 270
-[2m2026-02-14T23:08:49.673304Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 280
-[2m2026-02-14T23:08:50.641754Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m starting live stream for query: service:fleetd | tail 10
-[2m2026-02-14T23:08:50.641823Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 290
-[2m2026-02-14T23:08:50.641897Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m live stream task started
-[2m2026-02-14T23:08:51.669723Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 300
-[2m2026-02-14T23:08:52.338441Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:08:52.338519Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:08:52.338553Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:08:52.338588Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:08:52.338621Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:08:52.338652Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:08:52.338679Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:08:52.338716Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:08:52.338742Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:08:52.338767Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:08:52.703253Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 310
-[2m2026-02-14T23:08:53.752706Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 320
-[2m2026-02-14T23:08:54.799699Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 330
-[2m2026-02-14T23:08:55.830371Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 340
-[2m2026-02-14T23:08:56.860693Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 350
-[2m2026-02-14T23:08:57.344819Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:08:57.344896Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:08:57.344921Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:08:57.344969Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:08:57.345011Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:08:57.345069Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:08:57.345158Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
-[2m2026-02-14T23:08:57.345184Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:08:57.345219Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
-[2m2026-02-14T23:08:57.345258Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:08:57.898310Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 360
-[2m2026-02-14T23:08:58.968887Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 370
-[2m2026-02-14T23:09:00.004224Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 380
-[2m2026-02-14T23:09:01.034850Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 390
-[2m2026-02-14T23:09:02.064128Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 400
-[2m2026-02-14T23:09:02.342193Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:09:02.342264Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:09:02.342305Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:02.342323Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:09:02.342341Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:09:02.342357Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:02.342388Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
-[2m2026-02-14T23:09:02.342421Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:09:02.342450Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
-[2m2026-02-14T23:09:02.342474Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:09:03.101467Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 410
-[2m2026-02-14T23:09:04.151018Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 420
-[2m2026-02-14T23:09:05.180332Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 430
-[2m2026-02-14T23:09:06.210210Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 440
-[2m2026-02-14T23:09:07.239334Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 450
-[2m2026-02-14T23:09:07.340840Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:09:07.340920Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
-[2m2026-02-14T23:09:07.340947Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:09:07.340975Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "query_source", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:07.340995Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:09:07.341016Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:07.341036Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "stream_start", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:07.341057Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:09:07.341076Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:09:07.341097Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:08.286545Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 460
-[2m2026-02-14T23:09:09.338200Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 470
-[2m2026-02-14T23:09:10.368080Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 480
-[2m2026-02-14T23:09:11.397094Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 490
-[2m2026-02-14T23:09:12.343398Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:09:12.343479Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
-[2m2026-02-14T23:09:12.343497Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:09:12.343515Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "query_source", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:12.343620Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:09:12.343646Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:12.343663Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "stream_start", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:12.343679Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:09:12.343695Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:09:12.343709Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:12.427326Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 500
-[2m2026-02-14T23:09:13.479703Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 510
-[2m2026-02-14T23:09:14.510919Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 520
-[2m2026-02-14T23:09:15.540752Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 530
-[2m2026-02-14T23:09:16.571135Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 540
-[2m2026-02-14T23:09:17.342603Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "query_source", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:17.342670Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:09:17.342697Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:09:17.342724Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:17.342746Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "query_source", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:17.342770Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "http_response", expected a sequence at line 1 column 16
-[2m2026-02-14T23:09:17.342792Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "ingest_complete", expected a sequence at line 1 column 18
-[2m2026-02-14T23:09:17.342822Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "auth_success", expected a sequence at line 1 column 15
-[2m2026-02-14T23:09:17.342842Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_complete", expected a sequence at line 1 column 22
-[2m2026-02-14T23:09:17.342864Z[0m [33m WARN[0m [2mfleet_tui::app[0m[2m:[0m failed to parse stream result: invalid type: string "compaction_start", expected a sequence at line 1 column 19
-[2m2026-02-14T23:09:17.601415Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 550
-[2m2026-02-14T23:09:18.724754Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 560
-[2m2026-02-14T23:09:19.771023Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 570
-[2m2026-02-14T23:09:20.442256Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(CONTROL), code=Char('w')
-[2m2026-02-14T23:09:20.750789Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 580
+[2m2026-02-14T23:14:39.954283Z[0m [34mDEBUG[0m [2mfleet_tui::config[0m[2m:[0m config file not found at /Users/jakub/.config/fleet/config.toml, using defaults
+[2m2026-02-14T23:14:39.956484Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m fetching schema, history, and saved queries
+[2m2026-02-14T23:14:42.306024Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m schema fetched: 60 columns
+[2m2026-02-14T23:14:42.306084Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m history fetched: 16 entries
+[2m2026-02-14T23:14:42.306092Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved queries fetched: 0 entries
+[2m2026-02-14T23:14:43.252440Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 10
+[2m2026-02-14T23:14:44.278108Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 20
+[2m2026-02-14T23:14:45.304288Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 30
+[2m2026-02-14T23:14:46.328750Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 40
+[2m2026-02-14T23:14:47.369646Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 50
+[2m2026-02-14T23:14:48.434344Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 60
+[2m2026-02-14T23:14:49.459252Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 70
+[2m2026-02-14T23:14:49.740538Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
+[2m2026-02-14T23:14:49.880576Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:14:49.941434Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('r')
+[2m2026-02-14T23:14:50.126296Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('v')
+[2m2026-02-14T23:14:50.200486Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('i')
+[2m2026-02-14T23:14:50.282848Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('c')
+[2m2026-02-14T23:14:50.282896Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 80
+[2m2026-02-14T23:14:50.335156Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:14:50.563519Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(':')
+[2m2026-02-14T23:14:50.737350Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('f')
+[2m2026-02-14T23:14:50.822102Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
+[2m2026-02-14T23:14:50.895634Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:14:51.039167Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:14:51.039224Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 90
+[2m2026-02-14T23:14:51.135265Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:14:51.325822Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('d')
+[2m2026-02-14T23:14:52.053238Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 100
+[2m2026-02-14T23:14:52.126132Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:14:52.504087Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('|')
+[2m2026-02-14T23:14:53.026052Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:14:53.026121Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 110
+[2m2026-02-14T23:14:53.245623Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:14:53.310126Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
+[2m2026-02-14T23:14:53.356364Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('i')
+[2m2026-02-14T23:14:53.537391Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
+[2m2026-02-14T23:14:53.845312Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 120
+[2m2026-02-14T23:14:53.874159Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:14:53.978967Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('1')
+[2m2026-02-14T23:14:54.037280Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('0')
+[2m2026-02-14T23:14:54.652879Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 130
+[2m2026-02-14T23:14:55.457774Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=F(5)
+[2m2026-02-14T23:14:55.457833Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m executing query with F5
+[2m2026-02-14T23:14:55.457960Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m background task started for query: service:fleetd | tail 10
+[2m2026-02-14T23:14:55.663124Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 140
+[2m2026-02-14T23:14:56.688919Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 150
+[2m2026-02-14T23:14:56.691679Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m query completed in 1.233681209s, result: true
+[2m2026-02-14T23:14:56.791666Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:14:57.729276Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 160
+[2m2026-02-14T23:14:58.786701Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 170
+[2m2026-02-14T23:14:59.816330Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 180
+[2m2026-02-14T23:14:59.974946Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m starting live stream for query: service:fleetd | tail 10
+[2m2026-02-14T23:14:59.975070Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m live stream task started
+[2m2026-02-14T23:15:00.798880Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 190
+[2m2026-02-14T23:15:01.697376Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:01.697467Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:01.697494Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:01.697528Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:01.697558Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:01.697584Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:01.697612Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:01.697637Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:01.697665Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:01.697691Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:01.697717Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:01.725248Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:01.828317Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 200
+[2m2026-02-14T23:15:02.883469Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 210
+[2m2026-02-14T23:15:03.935191Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 220
+[2m2026-02-14T23:15:04.964715Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 230
+[2m2026-02-14T23:15:05.994794Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 240
+[2m2026-02-14T23:15:06.704076Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:06.704157Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:06.704194Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:06.704242Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:06.704273Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:06.704303Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:06.704344Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:06.704385Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:06.704415Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:06.704441Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:06.704452Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:06.716571Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:07.025931Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 250
+[2m2026-02-14T23:15:08.066952Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 260
+[2m2026-02-14T23:15:09.100003Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 270
+[2m2026-02-14T23:15:10.130090Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 280
+[2m2026-02-14T23:15:11.160559Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 290
+[2m2026-02-14T23:15:11.701269Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:11.701357Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:11.701388Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:11.701420Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:11.701448Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:11.701477Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:11.701504Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:11.701527Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:11.701551Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:11.701573Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:11.701584Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:11.778365Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:12.196533Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 300
+[2m2026-02-14T23:15:13.249201Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 310
+[2m2026-02-14T23:15:14.286806Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 320
+[2m2026-02-14T23:15:15.315666Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 330
+[2m2026-02-14T23:15:16.345639Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 340
+[2m2026-02-14T23:15:16.699202Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:16.699295Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:16.699329Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:16.699363Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:16.699391Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:16.699418Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:16.699446Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:16.699476Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:16.699503Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:16.699533Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:16.699544Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:16.758062Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:17.386373Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 350
+[2m2026-02-14T23:15:18.455799Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 360
+[2m2026-02-14T23:15:19.485136Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 370
+[2m2026-02-14T23:15:20.515742Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 380
+[2m2026-02-14T23:15:21.546795Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 390
+[2m2026-02-14T23:15:21.703890Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:21.703972Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:21.704008Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:21.704041Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:21.704064Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:21.704143Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:21.704206Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:21.704230Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:21.704259Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:21.704292Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:21.704310Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:21.752522Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:22.584709Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 400
+[2m2026-02-14T23:15:23.619153Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 410
+[2m2026-02-14T23:15:24.230607Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:24.348085Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:24.488827Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:24.488872Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 420
+[2m2026-02-14T23:15:24.612168Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:24.740936Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:24.870535Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:25.001334Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:25.120901Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:25.120949Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 430
+[2m2026-02-14T23:15:25.262527Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:26.085608Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 440
+[2m2026-02-14T23:15:26.645490Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:26.697489Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:26.697570Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:26.697607Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:26.697640Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:26.697667Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:26.697696Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:26.697722Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:26.697750Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:26.697778Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:26.697806Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:26.697816Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:26.748520Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:26.795514Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:27.002307Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 450
+[2m2026-02-14T23:15:27.082991Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:27.205421Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:27.540281Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Enter
+[2m2026-02-14T23:15:27.650039Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Enter
+[2m2026-02-14T23:15:27.754956Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 460
+[2m2026-02-14T23:15:28.053817Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Up
+[2m2026-02-14T23:15:28.788555Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 470
+[2m2026-02-14T23:15:29.170201Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('~')
+[2m2026-02-14T23:15:29.465526Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:15:29.553623Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:15:29.758983Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 480
+[2m2026-02-14T23:15:29.796157Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:15:29.911815Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:15:30.036929Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:15:30.328594Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('|')
+[2m2026-02-14T23:15:30.534893Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 490
+[2m2026-02-14T23:15:30.670828Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:15:30.799259Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:15:30.904418Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
+[2m2026-02-14T23:15:31.129468Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('b')
+[2m2026-02-14T23:15:31.232540Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 500
+[2m2026-02-14T23:15:31.267810Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('l')
+[2m2026-02-14T23:15:31.389959Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:15:31.533051Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:15:31.697202Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:31.697317Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:31.697392Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:31.697419Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:31.697450Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:31.697472Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:31.697498Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:31.697536Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:31.697590Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:31.697632Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:31.697657Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:31.739135Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:31.749484Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:15:31.862319Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('v')
+[2m2026-02-14T23:15:31.862372Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 510
+[2m2026-02-14T23:15:31.955568Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:15:32.064376Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('n')
+[2m2026-02-14T23:15:32.155631Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:15:32.334252Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('_')
+[2m2026-02-14T23:15:32.557968Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:15:32.624635Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('y')
+[2m2026-02-14T23:15:32.624693Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 520
+[2m2026-02-14T23:15:32.710307Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('p')
+[2m2026-02-14T23:15:32.840329Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:15:33.245785Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:33.367879Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:33.472463Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 530
+[2m2026-02-14T23:15:33.487031Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:33.614017Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:33.740461Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:33.864097Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:33.995390Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:34.098465Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 540
+[2m2026-02-14T23:15:34.111937Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:34.231075Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:34.355269Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Left
+[2m2026-02-14T23:15:34.869929Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 550
+[2m2026-02-14T23:15:35.900429Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 560
+[2m2026-02-14T23:15:36.697011Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:36.697105Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:36.697128Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:36.697155Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:36.697186Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:36.697216Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:36.697264Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:36.697295Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:36.697318Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:36.697400Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:36.697441Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:36.725457Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:36.932130Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 570
+[2m2026-02-14T23:15:37.962813Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 580
+[2m2026-02-14T23:15:38.993142Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 590
+[2m2026-02-14T23:15:39.746764Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:15:39.862688Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('i')
+[2m2026-02-14T23:15:39.862739Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 600
+[2m2026-02-14T23:15:39.939946Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('m')
+[2m2026-02-14T23:15:39.995076Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:15:40.197330Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
+[2m2026-02-14T23:15:40.270110Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('t')
+[2m2026-02-14T23:15:40.388998Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
+[2m2026-02-14T23:15:40.456426Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('m')
+[2m2026-02-14T23:15:40.514115Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('p')
+[2m2026-02-14T23:15:40.617218Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 610
+[2m2026-02-14T23:15:40.691482Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(',')
+[2m2026-02-14T23:15:40.874437Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:15:41.595638Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 620
+[2m2026-02-14T23:15:41.697923Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:41.698001Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:41.698047Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:41.698089Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:41.698125Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:41.698159Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:41.698187Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:41.698216Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:41.698242Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:41.698268Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:41.698279Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:41.698759Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:42.265239Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:42.399385Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:42.502482Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 630
+[2m2026-02-14T23:15:42.536977Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:42.681468Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:42.803731Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:42.928669Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:43.050498Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:43.153420Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 640
+[2m2026-02-14T23:15:43.171742Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:43.309086Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:43.451896Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Right
+[2m2026-02-14T23:15:43.948915Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('m')
+[2m2026-02-14T23:15:43.948966Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 650
+[2m2026-02-14T23:15:44.165074Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:15:44.415224Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:15:44.520470Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Backspace
+[2m2026-02-14T23:15:44.726661Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 660
+[2m2026-02-14T23:15:44.856815Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(',')
+[2m2026-02-14T23:15:45.041119Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char(' ')
+[2m2026-02-14T23:15:45.213800Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('m')
+[2m2026-02-14T23:15:45.295048Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:15:45.463869Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
+[2m2026-02-14T23:15:45.566994Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 670
+[2m2026-02-14T23:15:45.583795Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('s')
+[2m2026-02-14T23:15:45.706350Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('a')
+[2m2026-02-14T23:15:45.786949Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('g')
+[2m2026-02-14T23:15:45.833929Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=Char('e')
+[2m2026-02-14T23:15:46.348565Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 680
+[2m2026-02-14T23:15:46.696639Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:46.696721Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:46.696765Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:46.696813Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:46.696852Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:46.696886Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:46.696917Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:46.696947Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:46.696986Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:46.697017Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:46.697031Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:46.761105Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:47.213669Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=F(5)
+[2m2026-02-14T23:15:47.213765Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m executing query with F5
+[2m2026-02-14T23:15:47.214150Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m background task started for query: service:fleetd 
+| table timestamp, event_type, message
+| tail 10
+[2m2026-02-14T23:15:47.317178Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 690
+[2m2026-02-14T23:15:47.555384Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m query completed in 341.181625ms, result: true
+[2m2026-02-14T23:15:47.626403Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:48.348755Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 700
+[2m2026-02-14T23:15:49.379716Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 710
+[2m2026-02-14T23:15:50.409619Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 720
+[2m2026-02-14T23:15:51.447170Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 730
+[2m2026-02-14T23:15:51.704616Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:51.704690Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:51.704713Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:51.704801Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:51.704860Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:51.704887Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:51.704918Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:51.704944Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:51.704969Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:51.704996Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:51.705008Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:51.763600Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:52.507435Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 740
+[2m2026-02-14T23:15:53.552884Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 750
+[2m2026-02-14T23:15:54.129785Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m stopping live stream
+[2m2026-02-14T23:15:54.541694Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 760
+[2m2026-02-14T23:15:55.572707Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 770
+[2m2026-02-14T23:15:56.116966Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m editor key: modifiers=KeyModifiers(0x0), code=F(5)
+[2m2026-02-14T23:15:56.117015Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m executing query with F5
+[2m2026-02-14T23:15:56.117098Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m background task started for query: service:fleetd 
+| table timestamp, event_type, message
+| tail 10
+[2m2026-02-14T23:15:56.449411Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m query completed in 332.284458ms, result: true
+[2m2026-02-14T23:15:56.528388Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 780
+[2m2026-02-14T23:15:56.528439Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:57.587088Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 790
+[2m2026-02-14T23:15:57.620204Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m starting live stream for query: service:fleetd 
+| table timestamp, event_type, message
+| tail 10
+[2m2026-02-14T23:15:57.620316Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m live stream task started
+[2m2026-02-14T23:15:57.954467Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:15:57.954533Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:15:57.954554Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:15:57.954577Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:15:57.954606Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:15:57.954636Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:15:57.954657Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:15:57.954678Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:15:57.954696Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:15:57.954715Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:15:57.954723Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:15:58.032066Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:15:58.547622Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 800
+[2m2026-02-14T23:15:59.578615Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 810
+[2m2026-02-14T23:16:00.634892Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 820
+[2m2026-02-14T23:16:01.674344Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 830
+[2m2026-02-14T23:16:02.731717Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 840
+[2m2026-02-14T23:16:02.955187Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:02.955253Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:02.955276Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:02.955297Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:02.955329Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:02.955359Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:02.955392Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:02.955414Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:02.955427Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:02.955448Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:02.955466Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:03.045648Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:03.765362Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 850
+[2m2026-02-14T23:16:04.795578Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 860
+[2m2026-02-14T23:16:05.824911Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 870
+[2m2026-02-14T23:16:06.854518Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 880
+[2m2026-02-14T23:16:07.887217Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 890
+[2m2026-02-14T23:16:07.952865Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:07.952928Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:07.952949Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:07.952970Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:07.952988Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:07.953006Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:07.953017Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:07.953029Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:07.953040Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:07.953050Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:07.953058Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:07.990318Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:08.917466Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 900
+[2m2026-02-14T23:16:09.948355Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 910
+[2m2026-02-14T23:16:10.978973Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 920
+[2m2026-02-14T23:16:12.009259Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 930
+[2m2026-02-14T23:16:12.954217Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:12.954289Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:12.954311Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:12.954333Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:12.954352Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:12.954369Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:12.954390Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:12.954421Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:12.954443Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:12.954463Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:12.954475Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:13.054729Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 940
+[2m2026-02-14T23:16:13.054783Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:14.085120Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 950
+[2m2026-02-14T23:16:15.114182Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 960
+[2m2026-02-14T23:16:16.142033Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 970
+[2m2026-02-14T23:16:17.189913Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 980
+[2m2026-02-14T23:16:17.956504Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:17.956574Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:17.956599Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:17.956621Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:17.956640Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:17.956659Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:17.956671Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:17.956683Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:17.956700Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:17.956715Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:17.956723Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:18.034843Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:18.240993Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 990
+[2m2026-02-14T23:16:19.269438Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1000
+[2m2026-02-14T23:16:20.300357Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1010
+[2m2026-02-14T23:16:21.337287Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1020
+[2m2026-02-14T23:16:22.390590Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1030
+[2m2026-02-14T23:16:22.958022Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:22.958093Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:22.958114Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:22.958136Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:22.958155Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:22.958172Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:22.958196Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:22.958227Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:22.958249Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:22.958269Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:22.958279Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:23.009984Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:23.422544Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1040
+[2m2026-02-14T23:16:24.453559Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1050
+[2m2026-02-14T23:16:25.484642Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1060
+[2m2026-02-14T23:16:26.515883Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1070
+[2m2026-02-14T23:16:27.546874Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1080
+[2m2026-02-14T23:16:27.957286Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:27.957364Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:27.957388Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:27.957424Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:27.957454Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:27.957529Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:27.957592Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:27.957618Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:27.957652Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:27.957677Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:27.957687Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:27.959545Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:28.577441Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1090
+[2m2026-02-14T23:16:29.608769Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1100
+[2m2026-02-14T23:16:30.637749Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1110
+[2m2026-02-14T23:16:31.681840Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1120
+[2m2026-02-14T23:16:32.713151Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1130
+[2m2026-02-14T23:16:32.956174Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:32.956244Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:32.956267Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:32.956288Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:32.956308Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:32.956324Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:32.956336Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:32.956349Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:32.956366Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:32.956382Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:32.956391Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:33.022454Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:33.744560Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1140
+[2m2026-02-14T23:16:34.774761Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1150
+[2m2026-02-14T23:16:35.806448Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1160
+[2m2026-02-14T23:16:36.837190Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1170
+[2m2026-02-14T23:16:37.868522Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1180
+[2m2026-02-14T23:16:37.954240Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:37.954309Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:37.954335Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:37.954356Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:37.954383Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:37.954401Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:37.954431Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:37.954449Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:37.954466Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:37.954482Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:37.954490Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:37.971629Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:38.899836Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1190
+[2m2026-02-14T23:16:39.930214Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1200
+[2m2026-02-14T23:16:40.961386Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1210
+[2m2026-02-14T23:16:41.992403Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1220
+[2m2026-02-14T23:16:42.952389Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:42.952462Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:42.952484Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:42.952506Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:42.952525Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:42.952545Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:42.952563Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:42.952584Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:42.952602Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:42.952621Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:42.952631Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:43.025307Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1230
+[2m2026-02-14T23:16:43.025365Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:44.055372Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1240
+[2m2026-02-14T23:16:45.086009Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1250
+[2m2026-02-14T23:16:46.116819Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1260
+[2m2026-02-14T23:16:47.147461Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1270
+[2m2026-02-14T23:16:47.953794Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 1
+[2m2026-02-14T23:16:47.953883Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 2
+[2m2026-02-14T23:16:47.953907Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 3
+[2m2026-02-14T23:16:47.953931Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 4
+[2m2026-02-14T23:16:47.953955Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 5
+[2m2026-02-14T23:16:47.953974Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 6
+[2m2026-02-14T23:16:47.953987Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 7
+[2m2026-02-14T23:16:47.954000Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 8
+[2m2026-02-14T23:16:47.954022Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 9
+[2m2026-02-14T23:16:47.954054Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m received stream row, total: 10
+[2m2026-02-14T23:16:47.954063Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m sending batch of 10 rows
+[2m2026-02-14T23:16:47.971744Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m received query result for tab 0
+[2m2026-02-14T23:16:48.178086Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 1280

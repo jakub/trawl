@@ -92,6 +92,11 @@ impl App {
 
     /// Execute a query in the background.
     pub fn execute_query(&mut self) {
+        // Stop live streaming if active (user is running a new/edited query).
+        if self.live_mode {
+            self.stop_live_stream();
+        }
+
         let tab = self.active_tab_mut();
         let query = tab.editor.text().trim().to_owned();
 
