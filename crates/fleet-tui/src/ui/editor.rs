@@ -3,7 +3,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::app::App;
 use crate::highlight::Highlighter;
@@ -28,7 +28,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(border_style);
+        .border_style(border_style)
+        .padding(Padding::horizontal(1));
 
     let tab = app.active_tab();
 

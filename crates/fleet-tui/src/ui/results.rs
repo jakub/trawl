@@ -6,7 +6,8 @@ use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table,
 };
 
 use crate::app::App;
@@ -104,7 +105,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(border_style);
+            .border_style(border_style)
+            .padding(Padding::horizontal(1));
 
         let table = Table::default()
             .rows(data_rows)
@@ -154,7 +156,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Results ")
-            .border_style(border_style);
+            .border_style(border_style)
+            .padding(Padding::horizontal(1));
 
         let text = Line::from("no results yet — execute a query with F5");
         let paragraph = Paragraph::new(text).block(block);
