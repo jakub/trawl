@@ -154,7 +154,7 @@ impl HttpClient {
     /// but does NOT validate field existence.
     pub async fn validate(&self, dsl: &str) -> Result<ValidationResponse, ClientError> {
         let url = self.endpoint("/api/v1/validate");
-        let body = serde_json::json!({ "query": dsl });
+        let body = ValidateRequest { query: dsl };
         let req = self.client.post(&url).json(&body);
         self.send_authenticated(req).await
     }
@@ -165,22 +165,14 @@ impl HttpClient {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<HistoryResponse, ClientError> {
-        let mut url = self.endpoint("/api/v1/history");
-
-        // Build query string if parameters are provided.
-        let mut params = vec![];
+        let url = self.endpoint("/api/v1/history");
+        let mut req = self.client.get(&url);
         if let Some(l) = limit {
-            params.push(format!("limit={l}"));
+            req = req.query(&[("limit", l.to_string())]);
         }
         if let Some(o) = offset {
-            params.push(format!("offset={o}"));
+            req = req.query(&[("offset", o.to_string())]);
         }
-        if !params.is_empty() {
-            url.push('?');
-            url.push_str(&params.join("&"));
-        }
-
-        let req = self.client.get(&url);
         self.send_authenticated(req).await
     }
 
@@ -198,7 +190,7 @@ impl HttpClient {
         query: &str,
     ) -> Result<SavedQueryResponse, ClientError> {
         let url = self.endpoint("/api/v1/saved");
-        let body = serde_json::json!({ "name": name, "query": query });
+        let body = CreateSavedRequest { name, query };
         let req = self.client.post(&url).json(&body);
         self.send_authenticated(req).await
     }
@@ -210,7 +202,7 @@ impl HttpClient {
         query: &str,
     ) -> Result<SavedQueryResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{id}"));
-        let body = serde_json::json!({ "query": query });
+        let body = UpdateSavedRequest { query };
         let req = self.client.put(&url).json(&body);
         self.send_authenticated(req).await
     }
@@ -227,7 +219,7 @@ impl HttpClient {
     /// Returns raw CSV bytes suitable for writing to a file.
     pub async fn export(&self, query: &str, limit: Option<usize>) -> Result<Vec<u8>, ClientError> {
         let url = self.endpoint("/api/v1/export?format=csv");
-        let body = serde_json::json!({ "query": query, "limit": limit });
+        let body = ExportRequest { query, limit };
 
         let resp = self
             .client
@@ -340,14 +332,14 @@ struct ErrorResponse {
 }
 
 /// Health check response from the daemon.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HealthResponse {
     /// Status string, typically `"ok"`.
     pub status: String,
 }
 
 /// Schema introspection response from the daemon.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SchemaResponse {
     /// Column descriptors (name + type).
     pub columns: Vec<SchemaColumnResponse>,
@@ -358,7 +350,7 @@ pub struct SchemaResponse {
 }
 
 /// A single column in the schema response.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SchemaColumnResponse {
     /// Column name.
     pub name: String,
@@ -368,7 +360,7 @@ pub struct SchemaColumnResponse {
 }
 
 /// Active and recent queries response from the daemon.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct QueriesResponse {
     /// Currently executing queries.
     pub active: Vec<ActiveQuerySnapshot>,
@@ -377,7 +369,7 @@ pub struct QueriesResponse {
 }
 
 /// Snapshot of a currently executing query.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ActiveQuerySnapshot {
     /// Monotonic query ID.
     pub id: u64,
@@ -392,7 +384,7 @@ pub struct ActiveQuerySnapshot {
 }
 
 /// A completed query from recent history.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CompletedQuerySnapshot {
     /// Monotonic query ID.
     pub id: u64,
@@ -411,7 +403,7 @@ pub struct CompletedQuerySnapshot {
 }
 
 /// Response from the cancel query endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CancelResponse {
     /// Whether the query was found and cancelled.
     pub cancelled: bool,
@@ -420,7 +412,7 @@ pub struct CancelResponse {
 }
 
 /// Response from the validate endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ValidationResponse {
     /// Whether the query is valid.
     pub valid: bool,
@@ -429,7 +421,7 @@ pub struct ValidationResponse {
 }
 
 /// Query response with pagination metadata.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct QueryResponse {
     /// The query result (columns + rows).
     #[serde(flatten)]
@@ -441,7 +433,7 @@ pub struct QueryResponse {
 }
 
 /// Pagination metadata for query responses.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PaginationMeta {
     /// The limit applied to this response.
     pub limit: usize,
@@ -452,7 +444,7 @@ pub struct PaginationMeta {
 }
 
 /// Response from the history endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HistoryResponse {
     /// Query history entries (most recent first).
     pub entries: Vec<HistoryEntryResponse>,
@@ -461,7 +453,7 @@ pub struct HistoryResponse {
 }
 
 /// A single query history entry.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HistoryEntryResponse {
     /// History entry ID.
     pub id: i64,
@@ -478,14 +470,14 @@ pub struct HistoryEntryResponse {
 }
 
 /// Response from the list saved queries endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ListSavedResponse {
     /// Saved queries (sorted by name).
     pub queries: Vec<SavedQueryResponse>,
 }
 
 /// A single saved query.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SavedQueryResponse {
     /// Saved query ID.
     pub id: i64,
@@ -500,7 +492,7 @@ pub struct SavedQueryResponse {
 }
 
 /// Response from the delete saved query endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DeleteSavedResponse {
     /// Whether the query was successfully deleted.
     pub deleted: bool,
@@ -515,6 +507,29 @@ struct QueryRequestPaginated {
     limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     offset: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ValidateRequest<'a> {
+    query: &'a str,
+}
+
+#[derive(Serialize)]
+struct CreateSavedRequest<'a> {
+    name: &'a str,
+    query: &'a str,
+}
+
+#[derive(Serialize)]
+struct UpdateSavedRequest<'a> {
+    query: &'a str,
+}
+
+#[derive(Serialize)]
+struct ExportRequest<'a> {
+    query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
 }
 
 #[cfg(test)]
