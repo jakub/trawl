@@ -60,6 +60,8 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         let tab = app.active_tab();
         let (row, col) = tab.editor.cursor;
         #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
-        frame.set_cursor_position((chunks[1].x + col as u16 + 1, chunks[1].y + row as u16 + 1));
+        // +2 for x: border (1) + horizontal padding (1)
+        // +1 for y: border (1) only
+        frame.set_cursor_position((chunks[1].x + col as u16 + 2, chunks[1].y + row as u16 + 1));
     }
 }
