@@ -255,7 +255,7 @@ impl HttpClient {
         let resp = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .header("Authorization", self.auth_header_value())
             .header("Content-Type", "application/x-ndjson")
             .body(ndjson)
             .send()
@@ -284,7 +284,7 @@ impl HttpClient {
             .client
             .post(&url)
             .query(&[("format", format.to_string())])
-            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .header("Authorization", self.auth_header_value())
             .json(&body)
             .send()
             .await
@@ -372,7 +372,7 @@ impl HttpClient {
         }
 
         let resp = req
-            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .header("Authorization", self.auth_header_value())
             .send()
             .await
             .map_err(sanitize_reqwest_error)?;
@@ -381,13 +381,18 @@ impl HttpClient {
         Ok(resp)
     }
 
+    /// Build the Authorization header value for authenticated requests.
+    fn auth_header_value(&self) -> String {
+        format!("Bearer {}", self.token.as_str())
+    }
+
     /// Send an authenticated request, check for errors, and deserialize the response.
     async fn send_authenticated<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, ClientError> {
         let resp = req
-            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .header("Authorization", self.auth_header_value())
             .send()
             .await
             .map_err(sanitize_reqwest_error)?;
