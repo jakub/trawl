@@ -1,6 +1,6 @@
 //! fleet-client: shared client library for communicating with fleetd.
 //!
-//! Used by fleet-cli, fleet-admin, and the TUI. Handles connection
+//! Used by fleet-cli (CLI and TUI modes). Handles connection
 //! management, authentication, query submission, and result streaming
 //! across all supported transports.
 

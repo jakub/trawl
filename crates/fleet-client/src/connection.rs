@@ -577,19 +577,6 @@ mod tests {
 
     // ── error sanitization ──────────────────────────────────────────────
 
-    #[test]
-    fn sanitize_timeout_error() {
-        // Build a client with a 1ns timeout to force a timeout error.
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_nanos(1))
-            .build()
-            .unwrap();
-        // We can't easily construct reqwest errors directly, but we can
-        // verify the function signature exists and handles the variants.
-        // The actual integration is tested via fleet-server's http_api tests.
-        let _ = client; // ensure client builds
-    }
-
     // ── serde: QueryRequestPaginated ────────────────────────────────────
 
     #[test]
