@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 mod cli;
 mod config;
+mod tui;
 
 /// fleet — search your logs with a pipeline DSL.
 ///
@@ -97,11 +98,16 @@ async fn run(args: Cli) -> Result<(), CliError> {
 
     match args.command {
         None => {
-            // TUI mode (placeholder — wired up in a later commit).
-            eprintln!(
-                "fleet: TUI not yet available in this build, use `fleet query` or `fleet validate`"
-            );
-            process::exit(1);
+            // TUI mode — init tracing to stderr and launch.
+            tracing_subscriber::fmt()
+                .with_writer(io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("fleet=debug")),
+                )
+                .init();
+
+            tui::run(&cfg, args.token.as_deref()).await?;
         }
         Some(Command::Query {
             query,
