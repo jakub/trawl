@@ -235,7 +235,6 @@ fn render_sparkline(
     if series.len() == 1 {
         let (label, values) = &series[0];
         let max_val = values.iter().max().copied().unwrap_or(100);
-        let min_val = values.iter().min().copied().unwrap_or(0);
 
         let title = if let Some((ref start, ref end, ref span)) = time_info {
             format!(" {label} • {start} to {end} • span: {span} ")
@@ -246,10 +245,7 @@ fn render_sparkline(
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .title_bottom(format!(
-                " {} points  •  max: {max_val}  •  'v' to toggle view ",
-                values.len(),
-            ))
+            .title_bottom(format!(" {} points  •  'v' to toggle view ", values.len(),))
             .border_style(border_style)
             .padding(Padding::horizontal(1));
 
@@ -272,7 +268,7 @@ fn render_sparkline(
 
         frame.render_widget(sparkline, sparkline_area);
 
-        // Render y-axis labels (max at top, min at bottom)
+        // Render y-axis labels (max at top, 0 at bottom - sparkline is filled area from 0)
         let max_label =
             Paragraph::new(format!("{max_val:>7}")).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(
@@ -285,10 +281,9 @@ fn render_sparkline(
             },
         );
 
-        let min_label =
-            Paragraph::new(format!("{min_val:>7}")).style(Style::default().fg(Color::DarkGray));
+        let zero_label = Paragraph::new("      0").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(
-            min_label,
+            zero_label,
             Rect {
                 x: inner.x,
                 y: inner.y + sparkline_area.height.saturating_sub(1),
@@ -297,9 +292,14 @@ fn render_sparkline(
             },
         );
 
-        // Render x-axis time labels (first and last time)
+        // Render x-axis time labels (first and last time, properly spaced)
         if let Some((start, end, _)) = time_info {
-            let x_axis_text = format!("{start:<19} {end:>19}");
+            let available_width = sparkline_area.width as usize;
+            let start_len = start.len();
+            let end_len = end.len();
+            let padding = available_width.saturating_sub(start_len + end_len);
+
+            let x_axis_text = format!("{start}{}{end}", " ".repeat(padding));
             let x_axis_label =
                 Paragraph::new(x_axis_text).style(Style::default().fg(Color::DarkGray));
             frame.render_widget(
