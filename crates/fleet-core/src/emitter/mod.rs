@@ -673,6 +673,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // round with precision
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_let_round_with_precision() {
+        assert_snapshot!(emit_dsl("* | let pct = round(count * 100.0 / 1000, 2)"));
+    }
+
+    #[test]
+    fn pipe_let_round_no_precision() {
+        assert_snapshot!(emit_dsl("* | let r = round(duration)"));
+    }
+
+    #[test]
+    fn error_round_non_int_precision() {
+        assert_snapshot!(emit_dsl_err(r#"* | let r = round(duration, "two")"#));
+    }
+
+    // -----------------------------------------------------------------------
     // list-format source paths
     // -----------------------------------------------------------------------
 

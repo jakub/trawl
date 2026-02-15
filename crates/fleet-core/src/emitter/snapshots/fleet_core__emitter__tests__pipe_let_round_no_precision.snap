@@ -1,0 +1,10 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | let r = round(duration)\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT *, (ROUND("duration")) AS "r"
+FROM "_s0"

@@ -3,7 +3,7 @@ use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use super::EmitError;
 use super::SqlValue;
 use super::fields::quote_field;
-use super::functions::translate_function;
+use super::functions::{literal_int_positions, translate_function};
 use super::state::EmitterState;
 
 /// Recursively translate an expression AST node to a SQL fragment.
@@ -24,9 +24,26 @@ pub(crate) fn emit_expr(
             Ok(emit_unary(*op, &inner))
         }
         Expr::FunctionCall { name, args } => {
+            let lit_positions = literal_int_positions(name);
             let translated_args: Vec<String> = args
                 .iter()
-                .map(|a| emit_expr(a, state))
+                .enumerate()
+                .map(|(i, a)| {
+                    if lit_positions.contains(&i) {
+                        // DuckDB requires certain args as literal ints, not parameters
+                        match &a.node {
+                            Expr::Literal(LiteralValue::Int(n)) => Ok(n.to_string()),
+                            _ => Err(EmitError::InvalidAggregation {
+                                message: format!(
+                                    "{name}() argument {} must be an integer literal",
+                                    i + 1,
+                                ),
+                            }),
+                        }
+                    } else {
+                        emit_expr(a, state)
+                    }
+                })
                 .collect::<Result<_, _>>()?;
             translate_function(name, &translated_args)
         }

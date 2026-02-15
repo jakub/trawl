@@ -85,6 +85,15 @@ fn function_arity(name: &str) -> (usize, Option<usize>) {
     }
 }
 
+/// Arg positions (0-indexed) that must be inlined as literal integers
+/// rather than parameterized (`DuckDB` requirement).
+pub(crate) fn literal_int_positions(name: &str) -> &'static [usize] {
+    match name {
+        "round" => &[1], // precision arg
+        _ => &[],
+    }
+}
+
 /// Translate a DSL function call to `DuckDB` SQL.
 pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, EmitError> {
     match name {
