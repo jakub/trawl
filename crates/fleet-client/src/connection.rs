@@ -319,6 +319,12 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
         ClientError::Network("connection failed".into())
     } else if e.is_builder() {
         ClientError::Network("invalid request configuration".into())
+    } else if e.is_redirect() {
+        ClientError::Network("unexpected redirect".into())
+    } else if e.is_decode() {
+        ClientError::Network("response decode error".into())
+    } else if e.is_body() {
+        ClientError::Network("request body error".into())
     } else {
         ClientError::Network("request failed".into())
     }
