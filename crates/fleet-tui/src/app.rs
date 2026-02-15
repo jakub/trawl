@@ -462,6 +462,11 @@ impl App {
                 let tab = self.active_tab_mut();
                 tab.horizontal_scroll_offset = tab.horizontal_scroll_offset.saturating_add(1);
             }
+            // Cycle chart view
+            (KeyModifiers::NONE, KeyCode::Char('v')) => {
+                let tab = self.active_tab_mut();
+                tab.chart_view = tab.chart_view.next();
+            }
             _ => {}
         }
     }
