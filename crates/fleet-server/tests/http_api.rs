@@ -409,25 +409,15 @@ fn raw_client() -> reqwest::Client {
 #[tokio::test]
 async fn ingest_accepts_ndjson() {
     let server = setup().await;
-    let client = raw_client();
+    let client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
-    let ndjson = r#"{"service":"test-svc","host":"web01","message":"hello"}
-{"service":"test-svc","host":"web02","message":"world"}
-"#;
+    let records = vec![
+        serde_json::json!({"service": "test-svc", "host": "web01", "message": "hello"}),
+        serde_json::json!({"service": "test-svc", "host": "web02", "message": "world"}),
+    ];
 
-    let resp = client
-        .post(format!("{}/api/v1/ingest", server.url))
-        .header("authorization", format!("Bearer {}", server.ingest_token))
-        .header("content-type", "application/x-ndjson")
-        .body(ndjson)
-        .send()
-        .await
-        .unwrap();
-
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(status, 200, "ingest failed: {body}");
-    assert_eq!(body["accepted"], 2);
+    let resp = client.ingest(&records).await.unwrap();
+    assert_eq!(resp.accepted, 2);
 }
 
 #[tokio::test]
@@ -617,116 +607,61 @@ async fn query_pagination_defaults() {
 #[tokio::test]
 async fn stats_endpoint_admin_only() {
     let server = setup().await;
-    let _admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
-    // Admin can access stats.
-    let resp = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap()
-        .get(format!("{}/api/v1/stats", server.url))
-        .header("Authorization", format!("Bearer {}", server.admin_token))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 200);
-    let stats: serde_json::Value = resp.json().await.unwrap();
-    assert!(stats.get("uptime_secs").is_some());
-    assert!(stats.get("total_queries").is_some());
-    assert!(stats.get("active_queries").is_some());
-    assert!(stats.get("pool_available").is_some());
-    assert!(stats.get("pool_capacity").is_some());
+    let stats = admin.stats().await.unwrap();
+    assert!(stats.pool_capacity > 0);
 }
 
 #[tokio::test]
 async fn stats_endpoint_analyst_forbidden() {
     let server = setup().await;
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    let resp = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap()
-        .get(format!("{}/api/v1/stats", server.url))
-        .header("Authorization", format!("Bearer {}", server.analyst_token))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 401); // Unauthorized
+    let result = analyst.stats().await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        fleet_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
+        other => panic!("expected 401, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
 async fn field_values_endpoint() {
     let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    let resp = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap()
-        .get(format!(
-            "{}/api/v1/schema/values/service?limit=5",
-            server.url
-        ))
-        .header("Authorization", format!("Bearer {}", server.analyst_token))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 200);
-    let data: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(data["field"], "service");
-    let values = data["values"].as_array().unwrap();
-    assert!(!values.is_empty());
-    assert!(values.iter().any(|v| v == "nginx"));
+    let resp = client.field_values("service", Some(5)).await.unwrap();
+    assert_eq!(resp.field, "service");
+    assert!(!resp.values.is_empty());
+    assert!(resp.values.iter().any(|v| v == "nginx"));
 }
 
 #[tokio::test]
 async fn field_values_cached() {
     let server = setup().await;
-
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // First request should populate cache.
-    let resp1 = client
-        .get(format!("{}/api/v1/schema/values/service", server.url))
-        .header("Authorization", format!("Bearer {}", server.analyst_token))
-        .send()
-        .await
-        .unwrap();
-    let data1: serde_json::Value = resp1.json().await.unwrap();
-    assert_eq!(data1["cached"], false);
+    let resp1 = client.field_values("service", None).await.unwrap();
+    assert!(!resp1.cached);
 
     // Second request should hit cache.
-    let resp2 = client
-        .get(format!("{}/api/v1/schema/values/service", server.url))
-        .header("Authorization", format!("Bearer {}", server.analyst_token))
-        .send()
-        .await
-        .unwrap();
-    let data2: serde_json::Value = resp2.json().await.unwrap();
-    assert_eq!(data2["cached"], true);
+    let resp2 = client.field_values("service", None).await.unwrap();
+    assert!(resp2.cached);
 }
 
 #[tokio::test]
 async fn field_values_invalid_field_name() {
     let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    let resp = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap()
-        .get(format!("{}/api/v1/schema/values/bad;name", server.url))
-        .header("Authorization", format!("Bearer {}", server.analyst_token))
-        .send()
-        .await
-        .unwrap();
-
-    // Should reject invalid field name.
-    assert_eq!(resp.status(), 400);
+    let result = client.field_values("bad;name", None).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        fleet_client::ClientError::Server { status, .. } => assert_eq!(status, 400),
+        other => panic!("expected 400, got: {other:?}"),
+    }
 }
 
 // -- request ID tests --------------------------------------------------------

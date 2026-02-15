@@ -5,8 +5,9 @@ use zeroize::Zeroizing;
 
 use crate::error::ClientError;
 use crate::types::{
-    CancelResponse, DeleteSavedResponse, HealthResponse, HistoryResponse, ListSavedResponse,
-    QueriesResponse, QueryResponse, SavedQueryResponse, SchemaResponse, ValidationResponse,
+    CancelResponse, DeleteSavedResponse, FieldValuesResponse, HealthResponse, HistoryResponse,
+    IngestResponse, ListSavedResponse, QueriesResponse, QueryResponse, SavedQueryResponse,
+    SchemaResponse, StatsResponse, ValidationResponse,
 };
 use crate::types::{
     CreateSavedRequest, ErrorResponse, ExportRequest, QueryRequestPaginated, UpdateSavedRequest,
@@ -211,6 +212,57 @@ impl HttpClient {
         let url = self.endpoint(&format!("/api/v1/saved/{id}"));
         let req = self.client.delete(&url);
         self.send_authenticated(req).await
+    }
+
+    /// Fetch server stats (admin only).
+    pub async fn stats(&self) -> Result<StatsResponse, ClientError> {
+        let url = self.endpoint("/api/v1/stats");
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Fetch distinct values for a schema field (for autocomplete).
+    pub async fn field_values(
+        &self,
+        field: &str,
+        limit: Option<usize>,
+    ) -> Result<FieldValuesResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/schema/values/{field}"));
+        let mut req = self.client.get(&url);
+        if let Some(l) = limit {
+            req = req.query(&[("limit", l.to_string())]);
+        }
+        self.send_authenticated(req).await
+    }
+
+    /// Ingest log records in ndjson format.
+    pub async fn ingest(
+        &self,
+        records: &[serde_json::Value],
+    ) -> Result<IngestResponse, ClientError> {
+        let url = self.endpoint("/api/v1/ingest");
+        let mut ndjson = String::new();
+        for record in records {
+            let line = serde_json::to_string(record)
+                .map_err(|e| ClientError::Parse(format!("failed to serialize record: {e}")))?;
+            ndjson.push_str(&line);
+            ndjson.push('\n');
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .header("Content-Type", "application/x-ndjson")
+            .body(ndjson)
+            .send()
+            .await
+            .map_err(sanitize_reqwest_error)?;
+
+        let resp = check_status(resp).await?;
+        resp.json()
+            .await
+            .map_err(|e| ClientError::Parse(e.to_string()))
     }
 
     /// Export query results in the specified format.

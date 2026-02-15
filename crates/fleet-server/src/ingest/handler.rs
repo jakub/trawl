@@ -12,8 +12,8 @@ use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
 
 use crate::error::ServerError;
-use crate::ingest::types::IngestResponse;
 use crate::state::AppState;
+use fleet_api::IngestResponse;
 
 /// Maximum service name length.
 const MAX_SERVICE_NAME_LEN: usize = 128;

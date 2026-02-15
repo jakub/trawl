@@ -2,5 +2,4 @@
 
 pub mod compaction;
 pub mod handler;
-pub mod types;
 pub mod wal;
