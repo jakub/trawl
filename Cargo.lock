@@ -1021,6 +1021,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-api"
+version = "0.1.0"
+dependencies = [
+ "fleet-engine",
+ "serde",
+]
+
+[[package]]
 name = "fleet-auth"
 version = "0.1.0"
 dependencies = [
@@ -1066,12 +1074,12 @@ dependencies = [
 name = "fleet-client"
 version = "0.1.0"
 dependencies = [
+ "fleet-api",
  "fleet-engine",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
  "zeroize",
 ]
 
@@ -1107,6 +1115,7 @@ dependencies = [
  "dashmap",
  "duckdb",
  "flate2",
+ "fleet-api",
  "fleet-auth",
  "fleet-client",
  "fleet-core",

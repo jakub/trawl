@@ -12,7 +12,7 @@ pub use client::HttpClient;
 pub use error::ClientError;
 pub use types::{
     ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, DeleteSavedResponse,
-    HealthResponse, HistoryEntryResponse, HistoryResponse, ListSavedResponse, PaginationMeta,
-    QueriesResponse, QueryResponse, SavedQueryResponse, SchemaColumnResponse, SchemaResponse,
-    ValidationResponse,
+    FieldValuesResponse, HealthResponse, HistoryEntryResponse, HistoryResponse, IngestResponse,
+    ListSavedResponse, PaginationMeta, QueriesResponse, QueryResponse, SavedQueryResponse,
+    SchemaColumnResponse, SchemaResponse, StatsResponse, ValidationResponse,
 };

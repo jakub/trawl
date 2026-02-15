@@ -12,6 +12,7 @@ name = "fleetd"
 path = "src/main.rs"
 
 [dependencies]
+fleet-api = { workspace = true }
 fleet-core = { workspace = true }
 fleet-engine = { workspace = true }
 fleet-auth = { workspace = true }

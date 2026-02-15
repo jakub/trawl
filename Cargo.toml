@@ -16,6 +16,7 @@ fleet-core = { path = "crates/fleet-core" }
 fleet-engine = { path = "crates/fleet-engine" }
 fleet-auth = { path = "crates/fleet-auth" }
 fleet-server = { path = "crates/fleet-server" }
+fleet-api = { path = "crates/fleet-api" }
 fleet-client = { path = "crates/fleet-client" }
 
 # external deps

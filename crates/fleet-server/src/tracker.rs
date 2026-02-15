@@ -6,14 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
+use fleet_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
 use fleet_auth::keys::VerifiedKey;
-use serde::Serialize;
 
 /// Tracks active and recently completed queries.
 #[derive(Debug)]
 pub struct QueryTracker {
     active: DashMap<u64, ActiveQuery>,
-    history: Mutex<VecDeque<CompletedQuery>>,
+    history: Mutex<VecDeque<CompletedQuerySnapshot>>,
     next_id: AtomicU64,
     max_history: usize,
 }
@@ -31,35 +31,6 @@ pub struct ActiveQuery {
     pub query: String,
     /// When execution started.
     pub started_at: Instant,
-}
-
-/// A completed (or failed/timed-out) query.
-#[derive(Debug, Clone, Serialize)]
-pub struct CompletedQuery {
-    /// Monotonic query ID.
-    pub id: u64,
-    /// Authenticated user name.
-    pub user: String,
-    /// The DSL query string.
-    pub query: String,
-    /// Execution duration in milliseconds.
-    pub duration_ms: u64,
-    /// Row count (if successful).
-    pub rows: Option<usize>,
-    /// Error message (if failed).
-    pub error: Option<String>,
-    /// Whether the query exceeded the timeout.
-    pub timed_out: bool,
-}
-
-/// Serializable snapshot of an active query (for the API response).
-#[derive(Debug, Clone, Serialize)]
-pub struct ActiveQuerySnapshot {
-    pub id: u64,
-    pub user: String,
-    pub role: String,
-    pub query: String,
-    pub running_ms: u64,
 }
 
 /// Default ring buffer capacity for query history.
@@ -112,7 +83,7 @@ impl QueryTracker {
     /// Record successful completion of a query.
     pub fn complete(&self, id: u64, rows: usize) {
         if let Some((_, active)) = self.active.remove(&id) {
-            self.push_history(CompletedQuery {
+            self.push_history(CompletedQuerySnapshot {
                 id: active.id,
                 user: active.user,
                 query: active.query,
@@ -127,7 +98,7 @@ impl QueryTracker {
     /// Record a failed query.
     pub fn fail(&self, id: u64, error: &str) {
         if let Some((_, active)) = self.active.remove(&id) {
-            self.push_history(CompletedQuery {
+            self.push_history(CompletedQuerySnapshot {
                 id: active.id,
                 user: active.user,
                 query: active.query,
@@ -142,7 +113,7 @@ impl QueryTracker {
     /// Record a timed-out query.
     pub fn timeout(&self, id: u64) {
         if let Some((_, active)) = self.active.remove(&id) {
-            self.push_history(CompletedQuery {
+            self.push_history(CompletedQuerySnapshot {
                 id: active.id,
                 user: active.user,
                 query: active.query,
@@ -172,13 +143,13 @@ impl QueryTracker {
     }
 
     /// Recent completed queries (most recent first).
-    pub fn recent(&self) -> Vec<CompletedQuery> {
+    pub fn recent(&self) -> Vec<CompletedQuerySnapshot> {
         let history = self.history.lock();
         history.iter().rev().cloned().collect()
     }
 
     /// Push a completed query into the ring buffer, evicting the oldest if full.
-    fn push_history(&self, entry: CompletedQuery) {
+    fn push_history(&self, entry: CompletedQuerySnapshot) {
         let mut history = self.history.lock();
         if history.len() >= self.max_history {
             history.pop_front();

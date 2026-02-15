@@ -5,19 +5,24 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{Extension, Json};
+use fleet_api::{
+    CancelResponse, DeleteSavedResponse, FieldValuesResponse, HealthResponse, HistoryEntryResponse,
+    HistoryResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryResponse,
+    SavedQueryResponse, SchemaColumnResponse, SchemaResponse, StatsResponse, ValidationResponse,
+};
 use fleet_auth::HistoryEntry;
 use fleet_auth::SavedQuery;
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
-use fleet_engine::value::{QueryResult, SchemaColumn, Value};
-use serde::{Deserialize, Serialize};
+use fleet_engine::value::{QueryResult, Value};
+use serde::Deserialize;
 use std::convert::Infallible;
 use std::time::Duration;
 
 use crate::error::ServerError;
 use crate::state::{AppState, CachedFieldValues, CachedSchema};
 
-// -- request/response types --------------------------------------------------
+// -- request types -----------------------------------------------------------
 
 /// Query request body.
 #[derive(Debug, Deserialize)]
@@ -30,66 +35,6 @@ pub struct QueryRequest {
     /// Optional offset for pagination (defaults to 0).
     #[serde(default)]
     pub offset: Option<usize>,
-}
-
-/// Query response with pagination metadata.
-#[derive(Debug, Serialize)]
-pub struct QueryResponse {
-    /// The query result (columns + rows).
-    #[serde(flatten)]
-    pub result: QueryResult,
-    /// Whether results were truncated due to `max_result_rows`.
-    pub truncated: bool,
-    /// Pagination metadata.
-    pub pagination: PaginationMeta,
-}
-
-/// Pagination metadata for query responses.
-#[derive(Debug, Serialize)]
-pub struct PaginationMeta {
-    /// The limit applied to this response.
-    pub limit: usize,
-    /// The offset applied to this response.
-    pub offset: usize,
-    /// The number of rows actually returned.
-    pub returned: usize,
-}
-
-/// Health check response body.
-///
-/// Deliberately minimal — version and uptime are omitted to avoid
-/// information disclosure on an unauthenticated endpoint.
-#[derive(Debug, Serialize)]
-pub struct HealthResponse {
-    pub status: &'static str,
-}
-
-/// Schema introspection response body.
-#[derive(Debug, Serialize)]
-pub struct SchemaResponse {
-    /// Column descriptors (name + type).
-    pub columns: Vec<SchemaColumnResponse>,
-    /// Number of parquet files matching the configured glob.
-    pub file_count: u64,
-    /// Whether this result was served from cache.
-    pub cached: bool,
-}
-
-/// A single column in the schema response.
-#[derive(Debug, Serialize)]
-pub struct SchemaColumnResponse {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub data_type: String,
-}
-
-impl From<SchemaColumn> for SchemaColumnResponse {
-    fn from(col: SchemaColumn) -> Self {
-        Self {
-            name: col.name,
-            data_type: col.data_type,
-        }
-    }
 }
 
 // -- handlers ----------------------------------------------------------------
@@ -242,7 +187,9 @@ pub async fn query(
 /// `GET /api/v1/health` — unauthenticated health check.
 #[allow(clippy::unused_async)] // axum requires async handlers
 pub async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+    Json(HealthResponse {
+        status: "ok".into(),
+    })
 }
 
 /// `GET /api/v1/schema` — introspect the data source schema.
@@ -327,13 +274,6 @@ pub async fn queries(
     }))
 }
 
-/// Response for the queries endpoint.
-#[derive(Debug, Serialize)]
-pub struct QueriesResponse {
-    pub active: Vec<crate::tracker::ActiveQuerySnapshot>,
-    pub recent: Vec<crate::tracker::CompletedQuery>,
-}
-
 /// `DELETE /api/v1/queries/{id}` — cancel a running query by ID.
 ///
 /// Requires either `ServerManage` permission (admin) or ownership of the query.
@@ -375,13 +315,6 @@ pub async fn cancel_query(
     }))
 }
 
-/// Response for the cancel endpoint.
-#[derive(Debug, Serialize)]
-pub struct CancelResponse {
-    pub cancelled: bool,
-    pub query_id: u64,
-}
-
 /// `POST /api/v1/validate` — validate a DSL query without executing it.
 ///
 /// Performs syntax and semantic validation (function names, arity, regex patterns)
@@ -416,13 +349,6 @@ pub async fn validate_query(
     }
 }
 
-/// Response for the validate endpoint.
-#[derive(Debug, Serialize)]
-pub struct ValidationResponse {
-    pub valid: bool,
-    pub errors: Vec<String>,
-}
-
 /// `GET /api/v1/stats` — server statistics and metrics (admin only).
 pub async fn stats(
     State(state): State<AppState>,
@@ -441,16 +367,6 @@ pub async fn stats(
         pool_available: state.query.pool.available_permits(),
         pool_capacity: state.query.pool.capacity(),
     }))
-}
-
-/// Response for the stats endpoint.
-#[derive(Debug, Serialize)]
-pub struct StatsResponse {
-    pub uptime_secs: u64,
-    pub total_queries: u64,
-    pub active_queries: usize,
-    pub pool_available: usize,
-    pub pool_capacity: usize,
 }
 
 /// `GET /api/v1/schema/values/{field}` — sample distinct values for autocomplete.
@@ -515,14 +431,6 @@ pub struct FieldValuesParams {
     pub limit: Option<usize>,
 }
 
-/// Response for the field values endpoint.
-#[derive(Debug, Serialize)]
-pub struct FieldValuesResponse {
-    pub field: String,
-    pub values: Vec<String>,
-    pub cached: bool,
-}
-
 /// `GET /api/v1/history` — retrieve user's query history with pagination.
 pub async fn history(
     State(state): State<AppState>,
@@ -555,7 +463,7 @@ pub async fn history(
         entries: page
             .entries
             .into_iter()
-            .map(HistoryEntryResponse::from)
+            .map(history_entry_response)
             .collect(),
         total: page.total,
     }))
@@ -568,34 +476,15 @@ pub struct HistoryParams {
     pub offset: Option<usize>,
 }
 
-/// Response for the history endpoint.
-#[derive(Debug, Serialize)]
-pub struct HistoryResponse {
-    pub entries: Vec<HistoryEntryResponse>,
-    pub total: usize,
-}
-
-/// A single history entry in the response.
-#[derive(Debug, Serialize)]
-pub struct HistoryEntryResponse {
-    pub id: i64,
-    pub query: String,
-    pub executed_at: String,
-    pub duration_ms: u64,
-    pub row_count: usize,
-    pub status: String,
-}
-
-impl From<HistoryEntry> for HistoryEntryResponse {
-    fn from(entry: HistoryEntry) -> Self {
-        Self {
-            id: entry.id,
-            query: entry.query,
-            executed_at: entry.executed_at,
-            duration_ms: entry.duration_ms,
-            row_count: entry.row_count,
-            status: entry.status,
-        }
+/// Convert a [`HistoryEntry`] into a [`HistoryEntryResponse`].
+fn history_entry_response(entry: HistoryEntry) -> HistoryEntryResponse {
+    HistoryEntryResponse {
+        id: entry.id,
+        query: entry.query,
+        executed_at: entry.executed_at,
+        duration_ms: entry.duration_ms,
+        row_count: entry.row_count,
+        status: entry.status,
     }
 }
 
@@ -623,7 +512,7 @@ pub async fn list_saved(
         .map_err(|e| ServerError::Internal(format!("failed to list saved queries: {e}")))?;
 
     Ok(Json(ListSavedResponse {
-        queries: queries.into_iter().map(SavedQueryResponse::from).collect(),
+        queries: queries.into_iter().map(saved_query_response).collect(),
     }))
 }
 
@@ -656,7 +545,7 @@ pub async fn create_saved(
             e => ServerError::Internal(format!("failed to create saved query: {e}")),
         })?;
 
-    Ok(Json(SavedQueryResponse::from(saved)))
+    Ok(Json(saved_query_response(saved)))
 }
 
 /// `PUT /api/v1/saved/{id}` — update an existing saved query.
@@ -689,7 +578,7 @@ pub async fn update_saved(
             e => ServerError::Internal(format!("failed to update saved query: {e}")),
         })?;
 
-    Ok(Json(SavedQueryResponse::from(saved)))
+    Ok(Json(saved_query_response(saved)))
 }
 
 /// `DELETE /api/v1/saved/{id}` — delete a saved query.
@@ -724,12 +613,6 @@ pub async fn delete_saved(
     Ok(Json(DeleteSavedResponse { deleted: true }))
 }
 
-/// Response for listing saved queries.
-#[derive(Debug, Serialize)]
-pub struct ListSavedResponse {
-    pub queries: Vec<SavedQueryResponse>,
-}
-
 /// Request body for creating a saved query.
 #[derive(Debug, Deserialize)]
 pub struct CreateSavedRequest {
@@ -743,31 +626,14 @@ pub struct UpdateSavedRequest {
     pub query: String,
 }
 
-/// A single saved query in the response.
-#[derive(Debug, Serialize)]
-pub struct SavedQueryResponse {
-    pub id: i64,
-    pub name: String,
-    pub query: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-/// Response for deleting a saved query.
-#[derive(Debug, Serialize)]
-pub struct DeleteSavedResponse {
-    pub deleted: bool,
-}
-
-impl From<SavedQuery> for SavedQueryResponse {
-    fn from(saved: SavedQuery) -> Self {
-        Self {
-            id: saved.id,
-            name: saved.name,
-            query: saved.query,
-            created_at: saved.created_at,
-            updated_at: saved.updated_at,
-        }
+/// Convert a [`SavedQuery`] into a [`SavedQueryResponse`].
+fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
+    SavedQueryResponse {
+        id: saved.id,
+        name: saved.name,
+        query: saved.query,
+        created_at: saved.created_at,
+        updated_at: saved.updated_at,
     }
 }
 

@@ -1,0 +1,15 @@
+[package]
+name = "fleet-api"
+description = "Shared wire types for the fleet HTTP API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fleet-engine = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true
