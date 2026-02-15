@@ -17,6 +17,7 @@
 
 # debug
 *.pdb
+*.log
 
 # bacon state
 .bacon-locations

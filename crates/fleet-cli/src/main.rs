@@ -1,5 +1,6 @@
 use std::io;
 use std::process;
+use std::sync::Mutex;
 
 use clap::{Parser, Subcommand};
 
@@ -98,13 +99,22 @@ async fn run(args: Cli) -> Result<(), CliError> {
 
     match args.command {
         None => {
-            // TUI mode — init tracing to stderr and launch.
+            // TUI mode — tracing goes to a log file, not stderr (which corrupts the UI).
+            let log_dir = shellexpand::tilde("~/.config/fleet");
+            std::fs::create_dir_all(log_dir.as_ref())?;
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(format!("{log_dir}/tui.log"))?;
+
             tracing_subscriber::fmt()
-                .with_writer(io::stderr)
+                .with_writer(Mutex::new(log_file))
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("fleet=debug")),
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
                 )
+                .with_ansi(false)
                 .init();
 
             tui::run(&cfg, args.token.as_deref()).await?;
