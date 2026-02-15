@@ -121,6 +121,7 @@ impl HttpClient {
             .await
             .map_err(sanitize_reqwest_error)?;
 
+        let resp = check_status(resp).await?;
         resp.json()
             .await
             .map_err(|e| ClientError::Parse(e.to_string()))
@@ -237,15 +238,7 @@ impl HttpClient {
             .await
             .map_err(sanitize_reqwest_error)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let message = resp
-                .json::<ErrorResponse>()
-                .await
-                .map_or_else(|_| "unknown error".into(), |e| e.error);
-            return Err(ClientError::Server { status, message });
-        }
-
+        let resp = check_status(resp).await?;
         resp.bytes()
             .await
             .map(|b| b.to_vec())
@@ -279,15 +272,7 @@ impl HttpClient {
             .await
             .map_err(sanitize_reqwest_error)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let message = resp
-                .json::<ErrorResponse>()
-                .await
-                .map_or_else(|_| "unknown error".into(), |e| e.error);
-            return Err(ClientError::Server { status, message });
-        }
-
+        let resp = check_status(resp).await?;
         Ok(resp)
     }
 
@@ -302,19 +287,24 @@ impl HttpClient {
             .await
             .map_err(sanitize_reqwest_error)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let message = resp
-                .json::<ErrorResponse>()
-                .await
-                .map_or_else(|_| "unknown error".into(), |e| e.error);
-            return Err(ClientError::Server { status, message });
-        }
-
+        let resp = check_status(resp).await?;
         resp.json()
             .await
             .map_err(|e| ClientError::Parse(e.to_string()))
     }
+}
+
+/// Check HTTP response status and return a `Server` error on failure.
+async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let message = resp
+            .json::<ErrorResponse>()
+            .await
+            .map_or_else(|_| "unknown error".into(), |e| e.error);
+        return Err(ClientError::Server { status, message });
+    }
+    Ok(resp)
 }
 
 /// Strip trailing slashes so `endpoint()` can simply concatenate.
