@@ -6,8 +6,8 @@
 use chumsky::prelude::*;
 
 use crate::ast::{
-    FieldFilter, FilterOp, FilterValue, QuotedSearch, SearchStage, SearchToken, TextSearch,
-    TimeFilter,
+    FieldFilter, FilterOp, FilterValue, QuotedSearch, SearchStage, SearchToken, Spanned,
+    TextSearch, TimeFilter,
 };
 use crate::parser::primitives::{
     ParserExtra, ParserInput, bare_value, duration, field_name, filter_op, keyword, quoted_string,
@@ -184,7 +184,27 @@ pub(crate) fn search_stage<'src>()
             }
             // Remove empty groups (trailing OR, leading OR, double OR).
             groups.retain(|g| !g.is_empty());
-            SearchStage { groups }
+
+            // Hoist time filters out of groups — they apply globally.
+            // If multiple `last:` tokens appear, last one wins.
+            let mut time_filter = None;
+            for group in &mut groups {
+                group.retain(|t| {
+                    if let SearchToken::TimeFilter(tf) = &t.node {
+                        time_filter = Some(Spanned::new(tf.clone(), t.span.clone()));
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            // Remove groups that became empty after hoisting.
+            groups.retain(|g| !g.is_empty());
+
+            SearchStage {
+                groups,
+                time_filter,
+            }
         })
         .labelled("search stage")
 }
@@ -197,15 +217,17 @@ mod tests {
     #[test]
     fn test_time_filter() {
         let result = search_stage().parse("last:2h").into_result().unwrap();
-        assert_eq!(result.groups[0].len(), 1);
+        // Time filter is hoisted out of groups.
+        assert!(result.groups.is_empty());
+        let tf = result.time_filter.expect("time_filter should be hoisted");
         assert_eq!(
-            result.groups[0][0].node,
-            SearchToken::TimeFilter(TimeFilter {
+            tf.node,
+            TimeFilter {
                 duration: FleetDuration {
                     quantity: 2,
                     unit: TimeUnit::Hours,
                 },
-            })
+            }
         );
     }
 
@@ -359,7 +381,9 @@ mod tests {
             .parse("service:nginx level:error last:2h")
             .into_result()
             .unwrap();
-        assert_eq!(result.groups[0].len(), 3);
+        // Time filter hoisted, 2 tokens remain in group.
+        assert_eq!(result.groups[0].len(), 2);
+        assert!(result.time_filter.is_some());
     }
 
     #[test]
@@ -469,5 +493,51 @@ mod tests {
     fn test_empty_query_groups() {
         let result = search_stage().parse("").into_result().unwrap();
         assert!(result.groups.is_empty());
+        assert!(result.time_filter.is_none());
+    }
+
+    #[test]
+    fn test_time_filter_hoisted_from_or_groups() {
+        // `service:nginx last:2h OR service:postgres` — time filter applies globally.
+        let result = search_stage()
+            .parse("service:nginx last:2h OR service:postgres")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups.len(), 2);
+        // Neither group should contain the time filter.
+        for group in &result.groups {
+            for token in group {
+                assert!(
+                    !matches!(token.node, SearchToken::TimeFilter(_)),
+                    "time filter should be hoisted out of groups"
+                );
+            }
+        }
+        // Hoisted time filter should be present.
+        let tf = result.time_filter.expect("time_filter should be hoisted");
+        assert_eq!(tf.node.duration.quantity, 2);
+        assert_eq!(tf.node.duration.unit, TimeUnit::Hours);
+    }
+
+    #[test]
+    fn test_last_time_filter_wins() {
+        // Multiple time filters — last one wins.
+        let result = search_stage()
+            .parse("last:1h service:nginx last:2h")
+            .into_result()
+            .unwrap();
+        let tf = result.time_filter.expect("time_filter should be hoisted");
+        assert_eq!(tf.node.duration.quantity, 2);
+        assert_eq!(tf.node.duration.unit, TimeUnit::Hours);
+        // Only the service token remains in the group.
+        assert_eq!(result.groups[0].len(), 1);
+    }
+
+    #[test]
+    fn test_only_time_filter_produces_empty_groups() {
+        // A query with only a time filter — groups become empty after hoisting.
+        let result = search_stage().parse("last:5m").into_result().unwrap();
+        assert!(result.groups.is_empty());
+        assert!(result.time_filter.is_some());
     }
 }

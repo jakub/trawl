@@ -43,9 +43,16 @@ pub struct Query {
 ///
 /// `a b OR c d` → groups: `[[a, b], [c, d]]`
 /// Queries without OR have a single group (backward-compatible).
+///
+/// Time filters are hoisted out of groups and applied globally — a query
+/// like `service:nginx last:2h OR service:postgres` applies the time
+/// filter to both groups.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchStage {
     pub groups: Vec<Vec<Spanned<SearchToken>>>,
+    /// Global time filter, hoisted from groups during parsing.
+    /// If multiple `last:` tokens appear, last one wins.
+    pub time_filter: Option<Spanned<TimeFilter>>,
 }
 
 impl SearchStage {

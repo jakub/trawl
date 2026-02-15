@@ -6,10 +6,22 @@ use super::state::EmitterState;
 
 /// Translate the search stage tokens into WHERE clauses on the emitter state.
 ///
+/// Time filters are emitted first as a global WHERE clause (hoisted from
+/// groups during parsing). Then group tokens are emitted.
+///
 /// For single-group queries, emits tokens directly (same as before).
 /// For multi-group (OR) queries, collects each group's clauses and
 /// combines them as `(a AND b) OR (c AND d)`.
 pub(crate) fn emit_search(search: &SearchStage, state: &mut EmitterState) {
+    // Emit hoisted time filter as a top-level WHERE clause.
+    if let Some(tf) = &search.time_filter {
+        let interval = tf.node.duration.to_interval_string();
+        state.push_where(format!(
+            "CAST(\"timestamp\" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '{interval}'"
+        ));
+        state.time_filter = Some(tf.node.duration);
+    }
+
     match search.groups.len() {
         0 => {}
         1 => {
@@ -33,7 +45,10 @@ pub(crate) fn emit_search(search: &SearchStage, state: &mut EmitterState) {
                 }
             }
             if !group_conditions.is_empty() {
-                state.push_where(group_conditions.join(" OR "));
+                let or_expr = group_conditions.join(" OR ");
+                // Wrap in parens so the OR doesn't interact with other
+                // top-level WHERE clauses (e.g. the hoisted time filter).
+                state.push_where(format!("({or_expr})"));
             }
         }
     }
@@ -87,14 +102,10 @@ fn emit_search_token(token: &SearchToken, state: &mut EmitterState) {
                 state.push_where(format!("\"message\" ILIKE {placeholder}"));
             }
         }
-        SearchToken::TimeFilter(tf) => {
-            let interval = tf.duration.to_interval_string();
-            // CAST handles both old VARCHAR parquet files and new native TIMESTAMP files.
-            // ::TIMESTAMP on now() avoids TIMESTAMPTZ arithmetic requiring ICU.
-            state.push_where(format!(
-                "CAST(\"timestamp\" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '{interval}'"
-            ));
-            state.time_filter = Some(tf.duration);
+        SearchToken::TimeFilter(_) => {
+            // Time filters are hoisted out of groups during parsing and
+            // emitted as a top-level WHERE clause in `emit_search()`.
+            // This arm is a defensive no-op — it should never fire.
         }
         SearchToken::QuotedSearch(qs) => {
             let pattern = format!("%{}%", qs.phrase);

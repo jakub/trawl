@@ -64,13 +64,7 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
         },
     );
 
-    let time_filter = ast.search.all_tokens().find_map(|t| {
-        if let SearchToken::TimeFilter(tf) = &t.node {
-            Some(tf.duration)
-        } else {
-            None
-        }
-    });
+    let time_filter = ast.search.time_filter.as_ref().map(|tf| tf.node.duration);
 
     let base = base_dir.trim_end_matches('/');
 

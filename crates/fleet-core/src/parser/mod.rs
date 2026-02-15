@@ -145,7 +145,9 @@ mod tests {
     #[test]
     fn test_multi_token_search() {
         let query = parse("service:nginx level:error last:2h").unwrap();
-        assert_eq!(query.search.groups[0].len(), 3);
+        // Time filter hoisted, 2 tokens remain in group.
+        assert_eq!(query.search.groups[0].len(), 2);
+        assert!(query.search.time_filter.is_some());
     }
 
     #[test]
@@ -176,7 +178,9 @@ mod tests {
     #[test]
     fn test_search_with_stats() {
         let query = parse("service:nginx last:1h | stats count() by host").unwrap();
-        assert_eq!(query.search.groups[0].len(), 2);
+        // Time filter hoisted, 1 token remains in group.
+        assert_eq!(query.search.groups[0].len(), 1);
+        assert!(query.search.time_filter.is_some());
         assert_eq!(query.pipeline.len(), 1);
         assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
     }
@@ -221,7 +225,9 @@ mod tests {
         let query =
             parse("status:>=400 last:24h | stats count() by host, uri | sort -count | limit 20")
                 .unwrap();
-        assert_eq!(query.search.groups[0].len(), 2);
+        // Time filter hoisted, 1 token remains in group.
+        assert_eq!(query.search.groups[0].len(), 1);
+        assert!(query.search.time_filter.is_some());
         assert_eq!(query.pipeline.len(), 3);
         assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
         assert!(matches!(query.pipeline[1].node, PipeStage::Sort(_)));

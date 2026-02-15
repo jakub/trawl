@@ -237,6 +237,12 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn search_or_with_time_filter() {
+        // Time filter should be emitted as top-level WHERE, outside OR parens.
+        assert_snapshot!(emit_dsl("service:nginx last:2h OR service:postgres"));
+    }
+
     // -----------------------------------------------------------------------
     // single pipe stages
     // -----------------------------------------------------------------------

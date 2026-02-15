@@ -5,7 +5,7 @@ expression: "emit_dsl(\"service:nginx last:2h | stats count() by host | where co
 WITH _s0 AS (
   SELECT "host", COUNT(*) AS "count"
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-  WHERE "service" = ? AND CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours'
+  WHERE CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "service" = ?
   GROUP BY "host"
 )
 SELECT *

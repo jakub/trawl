@@ -4,7 +4,7 @@ expression: "emit_dsl(\"service:kernel OR service:fleetd | stats count()\")"
 ---
 SELECT COUNT(*) AS "count"
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE ("service" = ?) OR ("service" = ?)
+WHERE (("service" = ?) OR ("service" = ?))
 ---
 params:
   0: 'kernel'
