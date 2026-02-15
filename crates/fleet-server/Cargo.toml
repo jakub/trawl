@@ -36,6 +36,7 @@ dashmap = { workspace = true }
 shellexpand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -51,7 +52,6 @@ hostname = { workspace = true }
 [dev-dependencies]
 fleet-client = { workspace = true }
 reqwest = { workspace = true }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

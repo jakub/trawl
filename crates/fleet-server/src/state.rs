@@ -13,6 +13,7 @@ use fleet_engine::value::SchemaResult;
 
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
+use crate::hot_buffer::{HotBuffer, HotBufferConfig};
 use crate::ingest::wal::WalWriter;
 use crate::pool::ExecutorPool;
 use crate::tracker::QueryTracker;
@@ -52,6 +53,8 @@ pub struct QueryState {
     pub schema_cache: Arc<tokio::sync::Mutex<Option<CachedSchema>>>,
     /// Cached field value samples for autocomplete (shared TTL with schema cache).
     pub field_values_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedFieldValues>>>,
+    /// Hot buffer for fresh events not yet compacted to parquet.
+    pub hot_buffer: Option<Arc<HotBuffer>>,
 }
 
 /// Authentication state: key store, history store, saved queries, and database path.
@@ -124,12 +127,20 @@ impl AppState {
         let history = HistoryStore::open(&config.auth.db_path)?;
         let saved = SavedQueryStore::open(&config.auth.db_path)?;
 
-        let (wal_writer, event_bus) = if config.ingest.enabled {
+        let (wal_writer, event_bus, hot_buffer) = if config.ingest.enabled {
             let writer = WalWriter::new(config.wal_dir());
             let bus = LocalEventBus::new(config.ingest.event_bus_capacity);
-            (Some(Arc::new(writer)), Some(Arc::new(bus)))
+            let buffer = HotBuffer::new(HotBufferConfig {
+                max_events: config.ingest.hot_buffer_max_events,
+                max_bytes: config.ingest.hot_buffer_max_bytes,
+            });
+            (
+                Some(Arc::new(writer)),
+                Some(Arc::new(bus)),
+                Some(Arc::new(buffer)),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let state = Self {
@@ -145,6 +156,7 @@ impl AppState {
                 max_export_rows: config.server.max_export_rows,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                hot_buffer,
             },
             auth: AuthState {
                 key_store: Arc::new(Mutex::new(key_store)),

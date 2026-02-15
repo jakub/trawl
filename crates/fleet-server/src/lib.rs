@@ -9,6 +9,7 @@ pub mod bus;
 pub mod config;
 pub mod error;
 pub mod handlers;
+pub mod hot_buffer;
 pub mod ingest;
 pub mod pool;
 pub mod rate_limit;

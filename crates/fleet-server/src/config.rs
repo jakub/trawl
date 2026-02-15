@@ -192,6 +192,17 @@ pub struct IngestConfig {
     /// receive a `Lagged` notification. Default: 4096.
     #[serde(default = "default_event_bus_capacity")]
     pub event_bus_capacity: usize,
+
+    /// Maximum number of events held in the hot buffer.
+    /// Oldest batches are evicted when this limit is exceeded.
+    /// Default: 100,000.
+    #[serde(default = "default_hot_buffer_max_events")]
+    pub hot_buffer_max_events: usize,
+
+    /// Maximum estimated memory usage for the hot buffer in bytes.
+    /// Default: 100 MB.
+    #[serde(default = "default_hot_buffer_max_bytes")]
+    pub hot_buffer_max_bytes: usize,
 }
 
 impl Default for IngestConfig {
@@ -204,6 +215,8 @@ impl Default for IngestConfig {
             internal_telemetry: default_internal_telemetry(),
             daily_rollup: default_daily_rollup(),
             event_bus_capacity: default_event_bus_capacity(),
+            hot_buffer_max_events: default_hot_buffer_max_events(),
+            hot_buffer_max_bytes: default_hot_buffer_max_bytes(),
         }
     }
 }
@@ -311,6 +324,19 @@ fn default_daily_rollup() -> bool {
 
 fn default_event_bus_capacity() -> usize {
     crate::bus::DEFAULT_EVENT_BUS_CAPACITY
+}
+
+/// Default hot buffer max events.
+pub const DEFAULT_HOT_BUFFER_MAX_EVENTS: usize = 100_000;
+/// Default hot buffer max bytes (100 MB).
+pub const DEFAULT_HOT_BUFFER_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+fn default_hot_buffer_max_events() -> usize {
+    DEFAULT_HOT_BUFFER_MAX_EVENTS
+}
+
+fn default_hot_buffer_max_bytes() -> usize {
+    DEFAULT_HOT_BUFFER_MAX_BYTES
 }
 
 /// Default key audit polling interval (seconds).
