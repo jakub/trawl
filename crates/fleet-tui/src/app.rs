@@ -28,6 +28,19 @@ struct QueryResult {
     duration: Duration,
 }
 
+/// Result of a mutation operation (save/delete saved query).
+#[derive(Debug)]
+enum MutationResult {
+    /// Saved query was created successfully.
+    SavedQueryCreated { name: String },
+    /// Saved query was deleted successfully.
+    SavedQueryDeleted { name: String },
+    /// Saved queries cache refreshed.
+    CacheRefreshed { saved: ListSavedResponse },
+    /// Mutation failed.
+    Error { message: String },
+}
+
 /// Main TUI application state.
 pub struct App {
     /// HTTP client for API calls.
@@ -62,12 +75,17 @@ pub struct App {
     query_rx: mpsc::UnboundedReceiver<QueryResult>,
     /// Sender for spawning queries.
     query_tx: mpsc::UnboundedSender<QueryResult>,
+    /// Channel for receiving mutation results.
+    mutation_rx: mpsc::UnboundedReceiver<MutationResult>,
+    /// Sender for mutation operations.
+    mutation_tx: mpsc::UnboundedSender<MutationResult>,
 }
 
 impl App {
     /// Create a new app with the given client.
     pub fn new(client: HttpClient) -> Self {
         let (query_tx, query_rx) = mpsc::unbounded_channel();
+        let (mutation_tx, mutation_rx) = mpsc::unbounded_channel();
 
         Self {
             client,
@@ -86,6 +104,8 @@ impl App {
             live_task: None,
             query_rx,
             query_tx,
+            mutation_rx,
+            mutation_tx,
         }
     }
 
@@ -151,6 +171,67 @@ impl App {
                 duration,
             });
         });
+    }
+
+    /// Refresh the saved queries cache from the server.
+    fn refresh_saved_cache(&mut self) {
+        let client = self.client.clone();
+        let mutation_tx = self.mutation_tx.clone();
+        tokio::spawn(async move {
+            let result = match client.list_saved().await {
+                Ok(saved) => {
+                    tracing::debug!(
+                        "refreshed saved queries cache: {} queries",
+                        saved.queries.len()
+                    );
+                    MutationResult::CacheRefreshed { saved }
+                }
+                Err(e) => {
+                    tracing::error!("failed to refresh saved queries: {e}");
+                    MutationResult::Error {
+                        message: format!("Failed to refresh saved queries: {e}"),
+                    }
+                }
+            };
+            let _ = mutation_tx.send(result);
+        });
+    }
+
+    /// Poll for mutation results and refresh caches.
+    pub fn poll_mutations(&mut self) {
+        while let Ok(mutation_result) = self.mutation_rx.try_recv() {
+            match mutation_result {
+                MutationResult::SavedQueryCreated { name } => {
+                    tracing::info!("saved query created: {name}");
+                    // Refresh saved queries cache
+                    self.refresh_saved_cache();
+                }
+                MutationResult::SavedQueryDeleted { name } => {
+                    tracing::info!("saved query deleted: {name}");
+                    // Refresh saved queries cache
+                    self.refresh_saved_cache();
+                }
+                MutationResult::CacheRefreshed { saved } => {
+                    tracing::debug!(
+                        "updating saved queries cache with {} queries",
+                        saved.queries.len()
+                    );
+                    self.saved_cache = Some(saved);
+                    // Reset selection if it's now out of bounds
+                    if let Some(cache) = &self.saved_cache {
+                        if self.saved_selected_index >= cache.queries.len()
+                            && !cache.queries.is_empty()
+                        {
+                            self.saved_selected_index = cache.queries.len().saturating_sub(1);
+                        }
+                    }
+                }
+                MutationResult::Error { message } => {
+                    tracing::error!("mutation error: {message}");
+                    // TODO: Show error in UI (maybe status bar or popup)
+                }
+            }
+        }
     }
 
     /// Poll for query results and update tabs.
@@ -535,20 +616,24 @@ impl App {
     }
 
     /// Delete a saved query by ID.
-    fn delete_saved_query(&mut self, saved_id: i64, _name: String) {
+    fn delete_saved_query(&mut self, saved_id: i64, name: String) {
         let client = self.client.clone();
+        let mutation_tx = self.mutation_tx.clone();
 
         tokio::spawn(async move {
-            match client.delete_saved(saved_id).await {
+            let result = match client.delete_saved(saved_id).await {
                 Ok(_) => {
-                    tracing::info!("deleted saved query {saved_id}");
-                    // TODO: Refresh saved queries cache
+                    tracing::info!("deleted saved query '{name}'");
+                    MutationResult::SavedQueryDeleted { name }
                 }
                 Err(e) => {
                     tracing::error!("failed to delete saved query: {e}");
-                    // TODO: Show error to user
+                    MutationResult::Error {
+                        message: format!("Failed to delete query: {e}"),
+                    }
                 }
-            }
+            };
+            let _ = mutation_tx.send(result);
         });
     }
 
@@ -560,17 +645,21 @@ impl App {
         }
 
         let client = self.client.clone();
+        let mutation_tx = self.mutation_tx.clone();
         tokio::spawn(async move {
-            match client.create_saved(&name, &query).await {
+            let result = match client.create_saved(&name, &query).await {
                 Ok(_) => {
                     tracing::info!("saved query '{name}'");
-                    // TODO: Refresh saved queries cache
+                    MutationResult::SavedQueryCreated { name: name.clone() }
                 }
                 Err(e) => {
                     tracing::error!("failed to save query: {e}");
-                    // TODO: Show error to user
+                    MutationResult::Error {
+                        message: format!("Failed to save query: {e}"),
+                    }
                 }
-            }
+            };
+            let _ = mutation_tx.send(result);
         });
     }
 
@@ -857,6 +946,9 @@ fn run_event_loop(
 
         // Poll for query results from background tasks.
         app.poll_query_results();
+
+        // Poll for mutation results (save/delete operations).
+        app.poll_mutations();
 
         // Draw UI.
         terminal.draw(|f| ui::render(app, f))?;

@@ -81,7 +81,9 @@ fn get_context_hints(app: &App) -> String {
             Sidebar::Help => "esc: close help".to_owned(),
             Sidebar::Schema => "esc: close schema".to_owned(),
             Sidebar::History => "↑↓: navigate | enter: load query | esc: close".to_owned(),
-            Sidebar::Saved => "esc: close saved queries".to_owned(),
+            Sidebar::Saved => {
+                "↑↓: navigate | enter: load | backspace: delete | esc: close".to_owned()
+            }
         };
     }
 
@@ -96,7 +98,7 @@ fn get_context_hints(app: &App) -> String {
             if app.active_tab().editor.text().trim().is_empty() {
                 "F3: history | F4: saved | F1: help".to_owned()
             } else {
-                "F5: execute | ctrl+l: clear | F1: help".to_owned()
+                "F5: execute | ctrl+s: save | ctrl+l: clear".to_owned()
             }
         }
         Focus::Results => {
