@@ -4,13 +4,15 @@
 //! management, authentication, query submission, and result streaming
 //! across all supported transports.
 
-pub mod connection;
+pub mod client;
 pub mod error;
+pub mod types;
 
-pub use connection::{
-    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, DeleteSavedResponse,
-    HealthResponse, HistoryEntryResponse, HistoryResponse, HttpClient, ListSavedResponse,
-    PaginationMeta, QueriesResponse, QueryResponse, SavedQueryResponse, SchemaColumnResponse,
-    SchemaResponse, ValidationResponse,
-};
+pub use client::HttpClient;
 pub use error::ClientError;
+pub use types::{
+    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, DeleteSavedResponse,
+    HealthResponse, HistoryEntryResponse, HistoryResponse, ListSavedResponse, PaginationMeta,
+    QueriesResponse, QueryResponse, SavedQueryResponse, SchemaColumnResponse, SchemaResponse,
+    ValidationResponse,
+};
