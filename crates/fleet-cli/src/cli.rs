@@ -96,7 +96,8 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
 /// Connect to the daemon and execute the query over HTTPS.
 async fn run_daemon_mode(conn: &ConnectionParams, query: &str) -> Result<QueryResult, CliError> {
     let client = make_client(conn)?;
-    Ok(client.query(query).await?)
+    let response = client.query_paginated(query, None, None).await?;
+    Ok(response.result)
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.

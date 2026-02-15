@@ -252,25 +252,31 @@ async fn health_returns_ok() {
 async fn query_returns_results() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
-    let result = client.query("*").await.unwrap();
-    assert_eq!(result.row_count(), 3);
+    let result = client.query_paginated("*", None, None).await.unwrap();
+    assert_eq!(result.result.row_count(), 3);
 }
 
 #[tokio::test]
 async fn query_with_filter() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
-    let result = client.query("service:nginx").await.unwrap();
-    assert_eq!(result.row_count(), 2);
+    let result = client
+        .query_paginated("service:nginx", None, None)
+        .await
+        .unwrap();
+    assert_eq!(result.result.row_count(), 2);
 }
 
 #[tokio::test]
 async fn query_with_stats_pipeline() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
-    let result = client.query("* | stats count() by service").await.unwrap();
+    let result = client
+        .query_paginated("* | stats count() by service", None, None)
+        .await
+        .unwrap();
     // nginx: 2, postgres: 1 → 2 rows
-    assert_eq!(result.row_count(), 2);
+    assert_eq!(result.result.row_count(), 2);
 }
 
 #[tokio::test]
@@ -278,7 +284,7 @@ async fn query_rejects_missing_auth() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, "").unwrap();
 
-    let result = client.query("*").await;
+    let result = client.query_paginated("*", None, None).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
@@ -295,7 +301,7 @@ async fn query_rejects_invalid_token() {
     let client =
         HttpClient::new_insecure(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234").unwrap();
 
-    let result = client.query("*").await;
+    let result = client.query_paginated("*", None, None).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
@@ -311,7 +317,7 @@ async fn query_rejects_bad_dsl() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    let result = client.query("| | | broken {{{").await;
+    let result = client.query_paginated("| | | broken {{{", None, None).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
@@ -363,7 +369,7 @@ async fn queries_shows_history() {
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     // Run a query so there's something in history.
-    analyst.query("*").await.unwrap();
+    analyst.query_paginated("*", None, None).await.unwrap();
 
     let queries = admin.queries().await.unwrap();
     assert!(
@@ -471,11 +477,11 @@ async fn rate_limit_returns_429() {
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // First 2 should succeed (burst capacity).
-    client.query("*").await.unwrap();
-    client.query("*").await.unwrap();
+    client.query_paginated("*", None, None).await.unwrap();
+    client.query_paginated("*", None, None).await.unwrap();
 
     // 3rd should be rate limited.
-    let result = client.query("*").await;
+    let result = client.query_paginated("*", None, None).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
@@ -498,7 +504,9 @@ async fn cancel_query_by_admin() {
     let analyst_clone = analyst.clone();
     let slow_query = tokio::spawn(async move {
         // This query will take a while (timechart with small span).
-        let _ = analyst_clone.query("* | timechart span=1s count()").await;
+        let _ = analyst_clone
+            .query_paginated("* | timechart span=1s count()", None, None)
+            .await;
     });
 
     // Give it a moment to start.

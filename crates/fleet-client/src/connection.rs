@@ -86,13 +86,6 @@ impl HttpClient {
         format!("{}{path}", self.base_url)
     }
 
-    /// Execute a DSL query against the daemon.
-    pub async fn query(&self, dsl: &str) -> Result<QueryResult, ClientError> {
-        // Use query_paginated with no limits for backward compatibility.
-        let response = self.query_paginated(dsl, None, None).await?;
-        Ok(response.result)
-    }
-
     /// Execute a DSL query with optional pagination.
     pub async fn query_paginated(
         &self,
@@ -214,16 +207,22 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Export query results as CSV.
+    /// Export query results in the specified format.
     ///
-    /// Returns raw CSV bytes suitable for writing to a file.
-    pub async fn export(&self, query: &str, limit: Option<usize>) -> Result<Vec<u8>, ClientError> {
-        let url = self.endpoint("/api/v1/export?format=csv");
+    /// Returns raw bytes suitable for writing to a file.
+    pub async fn export(
+        &self,
+        query: &str,
+        format: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<u8>, ClientError> {
+        let url = self.endpoint("/api/v1/export");
         let body = ExportRequest { query, limit };
 
         let resp = self
             .client
             .post(&url)
+            .query(&[("format", format)])
             .header("Authorization", format!("Bearer {}", self.token.as_str()))
             .json(&body)
             .send()

@@ -153,24 +153,16 @@ impl App {
         tokio::spawn(async move {
             tracing::info!("background task started for query: {}", query);
             let start = Instant::now();
-            let result = client.query(&query).await.map_err(|e| e.to_string());
+            let result = client
+                .query_paginated(&query, None, None)
+                .await
+                .map_err(|e| e.to_string());
             let duration = start.elapsed();
             tracing::info!(
                 "query completed in {:?}, result: {:?}",
                 duration,
                 result.is_ok()
             );
-
-            // Convert QueryResult to QueryResponse (map the result).
-            let result = result.map(|r| QueryResponse {
-                result: r,
-                truncated: false,
-                pagination: fleet_client::PaginationMeta {
-                    limit: 0,
-                    offset: 0,
-                    returned: 0,
-                },
-            });
 
             let _ = tx.send(QueryResult {
                 tab_idx,
