@@ -175,3 +175,14 @@ fn value_to_string(value: &Value) -> String {
         Value::String(s) => s.clone(),
     }
 }
+
+/// Detect if a query result is from a timechart query.
+///
+/// Timechart queries always have `_time` as the first column.
+#[allow(dead_code)] // Used when chart rendering is implemented
+fn is_timechart_result(result: &fleet_engine::value::QueryResult) -> bool {
+    result
+        .columns
+        .first()
+        .is_some_and(|col| col.name == "_time")
+}
