@@ -9,7 +9,7 @@ use std::ops::Range;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, field_name, keyword, literal, quoted_string, spanned,
+    ParserExtra, ParserInput, field_name, keyword, literal, quoted_string, regex_pattern, spanned,
 };
 
 /// Parse an expression with full operator precedence.
@@ -127,17 +127,28 @@ pub(crate) fn expr<'src>()
             just(">").to(BinaryOp::Gt),
             just("<=").to(BinaryOp::Lte),
             just("<").to(BinaryOp::Lt),
-            keyword("matches").to(BinaryOp::Matches),
         ))
         .padded();
+
+        // `matches` is handled separately so the RHS can accept `/regex/`
+        // literals without conflicting with `/` as the division operator
+        let regex_literal =
+            spanned(regex_pattern().map(|s| Expr::Literal(LiteralValue::String(s))));
 
         let comparison = additive
             .clone()
             .then(
                 choice((
+                    // matches with regex literal support
+                    keyword("matches")
+                        .padded()
+                        .ignore_then(choice((regex_literal, additive.clone())))
+                        .map(|rhs| CmpRhs::Binary(BinaryOp::Matches, rhs)),
+                    // other comparison operators
                     cmp_op
                         .then(additive)
                         .map(|(op, rhs)| CmpRhs::Binary(op, rhs)),
+                    // in list
                     keyword("in")
                         .padded()
                         .ignore_then(
@@ -452,6 +463,55 @@ mod tests {
                 assert!(matches!(list[1].node, Expr::Binary { .. }));
             }
             other => panic!("expected InList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_matches_regex_literal() {
+        let result = parse_expr("host matches /prod-.*/");
+        match &result.node {
+            Expr::Binary { lhs, op, rhs } => {
+                assert_eq!(lhs.node, Expr::FieldRef("host".to_string()));
+                assert_eq!(*op, BinaryOp::Matches);
+                assert_eq!(
+                    rhs.node,
+                    Expr::Literal(LiteralValue::String("prod-.*".to_string()))
+                );
+            }
+            other => panic!("expected Binary Matches, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_matches_string_literal() {
+        // string literal RHS still works
+        let result = parse_expr(r#"host matches "pattern""#);
+        match &result.node {
+            Expr::Binary { lhs, op, rhs } => {
+                assert_eq!(lhs.node, Expr::FieldRef("host".to_string()));
+                assert_eq!(*op, BinaryOp::Matches);
+                assert_eq!(
+                    rhs.node,
+                    Expr::Literal(LiteralValue::String("pattern".to_string()))
+                );
+            }
+            other => panic!("expected Binary Matches, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_division_still_works() {
+        // `/` as division must not be confused with regex delimiters
+        let result = parse_expr("x / 2 > 0");
+        match &result.node {
+            Expr::Binary { lhs, op, .. } => {
+                assert_eq!(*op, BinaryOp::Gt);
+                match &lhs.node {
+                    Expr::Binary { op: inner_op, .. } => assert_eq!(*inner_op, BinaryOp::Div),
+                    other => panic!("expected inner Binary Div, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary Gt, got {other:?}"),
         }
     }
 

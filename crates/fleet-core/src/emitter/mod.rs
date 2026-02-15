@@ -673,6 +673,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // where matches with regex literal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expr_matches_regex_literal() {
+        assert_snapshot!(emit_dsl(r"* | where host matches /prod-.*/"));
+    }
+
+    #[test]
+    fn expr_matches_string_literal() {
+        assert_snapshot!(emit_dsl(r#"* | where host matches "pattern""#));
+    }
+
+    // -----------------------------------------------------------------------
     // round with precision
     // -----------------------------------------------------------------------
 
