@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*"]
-default-members = ["crates/fleet-cli", "crates/fleet-admin", "crates/fleet-server", "crates/fleet-tui"]
+default-members = ["crates/fleet-cli", "crates/fleet-admin", "crates/fleet-server"]
 resolver = "3"
 
 [workspace.package]
@@ -26,7 +26,6 @@ base64ct = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chumsky = "0.12"
 clap = { version = "4", features = ["derive", "env"] }
-color-eyre = "0.6"
 crossterm = "0.28"
 dashmap = "6"
 comfy-table = "7"
@@ -67,7 +66,6 @@ ulid = "1"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "catch-panic", "cors", "limit", "set-header"] }
 tracing = "0.1"
-tui-textarea = "0.7"
 tempfile = "3"
 time = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
