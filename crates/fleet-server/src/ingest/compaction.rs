@@ -5,9 +5,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
+
+use crate::hot_buffer::HotBuffer;
 
 /// Spawn the compaction background loop.
 ///
@@ -21,6 +24,7 @@ pub fn spawn_compaction(
     data_dir: PathBuf,
     interval: Duration,
     daily_rollup: bool,
+    hot_buffer: Option<Arc<HotBuffer>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -37,7 +41,7 @@ pub fn spawn_compaction(
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    if let Err(e) = compact_once(&wal_dir, &data_dir, interval, daily_rollup).await {
+                    if let Err(e) = compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref()).await {
                         tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
                     }
                 }
@@ -56,6 +60,7 @@ async fn compact_once(
     data_dir: &Path,
     min_age: Duration,
     daily_rollup: bool,
+    hot_buffer: Option<&Arc<HotBuffer>>,
 ) -> Result<(), String> {
     // Remove orphaned .parquet.tmp files from interrupted compaction runs.
     cleanup_stale_tmp_files(data_dir, min_age * 2);
@@ -76,6 +81,17 @@ async fn compact_once(
 
             match compact_service_batch(wal_files, data_dir, service).await {
                 Ok(()) => {
+                    // Drain corresponding batches from the hot buffer.
+                    // This must happen BEFORE WAL file deletion so that
+                    // events remain visible in queries during the transition.
+                    if let Some(buf) = &hot_buffer {
+                        let batch_ids: Vec<&str> = wal_files
+                            .iter()
+                            .filter_map(|f| f.file_stem()?.to_str())
+                            .collect();
+                        buf.drain(&batch_ids);
+                    }
+
                     // Clean up consumed WAL files.
                     for f in wal_files {
                         if let Err(e) = std::fs::remove_file(f) {
@@ -1057,7 +1073,7 @@ mod tests {
         write_hourly_parquet(&data_dir, &yesterday, "01", "nginx", &[&r1]);
 
         // WAL dir is empty — compact_once should still run rollup.
-        compact_once(&wal_dir, &data_dir, Duration::from_secs(1), true)
+        compact_once(&wal_dir, &data_dir, Duration::from_secs(1), true, None)
             .await
             .unwrap();
 

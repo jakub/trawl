@@ -53,41 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Spawn ingest compaction task if ingestion is enabled.
-    let compaction_handle = if config.ingest.enabled {
-        let wal_dir = config.wal_dir();
-
-        // Ensure the WAL directory exists at startup.
-        if let Some(writer) = &state.ingest.wal_writer {
-            writer.ensure_dir().map_err(|e| {
-                format!("failed to create WAL directory {}: {e}", wal_dir.display())
-            })?;
-        }
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let data_dir = config.data.base_dir();
-        let interval = std::time::Duration::from_secs(config.ingest.compaction_interval_secs);
-
-        tracing::info!(
-            event_type = "lifecycle",
-            wal_dir = %wal_dir.display(),
-            data_dir = %data_dir.display(),
-            interval_secs = config.ingest.compaction_interval_secs,
-            "ingest pipeline enabled"
-        );
-
-        let handle = fleet_server::ingest::compaction::spawn_compaction(
-            wal_dir,
-            data_dir,
-            interval,
-            config.ingest.daily_rollup,
-            shutdown_rx,
-        );
-        Some((handle, shutdown_tx))
-    } else {
-        tracing::info!(event_type = "lifecycle", "ingest pipeline disabled");
-        None
-    };
+    let compaction_handle = spawn_ingest_pipeline(&config, &state)?;
 
     // Spawn retention task (always-on with defaults).
     let retention_handle = {
@@ -125,9 +91,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     http::serve(state, &http_config, &config.server).await?;
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
-    // then compaction (may compact those final files), then retention, then audit.
+    // then hot buffer consumer (stop inserting), then compaction (may compact
+    // final files and drain hot buffer), then retention, then audit.
     shutdown_task(telemetry_handle, "telemetry").await;
-    shutdown_task(compaction_handle, "compaction").await;
+    if let Some((compaction_jh, compaction_tx, hot_buf_handle)) = compaction_handle {
+        // Stop the hot buffer consumer before compaction so no new
+        // batches arrive while compaction is draining.
+        if let Some((hb_jh, hb_tx)) = hot_buf_handle {
+            drop(hb_tx);
+            if let Err(e) = hb_jh.await {
+                tracing::warn!(event_type = "task_panic", task = "hot_buffer_consumer", error = %e, "task panicked during shutdown");
+            }
+        }
+        shutdown_task(Some((compaction_jh, compaction_tx)), "compaction").await;
+    }
     shutdown_task(Some(retention_handle), "retention").await;
     shutdown_task(audit_handle, "audit").await;
 
@@ -142,6 +119,67 @@ async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name
             tracing::warn!(event_type = "task_panic", task = name, error = %e, "task panicked during shutdown");
         }
     }
+}
+
+/// Spawn the ingest pipeline tasks (compaction + hot buffer consumer).
+///
+/// Returns handles for graceful shutdown, or `None` if ingest is disabled.
+type IngestHandles = (
+    JoinHandle<()>,
+    watch::Sender<bool>,
+    Option<(JoinHandle<()>, watch::Sender<()>)>,
+);
+
+fn spawn_ingest_pipeline(
+    config: &Config,
+    state: &AppState,
+) -> Result<Option<IngestHandles>, Box<dyn std::error::Error>> {
+    if !config.ingest.enabled {
+        tracing::info!(event_type = "lifecycle", "ingest pipeline disabled");
+        return Ok(None);
+    }
+
+    let wal_dir = config.wal_dir();
+
+    // Ensure the WAL directory exists at startup.
+    if let Some(writer) = &state.ingest.wal_writer {
+        writer
+            .ensure_dir()
+            .map_err(|e| format!("failed to create WAL directory {}: {e}", wal_dir.display()))?;
+    }
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let data_dir = config.data.base_dir();
+    let interval = std::time::Duration::from_secs(config.ingest.compaction_interval_secs);
+
+    tracing::info!(
+        event_type = "lifecycle",
+        wal_dir = %wal_dir.display(),
+        data_dir = %data_dir.display(),
+        interval_secs = config.ingest.compaction_interval_secs,
+        "ingest pipeline enabled"
+    );
+
+    // Spawn hot buffer consumer if available.
+    let hot_buffer_handle =
+        if let (Some(bus), Some(buf)) = (&state.ingest.event_bus, &state.query.hot_buffer) {
+            let (stx, srx) = tokio::sync::watch::channel(());
+            let h = fleet_server::hot_buffer::spawn_hot_buffer_consumer(bus, Arc::clone(buf), srx);
+            Some((h, stx))
+        } else {
+            None
+        };
+
+    let handle = fleet_server::ingest::compaction::spawn_compaction(
+        wal_dir,
+        data_dir,
+        interval,
+        config.ingest.daily_rollup,
+        state.query.hot_buffer.clone(),
+        shutdown_rx,
+    );
+
+    Ok(Some((handle, shutdown_tx, hot_buffer_handle)))
 }
 
 /// Initialize the tracing subscriber.
