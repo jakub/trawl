@@ -235,8 +235,9 @@ fn render_sparkline(
     if series.len() == 1 {
         let (label, values) = &series[0];
         let max_val = values.iter().max().copied().unwrap_or(100);
+        let min_val = values.iter().min().copied().unwrap_or(0);
 
-        let title = if let Some((start, end, span)) = time_info {
+        let title = if let Some((ref start, ref end, ref span)) = time_info {
             format!(" {label} • {start} to {end} • span: {span} ")
         } else {
             format!(" {label} over time ")
@@ -252,14 +253,65 @@ fn render_sparkline(
             .border_style(border_style)
             .padding(Padding::horizontal(1));
 
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // Reserve space for y-axis labels (8 chars wide)
+        let y_axis_width = 8;
+        let sparkline_area = Rect {
+            x: inner.x + y_axis_width,
+            y: inner.y,
+            width: inner.width.saturating_sub(y_axis_width),
+            height: inner.height.saturating_sub(1), // Reserve 1 row for x-axis
+        };
+
         let sparkline = Sparkline::default()
             .data(values)
             .style(Style::default().fg(Color::Cyan))
             .max(max_val);
 
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        frame.render_widget(sparkline, inner);
+        frame.render_widget(sparkline, sparkline_area);
+
+        // Render y-axis labels (max at top, min at bottom)
+        let max_label =
+            Paragraph::new(format!("{max_val:>7}")).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(
+            max_label,
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: y_axis_width,
+                height: 1,
+            },
+        );
+
+        let min_label =
+            Paragraph::new(format!("{min_val:>7}")).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(
+            min_label,
+            Rect {
+                x: inner.x,
+                y: inner.y + sparkline_area.height.saturating_sub(1),
+                width: y_axis_width,
+                height: 1,
+            },
+        );
+
+        // Render x-axis time labels (first and last time)
+        if let Some((start, end, _)) = time_info {
+            let x_axis_text = format!("{start:<19} {end:>19}");
+            let x_axis_label =
+                Paragraph::new(x_axis_text).style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(
+                x_axis_label,
+                Rect {
+                    x: inner.x + y_axis_width,
+                    y: inner.y + sparkline_area.height,
+                    width: sparkline_area.width,
+                    height: 1,
+                },
+            );
+        }
     } else {
         render_stacked_sparklines(app, frame, area, &series, border_style, time_info);
     }
