@@ -1,0 +1,259 @@
+//! CLI mode: query execution, validation, and output formatting.
+
+use std::io::{self, IsTerminal, Write};
+
+use clap::ValueEnum;
+use fleet_engine::value::{QueryResult, Value};
+
+use crate::CliError;
+
+/// Output format for CLI query results.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Table,
+    Json,
+    Csv,
+}
+
+/// Resolved connection parameters (after config + env + CLI override merge).
+pub struct ConnectionParams {
+    pub url: String,
+    pub token: String,
+    pub insecure: bool,
+}
+
+/// Execute a query and print the results.
+pub async fn run_query(
+    query: &str,
+    data: Option<&str>,
+    format: Option<OutputFormat>,
+    conn: Option<ConnectionParams>,
+) -> Result<(), CliError> {
+    let format = format.unwrap_or_else(|| {
+        if io::stdout().is_terminal() {
+            OutputFormat::Table
+        } else {
+            OutputFormat::Json
+        }
+    });
+
+    let result = if let Some(data) = data {
+        run_embedded_mode(data, query)?
+    } else if let Some(conn) = conn {
+        run_daemon_mode(&conn, query).await?
+    } else {
+        return Err(CliError::Usage(
+            "provide --url (daemon mode) or --data (embedded mode)".into(),
+        ));
+    };
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    match format {
+        OutputFormat::Table => render_table(&result, &mut out)?,
+        OutputFormat::Json => render_ndjson(&result, &mut out)?,
+        OutputFormat::Csv => render_csv(&result, &mut out)?,
+    }
+
+    Ok(())
+}
+
+/// Validate a DSL query.
+///
+/// If connection params are provided, validates via the server (checks syntax,
+/// semantics, function arity, regex patterns). Otherwise, validates locally
+/// (parse-only via `fleet_core`).
+pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result<(), CliError> {
+    if let Some(conn) = conn {
+        // Server-side validation (richer checks).
+        let client = make_client(&conn)?;
+        let response = client.validate(query).await?;
+        if response.valid {
+            println!("valid");
+        } else {
+            for err in &response.errors {
+                eprintln!("{err}");
+            }
+            return Err(CliError::Usage("query validation failed".into()));
+        }
+    } else {
+        // Local parse-only validation.
+        match fleet_core::parser::parse(query) {
+            Ok(_) => println!("valid"),
+            Err(errors) => {
+                for err in &errors {
+                    eprintln!("{err}");
+                }
+                return Err(CliError::Usage("query validation failed".into()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Connect to the daemon and execute the query over HTTPS.
+async fn run_daemon_mode(conn: &ConnectionParams, query: &str) -> Result<QueryResult, CliError> {
+    let client = make_client(conn)?;
+    Ok(client.query(query).await?)
+}
+
+/// Execute the query locally with an embedded `DuckDB` engine.
+fn run_embedded_mode(data: &str, query: &str) -> Result<QueryResult, CliError> {
+    let executor = fleet_engine::executor::Executor::new()?;
+    // CLI has no server-side row limit — use usize::MAX.
+    Ok(executor.run_query(query, data, usize::MAX)?)
+}
+
+/// Build an `HttpClient` from resolved connection params.
+fn make_client(conn: &ConnectionParams) -> Result<fleet_client::HttpClient, CliError> {
+    let client = if conn.insecure {
+        fleet_client::HttpClient::new_insecure(&conn.url, &conn.token)?
+    } else {
+        fleet_client::HttpClient::new(&conn.url, &conn.token)?
+    };
+    Ok(client)
+}
+
+// -- output formatters -------------------------------------------------------
+
+fn render_table(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
+    if result.is_empty() {
+        writeln!(out, "no results")?;
+        return Ok(());
+    }
+
+    let mut table = comfy_table::Table::new();
+    table
+        .load_preset(comfy_table::presets::UTF8_FULL)
+        .apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS)
+        .set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+
+    let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    table.set_header(headers);
+
+    for row in &result.rows {
+        let cells: Vec<String> = row.iter().map(ToString::to_string).collect();
+        table.add_row(cells);
+    }
+
+    writeln!(out, "{table}")?;
+    writeln!(out, "{} row(s)", result.row_count())?;
+    Ok(())
+}
+
+fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
+    for row in &result.rows {
+        let mut map = serde_json::Map::new();
+        for (col, val) in result.columns.iter().zip(row.iter()) {
+            // Value's custom Serialize impl maps directly to JSON primitives,
+            // so this conversion is infallible.
+            map.insert(
+                col.name.clone(),
+                serde_json::to_value(val).expect("Value serialization is infallible"),
+            );
+        }
+        serde_json::to_writer(&mut *out, &map).map_err(io::Error::other)?;
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+fn render_csv(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
+    let headers: Vec<String> = result
+        .columns
+        .iter()
+        .map(|c| csv_escape_string(&c.name))
+        .collect();
+    writeln!(out, "{}", headers.join(","))?;
+
+    for row in &result.rows {
+        let cells: Vec<String> = row.iter().map(csv_escape_value).collect();
+        writeln!(out, "{}", cells.join(","))?;
+    }
+    Ok(())
+}
+
+/// Escape a value for CSV output, applying formula injection protection
+/// only to string values (numeric types are inherently safe).
+fn csv_escape_value(val: &Value) -> String {
+    match val {
+        Value::Null => String::new(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => csv_escape_string(s),
+    }
+}
+
+/// Escape a string for CSV, preventing formula injection and quoting
+/// as needed for commas, quotes, and newlines.
+fn csv_escape_string(s: &str) -> String {
+    // Prevent CSV injection: prefix formula-triggering characters with a
+    // single quote so spreadsheet apps don't interpret cells as formulas.
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '|']) {
+        format!("'{s}")
+    } else {
+        s.to_owned()
+    };
+
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_negative_number_not_prefixed() {
+        assert_eq!(csv_escape_value(&Value::Integer(-42)), "-42");
+    }
+
+    #[test]
+    fn csv_negative_float_not_prefixed() {
+        assert_eq!(csv_escape_value(&Value::Float(-1.5)), "-1.5");
+    }
+
+    #[test]
+    fn csv_formula_string_prefixed() {
+        assert_eq!(csv_escape_value(&Value::String("=cmd".into())), "'=cmd");
+    }
+
+    #[test]
+    fn csv_tab_prefixed() {
+        assert_eq!(csv_escape_value(&Value::String("\tfoo".into())), "'\tfoo");
+    }
+
+    #[test]
+    fn csv_at_sign_prefixed() {
+        assert_eq!(csv_escape_value(&Value::String("@sum".into())), "'@sum");
+    }
+
+    #[test]
+    fn csv_pipe_prefixed() {
+        assert_eq!(csv_escape_value(&Value::String("|cmd".into())), "'|cmd");
+    }
+
+    #[test]
+    fn csv_null_empty() {
+        assert_eq!(csv_escape_value(&Value::Null), "");
+    }
+
+    #[test]
+    fn csv_string_with_comma() {
+        assert_eq!(csv_escape_value(&Value::String("a,b".into())), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_string_with_quotes() {
+        assert_eq!(
+            csv_escape_value(&Value::String(r#"say "hi""#.into())),
+            r#""say ""hi""""#
+        );
+    }
+}
