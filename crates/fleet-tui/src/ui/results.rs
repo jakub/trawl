@@ -228,14 +228,23 @@ fn render_sparkline(
         return;
     }
 
+    // Extract time metadata for title
+    let time_info = extract_time_metadata(result);
+
     // Single series: render one large sparkline
     if series.len() == 1 {
         let (label, values) = &series[0];
         let max_val = values.iter().max().copied().unwrap_or(100);
 
+        let title = if let Some((start, end, span)) = time_info {
+            format!(" {label} • {start} to {end} • span: {span} ")
+        } else {
+            format!(" {label} over time ")
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" {label} over time "))
+            .title(title)
             .title_bottom(format!(
                 " {} points  •  max: {max_val}  •  'v' to toggle view ",
                 values.len(),
@@ -252,7 +261,7 @@ fn render_sparkline(
         frame.render_widget(block, area);
         frame.render_widget(sparkline, inner);
     } else {
-        render_stacked_sparklines(app, frame, area, &series, border_style);
+        render_stacked_sparklines(app, frame, area, &series, border_style, time_info);
     }
 }
 
@@ -263,10 +272,17 @@ fn render_stacked_sparklines(
     area: Rect,
     series: &[(String, Vec<u64>)],
     border_style: Style,
+    time_info: Option<(String, String, String)>,
 ) {
+    let title = if let Some((start, end, span)) = time_info {
+        format!(" timechart • {start} to {end} • span: {span} ")
+    } else {
+        " timechart by series ".to_owned()
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" timechart by series ")
+        .title(title)
         .title_bottom(format!(" {} series  •  'v' to toggle view ", series.len()))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
@@ -355,6 +371,42 @@ fn value_to_u64(value: &Value) -> u64 {
         Value::Float(f) => f.max(0.0) as u64,
         _ => 0, // Null, Boolean, String all map to 0
     }
+}
+
+/// Extract time metadata from timechart result.
+///
+/// Returns (`start_time`, `end_time`, `span_interval`) as formatted strings.
+fn extract_time_metadata(
+    result: &fleet_engine::value::QueryResult,
+) -> Option<(String, String, String)> {
+    if result.rows.is_empty() {
+        return None;
+    }
+
+    // Get first and last time values
+    let first_time = value_to_string(&result.rows[0][0]);
+    let last_time = value_to_string(&result.rows[result.rows.len() - 1][0]);
+
+    // Calculate span by comparing first two timestamps (if available)
+    let span = if result.rows.len() >= 2 {
+        // Try to parse timestamps and calculate difference
+        // For now, just show "auto" - proper parsing would need chrono
+        "auto".to_owned()
+    } else {
+        "N/A".to_owned()
+    };
+
+    // Format times (truncate if too long)
+    let format_time = |s: String| {
+        if s.len() > 19 {
+            // Keep just date and time, drop subseconds/timezone
+            s.chars().take(19).collect()
+        } else {
+            s
+        }
+    };
+
+    Some((format_time(first_time), format_time(last_time), span))
 }
 
 /// Extract (label, values) tuples from timechart result.

@@ -61,10 +61,10 @@ impl ChartView {
     #[allow(dead_code)] // Used when 'v' keybinding is implemented
     pub fn next(self) -> Self {
         match self {
+            // Only cycle between Table and Sparkline for now
+            // (bar/line charts not yet implemented)
             Self::Table => Self::Sparkline,
-            Self::Sparkline => Self::BarChart,
-            Self::BarChart => Self::LineChart,
-            Self::LineChart => Self::Table,
+            Self::Sparkline | Self::BarChart | Self::LineChart => Self::Table,
         }
     }
 }
