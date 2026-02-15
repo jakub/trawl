@@ -36,7 +36,11 @@ enum MutationResult {
     /// Saved query was deleted successfully.
     SavedQueryDeleted { name: String },
     /// Saved queries cache refreshed.
-    CacheRefreshed { saved: ListSavedResponse },
+    CacheRefreshed {
+        saved: ListSavedResponse,
+        /// Name of the query to select after refresh (if any).
+        select_name: Option<String>,
+    },
     /// Mutation failed.
     Error { message: String },
 }
@@ -174,7 +178,7 @@ impl App {
     }
 
     /// Refresh the saved queries cache from the server.
-    fn refresh_saved_cache(&mut self) {
+    fn refresh_saved_cache(&mut self, select_name: Option<String>) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
         tokio::spawn(async move {
@@ -184,7 +188,7 @@ impl App {
                         "refreshed saved queries cache: {} queries",
                         saved.queries.len()
                     );
-                    MutationResult::CacheRefreshed { saved }
+                    MutationResult::CacheRefreshed { saved, select_name }
                 }
                 Err(e) => {
                     tracing::error!("failed to refresh saved queries: {e}");
@@ -203,20 +207,31 @@ impl App {
             match mutation_result {
                 MutationResult::SavedQueryCreated { name } => {
                     tracing::info!("saved query created: {name}");
-                    // Refresh saved queries cache
-                    self.refresh_saved_cache();
+                    // Refresh saved queries cache and select the new query
+                    self.refresh_saved_cache(Some(name.clone()));
+                    // Open saved queries sidebar to show the new query
+                    self.sidebar = Some(Sidebar::Saved);
                 }
                 MutationResult::SavedQueryDeleted { name } => {
                     tracing::info!("saved query deleted: {name}");
                     // Refresh saved queries cache
-                    self.refresh_saved_cache();
+                    self.refresh_saved_cache(None);
                 }
-                MutationResult::CacheRefreshed { saved } => {
+                MutationResult::CacheRefreshed { saved, select_name } => {
                     tracing::debug!(
                         "updating saved queries cache with {} queries",
                         saved.queries.len()
                     );
+
+                    // If we should select a specific query, find its index
+                    if let Some(name) = select_name {
+                        if let Some(idx) = saved.queries.iter().position(|q| q.name == name) {
+                            self.saved_selected_index = idx;
+                        }
+                    }
+
                     self.saved_cache = Some(saved);
+
                     // Reset selection if it's now out of bounds
                     if let Some(cache) = &self.saved_cache {
                         if self.saved_selected_index >= cache.queries.len()
