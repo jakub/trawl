@@ -1,5 +1,8 @@
 //! HTTP client for communicating with fleetd.
 
+use std::pin::Pin;
+
+use futures::Stream;
 use reqwest::Client;
 use zeroize::Zeroizing;
 
@@ -10,8 +13,8 @@ use crate::types::{
     SchemaResponse, StatsResponse, ValidationResponse,
 };
 use crate::types::{
-    CreateSavedRequest, ErrorResponse, ExportRequest, QueryRequestPaginated, UpdateSavedRequest,
-    ValidateRequest,
+    CreateSavedRequest, ErrorResponse, ExportRequest, QueryRequestPaginated, StreamEvent,
+    UpdateSavedRequest, ValidateRequest,
 };
 
 /// HTTP client for the fleet daemon API.
@@ -294,15 +297,68 @@ impl HttpClient {
             .map_err(|e| ClientError::Parse(e.to_string()))
     }
 
-    /// Stream live query results via Server-Sent Events.
+    /// Stream live query results as typed events.
     ///
-    /// Returns a response handle that can be used to read SSE events.
-    /// The caller is responsible for parsing the SSE event stream.
-    ///
-    /// # Parameters
-    /// - `query`: DSL query string to execute repeatedly
-    /// - `interval_secs`: Interval between query executions (1-60 seconds)
-    pub async fn stream(
+    /// Returns a stream of [`StreamEvent`] values parsed from the SSE
+    /// connection. Handles event framing and JSON deserialization.
+    pub async fn stream_events(
+        &self,
+        query: &str,
+        interval_secs: Option<u64>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ClientError>> + Send>>, ClientError>
+    {
+        let resp = self.stream(query, interval_secs).await?;
+        let byte_stream = resp.bytes_stream();
+
+        let event_stream = async_stream::try_stream! {
+            futures::pin_mut!(byte_stream);
+            let mut buffer = String::new();
+
+            while let Some(chunk) = futures::StreamExt::next(&mut byte_stream).await {
+                let chunk = chunk.map_err(sanitize_reqwest_error)?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some(pos) = buffer.find("\n\n") {
+                    let event_text = buffer[..pos].to_owned();
+                    buffer.drain(..pos + 2);
+
+                    let mut event_type = None;
+                    let mut event_data = None;
+
+                    for line in event_text.lines() {
+                        if let Some(t) = line.strip_prefix("event: ") {
+                            event_type = Some(t.to_owned());
+                        } else if let Some(d) = line.strip_prefix("data: ") {
+                            event_data = Some(d.to_owned());
+                        }
+                    }
+
+                    match event_type.as_deref() {
+                        Some("data") => {
+                            if let Some(data) = event_data {
+                                let row: Vec<fleet_engine::value::Value> =
+                                    serde_json::from_str(&data).map_err(|e| {
+                                        ClientError::Parse(format!("invalid stream row: {e}"))
+                                    })?;
+                                yield StreamEvent::Row(row);
+                            }
+                        }
+                        Some("error") => {
+                            if let Some(data) = event_data {
+                                yield StreamEvent::Error(data);
+                            }
+                        }
+                        _ => {} // ignore keep-alive, etc.
+                    }
+                }
+            }
+        };
+
+        Ok(Box::pin(event_stream))
+    }
+
+    /// Raw SSE stream connection (internal — use [`stream_events`](Self::stream_events) instead).
+    async fn stream(
         &self,
         query: &str,
         interval_secs: Option<u64>,

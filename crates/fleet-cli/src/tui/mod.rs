@@ -8,7 +8,10 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use fleet_client::{HistoryResponse, HttpClient, ListSavedResponse, QueryResponse, SchemaResponse};
+use fleet_client::{
+    HistoryResponse, HttpClient, ListSavedResponse, PaginationMeta, QueryResponse, SchemaResponse,
+    StreamEvent,
+};
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -715,7 +718,6 @@ impl App {
     }
 
     /// Start live streaming with the current query.
-    #[allow(clippy::too_many_lines)] // SSE parsing requires detailed logic
     fn start_live_stream(&mut self) {
         let query = self.active_tab().editor.text().trim().to_owned();
 
@@ -726,12 +728,12 @@ impl App {
 
         tracing::info!("starting live stream for query: {}", query);
 
-        // Cancel any existing stream
+        // Cancel any existing stream.
         if let Some(task) = self.live_task.take() {
             task.abort();
         }
 
-        // Get column names from existing result (if any) for the stream
+        // Get column names from existing result (if any) for the stream.
         let existing_columns = self
             .active_tab()
             .result
@@ -742,15 +744,13 @@ impl App {
         let tx = self.query_tx.clone();
         let tab_idx = self.active_tab_idx;
 
-        // Spawn background task to stream results
         let task = tokio::spawn(async move {
             tracing::info!("live stream task started");
 
-            // Start SSE stream (5 second interval)
-            let resp = match client.stream(&query, Some(5)).await {
-                Ok(r) => r,
+            let mut stream = match client.stream_events(&query, Some(5)).await {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::error!("failed to start stream: {}", e);
+                    tracing::error!("failed to start stream: {e}");
                     let _ = tx.send(QueryResult {
                         tab_idx,
                         result: Err(e.to_string()),
@@ -760,76 +760,30 @@ impl App {
                 }
             };
 
-            // Read SSE events from response body
-            let mut stream = resp.bytes_stream();
-
-            let mut buffer = String::new();
             let mut accumulated_rows: Vec<Vec<fleet_engine::value::Value>> = Vec::new();
             let columns = existing_columns;
 
-            while let Some(chunk) = stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::Row(row)) => {
+                        accumulated_rows.push(row);
+                        tracing::debug!("received stream row, total: {}", accumulated_rows.len());
+                    }
+                    Ok(StreamEvent::Error(msg)) => {
+                        tracing::error!("stream error event: {msg}");
+                    }
                     Err(e) => {
-                        tracing::error!("stream error: {}", e);
+                        tracing::error!("stream error: {e}");
                         break;
                     }
-                };
-
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // Parse SSE events from buffer (events are separated by \n\n)
-                while let Some(pos) = buffer.find("\n\n") {
-                    let event_text = buffer[..pos].to_owned();
-                    buffer.drain(..pos + 2);
-
-                    // Parse SSE event structure
-                    let mut event_type = None;
-                    let mut event_data = None;
-
-                    for line in event_text.lines() {
-                        if let Some(event) = line.strip_prefix("event: ") {
-                            event_type = Some(event.to_owned());
-                        } else if let Some(data) = line.strip_prefix("data: ") {
-                            event_data = Some(data.to_owned());
-                        }
-                    }
-
-                    // Only process "data" events (individual rows from query result)
-                    if event_type.as_deref() == Some("data") {
-                        if let Some(data) = event_data {
-                            // Parse JSON row (array of values)
-                            match serde_json::from_str::<Vec<fleet_engine::value::Value>>(&data) {
-                                Ok(row) => {
-                                    accumulated_rows.push(row);
-                                    tracing::debug!(
-                                        "received stream row, total: {}",
-                                        accumulated_rows.len()
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!("failed to parse stream row: {}", e);
-                                }
-                            }
-                        }
-                    } else if event_type.as_deref() == Some("error") {
-                        // Handle error events
-                        if let Some(data) = event_data {
-                            tracing::error!("stream error event: {}", data);
-                        }
-                    }
-                    // Ignore other event types (keep-alive, etc.)
                 }
 
-                // Periodically send accumulated rows (every second or when we have enough)
-                if !accumulated_rows.is_empty() && accumulated_rows.len() >= 10 {
-                    // Use existing columns or generate generic ones
+                // Send accumulated rows in batches.
+                if accumulated_rows.len() >= 10 {
                     let cols = if let Some(ref cols) = columns {
                         cols.clone()
-                    } else if !accumulated_rows.is_empty() {
-                        // Generate column names (col_0, col_1, etc.)
-                        let col_count = accumulated_rows[0].len();
-                        (0..col_count)
+                    } else if let Some(first) = accumulated_rows.first() {
+                        (0..first.len())
                             .map(|i| fleet_engine::value::Column {
                                 name: format!("col_{i}"),
                             })
@@ -850,7 +804,7 @@ impl App {
                         result: Ok(QueryResponse {
                             result,
                             truncated: false,
-                            pagination: fleet_client::PaginationMeta {
+                            pagination: PaginationMeta {
                                 limit: 0,
                                 offset: 0,
                                 returned: 0,

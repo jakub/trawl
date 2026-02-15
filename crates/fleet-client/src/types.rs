@@ -44,6 +44,17 @@ pub(crate) struct ExportRequest<'a> {
     pub limit: Option<usize>,
 }
 
+// -- streaming types ---------------------------------------------------------
+
+/// A single event from a live query stream.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// A result row.
+    Row(Vec<fleet_engine::value::Value>),
+    /// Server-side error message.
+    Error(String),
+}
+
 // -- re-exports from fleet-api -----------------------------------------------
 
 pub use fleet_api::{

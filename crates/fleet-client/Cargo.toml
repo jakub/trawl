@@ -11,6 +11,8 @@ publish.workspace = true
 fleet-api = { workspace = true }
 fleet-engine = { workspace = true }
 
+async-stream = { workspace = true }
+futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

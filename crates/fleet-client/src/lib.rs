@@ -14,5 +14,5 @@ pub use types::{
     ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, DeleteSavedResponse,
     FieldValuesResponse, HealthResponse, HistoryEntryResponse, HistoryResponse, IngestResponse,
     ListSavedResponse, PaginationMeta, QueriesResponse, QueryResponse, SavedQueryResponse,
-    SchemaColumnResponse, SchemaResponse, StatsResponse, ValidationResponse,
+    SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent, ValidationResponse,
 };

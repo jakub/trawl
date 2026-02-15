@@ -1074,8 +1074,10 @@ dependencies = [
 name = "fleet-client"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "fleet-api",
  "fleet-engine",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
