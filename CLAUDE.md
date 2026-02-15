@@ -19,7 +19,7 @@ crates/
   fleet-auth/     # API keys, roles, SQLite-backed
   fleet-server/   # daemon (axum, unix socket, TCP+TLS)
   fleet-client/   # shared client library
-  fleet-cli/      # CLI tool
+  fleet-cli/      # unified CLI + TUI binary
   fleet-admin/    # admin CLI (key mgmt, templates, enrollment)
 ```
 
@@ -41,7 +41,13 @@ crates/
 
 ## using fleet
 
-- We are running a development server at https://localhost:5514 with a self-signed cert. You need to use the --insecure flag. 
+- `fleet` (no subcommand) launches the interactive TUI
+- `fleet query "dsl..."` executes a query and prints results (table for TTY, JSON for pipes)
+- `fleet query --data '/path/*.parquet' "dsl..."` queries local parquet files (embedded mode)
+- `fleet validate "dsl..."` checks DSL syntax without executing
+- global flags: `--url`, `--token`, `--insecure`, `--token-file`, `--config`
+- config file: `~/.config/fleet/config.toml` (shared by CLI and TUI modes)
+- We are running a development server at https://localhost:5514 with a self-signed cert. You need to use the --insecure flag.
 - Environment variables FLEET_URL (https://localhost:5514) AND FLEET_TOKEN (with an admin-scoped token) should be already set. Environment variables override the config files in ~/.config/fleet/
 
 ## docs

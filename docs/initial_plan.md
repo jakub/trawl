@@ -491,7 +491,7 @@ AppState {
 
 ### 9.3 Deliverable
 
-A fully functional TUI log viewer. SSH into a box, run `fleet-tui`, search your logs interactively.
+A fully functional TUI log viewer. SSH into a box, run `fleet`, search your logs interactively.
 
 ---
 
