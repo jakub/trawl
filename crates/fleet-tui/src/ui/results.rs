@@ -473,11 +473,14 @@ fn extract_time_metadata(
     let first_time = value_to_string(&result.rows[0][0]);
     let last_time = value_to_string(&result.rows[result.rows.len() - 1][0]);
 
-    // Calculate span by comparing first two timestamps (if available)
+    // Derive span from the delta between first two time buckets
     let span = if result.rows.len() >= 2 {
-        // Try to parse timestamps and calculate difference
-        // For now, just show "auto" - proper parsing would need chrono
-        "auto".to_owned()
+        let t1 = value_to_string(&result.rows[0][0]);
+        let t2 = value_to_string(&result.rows[1][0]);
+        match (parse_timestamp_secs(&t1), parse_timestamp_secs(&t2)) {
+            (Some(s1), Some(s2)) => format_duration(s2.saturating_sub(s1)),
+            _ => "?".to_owned(),
+        }
     } else {
         "N/A".to_owned()
     };
@@ -527,5 +530,43 @@ fn extract_series(result: &fleet_engine::value::QueryResult) -> Vec<(String, Vec
     } else {
         // Unsupported format, fallback to empty
         vec![]
+    }
+}
+
+/// Parse "YYYY-MM-DD HH:MM:SS" into total seconds (for diffing, not epoch).
+fn parse_timestamp_secs(s: &str) -> Option<u64> {
+    // Expect at minimum "YYYY-MM-DD HH:MM:SS" (19 chars)
+    if s.len() < 19 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+
+    let year: u64 = s[0..4].parse().ok()?;
+    let month: u64 = s[5..7].parse().ok()?;
+    let day: u64 = s[8..10].parse().ok()?;
+
+    // Delimiter between date and time can be ' ' or 'T'
+    if bytes[10] != b' ' && bytes[10] != b'T' {
+        return None;
+    }
+
+    let hour: u64 = s[11..13].parse().ok()?;
+    let min: u64 = s[14..16].parse().ok()?;
+    let sec: u64 = s[17..19].parse().ok()?;
+
+    // Rough total seconds (not calendar-accurate, but fine for diffs within days)
+    Some(year * 365 * 86400 + month * 30 * 86400 + day * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Format a duration in seconds as a human-readable string.
+fn format_duration(secs: u64) -> String {
+    if secs >= 86400 {
+        format!("{}d", secs / 86400)
+    } else if secs >= 3600 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
     }
 }
