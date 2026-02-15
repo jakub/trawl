@@ -402,6 +402,7 @@ fn value_to_string(value: &Value) -> String {
         Value::Null => "NULL".to_owned(),
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
+        // display-friendly: 2dp for readability (CSV export preserves full precision)
         Value::Float(f) => format!("{f:.2}"),
         Value::String(s) => s.clone(),
     }

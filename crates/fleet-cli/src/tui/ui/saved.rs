@@ -1,7 +1,7 @@
 //! Saved queries sidebar (F4).
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
@@ -86,33 +86,4 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     }
 }
 
-/// Truncate query string to max length with ellipsis.
-fn truncate_query(query: &str, max_len: usize) -> String {
-    if query.len() <= max_len {
-        query.to_owned()
-    } else {
-        format!("{}...", &query[..max_len.saturating_sub(3)])
-    }
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    use ratatui::layout::{Constraint, Direction, Layout};
-
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
+use super::common::{centered_rect, truncate_query};

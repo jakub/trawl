@@ -183,6 +183,7 @@ fn csv_escape_value(val: &Value) -> String {
         Value::Null => String::new(),
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
+        // full precision for data fidelity (TUI display uses 2dp for readability)
         Value::Float(f) => f.to_string(),
         Value::String(s) => csv_escape_string(s),
     }

@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use crate::tui::App;
 use crate::tui::state::{Focus, Sidebar};
 
+pub mod common;
 pub mod editor;
 pub mod help;
 pub mod history;
