@@ -11,9 +11,21 @@ use axum::http::HeaderMap;
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
 
+use crate::bus::{EventBus as _, IngestBatch};
 use crate::error::ServerError;
 use crate::state::AppState;
 use fleet_api::IngestResponse;
+
+/// Parsed ingest payload ready for WAL write and bus publishing.
+#[derive(Debug)]
+struct ParsedEvents {
+    /// Service name extracted from events.
+    service: String,
+    /// Parsed event objects for in-memory consumers (hot buffer, streaming).
+    maps: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Serialized ndjson bytes for WAL write.
+    ndjson: Vec<u8>,
+}
 
 /// Maximum service name length.
 const MAX_SERVICE_NAME_LEN: usize = 128;
@@ -81,10 +93,12 @@ pub async fn ingest(
 
     // Parse events from either ndjson or JSON array format.
     // Always produces ndjson bytes for the WAL regardless of input format.
-    let (service, line_count, ndjson) = parse_events(&raw)?;
+    let parsed = parse_events(&raw)?;
+    let event_count = parsed.maps.len();
 
     // Write ndjson to WAL atomically.
-    let service_clone = service.clone();
+    let service_clone = parsed.service.clone();
+    let ndjson = parsed.ndjson;
     let wal_path = tokio::task::spawn_blocking({
         let wal_writer = Arc::clone(wal_writer);
         move || wal_writer.write(&service_clone, &ndjson)
@@ -93,11 +107,27 @@ pub async fn ingest(
     .map_err(|e| ServerError::Internal(format!("WAL write task panicked: {e}")))?
     .map_err(|e| ServerError::Internal(format!("WAL write failed: {e}")))?;
 
+    // Publish to event bus (best-effort — WAL is the durability guarantee).
+    if let Some(bus) = &state.ingest.event_bus {
+        let batch_id: Arc<str> = wal_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .into();
+        let batch = Arc::new(IngestBatch {
+            batch_id,
+            service: Arc::from(parsed.service.as_str()),
+            events: parsed.maps,
+        });
+        let subscribers = bus.publish(batch);
+        tracing::debug!(subscribers, "published batch to event bus");
+    }
+
     tracing::info!(
         event_type = "ingest_complete",
         user = %verified.name,
-        ingest_service = %service,
-        events = line_count,
+        ingest_service = %parsed.service,
+        events = event_count,
         body_bytes,
         wire_bytes,
         compressed,
@@ -106,7 +136,7 @@ pub async fn ingest(
     );
 
     Ok(Json(IngestResponse {
-        accepted: line_count,
+        accepted: event_count,
     }))
 }
 
@@ -130,9 +160,10 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, ServerError> {
 
 /// Parse events from either ndjson or JSON array format.
 ///
-/// Returns `(service_name, event_count, ndjson_bytes)`. The returned bytes
-/// are always ndjson regardless of input format, ready for the WAL.
-fn parse_events(data: &[u8]) -> Result<(String, usize, Vec<u8>), ServerError> {
+/// Returns parsed events with service name, JSON maps, and ndjson bytes.
+/// The ndjson bytes are always ndjson regardless of input format, ready
+/// for the WAL.
+fn parse_events(data: &[u8]) -> Result<ParsedEvents, ServerError> {
     let text = std::str::from_utf8(data)
         .map_err(|e| ServerError::Ingest(format!("body is not valid UTF-8: {e}")))?;
 
@@ -142,14 +173,14 @@ fn parse_events(data: &[u8]) -> Result<(String, usize, Vec<u8>), ServerError> {
     if trimmed.starts_with('[') {
         parse_json_array(trimmed)
     } else {
-        parse_ndjson(trimmed, data)
+        parse_ndjson(trimmed)
     }
 }
 
 /// Parse a JSON array of events (vector's default batch format).
 ///
-/// Converts to ndjson for WAL storage.
-fn parse_json_array(text: &str) -> Result<(String, usize, Vec<u8>), ServerError> {
+/// Converts to ndjson for WAL storage and retains parsed maps for the bus.
+fn parse_json_array(text: &str) -> Result<ParsedEvents, ServerError> {
     let parsed: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| ServerError::Ingest(format!("invalid JSON array: {e}")))?;
 
@@ -162,6 +193,7 @@ fn parse_json_array(text: &str) -> Result<(String, usize, Vec<u8>), ServerError>
     }
 
     let mut service: Option<String> = None;
+    let mut maps = Vec::with_capacity(arr.len());
     let mut ndjson = Vec::new();
 
     for (i, event) in arr.iter().enumerate() {
@@ -181,6 +213,8 @@ fn parse_json_array(text: &str) -> Result<(String, usize, Vec<u8>), ServerError>
             service = Some(svc.to_owned());
         }
 
+        maps.push(obj.clone());
+
         // Write each event as a ndjson line.
         serde_json::to_writer(&mut ndjson, event)
             .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
@@ -188,16 +222,21 @@ fn parse_json_array(text: &str) -> Result<(String, usize, Vec<u8>), ServerError>
     }
 
     let service = service.expect("non-empty array guarantees at least one service");
-    Ok((service, arr.len(), ndjson))
+    Ok(ParsedEvents {
+        service,
+        maps,
+        ndjson,
+    })
 }
 
 /// Parse ndjson (newline-delimited JSON objects).
 ///
-/// If the input is already valid ndjson, returns the original bytes
-/// to avoid a redundant serialize round-trip.
-fn parse_ndjson(text: &str, original: &[u8]) -> Result<(String, usize, Vec<u8>), ServerError> {
+/// Retains parsed maps for the bus and re-serializes to ndjson for
+/// consistent WAL bytes (trimmed, one object per line).
+fn parse_ndjson(text: &str) -> Result<ParsedEvents, ServerError> {
     let mut service: Option<String> = None;
-    let mut count = 0;
+    let mut maps = Vec::new();
+    let mut ndjson = Vec::new();
 
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -224,11 +263,20 @@ fn parse_ndjson(text: &str, original: &[u8]) -> Result<(String, usize, Vec<u8>),
             service = Some(svc.to_owned());
         }
 
-        count += 1;
+        maps.push(obj.clone());
+
+        // Re-serialize for consistent ndjson in WAL.
+        serde_json::to_writer(&mut ndjson, &parsed)
+            .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
+        ndjson.push(b'\n');
     }
 
     let service = service.ok_or_else(|| ServerError::Ingest("no valid events in body".into()))?;
-    Ok((service, count, original.to_vec()))
+    Ok(ParsedEvents {
+        service,
+        maps,
+        ndjson,
+    })
 }
 
 #[cfg(test)]
@@ -240,19 +288,19 @@ mod tests {
         let data = br#"{"service":"nginx","message":"ok"}
 {"service":"nginx","message":"error"}
 "#;
-        let (service, count, _ndjson) = parse_events(data).unwrap();
-        assert_eq!(service, "nginx");
-        assert_eq!(count, 2);
+        let parsed = parse_events(data).unwrap();
+        assert_eq!(parsed.service, "nginx");
+        assert_eq!(parsed.maps.len(), 2);
     }
 
     #[test]
     fn parse_json_array_format() {
         let data = br#"[{"service":"nginx","message":"ok"},{"service":"nginx","message":"error"}]"#;
-        let (service, count, ndjson) = parse_events(data).unwrap();
-        assert_eq!(service, "nginx");
-        assert_eq!(count, 2);
+        let parsed = parse_events(data).unwrap();
+        assert_eq!(parsed.service, "nginx");
+        assert_eq!(parsed.maps.len(), 2);
         // WAL output should be ndjson, not a JSON array.
-        let text = std::str::from_utf8(&ndjson).unwrap();
+        let text = std::str::from_utf8(&parsed.ndjson).unwrap();
         assert!(!text.starts_with('['));
         assert_eq!(text.lines().count(), 2);
     }
@@ -278,9 +326,9 @@ mod tests {
 
 {"service":"test","message":"world"}
 "#;
-        let (service, count, _) = parse_events(data).unwrap();
-        assert_eq!(service, "test");
-        assert_eq!(count, 2);
+        let parsed = parse_events(data).unwrap();
+        assert_eq!(parsed.service, "test");
+        assert_eq!(parsed.maps.len(), 2);
     }
 
     #[test]
@@ -323,9 +371,9 @@ mod tests {
     fn parse_accepts_valid_service_names() {
         for name in ["nginx", "my-app", "app_v2", "host.name.prod", "A1-B2_c3.d"] {
             let data = format!(r#"{{"service":"{name}","message":"ok"}}"#);
-            let (service, count, _) = parse_events(data.as_bytes()).unwrap();
-            assert_eq!(service, name);
-            assert_eq!(count, 1);
+            let parsed = parse_events(data.as_bytes()).unwrap();
+            assert_eq!(parsed.service, name);
+            assert_eq!(parsed.maps.len(), 1);
         }
     }
 
@@ -334,5 +382,39 @@ mod tests {
         let data = br#"[{"service":"../evil","message":"nope"}]"#;
         let err = parse_events(data).unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn parse_ndjson_retains_maps() {
+        let data = br#"{"service":"nginx","message":"hello","status":200}
+{"service":"nginx","message":"world","status":404}
+"#;
+        let parsed = parse_events(data).unwrap();
+        assert_eq!(parsed.maps.len(), 2);
+        assert_eq!(
+            parsed.maps[0].get("message").and_then(|v| v.as_str()),
+            Some("hello")
+        );
+        assert_eq!(
+            parsed.maps[1]
+                .get("status")
+                .and_then(serde_json::Value::as_u64),
+            Some(404)
+        );
+    }
+
+    #[test]
+    fn parse_json_array_retains_maps() {
+        let data = br#"[{"service":"nginx","level":"error"},{"service":"nginx","level":"warn"}]"#;
+        let parsed = parse_events(data).unwrap();
+        assert_eq!(parsed.maps.len(), 2);
+        assert_eq!(
+            parsed.maps[0].get("level").and_then(|v| v.as_str()),
+            Some("error")
+        );
+        assert_eq!(
+            parsed.maps[1].get("level").and_then(|v| v.as_str()),
+            Some("warn")
+        );
     }
 }

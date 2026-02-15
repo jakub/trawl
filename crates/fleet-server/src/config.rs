@@ -186,6 +186,12 @@ pub struct IngestConfig {
     /// Default: true.
     #[serde(default = "default_daily_rollup")]
     pub daily_rollup: bool,
+
+    /// Capacity of the in-memory event bus broadcast channel.
+    /// When the channel is full, slow subscribers miss messages and
+    /// receive a `Lagged` notification. Default: 4096.
+    #[serde(default = "default_event_bus_capacity")]
+    pub event_bus_capacity: usize,
 }
 
 impl Default for IngestConfig {
@@ -197,6 +203,7 @@ impl Default for IngestConfig {
             compaction_interval_secs: default_compaction_interval_secs(),
             internal_telemetry: default_internal_telemetry(),
             daily_rollup: default_daily_rollup(),
+            event_bus_capacity: default_event_bus_capacity(),
         }
     }
 }
@@ -300,6 +307,10 @@ fn default_internal_telemetry() -> bool {
 
 fn default_daily_rollup() -> bool {
     DEFAULT_DAILY_ROLLUP
+}
+
+fn default_event_bus_capacity() -> usize {
+    crate::bus::DEFAULT_EVENT_BUS_CAPACITY
 }
 
 /// Default key audit polling interval (seconds).

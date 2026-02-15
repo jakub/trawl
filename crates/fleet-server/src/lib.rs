@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod bus;
 pub mod config;
 pub mod error;
 pub mod handlers;

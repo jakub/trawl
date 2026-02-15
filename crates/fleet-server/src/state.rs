@@ -11,6 +11,7 @@ use std::time::Instant;
 use fleet_auth::{HistoryStore, KeyStore, SavedQueryStore};
 use fleet_engine::value::SchemaResult;
 
+use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
 use crate::ingest::wal::WalWriter;
 use crate::pool::ExecutorPool;
@@ -71,6 +72,8 @@ pub struct AuthState {
 pub struct IngestState {
     /// WAL writer for ingested events (None if ingest is disabled).
     pub wal_writer: Option<Arc<WalWriter>>,
+    /// Event bus for real-time fanout to subscribers (None if ingest is disabled).
+    pub event_bus: Option<Arc<LocalEventBus>>,
 }
 
 /// HTTP transport config consumed at router/server construction time.
@@ -121,11 +124,12 @@ impl AppState {
         let history = HistoryStore::open(&config.auth.db_path)?;
         let saved = SavedQueryStore::open(&config.auth.db_path)?;
 
-        let wal_writer = if config.ingest.enabled {
+        let (wal_writer, event_bus) = if config.ingest.enabled {
             let writer = WalWriter::new(config.wal_dir());
-            Some(Arc::new(writer))
+            let bus = LocalEventBus::new(config.ingest.event_bus_capacity);
+            (Some(Arc::new(writer)), Some(Arc::new(bus)))
         } else {
-            None
+            (None, None)
         };
 
         let state = Self {
@@ -148,7 +152,10 @@ impl AppState {
                 saved: Arc::new(Mutex::new(saved)),
                 db_path: Arc::new(config.auth.db_path.clone()),
             },
-            ingest: IngestState { wal_writer },
+            ingest: IngestState {
+                wal_writer,
+                event_bus,
+            },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),
         };
