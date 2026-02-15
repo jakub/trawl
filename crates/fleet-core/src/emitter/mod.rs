@@ -74,15 +74,28 @@ impl std::error::Error for EmitError {}
 ///
 /// `source` is the parquet glob path, e.g. `"/data/**/*.parquet"`.
 pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
-    let mut state = EmitterState::new(source)?;
+    let state = EmitterState::new(source)?;
+    emit_from_state(query, state)
+}
 
-    // pre-validate pipeline stages before mutating emission state
+/// Emit SQL that unions the primary parquet source with a hot buffer ndjson file.
+///
+/// Produces a `UNION ALL BY NAME` composite source so that fresh events
+/// in the hot buffer are visible alongside compacted parquet data.
+pub fn emit_with_hot_source(
+    query: &Query,
+    source: &str,
+    hot_source: &str,
+) -> Result<EmittedQuery, EmitError> {
+    let state = EmitterState::with_hot_source(source, hot_source)?;
+    emit_from_state(query, state)
+}
+
+fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuery, EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
 
-    // translate search stage into WHERE clauses
     search::emit_search(&query.search, &mut state);
 
-    // walk pipe stages — validate that pivot is terminal if present
     let stage_count = query.pipeline.len();
     for (i, stage) in query.pipeline.iter().enumerate() {
         if matches!(stage.node, crate::ast::PipeStage::Pivot(_)) && i != stage_count - 1 {
@@ -93,7 +106,6 @@ pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
         pipeline::process_stage(&stage.node, &mut state)?;
     }
 
-    // finalize into SQL
     let sql = state.finalize();
     let params = state.into_params();
 
@@ -709,6 +721,28 @@ mod tests {
     #[test]
     fn error_round_non_int_precision() {
         assert_snapshot!(emit_dsl_err(r#"* | let r = round(duration, "two")"#));
+    }
+
+    // -----------------------------------------------------------------------
+    // list-format source paths
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // composite hot source
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hot_source_emits_union_all() {
+        let query = parser::parse("service:nginx").unwrap();
+        let result = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson").unwrap();
+        assert_snapshot!(format_result(&result));
+    }
+
+    #[test]
+    fn hot_source_rejects_invalid_path() {
+        let query = parser::parse("*").unwrap();
+        let err = emit_with_hot_source(&query, SRC, "/tmp/bad;path.ndjson").unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
     }
 
     // -----------------------------------------------------------------------

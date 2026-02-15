@@ -22,6 +22,7 @@ use fleet_engine::value::{QueryResult, SchemaResult};
 use tokio::sync::Semaphore;
 
 use crate::error::ServerError;
+use crate::hot_buffer::HotBuffer;
 use crate::source::compute_source;
 
 /// Type-erased interrupt callback, keyed by monotonic query ID.
@@ -52,6 +53,8 @@ pub struct ExecutorPool {
     /// is acquired, so `pop()` only fails after a task panic (which is
     /// handled by creating a replacement).
     idle: Arc<Mutex<Vec<Executor>>>,
+    /// Hot buffer for fresh events not yet compacted to parquet.
+    hot_buffer: Option<Arc<HotBuffer>>,
 }
 
 impl std::fmt::Debug for ExecutorPool {
@@ -70,13 +73,68 @@ impl std::fmt::Debug for ExecutorPool {
     }
 }
 
+/// Run a query with panic recovery and optional hot buffer union.
+///
+/// Returns the executor (for pool return) and the query result.
+/// Called inside `spawn_blocking` — all I/O here is synchronous.
+fn run_query_blocking(
+    executor: Executor,
+    dsl: &str,
+    source: &str,
+    hot_buffer: Option<&Arc<HotBuffer>>,
+    max_result_rows: usize,
+) -> (Executor, Result<QueryResult, ServerError>) {
+    // Snapshot hot buffer to a temp ndjson file so fresh events
+    // are visible to this query via UNION ALL BY NAME.
+    let hot_tempfile = hot_buffer.and_then(|hb| hb.snapshot_to_tempfile());
+
+    // catch_unwind ensures the executor is always returned to the
+    // pool even if DuckDB panics (e.g. corrupt parquet file).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(ref hot_file) = hot_tempfile {
+            let hot_path = hot_file
+                .path()
+                .to_str()
+                .expect("temp file path is valid UTF-8");
+            executor
+                .run_query_with_hot(dsl, source, hot_path, max_result_rows)
+                .map_err(ServerError::from)
+        } else {
+            executor
+                .run_query(dsl, source, max_result_rows)
+                .map_err(ServerError::from)
+        }
+    }));
+    // hot_tempfile drops here → temp file auto-deleted
+    let result = match result {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = match payload.downcast_ref::<&str>() {
+                Some(s) => (*s).to_owned(),
+                None => match payload.downcast_ref::<String>() {
+                    Some(s) => s.clone(),
+                    None => "unknown panic".to_owned(),
+                },
+            };
+            Err(ServerError::Internal(format!("query panicked: {msg}")))
+        }
+    };
+
+    (executor, result)
+}
+
 impl ExecutorPool {
     /// Create a pool with the given concurrency limit and base data directory.
     ///
     /// Pre-creates `max_concurrent` executors sharing the same in-memory
     /// `DuckDB` database. Panics if the database cannot be initialized
     /// (fatal at startup — the server cannot function without `DuckDB`).
-    pub fn new(base_dir: String, max_concurrent: usize, max_result_rows: usize) -> Self {
+    pub fn new(
+        base_dir: String,
+        max_concurrent: usize,
+        max_result_rows: usize,
+        hot_buffer: Option<Arc<HotBuffer>>,
+    ) -> Self {
         let root = Executor::new().expect("failed to create DuckDB connection at startup");
         let mut executors = Vec::with_capacity(max_concurrent);
         for _ in 1..max_concurrent {
@@ -99,6 +157,7 @@ impl ExecutorPool {
             next_id: Arc::new(AtomicU64::new(0)),
             active_interrupts: Arc::new(Mutex::new(HashMap::new())),
             idle: Arc::new(Mutex::new(executors)),
+            hot_buffer,
         }
     }
 
@@ -160,6 +219,7 @@ impl ExecutorPool {
         let base_dir = Arc::clone(&self.base_dir);
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let max_result_rows = self.max_result_rows;
+        let hot_buffer = self.hot_buffer.clone();
 
         // Channel for the blocking task to send back its interrupt handle
         // before starting the actual query.
@@ -181,27 +241,14 @@ impl ExecutorPool {
                 source = %source,
                 "computed query source"
             );
-            // catch_unwind ensures the executor is always returned to the
-            // pool even if DuckDB panics (e.g. corrupt parquet file).
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                executor
-                    .run_query(&dsl, &source, max_result_rows)
-                    .map_err(ServerError::from)
-            }));
-            let result = match result {
-                Ok(r) => r,
-                Err(payload) => {
-                    let msg = match payload.downcast_ref::<&str>() {
-                        Some(s) => (*s).to_owned(),
-                        None => match payload.downcast_ref::<String>() {
-                            Some(s) => s.clone(),
-                            None => "unknown panic".to_owned(),
-                        },
-                    };
-                    Err(ServerError::Internal(format!("query panicked: {msg}")))
-                }
-            };
-            (executor, result)
+
+            run_query_blocking(
+                executor,
+                &dsl,
+                &source,
+                hot_buffer.as_ref(),
+                max_result_rows,
+            )
         });
 
         // Receive interrupt handle (may fail if the task panics before sending).
@@ -328,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_rejects_invalid_dsl() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
         // Must start with `|` to trigger a parse error — bare text is valid DSL.
         let result = pool.execute("| | invalid", Duration::from_secs(10)).await;
         assert!(result.is_err());
@@ -336,14 +383,14 @@ mod tests {
 
     #[tokio::test]
     async fn pool_respects_concurrency_limit() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // just verifying it doesn't panic with a single permit
         let _ = pool.execute("service:test", Duration::from_secs(10)).await;
     }
 
     #[tokio::test]
     async fn pool_reuses_executors() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
 
         // Run two sequential queries — both should succeed and the pool
         // should have the same number of idle executors before and after.
@@ -360,19 +407,19 @@ mod tests {
 
     #[test]
     fn fallback_glob_derived_from_base_dir() {
-        let pool = ExecutorPool::new("/var/lib/fleet/data".into(), 1, 100_000);
+        let pool = ExecutorPool::new("/var/lib/fleet/data".into(), 1, 100_000, None);
         assert_eq!(&*pool.fallback_glob, "/var/lib/fleet/data/**/*.parquet");
     }
 
     #[test]
     fn fallback_glob_strips_trailing_slash() {
-        let pool = ExecutorPool::new("/var/lib/fleet/data/".into(), 1, 100_000);
+        let pool = ExecutorPool::new("/var/lib/fleet/data/".into(), 1, 100_000, None);
         assert_eq!(&*pool.fallback_glob, "/var/lib/fleet/data/**/*.parquet");
     }
 
     #[tokio::test]
     async fn pool_timeout_returns_error() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // 1ns timeout — the blocking task can't possibly complete this fast.
         let result = pool.execute("*", Duration::from_nanos(1)).await;
         assert!(
@@ -383,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_executor_reclaimed_after_timeout() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         let idle_before = pool.idle.lock().len();
 
         // Trigger a timeout.
@@ -401,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_clears_interrupts() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // No active queries — cancel_all should be a no-op.
         pool.cancel_all();
         assert!(pool.active_interrupts.lock().is_empty());

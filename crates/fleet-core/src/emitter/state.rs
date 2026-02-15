@@ -105,28 +105,55 @@ fn validate_source_list(source: &str) -> Result<(), super::EmitError> {
     Ok(())
 }
 
+/// Build a `DuckDB` reader expression from a source path.
+///
+/// Handles three source formats:
+/// - List: `['path1', 'path2']` → `read_parquet([...], union_by_name=true)`
+/// - JSON/ndjson file: `*.json` or `*.ndjson` → `read_json_auto('...')`
+/// - Parquet glob: everything else → `read_parquet('...', union_by_name=true)`
+fn build_reader(source: &str) -> Result<String, super::EmitError> {
+    if source.starts_with('[') {
+        validate_source_list(source)?;
+        Ok(format!("read_parquet({source}, union_by_name=true)"))
+    } else {
+        validate_source_path(source)?;
+        let ext = std::path::Path::new(source)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("ndjson") {
+            Ok(format!("read_json_auto('{source}')"))
+        } else {
+            Ok(format!("read_parquet('{source}', union_by_name=true)"))
+        }
+    }
+}
+
 impl EmitterState {
     pub(crate) fn new(source: &str) -> Result<Self, super::EmitError> {
-        // List-format source: ['path1', 'path2', ...] — used for
-        // time-scoped queries that target specific hour-directories.
-        let reader = if source.starts_with('[') {
-            validate_source_list(source)?;
-            format!("read_parquet({source}, union_by_name=true)")
-        } else {
-            validate_source_path(source)?;
-            let ext = std::path::Path::new(source)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("ndjson") {
-                format!("read_json_auto('{source}')")
-            } else {
-                format!("read_parquet('{source}', union_by_name=true)")
-            }
-        };
-        Ok(Self {
+        let reader = build_reader(source)?;
+        Ok(Self::with_source(reader))
+    }
+
+    /// Construct with a composite source that unions parquet with hot buffer ndjson.
+    ///
+    /// The hot source is read via `read_json_auto` with a CAST on the
+    /// timestamp column to match parquet's TIMESTAMP type.
+    pub(crate) fn with_hot_source(primary: &str, hot: &str) -> Result<Self, super::EmitError> {
+        validate_source_path(hot)?;
+        let primary_reader = build_reader(primary)?;
+        let composite = format!(
+            "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
+             SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
+             FROM read_json_auto('{hot}'))"
+        );
+        Ok(Self::with_source(composite))
+    }
+
+    fn with_source(source: String) -> Self {
+        Self {
             step: 0,
-            source: reader,
+            source,
             select: Vec::new(),
             where_clauses: Vec::new(),
             group_by: Vec::new(),
@@ -138,7 +165,7 @@ impl EmitterState {
             pivot: None,
             ctes: Vec::new(),
             params: Vec::new(),
-        })
+        }
     }
 
     /// Push a parameter value and return the `?` placeholder string.

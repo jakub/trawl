@@ -53,6 +53,22 @@ impl Executor {
         self.execute_emitted(&emitted, max_rows)
     }
 
+    /// Full pipeline with hot buffer: parse DSL, emit composite SQL, execute.
+    ///
+    /// The emitted SQL unions the primary parquet source with a hot buffer
+    /// ndjson file via `UNION ALL BY NAME`.
+    pub fn run_query_with_hot(
+        &self,
+        dsl: &str,
+        source: &str,
+        hot_source: &str,
+        max_rows: usize,
+    ) -> Result<QueryResult, EngineError> {
+        let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
+        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
+        self.execute_emitted(&emitted, max_rows)
+    }
+
     /// Execute a pre-emitted query (SQL + params) against `DuckDB`.
     ///
     /// `max_rows` caps the number of result rows to prevent unbounded memory

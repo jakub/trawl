@@ -149,6 +149,7 @@ impl AppState {
                     config.data.base_dir().to_string_lossy().into_owned(),
                     config.server.max_concurrent_queries,
                     config.server.max_result_rows,
+                    hot_buffer.clone(),
                 ),
                 timeout_secs: config.server.timeout_secs,
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
