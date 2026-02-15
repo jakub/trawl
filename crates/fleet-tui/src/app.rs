@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::state::{Focus, Popup, Sidebar, Tab, TabStatus};
+use crate::state::{ChartView, Focus, Popup, Sidebar, Tab, TabStatus};
 use crate::ui;
 
 /// Result of an async query execution.
@@ -262,6 +262,16 @@ impl App {
 
             match query_result.result {
                 Ok(response) => {
+                    // Auto-switch to sparkline view for timechart queries
+                    let is_timechart = response
+                        .result
+                        .columns
+                        .first()
+                        .is_some_and(|col| col.name == "_time");
+                    if is_timechart && tab.chart_view == ChartView::Table {
+                        tab.chart_view = ChartView::Sparkline;
+                    }
+
                     tab.result = Some(response);
                     #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
                     let duration_ms = query_result.duration.as_millis() as u64;
