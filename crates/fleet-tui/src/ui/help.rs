@@ -46,6 +46,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         Line::from(Span::styled("Results", Style::default().fg(Color::Yellow))),
         Line::from(""),
         Line::from("  Tab         - switch to editor"),
+        Line::from("  v           - cycle chart view (table/sparkline/bar/line)"),
         Line::from("  ↑/↓         - scroll rows"),
         Line::from("  ←/→         - scroll columns"),
         Line::from("  PgUp/PgDn   - page up/down"),
