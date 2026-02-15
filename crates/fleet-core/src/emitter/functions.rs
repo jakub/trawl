@@ -1,6 +1,90 @@
 use super::EmitError;
 use super::fields::quote_field;
 
+/// Known function names accepted by the emitter.
+pub(crate) const KNOWN_FUNCTIONS: &[&str] = &[
+    // aggregates
+    "count",
+    "avg",
+    "sum",
+    "min",
+    "max",
+    "dc",
+    "distinct_count",
+    "p50",
+    "p90",
+    "p95",
+    "p99",
+    "first",
+    "last",
+    "values",
+    "list",
+    "median",
+    "stddev",
+    // scalars
+    "lower",
+    "upper",
+    "length",
+    "len",
+    "coalesce",
+    "if",
+    "replace",
+    "substr",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "isnull",
+    "isnotnull",
+    "abs",
+    "ceil",
+    "ceiling",
+    "floor",
+    "round",
+    "now",
+    "typeof",
+];
+
+/// Validate that a function name is known and argument count is correct.
+///
+/// Single source of truth for arity — used by both pre-emission
+/// validation (`validate.rs`) and translation (`translate_function`).
+pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), EmitError> {
+    if !KNOWN_FUNCTIONS.contains(&name) {
+        return Err(EmitError::UnknownFunction {
+            name: name.to_string(),
+        });
+    }
+
+    let (min, max) = function_arity(name);
+    if argc < min || max.is_some_and(|m| argc > m) {
+        let message = match (min, max) {
+            (0, Some(0)) => format!("{name}() requires exactly 0 argument(s)"),
+            (1, Some(1)) => format!("{name}() requires exactly one argument"),
+            (n, Some(m)) if n == m => format!("{name}() requires exactly {n} argument(s)"),
+            (min, Some(max)) => format!("{name}() requires {min} to {max} arguments"),
+            (1, None) => format!("{name}() requires at least one argument"),
+            (min, None) => format!("{name}() requires at least {min} argument(s)"),
+        };
+        return Err(EmitError::InvalidAggregation { message });
+    }
+
+    Ok(())
+}
+
+/// Return `(min_args, max_args)` for a function. `None` max means unbounded.
+fn function_arity(name: &str) -> (usize, Option<usize>) {
+    match name {
+        "count" => (0, Some(1)),
+        "coalesce" => (1, None),
+        "if" | "replace" => (3, Some(3)),
+        "substr" => (2, Some(3)),
+        "round" => (1, Some(2)),
+        "now" => (0, Some(0)),
+        // everything else: exactly 1
+        _ => (1, Some(1)),
+    }
+}
+
 /// Translate a DSL function call to `DuckDB` SQL.
 pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, EmitError> {
     match name {
