@@ -25,7 +25,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
 
 /// Render confirmation dialog for deleting a saved query.
 fn render_confirm_delete(frame: &mut Frame<'_>, name: &str) {
-    let area = centered_rect(60, 30, frame.area());
+    let area = centered_rect(60, 35, frame.area());
 
     frame.render_widget(Clear, area);
 
@@ -35,6 +35,7 @@ fn render_confirm_delete(frame: &mut Frame<'_>, name: &str) {
         .style(Style::default().bg(Color::Black).fg(Color::Red));
 
     let text = vec![
+        Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "Delete saved query?",
@@ -50,21 +51,27 @@ fn render_confirm_delete(frame: &mut Frame<'_>, name: &str) {
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
-            "Press Y or Enter to confirm, any other key to cancel",
+            "Press Y or Enter to confirm",
             Style::default().fg(Color::DarkGray),
         )),
+        Line::from(Span::styled(
+            "Any other key to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
     ];
 
     let paragraph = Paragraph::new(text)
         .block(block)
-        .alignment(Alignment::Center);
+        .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
 }
 
 /// Render text input dialog for saving a query.
 fn render_save_query(frame: &mut Frame<'_>, input: &str) {
-    let area = centered_rect(60, 30, frame.area());
+    let area = centered_rect(60, 35, frame.area());
 
     frame.render_widget(Clear, area);
 
@@ -74,6 +81,7 @@ fn render_save_query(frame: &mut Frame<'_>, input: &str) {
         .style(Style::default().bg(Color::Black).fg(Color::Cyan));
 
     let text = vec![
+        Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "Enter a name for this query:",
@@ -89,14 +97,20 @@ fn render_save_query(frame: &mut Frame<'_>, input: &str) {
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
-            "Press Enter to save, Esc to cancel",
+            "Press Enter to save",
             Style::default().fg(Color::DarkGray),
         )),
+        Line::from(Span::styled(
+            "Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
     ];
 
     let paragraph = Paragraph::new(text)
         .block(block)
-        .alignment(Alignment::Center);
+        .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
 }

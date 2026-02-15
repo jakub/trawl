@@ -1,8 +1,107 @@
-[2m2026-02-15T00:06:00.716320Z[0m [34mDEBUG[0m [2mfleet_tui::config[0m[2m:[0m config file not found at /Users/jakub/.config/fleet/config.toml, using defaults
-[2m2026-02-15T00:06:00.718218Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m fetching schema, history, and saved queries
-[2m2026-02-15T00:06:02.097758Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m schema fetched: 60 columns
-[2m2026-02-15T00:06:02.097801Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m history fetched: 27 entries
-[2m2026-02-15T00:06:02.097808Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved queries fetched: 1 entries
-[2m2026-02-15T00:06:03.022790Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 10
-[2m2026-02-15T00:06:04.049885Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 20
-[2m2026-02-15T00:06:05.076857Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 30
+[2m2026-02-15T00:07:13.067415Z[0m [34mDEBUG[0m [2mfleet_tui::config[0m[2m:[0m config file not found at /Users/jakub/.config/fleet/config.toml, using defaults
+[2m2026-02-15T00:07:13.069342Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m fetching schema, history, and saved queries
+[2m2026-02-15T00:07:16.942787Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m schema fetched: 60 columns
+[2m2026-02-15T00:07:16.942827Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m history fetched: 27 entries
+[2m2026-02-15T00:07:16.942837Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved queries fetched: 1 entries
+[2m2026-02-15T00:07:17.893691Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 10
+[2m2026-02-15T00:07:18.935799Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 20
+[2m2026-02-15T00:07:19.943413Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 30
+[2m2026-02-15T00:07:20.974257Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 40
+[2m2026-02-15T00:07:22.008675Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 50
+[2m2026-02-15T00:07:23.037999Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 60
+[2m2026-02-15T00:07:24.083207Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 70
+[2m2026-02-15T00:07:25.115062Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 80
+[2m2026-02-15T00:07:26.147193Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 90
+[2m2026-02-15T00:07:27.189938Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 100
+[2m2026-02-15T00:07:28.222224Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 110
+[2m2026-02-15T00:07:29.253499Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 120
+[2m2026-02-15T00:07:30.284438Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 130
+[2m2026-02-15T00:07:31.317817Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 140
+[2m2026-02-15T00:07:32.356524Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 150
+[2m2026-02-15T00:07:33.391665Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 160
+[2m2026-02-15T00:07:34.422576Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 170
+[2m2026-02-15T00:07:35.453595Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 180
+[2m2026-02-15T00:07:36.484151Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 190
+[2m2026-02-15T00:07:37.544991Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 200
+[2m2026-02-15T00:07:38.591396Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 210
+[2m2026-02-15T00:07:39.623114Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 220
+[2m2026-02-15T00:07:40.656224Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 230
+[2m2026-02-15T00:07:41.688537Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 240
+[2m2026-02-15T00:07:42.734825Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 250
+[2m2026-02-15T00:07:43.768012Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 260
+[2m2026-02-15T00:07:44.799453Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 270
+[2m2026-02-15T00:07:45.832217Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 280
+[2m2026-02-15T00:07:46.868505Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 290
+[2m2026-02-15T00:07:47.936445Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 300
+[2m2026-02-15T00:07:48.998634Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 310
+[2m2026-02-15T00:07:50.031493Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 320
+[2m2026-02-15T00:07:51.061104Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 330
+[2m2026-02-15T00:07:52.095183Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 340
+[2m2026-02-15T00:07:53.150308Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 350
+[2m2026-02-15T00:07:54.220429Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 360
+[2m2026-02-15T00:07:55.252475Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 370
+[2m2026-02-15T00:07:56.284891Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 380
+[2m2026-02-15T00:07:57.315887Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 390
+[2m2026-02-15T00:07:58.369859Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 400
+[2m2026-02-15T00:07:59.406312Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 410
+[2m2026-02-15T00:08:00.439833Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 420
+[2m2026-02-15T00:08:01.471644Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 430
+[2m2026-02-15T00:08:02.505121Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 440
+[2m2026-02-15T00:08:03.539688Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 450
+[2m2026-02-15T00:08:04.572258Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 460
+[2m2026-02-15T00:08:05.605376Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 470
+[2m2026-02-15T00:08:06.638846Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 480
+[2m2026-02-15T00:08:07.681403Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 490
+[2m2026-02-15T00:08:08.728067Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 500
+[2m2026-02-15T00:08:09.759909Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 510
+[2m2026-02-15T00:08:10.718524Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 520
+[2m2026-02-15T00:08:11.748564Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 530
+[2m2026-02-15T00:08:11.788181Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m deleted saved query 'most frequent fleetd events'
+[2m2026-02-15T00:08:11.851767Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved query deleted: most frequent fleetd events
+[2m2026-02-15T00:08:12.145862Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m refreshed saved queries cache: 0 queries
+[2m2026-02-15T00:08:12.160715Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m updating saved queries cache with 0 queries
+[2m2026-02-15T00:08:12.779501Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 540
+[2m2026-02-15T00:08:13.810509Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 550
+[2m2026-02-15T00:08:14.840841Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 560
+[2m2026-02-15T00:08:15.828203Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 570
+[2m2026-02-15T00:08:16.796282Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 580
+[2m2026-02-15T00:08:17.840648Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 590
+[2m2026-02-15T00:08:18.866103Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 600
+[2m2026-02-15T00:08:19.894872Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 610
+[2m2026-02-15T00:08:20.923292Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 620
+[2m2026-02-15T00:08:21.950533Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 630
+[2m2026-02-15T00:08:22.936309Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 640
+[2m2026-02-15T00:08:23.965137Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 650
+[2m2026-02-15T00:08:24.736605Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 660
+[2m2026-02-15T00:08:25.769313Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 670
+[2m2026-02-15T00:08:26.726455Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 680
+[2m2026-02-15T00:08:27.753363Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 690
+[2m2026-02-15T00:08:28.172789Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved query 'test 2'
+[2m2026-02-15T00:08:28.266907Z[0m [32m INFO[0m [2mfleet_tui::app[0m[2m:[0m saved query created: test 2
+[2m2026-02-15T00:08:28.564625Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m refreshed saved queries cache: 1 queries
+[2m2026-02-15T00:08:28.577111Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m updating saved queries cache with 1 queries
+[2m2026-02-15T00:08:28.783593Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 700
+[2m2026-02-15T00:08:29.814793Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 710
+[2m2026-02-15T00:08:30.769863Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 720
+[2m2026-02-15T00:08:31.801480Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 730
+[2m2026-02-15T00:08:32.833835Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 740
+[2m2026-02-15T00:08:33.801257Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 750
+[2m2026-02-15T00:08:34.827765Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 760
+[2m2026-02-15T00:08:35.863689Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 770
+[2m2026-02-15T00:08:36.890196Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 780
+[2m2026-02-15T00:08:37.916359Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 790
+[2m2026-02-15T00:08:38.942973Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 800
+[2m2026-02-15T00:08:39.970367Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 810
+[2m2026-02-15T00:08:40.997382Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 820
+[2m2026-02-15T00:08:42.023531Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 830
+[2m2026-02-15T00:08:43.050262Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 840
+[2m2026-02-15T00:08:44.077694Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 850
+[2m2026-02-15T00:08:45.108551Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 860
+[2m2026-02-15T00:08:46.151845Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 870
+[2m2026-02-15T00:08:47.176700Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 880
+[2m2026-02-15T00:08:48.201508Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 890
+[2m2026-02-15T00:08:49.227300Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 900
+[2m2026-02-15T00:08:50.253439Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 910
+[2m2026-02-15T00:08:51.280150Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 920
+[2m2026-02-15T00:08:52.305977Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 930
+[2m2026-02-15T00:08:53.331803Z[0m [34mDEBUG[0m [2mfleet_tui::app[0m[2m:[0m event loop iteration 940
