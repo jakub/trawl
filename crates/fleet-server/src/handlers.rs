@@ -721,6 +721,7 @@ fn value_to_string(value: &Value) -> String {
         Value::Integer(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
+        Value::Array(_) => value.to_string(),
     }
 }
 

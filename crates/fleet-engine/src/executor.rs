@@ -271,11 +271,35 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> Value {
         ValueRef::Timestamp(unit, val) => Value::String(format_timestamp(unit, val)),
         ValueRef::Date32(days) => Value::String(format_date(days)),
         ValueRef::Time64(unit, val) => Value::String(format_time(unit, val)),
+        // list values from aggregations like LIST(DISTINCT col)
+        ValueRef::List(..) => row
+            .get::<_, duckdb::types::Value>(idx)
+            .map(convert_duckdb_value)
+            .unwrap_or(Value::Null),
         // everything else: try string extraction, fall back to null
         _ => row
             .get::<_, String>(idx)
             .map(Value::String)
             .unwrap_or(Value::Null),
+    }
+}
+
+/// Recursively convert a `duckdb::types::Value` to our `Value`.
+fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
+    match v {
+        duckdb::types::Value::Null => Value::Null,
+        duckdb::types::Value::Boolean(b) => Value::Boolean(b),
+        duckdb::types::Value::TinyInt(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::SmallInt(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::Int(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::BigInt(i) => Value::Integer(i),
+        duckdb::types::Value::Float(f) => Value::Float(f64::from(f)),
+        duckdb::types::Value::Double(f) => Value::Float(f),
+        duckdb::types::Value::Text(s) => Value::String(s),
+        duckdb::types::Value::List(elements) => {
+            Value::Array(elements.into_iter().map(convert_duckdb_value).collect())
+        }
+        other => Value::String(format!("{other:?}")),
     }
 }
 

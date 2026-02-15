@@ -26,6 +26,7 @@ pub enum Value {
     Integer(i64),
     Float(f64),
     String(String),
+    Array(Vec<Value>),
 }
 
 impl Serialize for Value {
@@ -36,6 +37,14 @@ impl Serialize for Value {
             Self::Integer(i) => serializer.serialize_i64(*i),
             Self::Float(f) => serializer.serialize_f64(*f),
             Self::String(s) => serializer.serialize_str(s),
+            Self::Array(arr) => {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(arr.len()))?;
+                for val in arr {
+                    seq.serialize_element(val)?;
+                }
+                seq.end()
+            }
         }
     }
 }
@@ -121,11 +130,12 @@ impl<'de> Visitor<'de> for ValueVisitor {
         Ok(Value::String(v))
     }
 
-    // Arrays and objects are stringified — matches previous json_to_value behavior.
-    fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Value, A::Error> {
-        let json: serde_json::Value =
-            Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
-        Ok(Value::String(json.to_string()))
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(val) = seq.next_element::<Value>()? {
+            values.push(val);
+        }
+        Ok(Value::Array(values))
     }
 
     fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Value, A::Error> {
@@ -143,6 +153,10 @@ impl fmt::Display for Value {
             Self::Integer(i) => write!(f, "{i}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::String(s) => write!(f, "{s}"),
+            Self::Array(arr) => {
+                let items: Vec<std::string::String> = arr.iter().map(ToString::to_string).collect();
+                write!(f, "[{}]", items.join(", "))
+            }
         }
     }
 }

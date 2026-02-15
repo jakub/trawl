@@ -186,6 +186,10 @@ fn csv_escape_value(val: &Value) -> String {
         // full precision for data fidelity (TUI display uses 2dp for readability)
         Value::Float(f) => f.to_string(),
         Value::String(s) => csv_escape_string(s),
+        Value::Array(arr) => {
+            let json = serde_json::to_string(arr).unwrap_or_default();
+            csv_escape_string(&json)
+        }
     }
 }
 

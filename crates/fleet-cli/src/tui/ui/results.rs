@@ -405,6 +405,7 @@ fn value_to_string(value: &Value) -> String {
         // display-friendly: 2dp for readability (CSV export preserves full precision)
         Value::Float(f) => format!("{f:.2}"),
         Value::String(s) => s.clone(),
+        Value::Array(_) => value.to_string(),
     }
 }
 
