@@ -42,6 +42,33 @@ pub enum Popup {
     },
 }
 
+/// Chart visualization mode for results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Variants used when chart rendering is implemented
+pub enum ChartView {
+    /// Tabular view (default).
+    Table,
+    /// Sparkline view (compact ascii-art).
+    Sparkline,
+    /// Bar chart view (categorical).
+    BarChart,
+    /// Line chart view (continuous).
+    LineChart,
+}
+
+impl ChartView {
+    /// Cycle to the next view mode.
+    #[allow(dead_code)] // Used when 'v' keybinding is implemented
+    pub fn next(self) -> Self {
+        match self {
+            Self::Table => Self::Sparkline,
+            Self::Sparkline => Self::BarChart,
+            Self::BarChart => Self::LineChart,
+            Self::LineChart => Self::Table,
+        }
+    }
+}
+
 /// Status of a tab's current query.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used when query execution is implemented
@@ -213,6 +240,8 @@ pub struct Tab {
     pub horizontal_scroll_offset: usize,
     /// Current query status.
     pub status: TabStatus,
+    /// Chart visualization mode.
+    pub chart_view: ChartView,
 }
 
 impl Tab {
@@ -225,6 +254,7 @@ impl Tab {
             scroll_offset: 0,
             horizontal_scroll_offset: 0,
             status: TabStatus::Idle,
+            chart_view: ChartView::Table,
         }
     }
 
@@ -235,5 +265,6 @@ impl Tab {
         self.scroll_offset = 0;
         self.horizontal_scroll_offset = 0;
         self.status = TabStatus::Idle;
+        self.chart_view = ChartView::Table;
     }
 }
