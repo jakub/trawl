@@ -245,7 +245,7 @@ async fn health_returns_ok() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, "unused").unwrap();
     let health = client.health().await.unwrap();
-    assert_eq!(health.status, "ok");
+    assert_eq!(health.status, fleet_api::HealthStatus::Ok);
 }
 
 #[tokio::test]

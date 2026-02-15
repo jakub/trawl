@@ -11,8 +11,10 @@ pub mod types;
 pub use client::HttpClient;
 pub use error::ClientError;
 pub use types::{
-    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, DeleteSavedResponse,
-    FieldValuesResponse, HealthResponse, HistoryEntryResponse, HistoryResponse, IngestResponse,
-    ListSavedResponse, PaginationMeta, QueriesResponse, QueryResponse, SavedQueryResponse,
-    SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent, ValidationResponse,
+    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,
+    DeleteSavedResponse, ErrorResponse, ExportFormat, ExportRequest, FieldValuesResponse,
+    HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse, IngestResponse,
+    ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus,
+    SavedQueryResponse, SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent,
+    UpdateSavedRequest, ValidationResponse,
 };

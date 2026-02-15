@@ -94,7 +94,7 @@ impl IntoResponse for ServerError {
             }
         };
 
-        let body = serde_json::json!({ "error": message });
+        let body = fleet_api::ErrorResponse { error: message };
         (status, axum::Json(body)).into_response()
     }
 }

@@ -13,8 +13,8 @@ use crate::types::{
     SchemaResponse, StatsResponse, ValidationResponse,
 };
 use crate::types::{
-    CreateSavedRequest, ErrorResponse, ExportRequest, QueryRequestPaginated, StreamEvent,
-    UpdateSavedRequest, ValidateRequest,
+    CreateSavedRequestRef, ErrorResponse, ExportRequestRef, StreamEvent, UpdateSavedRequestRef,
+    ValidateRequest,
 };
 
 /// HTTP client for the fleet daemon API.
@@ -104,7 +104,7 @@ impl HttpClient {
         offset: Option<usize>,
     ) -> Result<QueryResponse, ClientError> {
         let url = self.endpoint("/api/v1/query");
-        let body = QueryRequestPaginated {
+        let body = fleet_api::QueryRequest {
             query: dsl.to_owned(),
             limit,
             offset,
@@ -193,7 +193,7 @@ impl HttpClient {
         query: &str,
     ) -> Result<SavedQueryResponse, ClientError> {
         let url = self.endpoint("/api/v1/saved");
-        let body = CreateSavedRequest { name, query };
+        let body = CreateSavedRequestRef { name, query };
         let req = self.client.post(&url).json(&body);
         self.send_authenticated(req).await
     }
@@ -205,7 +205,7 @@ impl HttpClient {
         query: &str,
     ) -> Result<SavedQueryResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{id}"));
-        let body = UpdateSavedRequest { query };
+        let body = UpdateSavedRequestRef { query };
         let req = self.client.put(&url).json(&body);
         self.send_authenticated(req).await
     }
@@ -274,16 +274,16 @@ impl HttpClient {
     pub async fn export(
         &self,
         query: &str,
-        format: &str,
+        format: fleet_api::ExportFormat,
         limit: Option<usize>,
     ) -> Result<Vec<u8>, ClientError> {
         let url = self.endpoint("/api/v1/export");
-        let body = ExportRequest { query, limit };
+        let body = ExportRequestRef { query, limit };
 
         let resp = self
             .client
             .post(&url)
-            .query(&[("format", format)])
+            .query(&[("format", format.to_string())])
             .header("Authorization", format!("Bearer {}", self.token.as_str()))
             .json(&body)
             .send()
@@ -446,8 +446,6 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::QueryRequestPaginated;
-
     // ── endpoint URL construction ───────────────────────────────────────
 
     #[test]
@@ -492,11 +490,11 @@ mod tests {
         assert!(!debug.contains("flt_"));
     }
 
-    // ── serde: QueryRequestPaginated ────────────────────────────────────
+    // ── serde: QueryRequest ────────────────────────────────────────────
 
     #[test]
-    fn query_request_paginated_serializes() {
-        let req = QueryRequestPaginated {
+    fn query_request_serializes() {
+        let req = fleet_api::QueryRequest {
             query: "service:nginx | stats count()".to_string(),
             limit: Some(10),
             offset: Some(5),
@@ -508,8 +506,8 @@ mod tests {
     }
 
     #[test]
-    fn query_request_paginated_omits_none() {
-        let req = QueryRequestPaginated {
+    fn query_request_omits_none() {
+        let req = fleet_api::QueryRequest {
             query: "service:nginx".to_string(),
             limit: None,
             offset: None,
@@ -526,7 +524,7 @@ mod tests {
     fn health_response_deserializes() {
         let json = r#"{"status": "ok"}"#;
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.status, fleet_api::HealthStatus::Ok);
     }
 
     // ── serde: SchemaResponse ───────────────────────────────────────────

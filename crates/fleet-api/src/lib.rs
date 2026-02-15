@@ -6,14 +6,127 @@
 
 use fleet_engine::value::{QueryResult, SchemaColumn};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+// -- common enums ------------------------------------------------------------
+
+/// Health status reported by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthStatus {
+    /// Service is healthy.
+    Ok,
+}
+
+/// Outcome status of a completed query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryStatus {
+    /// Query completed successfully.
+    Success,
+    /// Query failed with an error.
+    Error,
+    /// Query exceeded the configured timeout.
+    Timeout,
+}
+
+impl fmt::Display for QueryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Success => f.write_str("success"),
+            Self::Error => f.write_str("error"),
+            Self::Timeout => f.write_str("timeout"),
+        }
+    }
+}
+
+impl std::str::FromStr for QueryStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "success" => Ok(Self::Success),
+            "error" => Ok(Self::Error),
+            "timeout" => Ok(Self::Timeout),
+            other => Err(format!("unknown query status: {other}")),
+        }
+    }
+}
+
+/// Export output format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    /// RFC 4180 CSV.
+    Csv,
+}
+
+impl fmt::Display for ExportFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Csv => f.write_str("csv"),
+        }
+    }
+}
+
+// -- error -------------------------------------------------------------------
+
+/// Standard error response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    /// Human-readable error message.
+    pub error: String,
+}
+
+// -- request types -----------------------------------------------------------
+
+/// Request body for query execution (`POST /api/v1/query`) and
+/// validation (`POST /api/v1/validate`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryRequest {
+    /// The fleet DSL query string.
+    pub query: String,
+    /// Optional limit for pagination (defaults to server's `max_result_rows`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Optional offset for pagination (defaults to 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+}
+
+/// Request body for creating a saved query (`POST /api/v1/saved`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSavedRequest {
+    /// Display name for the saved query.
+    pub name: String,
+    /// The fleet DSL query string.
+    pub query: String,
+}
+
+/// Request body for updating a saved query (`PUT /api/v1/saved/{id}`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSavedRequest {
+    /// The new fleet DSL query string.
+    pub query: String,
+}
+
+/// Request body for exporting query results (`POST /api/v1/export`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportRequest {
+    /// The fleet DSL query string.
+    pub query: String,
+    /// Optional row limit (defaults to server's `max_export_rows`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
 
 // -- health ------------------------------------------------------------------
 
 /// Health check response from the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
-    /// Status string, typically `"ok"`.
-    pub status: String,
+    /// Daemon health status.
+    pub status: HealthStatus,
 }
 
 // -- schema ------------------------------------------------------------------
@@ -190,8 +303,8 @@ pub struct HistoryEntryResponse {
     pub duration_ms: u64,
     /// Number of rows returned.
     pub row_count: usize,
-    /// Query status ("success", "error", "timeout").
-    pub status: String,
+    /// Query outcome.
+    pub status: QueryStatus,
 }
 
 // -- saved queries -----------------------------------------------------------
@@ -232,4 +345,116 @@ pub struct DeleteSavedResponse {
 pub struct IngestResponse {
     /// Number of records accepted.
     pub accepted: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip a type through JSON serialization.
+    fn roundtrip<T: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug>(value: &T) -> T {
+        let json = serde_json::to_string(value).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn query_status_roundtrip() {
+        for status in [
+            QueryStatus::Success,
+            QueryStatus::Error,
+            QueryStatus::Timeout,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: QueryStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, parsed);
+        }
+    }
+
+    #[test]
+    fn query_status_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&QueryStatus::Success).unwrap(),
+            "\"success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&QueryStatus::Error).unwrap(),
+            "\"error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&QueryStatus::Timeout).unwrap(),
+            "\"timeout\""
+        );
+    }
+
+    #[test]
+    fn health_status_roundtrip() {
+        let json = serde_json::to_string(&HealthStatus::Ok).unwrap();
+        assert_eq!(json, "\"ok\"");
+        let parsed: HealthStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, HealthStatus::Ok);
+    }
+
+    #[test]
+    fn export_format_display() {
+        assert_eq!(ExportFormat::Csv.to_string(), "csv");
+    }
+
+    #[test]
+    fn error_response_roundtrip() {
+        let resp = ErrorResponse {
+            error: "something broke".into(),
+        };
+        let rt = roundtrip(&resp);
+        assert_eq!(rt.error, "something broke");
+    }
+
+    #[test]
+    fn query_request_roundtrip() {
+        let req = QueryRequest {
+            query: "level:error | stats count()".into(),
+            limit: Some(100),
+            offset: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // skip_serializing_if means offset should be absent
+        assert!(!json.contains("offset"));
+        let rt: QueryRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.query, req.query);
+        assert_eq!(rt.limit, Some(100));
+        assert_eq!(rt.offset, None);
+    }
+
+    #[test]
+    fn query_request_defaults() {
+        let json = r#"{"query":"*"}"#;
+        let req: QueryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "*");
+        assert_eq!(req.limit, None);
+        assert_eq!(req.offset, None);
+    }
+
+    #[test]
+    fn history_entry_uses_query_status() {
+        let entry = HistoryEntryResponse {
+            id: 1,
+            query: "* | head 5".into(),
+            executed_at: "2026-01-01T00:00:00Z".into(),
+            duration_ms: 42,
+            row_count: 5,
+            status: QueryStatus::Success,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"success\""));
+        let rt: HistoryEntryResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.status, QueryStatus::Success);
+    }
+
+    #[test]
+    fn health_response_format() {
+        let resp = HealthResponse {
+            status: HealthStatus::Ok,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\""));
+    }
 }

@@ -11,5 +11,8 @@ publish.workspace = true
 fleet-engine = { workspace = true }
 serde = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

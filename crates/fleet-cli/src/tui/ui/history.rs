@@ -35,11 +35,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             .iter()
             .map(|entry| {
                 // Format: "[timestamp] query (duration, rows, status)"
-                let status_style = match entry.status.as_str() {
-                    "success" => Style::default().fg(Color::Green),
-                    "error" => Style::default().fg(Color::Red),
-                    "timeout" => Style::default().fg(Color::Yellow),
-                    _ => Style::default().fg(Color::Gray),
+                let status_style = match entry.status {
+                    fleet_client::QueryStatus::Success => Style::default().fg(Color::Green),
+                    fleet_client::QueryStatus::Error => Style::default().fg(Color::Red),
+                    fleet_client::QueryStatus::Timeout => Style::default().fg(Color::Yellow),
                 };
 
                 let line = Line::from(vec![

@@ -1,25 +1,12 @@
 //! Wire types for the fleet daemon HTTP API.
 //!
-//! Response types are re-exported from `fleet-api`. Internal request
-//! types used only by the client are defined here.
+//! Response types and shared request/enum types are re-exported from
+//! `fleet-api`. Internal request types used only by the client
+//! (borrowing for zero-copy serialization) are defined here.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-// -- internal types (client-only) --------------------------------------------
-
-#[derive(Deserialize)]
-pub(crate) struct ErrorResponse {
-    pub error: String,
-}
-
-#[derive(Serialize)]
-pub(crate) struct QueryRequestPaginated {
-    pub query: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<usize>,
-}
+// -- internal types (client-only, borrow for zero-copy serialization) --------
 
 #[derive(Serialize)]
 pub(crate) struct ValidateRequest<'a> {
@@ -27,18 +14,18 @@ pub(crate) struct ValidateRequest<'a> {
 }
 
 #[derive(Serialize)]
-pub(crate) struct CreateSavedRequest<'a> {
+pub(crate) struct CreateSavedRequestRef<'a> {
     pub name: &'a str,
     pub query: &'a str,
 }
 
 #[derive(Serialize)]
-pub(crate) struct UpdateSavedRequest<'a> {
+pub(crate) struct UpdateSavedRequestRef<'a> {
     pub query: &'a str,
 }
 
 #[derive(Serialize)]
-pub(crate) struct ExportRequest<'a> {
+pub(crate) struct ExportRequestRef<'a> {
     pub query: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
@@ -58,8 +45,10 @@ pub enum StreamEvent {
 // -- re-exports from fleet-api -----------------------------------------------
 
 pub use fleet_api::{
-    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, DeleteSavedResponse,
-    FieldValuesResponse, HealthResponse, HistoryEntryResponse, HistoryResponse, IngestResponse,
-    ListSavedResponse, PaginationMeta, QueriesResponse, QueryResponse, SavedQueryResponse,
-    SchemaColumnResponse, SchemaResponse, StatsResponse, ValidationResponse,
+    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,
+    DeleteSavedResponse, ErrorResponse, ExportFormat, ExportRequest, FieldValuesResponse,
+    HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse, IngestResponse,
+    ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus,
+    SavedQueryResponse, SchemaColumnResponse, SchemaResponse, StatsResponse, UpdateSavedRequest,
+    ValidationResponse,
 };

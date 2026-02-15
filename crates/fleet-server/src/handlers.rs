@@ -6,9 +6,10 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{Extension, Json};
 use fleet_api::{
-    CancelResponse, DeleteSavedResponse, FieldValuesResponse, HealthResponse, HistoryEntryResponse,
-    HistoryResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryResponse,
-    SavedQueryResponse, SchemaColumnResponse, SchemaResponse, StatsResponse, ValidationResponse,
+    CancelResponse, CreateSavedRequest, DeleteSavedResponse, ExportRequest, FieldValuesResponse,
+    HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse, ListSavedResponse,
+    PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, SavedQueryResponse,
+    SchemaColumnResponse, SchemaResponse, StatsResponse, UpdateSavedRequest, ValidationResponse,
 };
 use fleet_auth::HistoryEntry;
 use fleet_auth::SavedQuery;
@@ -21,21 +22,6 @@ use std::time::Duration;
 
 use crate::error::ServerError;
 use crate::state::{AppState, CachedFieldValues, CachedSchema};
-
-// -- request types -----------------------------------------------------------
-
-/// Query request body.
-#[derive(Debug, Deserialize)]
-pub struct QueryRequest {
-    /// The fleet DSL query string.
-    pub query: String,
-    /// Optional limit for pagination (defaults to `max_result_rows`).
-    #[serde(default)]
-    pub limit: Option<usize>,
-    /// Optional offset for pagination (defaults to 0).
-    #[serde(default)]
-    pub offset: Option<usize>,
-}
 
 // -- handlers ----------------------------------------------------------------
 
@@ -188,7 +174,7 @@ pub async fn query(
 #[allow(clippy::unused_async)] // axum requires async handlers
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
-        status: "ok".into(),
+        status: HealthStatus::Ok,
     })
 }
 
@@ -484,7 +470,10 @@ fn history_entry_response(entry: HistoryEntry) -> HistoryEntryResponse {
         executed_at: entry.executed_at,
         duration_ms: entry.duration_ms,
         row_count: entry.row_count,
-        status: entry.status,
+        status: entry
+            .status
+            .parse::<QueryStatus>()
+            .unwrap_or(QueryStatus::Error),
     }
 }
 
@@ -613,19 +602,6 @@ pub async fn delete_saved(
     Ok(Json(DeleteSavedResponse { deleted: true }))
 }
 
-/// Request body for creating a saved query.
-#[derive(Debug, Deserialize)]
-pub struct CreateSavedRequest {
-    pub name: String,
-    pub query: String,
-}
-
-/// Request body for updating a saved query.
-#[derive(Debug, Deserialize)]
-pub struct UpdateSavedRequest {
-    pub query: String,
-}
-
 /// Convert a [`SavedQuery`] into a [`SavedQueryResponse`].
 fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
     SavedQueryResponse {
@@ -651,12 +627,7 @@ pub async fn export(
     }
 
     // Validate format (only CSV for now).
-    let format = params.format.as_deref().unwrap_or("csv");
-    if format != "csv" {
-        return Err(ServerError::BadRequest(
-            "only CSV format is supported".into(),
-        ));
-    }
+    let _format = params.format.unwrap_or(fleet_api::ExportFormat::Csv);
 
     // Get max_export_rows from state.
     let max_export_rows = state.query.max_export_rows;
@@ -696,15 +667,7 @@ pub async fn export(
 /// Query parameters for the export endpoint.
 #[derive(Debug, Deserialize)]
 pub struct ExportParams {
-    pub format: Option<String>,
-}
-
-/// Request body for the export endpoint.
-#[derive(Debug, Deserialize)]
-pub struct ExportRequest {
-    pub query: String,
-    #[serde(default)]
-    pub limit: Option<usize>,
+    pub format: Option<fleet_api::ExportFormat>,
 }
 
 /// Generate RFC 4180-compliant CSV from query results.
