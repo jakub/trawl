@@ -234,7 +234,6 @@ fn render_sparkline(
     // Single series: render one large sparkline
     if series.len() == 1 {
         let (label, values) = &series[0];
-        let max_val = values.iter().max().copied().unwrap_or(100);
 
         let title = if let Some((ref start, ref end, ref span)) = time_info {
             format!(" {label} • {start} to {end} • span: {span} ")
@@ -261,8 +260,12 @@ fn render_sparkline(
             height: inner.height.saturating_sub(1), // Reserve 1 row for x-axis
         };
 
+        // Downsample data to fit available width (preserves peaks via max-per-bucket)
+        let display_data = downsample(values, sparkline_area.width as usize);
+        let max_val = display_data.iter().max().copied().unwrap_or(100);
+
         let sparkline = Sparkline::default()
-            .data(values)
+            .data(&display_data)
             .style(Style::default().fg(Color::Cyan))
             .max(max_val);
 
@@ -413,6 +416,37 @@ fn is_timechart_result(result: &fleet_engine::value::QueryResult) -> bool {
         .columns
         .first()
         .is_some_and(|col| col.name == "_time")
+}
+
+/// Downsample data to fit within `target_width` columns.
+///
+/// When there are more data points than columns, groups points into buckets
+/// and takes the max of each bucket (preserving peaks). When data fits or
+/// is smaller, returns as-is.
+#[allow(clippy::cast_precision_loss)] // terminal widths won't overflow f64
+fn downsample(values: &[u64], target_width: usize) -> Vec<u64> {
+    if target_width == 0 || values.is_empty() {
+        return vec![];
+    }
+    if values.len() <= target_width {
+        return values.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(target_width);
+    let bucket_size_f = values.len() as f64 / target_width as f64;
+
+    for i in 0..target_width {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let start = (i as f64 * bucket_size_f) as usize;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let end = ((i + 1) as f64 * bucket_size_f) as usize;
+        let end = end.min(values.len());
+
+        let max_in_bucket = values[start..end].iter().max().copied().unwrap_or(0);
+        result.push(max_in_bucket);
+    }
+
+    result
 }
 
 /// Convert a Value to u64 for chart rendering.
