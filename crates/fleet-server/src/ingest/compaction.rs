@@ -55,6 +55,9 @@ pub fn spawn_compaction(
 }
 
 /// Run one compaction cycle.
+///
+/// Public for integration tests only — not part of the external API.
+/// Called internally by [`spawn_compaction`].
 pub async fn compact_once(
     wal_dir: &Path,
     data_dir: &Path,
