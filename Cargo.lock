@@ -1090,9 +1090,13 @@ dependencies = [
 name = "fleet-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "chumsky",
+ "duckdb",
  "insta",
  "regex",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

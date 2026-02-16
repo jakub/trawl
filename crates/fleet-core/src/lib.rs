@@ -12,3 +12,6 @@ pub mod parser;
 
 /// SQL emitter — transforms AST into DuckDB-compatible SQL.
 pub mod emitter;
+
+/// In-memory event filter compiled from the search stage.
+pub mod filter;
