@@ -18,8 +18,8 @@ use fleet_auth::roles::Permission;
 use fleet_engine::value::{QueryResult, Value};
 use serde::Deserialize;
 use std::convert::Infallible;
-use std::time::Duration;
 
+use crate::bus::{EventBus, EventSubscriber as _};
 use crate::error::ServerError;
 use crate::state::{AppState, CachedFieldValues, CachedSchema};
 
@@ -729,8 +729,7 @@ fn value_to_string(value: &Value) -> String {
 ///
 /// Subscribes to the event bus and filters incoming events in-memory
 /// using [`CompiledFilter`]. Each matching event is streamed individually
-/// as an SSE `data` event. Falls back to poll-based re-execution when
-/// the event bus is not available (ingest disabled).
+/// as an SSE `data` event. Requires ingest to be enabled (event bus available).
 pub async fn stream_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -770,84 +769,44 @@ pub async fn stream_query(
         .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
     let filter = fleet_core::filter::CompiledFilter::compile(&ast.search);
 
+    let Some(ref bus) = state.ingest.event_bus else {
+        return Err(ServerError::BadRequest(
+            "streaming requires ingest to be enabled".into(),
+        ));
+    };
+
+    let mut subscriber = EventBus::subscribe(bus.as_ref());
+
     let event_stream: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>,
-    > = if let Some(ref bus) = state.ingest.event_bus {
-        // Event bus available — real-time push-based streaming.
-        // Each matching event is streamed individually as it arrives.
-        use crate::bus::EventSubscriber;
-        let mut subscriber = crate::bus::EventBus::subscribe(bus.as_ref());
+    > = Box::pin(async_stream::stream! {
+        let _permit = sse_permit; // hold until stream ends
 
-        Box::pin(async_stream::stream! {
-            let _permit = sse_permit; // hold until stream ends
-            yield Ok(Event::default().event("mode").data("push"));
-
-            loop {
-                match subscriber.recv().await {
-                    Ok(batch) => {
-                        for event in &batch.events {
-                            if filter.matches(event) {
-                                let json = serde_json::to_string(event).unwrap_or_default();
-                                yield Ok(Event::default().event("data").data(json));
-                            }
+        loop {
+            match subscriber.recv().await {
+                Ok(batch) => {
+                    for event in &batch.events {
+                        if filter.matches(event) {
+                            let json = serde_json::to_string(event).unwrap_or_default();
+                            yield Ok(Event::default().event("data").data(json));
                         }
                     }
-                    Err(crate::bus::RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            event_type = "stream_lagged",
-                            missed = n,
-                            "stream subscriber fell behind"
-                        );
-                        let payload = serde_json::json!({ "missed": n }).to_string();
-                        yield Ok(Event::default().event("lagged").data(payload));
-                    }
-                    Err(crate::bus::RecvError::Closed) => {
-                        break;
-                    }
+                }
+                Err(crate::bus::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        event_type = "stream_lagged",
+                        missed = n,
+                        "stream subscriber fell behind"
+                    );
+                    let payload = serde_json::json!({ "missed": n }).to_string();
+                    yield Ok(Event::default().event("lagged").data(payload));
+                }
+                Err(crate::bus::RecvError::Closed) => {
+                    break;
                 }
             }
-        })
-    } else {
-        // No event bus — fall back to poll-based re-execution.
-        // NOTE: poll mode re-executes the full query each tick, so ALL
-        // matching results are sent each interval (not just new events).
-        // Clients should use the `mode: poll` event to handle this
-        // difference (e.g. replace results instead of appending).
-        let interval_secs = params.interval.unwrap_or(5).clamp(1, 60);
-        let pool = state.query.pool.clone();
-        let timeout = Duration::from_secs(state.query.timeout_secs);
-
-        Box::pin(async_stream::stream! {
-            let _permit = sse_permit; // hold until stream ends
-            yield Ok(Event::default().event("mode").data("poll"));
-
-            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-
-            loop {
-                interval.tick().await;
-
-                match pool.execute(&query_dsl, timeout).await {
-                    Ok(result) => {
-                        for row in &result.rows {
-                            if let Ok(json) = serde_json::to_string(&row) {
-                                yield Ok(Event::default().event("data").data(json));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = e.safe_message();
-                        tracing::warn!(
-                            event_type = "stream_query_error",
-                            error = %error_msg,
-                            "stream query failed"
-                        );
-                        let error_json = serde_json::json!({ "error": error_msg }).to_string();
-                        yield Ok(Event::default().event("error").data(error_json));
-                    }
-                }
-            }
-        })
-    };
+        }
+    });
 
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
@@ -855,9 +814,6 @@ pub async fn stream_query(
 /// Query parameters for the stream endpoint.
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
-    /// The DSL query to execute repeatedly.
+    /// The DSL query to filter live events.
     pub query: String,
-    /// Interval in seconds (1-60, default 5, used for poll-based fallback).
-    #[serde(default)]
-    pub interval: Option<u64>,
 }
