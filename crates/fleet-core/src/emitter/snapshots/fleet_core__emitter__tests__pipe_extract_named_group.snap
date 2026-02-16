@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT *, regexp_extract("message", ?, 1) AS "ip"
+SELECT *, nullif(regexp_extract("message", ?, 1), '') AS "ip"
 FROM "_s0"
 ---
 params:

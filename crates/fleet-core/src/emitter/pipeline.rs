@@ -239,12 +239,15 @@ fn process_extract(
             }
 
             let mut select_items = vec!["*".to_string()];
-            let placeholder = ctx.push_param(SqlValue::String(pattern.clone()));
             for (i, name) in group_names.iter().enumerate() {
                 let group_idx = i + 1;
                 let alias = quote_field(name);
+                // Each regexp_extract() call needs its own ? placeholder —
+                // DuckDB binds ? sequentially, so N groups need N params.
+                // nullif wraps the result so non-matches return NULL instead of ''.
+                let placeholder = ctx.push_param(SqlValue::String(pattern.clone()));
                 select_items.push(format!(
-                    "regexp_extract({source}, {placeholder}, {group_idx}) AS {alias}"
+                    "nullif(regexp_extract({source}, {placeholder}, {group_idx}), '') AS {alias}"
                 ));
             }
 
