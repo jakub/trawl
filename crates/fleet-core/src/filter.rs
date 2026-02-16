@@ -327,15 +327,17 @@ fn apply_ord(ord: std::cmp::Ordering, op: CompareOp) -> bool {
 
 /// Apply a comparison on f64 values.
 ///
+/// Uses exact IEEE 754 operators to match `DuckDB`'s behavior.
 /// `NaN` comparisons return false, matching SQL semantics.
+#[allow(clippy::float_cmp)] // intentional: must match DuckDB's exact comparison
 fn apply_f64(a: f64, b: f64, op: CompareOp) -> bool {
     match op {
-        CompareOp::Eq => (a - b).abs() < f64::EPSILON,
-        CompareOp::Ne => (a - b).abs() >= f64::EPSILON,
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
         CompareOp::Gt => a > b,
-        CompareOp::Gte => a >= b || (a - b).abs() < f64::EPSILON,
+        CompareOp::Gte => a >= b,
         CompareOp::Lt => a < b,
-        CompareOp::Lte => a <= b || (a - b).abs() < f64::EPSILON,
+        CompareOp::Lte => a <= b,
     }
 }
 
@@ -344,12 +346,24 @@ fn apply_f64(a: f64, b: f64, op: CompareOp) -> bool {
 // ---------------------------------------------------------------------------
 
 fn matches_time_filter(event: &serde_json::Map<String, Value>, tf: &TimeMatcher) -> bool {
-    let Some(Value::String(ts_str)) = event.get("timestamp") else {
+    let Some(ts_val) = event.get("timestamp") else {
         return false;
     };
 
-    // Try parsing common ISO 8601 formats.
-    let event_time = parse_timestamp(ts_str);
+    let event_time = match ts_val {
+        Value::String(s) => parse_timestamp(s),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                parse_epoch_i64(i)
+            } else if let Some(f) = n.as_f64() {
+                parse_epoch_f64(f)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
     let Some(event_time) = event_time else {
         return false;
     };
@@ -359,20 +373,69 @@ fn matches_time_filter(event: &serde_json::Map<String, Value>, tf: &TimeMatcher)
     event_time >= cutoff
 }
 
-/// Parse a timestamp string in common ISO 8601 formats.
+/// Parse a timestamp string in common formats.
+///
+/// Covers the most common log timestamp formats. Tried in order
+/// of decreasing specificity to avoid ambiguous matches.
 fn parse_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    // Try RFC 3339 first (most common for JSON).
+    // RFC 3339 (most common for JSON): 2026-02-15T12:00:00Z, 2026-02-15T12:00:00.123Z
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&chrono::Utc));
     }
-    // Try without timezone (assume UTC).
+    // ISO 8601 with timezone offset: 2026-02-15T12:00:00+05:30
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%:z") {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // ISO 8601 with fractional seconds, no timezone (assume UTC).
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(naive.and_utc());
+    }
+    // ISO 8601, no fractional seconds, no timezone (assume UTC).
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return Some(naive.and_utc());
     }
+    // Space-separated: 2026-02-15 12:00:00
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
         return Some(naive.and_utc());
     }
+    // Space-separated with fractional seconds: 2026-02-15 12:00:00.123456
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(naive.and_utc());
+    }
+    // Epoch-seconds or epoch-millis as string.
+    if let Ok(n) = s.parse::<i64>() {
+        return parse_epoch_i64(n);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return parse_epoch_f64(f);
+    }
     None
+}
+
+/// Parse an epoch timestamp from an i64.
+///
+/// Heuristic: values < 1e12 are epoch-seconds, >= 1e12 are epoch-millis.
+fn parse_epoch_i64(val: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if val.abs() < 1_000_000_000_000 {
+        chrono::DateTime::from_timestamp(val, 0)
+    } else {
+        let secs = val / 1000;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ns = ((val % 1000).unsigned_abs() as u32) * 1_000_000;
+        chrono::DateTime::from_timestamp(secs, ns)
+    }
+}
+
+/// Parse an epoch timestamp from an f64 (fractional seconds).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn parse_epoch_f64(val: f64) -> Option<chrono::DateTime<chrono::Utc>> {
+    let secs = val as i64;
+    let nanos = ((val - secs as f64).abs() * 1e9) as u32;
+    chrono::DateTime::from_timestamp(secs, nanos)
 }
 
 // ---------------------------------------------------------------------------
@@ -768,5 +831,91 @@ mod tests {
     #[test]
     fn glob_conversion_escapes_dots() {
         assert_eq!(glob_to_regex("foo.bar"), r"^foo\.bar$");
+    }
+
+    // ── timestamp parsing ────────────────────────────────────────────
+
+    #[test]
+    fn parse_timestamp_rfc3339() {
+        let ts = parse_timestamp("2026-02-15T12:00:00Z");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_timestamp_rfc3339_fractional() {
+        let ts = parse_timestamp("2026-02-15T12:00:00.123456Z");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_timestamp_iso_with_offset() {
+        let ts = parse_timestamp("2026-02-15T12:00:00+05:30");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_timestamp_naive_t_separator() {
+        let ts = parse_timestamp("2026-02-15T12:00:00");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_timestamp_naive_fractional() {
+        let ts = parse_timestamp("2026-02-15T12:00:00.5");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_timestamp_space_separator() {
+        let ts = parse_timestamp("2026-02-15 12:00:00");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_timestamp_space_fractional() {
+        let ts = parse_timestamp("2026-02-15 12:00:00.999");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_timestamp_epoch_seconds_string() {
+        let ts = parse_timestamp("1739620800");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_timestamp_epoch_millis_string() {
+        let ts = parse_timestamp("1739620800000");
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_epoch_i64_seconds() {
+        let ts = parse_epoch_i64(1_739_620_800);
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_epoch_i64_millis() {
+        let ts = parse_epoch_i64(1_739_620_800_000);
+        assert!(ts.is_some());
+        // Should be the same instant as epoch-seconds version.
+        let secs_ts = parse_epoch_i64(1_739_620_800).unwrap();
+        assert_eq!(ts.unwrap().timestamp(), secs_ts.timestamp());
+    }
+
+    #[test]
+    fn parse_epoch_f64_fractional() {
+        let ts = parse_epoch_f64(1_739_620_800.5);
+        assert!(ts.is_some());
+        let dt = ts.unwrap();
+        assert_eq!(dt.timestamp(), 1_739_620_800);
+        assert!(dt.timestamp_subsec_nanos() > 0);
+    }
+
+    #[test]
+    fn parse_timestamp_invalid() {
+        assert!(parse_timestamp("not-a-date").is_none());
+        assert!(parse_timestamp("").is_none());
     }
 }
