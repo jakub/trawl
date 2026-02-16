@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicU64;
 
 use parking_lot::Mutex;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 
 use fleet_auth::{HistoryStore, KeyStore, SavedQueryStore};
 use fleet_engine::value::SchemaResult;
@@ -55,6 +56,8 @@ pub struct QueryState {
     pub field_values_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedFieldValues>>>,
     /// Hot buffer for fresh events not yet compacted to parquet.
     pub hot_buffer: Option<Arc<HotBuffer>>,
+    /// Semaphore bounding concurrent SSE streaming connections.
+    pub sse_semaphore: Arc<Semaphore>,
 }
 
 /// Authentication state: key store, history store, saved queries, and database path.
@@ -158,6 +161,7 @@ impl AppState {
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 hot_buffer,
+                sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
             },
             auth: AuthState {
                 key_store: Arc::new(Mutex::new(key_store)),

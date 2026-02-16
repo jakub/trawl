@@ -40,6 +40,10 @@ pub enum ServerError {
     #[error("rate limit exceeded")]
     RateLimited,
 
+    /// Too many concurrent SSE streams (429).
+    #[error("too many concurrent streams")]
+    TooManyStreams,
+
     /// Internal server error (task panics, unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
@@ -58,6 +62,7 @@ impl ServerError {
             Self::BadRequest(_) => "bad request".to_owned(),
             Self::NotFound(_) => "not found".to_owned(),
             Self::RateLimited => "rate limit exceeded".to_owned(),
+            Self::TooManyStreams => "too many concurrent streams".to_owned(),
             other => other.to_string(),
         }
     }
@@ -84,6 +89,10 @@ impl IntoResponse for ServerError {
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate limit exceeded".to_owned(),
+            ),
+            Self::TooManyStreams => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent streams".to_owned(),
             ),
             Self::Internal(_) => {
                 tracing::error!(event_type = "internal_error", error = %self, "internal server error");

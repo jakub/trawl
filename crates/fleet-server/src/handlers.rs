@@ -747,6 +747,15 @@ pub async fn stream_query(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
+    // Bound concurrent SSE connections. The owned permit is held by the
+    // stream future and auto-released when the client disconnects.
+    let sse_permit = state
+        .query
+        .sse_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ServerError::TooManyStreams)?;
+
     let query_dsl = params.query.clone();
 
     tracing::info!(
@@ -765,10 +774,14 @@ pub async fn stream_query(
         Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>,
     > = if let Some(ref bus) = state.ingest.event_bus {
         // Event bus available — real-time push-based streaming.
+        // Each matching event is streamed individually as it arrives.
         use crate::bus::EventSubscriber;
         let mut subscriber = crate::bus::EventBus::subscribe(bus.as_ref());
 
         Box::pin(async_stream::stream! {
+            let _permit = sse_permit; // hold until stream ends
+            yield Ok(Event::default().event("mode").data("push"));
+
             loop {
                 match subscriber.recv().await {
                     Ok(batch) => {
@@ -796,11 +809,18 @@ pub async fn stream_query(
         })
     } else {
         // No event bus — fall back to poll-based re-execution.
+        // NOTE: poll mode re-executes the full query each tick, so ALL
+        // matching results are sent each interval (not just new events).
+        // Clients should use the `mode: poll` event to handle this
+        // difference (e.g. replace results instead of appending).
         let interval_secs = params.interval.unwrap_or(5).clamp(1, 60);
         let pool = state.query.pool.clone();
         let timeout = Duration::from_secs(state.query.timeout_secs);
 
         Box::pin(async_stream::stream! {
+            let _permit = sse_permit; // hold until stream ends
+            yield Ok(Event::default().event("mode").data("poll"));
+
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
             loop {

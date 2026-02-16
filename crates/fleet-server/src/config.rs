@@ -82,6 +82,11 @@ pub struct ServerConfig {
     #[serde(default = "default_max_query_history")]
     pub max_query_history: usize,
 
+    /// Maximum concurrent SSE streaming connections (default: 32).
+    /// Returns 429 when exceeded to prevent resource exhaustion.
+    #[serde(default = "default_max_sse_connections")]
+    pub max_sse_connections: usize,
+
     /// Per-role rate limiting (requests per minute). 0 = disabled.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -299,6 +304,8 @@ pub const DEFAULT_RATE_ANALYST: u32 = 60;
 pub const DEFAULT_RATE_READER: u32 = 30;
 /// Default ingest rate limit (requests/minute).
 pub const DEFAULT_RATE_INGEST: u32 = 1000;
+/// Default maximum concurrent SSE connections.
+pub const DEFAULT_MAX_SSE_CONNECTIONS: usize = 32;
 /// Fallback CPU count when `available_parallelism()` fails.
 const FALLBACK_CPU_COUNT: usize = 4;
 
@@ -401,6 +408,10 @@ fn default_schema_cache_ttl_secs() -> u64 {
 
 fn default_max_query_history() -> usize {
     DEFAULT_MAX_QUERY_HISTORY
+}
+
+fn default_max_sse_connections() -> usize {
+    DEFAULT_MAX_SSE_CONNECTIONS
 }
 
 fn default_rate_admin() -> u32 {
