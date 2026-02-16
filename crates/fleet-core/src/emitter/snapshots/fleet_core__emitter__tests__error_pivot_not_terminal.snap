@@ -1,5 +1,0 @@
----
-source: crates/fleet-core/src/emitter/mod.rs
-expression: "emit_dsl_err(\"* | pivot count() on status | where count > 5\")"
----
-unsupported operation: pivot must be the last stage in the pipeline

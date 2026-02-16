@@ -96,12 +96,12 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
 
     search::emit_search(&query.search, &mut state);
 
-    let stage_count = query.pipeline.len();
-    for (i, stage) in query.pipeline.iter().enumerate() {
-        if matches!(stage.node, crate::ast::PipeStage::Pivot(_)) && i != stage_count - 1 {
-            return Err(EmitError::UnsupportedOperation {
-                message: "pivot must be the last stage in the pipeline".to_string(),
-            });
+    for stage in &query.pipeline {
+        // If a pivot is pending and the next stage isn't another pivot,
+        // flush the pivot to a CTE so downstream stages can reference
+        // the pivot-generated columns.
+        if state.has_pivot() && !matches!(stage.node, crate::ast::PipeStage::Pivot(_)) {
+            state.flush_pivot_to_cte();
         }
         pipeline::process_stage(&stage.node, &mut state)?;
     }
@@ -666,9 +666,16 @@ mod tests {
     }
 
     #[test]
-    fn error_pivot_not_terminal() {
-        assert_snapshot!(emit_dsl_err(
-            "* | pivot count() on status | where count > 5"
+    fn pipe_pivot_then_where() {
+        assert_snapshot!(emit_dsl(
+            "* | pivot count() on status by host | where count > 5"
+        ));
+    }
+
+    #[test]
+    fn pipe_timechart_by_then_where() {
+        assert_snapshot!(emit_dsl(
+            "last:1h | timechart span=5m count() by level | where count > 10"
         ));
     }
 

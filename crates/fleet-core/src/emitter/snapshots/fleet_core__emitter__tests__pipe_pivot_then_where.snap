@@ -1,0 +1,22 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | pivot count() on status by host | where count > 5\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+), _s1 AS (
+  SELECT "status", "host"
+  FROM "_s0"
+), _s2 AS (
+  PIVOT "_s1"
+  ON "status"
+  USING COUNT(*)
+  GROUP BY "host"
+)
+SELECT *
+FROM "_s2"
+WHERE ("count" > ?)
+---
+params:
+  0: 5

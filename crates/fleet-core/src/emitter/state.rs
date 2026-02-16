@@ -280,6 +280,57 @@ impl EmitterState {
         });
     }
 
+    /// Whether the state currently has a pending pivot.
+    pub(crate) fn has_pivot(&self) -> bool {
+        self.pivot.is_some()
+    }
+
+    /// Flush a pending PIVOT to a CTE so that downstream stages can operate
+    /// on the pivot-generated columns.
+    ///
+    /// `DuckDB` doesn't support parameterized PIVOT, so we inline all
+    /// accumulated `?` placeholders across all CTEs and the PIVOT body,
+    /// then clear the param list. Subsequent stages can add fresh `?`
+    /// params as normal.
+    pub(crate) fn flush_pivot_to_cte(&mut self) {
+        let Some(pivot) = self.pivot.take() else {
+            return;
+        };
+
+        let pivot_sql = self.build_pivot(&pivot);
+
+        // Inline params sequentially across all CTEs + the pivot body.
+        // DuckDB binds ? left-to-right across the entire statement, so
+        // we must process them in the same order.
+        let mut param_idx = 0;
+        for cte in &mut self.ctes {
+            let (inlined, consumed) =
+                Self::inline_params_counted(&cte.sql, &self.params, param_idx);
+            cte.sql = inlined;
+            param_idx = consumed;
+        }
+        let (pivot_inlined, _) = Self::inline_params_counted(&pivot_sql, &self.params, param_idx);
+        self.params.clear();
+
+        // Push the pivot as a new CTE.
+        let cte_name = format!("_s{}", self.step);
+        self.ctes.push(Cte {
+            name: cte_name.clone(),
+            sql: pivot_inlined,
+        });
+
+        // Reset for downstream stages.
+        self.step += 1;
+        self.source = format!("\"{cte_name}\"");
+        self.select.clear();
+        self.where_clauses.clear();
+        self.group_by.clear();
+        self.order_by.clear();
+        self.limit = None;
+        self.has_aggregation = false;
+        self.has_projection = false;
+    }
+
     /// Produce the final SQL string including any accumulated CTEs.
     ///
     /// For PIVOT queries, inlines all `?` params directly into the SQL
@@ -345,8 +396,15 @@ impl EmitterState {
     /// Replace `?` placeholders with literal values for engines that
     /// don't support parameterized queries (e.g. `DuckDB` PIVOT).
     fn inline_params(sql: &str, params: &[SqlValue]) -> String {
+        Self::inline_params_counted(sql, params, 0).0
+    }
+
+    /// Replace `?` placeholders starting from `start_idx` in the params slice.
+    /// Returns the inlined SQL and the next param index (for chaining across
+    /// multiple SQL fragments).
+    fn inline_params_counted(sql: &str, params: &[SqlValue], start_idx: usize) -> (String, usize) {
         let mut result = String::with_capacity(sql.len());
-        let mut param_idx = 0;
+        let mut param_idx = start_idx;
         for ch in sql.chars() {
             if ch == '?' && param_idx < params.len() {
                 match &params[param_idx] {
@@ -371,7 +429,7 @@ impl EmitterState {
                 result.push(ch);
             }
         }
-        result
+        (result, param_idx)
     }
 
     /// Consume the state and return the accumulated parameters.
