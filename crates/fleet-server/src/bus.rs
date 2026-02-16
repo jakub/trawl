@@ -27,7 +27,7 @@ pub struct IngestBatch {
     /// Approximate size in bytes (from serialized ndjson).
     pub byte_size: usize,
     /// Set to `true` by compaction before writing parquet.
-    /// `snapshot_to_tempfile` skips batches with this flag set.
+    /// Snapshot generation skips batches with this flag set.
     pub draining: AtomicBool,
 }
 

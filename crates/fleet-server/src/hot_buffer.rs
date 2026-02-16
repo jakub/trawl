@@ -14,10 +14,10 @@
 
 use std::io::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::bus::{EventBus as _, EventSubscriber as _, IngestBatch, LocalEventBus, RecvError};
 
@@ -34,12 +34,29 @@ pub struct HotBufferConfig {
 ///
 /// Uses an `IndexMap` for insertion-order iteration (oldest-first
 /// FIFO eviction) keyed by batch ID (WAL filename stem).
-#[derive(Debug)]
 pub struct HotBuffer {
     batches: RwLock<IndexMap<Arc<str>, Arc<IngestBatch>>>,
     total_events: AtomicUsize,
     total_bytes: AtomicUsize,
     config: HotBufferConfig,
+    /// Monotonic counter bumped on every mutation (insert, drain, `mark_draining`).
+    /// Used to invalidate the snapshot cache.
+    generation: AtomicU64,
+    /// Cached snapshot: `(generation, temp_file)`. Reused across concurrent
+    /// queries when the buffer hasn't changed, avoiding O(events × queries)
+    /// I/O. Old snapshots stay alive via Arc until all queries using them finish.
+    snapshot_cache: Mutex<Option<(u64, Arc<tempfile::NamedTempFile>)>>,
+}
+
+impl std::fmt::Debug for HotBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HotBuffer")
+            .field("total_events", &self.total_events.load(Ordering::Relaxed))
+            .field("total_bytes", &self.total_bytes.load(Ordering::Relaxed))
+            .field("generation", &self.generation.load(Ordering::Relaxed))
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HotBuffer {
@@ -50,6 +67,8 @@ impl HotBuffer {
             total_events: AtomicUsize::new(0),
             total_bytes: AtomicUsize::new(0),
             config,
+            generation: AtomicU64::new(0),
+            snapshot_cache: Mutex::new(None),
         }
     }
 
@@ -85,6 +104,8 @@ impl HotBuffer {
             self.total_bytes.fetch_add(byte_count, Ordering::Relaxed);
             map.insert(Arc::clone(&batch.batch_id), batch);
         }
+
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Check if adding `extra_events` / `extra_bytes` would exceed limits.
@@ -96,7 +117,7 @@ impl HotBuffer {
     /// Mark batches as draining before compaction writes parquet.
     ///
     /// Sets the `draining` flag on matching batches so that
-    /// [`snapshot_to_tempfile`](Self::snapshot_to_tempfile) skips them.
+    /// [`snapshot`](Self::snapshot) skips them.
     /// Uses a read lock only — `AtomicBool` provides interior mutability.
     pub fn mark_draining(&self, batch_ids: &[&str]) {
         let map = self.batches.read();
@@ -107,6 +128,7 @@ impl HotBuffer {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Remove batches that have been compacted to parquet.
@@ -123,15 +145,42 @@ impl HotBuffer {
                     .fetch_sub(removed.byte_size, Ordering::Relaxed);
             }
         }
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Write all non-draining buffered events to a temporary ndjson file.
+    /// Get a snapshot of all non-draining buffered events as a temporary ndjson file.
     ///
     /// Returns `None` if the buffer is empty or all batches are draining.
-    /// Also returns `None` on I/O errors (logged). The returned
-    /// `NamedTempFile` auto-deletes on drop, so the caller must hold it
-    /// alive for the duration of the query.
-    pub fn snapshot_to_tempfile(&self) -> Option<tempfile::NamedTempFile> {
+    /// Uses a generation-based cache: concurrent queries against an unchanged
+    /// buffer share a single snapshot file (1 disk write instead of N).
+    /// The `Arc` ensures the temp file stays alive until all queries using it finish.
+    pub fn snapshot(&self) -> Option<Arc<tempfile::NamedTempFile>> {
+        let current_gen = self.generation.load(Ordering::Relaxed);
+
+        // Fast path: check if cached snapshot is still valid.
+        {
+            let cache = self.snapshot_cache.lock();
+            if let Some((cached_gen, ref file)) = *cache {
+                if cached_gen == current_gen {
+                    return Some(Arc::clone(file));
+                }
+            }
+        }
+
+        // Cache miss — build a new snapshot.
+        let snapshot = self.build_snapshot()?;
+        let snapshot = Arc::new(snapshot);
+
+        // Store in cache (another thread may have raced us — that's fine,
+        // the losing snapshot just gets dropped).
+        let mut cache = self.snapshot_cache.lock();
+        *cache = Some((current_gen, Arc::clone(&snapshot)));
+
+        Some(snapshot)
+    }
+
+    /// Build a fresh snapshot file from the current buffer contents.
+    fn build_snapshot(&self) -> Option<tempfile::NamedTempFile> {
         let map = self.batches.read();
         if map.is_empty() {
             return None;
@@ -298,7 +347,7 @@ mod tests {
         assert_eq!(buf.event_count(), 3);
         assert_eq!(buf.batch_count(), 1);
 
-        let tmpfile = buf.snapshot_to_tempfile().expect("should have events");
+        let tmpfile = buf.snapshot().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         assert_eq!(content.lines().count(), 3);
         assert!(content.contains("event_0"));
@@ -321,7 +370,7 @@ mod tests {
 
         buf.drain(&["batch_002"]);
         assert_eq!(buf.event_count(), 0);
-        assert!(buf.snapshot_to_tempfile().is_none());
+        assert!(buf.snapshot().is_none());
     }
 
     #[test]
@@ -339,7 +388,7 @@ mod tests {
         assert_eq!(buf.batch_count(), 1);
 
         // Only aaa_002 should remain.
-        let tmpfile = buf.snapshot_to_tempfile().unwrap();
+        let tmpfile = buf.snapshot().unwrap();
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         assert_eq!(content.lines().count(), 3);
     }
@@ -383,9 +432,7 @@ mod tests {
 
         buf.mark_draining(&["batch_001"]);
 
-        let tmpfile = buf
-            .snapshot_to_tempfile()
-            .expect("should have non-draining events");
+        let tmpfile = buf.snapshot().expect("should have non-draining events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         // Only batch_002's 3 events should be in the snapshot.
         assert_eq!(content.lines().count(), 3);
@@ -400,7 +447,7 @@ mod tests {
         buf.insert(make_batch("batch_001", 2));
         buf.mark_draining(&["batch_001"]);
 
-        assert!(buf.snapshot_to_tempfile().is_none());
+        assert!(buf.snapshot().is_none());
     }
 
     #[test]
@@ -409,7 +456,7 @@ mod tests {
             max_events: 100,
             max_bytes: 10_000_000,
         });
-        assert!(buf.snapshot_to_tempfile().is_none());
+        assert!(buf.snapshot().is_none());
     }
 
     #[test]

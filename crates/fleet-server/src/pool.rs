@@ -85,8 +85,9 @@ fn run_query_blocking(
     max_result_rows: usize,
 ) -> (Executor, Result<QueryResult, ServerError>) {
     // Snapshot hot buffer to a temp ndjson file so fresh events
-    // are visible to this query via UNION ALL BY NAME.
-    let hot_tempfile = hot_buffer.and_then(|hb| hb.snapshot_to_tempfile());
+    // are visible to this query via UNION ALL BY NAME. Returns a
+    // cached Arc when the buffer hasn't changed since the last snapshot.
+    let hot_tempfile = hot_buffer.and_then(|hb| hb.snapshot());
 
     // Filter out hot files whose paths aren't valid UTF-8 (required by
     // DuckDB's file reader). This is extremely unlikely on any modern OS
