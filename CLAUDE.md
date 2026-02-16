@@ -29,6 +29,9 @@ crates/
 - pipeline-oriented DSL: `service:nginx level:error last:2h | stats count() by host | where count > 10`
 - SQL injection prevention via parameterized queries + field allowlists
 - agent tasks are cryptographically signed offline — compromised server can't create novel execution authority
+- **real-time event bus**: ingested events are published to a `broadcast::channel`-backed bus and stored in a hot buffer, making them queryable within milliseconds of ingest (before WAL compaction to parquet)
+- **hot buffer**: batch-keyed in-memory store that makes fresh events visible to ALL queries via `UNION ALL BY NAME` with the parquet source; drained automatically after compaction
+- **live streaming**: SSE endpoint uses `CompiledFilter` (in-memory DSL matcher) against the event bus for real-time event delivery, with back-pressure notifications via `StreamEvent::Lagged`
 
 ## tooling
 
@@ -41,14 +44,100 @@ crates/
 
 ## using fleet
 
-- `fleet` (no subcommand) launches the interactive TUI
-- `fleet query "dsl..."` executes a query and prints results (table for TTY, JSON for pipes)
-- `fleet query --data '/path/*.parquet' "dsl..."` queries local parquet files (embedded mode)
-- `fleet validate "dsl..."` checks DSL syntax without executing
-- global flags: `--url`, `--token`, `--insecure`, `--token-file`, `--config`
-- config file: `~/.config/fleet/config.toml` (shared by CLI and TUI modes)
-- We are running a development server at https://localhost:5514 with a self-signed cert. You need to use the --insecure flag.
-- Environment variables FLEET_URL (https://localhost:5514) AND FLEET_TOKEN (with an admin-scoped token) should be already set. Environment variables override the config files in ~/.config/fleet/
+### dev server
+
+- development server runs at `https://localhost:5514` with a self-signed cert
+- always pass `--insecure` (or set `FLEET_INSECURE=true`) to accept the self-signed cert
+- environment variables `FLEET_URL` and `FLEET_TOKEN` should already be set (admin-scoped token)
+- env vars override `~/.config/fleet/config.toml`
+
+### CLI modes
+
+**TUI** (interactive):
+```
+fleet                               # launches TUI (no subcommand)
+fleet --insecure                    # TUI against dev server
+```
+
+**query** (execute and print):
+```
+fleet query --insecure "dsl..."                  # auto-detect output: table for TTY, JSON for pipe
+fleet query --insecure -f table "dsl..."         # force table output
+fleet query --insecure -f json "dsl..."          # force JSON (one object per line, ndjson)
+fleet query --insecure -f csv "dsl..."           # CSV output (with formula injection protection)
+```
+
+**embedded mode** (no server, queries parquet files directly):
+```
+fleet query --data '/path/*.parquet' "dsl..."    # query local parquet files
+fleet query --data 'data/**/*.parquet' "* | stats count() by service"
+```
+
+**validate** (syntax check, hits server for validation endpoint):
+```
+fleet validate --insecure "dsl..."               # prints "valid" or error with span
+```
+
+### global flags
+
+| flag | env var | description |
+|------|---------|-------------|
+| `--url <URL>` | `FLEET_URL` | server URL (default: `https://localhost:5514`) |
+| `--token <TOKEN>` | `FLEET_TOKEN` | API token (direct value) |
+| `-k, --token-file <PATH>` | `FLEET_TOKEN_FILE` | path to file containing API token |
+| `--insecure` | `FLEET_INSECURE` | accept self-signed TLS certificates |
+| `-c, --config <PATH>` | — | config file path (default: `~/.config/fleet/config.toml`) |
+
+### output formats
+
+- **table**: pretty-printed box-drawing table with row count footer (default for TTY)
+- **json**: one JSON object per row, ndjson-style (default for pipes)
+- **csv**: RFC 4180 with formula injection protection (string values starting with `=`, `+`, `-`, `@`, `\t`, `|` are prefixed with `'`)
+
+### common dev examples
+
+```sh
+# recent errors by service
+fleet query --insecure "level:error last:1h | stats count() by service | sort -count | head 10"
+
+# browse all data (table output)
+fleet query --insecure -f table "* | head 5 | fields timestamp, host, service, level, message"
+
+# pipe JSON to jq for ad-hoc processing
+fleet query --insecure "last:1h | stats count() by service" | jq '.service'
+
+# export to CSV file
+fleet query --insecure -f csv "last:24h | stats count() by service, level" > report.csv
+
+# validate a query without executing
+fleet validate --insecure "level:error | stats count() by host"
+
+# query local parquet files (no server needed)
+fleet query --data 'data/**/*.parquet' "* | stats count() by service | sort -count"
+```
+
+### HTTP API
+
+the fleet server exposes a REST API (all routes except `/health` and `/ingest` require bearer token auth):
+
+| method | path | description |
+|--------|------|-------------|
+| `GET` | `/health` | health check (returns `{"status":"ok"}`) |
+| `POST` | `/query` | execute a DSL query |
+| `POST` | `/validate` | validate DSL syntax |
+| `GET` | `/schema` | get column names and types |
+| `GET` | `/schema/values/{field}` | get distinct values for a field |
+| `GET` | `/queries` | list running queries |
+| `DELETE` | `/queries/{id}` | cancel a running query |
+| `GET` | `/stats` | server statistics |
+| `GET` | `/history` | query execution history |
+| `GET` | `/saved` | list saved queries |
+| `POST` | `/saved` | create a saved query |
+| `PUT` | `/saved/{id}` | update a saved query |
+| `DELETE` | `/saved/{id}` | delete a saved query |
+| `POST` | `/export` | export query results (CSV) |
+| `GET` | `/stream` | SSE stream of query results |
+| `POST` | `/ingest` | ingest log events (JSON array, optional gzip) |
 
 ## docs
 
