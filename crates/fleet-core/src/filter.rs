@@ -180,14 +180,19 @@ fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
 
 fn compile_op(op: FilterOp) -> CompareOp {
     match op {
+        FilterOp::Eq => CompareOp::Eq,
         FilterOp::Ne => CompareOp::Ne,
         FilterOp::Gt => CompareOp::Gt,
         FilterOp::Gte => CompareOp::Gte,
         FilterOp::Lt => CompareOp::Lt,
         FilterOp::Lte => CompareOp::Lte,
-        // Glob and Regex handled separately in compile_token;
-        // this fallback is defensive only.
-        FilterOp::Eq | FilterOp::Glob | FilterOp::Regex => CompareOp::Eq,
+        // Glob and Regex are handled before compile_op is called in
+        // compile_token. This arm is defensive only — if reached, the
+        // filter value was already matched as a literal comparison.
+        FilterOp::Glob | FilterOp::Regex => {
+            debug_assert!(false, "glob/regex should be handled in compile_token");
+            CompareOp::Eq
+        }
     }
 }
 
@@ -240,8 +245,9 @@ impl FieldMatcher {
 impl TextMatcher {
     fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
         let Some(Value::String(msg)) = event.get("message") else {
-            // No message field → negated matches, positive doesn't.
-            return self.negated;
+            // Missing/null message → no match (matches SQL NULL semantics).
+            // DuckDB: NULL ILIKE/NOT ILIKE → NULL → excluded from results.
+            return false;
         };
         let contains = msg.to_lowercase().contains(&self.term_lower);
         if self.negated { !contains } else { contains }
@@ -714,8 +720,9 @@ mod tests {
     fn text_search_missing_message() {
         // No message field: positive search → no match.
         assert!(!matches_event("error", r#"{"service": "nginx"}"#));
-        // Negated search: no message field → match (NOT contains = true).
-        assert!(matches_event("-debug", r#"{"service": "nginx"}"#));
+        // Negated search: no message field → no match (SQL NULL semantics:
+        // NULL NOT ILIKE → NULL → excluded from results).
+        assert!(!matches_event("-debug", r#"{"service": "nginx"}"#));
     }
 
     // ── quoted search ─────────────────────────────────────────────────

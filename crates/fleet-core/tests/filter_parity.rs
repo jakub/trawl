@@ -177,8 +177,17 @@ fn random_field_glob(rng: &mut Rng) -> String {
 fn random_event(rng: &mut Rng) -> Map<String, Value> {
     let mut event = Map::new();
 
-    // Always include message (text/quoted search targets it).
-    event.insert("message".to_string(), Value::String(random_message(rng)));
+    // Include message ~80% of the time. Set to null ~20% to exercise
+    // NULL semantics in both CompiledFilter and DuckDB SQL
+    // (NULL ILIKE/NOT ILIKE → NULL → excluded from results).
+    // We use explicit null instead of omitting the key, because DuckDB's
+    // read_json_auto infers schema from the data — a missing column
+    // causes binder errors rather than NULL comparison semantics.
+    if rng.range(5) != 0 {
+        event.insert("message".to_string(), Value::String(random_message(rng)));
+    } else {
+        event.insert("message".to_string(), Value::Null);
+    }
 
     // Always include all filterable fields to avoid DuckDB binder errors.
     for &field in FIELDS {
