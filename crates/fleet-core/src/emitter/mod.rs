@@ -544,6 +544,16 @@ mod tests {
         assert_snapshot!(emit_dsl("* | let x = duration * 1000 | let y = x + 100"));
     }
 
+    #[test]
+    fn pipe_let_multi_assignment() {
+        assert_snapshot!(emit_dsl("* | let a = lower(service), b = length(service)"));
+    }
+
+    #[test]
+    fn pipe_let_override_existing() {
+        assert_snapshot!(emit_dsl("* | let level = lower(level)"));
+    }
+
     // -----------------------------------------------------------------------
     // extract
     // -----------------------------------------------------------------------

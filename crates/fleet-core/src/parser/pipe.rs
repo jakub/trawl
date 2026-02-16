@@ -6,9 +6,9 @@
 use chumsky::prelude::*;
 
 use crate::ast::{
-    AggExpr, DedupStage, DropStage, ExtractMode, ExtractStage, LetStage, LimitStage, PipeStage,
-    PivotStage, RareStage, RenameStage, SortDirection, SortField, SortStage, Spanned, StatsStage,
-    TableStage, TailStage, TimechartStage, TopStage, WhereStage,
+    AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
+    PipeStage, PivotStage, RareStage, RenameStage, SortDirection, SortField, SortStage, Spanned,
+    StatsStage, TableStage, TailStage, TimechartStage, TopStage, WhereStage,
 };
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
@@ -225,26 +225,38 @@ fn drop_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("drop stage")
 }
 
-/// Parse a `let` stage: `let field = expr`
+/// Parse a `let` / `eval` assignment: `field = expr`.
+fn let_assignment<'src>()
+-> impl Parser<'src, ParserInput<'src>, (String, Spanned<Expr>), ParserExtra<'src>> + Clone {
+    field_name().then_ignore(just('=').padded()).then(expr())
+}
+
+/// Parse a `let` stage: `let field = expr [, field = expr]*`
 fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("let")
         .padded()
-        .ignore_then(field_name())
-        .then_ignore(just('=').padded())
-        .then(expr())
-        .map(|(field, expr)| PipeStage::Let(LetStage { field, expr }))
+        .ignore_then(
+            let_assignment()
+                .separated_by(just(',').padded())
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|assignments| PipeStage::Let(LetStage { assignments }))
         .labelled("let stage")
 }
 
-/// Parse an `eval` stage: alias for `let field = expr`.
+/// Parse an `eval` stage: alias for `let field = expr [, field = expr]*`.
 fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("eval")
         .padded()
-        .ignore_then(field_name())
-        .then_ignore(just('=').padded())
-        .then(expr())
-        .map(|(field, expr)| PipeStage::Let(LetStage { field, expr }))
+        .ignore_then(
+            let_assignment()
+                .separated_by(just(',').padded())
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .map(|assignments| PipeStage::Let(LetStage { assignments }))
         .labelled("eval stage")
 }
 
@@ -591,8 +603,9 @@ mod tests {
         assert_eq!(result.len(), 1);
         match &result[0].node {
             PipeStage::Let(l) => {
-                assert_eq!(l.field, "msg_len");
-                match &l.expr.node {
+                assert_eq!(l.assignments.len(), 1);
+                assert_eq!(l.assignments[0].0, "msg_len");
+                match &l.assignments[0].1.node {
                     Expr::FunctionCall { name, args } => {
                         assert_eq!(name, "length");
                         assert_eq!(args.len(), 1);
@@ -732,8 +745,9 @@ mod tests {
         let result = pipeline().parse(input).into_result().unwrap();
         match &result[0].node {
             PipeStage::Let(l) => {
-                assert_eq!(l.field, "duration_ms");
-                assert!(matches!(l.expr.node, Expr::Binary { .. }));
+                assert_eq!(l.assignments.len(), 1);
+                assert_eq!(l.assignments[0].0, "duration_ms");
+                assert!(matches!(l.assignments[0].1.node, Expr::Binary { .. }));
             }
             other => panic!("expected Let, got {other:?}"),
         }
@@ -745,14 +759,30 @@ mod tests {
         let result = pipeline().parse(input).into_result().unwrap();
         match &result[0].node {
             PipeStage::Let(l) => {
-                assert_eq!(l.field, "lower_host");
-                match &l.expr.node {
+                assert_eq!(l.assignments.len(), 1);
+                assert_eq!(l.assignments[0].0, "lower_host");
+                match &l.assignments[0].1.node {
                     Expr::FunctionCall { name, args } => {
                         assert_eq!(name, "lower");
                         assert_eq!(args.len(), 1);
                     }
                     other => panic!("expected FunctionCall, got {other:?}"),
                 }
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_let_multi_assignment() {
+        let input = "| let a = lower(service), b = length(service)";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::Let(l) => {
+                assert_eq!(l.assignments.len(), 2);
+                assert_eq!(l.assignments[0].0, "a");
+                assert_eq!(l.assignments[1].0, "b");
             }
             other => panic!("expected Let, got {other:?}"),
         }

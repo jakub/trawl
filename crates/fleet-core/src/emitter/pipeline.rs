@@ -200,10 +200,21 @@ fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Resu
     // which must not interleave with WHERE params from prior stages
     ctx.flush_if(FlushCondition::Always);
 
-    let expr_sql = emit_expr(&let_stage.expr, ctx)?;
-    let alias = quote_field(&let_stage.field);
+    let mut excludes = Vec::new();
+    let mut computed = Vec::new();
+    for (field, expr) in &let_stage.assignments {
+        let expr_sql = emit_expr(expr, ctx)?;
+        let alias = quote_field(field);
+        excludes.push(alias.clone());
+        computed.push(format!("({expr_sql}) AS {alias}"));
+    }
 
-    ctx.select = vec!["*".to_string(), format!("({expr_sql}) AS {alias}")];
+    // Use EXCLUDE so that let can override existing columns (e.g. `let level = lower(level)`).
+    // Without EXCLUDE, DuckDB keeps the original and ignores the alias.
+    let exclude_list = excludes.join(", ");
+    let mut items = vec![format!("* EXCLUDE ({exclude_list})")];
+    items.extend(computed);
+    ctx.select = items;
     ctx.has_projection = true;
 
     Ok(())

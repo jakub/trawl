@@ -1,10 +1,10 @@
 ---
 source: crates/fleet-core/src/emitter/mod.rs
-expression: "emit_dsl(\"* | let r = round(duration)\")"
+expression: "emit_dsl(\"* | let level = lower(level)\")"
 ---
 WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT * EXCLUDE ("r"), (ROUND("duration")) AS "r"
+SELECT * EXCLUDE ("level"), (LOWER("level")) AS "level"
 FROM "_s0"

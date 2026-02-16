@@ -344,11 +344,13 @@ pub struct DropStage {
     pub fields: Vec<String>,
 }
 
-/// `let duration_ms = duration * 1000` — computed/derived field.
+/// `let duration_ms = duration * 1000` — computed/derived field(s).
+///
+/// Supports comma-separated multi-assignment:
+/// `let a = lower(service), b = length(service)`
 #[derive(Debug, Clone, PartialEq)]
 pub struct LetStage {
-    pub field: String,
-    pub expr: Spanned<Expr>,
+    pub assignments: Vec<(String, Spanned<Expr>)>,
 }
 
 /// The mode of extraction for `extract`.

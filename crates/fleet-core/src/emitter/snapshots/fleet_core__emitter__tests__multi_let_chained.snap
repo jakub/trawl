@@ -6,10 +6,10 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 ), _s1 AS (
-  SELECT *, (("duration" * ?)) AS "x"
+  SELECT * EXCLUDE ("x"), (("duration" * ?)) AS "x"
   FROM "_s0"
 )
-SELECT *, (("x" + ?)) AS "y"
+SELECT * EXCLUDE ("y"), (("x" + ?)) AS "y"
 FROM "_s1"
 ---
 params:
