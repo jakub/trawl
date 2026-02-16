@@ -107,10 +107,6 @@ impl Default for UiConfig {
 /// Live tail configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TailConfig {
-    /// Default interval between queries (seconds).
-    #[serde(default = "default_tail_interval")]
-    pub default_interval_secs: u64,
-
     /// Maximum events to keep in memory.
     #[serde(default = "default_max_events")]
     pub max_events: usize,
@@ -119,7 +115,6 @@ pub struct TailConfig {
 impl Default for TailConfig {
     fn default() -> Self {
         Self {
-            default_interval_secs: default_tail_interval(),
             max_events: default_max_events(),
         }
     }
@@ -223,10 +218,6 @@ const fn default_tab_width() -> usize {
     2
 }
 
-const fn default_tail_interval() -> u64 {
-    5
-}
-
 const fn default_max_events() -> usize {
     1000
 }
@@ -245,7 +236,6 @@ mod tests {
         assert!(config.ui.enable_mouse);
         assert!(config.ui.auto_save_history);
         assert_eq!(config.ui.tab_width, 2);
-        assert_eq!(config.tail.default_interval_secs, 5);
         assert_eq!(config.tail.max_events, 1000);
     }
 
