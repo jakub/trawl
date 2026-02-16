@@ -40,6 +40,9 @@ pub enum StreamEvent {
     Row(Vec<fleet_engine::value::Value>),
     /// Server-side error message.
     Error(String),
+    /// Back-pressure notification: the subscriber fell behind and
+    /// missed `n` event batches from the bus.
+    Lagged(u64),
 }
 
 // -- re-exports from fleet-api -----------------------------------------------

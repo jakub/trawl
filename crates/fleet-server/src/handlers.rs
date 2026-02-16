@@ -3,7 +3,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::IntoResponse;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::{Extension, Json};
 use fleet_api::{
     CancelResponse, CreateSavedRequest, DeleteSavedResponse, ExportRequest, FieldValuesResponse,
@@ -725,61 +725,108 @@ fn value_to_string(value: &Value) -> String {
     }
 }
 
-/// `GET /api/v1/stream` — stream query results via Server-Sent Events (SSE).
+/// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
 ///
-/// Re-executes the query at regular intervals and streams new results.
-/// Used for live tail mode in the TUI (F9 toggle).
+/// Subscribes to the event bus and filters incoming events in-memory
+/// using [`CompiledFilter`]. Each matching event is streamed individually
+/// as an SSE `data` event. Falls back to poll-based re-execution when
+/// the event bus is not available (ingest disabled).
 pub async fn stream_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
     Query(params): Query<StreamParams>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ServerError> {
+) -> Result<
+    Sse<
+        KeepAliveStream<
+            std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>>,
+        >,
+    >,
+    ServerError,
+> {
     if !verified.role.has_permission(Permission::Query) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
     let query_dsl = params.query.clone();
-    let interval_secs = params.interval.unwrap_or(5).clamp(1, 60);
 
     tracing::info!(
         event_type = "stream_start",
         user = %verified.name,
         query = %query_dsl,
-        interval = interval_secs,
         "starting SSE stream"
     );
 
-    // Create SSE event stream using async-stream for cleaner async code.
-    let pool = state.query.pool.clone();
-    let timeout = Duration::from_secs(state.query.timeout_secs);
+    // Parse and compile the filter once upfront.
+    let ast = fleet_core::parser::parse(&query_dsl)
+        .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
+    let filter = fleet_core::filter::CompiledFilter::compile(&ast.search);
 
-    let event_stream = async_stream::stream! {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    let event_stream: std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>,
+    > = if let Some(ref bus) = state.ingest.event_bus {
+        // Event bus available — real-time push-based streaming.
+        use crate::bus::EventSubscriber;
+        let mut subscriber = crate::bus::EventBus::subscribe(bus.as_ref());
 
-        loop {
-            interval.tick().await;
-
-            match pool.execute(&query_dsl, timeout).await {
-                Ok(result) => {
-                    // Emit each row as a data event.
-                    for row in &result.rows {
-                        if let Ok(json) = serde_json::to_string(&row) {
-                            yield Ok(Event::default().event("data").data(json));
+        Box::pin(async_stream::stream! {
+            loop {
+                match subscriber.recv().await {
+                    Ok(batch) => {
+                        for event in &batch.events {
+                            if filter.matches(event) {
+                                let json = serde_json::to_string(event).unwrap_or_default();
+                                yield Ok(Event::default().event("data").data(json));
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    let error_msg = e.safe_message();
-                    tracing::warn!(
-                        event_type = "stream_query_error",
-                        error = %error_msg,
-                        "stream query failed"
-                    );
-                    let error_json = serde_json::json!({ "error": error_msg }).to_string();
-                    yield Ok(Event::default().event("error").data(error_json));
+                    Err(crate::bus::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            event_type = "stream_lagged",
+                            missed = n,
+                            "stream subscriber fell behind"
+                        );
+                        let payload = serde_json::json!({ "missed": n }).to_string();
+                        yield Ok(Event::default().event("lagged").data(payload));
+                    }
+                    Err(crate::bus::RecvError::Closed) => {
+                        break;
+                    }
                 }
             }
-        }
+        })
+    } else {
+        // No event bus — fall back to poll-based re-execution.
+        let interval_secs = params.interval.unwrap_or(5).clamp(1, 60);
+        let pool = state.query.pool.clone();
+        let timeout = Duration::from_secs(state.query.timeout_secs);
+
+        Box::pin(async_stream::stream! {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+
+            loop {
+                interval.tick().await;
+
+                match pool.execute(&query_dsl, timeout).await {
+                    Ok(result) => {
+                        for row in &result.rows {
+                            if let Ok(json) = serde_json::to_string(&row) {
+                                yield Ok(Event::default().event("data").data(json));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = e.safe_message();
+                        tracing::warn!(
+                            event_type = "stream_query_error",
+                            error = %error_msg,
+                            "stream query failed"
+                        );
+                        let error_json = serde_json::json!({ "error": error_msg }).to_string();
+                        yield Ok(Event::default().event("error").data(error_json));
+                    }
+                }
+            }
+        })
     };
 
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
@@ -790,7 +837,7 @@ pub async fn stream_query(
 pub struct StreamParams {
     /// The DSL query to execute repeatedly.
     pub query: String,
-    /// Interval in seconds (1-60, default 5).
+    /// Interval in seconds (1-60, default 5, used for poll-based fallback).
     #[serde(default)]
     pub interval: Option<u64>,
 }

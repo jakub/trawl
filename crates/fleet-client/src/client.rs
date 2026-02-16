@@ -348,6 +348,16 @@ impl HttpClient {
                                 yield StreamEvent::Error(data);
                             }
                         }
+                        Some("lagged") => {
+                            if let Some(data) = event_data {
+                                // Parse {"missed": N} payload.
+                                let missed = serde_json::from_str::<serde_json::Value>(&data)
+                                    .ok()
+                                    .and_then(|v| v.get("missed")?.as_u64())
+                                    .unwrap_or(0);
+                                yield StreamEvent::Lagged(missed);
+                            }
+                        }
                         _ => {} // ignore keep-alive, etc.
                     }
                 }

@@ -772,6 +772,13 @@ impl App {
                     Ok(StreamEvent::Error(msg)) => {
                         tracing::error!("stream error event: {msg}");
                     }
+                    Ok(StreamEvent::Lagged(n)) => {
+                        tracing::warn!(
+                            event_type = "stream_lagged",
+                            missed = n,
+                            "stream subscriber fell behind"
+                        );
+                    }
                     Err(e) => {
                         tracing::error!("stream error: {e}");
                         break;
