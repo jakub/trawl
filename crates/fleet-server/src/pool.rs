@@ -96,9 +96,17 @@ fn run_query_blocking(
                 .path()
                 .to_str()
                 .expect("temp file path is valid UTF-8");
-            executor
-                .run_query_with_hot(dsl, source, hot_path, max_result_rows)
-                .map_err(ServerError::from)
+            let composite = executor.run_query_with_hot(dsl, source, hot_path, max_result_rows);
+            // When the primary parquet source has no files, the composite
+            // query returns QueryResult::empty() (columns AND rows empty).
+            // Fall back to querying just the hot source so events ingested
+            // before the first compaction are still visible.
+            match composite {
+                Ok(ref r) if r.columns.is_empty() && r.rows.is_empty() => executor
+                    .run_query(dsl, hot_path, max_result_rows)
+                    .map_err(ServerError::from),
+                other => other.map_err(ServerError::from),
+            }
         } else {
             executor
                 .run_query(dsl, source, max_result_rows)

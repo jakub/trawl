@@ -55,7 +55,7 @@ pub fn spawn_compaction(
 }
 
 /// Run one compaction cycle.
-async fn compact_once(
+pub async fn compact_once(
     wal_dir: &Path,
     data_dir: &Path,
     min_age: Duration,

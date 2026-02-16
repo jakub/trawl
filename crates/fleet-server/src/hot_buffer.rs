@@ -102,7 +102,7 @@ impl HotBuffer {
             return None;
         }
 
-        let mut tmpfile = tempfile::NamedTempFile::new().ok()?;
+        let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
 
         for batch in map.values() {
             for event in &batch.events {
