@@ -720,8 +720,20 @@ fn value_to_string(value: &Value) -> String {
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Array(_) => value.to_string(),
+        Value::String(s) => sanitize_csv_formula(s),
+        Value::Array(_) => sanitize_csv_formula(&value.to_string()),
+    }
+}
+
+/// Prefix cell values that could trigger formula injection in spreadsheets.
+///
+/// See OWASP CSV injection guidelines. Only string values need
+/// sanitization — numeric values like `-42` are legitimately negative.
+fn sanitize_csv_formula(s: &str) -> String {
+    if s.starts_with(['=', '+', '-', '@', '\t', '|']) {
+        format!("'{s}")
+    } else {
+        s.to_owned()
     }
 }
 
@@ -816,4 +828,55 @@ pub async fn stream_query(
 pub struct StreamParams {
     /// The DSL query to filter live events.
     pub query: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_csv_formula_prefixes_dangerous_chars() {
+        assert_eq!(sanitize_csv_formula("=SUM(A1:A10)"), "'=SUM(A1:A10)");
+        assert_eq!(sanitize_csv_formula("+cmd"), "'+cmd");
+        assert_eq!(sanitize_csv_formula("-cmd"), "'-cmd");
+        assert_eq!(sanitize_csv_formula("@import"), "'@import");
+        assert_eq!(sanitize_csv_formula("\tcmd"), "'\tcmd");
+        assert_eq!(sanitize_csv_formula("|cmd"), "'|cmd");
+    }
+
+    #[test]
+    fn sanitize_csv_formula_passes_safe_strings() {
+        assert_eq!(sanitize_csv_formula("hello"), "hello");
+        assert_eq!(sanitize_csv_formula("200"), "200");
+        assert_eq!(sanitize_csv_formula("normal text"), "normal text");
+        assert_eq!(sanitize_csv_formula(""), "");
+    }
+
+    #[test]
+    fn value_to_string_sanitizes_strings() {
+        let val = Value::String("=DROP TABLE".to_owned());
+        assert_eq!(value_to_string(&val), "'=DROP TABLE");
+    }
+
+    #[test]
+    fn value_to_string_does_not_sanitize_numbers() {
+        assert_eq!(value_to_string(&Value::Integer(-42)), "-42");
+        assert_eq!(value_to_string(&Value::Float(-1.5)), "-1.5");
+    }
+
+    #[test]
+    fn csv_generation_sanitizes_string_values() {
+        let result = QueryResult {
+            columns: vec![fleet_engine::value::Column {
+                name: "cmd".to_owned(),
+            }],
+            rows: vec![
+                vec![Value::String("=evil()".to_owned())],
+                vec![Value::String("safe".to_owned())],
+            ],
+        };
+        let csv = generate_csv(&result);
+        assert!(csv.contains("'=evil()"));
+        assert!(csv.contains("safe"));
+    }
 }
