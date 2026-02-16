@@ -24,7 +24,11 @@ pub struct IngestBatch {
     pub service: Arc<str>,
     /// Parsed event objects ready for in-memory filtering.
     pub events: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// Approximate size in bytes (from serialized ndjson).
+    /// Approximate size in bytes (serialized ndjson byte count).
+    ///
+    /// This is the on-wire/on-disk size, not the in-memory representation
+    /// size. The in-memory `Map<String, Value>` uses ~3-5x more memory
+    /// due to allocator overhead, hash table structure, and `String` headers.
     pub byte_size: usize,
     /// Set to `true` by compaction before writing parquet.
     /// Snapshot generation skips batches with this flag set.

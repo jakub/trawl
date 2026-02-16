@@ -27,6 +27,12 @@ pub struct HotBufferConfig {
     /// Maximum number of events across all batches.
     pub max_events: usize,
     /// Maximum estimated memory usage in bytes (from ndjson byte sizes).
+    ///
+    /// This is the serialized ndjson byte count, which underestimates
+    /// actual in-memory usage by ~3-5x (in-memory `Map<String, Value>`
+    /// has allocator overhead, hash table buckets, `String` headers, etc.).
+    /// Set this conservatively — e.g. to 1/4 of the actual memory budget
+    /// you want to allocate for the hot buffer.
     pub max_bytes: usize,
 }
 
