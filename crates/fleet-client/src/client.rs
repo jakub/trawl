@@ -304,10 +304,9 @@ impl HttpClient {
     pub async fn stream_events(
         &self,
         query: &str,
-        interval_secs: Option<u64>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ClientError>> + Send>>, ClientError>
     {
-        let resp = self.stream(query, interval_secs).await?;
+        let resp = self.stream(query).await?;
         let byte_stream = resp.bytes_stream();
 
         let event_stream = async_stream::try_stream! {
@@ -336,11 +335,11 @@ impl HttpClient {
                     match event_type.as_deref() {
                         Some("data") => {
                             if let Some(data) = event_data {
-                                let row: Vec<fleet_engine::value::Value> =
+                                let event: serde_json::Map<String, serde_json::Value> =
                                     serde_json::from_str(&data).map_err(|e| {
-                                        ClientError::Parse(format!("invalid stream row: {e}"))
+                                        ClientError::Parse(format!("invalid stream event: {e}"))
                                     })?;
-                                yield StreamEvent::Row(row);
+                                yield StreamEvent::Event(event);
                             }
                         }
                         Some("error") => {
@@ -368,20 +367,13 @@ impl HttpClient {
     }
 
     /// Raw SSE stream connection (internal — use [`stream_events`](Self::stream_events) instead).
-    async fn stream(
-        &self,
-        query: &str,
-        interval_secs: Option<u64>,
-    ) -> Result<reqwest::Response, ClientError> {
+    async fn stream(&self, query: &str) -> Result<reqwest::Response, ClientError> {
         let url = self.endpoint("/api/v1/stream");
 
-        let mut req = self.client.get(&url).query(&[("query", query)]);
-
-        if let Some(interval) = interval_secs {
-            req = req.query(&[("interval", interval.to_string())]);
-        }
-
-        let resp = req
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("query", query)])
             .header("Authorization", self.auth_header_value())
             .send()
             .await

@@ -36,7 +36,9 @@ pub(crate) struct ExportRequestRef<'a> {
 /// A single event from a live query stream.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    /// A result row.
+    /// A log event as a named-field map (from SSE stream).
+    Event(serde_json::Map<String, serde_json::Value>),
+    /// A result row (columnar, for non-streaming use).
     Row(Vec<fleet_engine::value::Value>),
     /// Server-side error message.
     Error(String),
