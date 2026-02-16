@@ -73,7 +73,15 @@ fn emit_search_token(token: &SearchToken, state: &mut EmitterState) {
                         _ => {
                             let val = coerce_filter_value(v);
                             let placeholder = state.push_param(val);
-                            state.push_where(format!("{field} {sql_op} {placeholder}"));
+                            if ff.op == FilterOp::Ne {
+                                // SQL three-valued logic: NULL != x → UNKNOWN → filtered out.
+                                // Include NULLs explicitly so != behaves as users expect.
+                                state.push_where(format!(
+                                    "({field} {sql_op} {placeholder} OR {field} IS NULL)"
+                                ));
+                            } else {
+                                state.push_where(format!("{field} {sql_op} {placeholder}"));
+                            }
                         }
                     }
                 }
