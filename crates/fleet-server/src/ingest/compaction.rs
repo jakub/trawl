@@ -79,16 +79,20 @@ pub async fn compact_once(
                 "compacting service batch"
             );
 
+            // Mark hot buffer batches as draining BEFORE writing parquet,
+            // so concurrent snapshots skip them (prevents TOCTOU duplicates).
+            let batch_ids: Vec<&str> = wal_files
+                .iter()
+                .filter_map(|f| f.file_stem()?.to_str())
+                .collect();
+            if let Some(buf) = &hot_buffer {
+                buf.mark_draining(&batch_ids);
+            }
+
             match compact_service_batch(wal_files, data_dir, service).await {
                 Ok(()) => {
-                    // Drain corresponding batches from the hot buffer.
-                    // This must happen BEFORE WAL file deletion so that
-                    // events remain visible in queries during the transition.
+                    // Remove fully compacted batches from the hot buffer.
                     if let Some(buf) = &hot_buffer {
-                        let batch_ids: Vec<&str> = wal_files
-                            .iter()
-                            .filter_map(|f| f.file_stem()?.to_str())
-                            .collect();
                         buf.drain(&batch_ids);
                     }
 

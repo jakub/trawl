@@ -99,6 +99,7 @@ pub async fn ingest(
     // Write ndjson to WAL atomically.
     let service_clone = parsed.service.clone();
     let ndjson = parsed.ndjson;
+    let ndjson_byte_size = ndjson.len();
     let wal_path = tokio::task::spawn_blocking({
         let wal_writer = Arc::clone(wal_writer);
         move || wal_writer.write(&service_clone, &ndjson)
@@ -117,7 +118,9 @@ pub async fn ingest(
         let batch = Arc::new(IngestBatch {
             batch_id,
             service: Arc::from(parsed.service.as_str()),
+            byte_size: ndjson_byte_size,
             events: parsed.maps,
+            draining: std::sync::atomic::AtomicBool::new(false),
         });
         let subscribers = bus.publish(batch);
         tracing::debug!(subscribers, "published batch to event bus");

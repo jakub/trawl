@@ -6,14 +6,17 @@
 //! with the parquet source.
 //!
 //! Key invariant: a batch is in exactly one place at any time — hot
-//! buffer xor parquet. Compaction drains batches by their WAL filename
-//! stem (batch ID), eliminating dedup concerns.
+//! buffer xor parquet. Compaction marks batches as draining (via
+//! [`mark_draining`](HotBuffer::mark_draining)) before writing
+//! parquet, then calls [`drain`](HotBuffer::drain) after the write
+//! completes. Snapshots skip draining batches, eliminating the
+//! TOCTOU window where events could appear in both sources.
 
-use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use indexmap::IndexMap;
 use parking_lot::RwLock;
 
 use crate::bus::{EventBus as _, EventSubscriber as _, IngestBatch, LocalEventBus, RecvError};
@@ -23,18 +26,19 @@ use crate::bus::{EventBus as _, EventSubscriber as _, IngestBatch, LocalEventBus
 pub struct HotBufferConfig {
     /// Maximum number of events across all batches.
     pub max_events: usize,
-    /// Maximum estimated memory usage in bytes (rough heuristic).
+    /// Maximum estimated memory usage in bytes (from ndjson byte sizes).
     pub max_bytes: usize,
 }
 
 /// Batch-keyed in-memory event store.
 ///
-/// Uses a `BTreeMap` for deterministic iteration order (oldest-first
-/// eviction) keyed by batch ID (WAL filename stem).
+/// Uses an `IndexMap` for insertion-order iteration (oldest-first
+/// FIFO eviction) keyed by batch ID (WAL filename stem).
 #[derive(Debug)]
 pub struct HotBuffer {
-    batches: RwLock<BTreeMap<Arc<str>, Arc<IngestBatch>>>,
+    batches: RwLock<IndexMap<Arc<str>, Arc<IngestBatch>>>,
     total_events: AtomicUsize,
+    total_bytes: AtomicUsize,
     config: HotBufferConfig,
 }
 
@@ -42,30 +46,35 @@ impl HotBuffer {
     /// Create a new hot buffer with the given limits.
     pub fn new(config: HotBufferConfig) -> Self {
         Self {
-            batches: RwLock::new(BTreeMap::new()),
+            batches: RwLock::new(IndexMap::new()),
             total_events: AtomicUsize::new(0),
+            total_bytes: AtomicUsize::new(0),
             config,
         }
     }
 
     /// Insert a batch into the buffer.
     ///
-    /// If insertion would exceed limits, the oldest batches are evicted
-    /// first (logged as warnings).
+    /// If insertion would exceed either the event or byte limit,
+    /// the oldest batches are evicted first (logged as warnings).
     pub fn insert(&self, batch: Arc<IngestBatch>) {
         let event_count = batch.events.len();
+        let byte_count = batch.byte_size;
 
-        // Evict oldest batches if over the event limit.
+        // Evict oldest batches if over either limit.
         {
             let mut map = self.batches.write();
-            while self.total_events.load(Ordering::Relaxed) + event_count > self.config.max_events {
-                if let Some((evicted_id, evicted)) = map.pop_first() {
+            while self.over_limit(event_count, byte_count) {
+                if let Some((evicted_id, evicted)) = map.shift_remove_index(0) {
                     self.total_events
                         .fetch_sub(evicted.events.len(), Ordering::Relaxed);
+                    self.total_bytes
+                        .fetch_sub(evicted.byte_size, Ordering::Relaxed);
                     tracing::warn!(
                         batch_id = %evicted_id,
                         events = evicted.events.len(),
-                        "hot buffer evicted batch (over event limit)"
+                        bytes = evicted.byte_size,
+                        "hot buffer evicted batch (over limit)"
                     );
                 } else {
                     break;
@@ -73,29 +82,55 @@ impl HotBuffer {
             }
 
             self.total_events.fetch_add(event_count, Ordering::Relaxed);
+            self.total_bytes.fetch_add(byte_count, Ordering::Relaxed);
             map.insert(Arc::clone(&batch.batch_id), batch);
+        }
+    }
+
+    /// Check if adding `extra_events` / `extra_bytes` would exceed limits.
+    fn over_limit(&self, extra_events: usize, extra_bytes: usize) -> bool {
+        self.total_events.load(Ordering::Relaxed) + extra_events > self.config.max_events
+            || self.total_bytes.load(Ordering::Relaxed) + extra_bytes > self.config.max_bytes
+    }
+
+    /// Mark batches as draining before compaction writes parquet.
+    ///
+    /// Sets the `draining` flag on matching batches so that
+    /// [`snapshot_to_tempfile`](Self::snapshot_to_tempfile) skips them.
+    /// Uses a read lock only — `AtomicBool` provides interior mutability.
+    pub fn mark_draining(&self, batch_ids: &[&str]) {
+        let map = self.batches.read();
+        for id in batch_ids {
+            if let Some(batch) = map.get(*id) {
+                batch
+                    .draining
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
     /// Remove batches that have been compacted to parquet.
     ///
-    /// Called after compaction deletes WAL files — the same batch IDs
+    /// Called after compaction writes parquet — the same batch IDs
     /// are drained from the hot buffer.
     pub fn drain(&self, batch_ids: &[&str]) {
         let mut map = self.batches.write();
         for id in batch_ids {
-            if let Some(removed) = map.remove(*id) {
+            if let Some(removed) = map.shift_remove(*id) {
                 self.total_events
                     .fetch_sub(removed.events.len(), Ordering::Relaxed);
+                self.total_bytes
+                    .fetch_sub(removed.byte_size, Ordering::Relaxed);
             }
         }
     }
 
-    /// Write all buffered events to a temporary ndjson file.
+    /// Write all non-draining buffered events to a temporary ndjson file.
     ///
-    /// Returns `None` if the buffer is empty. The returned `NamedTempFile`
-    /// auto-deletes on drop, so the caller must hold it alive for the
-    /// duration of the query.
+    /// Returns `None` if the buffer is empty or all batches are draining.
+    /// Also returns `None` on I/O errors (logged). The returned
+    /// `NamedTempFile` auto-deletes on drop, so the caller must hold it
+    /// alive for the duration of the query.
     pub fn snapshot_to_tempfile(&self) -> Option<tempfile::NamedTempFile> {
         let map = self.batches.read();
         if map.is_empty() {
@@ -103,15 +138,25 @@ impl HotBuffer {
         }
 
         let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
+        let mut wrote_any = false;
 
         for batch in map.values() {
+            // Skip batches being drained by compaction.
+            if batch.draining.load(Ordering::Relaxed) {
+                continue;
+            }
+
             for event in &batch.events {
                 // Serialization failure here is very unlikely (we parsed it
                 // successfully during ingest), but log and skip rather than
                 // poisoning the entire snapshot.
                 match serde_json::to_writer(&mut tmpfile, event) {
                     Ok(()) => {
-                        let _ = tmpfile.write_all(b"\n");
+                        if let Err(e) = tmpfile.write_all(b"\n") {
+                            tracing::error!(error = %e, "hot buffer snapshot write failed");
+                            return None;
+                        }
+                        wrote_any = true;
                     }
                     Err(e) => {
                         tracing::error!(
@@ -124,8 +169,15 @@ impl HotBuffer {
             }
         }
 
+        if !wrote_any {
+            return None;
+        }
+
         // Flush to ensure DuckDB can read the file.
-        let _ = tmpfile.flush();
+        if let Err(e) = tmpfile.flush() {
+            tracing::error!(error = %e, "hot buffer snapshot flush failed");
+            return None;
+        }
 
         Some(tmpfile)
     }
@@ -133,6 +185,11 @@ impl HotBuffer {
     /// Total number of events across all batches.
     pub fn event_count(&self) -> usize {
         self.total_events.load(Ordering::Relaxed)
+    }
+
+    /// Total estimated bytes across all batches.
+    pub fn byte_count(&self) -> usize {
+        self.total_bytes.load(Ordering::Relaxed)
     }
 
     /// Number of batches in the buffer.
@@ -185,6 +242,8 @@ pub fn spawn_hot_buffer_consumer(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     fn make_batch(id: &str, n: usize) -> Arc<IngestBatch> {
@@ -202,7 +261,30 @@ mod tests {
         Arc::new(IngestBatch {
             batch_id: id.into(),
             service: "test".into(),
+            byte_size: n * 50, // rough estimate
             events,
+            draining: AtomicBool::new(false),
+        })
+    }
+
+    fn make_batch_with_bytes(id: &str, n: usize, byte_size: usize) -> Arc<IngestBatch> {
+        let events: Vec<_> = (0..n)
+            .map(|i| {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "message".into(),
+                    serde_json::Value::String(format!("event_{i}")),
+                );
+                m.insert("service".into(), serde_json::Value::String("test".into()));
+                m
+            })
+            .collect();
+        Arc::new(IngestBatch {
+            batch_id: id.into(),
+            service: "test".into(),
+            byte_size,
+            events,
+            draining: AtomicBool::new(false),
         })
     }
 
@@ -243,22 +325,82 @@ mod tests {
     }
 
     #[test]
-    fn eviction_removes_oldest() {
+    fn eviction_removes_oldest_by_insertion_order() {
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 5,
             max_bytes: 10_000_000,
         });
-        buf.insert(make_batch("aaa_001", 3));
-        buf.insert(make_batch("bbb_002", 3));
-        // Inserting 3 more events when we already have 3 (aaa evicted, bbb stays)
-        // should evict aaa_001 (oldest per BTreeMap order).
+        // Insert "zzz" first, then "aaa" — FIFO should evict "zzz" first
+        // even though it sorts last lexicographically.
+        buf.insert(make_batch("zzz_001", 3));
+        buf.insert(make_batch("aaa_002", 3));
+        // Inserting 3 more events when limit is 5: must evict zzz (oldest inserted).
         assert_eq!(buf.event_count(), 3);
         assert_eq!(buf.batch_count(), 1);
 
-        // Only bbb_002 should remain.
+        // Only aaa_002 should remain.
         let tmpfile = buf.snapshot_to_tempfile().unwrap();
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         assert_eq!(content.lines().count(), 3);
+    }
+
+    #[test]
+    fn eviction_by_bytes_limit() {
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1_000_000, // effectively unlimited
+            max_bytes: 500,
+        });
+        buf.insert(make_batch_with_bytes("batch_001", 2, 300));
+        buf.insert(make_batch_with_bytes("batch_002", 2, 300));
+        // 300 + 300 = 600 > 500, so batch_001 should be evicted.
+        assert_eq!(buf.event_count(), 2);
+        assert_eq!(buf.byte_count(), 300);
+        assert_eq!(buf.batch_count(), 1);
+    }
+
+    #[test]
+    fn drain_updates_byte_count() {
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        });
+        buf.insert(make_batch_with_bytes("batch_001", 2, 200));
+        buf.insert(make_batch_with_bytes("batch_002", 3, 400));
+        assert_eq!(buf.byte_count(), 600);
+
+        buf.drain(&["batch_001"]);
+        assert_eq!(buf.byte_count(), 400);
+    }
+
+    #[test]
+    fn mark_draining_excludes_from_snapshot() {
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        });
+        buf.insert(make_batch("batch_001", 2));
+        buf.insert(make_batch("batch_002", 3));
+
+        buf.mark_draining(&["batch_001"]);
+
+        let tmpfile = buf
+            .snapshot_to_tempfile()
+            .expect("should have non-draining events");
+        let content = std::fs::read_to_string(tmpfile.path()).unwrap();
+        // Only batch_002's 3 events should be in the snapshot.
+        assert_eq!(content.lines().count(), 3);
+    }
+
+    #[test]
+    fn all_draining_returns_none() {
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        });
+        buf.insert(make_batch("batch_001", 2));
+        buf.mark_draining(&["batch_001"]);
+
+        assert!(buf.snapshot_to_tempfile().is_none());
     }
 
     #[test]

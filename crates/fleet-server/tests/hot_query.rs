@@ -5,6 +5,7 @@
 //! and that compaction drains the buffer without introducing duplicates.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -82,10 +83,13 @@ async fn hot_buffer_makes_events_immediately_queryable() {
 
     // Publish to bus (simulating what the ingest handler does).
     let batch_id: Arc<str> = wal_path.file_stem().unwrap().to_str().unwrap().into();
+    let ndjson_bytes = ndjson.len();
     let batch = Arc::new(IngestBatch {
         batch_id,
         service: "nginx".into(),
+        byte_size: ndjson_bytes,
         events: events.clone(),
+        draining: AtomicBool::new(false),
     });
     bus.publish(batch);
 
@@ -188,7 +192,9 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     let batch1 = Arc::new(IngestBatch {
         batch_id: wal1.file_stem().unwrap().to_str().unwrap().into(),
         service: "nginx".into(),
+        byte_size: ndjson1.len(),
         events: batch1_events,
+        draining: AtomicBool::new(false),
     });
     bus.publish(batch1);
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -213,7 +219,9 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     let batch2 = Arc::new(IngestBatch {
         batch_id: "batch2_manual".into(),
         service: "nginx".into(),
+        byte_size: ndjson2.len(),
         events: batch2_events,
+        draining: AtomicBool::new(false),
     });
     bus.publish(batch2);
     tokio::time::sleep(Duration::from_millis(100)).await;

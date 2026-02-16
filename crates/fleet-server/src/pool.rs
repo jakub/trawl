@@ -88,21 +88,34 @@ fn run_query_blocking(
     // are visible to this query via UNION ALL BY NAME.
     let hot_tempfile = hot_buffer.and_then(|hb| hb.snapshot_to_tempfile());
 
+    // Filter out hot files whose paths aren't valid UTF-8 (required by
+    // DuckDB's file reader). This is extremely unlikely on any modern OS
+    // but avoids a panic in production.
+    let hot_tempfile = hot_tempfile.and_then(|f| {
+        if f.path().to_str().is_some() {
+            Some(f)
+        } else {
+            tracing::warn!("hot buffer temp file path is not valid UTF-8, skipping hot source");
+            None
+        }
+    });
+
     // catch_unwind ensures the executor is always returned to the
     // pool even if DuckDB panics (e.g. corrupt parquet file).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(ref hot_file) = hot_tempfile {
-            let hot_path = hot_file
-                .path()
-                .to_str()
-                .expect("temp file path is valid UTF-8");
+            // Safety: we verified UTF-8 validity above.
+            let hot_path = hot_file.path().to_str().unwrap_or_default();
             let composite = executor.run_query_with_hot(dsl, source, hot_path, max_result_rows);
             // When the primary parquet source has no files, the composite
-            // query returns QueryResult::empty() (columns AND rows empty).
-            // Fall back to querying just the hot source so events ingested
-            // before the first compaction are still visible.
+            // query may return an empty result or an error. Fall back to
+            // querying just the hot source so events ingested before the
+            // first compaction are still visible.
             match composite {
                 Ok(ref r) if r.columns.is_empty() && r.rows.is_empty() => executor
+                    .run_query(dsl, hot_path, max_result_rows)
+                    .map_err(ServerError::from),
+                Err(_) => executor
                     .run_query(dsl, hot_path, max_result_rows)
                     .map_err(ServerError::from),
                 other => other.map_err(ServerError::from),

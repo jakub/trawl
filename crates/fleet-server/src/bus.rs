@@ -9,13 +9,14 @@
 //! requiring any consumer changes.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// A batch of events published to the bus after a successful WAL write.
 ///
 /// The `batch_id` is the WAL filename stem (e.g. `nginx_1739000000000_abcd`),
 /// which doubles as the coordination key for hot buffer draining after
 /// compaction.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IngestBatch {
     /// WAL filename stem — unique identifier for this batch.
     pub batch_id: Arc<str>,
@@ -23,6 +24,11 @@ pub struct IngestBatch {
     pub service: Arc<str>,
     /// Parsed event objects ready for in-memory filtering.
     pub events: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Approximate size in bytes (from serialized ndjson).
+    pub byte_size: usize,
+    /// Set to `true` by compaction before writing parquet.
+    /// `snapshot_to_tempfile` skips batches with this flag set.
+    pub draining: AtomicBool,
 }
 
 /// Error returned when receiving from a subscriber.
@@ -136,6 +142,8 @@ mod tests {
                 m.insert("message".into(), serde_json::Value::String("hello".into()));
                 m
             }],
+            byte_size: 0,
+            draining: AtomicBool::new(false),
         });
 
         let receivers = bus.publish(Arc::clone(&batch));
@@ -156,6 +164,8 @@ mod tests {
             batch_id: "multi_001".into(),
             service: "test".into(),
             events: vec![],
+            byte_size: 0,
+            draining: AtomicBool::new(false),
         });
 
         let receivers = bus.publish(Arc::clone(&batch));
@@ -178,6 +188,8 @@ mod tests {
                 batch_id: format!("lag_{i}").into(),
                 service: "test".into(),
                 events: vec![],
+                byte_size: 0,
+                draining: AtomicBool::new(false),
             });
             bus.publish(batch);
         }
@@ -216,6 +228,8 @@ mod tests {
             batch_id: "orphan".into(),
             service: "test".into(),
             events: vec![],
+            byte_size: 0,
+            draining: AtomicBool::new(false),
         });
         // Should not panic, returns 0.
         let receivers = bus.publish(batch);
