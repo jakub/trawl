@@ -57,6 +57,10 @@ impl Executor {
     ///
     /// The emitted SQL unions the primary parquet source with a hot buffer
     /// ndjson file via `UNION ALL BY NAME`.
+    ///
+    /// Handles cold-start gracefully: when no parquet files exist yet
+    /// (empty columns = no data source), falls back to querying just the
+    /// hot buffer so events ingested before the first compaction are visible.
     pub fn run_query_with_hot(
         &self,
         dsl: &str,
@@ -66,7 +70,18 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
-        self.execute_emitted(&emitted, max_rows)
+        let result = self.execute_emitted(&emitted, max_rows);
+        match &result {
+            // Columns present → real result (possibly empty rows). Return as-is.
+            Ok(r) if !r.columns.is_empty() => result,
+            // No columns (no parquet source files) OR database error
+            // (UNION fails on missing source) → fall back to hot-only.
+            Ok(_) | Err(EngineError::Database(_)) => {
+                let hot_emitted = emitter::emit(&ast, hot_source)?;
+                self.execute_emitted(&hot_emitted, max_rows)
+            }
+            Err(_) => result,
+        }
     }
 
     /// Execute a pre-emitted query (SQL + params) against `DuckDB`.

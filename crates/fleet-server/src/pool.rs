@@ -106,20 +106,9 @@ fn run_query_blocking(
         if let Some(ref hot_file) = hot_tempfile {
             // Safety: we verified UTF-8 validity above.
             let hot_path = hot_file.path().to_str().unwrap_or_default();
-            let composite = executor.run_query_with_hot(dsl, source, hot_path, max_result_rows);
-            // When the primary parquet source has no files, the composite
-            // query may return an empty result or an error. Fall back to
-            // querying just the hot source so events ingested before the
-            // first compaction are still visible.
-            match composite {
-                Ok(ref r) if r.columns.is_empty() && r.rows.is_empty() => executor
-                    .run_query(dsl, hot_path, max_result_rows)
-                    .map_err(ServerError::from),
-                Err(_) => executor
-                    .run_query(dsl, hot_path, max_result_rows)
-                    .map_err(ServerError::from),
-                other => other.map_err(ServerError::from),
-            }
+            executor
+                .run_query_with_hot(dsl, source, hot_path, max_result_rows)
+                .map_err(ServerError::from)
         } else {
             executor
                 .run_query(dsl, source, max_result_rows)
