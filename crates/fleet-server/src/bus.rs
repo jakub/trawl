@@ -16,6 +16,10 @@ use std::sync::atomic::AtomicBool;
 /// The `batch_id` is the WAL filename stem (e.g. `nginx_1739000000000_abcd`),
 /// which doubles as the coordination key for hot buffer draining after
 /// compaction.
+///
+/// Always wrapped in `Arc<IngestBatch>` — the event bus publishes `Arc` clones
+/// to all subscribers, the hot buffer stores `Arc` references, and SSE streaming
+/// iterates `&batch.events`. No cloning of the `Vec<Map>` occurs.
 #[derive(Debug)]
 pub struct IngestBatch {
     /// WAL filename stem — unique identifier for this batch.
