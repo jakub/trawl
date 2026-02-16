@@ -275,6 +275,23 @@ mod tests {
     }
 
     #[test]
+    fn test_field_filter_ne() {
+        let result = search_stage()
+            .parse("service:!=kernel")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups[0].len(), 1);
+        assert_eq!(
+            result.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "service".to_string(),
+                op: FilterOp::Ne,
+                value: FilterValue::Literal("kernel".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn test_field_filter_list() {
         let result = search_stage()
             .parse("status:200,301,404")
