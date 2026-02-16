@@ -1,7 +1,10 @@
 //! Application state (tabs, focus, queries).
 
-use fleet_client::QueryResponse;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+
+use fleet_client::{PaginationMeta, QueryResponse};
+use fleet_engine::value::{Column, QueryResult, Value};
 
 /// Which pane has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +227,100 @@ impl SimpleEditor {
     }
 }
 
+/// Rolling buffer for live-streamed log events.
+///
+/// Tracks columns via union of all seen field names and maintains
+/// a bounded deque of rows. When new fields appear mid-stream,
+/// existing rows are extended with `Value::Null`.
+pub struct LiveBuffer {
+    /// Ordered column names (insertion order preserved).
+    column_names: Vec<String>,
+    /// Column name -> index for O(1) lookup.
+    column_index: HashMap<String, usize>,
+    /// Bounded row buffer (newest at back).
+    rows: VecDeque<Vec<Value>>,
+    /// Max rows to retain.
+    max_rows: usize,
+}
+
+impl LiveBuffer {
+    /// Create a new empty buffer with the given capacity.
+    pub fn new(max_rows: usize) -> Self {
+        Self {
+            column_names: Vec::new(),
+            column_index: HashMap::new(),
+            rows: VecDeque::new(),
+            max_rows,
+        }
+    }
+
+    /// Push a log event map into the buffer, extending the column union as needed.
+    pub fn push_event(&mut self, event: &serde_json::Map<String, serde_json::Value>) {
+        // Extend column set with any new fields.
+        for key in event.keys() {
+            if !self.column_index.contains_key(key) {
+                let idx = self.column_names.len();
+                self.column_names.push(key.clone());
+                self.column_index.insert(key.clone(), idx);
+
+                // Back-fill existing rows with Null for the new column.
+                for row in &mut self.rows {
+                    row.push(Value::Null);
+                }
+            }
+        }
+
+        // Build the row in column order.
+        let mut row = vec![Value::Null; self.column_names.len()];
+        for (key, json_val) in event {
+            if let Some(&idx) = self.column_index.get(key) {
+                row[idx] = serde_json::from_value(json_val.clone()).unwrap_or(Value::Null);
+            }
+        }
+
+        self.rows.push_back(row);
+
+        // Trim to capacity.
+        while self.rows.len() > self.max_rows {
+            self.rows.pop_front();
+        }
+    }
+
+    /// Snapshot the current buffer state as a `QueryResponse` for rendering.
+    pub fn to_query_response(&self) -> QueryResponse {
+        let columns: Vec<Column> = self
+            .column_names
+            .iter()
+            .map(|name| Column { name: name.clone() })
+            .collect();
+
+        let rows: Vec<Vec<Value>> = self.rows.iter().cloned().collect();
+        let returned = rows.len();
+
+        QueryResponse {
+            result: QueryResult { columns, rows },
+            truncated: false,
+            pagination: PaginationMeta {
+                limit: self.max_rows,
+                offset: 0,
+                returned,
+            },
+        }
+    }
+
+    /// Number of buffered rows.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the buffer is empty.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
 /// A single tab in the TUI.
 #[derive(Debug)]
 pub struct Tab {
@@ -266,5 +363,110 @@ impl Tab {
         self.horizontal_scroll_offset = 0;
         self.status = TabStatus::Idle;
         self.chart_view = ChartView::Table;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_event(
+        pairs: &[(&str, serde_json::Value)],
+    ) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn live_buffer_empty() {
+        let buf = LiveBuffer::new(100);
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+        let resp = buf.to_query_response();
+        assert!(resp.result.columns.is_empty());
+        assert!(resp.result.rows.is_empty());
+    }
+
+    #[test]
+    fn live_buffer_push_single_event() {
+        let mut buf = LiveBuffer::new(100);
+        let event = make_event(&[
+            ("host", serde_json::json!("web-1")),
+            ("level", serde_json::json!("error")),
+        ]);
+        buf.push_event(&event);
+        assert_eq!(buf.len(), 1);
+
+        let resp = buf.to_query_response();
+        assert_eq!(resp.result.columns.len(), 2);
+        assert_eq!(resp.result.rows.len(), 1);
+    }
+
+    #[test]
+    fn live_buffer_column_union_extends_with_nulls() {
+        let mut buf = LiveBuffer::new(100);
+
+        // First event has {host, level}.
+        buf.push_event(&make_event(&[
+            ("host", serde_json::json!("web-1")),
+            ("level", serde_json::json!("info")),
+        ]));
+
+        // Second event has {host, service} — new field appears.
+        buf.push_event(&make_event(&[
+            ("host", serde_json::json!("web-2")),
+            ("service", serde_json::json!("nginx")),
+        ]));
+
+        let resp = buf.to_query_response();
+        assert_eq!(resp.result.columns.len(), 3); // host, level, service
+
+        // First row should have Null for the new "service" column.
+        let first_row = &resp.result.rows[0];
+        assert_eq!(first_row.len(), 3);
+        assert_eq!(first_row[2], Value::Null); // service = Null
+
+        // Second row should have Null for "level".
+        let second_row = &resp.result.rows[1];
+        assert_eq!(second_row[1], Value::Null); // level = Null
+        assert_eq!(second_row[2], Value::String("nginx".to_owned()));
+    }
+
+    #[test]
+    fn live_buffer_caps_at_max_rows() {
+        let mut buf = LiveBuffer::new(3);
+
+        for i in 0..5 {
+            buf.push_event(&make_event(&[("n", serde_json::json!(i))]));
+        }
+
+        assert_eq!(buf.len(), 3);
+
+        let resp = buf.to_query_response();
+        // Should contain events 2, 3, 4 (oldest trimmed).
+        assert_eq!(resp.result.rows[0][0], Value::Integer(2));
+        assert_eq!(resp.result.rows[2][0], Value::Integer(4));
+    }
+
+    #[test]
+    fn live_buffer_handles_mixed_value_types() {
+        let mut buf = LiveBuffer::new(100);
+        buf.push_event(&make_event(&[
+            ("count", serde_json::json!(42)),
+            ("rate", serde_json::json!(1.5)),
+            ("active", serde_json::json!(true)),
+            ("tag", serde_json::json!(null)),
+        ]));
+
+        let resp = buf.to_query_response();
+        let row = &resp.result.rows[0];
+        // serde_json::Map iterates in BTreeMap (alphabetical) order:
+        // active, count, rate, tag
+        assert_eq!(row[0], Value::Boolean(true));
+        assert_eq!(row[1], Value::Integer(42));
+        assert_eq!(row[2], Value::Float(1.5));
+        assert_eq!(row[3], Value::Null);
     }
 }

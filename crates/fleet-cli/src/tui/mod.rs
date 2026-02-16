@@ -9,8 +9,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fleet_client::{
-    HistoryResponse, HttpClient, ListSavedResponse, PaginationMeta, QueryResponse, SchemaResponse,
-    StreamEvent,
+    HistoryResponse, HttpClient, ListSavedResponse, QueryResponse, SchemaResponse, StreamEvent,
 };
 use futures::StreamExt;
 use ratatui::Terminal;
@@ -19,7 +18,7 @@ use std::io;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use self::state::{ChartView, Focus, Popup, Sidebar, Tab, TabStatus};
+use self::state::{ChartView, Focus, LiveBuffer, Popup, Sidebar, Tab, TabStatus};
 use crate::CliError;
 use crate::config::Config;
 
@@ -79,6 +78,8 @@ pub struct App {
     pub should_quit: bool,
     /// Whether live tail mode is active.
     pub live_mode: bool,
+    /// Maximum events to retain in live streaming buffer.
+    max_live_events: usize,
     /// Handle to the live streaming task (if active).
     live_task: Option<tokio::task::JoinHandle<()>>,
     /// Channel for receiving query results from background tasks.
@@ -111,6 +112,7 @@ impl App {
             saved_selected_index: 0,
             should_quit: false,
             live_mode: false,
+            max_live_events: 1000,
             live_task: None,
             query_rx,
             query_tx,
@@ -733,21 +735,15 @@ impl App {
             task.abort();
         }
 
-        // Get column names from existing result (if any) for the stream.
-        let existing_columns = self
-            .active_tab()
-            .result
-            .as_ref()
-            .map(|r| r.result.columns.clone());
-
         let client = self.client.clone();
         let tx = self.query_tx.clone();
         let tab_idx = self.active_tab_idx;
+        let max_events = self.max_live_events;
 
         let task = tokio::spawn(async move {
             tracing::info!("live stream task started");
 
-            let mut stream = match client.stream_events(&query, Some(5)).await {
+            let mut stream = match client.stream_events(&query).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("failed to start stream: {e}");
@@ -760,14 +756,19 @@ impl App {
                 }
             };
 
-            let mut accumulated_rows: Vec<Vec<fleet_engine::value::Value>> = Vec::new();
-            let columns = existing_columns;
+            let mut buffer = LiveBuffer::new(max_events);
+            let mut event_count = 0usize;
 
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(StreamEvent::Row(row)) => {
-                        accumulated_rows.push(row);
-                        tracing::debug!("received stream row, total: {}", accumulated_rows.len());
+                    Ok(StreamEvent::Event(map)) => {
+                        buffer.push_event(&map);
+                        event_count += 1;
+                        tracing::debug!("received stream event, total: {event_count}");
+                    }
+                    Ok(StreamEvent::Row(_)) => {
+                        // Legacy variant — shouldn't appear from SSE stream.
+                        tracing::debug!("ignoring unexpected Row variant in live stream");
                     }
                     Ok(StreamEvent::Error(msg)) => {
                         tracing::error!("stream error event: {msg}");
@@ -785,41 +786,30 @@ impl App {
                     }
                 }
 
-                // Send accumulated rows in batches.
-                if accumulated_rows.len() >= 10 {
-                    let cols = if let Some(ref cols) = columns {
-                        cols.clone()
-                    } else if let Some(first) = accumulated_rows.first() {
-                        (0..first.len())
-                            .map(|i| fleet_engine::value::Column {
-                                name: format!("col_{i}"),
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                    let result = fleet_engine::value::QueryResult {
-                        columns: cols,
-                        rows: std::mem::take(&mut accumulated_rows),
-                    };
-
-                    tracing::debug!("sending batch of {} rows", result.row_count());
+                // Send snapshot every 10 events.
+                if event_count % 10 == 0 && event_count > 0 {
+                    let response = buffer.to_query_response();
+                    tracing::debug!(
+                        "sending live buffer snapshot ({} rows)",
+                        response.result.row_count()
+                    );
 
                     let _ = tx.send(QueryResult {
                         tab_idx,
-                        result: Ok(QueryResponse {
-                            result,
-                            truncated: false,
-                            pagination: PaginationMeta {
-                                limit: 0,
-                                offset: 0,
-                                returned: 0,
-                            },
-                        }),
+                        result: Ok(response),
                         duration: Duration::from_secs(0),
                     });
                 }
+            }
+
+            // Flush remaining events.
+            if !buffer.is_empty() {
+                let response = buffer.to_query_response();
+                let _ = tx.send(QueryResult {
+                    tab_idx,
+                    result: Ok(response),
+                    duration: Duration::from_secs(0),
+                });
             }
 
             tracing::info!("live stream task ended");
@@ -903,6 +893,7 @@ pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliE
 
     // Create app with schema, history, and saved queries.
     let mut app = App::new(client);
+    app.max_live_events = config.tail.max_events;
     app.schema_cache = schema;
     app.history_cache = history;
     app.saved_cache = saved;
