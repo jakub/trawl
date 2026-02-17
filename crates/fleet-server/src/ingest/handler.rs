@@ -77,36 +77,38 @@ pub async fn ingest(
         .as_ref()
         .ok_or_else(|| ServerError::Internal("ingest not enabled".into()))?;
 
-    // Decompress gzip if Content-Encoding header is set.
+    // Decompress, parse, and WAL-write in a single blocking task to avoid
+    // hogging tokio worker threads with CPU-bound gzip/JSON work.
     let compressed = is_gzip(&headers);
     let wire_bytes = body.len();
-    let raw = if compressed {
-        decompress_gzip(&body)?
-    } else {
-        body.to_vec()
-    };
-    let body_bytes = raw.len();
+    let wal_writer = Arc::clone(wal_writer);
 
-    if raw.is_empty() {
-        return Err(ServerError::Ingest("empty request body".into()));
-    }
+    let (parsed, wal_path, body_bytes, ndjson_byte_size) =
+        tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+            let raw = if compressed {
+                decompress_gzip(&body)?
+            } else {
+                body.to_vec()
+            };
+            let body_bytes = raw.len();
 
-    // Parse events from either ndjson or JSON array format.
-    // Always produces ndjson bytes for the WAL regardless of input format.
-    let parsed = parse_events(&raw)?;
+            if raw.is_empty() {
+                return Err(ServerError::Ingest("empty request body".into()));
+            }
+
+            let parsed = parse_events(&raw)?;
+            let ndjson_byte_size = parsed.ndjson.len();
+
+            let wal_path = wal_writer
+                .write(&parsed.service, &parsed.ndjson)
+                .map_err(|e| ServerError::Internal(format!("WAL write failed: {e}")))?;
+
+            Ok((parsed, wal_path, body_bytes, ndjson_byte_size))
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("ingest task panicked: {e}")))??;
+
     let event_count = parsed.maps.len();
-
-    // Write ndjson to WAL atomically.
-    let service_clone = parsed.service.clone();
-    let ndjson = parsed.ndjson;
-    let ndjson_byte_size = ndjson.len();
-    let wal_path = tokio::task::spawn_blocking({
-        let wal_writer = Arc::clone(wal_writer);
-        move || wal_writer.write(&service_clone, &ndjson)
-    })
-    .await
-    .map_err(|e| ServerError::Internal(format!("WAL write task panicked: {e}")))?
-    .map_err(|e| ServerError::Internal(format!("WAL write failed: {e}")))?;
 
     // Publish to event bus (best-effort — WAL is the durability guarantee).
     if let Some(bus) = &state.ingest.event_bus {
