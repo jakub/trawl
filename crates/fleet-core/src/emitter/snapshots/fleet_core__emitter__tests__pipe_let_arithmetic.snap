@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT * EXCLUDE ("duration_ms"), (("duration" * ?)) AS "duration_ms"
+SELECT COLUMNS(c -> c NOT IN ('duration_ms')), (("duration" * ?)) AS "duration_ms"
 FROM "_s0"
 ---
 params:

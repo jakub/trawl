@@ -6,5 +6,5 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT * EXCLUDE ("level"), (LOWER("level")) AS "level"
+SELECT COLUMNS(c -> c NOT IN ('level')), (LOWER("level")) AS "level"
 FROM "_s0"

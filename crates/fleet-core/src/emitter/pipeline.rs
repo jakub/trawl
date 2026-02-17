@@ -200,19 +200,22 @@ fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Resu
     // which must not interleave with WHERE params from prior stages
     ctx.flush_if(FlushCondition::Always);
 
-    let mut excludes = Vec::new();
+    let mut not_in_values = Vec::new();
     let mut computed = Vec::new();
     for (field, expr) in &let_stage.assignments {
         let expr_sql = emit_expr(expr, ctx)?;
         let alias = quote_field(field);
-        excludes.push(alias.clone());
+        // Escape single quotes for the COLUMNS lambda string comparison.
+        let escaped = field.replace('\'', "''");
+        not_in_values.push(format!("'{escaped}'"));
         computed.push(format!("({expr_sql}) AS {alias}"));
     }
 
-    // Use EXCLUDE so that let can override existing columns (e.g. `let level = lower(level)`).
-    // Without EXCLUDE, DuckDB keeps the original and ignores the alias.
-    let exclude_list = excludes.join(", ");
-    let mut items = vec![format!("* EXCLUDE ({exclude_list})")];
+    // Use COLUMNS lambda to filter out columns being overridden. Unlike
+    // `* EXCLUDE (...)`, this tolerates missing columns — crucial for
+    // `let a = expr` when `a` is a new computed field, not an override.
+    let not_in_list = not_in_values.join(", ");
+    let mut items = vec![format!("COLUMNS(c -> c NOT IN ({not_in_list}))")];
     items.extend(computed);
     ctx.select = items;
     ctx.has_projection = true;
