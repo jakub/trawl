@@ -17,6 +17,7 @@ use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
 use fleet_engine::value::{QueryResult, Value};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::convert::Infallible;
 
 use crate::bus::{EventBus, EventSubscriber as _};
@@ -674,8 +675,13 @@ pub struct ExportParams {
 ///
 /// Quotes fields containing commas, newlines, or quotes.
 /// Escapes quotes by doubling them.
+///
+/// Uses `Cow<str>` internally to avoid allocations when no
+/// transformation is needed (the common case for most cells).
 fn generate_csv(result: &QueryResult) -> String {
-    let mut csv = String::new();
+    // Pre-allocate: ~50 bytes per cell average.
+    let estimated = result.rows.len() * result.columns.len() * 50;
+    let mut csv = String::with_capacity(estimated);
 
     // Header row.
     for (i, col) in result.columns.iter().enumerate() {
@@ -692,7 +698,8 @@ fn generate_csv(result: &QueryResult) -> String {
             if i > 0 {
                 csv.push(',');
             }
-            csv.push_str(&quote_csv_field(&value_to_string(value)));
+            let cell = value_to_string(value);
+            csv.push_str(&quote_csv_field(&cell));
         }
         csv.push('\n');
     }
@@ -701,27 +708,34 @@ fn generate_csv(result: &QueryResult) -> String {
 }
 
 /// Quote a CSV field if it contains special characters (comma, newline, quote).
-/// Escape quotes by doubling them.
-fn quote_csv_field(s: &str) -> String {
+/// Escape quotes by doubling them. Returns borrowed when no quoting needed.
+fn quote_csv_field(s: &str) -> Cow<'_, str> {
     let needs_quoting = s.contains(',') || s.contains('\n') || s.contains('"');
 
     if needs_quoting || s.is_empty() {
         let escaped = s.replace('"', "\"\"");
-        format!("\"{escaped}\"")
+        Cow::Owned(format!("\"{escaped}\""))
     } else {
-        s.to_owned()
+        Cow::Borrowed(s)
     }
 }
 
-/// Convert a Value to a string for CSV export.
-fn value_to_string(value: &Value) -> String {
+/// Convert a `Value` to a string for CSV export.
+/// Returns borrowed for string values that don't need sanitization.
+fn value_to_string(value: &Value) -> Cow<'_, str> {
     match value {
-        Value::Null => String::new(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
+        Value::Null => Cow::Borrowed(""),
+        Value::Boolean(b) => Cow::Owned(b.to_string()),
+        Value::Integer(i) => Cow::Owned(i.to_string()),
+        Value::Float(f) => Cow::Owned(f.to_string()),
         Value::String(s) => sanitize_csv_formula(s),
-        Value::Array(_) => sanitize_csv_formula(&value.to_string()),
+        Value::Array(_) => {
+            let s = value.to_string();
+            match sanitize_csv_formula(&s) {
+                Cow::Borrowed(_) => Cow::Owned(s),
+                Cow::Owned(owned) => Cow::Owned(owned),
+            }
+        }
     }
 }
 
@@ -729,11 +743,12 @@ fn value_to_string(value: &Value) -> String {
 ///
 /// See OWASP CSV injection guidelines. Only string values need
 /// sanitization — numeric values like `-42` are legitimately negative.
-fn sanitize_csv_formula(s: &str) -> String {
+/// Returns borrowed when no prefix is needed.
+fn sanitize_csv_formula(s: &str) -> Cow<'_, str> {
     if s.starts_with(['=', '+', '-', '@', '\t', '|']) {
-        format!("'{s}")
+        Cow::Owned(format!("'{s}"))
     } else {
-        s.to_owned()
+        Cow::Borrowed(s)
     }
 }
 
@@ -797,8 +812,11 @@ pub async fn stream_query(
         loop {
             match subscriber.recv().await {
                 Ok(batch) => {
+                    // Compute now once per batch (~100ms intervals) to avoid
+                    // a Utc::now() syscall per event in the time filter.
+                    let now = chrono::Utc::now();
                     for event in &batch.events {
-                        if filter.matches(event) {
+                        if filter.matches_at(event, now) {
                             let json = serde_json::to_string(event).unwrap_or_default();
                             yield Ok(Event::default().event("data").data(json));
                         }
@@ -836,32 +854,35 @@ mod tests {
 
     #[test]
     fn sanitize_csv_formula_prefixes_dangerous_chars() {
-        assert_eq!(sanitize_csv_formula("=SUM(A1:A10)"), "'=SUM(A1:A10)");
-        assert_eq!(sanitize_csv_formula("+cmd"), "'+cmd");
-        assert_eq!(sanitize_csv_formula("-cmd"), "'-cmd");
-        assert_eq!(sanitize_csv_formula("@import"), "'@import");
-        assert_eq!(sanitize_csv_formula("\tcmd"), "'\tcmd");
-        assert_eq!(sanitize_csv_formula("|cmd"), "'|cmd");
+        assert_eq!(
+            sanitize_csv_formula("=SUM(A1:A10)").as_ref(),
+            "'=SUM(A1:A10)"
+        );
+        assert_eq!(sanitize_csv_formula("+cmd").as_ref(), "'+cmd");
+        assert_eq!(sanitize_csv_formula("-cmd").as_ref(), "'-cmd");
+        assert_eq!(sanitize_csv_formula("@import").as_ref(), "'@import");
+        assert_eq!(sanitize_csv_formula("\tcmd").as_ref(), "'\tcmd");
+        assert_eq!(sanitize_csv_formula("|cmd").as_ref(), "'|cmd");
     }
 
     #[test]
     fn sanitize_csv_formula_passes_safe_strings() {
-        assert_eq!(sanitize_csv_formula("hello"), "hello");
-        assert_eq!(sanitize_csv_formula("200"), "200");
-        assert_eq!(sanitize_csv_formula("normal text"), "normal text");
-        assert_eq!(sanitize_csv_formula(""), "");
+        assert_eq!(sanitize_csv_formula("hello").as_ref(), "hello");
+        assert_eq!(sanitize_csv_formula("200").as_ref(), "200");
+        assert_eq!(sanitize_csv_formula("normal text").as_ref(), "normal text");
+        assert_eq!(sanitize_csv_formula("").as_ref(), "");
     }
 
     #[test]
     fn value_to_string_sanitizes_strings() {
         let val = Value::String("=DROP TABLE".to_owned());
-        assert_eq!(value_to_string(&val), "'=DROP TABLE");
+        assert_eq!(value_to_string(&val).as_ref(), "'=DROP TABLE");
     }
 
     #[test]
     fn value_to_string_does_not_sanitize_numbers() {
-        assert_eq!(value_to_string(&Value::Integer(-42)), "-42");
-        assert_eq!(value_to_string(&Value::Float(-1.5)), "-1.5");
+        assert_eq!(value_to_string(&Value::Integer(-42)).as_ref(), "-42");
+        assert_eq!(value_to_string(&Value::Float(-1.5)).as_ref(), "-1.5");
     }
 
     #[test]

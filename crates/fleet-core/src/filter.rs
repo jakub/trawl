@@ -112,10 +112,27 @@ impl CompiledFilter {
     }
 
     /// Test whether a JSON event matches this filter.
+    ///
+    /// Convenience wrapper that computes `Utc::now()` per call. For batch
+    /// filtering (e.g. SSE streams), prefer [`matches_at`](Self::matches_at)
+    /// with a pre-computed timestamp to avoid a syscall per event.
     pub fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
+        self.matches_at(event, chrono::Utc::now())
+    }
+
+    /// Test whether a JSON event matches this filter using a pre-computed
+    /// timestamp for the time filter cutoff.
+    ///
+    /// Avoids a `Utc::now()` syscall per event — compute `now` once per
+    /// batch and pass it to each event.
+    pub fn matches_at(
+        &self,
+        event: &serde_json::Map<String, Value>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
         // Check time filter first (global, not per-group).
         if let Some(tf) = &self.time_filter {
-            if !matches_time_filter(event, tf) {
+            if !matches_time_filter_at(event, tf, now) {
                 return false;
             }
         }
@@ -351,7 +368,11 @@ fn apply_f64(a: f64, b: f64, op: CompareOp) -> bool {
 // Time filter
 // ---------------------------------------------------------------------------
 
-fn matches_time_filter(event: &serde_json::Map<String, Value>, tf: &TimeMatcher) -> bool {
+fn matches_time_filter_at(
+    event: &serde_json::Map<String, Value>,
+    tf: &TimeMatcher,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
     let Some(ts_val) = event.get("timestamp") else {
         return false;
     };
@@ -375,7 +396,7 @@ fn matches_time_filter(event: &serde_json::Map<String, Value>, tf: &TimeMatcher)
     };
 
     #[allow(clippy::cast_possible_wrap)]
-    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(tf.duration_secs as i64);
+    let cutoff = now - chrono::Duration::seconds(tf.duration_secs as i64);
     event_time >= cutoff
 }
 
@@ -1014,5 +1035,30 @@ mod tests {
         event.insert("message".into(), Value::String("test".into()));
         let json = serde_json::to_string(&event).unwrap();
         assert!(!matches_event("last:1h", &json));
+    }
+
+    // ── matches_at with explicit timestamp ──────────────────────────
+
+    #[test]
+    fn matches_at_uses_provided_now() {
+        let query = parser::parse("last:1h").expect("parse should succeed");
+        let filter = CompiledFilter::compile(&query.search);
+
+        // Event 30 min ago from "now".
+        let now = chrono::Utc::now();
+        let event_ts = (now - chrono::Duration::minutes(30)).to_rfc3339();
+        let event = event_with_timestamp(&event_ts);
+
+        // With real now → should match (30 min < 1 hour).
+        assert!(filter.matches_at(&event, now));
+
+        // With a fake "now" that is 2 hours before the event → event
+        // is in the future relative to this now, should match.
+        let old_now = now - chrono::Duration::hours(3);
+        assert!(filter.matches_at(&event, old_now));
+
+        // With a fake "now" where event is >1h old → should NOT match.
+        let future_now = now + chrono::Duration::hours(2);
+        assert!(!filter.matches_at(&event, future_now));
     }
 }
