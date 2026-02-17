@@ -44,6 +44,13 @@ crates/
 
 ## using fleet
 
+### binaries
+
+- **fleet CLI binary**: `target/debug/fleet` (after `cargo build -p fleet-cli`)
+- the binary name is `fleet`, NOT `fleet-cli` — the crate is `fleet-cli` but the binary is `fleet`
+- the server binary is `target/debug/fleetd` (crate `fleet-server`)
+- admin binary is `target/debug/fleet-admin` (crate `fleet-admin`)
+
 ### dev server
 
 - development server runs at `https://localhost:5514` with a self-signed cert
