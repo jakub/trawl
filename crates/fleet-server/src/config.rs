@@ -349,6 +349,13 @@ fn default_hot_buffer_max_bytes() -> usize {
 /// Default key audit polling interval (seconds).
 pub const DEFAULT_AUDIT_INTERVAL_SECS: u64 = 30;
 
+/// Default auth cache TTL (seconds).
+pub const DEFAULT_AUTH_CACHE_TTL_SECS: u64 = 300;
+
+fn default_auth_cache_ttl_secs() -> u64 {
+    DEFAULT_AUTH_CACHE_TTL_SECS
+}
+
 /// Authentication database settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
@@ -360,6 +367,12 @@ pub struct AuthConfig {
     /// Set to 0 to disable. Default: 30.
     #[serde(default = "default_audit_interval_secs")]
     pub audit_interval_secs: u64,
+
+    /// TTL for the in-memory auth token cache (seconds). Verified tokens
+    /// skip argon2id on cache hits. Revoked keys stay valid for up to
+    /// this duration. Set to 0 to disable caching. Default: 300 (5 min).
+    #[serde(default = "default_auth_cache_ttl_secs")]
+    pub auth_cache_ttl_secs: u64,
 }
 
 fn default_audit_interval_secs() -> u64 {

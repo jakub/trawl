@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use fleet_auth::{HistoryStore, KeyStore, SavedQueryStore};
 use fleet_engine::value::SchemaResult;
 
+use crate::auth::AuthCache;
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
 use crate::hot_buffer::{HotBuffer, HotBufferConfig};
@@ -71,6 +72,8 @@ pub struct AuthState {
     pub saved: Arc<Mutex<SavedQueryStore>>,
     /// Path to the `SQLite` auth database (kept for admin commands).
     pub db_path: Arc<PathBuf>,
+    /// In-memory auth token cache (skips argon2id on hits).
+    pub auth_cache: Arc<AuthCache>,
 }
 
 /// Ingest pipeline state.
@@ -146,6 +149,10 @@ impl AppState {
             (None, None, None)
         };
 
+        let auth_cache = Arc::new(AuthCache::new(std::time::Duration::from_secs(
+            config.auth.auth_cache_ttl_secs,
+        )));
+
         let state = Self {
             query: QueryState {
                 pool: ExecutorPool::new(
@@ -168,6 +175,7 @@ impl AppState {
                 history: Arc::new(Mutex::new(history)),
                 saved: Arc::new(Mutex::new(saved)),
                 db_path: Arc::new(config.auth.db_path.clone()),
+                auth_cache,
             },
             ingest: IngestState {
                 wal_writer,

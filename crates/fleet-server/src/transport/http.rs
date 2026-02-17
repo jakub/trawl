@@ -73,8 +73,9 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .layer(middleware::from_fn(auth_middleware))
         .layer(RequestBodyLimitLayer::new(max_body));
 
-    // Shared key store injected into extensions for the auth middleware.
+    // Shared key store and auth cache injected into extensions for the auth middleware.
     let key_store = Arc::clone(&state.auth.key_store);
+    let auth_cache = Arc::clone(&state.auth.auth_cache);
 
     // Ingest route: body limit → auth → rate limit.
     let ingest_routes = if ingest_enabled {
@@ -170,6 +171,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     )
     .layer(middleware::from_fn(request_id_middleware))
     .layer(axum::Extension(rate_state))
+    .layer(axum::Extension(auth_cache))
     .layer(axum::Extension(key_store))
     .with_state(state)
 }
