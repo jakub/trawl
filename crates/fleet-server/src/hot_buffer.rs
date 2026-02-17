@@ -160,26 +160,30 @@ impl HotBuffer {
     /// Uses a generation-based cache: concurrent queries against an unchanged
     /// buffer share a single snapshot file (1 disk write instead of N).
     /// The `Arc` ensures the temp file stays alive until all queries using it finish.
+    ///
+    /// The snapshot cache mutex is held for the entire build to serialize
+    /// concurrent misses — one thread builds while others wait ~40ms and
+    /// get the cached result, preventing thundering herd I/O.
     pub fn snapshot(&self) -> Option<Arc<tempfile::NamedTempFile>> {
+        // Fast path: no events at all → skip locking entirely.
+        if self.total_events.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+
         let current_gen = self.generation.load(Ordering::Relaxed);
 
-        // Fast path: check if cached snapshot is still valid.
-        {
-            let cache = self.snapshot_cache.lock();
-            if let Some((cached_gen, ref file)) = *cache {
-                if cached_gen == current_gen {
-                    return Some(Arc::clone(file));
-                }
+        // Hold the mutex for the full check-then-build cycle to serialize
+        // concurrent cache misses (only one thread builds).
+        let mut cache = self.snapshot_cache.lock();
+
+        if let Some((cached_gen, ref file)) = *cache {
+            if cached_gen == current_gen {
+                return Some(Arc::clone(file));
             }
         }
 
-        // Cache miss — build a new snapshot.
-        let snapshot = self.build_snapshot()?;
-        let snapshot = Arc::new(snapshot);
-
-        // Store in cache (another thread may have raced us — that's fine,
-        // the losing snapshot just gets dropped).
-        let mut cache = self.snapshot_cache.lock();
+        // Cache miss — build under lock so concurrent queries wait.
+        let snapshot = Arc::new(self.build_snapshot()?);
         *cache = Some((current_gen, Arc::clone(&snapshot)));
 
         Some(snapshot)
