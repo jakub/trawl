@@ -379,6 +379,168 @@ mod tests {
             .collect()
     }
 
+    // --- SimpleEditor tests ---
+
+    #[test]
+    fn editor_new_is_empty() {
+        let editor = SimpleEditor::new();
+        assert_eq!(editor.lines, vec![String::new()]);
+        assert_eq!(editor.cursor, (0, 0));
+        assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn editor_insert_chars() {
+        let mut editor = SimpleEditor::new();
+        for ch in "abc".chars() {
+            editor.insert_char(ch);
+        }
+        assert_eq!(editor.text(), "abc");
+        assert_eq!(editor.cursor, (0, 3));
+    }
+
+    #[test]
+    fn editor_insert_newline_splits_line() {
+        let mut editor = SimpleEditor::new();
+        for ch in "hello".chars() {
+            editor.insert_char(ch);
+        }
+        // Move cursor to col 2
+        editor.cursor.1 = 2;
+        editor.insert_newline();
+        assert_eq!(editor.lines, vec!["he".to_owned(), "llo".to_owned()]);
+        assert_eq!(editor.cursor, (1, 0));
+    }
+
+    #[test]
+    fn editor_backspace_joins_lines() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned(), "world".to_owned()];
+        editor.cursor = (1, 0);
+        editor.delete_char_before();
+        assert_eq!(editor.lines, vec!["helloworld".to_owned()]);
+        assert_eq!(editor.cursor, (0, 5));
+    }
+
+    #[test]
+    fn editor_backspace_at_origin_is_noop() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_char('x');
+        editor.cursor = (0, 0);
+        editor.delete_char_before();
+        assert_eq!(editor.text(), "x");
+        assert_eq!(editor.cursor, (0, 0));
+    }
+
+    #[test]
+    fn editor_delete_joins_lines() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned(), "world".to_owned()];
+        editor.cursor = (0, 5); // end of first line
+        editor.delete_char_at();
+        assert_eq!(editor.lines, vec!["helloworld".to_owned()]);
+        assert_eq!(editor.cursor, (0, 5));
+    }
+
+    #[test]
+    fn editor_delete_at_end_is_noop() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_char('x');
+        // cursor already at (0, 1), which is end of last line
+        editor.delete_char_at();
+        assert_eq!(editor.text(), "x");
+    }
+
+    #[test]
+    fn editor_move_up_clamps_col() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["short".to_owned(), "longer line".to_owned()];
+        editor.cursor = (1, 11); // end of "longer line"
+        editor.move_up();
+        assert_eq!(editor.cursor, (0, 5)); // clamped to len of "short"
+    }
+
+    #[test]
+    fn editor_move_down_clamps_col() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["longer line".to_owned(), "short".to_owned()];
+        editor.cursor = (0, 11); // end of "longer line"
+        editor.move_down();
+        assert_eq!(editor.cursor, (1, 5)); // clamped to len of "short"
+    }
+
+    #[test]
+    fn editor_move_left_wraps_to_prev_line() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["abc".to_owned(), "def".to_owned()];
+        editor.cursor = (1, 0);
+        editor.move_left();
+        assert_eq!(editor.cursor, (0, 3)); // end of "abc"
+    }
+
+    #[test]
+    fn editor_move_right_wraps_to_next_line() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["abc".to_owned(), "def".to_owned()];
+        editor.cursor = (0, 3); // end of "abc"
+        editor.move_right();
+        assert_eq!(editor.cursor, (1, 0)); // start of "def"
+    }
+
+    #[test]
+    fn editor_move_left_at_origin_is_noop() {
+        let editor_before = SimpleEditor::new();
+        let mut editor = SimpleEditor::new();
+        editor.move_left();
+        assert_eq!(editor.cursor, editor_before.cursor);
+    }
+
+    #[test]
+    fn editor_move_right_at_end_is_noop() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_char('x');
+        let cursor_before = editor.cursor;
+        editor.move_right();
+        assert_eq!(editor.cursor, cursor_before);
+    }
+
+    #[test]
+    fn editor_home_end() {
+        let mut editor = SimpleEditor::new();
+        for ch in "hello".chars() {
+            editor.insert_char(ch);
+        }
+        assert_eq!(editor.cursor.1, 5);
+        editor.move_to_line_start();
+        assert_eq!(editor.cursor.1, 0);
+        editor.move_to_line_end();
+        assert_eq!(editor.cursor.1, 5);
+    }
+
+    #[test]
+    fn editor_clear() {
+        let mut editor = SimpleEditor::new();
+        for ch in "hello world".chars() {
+            editor.insert_char(ch);
+        }
+        editor.clear();
+        assert_eq!(editor.lines, vec![String::new()]);
+        assert_eq!(editor.cursor, (0, 0));
+    }
+
+    #[test]
+    fn editor_text_multiline() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec![
+            "line one".to_owned(),
+            "line two".to_owned(),
+            "line three".to_owned(),
+        ];
+        assert_eq!(editor.text(), "line one\nline two\nline three");
+    }
+
+    // --- LiveBuffer tests ---
+
     #[test]
     fn live_buffer_empty() {
         let buf = LiveBuffer::new(100);

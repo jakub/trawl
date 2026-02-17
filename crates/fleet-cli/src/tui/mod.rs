@@ -910,8 +910,8 @@ pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliE
 }
 
 /// Main event loop.
-fn run_event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn run_event_loop<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> Result<(), CliError> {
     let mut iteration = 0u64;
@@ -944,4 +944,508 @@ fn run_event_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fleet_client::{ListSavedResponse, SavedQueryResponse};
+    use fleet_engine::value::{Column, Value};
+
+    /// Create an App with a dummy client for testing.
+    /// No network calls will be made — only channel injection.
+    pub(crate) fn test_app() -> App {
+        let client = HttpClient::new_insecure("https://localhost:0", "flt_test_not_real").unwrap();
+        App::new(client)
+    }
+
+    /// Build a synthetic `KeyEvent` with no modifiers.
+    fn key(code: KeyCode) -> event::KeyEvent {
+        event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Build a synthetic `KeyEvent` with modifiers.
+    fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> event::KeyEvent {
+        event::KeyEvent::new(code, modifiers)
+    }
+
+    /// Build a successful `QueryResponse` with the given columns and rows.
+    fn make_query_response(columns: Vec<&str>, rows: Vec<Vec<Value>>) -> QueryResponse {
+        let cols = columns
+            .into_iter()
+            .map(|name| Column {
+                name: name.to_owned(),
+            })
+            .collect();
+        let returned = rows.len();
+        QueryResponse {
+            result: fleet_engine::value::QueryResult {
+                columns: cols,
+                rows,
+            },
+            truncated: false,
+            pagination: fleet_client::PaginationMeta {
+                limit: 10000,
+                offset: 0,
+                returned,
+            },
+        }
+    }
+
+    // --- Focus transition tests ---
+
+    #[test]
+    fn key_tab_switches_focus_editor_to_results() {
+        let mut app = test_app();
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Results);
+    }
+
+    #[test]
+    fn key_tab_switches_focus_results_to_editor() {
+        let mut app = test_app();
+        app.focus = Focus::Results;
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    // --- Sidebar toggle tests ---
+
+    #[test]
+    fn key_f1_toggles_help() {
+        let mut app = test_app();
+        assert_eq!(app.sidebar, None);
+        app.handle_key(key(KeyCode::F(1)));
+        assert_eq!(app.sidebar, Some(Sidebar::Help));
+        app.handle_key(key(KeyCode::F(1)));
+        assert_eq!(app.sidebar, None);
+    }
+
+    #[test]
+    fn key_f2_toggles_schema() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::F(2)));
+        assert_eq!(app.sidebar, Some(Sidebar::Schema));
+        app.handle_key(key(KeyCode::F(2)));
+        assert_eq!(app.sidebar, None);
+    }
+
+    #[test]
+    fn key_f3_toggles_history() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::F(3)));
+        assert_eq!(app.sidebar, Some(Sidebar::History));
+        app.handle_key(key(KeyCode::F(3)));
+        assert_eq!(app.sidebar, None);
+    }
+
+    #[test]
+    fn key_f4_toggles_saved() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::F(4)));
+        assert_eq!(app.sidebar, Some(Sidebar::Saved));
+        app.handle_key(key(KeyCode::F(4)));
+        assert_eq!(app.sidebar, None);
+    }
+
+    #[test]
+    fn key_esc_closes_sidebar() {
+        let mut app = test_app();
+        app.sidebar = Some(Sidebar::Help);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.sidebar, None);
+    }
+
+    #[test]
+    fn sidebar_blocks_focus_keys() {
+        let mut app = test_app();
+        app.sidebar = Some(Sidebar::Help);
+        app.focus = Focus::Editor;
+        // Tab should NOT switch focus while sidebar is open
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    // --- Tab management tests ---
+
+    #[test]
+    fn key_ctrl_t_creates_tab() {
+        let mut app = test_app();
+        assert_eq!(app.tabs.len(), 1);
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab_idx, 1);
+    }
+
+    #[test]
+    fn key_ctrl_w_closes_tab() {
+        let mut app = test_app();
+        // Create a second tab first
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.tabs.len(), 2);
+        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn key_ctrl_w_with_one_tab_is_noop() {
+        let mut app = test_app();
+        assert_eq!(app.tabs.len(), 1);
+        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn key_shift_tab_cycles_tabs() {
+        let mut app = test_app();
+        // Create 3 tabs total
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.active_tab_idx, 2);
+
+        // Cycle: 2 -> 0
+        app.handle_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.active_tab_idx, 0);
+
+        // Cycle: 0 -> 1
+        app.handle_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.active_tab_idx, 1);
+    }
+
+    // --- Quit ---
+
+    #[test]
+    fn key_ctrl_q_sets_quit() {
+        let mut app = test_app();
+        app.handle_key(key_mod(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    // --- Popup interaction tests ---
+
+    #[test]
+    fn key_ctrl_s_opens_save_popup() {
+        let mut app = test_app();
+        // Type something so editor isn't empty
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.popup,
+            Some(Popup::SaveQuery {
+                input: String::new()
+            })
+        );
+    }
+
+    #[test]
+    fn key_ctrl_s_with_empty_editor_is_noop() {
+        let mut app = test_app();
+        app.handle_key(key_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.popup, None);
+    }
+
+    #[test]
+    fn popup_blocks_global_keys() {
+        let mut app = test_app();
+        app.popup = Some(Popup::SaveQuery {
+            input: String::new(),
+        });
+        // F1 should NOT open sidebar while popup is active
+        app.handle_key(key(KeyCode::F(1)));
+        assert_eq!(app.sidebar, None);
+        assert!(app.popup.is_some());
+    }
+
+    #[test]
+    fn popup_esc_closes() {
+        let mut app = test_app();
+        app.popup = Some(Popup::SaveQuery {
+            input: String::new(),
+        });
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.popup, None);
+    }
+
+    #[test]
+    fn popup_typing_appends() {
+        let mut app = test_app();
+        app.popup = Some(Popup::SaveQuery {
+            input: String::new(),
+        });
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.popup,
+            Some(Popup::SaveQuery {
+                input: "ab".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn popup_backspace_removes() {
+        let mut app = test_app();
+        app.popup = Some(Popup::SaveQuery {
+            input: "abc".to_owned(),
+        });
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(
+            app.popup,
+            Some(Popup::SaveQuery {
+                input: "ab".to_owned()
+            })
+        );
+    }
+
+    // --- Editor key routing ---
+
+    #[test]
+    fn editor_keys_reach_editor() {
+        let mut app = test_app();
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.active_tab().editor.text(), "hi");
+    }
+
+    // --- Results key routing ---
+
+    #[test]
+    fn results_keys_scroll() {
+        let mut app = test_app();
+        app.focus = Focus::Results;
+        assert_eq!(app.active_tab().scroll_offset, 0);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.active_tab().scroll_offset, 1);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.active_tab().scroll_offset, 2);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.active_tab().scroll_offset, 1);
+    }
+
+    // --- Channel injection tests (poll_query_results / poll_mutations) ---
+
+    #[test]
+    fn poll_query_result_updates_tab() {
+        let mut app = test_app();
+        let response = make_query_response(
+            vec!["host", "count"],
+            vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+        );
+        app.query_tx
+            .send(QueryResult {
+                tab_idx: 0,
+                result: Ok(response),
+                duration: Duration::from_millis(50),
+            })
+            .unwrap();
+
+        app.poll_query_results();
+
+        assert!(app.tabs[0].result.is_some());
+        assert!(matches!(app.tabs[0].status, TabStatus::Success { .. }));
+    }
+
+    #[test]
+    fn poll_query_result_sets_error_status() {
+        let mut app = test_app();
+        app.query_tx
+            .send(QueryResult {
+                tab_idx: 0,
+                result: Err("something broke".to_owned()),
+                duration: Duration::from_millis(10),
+            })
+            .unwrap();
+
+        app.poll_query_results();
+
+        assert!(matches!(
+            app.tabs[0].status,
+            TabStatus::Error { ref message } if message == "something broke"
+        ));
+    }
+
+    #[test]
+    fn poll_query_result_resets_scroll() {
+        let mut app = test_app();
+        app.tabs[0].scroll_offset = 42;
+        app.tabs[0].horizontal_scroll_offset = 7;
+
+        let response = make_query_response(vec!["x"], vec![vec![Value::Integer(1)]]);
+        app.query_tx
+            .send(QueryResult {
+                tab_idx: 0,
+                result: Ok(response),
+                duration: Duration::from_millis(1),
+            })
+            .unwrap();
+
+        app.poll_query_results();
+
+        assert_eq!(app.tabs[0].scroll_offset, 0);
+        assert_eq!(app.tabs[0].horizontal_scroll_offset, 0);
+    }
+
+    #[test]
+    fn poll_query_result_ignores_closed_tab() {
+        let mut app = test_app();
+        // Send result for tab index 5, which doesn't exist
+        app.query_tx
+            .send(QueryResult {
+                tab_idx: 5,
+                result: Ok(make_query_response(vec!["x"], vec![])),
+                duration: Duration::from_millis(1),
+            })
+            .unwrap();
+
+        // Should not panic
+        app.poll_query_results();
+    }
+
+    #[test]
+    fn poll_query_result_timechart_auto_switches_view() {
+        let mut app = test_app();
+        assert_eq!(app.tabs[0].chart_view, ChartView::Table);
+
+        let response = make_query_response(
+            vec!["_time", "count"],
+            vec![vec![
+                Value::String("2025-01-01T00:00:00Z".into()),
+                Value::Integer(10),
+            ]],
+        );
+        app.query_tx
+            .send(QueryResult {
+                tab_idx: 0,
+                result: Ok(response),
+                duration: Duration::from_millis(1),
+            })
+            .unwrap();
+
+        app.poll_query_results();
+
+        assert_eq!(app.tabs[0].chart_view, ChartView::Sparkline);
+    }
+
+    #[tokio::test]
+    async fn poll_mutation_saved_created() {
+        let mut app = test_app();
+        app.mutation_tx
+            .send(MutationResult::SavedQueryCreated {
+                name: "my query".to_owned(),
+            })
+            .unwrap();
+
+        app.poll_mutations();
+
+        // SavedQueryCreated opens the sidebar to Saved
+        assert_eq!(app.sidebar, Some(Sidebar::Saved));
+    }
+
+    #[test]
+    fn poll_mutation_cache_refreshed() {
+        let mut app = test_app();
+        let saved = ListSavedResponse {
+            queries: vec![SavedQueryResponse {
+                id: 1,
+                name: "test query".to_owned(),
+                query: "level:error".to_owned(),
+                created_at: "2025-01-01T00:00:00Z".to_owned(),
+                updated_at: "2025-01-01T00:00:00Z".to_owned(),
+            }],
+        };
+
+        app.mutation_tx
+            .send(MutationResult::CacheRefreshed {
+                saved,
+                select_name: None,
+            })
+            .unwrap();
+
+        app.poll_mutations();
+
+        assert!(app.saved_cache.is_some());
+        assert_eq!(app.saved_cache.as_ref().unwrap().queries.len(), 1);
+    }
+
+    #[test]
+    fn poll_mutation_cache_refreshed_selects_name() {
+        let mut app = test_app();
+        let saved = ListSavedResponse {
+            queries: vec![
+                SavedQueryResponse {
+                    id: 1,
+                    name: "alpha".to_owned(),
+                    query: "a".to_owned(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+                SavedQueryResponse {
+                    id: 2,
+                    name: "beta".to_owned(),
+                    query: "b".to_owned(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+            ],
+        };
+
+        app.mutation_tx
+            .send(MutationResult::CacheRefreshed {
+                saved,
+                select_name: Some("beta".to_owned()),
+            })
+            .unwrap();
+
+        app.poll_mutations();
+
+        assert_eq!(app.saved_selected_index, 1);
+    }
+
+    #[test]
+    fn poll_mutation_error_is_handled() {
+        let mut app = test_app();
+        app.mutation_tx
+            .send(MutationResult::Error {
+                message: "kaboom".to_owned(),
+            })
+            .unwrap();
+
+        // Should not panic
+        app.poll_mutations();
+    }
+
+    #[test]
+    fn multiple_results_processed_in_order() {
+        let mut app = test_app();
+        // Create 3 tabs
+        app.tabs.push(Tab::new(1));
+        app.tabs.push(Tab::new(2));
+
+        for i in 0..3 {
+            let response = make_query_response(
+                vec!["idx"],
+                vec![vec![Value::Integer(i64::try_from(i).unwrap())]],
+            );
+            app.query_tx
+                .send(QueryResult {
+                    tab_idx: i,
+                    result: Ok(response),
+                    duration: Duration::from_millis(1),
+                })
+                .unwrap();
+        }
+
+        app.poll_query_results();
+
+        // All 3 tabs should have results
+        for (i, tab) in app.tabs.iter().enumerate() {
+            assert!(
+                tab.result.is_some(),
+                "tab {i} should have received its result"
+            );
+        }
+    }
 }
