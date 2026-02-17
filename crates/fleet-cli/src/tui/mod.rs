@@ -5,6 +5,7 @@ pub mod state;
 mod ui;
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -980,7 +981,7 @@ pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliE
     // Set up terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1038,7 +1039,11 @@ pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliE
 
     // Restore terminal.
     disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -1067,8 +1072,19 @@ fn run_event_loop<B: ratatui::backend::Backend>(
 
         // Poll for events (100ms timeout).
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_key(key);
+            match event::read()? {
+                Event::Key(key) => {
+                    app.handle_key(key);
+                }
+                Event::Paste(text) => {
+                    if app.focus == Focus::Editor {
+                        let editor = &mut app.active_tab_mut().editor;
+                        editor.save_snapshot();
+                        editor.delete_selection();
+                        editor.insert_text(&text);
+                    }
+                }
+                _ => {}
             }
         }
 
