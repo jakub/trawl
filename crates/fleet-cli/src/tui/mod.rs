@@ -543,20 +543,9 @@ impl App {
 
                 if let Some(query) = query_text {
                     let tab = self.active_tab_mut();
-                    // Clear editor and set query
                     tab.editor.clear();
-                    // Insert the query text line by line
-                    for (i, line) in query.lines().enumerate() {
-                        if i > 0 {
-                            tab.editor.insert_newline();
-                        }
-                        for ch in line.chars() {
-                            tab.editor.insert_char(ch);
-                        }
-                    }
-                    // Move cursor to end
+                    tab.editor.insert_text(&query);
                     tab.editor.move_to_line_end();
-                    // Close sidebar
                     self.sidebar = None;
                 }
             }
@@ -592,20 +581,9 @@ impl App {
 
                 if let Some(query) = query_text {
                     let tab = self.active_tab_mut();
-                    // Clear editor and set query
                     tab.editor.clear();
-                    // Insert the query text line by line
-                    for (i, line) in query.lines().enumerate() {
-                        if i > 0 {
-                            tab.editor.insert_newline();
-                        }
-                        for ch in line.chars() {
-                            tab.editor.insert_char(ch);
-                        }
-                    }
-                    // Move cursor to end
+                    tab.editor.insert_text(&query);
                     tab.editor.move_to_line_end();
-                    // Close sidebar
                     self.sidebar = None;
                 }
             }

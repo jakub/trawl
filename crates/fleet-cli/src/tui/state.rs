@@ -102,6 +102,10 @@ pub struct SimpleEditor {
     pub lines: Vec<String>,
     /// Cursor position (row, column).
     pub cursor: (usize, usize),
+    /// Desired column for vertical movement (sticky column).
+    /// Set on horizontal movement, used by `move_up()`/`move_down()` to
+    /// maintain column position across lines of varying length.
+    desired_col: Option<usize>,
 }
 
 impl Default for SimpleEditor {
@@ -116,6 +120,7 @@ impl SimpleEditor {
         Self {
             lines: vec![String::new()],
             cursor: (0, 0),
+            desired_col: None,
         }
     }
 
@@ -174,24 +179,33 @@ impl SimpleEditor {
         }
     }
 
-    /// Move cursor up.
+    /// Move cursor up (uses sticky column).
     pub fn move_up(&mut self) {
         if self.cursor.0 > 0 {
+            let target_col = self.desired_col.unwrap_or(self.cursor.1);
             self.cursor.0 -= 1;
-            self.cursor.1 = self.cursor.1.min(self.lines[self.cursor.0].len());
+            self.cursor.1 = target_col.min(self.lines[self.cursor.0].len());
+            if self.desired_col.is_none() {
+                self.desired_col = Some(target_col);
+            }
         }
     }
 
-    /// Move cursor down.
+    /// Move cursor down (uses sticky column).
     pub fn move_down(&mut self) {
         if self.cursor.0 < self.lines.len() - 1 {
+            let target_col = self.desired_col.unwrap_or(self.cursor.1);
             self.cursor.0 += 1;
-            self.cursor.1 = self.cursor.1.min(self.lines[self.cursor.0].len());
+            self.cursor.1 = target_col.min(self.lines[self.cursor.0].len());
+            if self.desired_col.is_none() {
+                self.desired_col = Some(target_col);
+            }
         }
     }
 
-    /// Move cursor left.
+    /// Move cursor left (clears sticky column).
     pub fn move_left(&mut self) {
+        self.desired_col = None;
         if self.cursor.1 > 0 {
             self.cursor.1 -= 1;
         } else if self.cursor.0 > 0 {
@@ -200,8 +214,9 @@ impl SimpleEditor {
         }
     }
 
-    /// Move cursor right.
+    /// Move cursor right (clears sticky column).
     pub fn move_right(&mut self) {
+        self.desired_col = None;
         if self.cursor.1 < self.lines[self.cursor.0].len() {
             self.cursor.1 += 1;
         } else if self.cursor.0 < self.lines.len() - 1 {
@@ -210,13 +225,15 @@ impl SimpleEditor {
         }
     }
 
-    /// Move cursor to start of line.
+    /// Move cursor to start of line (clears sticky column).
     pub fn move_to_line_start(&mut self) {
+        self.desired_col = None;
         self.cursor.1 = 0;
     }
 
-    /// Move cursor to end of line.
+    /// Move cursor to end of line (clears sticky column).
     pub fn move_to_line_end(&mut self) {
+        self.desired_col = None;
         self.cursor.1 = self.lines[self.cursor.0].len();
     }
 
@@ -282,16 +299,31 @@ impl SimpleEditor {
         (row, c)
     }
 
-    /// Move cursor one word to the left.
+    /// Move cursor one word to the left (clears sticky column).
     pub fn move_word_left(&mut self) {
+        self.desired_col = None;
         let (row, col) = self.cursor;
         self.cursor = self.find_word_boundary_left(row, col);
     }
 
-    /// Move cursor one word to the right.
+    /// Move cursor one word to the right (clears sticky column).
     pub fn move_word_right(&mut self) {
+        self.desired_col = None;
         let (row, col) = self.cursor;
         self.cursor = self.find_word_boundary_right(row, col);
+    }
+
+    /// Insert arbitrary text at cursor, handling newlines by splitting lines.
+    ///
+    /// Used by paste and bracketed paste operations.
+    pub fn insert_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.insert_newline();
+            } else if ch != '\r' {
+                self.insert_char(ch);
+            }
+        }
     }
 
     /// Delete from cursor to word boundary left (Ctrl+W).
@@ -349,6 +381,7 @@ impl SimpleEditor {
     pub fn clear(&mut self) {
         self.lines = vec![String::new()];
         self.cursor = (0, 0);
+        self.desired_col = None;
     }
 }
 
@@ -748,6 +781,73 @@ mod tests {
         assert_eq!(editor.cursor, (0, 6));
         editor.move_word_right();
         assert_eq!(editor.cursor, (0, 11));
+    }
+
+    // --- Sticky column tests ---
+
+    #[test]
+    fn editor_sticky_column_preserved_across_short_line() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec![
+            "long line here".to_owned(),
+            "short".to_owned(),
+            "another long one".to_owned(),
+        ];
+        editor.cursor = (0, 10); // col 10 in first line
+        editor.move_down(); // to "short" — clamped to col 5
+        assert_eq!(editor.cursor, (1, 5));
+        editor.move_down(); // to "another long one" — sticky col restores to 10
+        assert_eq!(editor.cursor, (2, 10));
+    }
+
+    #[test]
+    fn editor_sticky_column_cleared_on_horizontal_move() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec![
+            "long line here".to_owned(),
+            "short".to_owned(),
+            "another long one".to_owned(),
+        ];
+        editor.cursor = (0, 10);
+        editor.move_down(); // col clamped to 5, desired_col = 10
+        editor.move_left(); // clears desired_col, cursor at (1, 4)
+        assert_eq!(editor.cursor, (1, 4));
+        editor.move_down(); // no sticky col, uses current col 4
+        assert_eq!(editor.cursor, (2, 4));
+    }
+
+    // --- insert_text tests ---
+
+    #[test]
+    fn editor_insert_text_single_line() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("hello world");
+        assert_eq!(editor.text(), "hello world");
+        assert_eq!(editor.cursor, (0, 11));
+    }
+
+    #[test]
+    fn editor_insert_text_multiline() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("hello\nworld\nfoo");
+        assert_eq!(editor.text(), "hello\nworld\nfoo");
+        assert_eq!(editor.cursor, (2, 3));
+    }
+
+    #[test]
+    fn editor_insert_text_strips_cr() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("hello\r\nworld");
+        assert_eq!(editor.text(), "hello\nworld");
+    }
+
+    #[test]
+    fn editor_insert_text_at_cursor() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["abcdef".to_owned()];
+        editor.cursor = (0, 3);
+        editor.insert_text("XYZ");
+        assert_eq!(editor.text(), "abcXYZdef");
     }
 
     // --- Kill operation tests ---
