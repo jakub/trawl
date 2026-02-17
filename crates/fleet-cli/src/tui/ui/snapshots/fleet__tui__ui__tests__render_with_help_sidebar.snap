@@ -1,0 +1,28 @@
+---
+source: crates/fleet-cli/src/tui/ui/mod.rs
+expression: terminal.backend().to_string()
+---
+" 1 ●                                                     ctrl+t new  ctrl+w clos"
+"┌ Query Editor ────────────────────────────────────────────────────────────────┐"
+"│                                                                              │"
+"│                                                                              │"
+"│               ┌ Help ────────────────────────────────────────┐               │"
+"│               │                                              │               │"
+"│               │Global Keybindings                            │               │"
+"│               │                                              │               │"
+"│               │  F1          - toggle help                   │               │"
+"│               │  F2          - toggle schema browser         │               │"
+"└───────────────│  F3          - toggle query history          │───────────────┘"
+"┌ Results ──────│  F4          - toggle saved queries          │───────────────┐"
+"│ no results yet│  F9          - toggle live tail mode         │               │"
+"│               │  Ctrl+Q      - quit                          │               │"
+"│               │  Ctrl+S      - save current query            │               │"
+"│               │  Ctrl+T      - new tab                       │               │"
+"│               │  Ctrl+W      - close tab                     │               │"
+"│               │  Shift+Tab   - cycle tabs                    │               │"
+"│               │                                              │               │"
+"│               └──────────────────────────────────────────────┘               │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"idle [editor]                                                    esc: close help"
