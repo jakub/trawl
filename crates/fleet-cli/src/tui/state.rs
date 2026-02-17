@@ -106,6 +106,10 @@ pub struct SimpleEditor {
     /// Set on horizontal movement, used by `move_up()`/`move_down()` to
     /// maintain column position across lines of varying length.
     desired_col: Option<usize>,
+    /// Vertical scroll offset (first visible line).
+    pub scroll_row: usize,
+    /// Horizontal scroll offset (first visible column).
+    pub scroll_col: usize,
 }
 
 impl Default for SimpleEditor {
@@ -121,6 +125,8 @@ impl SimpleEditor {
             lines: vec![String::new()],
             cursor: (0, 0),
             desired_col: None,
+            scroll_row: 0,
+            scroll_col: 0,
         }
     }
 
@@ -377,11 +383,38 @@ impl SimpleEditor {
         self.lines[row].truncate(col);
     }
 
+    /// Adjust scroll offsets to keep cursor in viewport.
+    ///
+    /// Call after every cursor movement or content change.
+    pub fn ensure_cursor_visible(&mut self, visible_rows: usize, visible_cols: usize) {
+        let (row, col) = self.cursor;
+
+        // Vertical scrolling
+        if visible_rows > 0 {
+            if row < self.scroll_row {
+                self.scroll_row = row;
+            } else if row >= self.scroll_row + visible_rows {
+                self.scroll_row = row - visible_rows + 1;
+            }
+        }
+
+        // Horizontal scrolling
+        if visible_cols > 0 {
+            if col < self.scroll_col {
+                self.scroll_col = col;
+            } else if col >= self.scroll_col + visible_cols {
+                self.scroll_col = col - visible_cols + 1;
+            }
+        }
+    }
+
     /// Clear all text.
     pub fn clear(&mut self) {
         self.lines = vec![String::new()];
         self.cursor = (0, 0);
         self.desired_col = None;
+        self.scroll_row = 0;
+        self.scroll_col = 0;
     }
 }
 

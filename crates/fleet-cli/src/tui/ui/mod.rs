@@ -18,7 +18,7 @@ pub mod status;
 pub mod tabs;
 
 /// Main render function — dispatches to submodules based on app state.
-pub fn render(app: &App, frame: &mut Frame<'_>) {
+pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     // Split the screen into tab bar, editor, results, and status bar.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -33,7 +33,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     // Render tab bar.
     tabs::render(app, frame, chunks[0]);
 
-    // Render editor pane.
+    // Render editor pane (needs &mut for scroll adjustment).
     editor::render(app, frame, chunks[1]);
 
     // Render results pane.
@@ -55,15 +55,19 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     // Render popup overlay (if any) — renders on top of everything.
     popup::render(app, frame);
 
-    // Set cursor position based on focus.
+    // Set cursor position based on focus (adjusted for scroll offset).
     if app.sidebar.is_none() && app.focus == Focus::Editor {
-        // Show cursor in editor.
         let tab = app.active_tab();
         let (row, col) = tab.editor.cursor;
-        #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
+        let scroll_row = tab.editor.scroll_row;
+        let scroll_col = tab.editor.scroll_col;
         // +2 for x: border (1) + horizontal padding (1)
         // +1 for y: border (1) only
-        frame.set_cursor_position((chunks[1].x + col as u16 + 2, chunks[1].y + row as u16 + 1));
+        #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
+        let x = chunks[1].x + col.saturating_sub(scroll_col) as u16 + 2;
+        #[allow(clippy::cast_possible_truncation)]
+        let y = chunks[1].y + row.saturating_sub(scroll_row) as u16 + 1;
+        frame.set_cursor_position((x, y));
     }
 }
 
@@ -102,10 +106,10 @@ mod tests {
 
     #[test]
     fn render_empty_app() {
-        let app = test_app();
+        let mut app = test_app();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| super::render(&app, f)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
@@ -117,7 +121,7 @@ mod tests {
         }
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| super::render(&app, f)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
@@ -158,7 +162,7 @@ mod tests {
         app.tabs[0].status = TabStatus::Success { duration_ms: 42 };
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| super::render(&app, f)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
@@ -170,7 +174,7 @@ mod tests {
         };
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| super::render(&app, f)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
@@ -180,7 +184,7 @@ mod tests {
         app.sidebar = Some(Sidebar::Help);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| super::render(&app, f)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
@@ -192,7 +196,7 @@ mod tests {
         });
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| super::render(&app, f)).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 }
