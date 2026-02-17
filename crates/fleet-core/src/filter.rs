@@ -7,6 +7,7 @@
 //! Key invariant: `filter.matches(event)` must agree with running the
 //! emitted SQL against `DuckDB` for every `(event, search_stage)` pair.
 
+use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde_json::Value;
 
@@ -74,8 +75,9 @@ enum CoercedValue {
 }
 
 struct TextMatcher {
-    /// Lowercased search term for case-insensitive matching.
-    term_lower: String,
+    /// SIMD-accelerated case-insensitive searcher (ASCII case folding,
+    /// matching `DuckDB` ILIKE semantics).
+    searcher: AhoCorasick,
     /// Whether the match is negated (NOT ILIKE).
     negated: bool,
 }
@@ -179,8 +181,12 @@ fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
             if ts.term == "*" {
                 return None;
             }
+            let searcher = AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build([&ts.term])
+                .ok()?;
             Some(TokenMatcher::Text(TextMatcher {
-                term_lower: ts.term.to_lowercase(),
+                searcher,
                 negated: ts.negated,
             }))
         }
@@ -188,10 +194,16 @@ fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
             // Time filters are hoisted — this shouldn't appear in groups.
             None
         }
-        SearchToken::QuotedSearch(qs) => Some(TokenMatcher::Text(TextMatcher {
-            term_lower: qs.phrase.to_lowercase(),
-            negated: false,
-        })),
+        SearchToken::QuotedSearch(qs) => {
+            let searcher = AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build([&qs.phrase])
+                .ok()?;
+            Some(TokenMatcher::Text(TextMatcher {
+                searcher,
+                negated: false,
+            }))
+        }
     }
 }
 
@@ -266,8 +278,8 @@ impl TextMatcher {
             // DuckDB: NULL ILIKE/NOT ILIKE → NULL → excluded from results.
             return false;
         };
-        let contains = msg.to_lowercase().contains(&self.term_lower);
-        if self.negated { !contains } else { contains }
+        let found = self.searcher.is_match(msg);
+        if self.negated { !found } else { found }
     }
 }
 

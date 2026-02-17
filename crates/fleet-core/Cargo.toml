@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+aho-corasick = { workspace = true }
 chrono = { workspace = true }
 chumsky = { workspace = true }
 regex = { workspace = true }
