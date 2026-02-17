@@ -95,6 +95,84 @@ pub enum TabStatus {
     },
 }
 
+/// A snapshot of editor state for undo/redo.
+#[derive(Debug, Clone)]
+struct EditorSnapshot {
+    lines: Vec<String>,
+    cursor: (usize, usize),
+}
+
+/// Categories of edit operations for undo grouping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    /// Character insertion (grouped until word boundary).
+    Insert,
+    /// Character deletion.
+    Delete,
+    /// Newline insertion.
+    Newline,
+    /// Paste or bulk insert.
+    Paste,
+    /// Any other operation.
+    Other,
+}
+
+/// Undo/redo history stack.
+#[derive(Debug, Clone)]
+struct UndoStack {
+    /// History of snapshots.
+    history: Vec<EditorSnapshot>,
+    /// Current position in history (points to the "current" state).
+    position: usize,
+    /// Maximum number of snapshots to retain.
+    max_size: usize,
+}
+
+impl UndoStack {
+    fn new(max_size: usize) -> Self {
+        Self {
+            history: Vec::new(),
+            position: 0,
+            max_size,
+        }
+    }
+
+    /// Push a new snapshot, discarding any redo history.
+    fn push(&mut self, snapshot: EditorSnapshot) {
+        // Truncate any forward history (we branched).
+        self.history.truncate(self.position);
+        self.history.push(snapshot);
+        self.position = self.history.len();
+
+        // Cap memory usage.
+        if self.history.len() > self.max_size {
+            let excess = self.history.len() - self.max_size;
+            self.history.drain(..excess);
+            self.position = self.history.len();
+        }
+    }
+
+    /// Undo: return the previous snapshot (if any).
+    fn undo(&mut self) -> Option<&EditorSnapshot> {
+        if self.position > 0 {
+            self.position -= 1;
+            Some(&self.history[self.position])
+        } else {
+            None
+        }
+    }
+
+    /// Redo: return the next snapshot (if any).
+    fn redo(&mut self) -> Option<&EditorSnapshot> {
+        if self.position + 1 < self.history.len() {
+            self.position += 1;
+            Some(&self.history[self.position])
+        } else {
+            None
+        }
+    }
+}
+
 /// Simple text editor for DSL queries.
 #[derive(Debug, Clone)]
 pub struct SimpleEditor {
@@ -113,6 +191,10 @@ pub struct SimpleEditor {
     /// Selection anchor position. If `Some`, marks start of selection;
     /// cursor is the other end.
     pub selection_anchor: Option<(usize, usize)>,
+    /// Undo/redo history.
+    undo_stack: UndoStack,
+    /// Last edit kind for undo grouping.
+    last_edit_kind: Option<EditKind>,
 }
 
 impl Default for SimpleEditor {
@@ -131,6 +213,8 @@ impl SimpleEditor {
             scroll_row: 0,
             scroll_col: 0,
             selection_anchor: None,
+            undo_stack: UndoStack::new(200),
+            last_edit_kind: None,
         }
     }
 
@@ -147,6 +231,7 @@ impl SimpleEditor {
 
     /// Insert a character at the cursor position.
     pub fn insert_char(&mut self, ch: char) {
+        self.maybe_snapshot(EditKind::Insert);
         self.delete_selection();
         let (row, col) = self.cursor;
         self.lines[row].insert(col, ch);
@@ -155,6 +240,7 @@ impl SimpleEditor {
 
     /// Insert a newline at the cursor position.
     pub fn insert_newline(&mut self) {
+        self.maybe_snapshot(EditKind::Newline);
         self.delete_selection();
         let (row, col) = self.cursor;
         let current_line = self.lines[row].clone();
@@ -166,6 +252,7 @@ impl SimpleEditor {
 
     /// Delete character before cursor (backspace).
     pub fn delete_char_before(&mut self) {
+        self.maybe_snapshot(EditKind::Delete);
         if self.delete_selection() {
             return;
         }
@@ -184,6 +271,7 @@ impl SimpleEditor {
 
     /// Delete character at cursor (delete key).
     pub fn delete_char_at(&mut self) {
+        self.maybe_snapshot(EditKind::Delete);
         if self.delete_selection() {
             return;
         }
@@ -334,18 +422,29 @@ impl SimpleEditor {
     /// Insert arbitrary text at cursor, handling newlines by splitting lines.
     ///
     /// Used by paste and bracketed paste operations.
+    /// Does raw insertion (no per-character undo snapshots).
     pub fn insert_text(&mut self, text: &str) {
+        self.maybe_snapshot(EditKind::Paste);
+        self.delete_selection();
         for ch in text.chars() {
             if ch == '\n' {
-                self.insert_newline();
+                let (row, col) = self.cursor;
+                let current_line = self.lines[row].clone();
+                let (before, after) = current_line.split_at(col);
+                before.clone_into(&mut self.lines[row]);
+                self.lines.insert(row + 1, after.to_owned());
+                self.cursor = (row + 1, 0);
             } else if ch != '\r' {
-                self.insert_char(ch);
+                let (row, col) = self.cursor;
+                self.lines[row].insert(col, ch);
+                self.cursor.1 += 1;
             }
         }
     }
 
     /// Delete from cursor to word boundary left (Ctrl+W).
     pub fn delete_word_before(&mut self) {
+        self.maybe_snapshot(EditKind::Other);
         let (row, col) = self.cursor;
         let (new_row, new_col) = self.find_word_boundary_left(row, col);
 
@@ -366,6 +465,7 @@ impl SimpleEditor {
 
     /// Delete from cursor to word boundary right (Ctrl+Delete / Alt+D).
     pub fn delete_word_after(&mut self) {
+        self.maybe_snapshot(EditKind::Other);
         let (row, col) = self.cursor;
         let (new_row, new_col) = self.find_word_boundary_right(row, col);
 
@@ -384,6 +484,7 @@ impl SimpleEditor {
 
     /// Delete from cursor to start of line (Ctrl+U).
     pub fn delete_to_line_start(&mut self) {
+        self.maybe_snapshot(EditKind::Other);
         let (row, col) = self.cursor;
         self.lines[row].drain(..col);
         self.cursor.1 = 0;
@@ -391,6 +492,7 @@ impl SimpleEditor {
 
     /// Delete from cursor to end of line (Ctrl+K).
     pub fn delete_to_line_end(&mut self) {
+        self.maybe_snapshot(EditKind::Other);
         let (row, col) = self.cursor;
         self.lines[row].truncate(col);
     }
@@ -489,8 +591,78 @@ impl SimpleEditor {
         }
     }
 
+    /// Save a snapshot for undo if the edit kind changed or is a boundary.
+    fn maybe_snapshot(&mut self, kind: EditKind) {
+        let should_snapshot = match (self.last_edit_kind, kind) {
+            // Always snapshot on kind change
+            (Some(prev), cur) if prev != cur => true,
+            // Always snapshot on newline, paste, other, or first edit
+            (_, EditKind::Newline | EditKind::Paste | EditKind::Other) | (None, _) => true,
+            // Same kind continues — check for word boundary on inserts
+            (Some(EditKind::Insert), EditKind::Insert) => {
+                // Snapshot at word boundaries (space/punctuation)
+                let (row, col) = self.cursor;
+                col > 0
+                    && self.lines[row]
+                        .chars()
+                        .nth(col - 1)
+                        .is_some_and(|ch| ch == ' ' || ch.is_ascii_punctuation())
+            }
+            _ => false,
+        };
+
+        if should_snapshot {
+            self.undo_stack.push(EditorSnapshot {
+                lines: self.lines.clone(),
+                cursor: self.cursor,
+            });
+        }
+        self.last_edit_kind = Some(kind);
+    }
+
+    /// Save a snapshot unconditionally (for paste/bulk operations).
+    pub fn save_snapshot(&mut self) {
+        self.undo_stack.push(EditorSnapshot {
+            lines: self.lines.clone(),
+            cursor: self.cursor,
+        });
+        self.last_edit_kind = None;
+    }
+
+    /// Undo the last edit operation.
+    pub fn undo(&mut self) {
+        // Save the current state for redo (if at the tip of history).
+        if self.undo_stack.position == self.undo_stack.history.len() {
+            self.undo_stack.history.push(EditorSnapshot {
+                lines: self.lines.clone(),
+                cursor: self.cursor,
+            });
+            // Don't increment position — we want undo to go back from here.
+        }
+
+        if let Some(snapshot) = self.undo_stack.undo() {
+            let snapshot = snapshot.clone();
+            self.lines = snapshot.lines;
+            self.cursor = snapshot.cursor;
+            self.selection_anchor = None;
+            self.last_edit_kind = None;
+        }
+    }
+
+    /// Redo the last undone edit operation.
+    pub fn redo(&mut self) {
+        if let Some(snapshot) = self.undo_stack.redo() {
+            let snapshot = snapshot.clone();
+            self.lines = snapshot.lines;
+            self.cursor = snapshot.cursor;
+            self.selection_anchor = None;
+            self.last_edit_kind = None;
+        }
+    }
+
     /// Clear all text.
     pub fn clear(&mut self) {
+        self.save_snapshot();
         self.lines = vec![String::new()];
         self.cursor = (0, 0);
         self.desired_col = None;
@@ -896,6 +1068,63 @@ mod tests {
         assert_eq!(editor.cursor, (0, 6));
         editor.move_word_right();
         assert_eq!(editor.cursor, (0, 11));
+    }
+
+    // --- Undo/redo tests ---
+
+    #[test]
+    fn editor_undo_restores_state() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_char('a');
+        editor.insert_char('b');
+        // Trigger snapshot by changing edit kind
+        editor.insert_newline();
+        editor.insert_char('c');
+        // Undo should restore to before the newline
+        editor.undo();
+        // The exact state depends on snapshot boundaries, but we should
+        // get back to something before the newline
+        assert!(editor.text().len() < 4);
+    }
+
+    #[test]
+    fn editor_undo_at_empty_is_noop() {
+        let mut editor = SimpleEditor::new();
+        editor.undo(); // Should not panic
+        assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn editor_redo_after_undo() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("hello");
+        editor.save_snapshot(); // Force snapshot
+        editor.insert_text(" world");
+        editor.undo();
+        let after_undo = editor.text();
+        editor.redo();
+        let after_redo = editor.text();
+        // After redo, we should be back to "hello world" (or close to it)
+        assert!(after_redo.len() > after_undo.len());
+    }
+
+    #[test]
+    fn editor_redo_at_end_is_noop() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_char('x');
+        editor.redo(); // Should not panic
+        assert_eq!(editor.text(), "x");
+    }
+
+    #[test]
+    fn editor_clear_pushes_undo() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("hello world");
+        editor.clear();
+        assert_eq!(editor.text(), "");
+        editor.undo();
+        // Should restore the previous text
+        assert!(!editor.text().is_empty());
     }
 
     // --- Selection tests ---

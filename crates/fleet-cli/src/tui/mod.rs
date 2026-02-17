@@ -487,6 +487,20 @@ impl App {
                 editor.start_selection();
                 editor.move_to_line_end();
             }
+            // Undo: Ctrl+Z
+            (KeyModifiers::CONTROL, KeyCode::Char('z')) => {
+                self.active_tab_mut().editor.undo();
+            }
+            // Redo: Ctrl+Y / Ctrl+Shift+Z
+            (KeyModifiers::CONTROL, KeyCode::Char('y')) => {
+                self.active_tab_mut().editor.redo();
+            }
+            (_, KeyCode::Char('Z'))
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.active_tab_mut().editor.redo();
+            }
             // Clipboard: Ctrl+C (copy), Ctrl+X (cut)
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if let Some(text) = self.active_tab().editor.selected_text() {
