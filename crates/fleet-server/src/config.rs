@@ -41,7 +41,11 @@ pub struct ServerConfig {
     pub max_export_rows: usize,
 
     /// Maximum request body size in bytes (default: 128 KB).
-    #[serde(default = "default_max_request_body_bytes")]
+    /// Accepts human-readable sizes like `"128K"`, `"1M"`.
+    #[serde(
+        default = "default_max_request_body_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
     pub max_request_body_bytes: usize,
 
     /// Maximum concurrent HTTP requests (default: 256).
@@ -169,7 +173,11 @@ pub struct IngestConfig {
     pub enabled: bool,
 
     /// Maximum request body size for ingest (bytes). Default: 16 MB.
-    #[serde(default = "default_ingest_max_body_bytes")]
+    /// Accepts human-readable sizes like `"16M"`, `"1G"`.
+    #[serde(
+        default = "default_ingest_max_body_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
     pub max_body_bytes: usize,
 
     /// WAL directory path. Defaults to `{data.base_dir}/wal/`.
@@ -205,9 +213,25 @@ pub struct IngestConfig {
     pub hot_buffer_max_events: usize,
 
     /// Maximum estimated memory usage for the hot buffer in bytes.
-    /// Default: 100 MB.
-    #[serde(default = "default_hot_buffer_max_bytes")]
+    /// Default: 100 MB. Accepts human-readable sizes like `"100M"`, `"1G"`.
+    #[serde(
+        default = "default_hot_buffer_max_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
     pub hot_buffer_max_bytes: usize,
+
+    /// How often server stats (pool utilization, SSE connections, hot buffer
+    /// metrics) are emitted as telemetry events (seconds). Default: 60.
+    /// Lower values give more granular observability at the cost of telemetry
+    /// volume. Set to 0 to disable.
+    #[serde(default = "default_stats_interval_secs")]
+    pub stats_interval_secs: u64,
+
+    /// How often buffered tracing events are flushed to WAL (seconds).
+    /// Default: 1. Lower values reduce latency for self-hosted dashboards
+    /// but increase I/O.
+    #[serde(default = "default_telemetry_flush_interval_secs")]
+    pub telemetry_flush_interval_secs: u64,
 }
 
 impl Default for IngestConfig {
@@ -222,6 +246,8 @@ impl Default for IngestConfig {
             event_bus_capacity: default_event_bus_capacity(),
             hot_buffer_max_events: default_hot_buffer_max_events(),
             hot_buffer_max_bytes: default_hot_buffer_max_bytes(),
+            stats_interval_secs: DEFAULT_STATS_INTERVAL_SECS,
+            telemetry_flush_interval_secs: DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS,
         }
     }
 }
@@ -239,7 +265,11 @@ pub struct RetentionConfig {
 
     /// If free disk space drops below this many bytes, delete oldest
     /// data first regardless of age. 0 = disabled.
-    #[serde(default = "default_retention_min_free_disk_bytes")]
+    /// Accepts human-readable sizes like `"1G"`, `"500M"`.
+    #[serde(
+        default = "default_retention_min_free_disk_bytes",
+        deserialize_with = "deserialize_byte_size_u64"
+    )]
     pub min_free_disk_bytes: u64,
 
     /// How often the retention task runs (seconds).
@@ -255,6 +285,114 @@ impl Default for RetentionConfig {
             retention_interval_secs: DEFAULT_RETENTION_INTERVAL_SECS,
         }
     }
+}
+
+// -- byte size deserializer --------------------------------------------------
+// Accepts either a raw integer (backward compat) or a string with a unit
+// suffix like "128K", "16M", "1G", "100MiB". All multipliers are binary
+// (1024-based) because nobody means 1,000,000 when they write "1M" in a
+// server config file.
+
+/// Parse a byte size string like "128K", "16M", "1GiB" into a raw byte count.
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty byte size".into());
+    }
+
+    // Find where digits/dots end and the suffix begins.
+    let num_end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    let (num_str, suffix) = s.split_at(num_end);
+    let suffix = suffix.trim();
+
+    let multiplier: u64 = match suffix.to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" | "KIB" => 1024,
+        "M" | "MB" | "MIB" => 1024 * 1024,
+        "G" | "GB" | "GIB" => 1024 * 1024 * 1024,
+        "T" | "TB" | "TIB" => 1024 * 1024 * 1024 * 1024,
+        _ => return Err(format!("unknown byte size suffix: {suffix:?}")),
+    };
+
+    // Use integer math for whole numbers (the common case), float only
+    // for decimals like "1.5G".
+    if num_str.contains('.') {
+        let num: f64 = num_str
+            .parse()
+            .map_err(|_| format!("invalid number in byte size: {s:?}"))?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        Ok((num * multiplier as f64) as u64)
+    } else {
+        let num: u64 = num_str
+            .parse()
+            .map_err(|_| format!("invalid number in byte size: {s:?}"))?;
+        Ok(num * multiplier)
+    }
+}
+
+/// Deserialize a byte size as either a raw number or a string with unit suffix.
+fn deserialize_byte_size<'de, D: serde::Deserializer<'de>>(de: D) -> Result<usize, D::Error> {
+    use serde::de;
+
+    struct ByteSizeVisitor;
+
+    impl de::Visitor<'_> for ByteSizeVisitor {
+        type Value = usize;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a byte count (integer) or a string like \"128K\", \"16M\", \"1G\"")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<usize, E> {
+            usize::try_from(v).map_err(E::custom)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<usize, E> {
+            usize::try_from(v).map_err(E::custom)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<usize, E> {
+            let bytes = parse_byte_size(v).map_err(E::custom)?;
+            usize::try_from(bytes).map_err(E::custom)
+        }
+    }
+
+    de.deserialize_any(ByteSizeVisitor)
+}
+
+/// Same as [`deserialize_byte_size`] but returns `u64` (for retention config).
+fn deserialize_byte_size_u64<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u64, D::Error> {
+    use serde::de;
+
+    struct ByteSizeVisitor;
+
+    impl de::Visitor<'_> for ByteSizeVisitor {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a byte count (integer) or a string like \"128K\", \"16M\", \"1G\"")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            u64::try_from(v).map_err(E::custom)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            parse_byte_size(v).map_err(E::custom)
+        }
+    }
+
+    de.deserialize_any(ByteSizeVisitor)
 }
 
 // -- default constants -------------------------------------------------------
@@ -344,6 +482,19 @@ fn default_hot_buffer_max_events() -> usize {
 
 fn default_hot_buffer_max_bytes() -> usize {
     DEFAULT_HOT_BUFFER_MAX_BYTES
+}
+
+/// Default server stats emission interval (seconds).
+pub const DEFAULT_STATS_INTERVAL_SECS: u64 = 60;
+/// Default telemetry flush interval (seconds).
+pub const DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS: u64 = 1;
+
+fn default_stats_interval_secs() -> u64 {
+    DEFAULT_STATS_INTERVAL_SECS
+}
+
+fn default_telemetry_flush_interval_secs() -> u64 {
+    DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS
 }
 
 /// Default key audit polling interval (seconds).
@@ -1033,5 +1184,170 @@ min_free_disk_bytes = 0
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.retention.max_age_days, 0);
         assert_eq!(config.retention.min_free_disk_bytes, 0);
+    }
+
+    // -- byte size deserializer tests ----------------------------------------
+
+    #[test]
+    fn parse_byte_size_raw_number() {
+        assert_eq!(parse_byte_size("131072").unwrap(), 131_072);
+    }
+
+    #[test]
+    fn parse_byte_size_kilobytes() {
+        assert_eq!(parse_byte_size("128K").unwrap(), 128 * 1024);
+        assert_eq!(parse_byte_size("128KB").unwrap(), 128 * 1024);
+        assert_eq!(parse_byte_size("128KiB").unwrap(), 128 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_megabytes() {
+        assert_eq!(parse_byte_size("16M").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(parse_byte_size("16MB").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(parse_byte_size("100MiB").unwrap(), 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_gigabytes() {
+        assert_eq!(parse_byte_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1GiB").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_bare_bytes() {
+        assert_eq!(parse_byte_size("4096B").unwrap(), 4096);
+    }
+
+    #[test]
+    fn parse_byte_size_case_insensitive() {
+        assert_eq!(parse_byte_size("16m").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("128kb").unwrap(), 128 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_with_whitespace() {
+        assert_eq!(parse_byte_size("  16M  ").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(parse_byte_size("128 K").unwrap(), 128 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_invalid_suffix() {
+        assert!(parse_byte_size("16X").is_err());
+    }
+
+    #[test]
+    fn parse_byte_size_empty() {
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("   ").is_err());
+    }
+
+    #[test]
+    fn byte_size_field_accepts_string() {
+        let toml = r#"
+[server]
+max_request_body_bytes = "256K"
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.max_request_body_bytes, 256 * 1024);
+    }
+
+    #[test]
+    fn byte_size_field_accepts_integer() {
+        let toml = r#"
+[server]
+max_request_body_bytes = 262144
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.max_request_body_bytes, 262_144);
+    }
+
+    #[test]
+    fn ingest_byte_size_string() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[ingest]
+max_body_bytes = "32M"
+hot_buffer_max_bytes = "200M"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ingest.max_body_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.ingest.hot_buffer_max_bytes, 200 * 1024 * 1024);
+    }
+
+    #[test]
+    fn retention_byte_size_string() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[retention]
+min_free_disk_bytes = "2G"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.retention.min_free_disk_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    // -- new interval field tests --------------------------------------------
+
+    #[test]
+    fn interval_defaults_when_omitted() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ingest.stats_interval_secs, 60);
+        assert_eq!(config.ingest.telemetry_flush_interval_secs, 1);
+    }
+
+    #[test]
+    fn interval_custom_values() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[ingest]
+stats_interval_secs = 30
+telemetry_flush_interval_secs = 5
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ingest.stats_interval_secs, 30);
+        assert_eq!(config.ingest.telemetry_flush_interval_secs, 5);
+    }
+
+    #[test]
+    fn stats_interval_disabled() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/auth.db"
+[ingest]
+stats_interval_secs = 0
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ingest.stats_interval_secs, 0);
     }
 }

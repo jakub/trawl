@@ -80,22 +80,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Spawn telemetry flush task (1-second interval).
+    // Spawn telemetry flush task.
+    let flush_interval =
+        std::time::Duration::from_secs(config.ingest.telemetry_flush_interval_secs);
     let telemetry_handle = telemetry.map(|(_, layer)| {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let join =
-            telemetry::spawn_flush_task(layer, std::time::Duration::from_secs(1), shutdown_rx);
+        let join = telemetry::spawn_flush_task(layer, flush_interval, shutdown_rx);
         (join, shutdown_tx)
     });
 
-    // Spawn periodic server stats emitter (60-second interval).
+    // Spawn periodic server stats emitter.
+    let stats_interval = std::time::Duration::from_secs(config.ingest.stats_interval_secs);
     let stats_handle = {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let handle = fleet_server::stats::spawn_stats_emitter(
-            &state,
-            std::time::Duration::from_secs(60),
-            shutdown_rx,
-        );
+        let handle = fleet_server::stats::spawn_stats_emitter(&state, stats_interval, shutdown_rx);
         (handle, shutdown_tx)
     };
 

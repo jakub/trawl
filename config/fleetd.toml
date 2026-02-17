@@ -2,6 +2,7 @@
 #
 # All fields shown with their defaults. Uncomment and modify as needed.
 # Paths support ~ for $HOME expansion.
+# Byte sizes accept human-readable suffixes: K, M, G, T (binary/1024-based).
 
 [server]
 # Address to bind the HTTPS listener.
@@ -15,17 +16,29 @@
 # max_concurrent_queries = 4
 
 # Maximum rows a single query can return before being rejected.
+# Increase if analysts need larger result sets; decrease to bound memory.
 # max_result_rows = 100000
 
-# Maximum request body size in bytes (128 KB).
-# max_request_body_bytes = 131072
+# Maximum rows allowed in CSV export responses. Exports bypass
+# max_result_rows to support larger downloads.
+# Increase for large report exports; decrease to bound server memory.
+# max_export_rows = 1000000
 
-# Maximum concurrent HTTP requests.
+# Maximum request body size (default: 128K).
+# Increase if POST /query payloads are large (e.g. complex DSL queries).
+# max_request_body_bytes = "128K"
+
+# Maximum concurrent HTTP requests. Returns 503 when exceeded.
+# Increase for high-traffic deployments; decrease to protect resources.
 # max_concurrent_requests = 256
 
 # Graceful shutdown drain timeout (seconds). In-flight requests get
 # this long to finish before being aborted.
 # shutdown_drain_secs = 30
+
+# Maximum concurrent SSE streaming connections. Returns 429 when exceeded.
+# Increase if many clients use live streaming; each holds a connection open.
+# max_sse_connections = 32
 
 # Log file path (JSON format). When set, logs go to both stdout and this file.
 # Deprecated when internal_telemetry is enabled — the WAL layer replaces
@@ -38,14 +51,17 @@
 # tls_key_path = "/etc/fleet/key.pem"
 
 # How often to check cert/key files for changes (seconds). 0 = disabled.
+# Useful with ACME/Let's Encrypt where certs rotate automatically.
 # tls_reload_interval_secs = 300
 
 # CORS allowed origins. Empty list (default) means no CORS headers are
 # sent, so the browser's same-origin policy blocks cross-origin requests.
+# Set this when running the web UI on a different origin than fleetd.
 # cors_allowed_origins = ["https://fleet.example.com"]
 
 # Schema cache TTL (seconds). Controls how long GET /schema results are
 # cached before re-introspecting the parquet files.
+# Decrease if schema changes frequently; increase for less disk I/O.
 # schema_cache_ttl_secs = 60
 
 # Maximum completed queries kept in the history ring buffer,
@@ -69,21 +85,81 @@ path = "~/.fleet/data"
 # Path to the SQLite auth database (API keys and roles).
 db_path = "~/.fleet/auth.db"
 
+# How often to poll the auth database for key changes (seconds).
+# Detects keys created/revoked by fleet-admin and emits audit events.
+# Decrease for faster key revocation propagation. 0 = disabled.
+# audit_interval_secs = 30
+
+# TTL for the in-memory auth token cache (seconds). Verified tokens
+# skip argon2id on cache hits, improving throughput. Revoked keys
+# stay valid for up to this duration before eviction.
+# Decrease for tighter revocation windows. 0 = disabled (always verify).
+# auth_cache_ttl_secs = 300
+
 [ingest]
 # Whether the ingest endpoint (POST /api/v1/ingest) is enabled.
 # enabled = true
 
-# Maximum request body size for ingest (bytes). Default: 16 MB.
-# max_body_bytes = 16777216
+# Maximum request body size for ingest (default: 16M).
+# Increase for high-volume ingest with large batches; decrease to
+# bound per-request memory.
+# max_body_bytes = "16M"
 
 # WAL directory for buffering ingested events before compaction.
 # Defaults to {data.path}/wal/ when omitted.
 # wal_dir = "~/.fleet/data/wal"
 
-# How often the compaction task runs (seconds).
+# How often the compaction task runs (seconds). Controls how quickly
+# WAL files are merged into parquet. Lower = fresher data but more I/O.
 # compaction_interval_secs = 10
 
 # Write internal server events (queries, auth, compaction) to the ingest
 # pipeline as service:fleetd. Enables self-hosted dashboards and audit trails.
 # Requires ingest.enabled = true. Replaces the log_file JSON logger.
 # internal_telemetry = true
+
+# Consolidate per-service hourly parquet files into daily files for
+# dates older than today. Dramatically reduces file count for long
+# lookback queries at the cost of a brief compaction spike.
+# daily_rollup = true
+
+# Capacity of the in-memory event bus broadcast channel. When the
+# channel is full, slow SSE subscribers miss events and get a Lagged
+# notification. Increase if SSE clients report frequent lag.
+# event_bus_capacity = 4096
+
+# Maximum number of events held in the hot buffer across all batches.
+# Oldest batches are evicted when exceeded. Increase for longer hot
+# buffer retention; decrease to reduce memory usage.
+# hot_buffer_max_events = 100000
+
+# Maximum estimated memory usage for the hot buffer (default: 100M).
+# This is the serialized ndjson byte count; actual in-memory usage is
+# ~3-5x larger due to Map<String, Value> overhead. Increase for bursty
+# workloads; decrease on memory-constrained hosts.
+# hot_buffer_max_bytes = "100M"
+
+# How often server stats (pool utilization, SSE connections, hot buffer
+# metrics) are emitted as telemetry events (seconds). Lower values give
+# more granular observability at the cost of telemetry volume.
+# 0 = disabled.
+# stats_interval_secs = 60
+
+# How often buffered tracing events are flushed to WAL (seconds).
+# Lower values reduce latency for self-hosted dashboards but increase
+# disk I/O from more frequent small writes.
+# telemetry_flush_interval_secs = 1
+
+[retention]
+# Delete date directories older than this many days. 0 = disabled.
+# Adjust based on your storage capacity and compliance requirements.
+# max_age_days = 90
+
+# If free disk space drops below this threshold, delete oldest data
+# regardless of age. 0 = disabled. Acts as a safety net independent
+# of max_age_days.
+# min_free_disk_bytes = "1G"
+
+# How often the retention task runs (seconds). More frequent checks
+# respond faster to disk pressure but add minor I/O overhead.
+# retention_interval_secs = 3600
