@@ -1117,6 +1117,7 @@ dependencies = [
  "fleet-core",
  "fleet-engine",
  "futures",
+ "insta",
  "ratatui",
  "serde",
  "serde_json",
