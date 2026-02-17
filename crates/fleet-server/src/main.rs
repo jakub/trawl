@@ -88,12 +88,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (join, shutdown_tx)
     });
 
+    // Spawn periodic server stats emitter (60-second interval).
+    let stats_handle = {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = fleet_server::stats::spawn_stats_emitter(
+            &state,
+            std::time::Duration::from_secs(60),
+            shutdown_rx,
+        );
+        (handle, shutdown_tx)
+    };
+
     http::serve(state, &http_config, &config.server).await?;
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
-    // then hot buffer consumer (stop inserting), then compaction (may compact
-    // final files and drain hot buffer), then retention, then audit.
+    // then stats emitter, then hot buffer consumer (stop inserting), then
+    // compaction (may compact final files and drain hot buffer), then
+    // retention, then audit.
     shutdown_task(telemetry_handle, "telemetry").await;
+    shutdown_task(Some(stats_handle), "stats_emitter").await;
     if let Some((compaction_jh, compaction_tx, hot_buf_handle)) = compaction_handle {
         // Stop the hot buffer consumer before compaction so no new
         // batches arrive while compaction is draining.

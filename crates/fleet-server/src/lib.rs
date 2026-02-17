@@ -17,6 +17,7 @@ pub mod retention;
 pub mod shutdown;
 pub(crate) mod source;
 pub mod state;
+pub mod stats;
 pub mod telemetry;
 pub mod tls;
 pub mod tracker;
