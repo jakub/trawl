@@ -384,6 +384,7 @@ impl App {
     }
 
     /// Handle key events when editor is focused.
+    #[allow(clippy::too_many_lines)] // Inherently large key dispatch
     fn handle_editor_key(&mut self, key: event::KeyEvent) {
         // Debug: log the key event to see what we're receiving
         tracing::debug!(
@@ -413,19 +414,66 @@ impl App {
             }
             // Readline: Ctrl+A → line start
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
-                self.active_tab_mut().editor.move_to_line_start();
+                let editor = &mut self.active_tab_mut().editor;
+                editor.clear_selection();
+                editor.move_to_line_start();
             }
             // Readline: Ctrl+E → line end
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
-                self.active_tab_mut().editor.move_to_line_end();
+                let editor = &mut self.active_tab_mut().editor;
+                editor.clear_selection();
+                editor.move_to_line_end();
             }
             // Word movement: Ctrl+Left / Alt+B (readline)
             (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Char('b')) => {
-                self.active_tab_mut().editor.move_word_left();
+                let editor = &mut self.active_tab_mut().editor;
+                editor.clear_selection();
+                editor.move_word_left();
             }
             // Word movement: Ctrl+Right / Alt+F (readline)
             (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Char('f')) => {
-                self.active_tab_mut().editor.move_word_right();
+                let editor = &mut self.active_tab_mut().editor;
+                editor.clear_selection();
+                editor.move_word_right();
+            }
+            // Selection: Shift+Arrow
+            (_, KeyCode::Left) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let editor = &mut self.active_tab_mut().editor;
+                editor.start_selection();
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    editor.move_word_left();
+                } else {
+                    editor.move_left();
+                }
+            }
+            (_, KeyCode::Right) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let editor = &mut self.active_tab_mut().editor;
+                editor.start_selection();
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    editor.move_word_right();
+                } else {
+                    editor.move_right();
+                }
+            }
+            (KeyModifiers::SHIFT, KeyCode::Up) => {
+                let editor = &mut self.active_tab_mut().editor;
+                editor.start_selection();
+                editor.move_up();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Down) => {
+                let editor = &mut self.active_tab_mut().editor;
+                editor.start_selection();
+                editor.move_down();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Home) => {
+                let editor = &mut self.active_tab_mut().editor;
+                editor.start_selection();
+                editor.move_to_line_start();
+            }
+            (KeyModifiers::SHIFT, KeyCode::End) => {
+                let editor = &mut self.active_tab_mut().editor;
+                editor.start_selection();
+                editor.move_to_line_end();
             }
             // Kill word before cursor: Ctrl+W / Ctrl+Backspace
             (KeyModifiers::CONTROL, KeyCode::Char('w') | KeyCode::Backspace) => {
@@ -451,12 +499,30 @@ impl App {
                     KeyCode::Enter => editor.insert_newline(),
                     KeyCode::Backspace => editor.delete_char_before(),
                     KeyCode::Delete => editor.delete_char_at(),
-                    KeyCode::Left => editor.move_left(),
-                    KeyCode::Right => editor.move_right(),
-                    KeyCode::Up => editor.move_up(),
-                    KeyCode::Down => editor.move_down(),
-                    KeyCode::Home => editor.move_to_line_start(),
-                    KeyCode::End => editor.move_to_line_end(),
+                    KeyCode::Left => {
+                        editor.clear_selection();
+                        editor.move_left();
+                    }
+                    KeyCode::Right => {
+                        editor.clear_selection();
+                        editor.move_right();
+                    }
+                    KeyCode::Up => {
+                        editor.clear_selection();
+                        editor.move_up();
+                    }
+                    KeyCode::Down => {
+                        editor.clear_selection();
+                        editor.move_down();
+                    }
+                    KeyCode::Home => {
+                        editor.clear_selection();
+                        editor.move_to_line_start();
+                    }
+                    KeyCode::End => {
+                        editor.clear_selection();
+                        editor.move_to_line_end();
+                    }
                     _ => {}
                 }
             }

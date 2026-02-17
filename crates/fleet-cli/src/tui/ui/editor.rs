@@ -2,12 +2,18 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::tui::App;
 use crate::tui::highlight::Highlighter;
 use crate::tui::state::Focus;
+
+/// Selection highlight style.
+const SELECTION_STYLE: Style = Style::new()
+    .bg(Color::DarkGray)
+    .add_modifier(Modifier::empty());
 
 /// Render the editor pane.
 pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
@@ -44,15 +50,40 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let tab = app.active_tab();
     let scroll_row = tab.editor.scroll_row;
     let scroll_col = tab.editor.scroll_col;
+    let selection = tab.editor.selection_range();
 
     // Create highlighter with schema information.
     let highlighter = Highlighter::new(app.schema_cache.as_ref());
 
-    // Highlight visible lines only.
+    // Highlight visible lines and apply selection overlay.
     let end_row = (scroll_row + visible_rows).min(tab.editor.lines.len());
-    let highlighted_lines: Vec<_> = tab.editor.lines[scroll_row..end_row]
+    let highlighted_lines: Vec<Line<'static>> = tab.editor.lines[scroll_row..end_row]
         .iter()
-        .map(|line| highlighter.highlight_line(line))
+        .enumerate()
+        .map(|(i, line)| {
+            let abs_row = scroll_row + i;
+            let styled_line = highlighter.highlight_line(line);
+
+            if let Some(((sel_start_row, sel_start_col), (sel_end_row, sel_end_col))) = selection {
+                if abs_row >= sel_start_row && abs_row <= sel_end_row {
+                    // This line is (partially) selected
+                    let line_len = line.len();
+                    let sel_start = if abs_row == sel_start_row {
+                        sel_start_col
+                    } else {
+                        0
+                    };
+                    let sel_end = if abs_row == sel_end_row {
+                        sel_end_col
+                    } else {
+                        line_len
+                    };
+                    return apply_selection_style(styled_line, sel_start, sel_end);
+                }
+            }
+
+            styled_line
+        })
         .collect();
 
     #[allow(clippy::cast_possible_truncation)] // scroll_col bounded by terminal width
@@ -61,4 +92,50 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         .scroll((0, scroll_col as u16));
 
     frame.render_widget(paragraph, area);
+}
+
+/// Apply selection background to a highlighted line within the given column range.
+fn apply_selection_style(line: Line<'static>, sel_start: usize, sel_end: usize) -> Line<'static> {
+    if sel_start >= sel_end {
+        return line;
+    }
+
+    let mut result: Vec<Span<'static>> = Vec::new();
+    let mut col = 0;
+
+    for span in line.spans {
+        let span_len = span.content.len();
+        let span_end = col + span_len;
+
+        if span_end <= sel_start || col >= sel_end {
+            // Entirely outside selection
+            result.push(span);
+        } else if col >= sel_start && span_end <= sel_end {
+            // Entirely inside selection
+            result.push(Span::styled(
+                span.content,
+                span.style.bg(SELECTION_STYLE.bg.unwrap_or(Color::DarkGray)),
+            ));
+        } else {
+            // Partially overlapping — split the span
+            let text = span.content.to_string();
+            let rel_start = sel_start.saturating_sub(col);
+            let rel_end = sel_end.saturating_sub(col).min(span_len);
+
+            if rel_start > 0 {
+                result.push(Span::styled(text[..rel_start].to_owned(), span.style));
+            }
+            result.push(Span::styled(
+                text[rel_start..rel_end].to_owned(),
+                span.style.bg(SELECTION_STYLE.bg.unwrap_or(Color::DarkGray)),
+            ));
+            if rel_end < span_len {
+                result.push(Span::styled(text[rel_end..].to_owned(), span.style));
+            }
+        }
+
+        col = span_end;
+    }
+
+    Line::from(result)
 }

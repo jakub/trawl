@@ -110,6 +110,9 @@ pub struct SimpleEditor {
     pub scroll_row: usize,
     /// Horizontal scroll offset (first visible column).
     pub scroll_col: usize,
+    /// Selection anchor position. If `Some`, marks start of selection;
+    /// cursor is the other end.
+    pub selection_anchor: Option<(usize, usize)>,
 }
 
 impl Default for SimpleEditor {
@@ -127,6 +130,7 @@ impl SimpleEditor {
             desired_col: None,
             scroll_row: 0,
             scroll_col: 0,
+            selection_anchor: None,
         }
     }
 
@@ -143,6 +147,7 @@ impl SimpleEditor {
 
     /// Insert a character at the cursor position.
     pub fn insert_char(&mut self, ch: char) {
+        self.delete_selection();
         let (row, col) = self.cursor;
         self.lines[row].insert(col, ch);
         self.cursor.1 += 1;
@@ -150,6 +155,7 @@ impl SimpleEditor {
 
     /// Insert a newline at the cursor position.
     pub fn insert_newline(&mut self) {
+        self.delete_selection();
         let (row, col) = self.cursor;
         let current_line = self.lines[row].clone();
         let (before, after) = current_line.split_at(col);
@@ -160,6 +166,9 @@ impl SimpleEditor {
 
     /// Delete character before cursor (backspace).
     pub fn delete_char_before(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (row, col) = self.cursor;
         if col > 0 {
             self.lines[row].remove(col - 1);
@@ -175,6 +184,9 @@ impl SimpleEditor {
 
     /// Delete character at cursor (delete key).
     pub fn delete_char_at(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (row, col) = self.cursor;
         if col < self.lines[row].len() {
             self.lines[row].remove(col);
@@ -383,6 +395,76 @@ impl SimpleEditor {
         self.lines[row].truncate(col);
     }
 
+    /// Start or extend selection from the current cursor position.
+    ///
+    /// If no selection is active, sets the anchor to the current cursor.
+    pub fn start_selection(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+    }
+
+    /// Clear the active selection.
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// Get the selection range in document order (start, end).
+    pub fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.selection_anchor?;
+        let cursor = self.cursor;
+        if anchor <= cursor {
+            Some((anchor, cursor))
+        } else {
+            Some((cursor, anchor))
+        }
+    }
+
+    /// Extract the selected text as a string.
+    #[allow(dead_code)] // Used by clipboard operations (step 6)
+    pub fn selected_text(&self) -> Option<String> {
+        let ((start_row, start_col), (end_row, end_col)) = self.selection_range()?;
+
+        if start_row == end_row {
+            // Single-line selection
+            Some(self.lines[start_row][start_col..end_col].to_owned())
+        } else {
+            // Multi-line selection
+            let mut result = String::new();
+            result.push_str(&self.lines[start_row][start_col..]);
+            for row in (start_row + 1)..end_row {
+                result.push('\n');
+                result.push_str(&self.lines[row]);
+            }
+            result.push('\n');
+            result.push_str(&self.lines[end_row][..end_col]);
+            Some(result)
+        }
+    }
+
+    /// Delete the selected region. Returns `true` if a selection existed.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(((start_row, start_col), (end_row, end_col))) = self.selection_range() else {
+            return false;
+        };
+
+        if start_row == end_row {
+            // Single-line: just drain the range
+            self.lines[start_row].drain(start_col..end_col);
+        } else {
+            // Multi-line: keep start of first line + end of last line
+            let tail = self.lines[end_row][end_col..].to_owned();
+            self.lines[start_row].truncate(start_col);
+            self.lines[start_row].push_str(&tail);
+            // Remove intermediate + last lines
+            self.lines.drain((start_row + 1)..=end_row);
+        }
+
+        self.cursor = (start_row, start_col);
+        self.selection_anchor = None;
+        true
+    }
+
     /// Adjust scroll offsets to keep cursor in viewport.
     ///
     /// Call after every cursor movement or content change.
@@ -415,6 +497,7 @@ impl SimpleEditor {
         self.desired_col = None;
         self.scroll_row = 0;
         self.scroll_col = 0;
+        self.selection_anchor = None;
     }
 }
 
@@ -814,6 +897,94 @@ mod tests {
         assert_eq!(editor.cursor, (0, 6));
         editor.move_word_right();
         assert_eq!(editor.cursor, (0, 11));
+    }
+
+    // --- Selection tests ---
+
+    #[test]
+    fn editor_selection_range_none_by_default() {
+        let editor = SimpleEditor::new();
+        assert_eq!(editor.selection_range(), None);
+    }
+
+    #[test]
+    fn editor_start_and_extend_selection() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.cursor = (0, 5);
+        editor.start_selection();
+        editor.cursor = (0, 11);
+        assert_eq!(editor.selection_range(), Some(((0, 5), (0, 11))));
+    }
+
+    #[test]
+    fn editor_selection_range_reversed() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned()];
+        editor.cursor = (0, 5);
+        editor.start_selection();
+        editor.cursor = (0, 0);
+        // Should return in document order
+        assert_eq!(editor.selection_range(), Some(((0, 0), (0, 5))));
+    }
+
+    #[test]
+    fn editor_selected_text_single_line() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.selection_anchor = Some((0, 0));
+        editor.cursor = (0, 5);
+        assert_eq!(editor.selected_text(), Some("hello".to_owned()));
+    }
+
+    #[test]
+    fn editor_selected_text_multiline() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned(), "world".to_owned(), "foo".to_owned()];
+        editor.selection_anchor = Some((0, 3));
+        editor.cursor = (2, 2);
+        assert_eq!(editor.selected_text(), Some("lo\nworld\nfo".to_owned()));
+    }
+
+    #[test]
+    fn editor_delete_selection_single_line() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.selection_anchor = Some((0, 5));
+        editor.cursor = (0, 11);
+        assert!(editor.delete_selection());
+        assert_eq!(editor.text(), "hello");
+        assert_eq!(editor.cursor, (0, 5));
+        assert_eq!(editor.selection_anchor, None);
+    }
+
+    #[test]
+    fn editor_delete_selection_multiline() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["aaa".to_owned(), "bbb".to_owned(), "ccc".to_owned()];
+        editor.selection_anchor = Some((0, 1));
+        editor.cursor = (2, 2);
+        assert!(editor.delete_selection());
+        assert_eq!(editor.text(), "ac");
+        assert_eq!(editor.cursor, (0, 1));
+    }
+
+    #[test]
+    fn editor_insert_char_replaces_selection() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned()];
+        editor.selection_anchor = Some((0, 1));
+        editor.cursor = (0, 4);
+        editor.insert_char('X');
+        assert_eq!(editor.text(), "hXo");
+    }
+
+    #[test]
+    fn editor_clear_selection() {
+        let mut editor = SimpleEditor::new();
+        editor.selection_anchor = Some((0, 0));
+        editor.clear_selection();
+        assert_eq!(editor.selection_anchor, None);
     }
 
     // --- Sticky column tests ---
