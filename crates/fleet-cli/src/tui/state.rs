@@ -220,6 +220,80 @@ impl SimpleEditor {
         self.cursor.1 = self.lines[self.cursor.0].len();
     }
 
+    /// Whether a character is a "word" character (alphanumeric or underscore).
+    fn is_word_char(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
+    }
+
+    /// Find the word boundary to the left of a given position.
+    ///
+    /// Skips non-word chars, then skips word chars (standard word-left).
+    /// Wraps to previous line if at column 0.
+    pub fn find_word_boundary_left(&self, row: usize, col: usize) -> (usize, usize) {
+        if col == 0 {
+            // Wrap to end of previous line
+            if row > 0 {
+                return (row - 1, self.lines[row - 1].len());
+            }
+            return (0, 0);
+        }
+
+        let line: Vec<char> = self.lines[row].chars().collect();
+        let mut c = col;
+
+        // Skip non-word chars
+        while c > 0 && !Self::is_word_char(line[c - 1]) {
+            c -= 1;
+        }
+        // Skip word chars
+        while c > 0 && Self::is_word_char(line[c - 1]) {
+            c -= 1;
+        }
+
+        (row, c)
+    }
+
+    /// Find the word boundary to the right of a given position.
+    ///
+    /// Skips word chars, then skips non-word chars (standard word-right).
+    /// Wraps to next line if at end of line.
+    pub fn find_word_boundary_right(&self, row: usize, col: usize) -> (usize, usize) {
+        let line_len = self.lines[row].len();
+        if col >= line_len {
+            // Wrap to start of next line
+            if row < self.lines.len() - 1 {
+                return (row + 1, 0);
+            }
+            return (row, line_len);
+        }
+
+        let line: Vec<char> = self.lines[row].chars().collect();
+        let mut c = col;
+
+        // Skip word chars
+        while c < line.len() && Self::is_word_char(line[c]) {
+            c += 1;
+        }
+        // Skip non-word chars
+        while c < line.len() && !Self::is_word_char(line[c]) {
+            c += 1;
+        }
+
+        (row, c)
+    }
+
+    /// Move cursor one word to the left.
+    pub fn move_word_left(&mut self) {
+        let (row, col) = self.cursor;
+        self.cursor = self.find_word_boundary_left(row, col);
+    }
+
+    /// Move cursor one word to the right.
+    pub fn move_word_right(&mut self) {
+        let (row, col) = self.cursor;
+        self.cursor = self.find_word_boundary_right(row, col);
+    }
+
     /// Clear all text.
     pub fn clear(&mut self) {
         self.lines = vec![String::new()];
@@ -537,6 +611,92 @@ mod tests {
             "line three".to_owned(),
         ];
         assert_eq!(editor.text(), "line one\nline two\nline three");
+    }
+
+    // --- Word movement tests ---
+
+    #[test]
+    fn editor_word_boundary_left_skips_word() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        // From end of "world" (col 11)
+        assert_eq!(editor.find_word_boundary_left(0, 11), (0, 6));
+        // From start of "world" (col 6)
+        assert_eq!(editor.find_word_boundary_left(0, 6), (0, 0));
+    }
+
+    #[test]
+    fn editor_word_boundary_left_with_symbols() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["foo_bar::baz".to_owned()];
+        // From end (col 12) — skips "baz", skips "::", lands at start of "foo_bar"? No.
+        // Actually: col 12, skip non-word (none at 11, 'z' is word), skip word "baz" → col 9
+        // Wait: col 12: chars[11] = 'z' (word), so skip word first? No, the algorithm is:
+        // skip non-word first, then word. If at word char, skip nothing then skip word.
+        // Let me trace: c=12, chars[11]='z' word → skip non-word: nothing. skip word: z,a,b → c=9
+        assert_eq!(editor.find_word_boundary_left(0, 12), (0, 9));
+        // From col 9: chars[8]=':' not word → skip non-word: ::, c=7. skip word: r,a,b,_,o,o,f → c=0
+        assert_eq!(editor.find_word_boundary_left(0, 9), (0, 0));
+    }
+
+    #[test]
+    fn editor_word_boundary_left_at_origin() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned()];
+        assert_eq!(editor.find_word_boundary_left(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn editor_word_boundary_left_wraps_line() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["abc".to_owned(), "def".to_owned()];
+        assert_eq!(editor.find_word_boundary_left(1, 0), (0, 3));
+    }
+
+    #[test]
+    fn editor_word_boundary_right_skips_word() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        // From col 0: skip word "hello" → col 5, skip non-word " " → col 6
+        assert_eq!(editor.find_word_boundary_right(0, 0), (0, 6));
+        // From col 6: skip word "world" → col 11, skip non-word: nothing → col 11
+        assert_eq!(editor.find_word_boundary_right(0, 6), (0, 11));
+    }
+
+    #[test]
+    fn editor_word_boundary_right_at_end() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned()];
+        assert_eq!(editor.find_word_boundary_right(0, 5), (0, 5));
+    }
+
+    #[test]
+    fn editor_word_boundary_right_wraps_line() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["abc".to_owned(), "def".to_owned()];
+        assert_eq!(editor.find_word_boundary_right(0, 3), (1, 0));
+    }
+
+    #[test]
+    fn editor_move_word_left() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.cursor = (0, 11);
+        editor.move_word_left();
+        assert_eq!(editor.cursor, (0, 6));
+        editor.move_word_left();
+        assert_eq!(editor.cursor, (0, 0));
+    }
+
+    #[test]
+    fn editor_move_word_right() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.cursor = (0, 0);
+        editor.move_word_right();
+        assert_eq!(editor.cursor, (0, 6));
+        editor.move_word_right();
+        assert_eq!(editor.cursor, (0, 11));
     }
 
     // --- LiveBuffer tests ---

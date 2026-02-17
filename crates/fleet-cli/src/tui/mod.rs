@@ -411,6 +411,14 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.active_tab_mut().clear();
             }
+            // Word movement: Ctrl+Left / Alt+B (readline)
+            (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Char('b')) => {
+                self.active_tab_mut().editor.move_word_left();
+            }
+            // Word movement: Ctrl+Right / Alt+F (readline)
+            (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Char('f')) => {
+                self.active_tab_mut().editor.move_word_right();
+            }
             // Handle text editing.
             _ => {
                 let editor = &mut self.active_tab_mut().editor;
@@ -1197,6 +1205,52 @@ mod tests {
                 input: "ab".to_owned()
             })
         );
+    }
+
+    // --- Word movement keybinding tests ---
+
+    #[test]
+    fn key_ctrl_left_moves_word_left() {
+        let mut app = test_app();
+        // Type "hello world"
+        for ch in "hello world".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.active_tab().editor.cursor, (0, 11));
+        app.handle_key(key_mod(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab().editor.cursor, (0, 6));
+    }
+
+    #[test]
+    fn key_ctrl_right_moves_word_right() {
+        let mut app = test_app();
+        for ch in "hello world".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.active_tab_mut().editor.cursor = (0, 0);
+        app.handle_key(key_mod(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab().editor.cursor, (0, 6));
+    }
+
+    #[test]
+    fn key_alt_b_moves_word_left() {
+        let mut app = test_app();
+        for ch in "hello world".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key_mod(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(app.active_tab().editor.cursor, (0, 6));
+    }
+
+    #[test]
+    fn key_alt_f_moves_word_right() {
+        let mut app = test_app();
+        for ch in "hello world".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.active_tab_mut().editor.cursor = (0, 0);
+        app.handle_key(key_mod(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(app.active_tab().editor.cursor, (0, 6));
     }
 
     // --- Editor key routing ---
