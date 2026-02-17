@@ -100,6 +100,7 @@ pub async fn query(
             tracing::info!(
                 event_type = "query_complete",
                 user = %verified.name,
+                query = %req.query,
                 total_rows = total,
                 returned_rows = returned,
                 query_id,
@@ -375,6 +376,12 @@ pub async fn field_values(
         let cache = state.query.field_values_cache.lock().await;
         if let Some(cached) = cache.get(&field) {
             if cached.cached_at.elapsed().as_secs() < cache_ttl {
+                tracing::info!(
+                    event_type = "field_values_cache_hit",
+                    user = %verified.name,
+                    field = %field,
+                    "field values served from cache"
+                );
                 return Ok(Json(FieldValuesResponse {
                     field: field.clone(),
                     values: cached.values.clone(),
@@ -385,6 +392,7 @@ pub async fn field_values(
     }
 
     // Cache miss — sample from parquet.
+    let start = std::time::Instant::now();
     let glob = state.query.pool.fallback_glob().to_string();
     let field_clone = field.clone();
 
@@ -395,6 +403,17 @@ pub async fn field_values(
     .await
     .map_err(|e| ServerError::Internal(format!("task panicked: {e}")))?
     .map_err(ServerError::from)?;
+
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    tracing::info!(
+        event_type = "field_values_complete",
+        user = %verified.name,
+        field = %field,
+        values_count = values.len(),
+        duration_ms,
+        "field values sampled"
+    );
 
     // Update cache.
     state.query.field_values_cache.lock().await.insert(
@@ -643,6 +662,7 @@ pub async fn export(
         "executing export"
     );
 
+    let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
     let result = state.query.pool.execute(&req.query, timeout).await?;
 
@@ -651,6 +671,17 @@ pub async fn export(
 
     // Generate CSV.
     let csv = generate_csv(&limited);
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    tracing::info!(
+        event_type = "export_complete",
+        user = %verified.name,
+        query = %req.query,
+        rows = limited.row_count(),
+        bytes = csv.len(),
+        duration_ms,
+        "export complete"
+    );
 
     // Return CSV response with proper headers.
     Ok((

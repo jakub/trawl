@@ -216,13 +216,12 @@ impl ExecutorPool {
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
         let wait_ms = wait_start.elapsed().as_millis();
-        if wait_ms > 0 {
-            tracing::debug!(
-                event_type = "pool_acquired",
-                wait_ms,
-                "semaphore permit acquired"
-            );
-        }
+        tracing::info!(
+            event_type = "pool_acquired",
+            wait_ms,
+            available = self.semaphore.available_permits(),
+            "semaphore permit acquired"
+        );
 
         let executor = self.take_executor();
 
