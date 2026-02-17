@@ -15,6 +15,7 @@ path = "src/main.rs"
 fleet-client = { workspace = true }
 fleet-core = { workspace = true }
 fleet-engine = { workspace = true }
+arboard = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }

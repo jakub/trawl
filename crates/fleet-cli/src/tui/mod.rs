@@ -22,6 +22,18 @@ use self::state::{ChartView, Focus, LiveBuffer, Popup, Sidebar, Tab, TabStatus};
 use crate::CliError;
 use crate::config::Config;
 
+/// Get text from the system clipboard. Returns `None` if clipboard is unavailable.
+fn clipboard_get() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+/// Set text on the system clipboard. Silently fails if clipboard is unavailable.
+fn clipboard_set(text: &str) {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_owned());
+    }
+}
+
 /// Result of an async query execution.
 #[derive(Debug)]
 struct QueryResult {
@@ -474,6 +486,27 @@ impl App {
                 let editor = &mut self.active_tab_mut().editor;
                 editor.start_selection();
                 editor.move_to_line_end();
+            }
+            // Clipboard: Ctrl+C (copy), Ctrl+X (cut)
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                if let Some(text) = self.active_tab().editor.selected_text() {
+                    clipboard_set(&text);
+                }
+                // Without selection, Ctrl+C is intentionally a no-op (Ctrl+Q is quit)
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('x')) => {
+                if let Some(text) = self.active_tab().editor.selected_text() {
+                    clipboard_set(&text);
+                    self.active_tab_mut().editor.delete_selection();
+                }
+            }
+            // Clipboard: Ctrl+V (paste)
+            (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
+                if let Some(text) = clipboard_get() {
+                    let editor = &mut self.active_tab_mut().editor;
+                    editor.delete_selection();
+                    editor.insert_text(&text);
+                }
             }
             // Kill word before cursor: Ctrl+W / Ctrl+Backspace
             (KeyModifiers::CONTROL, KeyCode::Char('w') | KeyCode::Backspace) => {

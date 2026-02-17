@@ -21,6 +21,7 @@ fleet-client = { path = "crates/fleet-client" }
 
 # external deps
 aho-corasick = "1"
+arboard = "3"
 argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
 axum = "0.8"

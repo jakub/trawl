@@ -421,7 +421,6 @@ impl SimpleEditor {
     }
 
     /// Extract the selected text as a string.
-    #[allow(dead_code)] // Used by clipboard operations (step 6)
     pub fn selected_text(&self) -> Option<String> {
         let ((start_row, start_col), (end_row, end_col)) = self.selection_range()?;
 
