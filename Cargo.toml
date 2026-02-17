@@ -20,6 +20,7 @@ fleet-api = { path = "crates/fleet-api" }
 fleet-client = { path = "crates/fleet-client" }
 
 # external deps
+aho-corasick = "1"
 argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
 axum = "0.8"
@@ -72,6 +73,7 @@ tempfile = "3"
 time = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-width = "0.2"
+x509-parser = "0.16"
 zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]

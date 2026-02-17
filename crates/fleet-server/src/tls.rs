@@ -72,6 +72,8 @@ pub fn build_server_config(
         }
     };
 
+    log_cert_details(&cert_pem);
+
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsError::InvalidCert(e.to_string()))?;
@@ -104,6 +106,55 @@ fn load_pem_files(cert_path: &Path, key_path: &Path) -> Result<(Vec<u8>, Vec<u8>
         source: e,
     })?;
     Ok((cert, key))
+}
+
+/// Log certificate details (subject, issuer, validity period) for observability.
+///
+/// Parses the PEM-encoded certificate and emits a `tls_cert_details` event.
+/// Failures are logged as warnings rather than propagated, since cert
+/// details are informational — the actual TLS handshake will catch
+/// genuinely broken certs.
+fn log_cert_details(pem_bytes: &[u8]) {
+    match x509_parser::pem::parse_x509_pem(pem_bytes) {
+        Ok((_, pem)) => match pem.parse_x509() {
+            Ok(cert) => {
+                let subject = cert.subject().to_string();
+                let issuer = cert.issuer().to_string();
+                let not_before = cert
+                    .validity()
+                    .not_before
+                    .to_rfc2822()
+                    .unwrap_or_else(|e| format!("(invalid: {e})"));
+                let not_after = cert
+                    .validity()
+                    .not_after
+                    .to_rfc2822()
+                    .unwrap_or_else(|e| format!("(invalid: {e})"));
+                tracing::info!(
+                    event_type = "tls_cert_details",
+                    subject = %subject,
+                    issuer = %issuer,
+                    not_before = %not_before,
+                    not_after = %not_after,
+                    "TLS certificate details"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "tls_cert_details",
+                    error = %e,
+                    "failed to parse X.509 certificate"
+                );
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                event_type = "tls_cert_details",
+                error = %e,
+                "failed to parse PEM certificate"
+            );
+        }
+    }
 }
 
 /// Resolve the default TLS directory (`~/.fleet/tls/`).
