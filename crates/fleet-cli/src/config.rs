@@ -91,6 +91,11 @@ pub struct UiConfig {
     /// Tab width in spaces.
     #[serde(default = "default_tab_width")]
     pub tab_width: usize,
+
+    /// When true, Enter executes the query and Shift+Enter inserts a newline.
+    /// When false (default), Enter inserts a newline and Ctrl+Enter executes.
+    #[serde(default)]
+    pub enter_executes: bool,
 }
 
 impl Default for UiConfig {
@@ -100,6 +105,7 @@ impl Default for UiConfig {
             enable_mouse: true,
             auto_save_history: true,
             tab_width: default_tab_width(),
+            enter_executes: false,
         }
     }
 }

@@ -90,6 +90,8 @@ pub struct App {
     pub should_quit: bool,
     /// Whether live tail mode is active.
     pub live_mode: bool,
+    /// When true, Enter executes query and Shift+Enter inserts newline.
+    pub enter_executes: bool,
     /// Maximum events to retain in live streaming buffer.
     max_live_events: usize,
     /// Handle to the live streaming task (if active).
@@ -124,6 +126,7 @@ impl App {
             saved_selected_index: 0,
             should_quit: false,
             live_mode: false,
+            enter_executes: false,
             max_live_events: 1000,
             live_task: None,
             query_rx,
@@ -415,10 +418,18 @@ impl App {
                 tracing::info!("executing query with F5");
                 self.execute_query();
             }
-            // Execute query: Ctrl+Enter
+            // Execute query: Ctrl+Enter (always executes regardless of config)
             (_, KeyCode::Enter) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 tracing::info!("executing query with ctrl+enter");
                 self.execute_query();
+            }
+            // Configurable Enter: when enter_executes=true, Enter executes and Shift+Enter inserts newline
+            (KeyModifiers::NONE, KeyCode::Enter) if self.enter_executes => {
+                tracing::info!("executing query with enter (enter_executes mode)");
+                self.execute_query();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Enter) if self.enter_executes => {
+                self.active_tab_mut().editor.insert_newline();
             }
             // Clear editor: Ctrl+L
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
@@ -1017,6 +1028,7 @@ pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliE
     // Create app with schema, history, and saved queries.
     let mut app = App::new(client);
     app.max_live_events = config.tail.max_events;
+    app.enter_executes = config.ui.enter_executes;
     app.schema_cache = schema;
     app.history_cache = history;
     app.saved_cache = saved;
