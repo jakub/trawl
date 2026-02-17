@@ -107,7 +107,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
     // Fast path: check cache before expensive argon2id verification.
     if let Some(ref cache) = auth_cache {
         if let Some(verified) = cache.get(raw_token) {
-            tracing::debug!(
+            tracing::info!(
                 event_type = "auth_cache_hit",
                 user = %verified.name,
                 path = %path,
@@ -122,6 +122,7 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
     let token = raw_token.to_owned();
     let token_for_cache = token.clone();
 
+    let verify_start = Instant::now();
     let verified = match tokio::task::spawn_blocking(move || {
         let store = key_store.lock();
         store.verify_key(&token)
@@ -140,6 +141,15 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
             )));
         }
     };
+
+    let verify_ms = verify_start.elapsed().as_millis();
+    tracing::info!(
+        event_type = "auth_cache_miss",
+        user = %verified.name,
+        path = %path,
+        verify_ms,
+        "authenticated (cache miss, argon2id verified)"
+    );
 
     // Populate cache on successful verification.
     if let Some(cache) = auth_cache {
