@@ -83,27 +83,41 @@ pub async fn ingest(
     let wire_bytes = body.len();
     let wal_writer = Arc::clone(wal_writer);
 
-    let (parsed, wal_path, body_bytes, ndjson_byte_size) =
+    let (parsed, wal_path, body_bytes, ndjson_byte_size, decompress_ms, parse_ms, wal_ms) =
         tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+            let t0 = std::time::Instant::now();
             let raw = if compressed {
                 decompress_gzip(&body)?
             } else {
                 body.to_vec()
             };
+            let decompress_ms = t0.elapsed().as_millis();
             let body_bytes = raw.len();
 
             if raw.is_empty() {
                 return Err(ServerError::Ingest("empty request body".into()));
             }
 
+            let t1 = std::time::Instant::now();
             let parsed = parse_events(&raw)?;
+            let parse_ms = t1.elapsed().as_millis();
             let ndjson_byte_size = parsed.ndjson.len();
 
+            let t2 = std::time::Instant::now();
             let wal_path = wal_writer
                 .write(&parsed.service, &parsed.ndjson)
                 .map_err(|e| ServerError::Internal(format!("WAL write failed: {e}")))?;
+            let wal_ms = t2.elapsed().as_millis();
 
-            Ok((parsed, wal_path, body_bytes, ndjson_byte_size))
+            Ok((
+                parsed,
+                wal_path,
+                body_bytes,
+                ndjson_byte_size,
+                decompress_ms,
+                parse_ms,
+                wal_ms,
+            ))
         })
         .await
         .map_err(|e| ServerError::Internal(format!("ingest task panicked: {e}")))??;
@@ -128,6 +142,7 @@ pub async fn ingest(
         tracing::debug!(subscribers, "published batch to event bus");
     }
 
+    let duration_ms = decompress_ms + parse_ms + wal_ms;
     tracing::info!(
         event_type = "ingest_complete",
         user = %verified.name,
@@ -136,6 +151,10 @@ pub async fn ingest(
         body_bytes,
         wire_bytes,
         compressed,
+        duration_ms,
+        decompress_ms,
+        parse_ms,
+        wal_ms,
         path = %wal_path.display(),
         "ingested events to WAL"
     );

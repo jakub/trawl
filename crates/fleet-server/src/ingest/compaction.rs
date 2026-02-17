@@ -397,6 +397,7 @@ fn rollup_day_blocking(
     service: &str,
     hourly_files: &[PathBuf],
 ) -> Result<(), String> {
+    let rollup_start = std::time::Instant::now();
     let conn =
         duckdb::Connection::open_in_memory().map_err(|e| format!("DuckDB open failed: {e}"))?;
 
@@ -452,12 +453,14 @@ fn rollup_day_blocking(
         .map(|m| m.len())
         .unwrap_or(0);
 
+    let duration_ms = rollup_start.elapsed().as_millis();
     tracing::info!(
         event_type = "rollup_complete",
         compact_service = %service,
         output = %canonical_path.display(),
         hourly_files = hourly_files.len(),
         output_bytes,
+        duration_ms,
         "daily rollup complete"
     );
 
@@ -502,6 +505,7 @@ fn compact_service_blocking(
     data_dir: &Path,
     service: &str,
 ) -> Result<(), String> {
+    let compact_start = std::time::Instant::now();
     let conn =
         duckdb::Connection::open_in_memory().map_err(|e| format!("DuckDB open failed: {e}"))?;
 
@@ -584,6 +588,7 @@ fn compact_service_blocking(
         .map(|m| m.len())
         .unwrap_or(0);
 
+    let duration_ms = compact_start.elapsed().as_millis();
     tracing::info!(
         event_type = "compaction_complete",
         compact_service = %service,
@@ -592,6 +597,7 @@ fn compact_service_blocking(
         merged,
         rows,
         output_bytes,
+        duration_ms,
         "compaction complete"
     );
 
