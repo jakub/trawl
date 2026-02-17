@@ -411,6 +411,14 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.active_tab_mut().clear();
             }
+            // Readline: Ctrl+A → line start
+            (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
+                self.active_tab_mut().editor.move_to_line_start();
+            }
+            // Readline: Ctrl+E → line end
+            (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+                self.active_tab_mut().editor.move_to_line_end();
+            }
             // Word movement: Ctrl+Left / Alt+B (readline)
             (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Char('b')) => {
                 self.active_tab_mut().editor.move_word_left();
@@ -418,6 +426,22 @@ impl App {
             // Word movement: Ctrl+Right / Alt+F (readline)
             (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Char('f')) => {
                 self.active_tab_mut().editor.move_word_right();
+            }
+            // Kill word before cursor: Ctrl+W / Ctrl+Backspace
+            (KeyModifiers::CONTROL, KeyCode::Char('w') | KeyCode::Backspace) => {
+                self.active_tab_mut().editor.delete_word_before();
+            }
+            // Kill word after cursor: Ctrl+Delete / Alt+D
+            (KeyModifiers::CONTROL, KeyCode::Delete) | (KeyModifiers::ALT, KeyCode::Char('d')) => {
+                self.active_tab_mut().editor.delete_word_after();
+            }
+            // Kill to line start: Ctrl+U
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                self.active_tab_mut().editor.delete_to_line_start();
+            }
+            // Kill to line end: Ctrl+K
+            (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+                self.active_tab_mut().editor.delete_to_line_end();
             }
             // Handle text editing.
             _ => {

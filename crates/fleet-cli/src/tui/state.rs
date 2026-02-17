@@ -294,6 +294,57 @@ impl SimpleEditor {
         self.cursor = self.find_word_boundary_right(row, col);
     }
 
+    /// Delete from cursor to word boundary left (Ctrl+W).
+    pub fn delete_word_before(&mut self) {
+        let (row, col) = self.cursor;
+        let (new_row, new_col) = self.find_word_boundary_left(row, col);
+
+        if new_row == row {
+            // Same line: remove chars between new_col and col
+            let line = &mut self.lines[row];
+            line.drain(new_col..col);
+            self.cursor.1 = new_col;
+        } else {
+            // Crossed line boundary: delete from start of current line + join with prev
+            let current = self.lines[row][col..].to_owned();
+            self.lines.remove(row);
+            self.lines[new_row].truncate(new_col);
+            self.lines[new_row].push_str(&current);
+            self.cursor = (new_row, new_col);
+        }
+    }
+
+    /// Delete from cursor to word boundary right (Ctrl+Delete / Alt+D).
+    pub fn delete_word_after(&mut self) {
+        let (row, col) = self.cursor;
+        let (new_row, new_col) = self.find_word_boundary_right(row, col);
+
+        if new_row == row {
+            // Same line: remove chars between col and new_col
+            self.lines[row].drain(col..new_col);
+        } else {
+            // Crossed line boundary: delete rest of current line + join with next
+            self.lines[row].truncate(col);
+            let rest = self.lines[new_row][new_col..].to_owned();
+            self.lines.remove(new_row);
+            self.lines[row].push_str(&rest);
+        }
+        // Cursor stays where it is
+    }
+
+    /// Delete from cursor to start of line (Ctrl+U).
+    pub fn delete_to_line_start(&mut self) {
+        let (row, col) = self.cursor;
+        self.lines[row].drain(..col);
+        self.cursor.1 = 0;
+    }
+
+    /// Delete from cursor to end of line (Ctrl+K).
+    pub fn delete_to_line_end(&mut self) {
+        let (row, col) = self.cursor;
+        self.lines[row].truncate(col);
+    }
+
     /// Clear all text.
     pub fn clear(&mut self) {
         self.lines = vec![String::new()];
@@ -697,6 +748,68 @@ mod tests {
         assert_eq!(editor.cursor, (0, 6));
         editor.move_word_right();
         assert_eq!(editor.cursor, (0, 11));
+    }
+
+    // --- Kill operation tests ---
+
+    #[test]
+    fn editor_delete_word_before() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.cursor = (0, 11);
+        editor.delete_word_before();
+        assert_eq!(editor.text(), "hello ");
+        assert_eq!(editor.cursor, (0, 6));
+    }
+
+    #[test]
+    fn editor_delete_word_before_at_start() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned()];
+        editor.cursor = (0, 0);
+        editor.delete_word_before();
+        assert_eq!(editor.text(), "hello");
+        assert_eq!(editor.cursor, (0, 0));
+    }
+
+    #[test]
+    fn editor_delete_word_after() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.cursor = (0, 0);
+        editor.delete_word_after();
+        assert_eq!(editor.text(), "world");
+        assert_eq!(editor.cursor, (0, 0));
+    }
+
+    #[test]
+    fn editor_delete_word_after_at_end() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello".to_owned()];
+        editor.cursor = (0, 5);
+        editor.delete_word_after();
+        assert_eq!(editor.text(), "hello");
+        assert_eq!(editor.cursor, (0, 5));
+    }
+
+    #[test]
+    fn editor_delete_to_line_start() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.cursor = (0, 6);
+        editor.delete_to_line_start();
+        assert_eq!(editor.text(), "world");
+        assert_eq!(editor.cursor, (0, 0));
+    }
+
+    #[test]
+    fn editor_delete_to_line_end() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["hello world".to_owned()];
+        editor.cursor = (0, 5);
+        editor.delete_to_line_end();
+        assert_eq!(editor.text(), "hello");
+        assert_eq!(editor.cursor, (0, 5));
     }
 
     // --- LiveBuffer tests ---
