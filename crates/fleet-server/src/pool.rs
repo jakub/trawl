@@ -203,7 +203,7 @@ impl ExecutorPool {
         if available == 0 {
             tracing::warn!(
                 event_type = "pool_pressure",
-                max_concurrent = self.semaphore.available_permits() + 1,
+                max_concurrent = self.max_concurrent,
                 "executor pool at capacity, query queued"
             );
         }

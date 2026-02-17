@@ -96,6 +96,7 @@ impl HotBuffer {
                     self.total_bytes
                         .fetch_sub(evicted.byte_size, Ordering::Relaxed);
                     tracing::warn!(
+                        event_type = "hot_buffer_eviction",
                         batch_id = %evicted_id,
                         events = evicted.events.len(),
                         bytes = evicted.byte_size,
@@ -212,13 +213,14 @@ impl HotBuffer {
                 match serde_json::to_writer(&mut tmpfile, event) {
                     Ok(()) => {
                         if let Err(e) = tmpfile.write_all(b"\n") {
-                            tracing::error!(error = %e, "hot buffer snapshot write failed");
+                            tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot write failed");
                             return None;
                         }
                         wrote_any = true;
                     }
                     Err(e) => {
                         tracing::error!(
+                            event_type = "hot_buffer_error",
                             batch_id = %batch.batch_id,
                             error = %e,
                             "failed to serialize event in hot buffer snapshot"
@@ -234,7 +236,7 @@ impl HotBuffer {
 
         // Flush to ensure DuckDB can read the file.
         if let Err(e) = tmpfile.flush() {
-            tracing::error!(error = %e, "hot buffer snapshot flush failed");
+            tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot flush failed");
             return None;
         }
 
@@ -279,19 +281,20 @@ pub fn spawn_hot_buffer_consumer(
                         }
                         Err(RecvError::Lagged(n)) => {
                             tracing::warn!(
+                                event_type = "hot_buffer_lag",
                                 missed = n,
                                 "hot buffer consumer lagged — \
                                  missed events are still in the WAL"
                             );
                         }
                         Err(RecvError::Closed) => {
-                            tracing::info!("event bus closed, hot buffer consumer shutting down");
+                            tracing::info!(event_type = "hot_buffer_shutdown", "event bus closed, hot buffer consumer shutting down");
                             break;
                         }
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    tracing::info!("hot buffer consumer received shutdown signal");
+                    tracing::info!(event_type = "hot_buffer_shutdown", "hot buffer consumer received shutdown signal");
                     break;
                 }
             }
