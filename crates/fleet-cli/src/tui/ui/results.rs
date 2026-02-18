@@ -425,7 +425,7 @@ fn render_stacked_sparklines(
     border_style: Style,
     time_info: Option<(String, String, String)>,
 ) {
-    let title = if let Some((start, end, span)) = time_info {
+    let title = if let Some((ref start, ref end, ref span)) = time_info {
         format!(" timechart • {start} to {end} • span: {span} ")
     } else {
         " timechart by series ".to_owned()
@@ -499,6 +499,28 @@ fn render_stacked_sparklines(
         let label_text = format!("{label} (max:{max_val})");
         let paragraph = Paragraph::new(label_text).style(Style::default().fg(color));
         frame.render_widget(paragraph, label_area);
+    }
+
+    // Render x-axis time labels at the bottom (using the reserved 2 rows)
+    if let Some((start, end, _)) = time_info {
+        let sparkline_width = inner.width.saturating_sub(20) as usize;
+        let start_len = start.len();
+        let end_len = end.len();
+        let padding = sparkline_width.saturating_sub(start_len + end_len);
+
+        let x_axis_text = format!("{start}{}{end}", " ".repeat(padding));
+        let x_axis_label = Paragraph::new(x_axis_text).style(Style::default().fg(Color::DarkGray));
+        #[allow(clippy::cast_possible_truncation)]
+        let y = inner.y + (series.len() * row_height) as u16;
+        frame.render_widget(
+            x_axis_label,
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width.saturating_sub(20),
+                height: 1,
+            },
+        );
     }
 }
 
