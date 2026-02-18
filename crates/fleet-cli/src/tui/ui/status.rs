@@ -102,19 +102,8 @@ fn get_context_hints(app: &App) -> String {
             }
         }
         Focus::Results => {
-            if let Some(response) = &app.active_tab().result {
-                // Check if it's a timechart query
-                let is_timechart = response
-                    .result
-                    .columns
-                    .first()
-                    .is_some_and(|col| col.name == "_time");
-
-                if is_timechart {
-                    "v: cycle chart | ↑↓←→: scroll | tab: editor | F9: live tail".to_owned()
-                } else {
-                    "↑↓←→: scroll | tab: editor | F9: live tail".to_owned()
-                }
+            if app.active_tab().result.is_some() {
+                "↑↓: select | Enter: detail | /: search | tab: editor".to_owned()
             } else {
                 "tab: editor | F5: execute query".to_owned()
             }

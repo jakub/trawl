@@ -4,7 +4,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
 use crate::tui::App;
 use crate::tui::highlight::Highlighter;
@@ -92,6 +94,25 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         .scroll((0, scroll_col as u16));
 
     frame.render_widget(paragraph, area);
+
+    // Render vertical scrollbar when content exceeds visible area
+    let total_lines = tab.editor.lines.len();
+    if total_lines > visible_rows {
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(scroll_row);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(ratatui::layout::Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 /// Apply selection background to a highlighted line within the given char column range.
