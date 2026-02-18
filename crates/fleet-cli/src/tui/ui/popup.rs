@@ -16,8 +16,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Popup::ConfirmDelete { name, .. } => {
                 render_confirm_delete(frame, name);
             }
-            Popup::SaveQuery { input } => {
-                render_save_query(frame, input);
+            Popup::SaveQuery { editor } => {
+                render_save_query(frame, editor);
             }
             Popup::EventDetail { row_index, scroll } => {
                 render_event_detail(app, frame, *row_index, *scroll);
@@ -73,8 +73,9 @@ fn render_confirm_delete(frame: &mut Frame<'_>, name: &str) {
 }
 
 /// Render text input dialog for saving a query.
-fn render_save_query(frame: &mut Frame<'_>, input: &str) {
+fn render_save_query(frame: &mut Frame<'_>, editor: &crate::tui::state::SimpleEditor) {
     let area = centered_rect(60, 35, frame.area());
+    let input = editor.text();
 
     frame.render_widget(Clear, area);
 
@@ -116,6 +117,14 @@ fn render_save_query(frame: &mut Frame<'_>, input: &str) {
         .wrap(ratatui::widgets::Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+
+    // Position the cursor inside the input field.
+    let cursor_col = editor.cursor.1;
+    #[allow(clippy::cast_possible_truncation)]
+    let cursor_x =
+        area.x + (area.width / 2).saturating_sub((input.len() as u16) / 2) + 2 + cursor_col as u16;
+    let cursor_y = area.y + 5; // Row of the input line within the popup
+    frame.set_cursor_position((cursor_x, cursor_y));
 }
 
 /// Render the event detail popup (key-value view of a single row).

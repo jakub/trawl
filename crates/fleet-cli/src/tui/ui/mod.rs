@@ -190,10 +190,11 @@ mod tests {
 
     #[test]
     fn render_with_save_popup() {
+        use crate::tui::state::SimpleEditor;
         let mut app = test_app();
-        app.popup = Some(Popup::SaveQuery {
-            input: "my query".to_owned(),
-        });
+        let mut editor = SimpleEditor::new_single_line();
+        editor.insert_text("my query");
+        app.popup = Some(Popup::SaveQuery { editor });
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();

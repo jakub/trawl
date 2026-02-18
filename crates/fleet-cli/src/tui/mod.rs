@@ -19,7 +19,9 @@ use std::io;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use self::state::{ChartView, Focus, LiveBuffer, Popup, ResultsSearch, Sidebar, Tab, TabStatus};
+use self::state::{
+    ChartView, Focus, LiveBuffer, Popup, ResultsSearch, Sidebar, SimpleEditor, Tab, TabStatus,
+};
 use crate::CliError;
 use crate::config::Config;
 
@@ -439,7 +441,7 @@ impl App {
                 let query = self.active_tab().editor.text();
                 if !query.trim().is_empty() {
                     self.popup = Some(Popup::SaveQuery {
-                        input: String::new(),
+                        editor: SimpleEditor::new_single_line(),
                     });
                 }
                 return;
@@ -1051,34 +1053,8 @@ impl App {
                         }
                     }
                 }
-                Popup::SaveQuery { input } => {
-                    let mut current_input = input.clone();
-                    match (key.modifiers, key.code) {
-                        // Confirm save: Enter
-                        (KeyModifiers::NONE, KeyCode::Enter) if !current_input.is_empty() => {
-                            self.popup = None;
-                            self.save_current_query(current_input);
-                        }
-                        // Cancel: Esc
-                        (KeyModifiers::NONE, KeyCode::Esc) => {
-                            self.popup = None;
-                        }
-                        // Backspace
-                        (KeyModifiers::NONE, KeyCode::Backspace) => {
-                            current_input.pop();
-                            self.popup = Some(Popup::SaveQuery {
-                                input: current_input,
-                            });
-                        }
-                        // Regular character input
-                        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-                            current_input.push(c);
-                            self.popup = Some(Popup::SaveQuery {
-                                input: current_input,
-                            });
-                        }
-                        _ => {}
-                    }
+                Popup::SaveQuery { .. } => {
+                    self.handle_save_query_key(key);
                 }
                 Popup::EventDetail {
                     row_index, scroll, ..
@@ -1144,6 +1120,53 @@ impl App {
                                     scroll: 0,
                                 });
                             }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle key events for the save query popup (delegates to `SimpleEditor`).
+    fn handle_save_query_key(&mut self, key: event::KeyEvent) {
+        match (key.modifiers, key.code) {
+            // Confirm save: Enter
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if let Some(Popup::SaveQuery { ref editor }) = self.popup {
+                    let name = editor.text().trim().to_owned();
+                    if !name.is_empty() {
+                        self.popup = None;
+                        self.save_current_query(name);
+                    }
+                }
+            }
+            // Cancel: Esc
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.popup = None;
+            }
+            // Delegate all other keys to the editor
+            _ => {
+                if let Some(Popup::SaveQuery { ref mut editor }) = self.popup {
+                    match key.code {
+                        KeyCode::Char(ch) => editor.insert_char(ch),
+                        KeyCode::Backspace => editor.delete_char_before(),
+                        KeyCode::Delete => editor.delete_char_at(),
+                        KeyCode::Left => {
+                            editor.clear_selection();
+                            editor.move_left();
+                        }
+                        KeyCode::Right => {
+                            editor.clear_selection();
+                            editor.move_right();
+                        }
+                        KeyCode::Home => {
+                            editor.clear_selection();
+                            editor.move_to_line_start();
+                        }
+                        KeyCode::End => {
+                            editor.clear_selection();
+                            editor.move_to_line_end();
                         }
                         _ => {}
                     }
@@ -1776,30 +1799,25 @@ mod tests {
         // Type something so editor isn't empty
         app.handle_key(key(KeyCode::Char('x')));
         app.handle_key(key_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert_eq!(
-            app.popup,
-            Some(Popup::SaveQuery {
-                input: String::new()
-            })
-        );
+        assert!(matches!(app.popup, Some(Popup::SaveQuery { .. })));
     }
 
     #[test]
     fn key_ctrl_s_with_empty_editor_is_noop() {
         let mut app = test_app();
         app.handle_key(key_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert_eq!(app.popup, None);
+        assert!(app.popup.is_none());
     }
 
     #[test]
     fn popup_blocks_global_keys() {
         let mut app = test_app();
         app.popup = Some(Popup::SaveQuery {
-            input: String::new(),
+            editor: SimpleEditor::new_single_line(),
         });
         // F1 should NOT open sidebar while popup is active
         app.handle_key(key(KeyCode::F(1)));
-        assert_eq!(app.sidebar, None);
+        assert!(app.sidebar.is_none());
         assert!(app.popup.is_some());
     }
 
@@ -1807,41 +1825,39 @@ mod tests {
     fn popup_esc_closes() {
         let mut app = test_app();
         app.popup = Some(Popup::SaveQuery {
-            input: String::new(),
+            editor: SimpleEditor::new_single_line(),
         });
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.popup, None);
+        assert!(app.popup.is_none());
     }
 
     #[test]
     fn popup_typing_appends() {
         let mut app = test_app();
         app.popup = Some(Popup::SaveQuery {
-            input: String::new(),
+            editor: SimpleEditor::new_single_line(),
         });
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(key(KeyCode::Char('b')));
-        assert_eq!(
-            app.popup,
-            Some(Popup::SaveQuery {
-                input: "ab".to_owned()
-            })
-        );
+        if let Some(Popup::SaveQuery { ref editor }) = app.popup {
+            assert_eq!(editor.text(), "ab");
+        } else {
+            panic!("expected SaveQuery popup");
+        }
     }
 
     #[test]
     fn popup_backspace_removes() {
         let mut app = test_app();
-        app.popup = Some(Popup::SaveQuery {
-            input: "abc".to_owned(),
-        });
+        let mut editor = SimpleEditor::new_single_line();
+        editor.insert_text("abc");
+        app.popup = Some(Popup::SaveQuery { editor });
         app.handle_key(key(KeyCode::Backspace));
-        assert_eq!(
-            app.popup,
-            Some(Popup::SaveQuery {
-                input: "ab".to_owned()
-            })
-        );
+        if let Some(Popup::SaveQuery { ref editor }) = app.popup {
+            assert_eq!(editor.text(), "ab");
+        } else {
+            panic!("expected SaveQuery popup");
+        }
     }
 
     // --- Word movement keybinding tests ---

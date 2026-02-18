@@ -109,7 +109,7 @@ impl Sidebar {
 }
 
 /// Active popup overlay.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Popup {
     /// Confirm deletion of saved query.
     ConfirmDelete {
@@ -120,8 +120,8 @@ pub enum Popup {
     },
     /// Text input for saving current query.
     SaveQuery {
-        /// Current input text.
-        input: String,
+        /// Single-line editor for the query name.
+        editor: SimpleEditor,
     },
     /// Detail view for a single result row.
     EventDetail {
@@ -274,6 +274,8 @@ pub struct SimpleEditor {
     undo_stack: UndoStack,
     /// Last edit kind for undo grouping.
     last_edit_kind: Option<EditKind>,
+    /// Single-line mode: disables newline insertion.
+    pub single_line: bool,
 }
 
 impl Default for SimpleEditor {
@@ -294,7 +296,15 @@ impl SimpleEditor {
             selection_anchor: None,
             undo_stack: UndoStack::new(200),
             last_edit_kind: None,
+            single_line: false,
         }
+    }
+
+    /// Create a new single-line editor (for popup inputs, search bars, etc.).
+    pub fn new_single_line() -> Self {
+        let mut editor = Self::new();
+        editor.single_line = true;
+        editor
     }
 
     /// Convert a char offset to a byte offset within a string.
@@ -335,6 +345,9 @@ impl SimpleEditor {
 
     /// Insert a newline at the cursor position.
     pub fn insert_newline(&mut self) {
+        if self.single_line {
+            return;
+        }
         self.maybe_snapshot(EditKind::Newline);
         self.delete_selection();
         let (row, col) = self.cursor;
