@@ -2,10 +2,12 @@ use super::SqlValue;
 
 /// Map system field names to their storage column names.
 ///
-/// `@timestamp` → `timestamp`, everything else passes through.
+/// `@timestamp` and `_time` → `timestamp`, everything else passes through.
+/// `_time` is the Splunk-style alias so users can write `| table _time`
+/// or `sort _time` and it resolves to the canonical `timestamp` column.
 pub(crate) fn map_field_name(name: &str) -> &str {
     match name {
-        "@timestamp" => "timestamp",
+        "@timestamp" | "_time" => "timestamp",
         other => other,
     }
 }
@@ -43,6 +45,11 @@ mod tests {
     #[test]
     fn quote_field_maps_timestamp() {
         assert_eq!(quote_field("@timestamp"), "\"timestamp\"");
+    }
+
+    #[test]
+    fn quote_field_maps_time_alias() {
+        assert_eq!(quote_field("_time"), "\"timestamp\"");
     }
 
     #[test]
