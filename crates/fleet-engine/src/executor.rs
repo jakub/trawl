@@ -81,9 +81,8 @@ impl Executor {
             Ok(_) | Err(EngineError::Database(_) | EngineError::Emit(_)) => {
                 let hot_emitted = emitter::emit(&ast, hot_source)?;
                 match self.execute_emitted(&hot_emitted, max_rows) {
-                    // Hot-only also hit a binder error (e.g. empty ndjson
-                    // between compaction and next ingest, so schema inference
-                    // can't resolve the field). Treat as empty result, not error.
+                    // Hot-only also hit a binder/emit error (e.g. empty ndjson
+                    // between compaction cycles). Treat as empty, not error.
                     Err(EngineError::Emit(_)) => Ok(QueryResult::empty()),
                     other => other,
                 }

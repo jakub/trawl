@@ -109,7 +109,7 @@ fn validate_source_list(source: &str) -> Result<(), super::EmitError> {
 ///
 /// Handles three source formats:
 /// - List: `['path1', 'path2']` → `read_parquet([...], union_by_name=true)`
-/// - JSON/ndjson file: `*.json` or `*.ndjson` → `read_json_auto('...')`
+/// - JSON/ndjson file: `*.json` or `*.ndjson` → `read_json(...)`
 /// - Parquet glob: everything else → `read_parquet('...', union_by_name=true)`
 fn build_reader(source: &str) -> Result<String, super::EmitError> {
     if source.starts_with('[') {
@@ -121,8 +121,17 @@ fn build_reader(source: &str) -> Result<String, super::EmitError> {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("ndjson") {
-            Ok(format!("read_json_auto('{source}')"))
+        if ext.eq_ignore_ascii_case("ndjson") || ext.eq_ignore_ascii_case("json") {
+            // Explicit format params prevent DuckDB from inferring the ndjson
+            // as a single JSON column. field_appearance_threshold=0 is critical:
+            // the default (0.1) causes DuckDB to fall back to MAP(VARCHAR, JSON)
+            // when events have heterogeneous schemas where most fields appear in
+            // less than 10% of records (e.g. internal telemetry with 64 keys
+            // mixed with external events that only have 5 keys).
+            Ok(format!(
+                "read_json('{source}', format='newline_delimited', records=true, \
+                 auto_detect=true, field_appearance_threshold=0)"
+            ))
         } else {
             Ok(format!("read_parquet('{source}', union_by_name=true)"))
         }
@@ -137,15 +146,18 @@ impl EmitterState {
 
     /// Construct with a composite source that unions parquet with hot buffer ndjson.
     ///
-    /// The hot source is read via `read_json_auto` with a CAST on the
-    /// timestamp column to match parquet's TIMESTAMP type.
+    /// The hot source is read via `read_json` with explicit format parameters
+    /// and a CAST on the timestamp column to match parquet's TIMESTAMP type.
+    /// `field_appearance_threshold=0` prevents `DuckDB` from collapsing
+    /// heterogeneous-schema events into a single MAP column.
     pub(crate) fn with_hot_source(primary: &str, hot: &str) -> Result<Self, super::EmitError> {
         validate_source_path(hot)?;
         let primary_reader = build_reader(primary)?;
         let composite = format!(
             "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
              SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
-             FROM read_json_auto('{hot}'))"
+             FROM read_json('{hot}', format='newline_delimited', records=true, \
+             auto_detect=true, field_appearance_threshold=0))"
         );
         Ok(Self::with_source(composite))
     }

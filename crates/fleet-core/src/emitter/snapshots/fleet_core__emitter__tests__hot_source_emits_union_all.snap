@@ -3,7 +3,7 @@ source: crates/fleet-core/src/emitter/mod.rs
 expression: format_result(&result)
 ---
 SELECT *
-FROM (SELECT * FROM read_parquet('/data/**/*.parquet', union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (CAST("timestamp" AS TIMESTAMP) AS "timestamp") FROM read_json_auto('/tmp/hot_abc123.ndjson'))
+FROM (SELECT * FROM read_parquet('/data/**/*.parquet', union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (CAST("timestamp" AS TIMESTAMP) AS "timestamp") FROM read_json('/tmp/hot_abc123.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
 WHERE "service" = ?
 ---
 params:
