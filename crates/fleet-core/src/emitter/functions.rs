@@ -168,8 +168,7 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
 }
 
 /// Check whether a function name refers to an aggregate function.
-#[allow(dead_code)] // exposed for future use by validation/planning layers
-pub(crate) fn is_aggregate_function(name: &str) -> bool {
+pub fn is_aggregate_function(name: &str) -> bool {
     matches!(
         name,
         "count"

@@ -844,7 +844,13 @@ pub async fn stream_query(
     > = Box::pin(async_stream::stream! {
         let _permit = sse_permit; // hold until stream ends
 
-        let fleet_core::stream::StreamPlan::PassThrough(mut stages) = stream_plan;
+        let fleet_core::stream::StreamPlan::PassThrough(mut stages) = stream_plan else {
+            // Aggregate mode will be handled in a future phase.
+            yield Ok(Event::default().event("error").data(
+                r#"{"error":"aggregation mode not yet supported in streaming"}"#
+            ));
+            return;
+        };
 
         let mut stream_done = false;
 
