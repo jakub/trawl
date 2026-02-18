@@ -827,6 +827,10 @@ pub async fn stream_query(
         .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
     let filter = fleet_core::filter::CompiledFilter::compile(&ast.search);
 
+    // Compile the pipeline stages for streaming evaluation.
+    let stream_plan = fleet_core::stream::compile_stream_plan(&ast.pipeline)
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
     let Some(ref bus) = state.ingest.event_bus else {
         return Err(ServerError::BadRequest(
             "streaming requires ingest to be enabled".into(),
@@ -840,15 +844,45 @@ pub async fn stream_query(
     > = Box::pin(async_stream::stream! {
         let _permit = sse_permit; // hold until stream ends
 
+        let fleet_core::stream::StreamPlan::PassThrough(mut stages) = stream_plan;
+
+        let mut stream_done = false;
+
         loop {
+            if stream_done {
+                break;
+            }
+
             match subscriber.recv().await {
                 Ok(batch) => {
                     // Compute now once per batch (~100ms intervals) to avoid
                     // a Utc::now() syscall per event in the time filter.
                     let now = chrono::Utc::now();
                     for event in &batch.events {
-                        if filter.matches_at(event, now) {
-                            let json = serde_json::to_string(event).unwrap_or_default();
+                        if !filter.matches_at(event, now) {
+                            continue;
+                        }
+
+                        // Apply pipeline stages to a mutable copy.
+                        let mut event = event.clone();
+                        let mut pass = true;
+                        for stage in &mut stages {
+                            match fleet_core::stream::apply_stage(stage, &mut event) {
+                                fleet_core::stream::StageResult::Pass => {}
+                                fleet_core::stream::StageResult::Filtered => {
+                                    pass = false;
+                                    break;
+                                }
+                                fleet_core::stream::StageResult::Done => {
+                                    stream_done = true;
+                                    pass = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if pass {
+                            let json = serde_json::to_string(&event).unwrap_or_default();
                             yield Ok(Event::default().event("data").data(json));
                         }
                     }
