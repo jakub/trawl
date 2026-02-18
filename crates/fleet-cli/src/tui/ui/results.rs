@@ -52,21 +52,39 @@ fn render_table(
     let tab = app.active_tab();
     let result = &response.result;
 
-    // Calculate how many columns fit on screen (assume ~20 chars per column + borders)
-    let col_width = 20;
-    let available_width = area.width.saturating_sub(2); // -2 for borders
-    let max_cols_on_screen = (available_width as usize) / col_width;
-    let max_cols_on_screen = max_cols_on_screen.max(3); // Show at least 3 columns
-
-    // Calculate visible column range based on horizontal scroll
-    let total_cols = result.columns.len();
-    let h_scroll = if total_cols <= max_cols_on_screen {
-        0 // All columns fit, no scrolling needed
+    // Calculate visible row range first (needed for column width sampling)
+    let max_visible_rows = area.height.saturating_sub(4) as usize; // -4 for borders and header
+    let total_rows = result.row_count();
+    let v_scroll = if total_rows <= max_visible_rows {
+        0
     } else {
-        tab.horizontal_scroll_offset
-            .min(total_cols.saturating_sub(max_cols_on_screen))
+        tab.scroll_offset
+            .min(total_rows.saturating_sub(max_visible_rows))
     };
-    let visible_cols = max_cols_on_screen.min(total_cols - h_scroll);
+
+    // Compute adaptive column widths
+    let all_widths = compute_column_widths(result, v_scroll);
+
+    // Calculate how many columns fit on screen
+    let available_width = area.width.saturating_sub(4) as usize; // borders + padding
+    let total_cols = result.columns.len();
+    let h_scroll = tab
+        .horizontal_scroll_offset
+        .min(total_cols.saturating_sub(1));
+
+    // Find how many columns fit starting from h_scroll
+    let mut cols_width_sum = 0usize;
+    let mut visible_cols = 0;
+    for w in all_widths.iter().skip(h_scroll) {
+        // +3 for cell padding/borders in ratatui Table
+        let next = cols_width_sum + *w as usize + 3;
+        if next > available_width && visible_cols > 0 {
+            break;
+        }
+        cols_width_sum = next;
+        visible_cols += 1;
+    }
+    let visible_cols = visible_cols.max(1).min(total_cols - h_scroll);
 
     // Build header with visible columns
     let header_row = Row::new(
@@ -84,35 +102,42 @@ fn render_table(
             .fg(Color::Yellow),
     );
 
-    // Calculate visible row range based on vertical scroll
-    let max_visible_rows = area.height.saturating_sub(4) as usize; // -4 for borders and header
-    let total_rows = result.row_count();
-    let v_scroll = if total_rows <= max_visible_rows {
-        0 // All rows fit, no scrolling needed
-    } else {
-        tab.scroll_offset
-            .min(total_rows.saturating_sub(max_visible_rows))
-    };
-
-    // Build data rows with visible columns
+    // Build data rows with visible columns, truncating to column width
+    let selected_row = tab.selected_row;
     let data_rows: Vec<Row<'_>> = result
         .rows
         .iter()
         .skip(v_scroll)
         .take(max_visible_rows)
-        .map(|row_data| {
-            Row::new(
-                row_data
-                    .iter()
-                    .skip(h_scroll)
-                    .take(visible_cols)
-                    .map(|value| Cell::from(value_to_string(value)))
-                    .collect::<Vec<_>>(),
-            )
+        .enumerate()
+        .map(|(display_idx, row_data)| {
+            let abs_row = v_scroll + display_idx;
+            let cells: Vec<Cell<'_>> = row_data
+                .iter()
+                .zip(all_widths.iter())
+                .skip(h_scroll)
+                .take(visible_cols)
+                .map(|(value, &width)| {
+                    let text = value_to_string(value);
+                    let truncated = truncate_with_ellipsis(&text, width as usize);
+                    Cell::from(truncated)
+                })
+                .collect();
+            let row = Row::new(cells);
+            if selected_row == Some(abs_row) {
+                row.style(Style::default().bg(Color::DarkGray).fg(Color::White))
+            } else {
+                row
+            }
         })
         .collect();
 
-    let widths: Vec<Constraint> = (0..visible_cols).map(|_| Constraint::Length(20)).collect();
+    let widths: Vec<Constraint> = all_widths
+        .iter()
+        .skip(h_scroll)
+        .take(visible_cols)
+        .map(|&w| Constraint::Length(w))
+        .collect();
 
     let title = format!(
         " Results ({} rows, cols {}-{}/{}{}) ",
@@ -160,7 +185,7 @@ fn render_table(
     }
 
     // Render horizontal scrollbar if needed
-    if total_cols > max_cols_on_screen {
+    if total_cols > visible_cols {
         let mut scrollbar_state = ScrollbarState::new(total_cols).position(h_scroll);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
@@ -386,8 +411,50 @@ fn render_stacked_sparklines(
     }
 }
 
+/// Compute adaptive column widths based on header + first N rows of data.
+///
+/// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
+/// the max display width per column, clamped to `[MIN_COL, MAX_COL]`.
+fn compute_column_widths(result: &fleet_engine::value::QueryResult, v_scroll: usize) -> Vec<u16> {
+    const MIN_COL: usize = 8;
+    const MAX_COL: usize = 60;
+    const SAMPLE_ROWS: usize = 50;
+
+    result
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(col_idx, col)| {
+            let mut max_width = col.name.len();
+
+            for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
+                if let Some(value) = row.get(col_idx) {
+                    let display_len = value_to_string(value).len();
+                    if display_len > max_width {
+                        max_width = display_len;
+                    }
+                }
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            let width = max_width.clamp(MIN_COL, MAX_COL) as u16;
+            width
+        })
+        .collect()
+}
+
+/// Truncate a string to max width, appending `…` if truncated.
+fn truncate_with_ellipsis(value: &str, max_width: usize) -> String {
+    if value.chars().count() <= max_width {
+        value.to_owned()
+    } else {
+        let truncated: String = value.chars().take(max_width.saturating_sub(1)).collect();
+        format!("{truncated}\u{2026}")
+    }
+}
+
 /// Convert a Value to a string for display.
-fn value_to_string(value: &Value) -> String {
+pub fn value_to_string(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_owned(),
         Value::Boolean(b) => b.to_string(),

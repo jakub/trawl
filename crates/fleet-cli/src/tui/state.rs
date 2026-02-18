@@ -868,6 +868,10 @@ pub struct Tab {
     pub status: TabStatus,
     /// Chart visualization mode.
     pub chart_view: ChartView,
+    /// Currently selected row in results (htop-style highlight bar).
+    pub selected_row: Option<usize>,
+    /// Cached column widths (invalidated on new result).
+    pub column_widths: Option<Vec<u16>>,
 }
 
 impl Tab {
@@ -881,6 +885,8 @@ impl Tab {
             horizontal_scroll_offset: 0,
             status: TabStatus::Idle,
             chart_view: ChartView::Table,
+            selected_row: None,
+            column_widths: None,
         }
     }
 
@@ -892,6 +898,8 @@ impl Tab {
         self.horizontal_scroll_offset = 0;
         self.status = TabStatus::Idle;
         self.chart_view = ChartView::Table;
+        self.selected_row = None;
+        self.column_widths = None;
     }
 }
 

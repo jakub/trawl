@@ -296,8 +296,10 @@ impl App {
                     #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
                     let duration_ms = query_result.duration.as_millis() as u64;
                     tab.status = TabStatus::Success { duration_ms };
-                    tab.scroll_offset = 0; // Reset vertical scroll to top.
-                    tab.horizontal_scroll_offset = 0; // Reset horizontal scroll to left.
+                    tab.scroll_offset = 0;
+                    tab.horizontal_scroll_offset = 0;
+                    tab.selected_row = None;
+                    tab.column_widths = None;
                 }
                 Err(message) => {
                     tab.status = TabStatus::Error { message };
