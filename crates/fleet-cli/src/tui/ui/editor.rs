@@ -67,7 +67,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
             if let Some(((sel_start_row, sel_start_col), (sel_end_row, sel_end_col))) = selection {
                 if abs_row >= sel_start_row && abs_row <= sel_end_row {
                     // This line is (partially) selected
-                    let line_len = line.len();
+                    let line_len = line.chars().count();
                     let sel_start = if abs_row == sel_start_row {
                         sel_start_col
                     } else {
@@ -94,18 +94,18 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Apply selection background to a highlighted line within the given column range.
+/// Apply selection background to a highlighted line within the given char column range.
 fn apply_selection_style(line: Line<'static>, sel_start: usize, sel_end: usize) -> Line<'static> {
     if sel_start >= sel_end {
         return line;
     }
 
     let mut result: Vec<Span<'static>> = Vec::new();
-    let mut col = 0;
+    let mut col = 0; // char offset
 
     for span in line.spans {
-        let span_len = span.content.len();
-        let span_end = col + span_len;
+        let span_chars = span.content.chars().count();
+        let span_end = col + span_chars;
 
         if span_end <= sel_start || col >= sel_end {
             // Entirely outside selection
@@ -117,20 +117,24 @@ fn apply_selection_style(line: Line<'static>, sel_start: usize, sel_end: usize) 
                 span.style.bg(SELECTION_STYLE.bg.unwrap_or(Color::DarkGray)),
             ));
         } else {
-            // Partially overlapping — split the span
+            // Partially overlapping — split the span by char offset
             let text = span.content.to_string();
             let rel_start = sel_start.saturating_sub(col);
-            let rel_end = sel_end.saturating_sub(col).min(span_len);
+            let rel_end = sel_end.saturating_sub(col).min(span_chars);
 
-            if rel_start > 0 {
-                result.push(Span::styled(text[..rel_start].to_owned(), span.style));
+            // Convert char offsets to byte offsets for slicing
+            let byte_start = char_to_byte(&text, rel_start);
+            let byte_end = char_to_byte(&text, rel_end);
+
+            if byte_start > 0 {
+                result.push(Span::styled(text[..byte_start].to_owned(), span.style));
             }
             result.push(Span::styled(
-                text[rel_start..rel_end].to_owned(),
+                text[byte_start..byte_end].to_owned(),
                 span.style.bg(SELECTION_STYLE.bg.unwrap_or(Color::DarkGray)),
             ));
-            if rel_end < span_len {
-                result.push(Span::styled(text[rel_end..].to_owned(), span.style));
+            if byte_end < text.len() {
+                result.push(Span::styled(text[byte_end..].to_owned(), span.style));
             }
         }
 
@@ -138,4 +142,11 @@ fn apply_selection_style(line: Line<'static>, sel_start: usize, sel_end: usize) 
     }
 
     Line::from(result)
+}
+
+/// Convert a char offset to a byte offset within a string.
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map_or(s.len(), |(byte_idx, _)| byte_idx)
 }

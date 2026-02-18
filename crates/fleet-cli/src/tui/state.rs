@@ -218,6 +218,21 @@ impl SimpleEditor {
         }
     }
 
+    /// Convert a char offset to a byte offset within a string.
+    ///
+    /// Returns `s.len()` when `char_idx` is at or past the end,
+    /// which is correct for "one past the last char" positions.
+    fn char_to_byte(s: &str, char_idx: usize) -> usize {
+        s.char_indices()
+            .nth(char_idx)
+            .map_or(s.len(), |(byte_idx, _)| byte_idx)
+    }
+
+    /// Count the number of characters in a string (not bytes).
+    fn char_count(s: &str) -> usize {
+        s.chars().count()
+    }
+
     /// Get the current line.
     #[allow(dead_code)] // May be used in future features
     pub fn current_line(&self) -> &str {
@@ -234,7 +249,8 @@ impl SimpleEditor {
         self.maybe_snapshot(EditKind::Insert);
         self.delete_selection();
         let (row, col) = self.cursor;
-        self.lines[row].insert(col, ch);
+        let byte_idx = Self::char_to_byte(&self.lines[row], col);
+        self.lines[row].insert(byte_idx, ch);
         self.cursor.1 += 1;
     }
 
@@ -243,8 +259,9 @@ impl SimpleEditor {
         self.maybe_snapshot(EditKind::Newline);
         self.delete_selection();
         let (row, col) = self.cursor;
+        let byte_idx = Self::char_to_byte(&self.lines[row], col);
         let current_line = self.lines[row].clone();
-        let (before, after) = current_line.split_at(col);
+        let (before, after) = current_line.split_at(byte_idx);
         before.clone_into(&mut self.lines[row]);
         self.lines.insert(row + 1, after.to_owned());
         self.cursor = (row + 1, 0);
@@ -258,12 +275,13 @@ impl SimpleEditor {
         }
         let (row, col) = self.cursor;
         if col > 0 {
-            self.lines[row].remove(col - 1);
+            let byte_idx = Self::char_to_byte(&self.lines[row], col - 1);
+            self.lines[row].remove(byte_idx);
             self.cursor.1 -= 1;
         } else if row > 0 {
             // Join with previous line
             let current = self.lines.remove(row);
-            let prev_len = self.lines[row - 1].len();
+            let prev_len = Self::char_count(&self.lines[row - 1]);
             self.lines[row - 1].push_str(&current);
             self.cursor = (row - 1, prev_len);
         }
@@ -276,8 +294,10 @@ impl SimpleEditor {
             return;
         }
         let (row, col) = self.cursor;
-        if col < self.lines[row].len() {
-            self.lines[row].remove(col);
+        let line_chars = Self::char_count(&self.lines[row]);
+        if col < line_chars {
+            let byte_idx = Self::char_to_byte(&self.lines[row], col);
+            self.lines[row].remove(byte_idx);
         } else if row < self.lines.len() - 1 {
             // Join with next line
             let next = self.lines.remove(row + 1);
@@ -290,7 +310,8 @@ impl SimpleEditor {
         if self.cursor.0 > 0 {
             let target_col = self.desired_col.unwrap_or(self.cursor.1);
             self.cursor.0 -= 1;
-            self.cursor.1 = target_col.min(self.lines[self.cursor.0].len());
+            let line_chars = Self::char_count(&self.lines[self.cursor.0]);
+            self.cursor.1 = target_col.min(line_chars);
             if self.desired_col.is_none() {
                 self.desired_col = Some(target_col);
             }
@@ -302,7 +323,8 @@ impl SimpleEditor {
         if self.cursor.0 < self.lines.len() - 1 {
             let target_col = self.desired_col.unwrap_or(self.cursor.1);
             self.cursor.0 += 1;
-            self.cursor.1 = target_col.min(self.lines[self.cursor.0].len());
+            let line_chars = Self::char_count(&self.lines[self.cursor.0]);
+            self.cursor.1 = target_col.min(line_chars);
             if self.desired_col.is_none() {
                 self.desired_col = Some(target_col);
             }
@@ -316,14 +338,14 @@ impl SimpleEditor {
             self.cursor.1 -= 1;
         } else if self.cursor.0 > 0 {
             self.cursor.0 -= 1;
-            self.cursor.1 = self.lines[self.cursor.0].len();
+            self.cursor.1 = Self::char_count(&self.lines[self.cursor.0]);
         }
     }
 
     /// Move cursor right (clears sticky column).
     pub fn move_right(&mut self) {
         self.desired_col = None;
-        if self.cursor.1 < self.lines[self.cursor.0].len() {
+        if self.cursor.1 < Self::char_count(&self.lines[self.cursor.0]) {
             self.cursor.1 += 1;
         } else if self.cursor.0 < self.lines.len() - 1 {
             self.cursor.0 += 1;
@@ -340,7 +362,7 @@ impl SimpleEditor {
     /// Move cursor to end of line (clears sticky column).
     pub fn move_to_line_end(&mut self) {
         self.desired_col = None;
-        self.cursor.1 = self.lines[self.cursor.0].len();
+        self.cursor.1 = Self::char_count(&self.lines[self.cursor.0]);
     }
 
     /// Whether a character is a "word" character (alphanumeric or underscore).
@@ -356,7 +378,7 @@ impl SimpleEditor {
         if col == 0 {
             // Wrap to end of previous line
             if row > 0 {
-                return (row - 1, self.lines[row - 1].len());
+                return (row - 1, Self::char_count(&self.lines[row - 1]));
             }
             return (0, 0);
         }
@@ -381,13 +403,13 @@ impl SimpleEditor {
     /// Skips word chars, then skips non-word chars (standard word-right).
     /// Wraps to next line if at end of line.
     pub fn find_word_boundary_right(&self, row: usize, col: usize) -> (usize, usize) {
-        let line_len = self.lines[row].len();
-        if col >= line_len {
+        let line_chars = Self::char_count(&self.lines[row]);
+        if col >= line_chars {
             // Wrap to start of next line
             if row < self.lines.len() - 1 {
                 return (row + 1, 0);
             }
-            return (row, line_len);
+            return (row, line_chars);
         }
 
         let line: Vec<char> = self.lines[row].chars().collect();
@@ -429,14 +451,16 @@ impl SimpleEditor {
         for ch in text.chars() {
             if ch == '\n' {
                 let (row, col) = self.cursor;
+                let byte_idx = Self::char_to_byte(&self.lines[row], col);
                 let current_line = self.lines[row].clone();
-                let (before, after) = current_line.split_at(col);
+                let (before, after) = current_line.split_at(byte_idx);
                 before.clone_into(&mut self.lines[row]);
                 self.lines.insert(row + 1, after.to_owned());
                 self.cursor = (row + 1, 0);
             } else if ch != '\r' {
                 let (row, col) = self.cursor;
-                self.lines[row].insert(col, ch);
+                let byte_idx = Self::char_to_byte(&self.lines[row], col);
+                self.lines[row].insert(byte_idx, ch);
                 self.cursor.1 += 1;
             }
         }
@@ -450,14 +474,17 @@ impl SimpleEditor {
 
         if new_row == row {
             // Same line: remove chars between new_col and col
-            let line = &mut self.lines[row];
-            line.drain(new_col..col);
+            let byte_start = Self::char_to_byte(&self.lines[row], new_col);
+            let byte_end = Self::char_to_byte(&self.lines[row], col);
+            self.lines[row].drain(byte_start..byte_end);
             self.cursor.1 = new_col;
         } else {
             // Crossed line boundary: delete from start of current line + join with prev
-            let current = self.lines[row][col..].to_owned();
+            let byte_col = Self::char_to_byte(&self.lines[row], col);
+            let current = self.lines[row][byte_col..].to_owned();
             self.lines.remove(row);
-            self.lines[new_row].truncate(new_col);
+            let byte_new_col = Self::char_to_byte(&self.lines[new_row], new_col);
+            self.lines[new_row].truncate(byte_new_col);
             self.lines[new_row].push_str(&current);
             self.cursor = (new_row, new_col);
         }
@@ -471,11 +498,15 @@ impl SimpleEditor {
 
         if new_row == row {
             // Same line: remove chars between col and new_col
-            self.lines[row].drain(col..new_col);
+            let byte_start = Self::char_to_byte(&self.lines[row], col);
+            let byte_end = Self::char_to_byte(&self.lines[row], new_col);
+            self.lines[row].drain(byte_start..byte_end);
         } else {
             // Crossed line boundary: delete rest of current line + join with next
-            self.lines[row].truncate(col);
-            let rest = self.lines[new_row][new_col..].to_owned();
+            let byte_col = Self::char_to_byte(&self.lines[row], col);
+            self.lines[row].truncate(byte_col);
+            let byte_new_col = Self::char_to_byte(&self.lines[new_row], new_col);
+            let rest = self.lines[new_row][byte_new_col..].to_owned();
             self.lines.remove(new_row);
             self.lines[row].push_str(&rest);
         }
@@ -486,7 +517,8 @@ impl SimpleEditor {
     pub fn delete_to_line_start(&mut self) {
         self.maybe_snapshot(EditKind::Other);
         let (row, col) = self.cursor;
-        self.lines[row].drain(..col);
+        let byte_idx = Self::char_to_byte(&self.lines[row], col);
+        self.lines[row].drain(..byte_idx);
         self.cursor.1 = 0;
     }
 
@@ -494,7 +526,8 @@ impl SimpleEditor {
     pub fn delete_to_line_end(&mut self) {
         self.maybe_snapshot(EditKind::Other);
         let (row, col) = self.cursor;
-        self.lines[row].truncate(col);
+        let byte_idx = Self::char_to_byte(&self.lines[row], col);
+        self.lines[row].truncate(byte_idx);
     }
 
     /// Start or extend selection from the current cursor position.
@@ -528,17 +561,21 @@ impl SimpleEditor {
 
         if start_row == end_row {
             // Single-line selection
-            Some(self.lines[start_row][start_col..end_col].to_owned())
+            let byte_start = Self::char_to_byte(&self.lines[start_row], start_col);
+            let byte_end = Self::char_to_byte(&self.lines[start_row], end_col);
+            Some(self.lines[start_row][byte_start..byte_end].to_owned())
         } else {
             // Multi-line selection
             let mut result = String::new();
-            result.push_str(&self.lines[start_row][start_col..]);
+            let byte_start = Self::char_to_byte(&self.lines[start_row], start_col);
+            result.push_str(&self.lines[start_row][byte_start..]);
             for row in (start_row + 1)..end_row {
                 result.push('\n');
                 result.push_str(&self.lines[row]);
             }
             result.push('\n');
-            result.push_str(&self.lines[end_row][..end_col]);
+            let byte_end = Self::char_to_byte(&self.lines[end_row], end_col);
+            result.push_str(&self.lines[end_row][..byte_end]);
             Some(result)
         }
     }
@@ -551,11 +588,15 @@ impl SimpleEditor {
 
         if start_row == end_row {
             // Single-line: just drain the range
-            self.lines[start_row].drain(start_col..end_col);
+            let byte_start = Self::char_to_byte(&self.lines[start_row], start_col);
+            let byte_end = Self::char_to_byte(&self.lines[start_row], end_col);
+            self.lines[start_row].drain(byte_start..byte_end);
         } else {
             // Multi-line: keep start of first line + end of last line
-            let tail = self.lines[end_row][end_col..].to_owned();
-            self.lines[start_row].truncate(start_col);
+            let byte_end = Self::char_to_byte(&self.lines[end_row], end_col);
+            let tail = self.lines[end_row][byte_end..].to_owned();
+            let byte_start = Self::char_to_byte(&self.lines[start_row], start_col);
+            self.lines[start_row].truncate(byte_start);
             self.lines[start_row].push_str(&tail);
             // Remove intermediate + last lines
             self.lines.drain((start_row + 1)..=end_row);
@@ -1342,6 +1383,110 @@ mod tests {
         editor.delete_to_line_end();
         assert_eq!(editor.text(), "hello");
         assert_eq!(editor.cursor, (0, 5));
+    }
+
+    // --- Multi-byte / UTF-8 tests ---
+
+    #[test]
+    fn editor_insert_multibyte_char() {
+        let mut editor = SimpleEditor::new();
+        // ∂ is U+2202, 3 bytes in UTF-8
+        editor.insert_char('∂');
+        assert_eq!(editor.text(), "∂");
+        assert_eq!(editor.cursor, (0, 1)); // char offset, not byte
+    }
+
+    #[test]
+    fn editor_insert_after_multibyte() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_char('∂');
+        editor.insert_char('x');
+        assert_eq!(editor.text(), "∂x");
+        assert_eq!(editor.cursor, (0, 2));
+    }
+
+    #[test]
+    fn editor_backspace_multibyte() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_char('a');
+        editor.insert_char('∂');
+        editor.insert_char('b');
+        assert_eq!(editor.text(), "a∂b");
+        // Delete the ∂
+        editor.move_left();
+        editor.delete_char_before();
+        assert_eq!(editor.text(), "ab");
+        assert_eq!(editor.cursor, (0, 1));
+    }
+
+    #[test]
+    fn editor_delete_at_multibyte() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_char('∂');
+        editor.insert_char('x');
+        editor.move_to_line_start();
+        editor.delete_char_at();
+        assert_eq!(editor.text(), "x");
+        assert_eq!(editor.cursor, (0, 0));
+    }
+
+    #[test]
+    fn editor_move_across_multibyte() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("a∂b");
+        assert_eq!(editor.cursor, (0, 3));
+        editor.move_left();
+        assert_eq!(editor.cursor, (0, 2));
+        editor.move_left();
+        assert_eq!(editor.cursor, (0, 1));
+        editor.move_right();
+        assert_eq!(editor.cursor, (0, 2));
+        editor.move_to_line_end();
+        assert_eq!(editor.cursor, (0, 3));
+    }
+
+    #[test]
+    fn editor_newline_split_multibyte() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("café");
+        // Move cursor between 'f' and 'é'
+        editor.move_left();
+        editor.insert_newline();
+        assert_eq!(editor.lines, vec!["caf", "é"]);
+        assert_eq!(editor.cursor, (1, 0));
+    }
+
+    #[test]
+    fn editor_select_multibyte() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("a∂b");
+        // Select "∂b" (chars 1..3)
+        editor.cursor = (0, 1);
+        editor.selection_anchor = Some((0, 3));
+        assert_eq!(editor.selected_text().unwrap(), "∂b");
+    }
+
+    #[test]
+    fn editor_delete_selection_multibyte() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("hé∂lo");
+        // Select "é∂" (chars 1..3)
+        editor.cursor = (0, 1);
+        editor.selection_anchor = Some((0, 3));
+        editor.delete_selection();
+        assert_eq!(editor.text(), "hlo");
+        assert_eq!(editor.cursor, (0, 1));
+    }
+
+    #[test]
+    fn editor_kill_line_multibyte() {
+        let mut editor = SimpleEditor::new();
+        editor.insert_text("∂∂∂abc");
+        editor.cursor = (0, 3); // after the three ∂ chars
+        editor.delete_to_line_end();
+        assert_eq!(editor.text(), "∂∂∂");
+        editor.delete_to_line_start();
+        assert_eq!(editor.text(), "");
     }
 
     // --- LiveBuffer tests ---
