@@ -1,6 +1,7 @@
 //! HTTP handler for the `POST /api/v1/ingest` endpoint.
 
 use std::io::Read as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Extension;
@@ -10,6 +11,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
+use serde_json::json;
 
 use crate::bus::{EventBus as _, IngestBatch};
 use crate::error::ServerError;
@@ -57,6 +59,34 @@ fn validate_service_name(service: &str) -> Result<(), ServerError> {
     Ok(())
 }
 
+/// Per-request defaults for fields that must always be present in WAL events.
+///
+/// Constructed once per ingest request (before `spawn_blocking`) so all events
+/// in the batch share the same request-scoped timestamp and peer address.
+struct IngestDefaults {
+    /// RFC 3339 timestamp with millisecond precision (from request arrival).
+    timestamp: String,
+    /// Peer IP address as a string (from the TCP connection).
+    host: String,
+}
+
+/// Fill mandatory fields on an event map if they are missing.
+///
+/// Events without these fields are effectively invisible to most queries
+/// (time filters, bare text search, host grouping), so we fill sensible
+/// defaults at ingest time rather than silently dropping them.
+fn fill_defaults(obj: &mut serde_json::Map<String, serde_json::Value>, defaults: &IngestDefaults) {
+    if !obj.contains_key("timestamp") {
+        obj.insert("timestamp".into(), json!(&defaults.timestamp));
+    }
+    if !obj.contains_key("host") {
+        obj.insert("host".into(), json!(&defaults.host));
+    }
+    if !obj.contains_key("message") {
+        obj.insert("message".into(), json!(""));
+    }
+}
+
 /// `POST /api/v1/ingest` — accept ndjson events into the WAL.
 ///
 /// Expects `Content-Type: application/x-ndjson` (or `application/json`).
@@ -64,6 +94,7 @@ fn validate_service_name(service: &str) -> Result<(), ServerError> {
 pub async fn ingest(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
+    Extension(peer_addr): Extension<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<IngestResponse>, ServerError> {
@@ -83,6 +114,12 @@ pub async fn ingest(
     let wire_bytes = body.len();
     let wal_writer = Arc::clone(wal_writer);
 
+    // Capture request-scoped defaults before moving into blocking task.
+    let defaults = IngestDefaults {
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        host: peer_addr.ip().to_string(),
+    };
+
     let (parsed, wal_path, body_bytes, ndjson_byte_size, decompress_ms, parse_ms, wal_ms) =
         tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
             let t0 = std::time::Instant::now();
@@ -99,7 +136,7 @@ pub async fn ingest(
             }
 
             let t1 = std::time::Instant::now();
-            let parsed = parse_events(&raw)?;
+            let parsed = parse_events(&raw, &defaults)?;
             let parse_ms = t1.elapsed().as_millis();
             let ndjson_byte_size = parsed.ndjson.len();
 
@@ -187,7 +224,7 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, ServerError> {
 /// Returns parsed events with service name, JSON maps, and ndjson bytes.
 /// The ndjson bytes are always ndjson regardless of input format, ready
 /// for the WAL.
-fn parse_events(data: &[u8]) -> Result<ParsedEvents, ServerError> {
+fn parse_events(data: &[u8], defaults: &IngestDefaults) -> Result<ParsedEvents, ServerError> {
     let text = std::str::from_utf8(data)
         .map_err(|e| ServerError::Ingest(format!("body is not valid UTF-8: {e}")))?;
 
@@ -195,16 +232,16 @@ fn parse_events(data: &[u8]) -> Result<ParsedEvents, ServerError> {
 
     // Detect format: JSON array (vector batches) vs ndjson (line-delimited).
     if trimmed.starts_with('[') {
-        parse_json_array(trimmed)
+        parse_json_array(trimmed, defaults)
     } else {
-        parse_ndjson(trimmed)
+        parse_ndjson(trimmed, defaults)
     }
 }
 
 /// Parse a JSON array of events (vector's default batch format).
 ///
 /// Converts to ndjson for WAL storage and retains parsed maps for the bus.
-fn parse_json_array(text: &str) -> Result<ParsedEvents, ServerError> {
+fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, ServerError> {
     let parsed: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| ServerError::Ingest(format!("invalid JSON array: {e}")))?;
 
@@ -237,12 +274,15 @@ fn parse_json_array(text: &str) -> Result<ParsedEvents, ServerError> {
             service = Some(svc.to_owned());
         }
 
-        maps.push(obj.clone());
+        let mut obj = obj.clone();
+        fill_defaults(&mut obj, defaults);
 
-        // Write each event as a ndjson line.
-        serde_json::to_writer(&mut ndjson, event)
+        // Write each event as a ndjson line (from the filled map).
+        serde_json::to_writer(&mut ndjson, &obj)
             .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
         ndjson.push(b'\n');
+
+        maps.push(obj);
     }
 
     let service = service.expect("non-empty array guarantees at least one service");
@@ -257,7 +297,7 @@ fn parse_json_array(text: &str) -> Result<ParsedEvents, ServerError> {
 ///
 /// Retains parsed maps for the bus and re-serializes to ndjson for
 /// consistent WAL bytes (trimmed, one object per line).
-fn parse_ndjson(text: &str) -> Result<ParsedEvents, ServerError> {
+fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, ServerError> {
     let mut service: Option<String> = None;
     let mut maps = Vec::new();
     let mut ndjson = Vec::new();
@@ -287,12 +327,15 @@ fn parse_ndjson(text: &str) -> Result<ParsedEvents, ServerError> {
             service = Some(svc.to_owned());
         }
 
-        maps.push(obj.clone());
+        let mut obj = obj.clone();
+        fill_defaults(&mut obj, defaults);
 
-        // Re-serialize for consistent ndjson in WAL.
-        serde_json::to_writer(&mut ndjson, &parsed)
+        // Re-serialize for consistent ndjson in WAL (from the filled map).
+        serde_json::to_writer(&mut ndjson, &obj)
             .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
         ndjson.push(b'\n');
+
+        maps.push(obj);
     }
 
     let service = service.ok_or_else(|| ServerError::Ingest("no valid events in body".into()))?;
@@ -307,12 +350,20 @@ fn parse_ndjson(text: &str) -> Result<ParsedEvents, ServerError> {
 mod tests {
     use super::*;
 
+    /// Construct test defaults for use in parse tests.
+    fn test_defaults() -> IngestDefaults {
+        IngestDefaults {
+            timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+            host: "127.0.0.1".to_owned(),
+        }
+    }
+
     #[test]
     fn parse_ndjson_format() {
         let data = br#"{"service":"nginx","message":"ok"}
 {"service":"nginx","message":"error"}
 "#;
-        let parsed = parse_events(data).unwrap();
+        let parsed = parse_events(data, &test_defaults()).unwrap();
         assert_eq!(parsed.service, "nginx");
         assert_eq!(parsed.maps.len(), 2);
     }
@@ -320,7 +371,7 @@ mod tests {
     #[test]
     fn parse_json_array_format() {
         let data = br#"[{"service":"nginx","message":"ok"},{"service":"nginx","message":"error"}]"#;
-        let parsed = parse_events(data).unwrap();
+        let parsed = parse_events(data, &test_defaults()).unwrap();
         assert_eq!(parsed.service, "nginx");
         assert_eq!(parsed.maps.len(), 2);
         // WAL output should be ndjson, not a JSON array.
@@ -332,14 +383,14 @@ mod tests {
     #[test]
     fn parse_missing_service() {
         let data = br#"{"message":"no service field"}"#;
-        let err = parse_events(data).unwrap_err();
+        let err = parse_events(data, &test_defaults()).unwrap_err();
         assert!(err.to_string().contains("missing 'service'"));
     }
 
     #[test]
     fn parse_invalid_json() {
         let data = b"not json at all";
-        let err = parse_events(data).unwrap_err();
+        let err = parse_events(data, &test_defaults()).unwrap_err();
         assert!(err.to_string().contains("invalid JSON"));
     }
 
@@ -350,7 +401,7 @@ mod tests {
 
 {"service":"test","message":"world"}
 "#;
-        let parsed = parse_events(data).unwrap();
+        let parsed = parse_events(data, &test_defaults()).unwrap();
         assert_eq!(parsed.service, "test");
         assert_eq!(parsed.maps.len(), 2);
     }
@@ -358,28 +409,28 @@ mod tests {
     #[test]
     fn parse_empty_json_array_rejected() {
         let data = b"[]";
-        let err = parse_events(data).unwrap_err();
+        let err = parse_events(data, &test_defaults()).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
     #[test]
     fn parse_rejects_path_traversal_service() {
         let data = br#"{"service":"../../etc/passwd","message":"pwned"}"#;
-        let err = parse_events(data).unwrap_err();
+        let err = parse_events(data, &test_defaults()).unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]
     fn parse_rejects_slash_in_service() {
         let data = br#"{"service":"foo/bar","message":"nope"}"#;
-        let err = parse_events(data).unwrap_err();
+        let err = parse_events(data, &test_defaults()).unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]
     fn parse_rejects_empty_service_name() {
         let data = br#"{"service":"","message":"empty"}"#;
-        let err = parse_events(data).unwrap_err();
+        let err = parse_events(data, &test_defaults()).unwrap_err();
         assert!(err.to_string().contains("cannot be empty"));
     }
 
@@ -387,15 +438,16 @@ mod tests {
     fn parse_rejects_long_service_name() {
         let name = "a".repeat(129);
         let data = format!(r#"{{"service":"{name}","message":"long"}}"#);
-        let err = parse_events(data.as_bytes()).unwrap_err();
+        let err = parse_events(data.as_bytes(), &test_defaults()).unwrap_err();
         assert!(err.to_string().contains("too long"));
     }
 
     #[test]
     fn parse_accepts_valid_service_names() {
+        let defaults = test_defaults();
         for name in ["nginx", "my-app", "app_v2", "host.name.prod", "A1-B2_c3.d"] {
             let data = format!(r#"{{"service":"{name}","message":"ok"}}"#);
-            let parsed = parse_events(data.as_bytes()).unwrap();
+            let parsed = parse_events(data.as_bytes(), &defaults).unwrap();
             assert_eq!(parsed.service, name);
             assert_eq!(parsed.maps.len(), 1);
         }
@@ -404,7 +456,7 @@ mod tests {
     #[test]
     fn parse_json_array_rejects_bad_service() {
         let data = br#"[{"service":"../evil","message":"nope"}]"#;
-        let err = parse_events(data).unwrap_err();
+        let err = parse_events(data, &test_defaults()).unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
     }
 
@@ -413,7 +465,7 @@ mod tests {
         let data = br#"{"service":"nginx","message":"hello","status":200}
 {"service":"nginx","message":"world","status":404}
 "#;
-        let parsed = parse_events(data).unwrap();
+        let parsed = parse_events(data, &test_defaults()).unwrap();
         assert_eq!(parsed.maps.len(), 2);
         assert_eq!(
             parsed.maps[0].get("message").and_then(|v| v.as_str()),
@@ -430,7 +482,7 @@ mod tests {
     #[test]
     fn parse_json_array_retains_maps() {
         let data = br#"[{"service":"nginx","level":"error"},{"service":"nginx","level":"warn"}]"#;
-        let parsed = parse_events(data).unwrap();
+        let parsed = parse_events(data, &test_defaults()).unwrap();
         assert_eq!(parsed.maps.len(), 2);
         assert_eq!(
             parsed.maps[0].get("level").and_then(|v| v.as_str()),
@@ -440,5 +492,67 @@ mod tests {
             parsed.maps[1].get("level").and_then(|v| v.as_str()),
             Some("warn")
         );
+    }
+
+    // --- defaults tests ---
+
+    #[test]
+    fn defaults_filled_when_missing_ndjson() {
+        let data = br#"{"service":"test"}"#;
+        let defaults = test_defaults();
+        let parsed = parse_events(data, &defaults).unwrap();
+        let event = &parsed.maps[0];
+        assert_eq!(
+            event.get("timestamp").and_then(|v| v.as_str()),
+            Some("2026-01-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            event.get("host").and_then(|v| v.as_str()),
+            Some("127.0.0.1")
+        );
+        assert_eq!(event.get("message").and_then(|v| v.as_str()), Some(""));
+    }
+
+    #[test]
+    fn defaults_filled_when_missing_json_array() {
+        let data = br#"[{"service":"test"}]"#;
+        let defaults = test_defaults();
+        let parsed = parse_events(data, &defaults).unwrap();
+        let event = &parsed.maps[0];
+        assert_eq!(
+            event.get("timestamp").and_then(|v| v.as_str()),
+            Some("2026-01-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            event.get("host").and_then(|v| v.as_str()),
+            Some("127.0.0.1")
+        );
+        assert_eq!(event.get("message").and_then(|v| v.as_str()), Some(""));
+    }
+
+    #[test]
+    fn defaults_not_overwritten_when_present() {
+        let data = br#"{"service":"test","timestamp":"2025-06-01T12:00:00Z","host":"myhost","message":"hello"}"#;
+        let defaults = test_defaults();
+        let parsed = parse_events(data, &defaults).unwrap();
+        let event = &parsed.maps[0];
+        assert_eq!(
+            event.get("timestamp").and_then(|v| v.as_str()),
+            Some("2025-06-01T12:00:00Z")
+        );
+        assert_eq!(event.get("host").and_then(|v| v.as_str()), Some("myhost"));
+        assert_eq!(event.get("message").and_then(|v| v.as_str()), Some("hello"));
+    }
+
+    #[test]
+    fn defaults_appear_in_wal_ndjson() {
+        let data = br#"{"service":"test"}"#;
+        let defaults = test_defaults();
+        let parsed = parse_events(data, &defaults).unwrap();
+        let wal_text = std::str::from_utf8(&parsed.ndjson).unwrap();
+        let wal_event: serde_json::Value = serde_json::from_str(wal_text.trim()).unwrap();
+        assert_eq!(wal_event["timestamp"], "2026-01-01T00:00:00.000Z");
+        assert_eq!(wal_event["host"], "127.0.0.1");
+        assert_eq!(wal_event["message"], "");
     }
 }
