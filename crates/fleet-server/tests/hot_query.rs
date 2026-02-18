@@ -98,9 +98,11 @@ async fn hot_buffer_makes_events_immediately_queryable() {
 
     // --- query BEFORE compaction → events should be visible from hot buffer ---
 
-    let result = pool.execute("* | head 100", Duration::from_secs(10)).await;
+    let result = pool
+        .execute("* | head 100", Duration::from_secs(10), false)
+        .await;
 
-    let query_result = result.expect("query should succeed");
+    let query_result = result.result.expect("query should succeed");
     assert_eq!(
         query_result.rows.len(),
         3,
@@ -135,9 +137,13 @@ async fn hot_buffer_makes_events_immediately_queryable() {
 
     // --- query AFTER compaction → same events now from parquet ---
 
-    let result_after = pool.execute("* | head 100", Duration::from_secs(10)).await;
+    let result_after = pool
+        .execute("* | head 100", Duration::from_secs(10), false)
+        .await;
 
-    let query_result_after = result_after.expect("post-compaction query should succeed");
+    let query_result_after = result_after
+        .result
+        .expect("post-compaction query should succeed");
     assert_eq!(
         query_result_after.rows.len(),
         3,
@@ -228,9 +234,11 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
 
     // --- query → should see both batches without duplicates ---
 
-    let result = pool.execute("* | head 100", Duration::from_secs(10)).await;
+    let result = pool
+        .execute("* | head 100", Duration::from_secs(10), false)
+        .await;
 
-    let query_result = result.expect("mixed query should succeed");
+    let query_result = result.result.expect("mixed query should succeed");
     assert_eq!(
         query_result.rows.len(),
         3,
@@ -270,9 +278,13 @@ async fn query_works_without_hot_buffer() {
     .await
     .expect("compaction without hot buffer should succeed");
 
-    let result = pool.execute("* | head 100", Duration::from_secs(10)).await;
+    let result = pool
+        .execute("* | head 100", Duration::from_secs(10), false)
+        .await;
 
-    let query_result = result.expect("query without hot buffer should succeed");
+    let query_result = result
+        .result
+        .expect("query without hot buffer should succeed");
     assert_eq!(
         query_result.rows.len(),
         1,

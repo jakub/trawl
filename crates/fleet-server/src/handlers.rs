@@ -69,10 +69,15 @@ pub async fn query(
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
     let start = std::time::Instant::now();
-    let result = state.query.pool.execute(&req.query, timeout).await;
+    let capture_debug = state.query.query_log.is_some();
+    let outcome = state
+        .query
+        .pool
+        .execute(&req.query, timeout, capture_debug)
+        .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    match result {
+    match outcome.result {
         Ok(qr) => {
             let total = qr.row_count();
             let truncated = total >= max_rows;
@@ -664,7 +669,13 @@ pub async fn export(
 
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
-    let result = state.query.pool.execute(&req.query, timeout).await?;
+    let capture_debug = state.query.query_log.is_some();
+    let outcome = state
+        .query
+        .pool
+        .execute(&req.query, timeout, capture_debug)
+        .await;
+    let result = outcome.result?;
 
     // Limit rows to max_export_rows.
     let limited = result.paginate(0, limit);

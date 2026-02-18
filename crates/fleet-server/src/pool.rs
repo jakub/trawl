@@ -28,6 +28,46 @@ use crate::source::compute_source;
 /// Type-erased interrupt callback, keyed by monotonic query ID.
 type InterruptMap = HashMap<u64, Box<dyn Fn() + Send + Sync>>;
 
+/// Debug info captured from the pool's blocking execution path.
+///
+/// Only populated when `capture_debug` is true (i.e. query log is active).
+#[derive(Debug)]
+pub struct PoolDebugInfo {
+    /// The computed source argument passed to `read_parquet()`.
+    pub computed_source: String,
+    /// Number of glob patterns in the source list.
+    pub glob_count: usize,
+    /// Service name extracted from the DSL, if any.
+    pub service_filter: Option<String>,
+    /// Time filter duration in seconds, if any.
+    pub time_filter_secs: Option<u64>,
+    /// Whether the source fell back to recursive glob.
+    pub is_fallback: bool,
+    /// Hot buffer status: "disabled", "empty", or "active".
+    pub hot_status: &'static str,
+    /// Hot buffer event count at snapshot time.
+    pub hot_events: usize,
+    /// Hot buffer batch count at snapshot time.
+    pub hot_batches: usize,
+    /// Hot buffer estimated byte size at snapshot time.
+    pub hot_bytes: usize,
+    /// Generated SQL (parameterized).
+    pub sql: String,
+    /// SQL parameter values (Display form).
+    pub params: Vec<String>,
+    /// Time spent waiting for pool permit (ms).
+    pub pool_wait_ms: u64,
+}
+
+/// Query result paired with optional debug info.
+#[derive(Debug)]
+pub struct ExecuteOutcome {
+    /// The query result (success or error).
+    pub result: Result<QueryResult, ServerError>,
+    /// Debug info, populated only when `capture_debug` was true.
+    pub debug: Option<PoolDebugInfo>,
+}
+
 /// Pool that bounds concurrent `DuckDB` query execution.
 ///
 /// Executors are pre-created at startup and reused across queries.
@@ -77,13 +117,21 @@ impl std::fmt::Debug for ExecutorPool {
 ///
 /// Returns the executor (for pool return) and the query result.
 /// Called inside `spawn_blocking` — all I/O here is synchronous.
+#[allow(clippy::too_many_arguments)]
 fn run_query_blocking(
     executor: Executor,
     dsl: &str,
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
     max_result_rows: usize,
-) -> (Executor, Result<QueryResult, ServerError>) {
+    capture_debug: bool,
+    fallback_glob: &str,
+    pool_wait_ms: u64,
+) -> (
+    Executor,
+    Result<QueryResult, ServerError>,
+    Option<PoolDebugInfo>,
+) {
     // Snapshot hot buffer to a temp ndjson file so fresh events
     // are visible to this query via UNION ALL BY NAME. Returns a
     // cached Arc when the buffer hasn't changed since the last snapshot.
@@ -100,6 +148,19 @@ fn run_query_blocking(
             None
         }
     });
+
+    // Capture debug info if requested (query log is active).
+    let debug = if capture_debug {
+        Some(capture_pool_debug(
+            dsl,
+            source,
+            hot_buffer,
+            fallback_glob,
+            pool_wait_ms,
+        ))
+    } else {
+        None
+    };
 
     // catch_unwind ensures the executor is always returned to the
     // pool even if DuckDB panics (e.g. corrupt parquet file).
@@ -131,7 +192,88 @@ fn run_query_blocking(
         }
     };
 
-    (executor, result)
+    (executor, result, debug)
+}
+
+/// Capture debug info about source selection, hot buffer state, and SQL generation.
+///
+/// This is cheap (re-parse + emit is <1ms) and only runs when the query log is active.
+fn capture_pool_debug(
+    dsl: &str,
+    source: &str,
+    hot_buffer: Option<&Arc<HotBuffer>>,
+    fallback_glob: &str,
+    pool_wait_ms: u64,
+) -> PoolDebugInfo {
+    let glob_count = if source.starts_with('[') {
+        source.matches(',').count() + 1
+    } else {
+        1
+    };
+    let is_fallback = source == fallback_glob || source.ends_with("/**/*.parquet");
+
+    // Re-parse AST to extract filters and emit SQL (cheap, <1ms).
+    let (service_filter, time_filter_secs, sql, params) = if let Ok(ast) =
+        fleet_core::parser::parse(dsl)
+    {
+        let service = ast.search.groups.first().and_then(|g| {
+            g.iter().find_map(|t| {
+                if let fleet_core::ast::SearchToken::FieldFilter(fleet_core::ast::FieldFilter {
+                    field,
+                    op: fleet_core::ast::FilterOp::Eq,
+                    value: fleet_core::ast::FilterValue::Literal(s),
+                }) = &t.node
+                {
+                    if field == "service" {
+                        return Some(s.clone());
+                    }
+                }
+                None
+            })
+        });
+        let time_secs = ast
+            .search
+            .time_filter
+            .as_ref()
+            .map(|tf| tf.node.duration.to_seconds());
+        let (sql, params) = match fleet_core::emitter::emit(&ast, source) {
+            Ok(emitted) => (
+                emitted.sql,
+                emitted.params.iter().map(ToString::to_string).collect(),
+            ),
+            Err(_) => (String::new(), vec![]),
+        };
+        (service, time_secs, sql, params)
+    } else {
+        (None, None, String::new(), vec![])
+    };
+
+    let (hot_status, hot_events, hot_batches, hot_bytes) = match hot_buffer {
+        None => ("disabled", 0, 0, 0),
+        Some(hb) => {
+            let events = hb.event_count();
+            if events == 0 {
+                ("empty", 0, hb.batch_count(), 0)
+            } else {
+                ("active", events, hb.batch_count(), hb.byte_count())
+            }
+        }
+    };
+
+    PoolDebugInfo {
+        computed_source: source.to_owned(),
+        glob_count,
+        service_filter,
+        time_filter_secs,
+        is_fallback,
+        hot_status,
+        hot_events,
+        hot_batches,
+        hot_bytes,
+        sql,
+        params,
+        pool_wait_ms,
+    }
 }
 
 impl ExecutorPool {
@@ -198,7 +340,16 @@ impl ExecutorPool {
     /// If the query exceeds `timeout`, the `DuckDB` connection is interrupted
     /// and the query is aborted. The executor is reclaimed asynchronously
     /// once the interrupted task completes.
-    pub async fn execute(&self, dsl: &str, timeout: Duration) -> Result<QueryResult, ServerError> {
+    ///
+    /// When `capture_debug` is true, captures source selection, hot buffer
+    /// state, and generated SQL for the query debug log.
+    #[allow(clippy::too_many_lines)]
+    pub async fn execute(
+        &self,
+        dsl: &str,
+        timeout: Duration,
+        capture_debug: bool,
+    ) -> ExecuteOutcome {
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
@@ -210,12 +361,16 @@ impl ExecutorPool {
 
         let wait_start = std::time::Instant::now();
         let semaphore = Arc::clone(&self.semaphore);
-        let permit = semaphore
-            .acquire_owned()
-            .await
-            .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
+        let Ok(permit) = semaphore.acquire_owned().await else {
+            return ExecuteOutcome {
+                result: Err(ServerError::Internal("executor pool shut down".into())),
+                debug: None,
+            };
+        };
 
         let wait_ms = wait_start.elapsed().as_millis();
+        #[allow(clippy::cast_possible_truncation)]
+        let pool_wait_ms = wait_ms as u64;
         tracing::info!(
             event_type = "pool_acquired",
             wait_ms,
@@ -258,6 +413,9 @@ impl ExecutorPool {
                 &source,
                 hot_buffer.as_ref(),
                 max_result_rows,
+                capture_debug,
+                &fallback_glob,
+                pool_wait_ms,
             )
         });
 
@@ -275,13 +433,19 @@ impl ExecutorPool {
 
         // Use select! so the JoinHandle remains available for async
         // executor reclamation if the timeout branch wins.
-        let result = tokio::select! {
+        let outcome = tokio::select! {
             // Query completed within timeout — return executor to pool.
             join_result = &mut task => {
-                let (executor, result) = join_result
-                    .map_err(|e| ServerError::Internal(format!("query task panicked: {e}")))?;
-                self.return_executor(executor);
-                result
+                match join_result {
+                    Ok((executor, result, debug)) => {
+                        self.return_executor(executor);
+                        ExecuteOutcome { result, debug }
+                    }
+                    Err(e) => ExecuteOutcome {
+                        result: Err(ServerError::Internal(format!("query task panicked: {e}"))),
+                        debug: None,
+                    },
+                }
             }
             // Timeout elapsed — interrupt the DuckDB query and reclaim
             // the executor asynchronously once the interrupt completes.
@@ -292,7 +456,7 @@ impl ExecutorPool {
                 let idle = Arc::clone(&self.idle);
                 tokio::spawn(async move {
                     match task.await {
-                        Ok((executor, _)) => {
+                        Ok((executor, _, _)) => {
                             idle.lock().push(executor);
                         }
                         Err(e) => {
@@ -300,14 +464,17 @@ impl ExecutorPool {
                         }
                     }
                 });
-                Err(ServerError::Timeout)
+                ExecuteOutcome {
+                    result: Err(ServerError::Timeout),
+                    debug: None,
+                }
             }
         };
 
         // Deregister this query's interrupt handle.
         self.active_interrupts.lock().remove(&query_id);
 
-        result
+        outcome
     }
 
     /// Interrupt all currently executing queries. Called during shutdown
@@ -387,15 +554,19 @@ mod tests {
     async fn pool_rejects_invalid_dsl() {
         let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
         // Must start with `|` to trigger a parse error — bare text is valid DSL.
-        let result = pool.execute("| | invalid", Duration::from_secs(10)).await;
-        assert!(result.is_err());
+        let outcome = pool
+            .execute("| | invalid", Duration::from_secs(10), false)
+            .await;
+        assert!(outcome.result.is_err());
     }
 
     #[tokio::test]
     async fn pool_respects_concurrency_limit() {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // just verifying it doesn't panic with a single permit
-        let _ = pool.execute("service:test", Duration::from_secs(10)).await;
+        let _ = pool
+            .execute("service:test", Duration::from_secs(10), false)
+            .await;
     }
 
     #[tokio::test]
@@ -405,8 +576,12 @@ mod tests {
         // Run two sequential queries — both should succeed and the pool
         // should have the same number of idle executors before and after.
         let idle_before = pool.idle.lock().len();
-        let _ = pool.execute("service:test", Duration::from_secs(10)).await;
-        let _ = pool.execute("service:test", Duration::from_secs(10)).await;
+        let _ = pool
+            .execute("service:test", Duration::from_secs(10), false)
+            .await;
+        let _ = pool
+            .execute("service:test", Duration::from_secs(10), false)
+            .await;
         let idle_after = pool.idle.lock().len();
 
         assert_eq!(
@@ -431,10 +606,11 @@ mod tests {
     async fn pool_timeout_returns_error() {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // 1ns timeout — the blocking task can't possibly complete this fast.
-        let result = pool.execute("*", Duration::from_nanos(1)).await;
+        let outcome = pool.execute("*", Duration::from_nanos(1), false).await;
         assert!(
-            matches!(result, Err(ServerError::Timeout)),
-            "expected Timeout, got: {result:?}"
+            matches!(outcome.result, Err(ServerError::Timeout)),
+            "expected Timeout, got: {:?}",
+            outcome.result
         );
     }
 
@@ -444,7 +620,7 @@ mod tests {
         let idle_before = pool.idle.lock().len();
 
         // Trigger a timeout.
-        let _ = pool.execute("*", Duration::from_nanos(1)).await;
+        let _ = pool.execute("*", Duration::from_nanos(1), false).await;
 
         // Wait briefly for the async reclamation task to complete.
         tokio::time::sleep(Duration::from_millis(200)).await;
