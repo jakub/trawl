@@ -946,6 +946,8 @@ pub struct Tab {
     pub selected_row: Option<usize>,
     /// Cached column widths (invalidated on new result).
     pub column_widths: Option<Vec<u16>>,
+    /// Handle to the running query task (for cancellation).
+    pub query_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Tab {
@@ -961,6 +963,7 @@ impl Tab {
             chart_view: ChartView::Table,
             selected_row: None,
             column_widths: None,
+            query_task: None,
         }
     }
 
@@ -974,6 +977,10 @@ impl Tab {
         self.chart_view = ChartView::Table;
         self.selected_row = None;
         self.column_widths = None;
+        // Abort any running query task.
+        if let Some(handle) = self.query_task.take() {
+            handle.abort();
+        }
     }
 }
 

@@ -167,6 +167,11 @@ impl App {
             return;
         }
 
+        // Abort any previously running query on this tab.
+        if let Some(handle) = tab.query_task.take() {
+            handle.abort();
+        }
+
         // Update tab status to running.
         tab.status = TabStatus::Running {
             start: Instant::now(),
@@ -178,7 +183,7 @@ impl App {
         let tab_idx = self.active_tab_idx;
         let timezone = self.timezone.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tracing::info!("background task started for query: {}", query);
             let start = Instant::now();
             let result = client
@@ -198,6 +203,21 @@ impl App {
                 duration,
             });
         });
+
+        // Store handle for cancellation.
+        self.active_tab_mut().query_task = Some(handle);
+    }
+
+    /// Cancel the currently running query on the active tab (if any).
+    fn cancel_query(&mut self) {
+        let tab = self.active_tab_mut();
+        if let Some(handle) = tab.query_task.take() {
+            handle.abort();
+            tab.status = TabStatus::Error {
+                message: "cancelled".to_owned(),
+            };
+            tracing::info!("query cancelled by user");
+        }
     }
 
     /// Refresh the saved queries cache from the server.
@@ -282,6 +302,7 @@ impl App {
             }
 
             let tab = &mut self.tabs[query_result.tab_idx];
+            tab.query_task = None; // Query finished, clear the handle.
 
             match query_result.result {
                 Ok(response) => {
@@ -355,6 +376,13 @@ impl App {
             // Close sidebar: Esc (if sidebar is open)
             (KeyModifiers::NONE, KeyCode::Esc) if self.sidebar.is_some() => {
                 self.sidebar = None;
+                return;
+            }
+            // Cancel running query: Esc (if query is running, no sidebar)
+            (KeyModifiers::NONE, KeyCode::Esc)
+                if matches!(self.active_tab().status, TabStatus::Running { .. }) =>
+            {
+                self.cancel_query();
                 return;
             }
             // New tab: Ctrl+T
@@ -564,12 +592,13 @@ impl App {
             {
                 self.active_tab_mut().editor.redo();
             }
-            // Clipboard: Ctrl+C (copy), Ctrl+X (cut)
+            // Clipboard: Ctrl+C (copy), or cancel running query if no selection
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if let Some(text) = self.active_tab().editor.selected_text() {
                     clipboard_set(&text);
+                } else if matches!(self.active_tab().status, TabStatus::Running { .. }) {
+                    self.cancel_query();
                 }
-                // Without selection, Ctrl+C is intentionally a no-op (Ctrl+Q is quit)
             }
             (KeyModifiers::CONTROL, KeyCode::Char('x')) => {
                 if let Some(text) = self.active_tab().editor.selected_text() {
@@ -749,7 +778,7 @@ impl App {
                     });
                 }
             }
-            // Esc: close search first, then deselect row
+            // Esc: close search → deselect row (cancel handled globally)
             (KeyModifiers::NONE, KeyCode::Esc) => {
                 if self.results_search.is_some() {
                     self.results_search = None;
@@ -758,6 +787,12 @@ impl App {
                     if tab.selected_row.is_some() {
                         tab.selected_row = None;
                     }
+                }
+            }
+            // Ctrl+C: cancel running query (from results focus)
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                if matches!(self.active_tab().status, TabStatus::Running { .. }) {
+                    self.cancel_query();
                 }
             }
             // Horizontal scrolling
