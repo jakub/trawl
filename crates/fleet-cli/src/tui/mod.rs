@@ -861,6 +861,7 @@ impl App {
     }
 
     /// Start live streaming with the current query.
+    #[allow(clippy::too_many_lines)]
     fn start_live_stream(&mut self) {
         let query = self.active_tab().editor.text().trim().to_owned();
 
@@ -878,6 +879,10 @@ impl App {
 
         // Extract field order from the DSL so the live buffer preserves it.
         let field_order = extract_field_order(&query);
+
+        // Resolve timezone offset for timestamp display in streaming events.
+        let utc_offset_secs =
+            fleet_engine::timezone::resolve_utc_offset(&self.timezone).unwrap_or(0);
 
         let client = self.client.clone();
         let tx = self.query_tx.clone();
@@ -908,7 +913,18 @@ impl App {
 
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(StreamEvent::Event(map)) => {
+                    Ok(StreamEvent::Event(mut map)) => {
+                        // Apply timezone offset to timestamp field.
+                        if utc_offset_secs != 0 {
+                            if let Some(serde_json::Value::String(ts)) = map.get("timestamp") {
+                                let converted =
+                                    fleet_engine::timezone::reformat_rfc3339(ts, utc_offset_secs);
+                                map.insert(
+                                    "timestamp".to_owned(),
+                                    serde_json::Value::String(converted),
+                                );
+                            }
+                        }
                         buffer.push_event(&map);
                         event_count += 1;
                         tracing::debug!("received stream event, total: {event_count}");

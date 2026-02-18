@@ -51,6 +51,36 @@ fn parse_fixed_offset(s: &str) -> Result<i32, String> {
     Ok(sign * (hours * 3600 + minutes * 60))
 }
 
+/// Reformat an RFC 3339 timestamp string with a UTC offset applied.
+///
+/// Parses the input as RFC 3339, shifts by `utc_offset_secs`, and returns
+/// a display string matching the executor's format: `YYYY-MM-DD HH:MM:SS[.fff]`.
+/// Returns the original string unchanged if parsing fails.
+pub fn reformat_rfc3339(ts: &str, utc_offset_secs: i32) -> String {
+    use chrono::{DateTime, FixedOffset, Utc};
+
+    let Ok(dt) = ts.parse::<DateTime<Utc>>() else {
+        return ts.to_owned();
+    };
+
+    let offset =
+        FixedOffset::east_opt(utc_offset_secs).unwrap_or(FixedOffset::east_opt(0).unwrap());
+    let local = dt.with_timezone(&offset);
+
+    // Match executor format: omit sub-second part if zero, otherwise
+    // include trimmed fractional seconds.
+    let nanos = local.timestamp_subsec_nanos();
+    if nanos == 0 {
+        local.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        // Trim trailing zeros from sub-second part.
+        let micros = nanos / 1_000;
+        let frac = format!("{micros:06}");
+        let trimmed = frac.trim_end_matches('0');
+        local.format("%Y-%m-%d %H:%M:%S").to_string() + "." + trimmed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +132,63 @@ mod tests {
     fn whitespace_trimmed() {
         assert_eq!(resolve_utc_offset("  UTC  ").unwrap(), 0);
         assert_eq!(resolve_utc_offset(" +05:30 ").unwrap(), 19800);
+    }
+
+    // ── reformat_rfc3339 ──────────────────────────────────────────
+
+    #[test]
+    fn reformat_utc_no_change() {
+        assert_eq!(
+            reformat_rfc3339("2026-02-18T12:00:00Z", 0),
+            "2026-02-18 12:00:00"
+        );
+    }
+
+    #[test]
+    fn reformat_positive_offset() {
+        // +05:30 = 19800 seconds
+        assert_eq!(
+            reformat_rfc3339("2026-02-18T12:00:00Z", 19800),
+            "2026-02-18 17:30:00"
+        );
+    }
+
+    #[test]
+    fn reformat_negative_offset() {
+        // -06:00 = -21600 seconds
+        assert_eq!(
+            reformat_rfc3339("2026-02-18T12:00:00Z", -21600),
+            "2026-02-18 06:00:00"
+        );
+    }
+
+    #[test]
+    fn reformat_preserves_subseconds() {
+        assert_eq!(
+            reformat_rfc3339("2026-02-18T12:00:00.123456Z", 0),
+            "2026-02-18 12:00:00.123456"
+        );
+    }
+
+    #[test]
+    fn reformat_trims_trailing_zeros() {
+        assert_eq!(
+            reformat_rfc3339("2026-02-18T12:00:00.100000Z", 0),
+            "2026-02-18 12:00:00.1"
+        );
+    }
+
+    #[test]
+    fn reformat_crosses_midnight() {
+        // 23:00 UTC + 2h offset = 01:00 next day
+        assert_eq!(
+            reformat_rfc3339("2026-02-18T23:00:00Z", 7200),
+            "2026-02-19 01:00:00"
+        );
+    }
+
+    #[test]
+    fn reformat_invalid_input_passthrough() {
+        assert_eq!(reformat_rfc3339("not a timestamp", 3600), "not a timestamp");
     }
 }
