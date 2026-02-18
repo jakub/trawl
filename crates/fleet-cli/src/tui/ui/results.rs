@@ -624,7 +624,8 @@ fn value_to_u64(value: &Value) -> u64 {
     match value {
         Value::Integer(i) => (*i).max(0) as u64,
         Value::Float(f) => f.max(0.0) as u64,
-        _ => 0, // Null, Boolean, String all map to 0
+        Value::String(s) => s.parse::<f64>().unwrap_or(0.0).max(0.0) as u64,
+        _ => 0,
     }
 }
 
