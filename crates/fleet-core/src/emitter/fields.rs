@@ -5,7 +5,7 @@ use super::SqlValue;
 /// `@timestamp` and `_time` → `timestamp`, everything else passes through.
 /// `_time` is the Splunk-style alias so users can write `| table _time`
 /// or `sort _time` and it resolves to the canonical `timestamp` column.
-pub(crate) fn map_field_name(name: &str) -> &str {
+pub fn map_field_name(name: &str) -> &str {
     match name {
         "@timestamp" | "_time" => "timestamp",
         other => other,

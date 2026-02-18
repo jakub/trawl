@@ -14,6 +14,7 @@ mod validate;
 use crate::ast::Query;
 use state::EmitterState;
 
+pub use fields::map_field_name;
 pub use state::validate_source_path;
 pub use validate::validate_pipeline;
 
