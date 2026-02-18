@@ -783,11 +783,57 @@ fn sanitize_csv_formula(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// Apply pipeline stages to an event. Returns `true` if the event passes,
+/// `false` if filtered or done.
+fn apply_stages(
+    stages: &mut [fleet_core::stream::CompiledStage],
+    event: &mut serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    for stage in stages.iter_mut() {
+        match fleet_core::stream::apply_stage(stage, event) {
+            fleet_core::stream::StageResult::Pass => {}
+            fleet_core::stream::StageResult::Filtered | fleet_core::stream::StageResult::Done => {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Build an SSE snapshot event from the current aggregation state,
+/// applying post-stages to each row.
+fn emit_agg_snapshot(
+    aggregation: &fleet_core::stream::CompiledAggregation,
+    post_stages: &mut [fleet_core::stream::CompiledStage],
+) -> Event {
+    let (columns, rows) = aggregation.snapshot();
+    let filtered_rows: Vec<_> = rows
+        .into_iter()
+        .filter_map(|mut row| {
+            for stage in post_stages.iter_mut() {
+                match fleet_core::stream::apply_stage(stage, &mut row) {
+                    fleet_core::stream::StageResult::Pass => {}
+                    fleet_core::stream::StageResult::Filtered
+                    | fleet_core::stream::StageResult::Done => return None,
+                }
+            }
+            Some(row)
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "columns": columns,
+        "rows": filtered_rows,
+    });
+    Event::default().event("snapshot").data(payload.to_string())
+}
+
 /// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
 ///
 /// Subscribes to the event bus and filters incoming events in-memory
 /// using [`CompiledFilter`]. Each matching event is streamed individually
 /// as an SSE `data` event. Requires ingest to be enabled (event bus available).
+#[allow(clippy::too_many_lines)]
 pub async fn stream_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -844,66 +890,134 @@ pub async fn stream_query(
     > = Box::pin(async_stream::stream! {
         let _permit = sse_permit; // hold until stream ends
 
-        let fleet_core::stream::StreamPlan::PassThrough(mut stages) = stream_plan else {
-            // Aggregate mode will be handled in a future phase.
-            yield Ok(Event::default().event("error").data(
-                r#"{"error":"aggregation mode not yet supported in streaming"}"#
-            ));
-            return;
-        };
+        match stream_plan {
+            fleet_core::stream::StreamPlan::PassThrough(mut stages) => {
+                let mut stream_done = false;
 
-        let mut stream_done = false;
+                loop {
+                    if stream_done {
+                        break;
+                    }
 
-        loop {
-            if stream_done {
-                break;
-            }
-
-            match subscriber.recv().await {
-                Ok(batch) => {
-                    // Compute now once per batch (~100ms intervals) to avoid
-                    // a Utc::now() syscall per event in the time filter.
-                    let now = chrono::Utc::now();
-                    for event in &batch.events {
-                        if !filter.matches_at(event, now) {
-                            continue;
-                        }
-
-                        // Apply pipeline stages to a mutable copy.
-                        let mut event = event.clone();
-                        let mut pass = true;
-                        for stage in &mut stages {
-                            match fleet_core::stream::apply_stage(stage, &mut event) {
-                                fleet_core::stream::StageResult::Pass => {}
-                                fleet_core::stream::StageResult::Filtered => {
-                                    pass = false;
-                                    break;
+                    match subscriber.recv().await {
+                        Ok(batch) => {
+                            let now = chrono::Utc::now();
+                            for event in &batch.events {
+                                if !filter.matches_at(event, now) {
+                                    continue;
                                 }
-                                fleet_core::stream::StageResult::Done => {
-                                    stream_done = true;
-                                    pass = false;
+
+                                let mut event = event.clone();
+                                let mut pass = true;
+                                for stage in &mut stages {
+                                    match fleet_core::stream::apply_stage(stage, &mut event) {
+                                        fleet_core::stream::StageResult::Pass => {}
+                                        fleet_core::stream::StageResult::Filtered => {
+                                            pass = false;
+                                            break;
+                                        }
+                                        fleet_core::stream::StageResult::Done => {
+                                            stream_done = true;
+                                            pass = false;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if pass {
+                                    let json = serde_json::to_string(&event).unwrap_or_default();
+                                    yield Ok(Event::default().event("data").data(json));
+                                }
+                            }
+                        }
+                        Err(crate::bus::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                event_type = "stream_lagged",
+                                missed = n,
+                                "stream subscriber fell behind"
+                            );
+                            let payload = serde_json::json!({ "missed": n }).to_string();
+                            yield Ok(Event::default().event("lagged").data(payload));
+                        }
+                        Err(crate::bus::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
+            }
+            fleet_core::stream::StreamPlan::Aggregate {
+                mut pre_stages,
+                mut aggregation,
+                mut post_stages,
+            } => {
+                // Emit aggregation snapshots periodically: every 500ms or
+                // after 100 matching events, whichever comes first.
+                const SNAPSHOT_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_millis(500);
+                const SNAPSHOT_EVENT_THRESHOLD: u64 = 100;
+
+                let mut events_since_snapshot: u64 = 0;
+                let mut snapshot_timer = tokio::time::interval(SNAPSHOT_INTERVAL);
+                snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Skip the first immediate tick.
+                snapshot_timer.tick().await;
+
+                loop {
+                    tokio::select! {
+                        result = subscriber.recv() => {
+                            match result {
+                                Ok(batch) => {
+                                    let now = chrono::Utc::now();
+                                    for event in &batch.events {
+                                        if !filter.matches_at(event, now) {
+                                            continue;
+                                        }
+
+                                        // Apply pre-stages and feed accumulator.
+                                        let mut event = event.clone();
+                                        if apply_stages(&mut pre_stages, &mut event) {
+                                            aggregation.feed_event(&event);
+                                            events_since_snapshot += 1;
+                                        }
+                                    }
+
+                                    // Emit snapshot if event threshold reached.
+                                    if events_since_snapshot >= SNAPSHOT_EVENT_THRESHOLD {
+                                        let snapshot = emit_agg_snapshot(
+                                            &aggregation,
+                                            &mut post_stages,
+                                        );
+                                        yield Ok(snapshot);
+                                        events_since_snapshot = 0;
+                                        snapshot_timer.reset();
+                                    }
+                                }
+                                Err(crate::bus::RecvError::Lagged(n)) => {
+                                    tracing::warn!(
+                                        event_type = "stream_lagged",
+                                        missed = n,
+                                        "stream subscriber fell behind"
+                                    );
+                                    let payload = serde_json::json!({ "missed": n }).to_string();
+                                    yield Ok(Event::default().event("lagged").data(payload));
+                                }
+                                Err(crate::bus::RecvError::Closed) => {
                                     break;
                                 }
                             }
                         }
-
-                        if pass {
-                            let json = serde_json::to_string(&event).unwrap_or_default();
-                            yield Ok(Event::default().event("data").data(json));
+                        _ = snapshot_timer.tick() => {
+                            // Time-based snapshot: only emit if new events arrived.
+                            if events_since_snapshot > 0 {
+                                let snapshot = emit_agg_snapshot(
+                                    &aggregation,
+                                    &mut post_stages,
+                                );
+                                yield Ok(snapshot);
+                                events_since_snapshot = 0;
+                            }
                         }
                     }
-                }
-                Err(crate::bus::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        event_type = "stream_lagged",
-                        missed = n,
-                        "stream subscriber fell behind"
-                    );
-                    let payload = serde_json::json!({ "missed": n }).to_string();
-                    yield Ok(Event::default().event("lagged").data(payload));
-                }
-                Err(crate::bus::RecvError::Closed) => {
-                    break;
                 }
             }
         }
