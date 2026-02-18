@@ -42,6 +42,8 @@ pub(crate) const KNOWN_FUNCTIONS: &[&str] = &[
     "round",
     "now",
     "typeof",
+    "tonumber",
+    "tostring",
 ];
 
 /// Validate that a function name is known and argument count is correct.
@@ -155,6 +157,8 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
         }),
         "now" => require_n_args(name, args, 0, |_| "now()".to_string()),
         "typeof" => require_one_arg(name, args, |a| format!("TYPEOF({a})")),
+        "tonumber" => require_one_arg(name, args, |a| format!("TRY_CAST({a} AS DOUBLE)")),
+        "tostring" => require_one_arg(name, args, |a| format!("CAST({a} AS VARCHAR)")),
         // new aggregate functions
         "first" => require_one_arg(name, args, |a| format!("FIRST({a})")),
         "last" => require_one_arg(name, args, |a| format!("LAST({a})")),
@@ -516,6 +520,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn translate_tonumber() {
+        assert_eq!(
+            translate_function("tonumber", &args(&["x"])).unwrap(),
+            "TRY_CAST(x AS DOUBLE)"
+        );
+    }
+
+    #[test]
+    fn translate_tostring() {
+        assert_eq!(
+            translate_function("tostring", &args(&["x"])).unwrap(),
+            "CAST(x AS VARCHAR)"
+        );
+    }
+
     // ── translate_function: new aggregates ───────────────────────────────
 
     #[test]
@@ -654,6 +674,8 @@ mod tests {
             "now",
             "typeof",
             "bogus",
+            "tonumber",
+            "tostring",
         ] {
             assert!(
                 !is_aggregate_function(name),
