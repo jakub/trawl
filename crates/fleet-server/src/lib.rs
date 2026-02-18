@@ -12,6 +12,7 @@ pub mod handlers;
 pub mod hot_buffer;
 pub mod ingest;
 pub mod pool;
+pub mod query_log;
 pub mod rate_limit;
 pub mod retention;
 pub mod shutdown;
