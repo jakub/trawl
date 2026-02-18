@@ -429,8 +429,9 @@ impl App {
                 tracing::info!("executing query with enter (enter_executes mode)");
                 self.execute_query();
             }
-            // Shift+Enter always inserts newline (both modes)
-            (KeyModifiers::SHIFT, KeyCode::Enter) => {
+            // Shift+Enter always inserts newline (both modes).
+            // iTerm2 sends Shift+Enter as Ctrl+J (ASCII LF), so handle both.
+            (KeyModifiers::SHIFT, KeyCode::Enter) | (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
                 self.active_tab_mut().editor.insert_newline();
             }
             // Clear editor: Ctrl+L
