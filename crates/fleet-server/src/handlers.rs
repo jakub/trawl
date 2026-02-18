@@ -20,8 +20,12 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
 
+use std::collections::BTreeMap;
+
 use crate::bus::{EventBus, EventSubscriber as _};
 use crate::error::ServerError;
+use crate::pool::PoolDebugInfo;
+use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
 use crate::state::{AppState, CachedFieldValues, CachedSchema};
 
 // -- handlers ----------------------------------------------------------------
@@ -112,6 +116,18 @@ pub async fn query(
                 duration_ms,
                 "query complete"
             );
+
+            // Write query debug log entry (success).
+            write_query_log(
+                &state,
+                &verified,
+                &req.query,
+                outcome.debug.as_ref(),
+                Some(&paginated),
+                duration_ms,
+                None,
+            );
+
             Ok(Json(QueryResponse {
                 result: paginated,
                 truncated,
@@ -133,6 +149,17 @@ pub async fn query(
                 timeout_secs = state.query.timeout_secs,
                 "query timed out"
             );
+
+            write_query_log(
+                &state,
+                &verified,
+                &req.query,
+                outcome.debug.as_ref(),
+                None,
+                duration_ms,
+                Some("query timed out"),
+            );
+
             Err(ServerError::Timeout)
         }
         Err(e) => {
@@ -172,6 +199,17 @@ pub async fn query(
                     );
                 }
             }
+
+            write_query_log(
+                &state,
+                &verified,
+                &req.query,
+                outcome.debug.as_ref(),
+                None,
+                duration_ms,
+                Some(&safe_msg),
+            );
+
             Err(e)
         }
     }
@@ -675,14 +713,30 @@ pub async fn export(
         .pool
         .execute(&req.query, timeout, capture_debug)
         .await;
-    let result = outcome.result?;
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let result = match outcome.result {
+        Ok(qr) => qr,
+        Err(e) => {
+            let error_msg = e.safe_message();
+            write_query_log(
+                &state,
+                &verified,
+                &req.query,
+                outcome.debug.as_ref(),
+                None,
+                duration_ms,
+                Some(&error_msg),
+            );
+            return Err(e);
+        }
+    };
 
     // Limit rows to max_export_rows.
     let limited = result.paginate(0, limit);
 
     // Generate CSV.
     let csv = generate_csv(&limited);
-    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     tracing::info!(
         event_type = "export_complete",
@@ -692,6 +746,16 @@ pub async fn export(
         bytes = csv.len(),
         duration_ms,
         "export complete"
+    );
+
+    write_query_log(
+        &state,
+        &verified,
+        &req.query,
+        outcome.debug.as_ref(),
+        Some(&limited),
+        duration_ms,
+        None,
     );
 
     // Return CSV response with proper headers.
@@ -711,6 +775,108 @@ pub async fn export(
 #[derive(Debug, Deserialize)]
 pub struct ExportParams {
     pub format: Option<fleet_api::ExportFormat>,
+}
+
+// -- query debug log helpers -------------------------------------------------
+
+/// Maximum number of sample rows included in a query log entry.
+const QUERY_LOG_SAMPLE_SIZE: usize = 5;
+
+/// Write a query debug log entry if the query log is active.
+///
+/// No-op when `state.query.query_log` is `None`. Infallible — errors
+/// are logged via tracing and never propagated.
+#[allow(clippy::too_many_arguments)]
+fn write_query_log(
+    state: &AppState,
+    verified: &VerifiedKey,
+    dsl: &str,
+    debug: Option<&PoolDebugInfo>,
+    result: Option<&QueryResult>,
+    duration_ms: u64,
+    error: Option<&str>,
+) {
+    let Some(log) = &state.query.query_log else {
+        return;
+    };
+    let Some(debug) = debug else {
+        return;
+    };
+
+    let entry = QueryLogEntry {
+        ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        user: verified.name.clone(),
+        role: verified.role.to_string(),
+        dsl: dsl.to_owned(),
+        source: SourceDebug {
+            computed: debug.computed_source.clone(),
+            globs: debug.glob_count,
+            service_filter: debug.service_filter.clone(),
+            time_filter_secs: debug.time_filter_secs,
+            is_fallback: debug.is_fallback,
+        },
+        hot_buffer: HotBufferDebug {
+            status: debug.hot_status,
+            events: debug.hot_events,
+            batches: debug.hot_batches,
+            bytes: debug.hot_bytes,
+        },
+        sql: debug.sql.clone(),
+        params: debug.params.clone(),
+        result: build_result_debug(result),
+        timing_ms: TimingDebug {
+            pool_wait: debug.pool_wait_ms,
+            total: duration_ms,
+        },
+        error: error.map(String::from),
+    };
+
+    log.write(&entry);
+}
+
+/// Build a result debug summary with column names and sample rows.
+fn build_result_debug(result: Option<&QueryResult>) -> ResultDebug {
+    let Some(qr) = result else {
+        return ResultDebug {
+            status: "error",
+            columns: vec![],
+            row_count: 0,
+            sample: vec![],
+        };
+    };
+
+    let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
+    let sample: Vec<BTreeMap<String, serde_json::Value>> = qr
+        .rows
+        .iter()
+        .take(QUERY_LOG_SAMPLE_SIZE)
+        .map(|row| {
+            columns
+                .iter()
+                .zip(row.iter())
+                .map(|(col, val)| (col.clone(), value_to_json(val)))
+                .collect()
+        })
+        .collect();
+
+    ResultDebug {
+        status: "success",
+        columns,
+        row_count: qr.row_count(),
+        sample,
+    }
+}
+
+/// Convert a fleet `Value` to a `serde_json::Value` for debug log output.
+fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Integer(i) => serde_json::json!(i),
+        Value::Float(f) => serde_json::json!(f),
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
+    }
 }
 
 /// Generate RFC 4180-compliant CSV from query results.
