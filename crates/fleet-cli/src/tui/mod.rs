@@ -4,7 +4,7 @@ pub mod highlight;
 pub mod state;
 mod ui;
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -1073,7 +1073,7 @@ fn run_event_loop<B: ratatui::backend::Backend>(
         // Poll for events (100ms timeout).
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
                 }
                 Event::Paste(text) => {
