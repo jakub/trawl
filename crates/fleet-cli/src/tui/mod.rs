@@ -914,17 +914,7 @@ impl App {
             while let Some(event) = stream.next().await {
                 match event {
                     Ok(StreamEvent::Event(mut map)) => {
-                        // Apply timezone offset to timestamp field.
-                        if utc_offset_secs != 0 {
-                            if let Some(serde_json::Value::String(ts)) = map.get("timestamp") {
-                                let converted =
-                                    fleet_engine::timezone::reformat_rfc3339(ts, utc_offset_secs);
-                                map.insert(
-                                    "timestamp".to_owned(),
-                                    serde_json::Value::String(converted),
-                                );
-                            }
-                        }
+                        apply_tz_to_event(&mut map, utc_offset_secs);
                         buffer.push_event(&map);
                         event_count += 1;
                         tracing::debug!("received stream event, total: {event_count}");
@@ -933,7 +923,15 @@ impl App {
                         ref columns,
                         ref rows,
                     }) => {
-                        buffer.replace_with_snapshot(columns, rows);
+                        let rows: Vec<_> = rows
+                            .iter()
+                            .cloned()
+                            .map(|mut row| {
+                                apply_tz_to_event(&mut row, utc_offset_secs);
+                                row
+                            })
+                            .collect();
+                        buffer.replace_with_snapshot(columns, &rows);
                         // Snapshots are complete results — send immediately.
                         let response = buffer.to_query_response();
                         let _ = tx.send(QueryResult {
@@ -1109,6 +1107,23 @@ fn extract_field_order(query: &str) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+/// Apply timezone offset to timestamp-valued fields in a streaming event.
+///
+/// Converts RFC 3339 UTC strings to the display format used by the query
+/// executor, with the configured UTC offset applied. Handles both the
+/// standard `timestamp` field and timechart's `_time` bucket field.
+fn apply_tz_to_event(event: &mut serde_json::Map<String, serde_json::Value>, utc_offset_secs: i32) {
+    if utc_offset_secs == 0 {
+        return;
+    }
+    for key in &["timestamp", "_time"] {
+        if let Some(serde_json::Value::String(ts)) = event.get(*key) {
+            let converted = fleet_engine::timezone::reformat_rfc3339(ts, utc_offset_secs);
+            event.insert((*key).to_owned(), serde_json::Value::String(converted));
+        }
+    }
 }
 
 /// Main event loop.
