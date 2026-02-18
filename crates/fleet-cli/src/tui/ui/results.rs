@@ -656,8 +656,19 @@ fn extract_series(result: &fleet_engine::value::QueryResult) -> Vec<(String, Vec
         vec![(metric_name.clone(), values)]
     } else if other_cols.len() == 2 {
         // Multi series: _time + group_by + metric
-        let group_idx = other_cols[0];
-        let metric_idx = other_cols[1];
+        // Determine which is group (string) vs metric (numeric) by sampling the first row,
+        // since UNION ALL BY NAME can reorder columns arbitrarily.
+        let (group_idx, metric_idx) = if let Some(first_row) = result.rows.first() {
+            let a = other_cols[0];
+            let b = other_cols[1];
+            if matches!(first_row.get(b), Some(Value::String(_))) {
+                (b, a)
+            } else {
+                (a, b)
+            }
+        } else {
+            return vec![];
+        };
 
         let mut series_map: HashMap<String, Vec<u64>> = HashMap::new();
 
