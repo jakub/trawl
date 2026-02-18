@@ -74,9 +74,11 @@ impl Executor {
         match &result {
             // Columns present → real result (possibly empty rows). Return as-is.
             Ok(r) if !r.columns.is_empty() => result,
-            // No columns (no parquet source files) OR database error
-            // (UNION fails on missing source) → fall back to hot-only.
-            Ok(_) | Err(EngineError::Database(_)) => {
+            // No columns (no parquet source files), database error (UNION
+            // fails on missing source), or binder error remapped to Emit
+            // (column not found in empty parquet) → fall back to hot-only.
+            // ResultTooLarge is excluded: the query worked, just too many rows.
+            Ok(_) | Err(EngineError::Database(_) | EngineError::Emit(_)) => {
                 let hot_emitted = emitter::emit(&ast, hot_source)?;
                 self.execute_emitted(&hot_emitted, max_rows)
             }
