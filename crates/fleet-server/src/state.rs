@@ -18,6 +18,7 @@ use crate::config::{Config, RateLimitConfig};
 use crate::hot_buffer::{HotBuffer, HotBufferConfig};
 use crate::ingest::wal::WalWriter;
 use crate::pool::ExecutorPool;
+use crate::query_log::QueryLog;
 use crate::tracker::QueryTracker;
 
 /// Shared state injected into handlers via axum's `State` extractor.
@@ -59,6 +60,8 @@ pub struct QueryState {
     pub hot_buffer: Option<Arc<HotBuffer>>,
     /// Semaphore bounding concurrent SSE streaming connections.
     pub sse_semaphore: Arc<Semaphore>,
+    /// Optional ndjson query debug log.
+    pub query_log: Option<Arc<QueryLog>>,
 }
 
 /// Authentication state: key store, history store, saved queries, and database path.
@@ -169,6 +172,7 @@ impl AppState {
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 hot_buffer,
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
+                query_log: None,
             },
             auth: AuthState {
                 key_store: Arc::new(Mutex::new(key_store)),

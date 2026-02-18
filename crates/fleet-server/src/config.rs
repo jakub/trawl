@@ -70,6 +70,10 @@ pub struct ServerConfig {
     #[serde(default = "default_tls_reload_interval_secs")]
     pub tls_reload_interval_secs: u64,
 
+    /// Optional query debug log path. When set, every query execution is
+    /// logged as ndjson to this file for `tail -f | jq` debugging.
+    pub query_log: Option<PathBuf>,
+
     /// Allowed CORS origins (e.g. `["https://fleet.example.com"]`).
     /// Empty list (default) means no CORS headers are sent, so the browser's
     /// same-origin policy blocks all cross-origin requests.
@@ -675,6 +679,9 @@ impl Config {
         }
         if let Some(wal_dir) = &self.ingest.wal_dir {
             self.ingest.wal_dir = Some(PathBuf::from(expand_tilde(&wal_dir.to_string_lossy())));
+        }
+        if let Some(query_log) = &self.server.query_log {
+            self.server.query_log = Some(PathBuf::from(expand_tilde(&query_log.to_string_lossy())));
         }
     }
 

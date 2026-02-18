@@ -20,6 +20,10 @@ struct Cli {
     /// Path to the configuration file.
     #[arg(long, env = "FLEET_CONFIG", default_value = "~/.fleet/fleetd.toml")]
     config: String,
+
+    /// Path to ndjson query debug log. Overrides config `server.query_log`.
+    #[arg(long, env = "FLEET_QUERY_LOG")]
+    query_log: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -44,7 +48,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting fleetd"
     );
 
-    let (state, http_config) = AppState::from_config(&config)?;
+    let (mut state, http_config) = AppState::from_config(&config)?;
+
+    // Open query debug log if configured (CLI flag overrides config).
+    let query_log_path = cli.query_log.or(config.server.query_log.clone());
+    if let Some(ref path) = query_log_path {
+        let log = fleet_server::query_log::QueryLog::open(path)
+            .map_err(|e| format!("failed to open query log {}: {e}", path.display()))?;
+        tracing::info!(
+            event_type = "lifecycle",
+            path = %path.display(),
+            "query debug log enabled"
+        );
+        state.query.query_log = Some(Arc::new(log));
+    }
 
     // Activate internal telemetry by injecting the WAL writer.
     if let Some((handle, layer)) = &telemetry {
