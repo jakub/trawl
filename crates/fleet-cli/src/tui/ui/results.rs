@@ -540,12 +540,10 @@ pub fn value_to_string(value: &Value) -> String {
 
 /// Detect if a query result is from a timechart query.
 ///
-/// Timechart queries always have `_time` as the first column.
+/// Timechart queries produce a `_time` column. We check any position
+/// because `UNION ALL BY NAME` can reorder columns.
 pub fn is_timechart_result(result: &fleet_engine::value::QueryResult) -> bool {
-    result
-        .columns
-        .first()
-        .is_some_and(|col| col.name == "_time")
+    result.columns.iter().any(|col| col.name == "_time")
 }
 
 /// Downsample data to fit within `target_width` columns.
@@ -599,14 +597,17 @@ fn extract_time_metadata(
         return None;
     }
 
+    // Find the _time column by name (UNION ALL BY NAME can reorder columns)
+    let time_col = result.columns.iter().position(|c| c.name == "_time")?;
+
     // Get first and last time values
-    let first_time = value_to_string(&result.rows[0][0]);
-    let last_time = value_to_string(&result.rows[result.rows.len() - 1][0]);
+    let first_time = value_to_string(&result.rows[0][time_col]);
+    let last_time = value_to_string(&result.rows[result.rows.len() - 1][time_col]);
 
     // Derive span from the delta between first two time buckets
     let span = if result.rows.len() >= 2 {
-        let t1 = value_to_string(&result.rows[0][0]);
-        let t2 = value_to_string(&result.rows[1][0]);
+        let t1 = value_to_string(&result.rows[0][time_col]);
+        let t2 = value_to_string(&result.rows[1][time_col]);
         match (parse_timestamp_secs(&t1), parse_timestamp_secs(&t2)) {
             (Some(s1), Some(s2)) => format_duration(s2.saturating_sub(s1)),
             _ => "?".to_owned(),
@@ -633,23 +634,36 @@ fn extract_time_metadata(
 /// Single series: [(_time, count)] → [("count", [v1, v2, ...])]
 /// Multi series: [(_time, service, count)] → [("nginx", [v1, v2, ...]), ("apache", [...])]
 fn extract_series(result: &fleet_engine::value::QueryResult) -> Vec<(String, Vec<u64>)> {
-    if result.columns.len() == 2 {
-        // Single series: _time, metric
-        let metric_name = &result.columns[1].name;
+    // Find the _time column by name (UNION ALL BY NAME can reorder columns)
+    let Some(time_col) = result.columns.iter().position(|c| c.name == "_time") else {
+        return vec![];
+    };
+
+    // Non-_time columns are either metric or group_by + metric
+    let other_cols: Vec<usize> = (0..result.columns.len())
+        .filter(|&i| i != time_col)
+        .collect();
+
+    if other_cols.len() == 1 {
+        // Single series: _time + one metric column
+        let metric_idx = other_cols[0];
+        let metric_name = &result.columns[metric_idx].name;
         let values: Vec<u64> = result
             .rows
             .iter()
-            .map(|row| value_to_u64(&row[1]))
+            .map(|row| value_to_u64(&row[metric_idx]))
             .collect();
         vec![(metric_name.clone(), values)]
-    } else if result.columns.len() == 3 {
-        // Multi series: _time, group_by, metric
-        // Group rows by series label
+    } else if other_cols.len() == 2 {
+        // Multi series: _time + group_by + metric
+        let group_idx = other_cols[0];
+        let metric_idx = other_cols[1];
+
         let mut series_map: HashMap<String, Vec<u64>> = HashMap::new();
 
         for row in &result.rows {
-            let label = value_to_string(&row[1]);
-            let value = value_to_u64(&row[2]);
+            let label = value_to_string(&row[group_idx]);
+            let value = value_to_u64(&row[metric_idx]);
             series_map.entry(label).or_default().push(value);
         }
 

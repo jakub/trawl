@@ -308,12 +308,10 @@ impl App {
 
             match query_result.result {
                 Ok(response) => {
-                    // Auto-switch to sparkline view for timechart queries
-                    let is_timechart = response
-                        .result
-                        .columns
-                        .first()
-                        .is_some_and(|col| col.name == "_time");
+                    // Auto-switch to sparkline view for timechart queries.
+                    // Check for _time in any column position (UNION ALL BY NAME
+                    // can reorder columns vs. the original SELECT order).
+                    let is_timechart = response.result.columns.iter().any(|c| c.name == "_time");
                     if is_timechart && tab.chart_view == ChartView::Table {
                         tab.chart_view = ChartView::Sparkline;
                     }
@@ -394,11 +392,8 @@ impl App {
                 self.active_tab_idx = new_id;
                 return;
             }
-            // Close tab: Ctrl+Shift+W
-            (_, KeyCode::Char('W'))
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            // Close tab: Ctrl+W (when NOT in editor focus — editor uses Ctrl+W for kill-word)
+            (KeyModifiers::CONTROL, KeyCode::Char('w')) if self.focus != Focus::Editor => {
                 if self.tabs.len() > 1 {
                     self.tabs.remove(self.active_tab_idx);
                     if self.active_tab_idx >= self.tabs.len() {
@@ -410,21 +405,10 @@ impl App {
                 }
                 return;
             }
-            // Next tab: Ctrl+Tab
-            (_, KeyCode::Tab) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Cycle tabs: Shift+Tab (BackTab) — cycles forward, wrapping around
+            (_, KeyCode::BackTab) => {
                 if self.tabs.len() > 1 {
                     self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
-                }
-                return;
-            }
-            // Prev tab: Ctrl+Shift+Tab
-            (_, KeyCode::BackTab)
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
-                if self.tabs.len() > 1 {
-                    self.active_tab_idx =
-                        (self.active_tab_idx + self.tabs.len() - 1) % self.tabs.len();
                 }
                 return;
             }
@@ -1694,34 +1678,42 @@ mod tests {
     }
 
     #[test]
-    fn key_ctrl_shift_w_closes_tab() {
+    fn key_ctrl_w_closes_tab_from_results() {
         let mut app = test_app();
         // Create a second tab first
         app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.tabs.len(), 2);
-        app.handle_key(key_mod(
-            KeyCode::Char('W'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
+        // Switch to results focus so Ctrl+W closes tab (not kill-word)
+        app.focus = Focus::Results;
+        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(app.tabs.len(), 1);
     }
 
     #[test]
-    fn key_ctrl_shift_w_with_one_tab_clears() {
+    fn key_ctrl_w_in_editor_does_not_close_tab() {
+        let mut app = test_app();
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.tabs.len(), 2);
+        // In editor focus, Ctrl+W is kill-word, not close tab
+        app.focus = Focus::Editor;
+        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.tabs.len(), 2);
+    }
+
+    #[test]
+    fn key_ctrl_w_with_one_tab_clears() {
         let mut app = test_app();
         // Type something so we can verify it gets cleared
         app.handle_key(key(KeyCode::Char('x')));
         assert_eq!(app.active_tab().editor.text(), "x");
-        app.handle_key(key_mod(
-            KeyCode::Char('W'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
+        app.focus = Focus::Results;
+        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.active_tab().editor.text(), "");
     }
 
     #[test]
-    fn key_ctrl_tab_cycles_tabs() {
+    fn key_shift_tab_cycles_tabs() {
         let mut app = test_app();
         // Create 3 tabs total
         app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -1730,35 +1722,12 @@ mod tests {
         assert_eq!(app.active_tab_idx, 2);
 
         // Cycle forward: 2 -> 0
-        app.handle_key(key_mod(KeyCode::Tab, KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(app.active_tab_idx, 0);
 
         // Cycle forward: 0 -> 1
-        app.handle_key(key_mod(KeyCode::Tab, KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(app.active_tab_idx, 1);
-    }
-
-    #[test]
-    fn key_ctrl_shift_tab_cycles_tabs_backward() {
-        let mut app = test_app();
-        // Create 3 tabs total
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(app.active_tab_idx, 2);
-
-        // Cycle backward: 2 -> 1
-        app.handle_key(key_mod(
-            KeyCode::BackTab,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
-        assert_eq!(app.active_tab_idx, 1);
-
-        // Cycle backward: 1 -> 0
-        app.handle_key(key_mod(
-            KeyCode::BackTab,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
-        assert_eq!(app.active_tab_idx, 0);
     }
 
     #[test]
