@@ -17,7 +17,7 @@ trait RunQueryUnlimited {
 
 impl RunQueryUnlimited for Executor {
     fn run_query_max(&self, dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
-        self.run_query(dsl, source, usize::MAX)
+        self.run_query(dsl, source, usize::MAX, 0)
     }
 }
 

@@ -92,6 +92,10 @@ pub struct QueryRequest {
     /// Optional offset for pagination (defaults to 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<usize>,
+    /// Timezone for timestamp display (e.g. `"UTC"`, `"local"`, `"+05:30"`).
+    /// When absent, the server uses UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 /// Request body for creating a saved query (`POST /api/v1/saved`).
@@ -414,6 +418,7 @@ mod tests {
             query: "level:error | stats count()".into(),
             limit: Some(100),
             offset: None,
+            timezone: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         // skip_serializing_if means offset should be absent

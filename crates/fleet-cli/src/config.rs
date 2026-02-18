@@ -96,6 +96,14 @@ pub struct UiConfig {
     /// When false (default), Enter inserts a newline and Ctrl+Enter executes.
     #[serde(default)]
     pub enter_executes: bool,
+
+    /// Timezone for timestamp display.
+    ///
+    /// - `"local"` (default) — system timezone via `chrono::Local`
+    /// - `"UTC"` — no conversion
+    /// - `"+HH:MM"` / `"-HH:MM"` — fixed offset
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
 }
 
 impl Default for UiConfig {
@@ -106,6 +114,7 @@ impl Default for UiConfig {
             auto_save_history: true,
             tab_width: default_tab_width(),
             enter_executes: false,
+            timezone: default_timezone(),
         }
     }
 }
@@ -226,6 +235,10 @@ const fn default_tab_width() -> usize {
 
 const fn default_max_events() -> usize {
     1000
+}
+
+fn default_timezone() -> String {
+    "local".to_owned()
 }
 
 #[cfg(test)]

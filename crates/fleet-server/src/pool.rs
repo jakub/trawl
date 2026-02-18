@@ -124,6 +124,7 @@ fn run_query_blocking(
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
     max_result_rows: usize,
+    utc_offset_secs: i32,
     capture_debug: bool,
     fallback_glob: &str,
     pool_wait_ms: u64,
@@ -169,11 +170,11 @@ fn run_query_blocking(
             // Safety: we verified UTF-8 validity above.
             let hot_path = hot_file.path().to_str().unwrap_or_default();
             executor
-                .run_query_with_hot(dsl, source, hot_path, max_result_rows)
+                .run_query_with_hot(dsl, source, hot_path, max_result_rows, utc_offset_secs)
                 .map_err(ServerError::from)
         } else {
             executor
-                .run_query(dsl, source, max_result_rows)
+                .run_query(dsl, source, max_result_rows, utc_offset_secs)
                 .map_err(ServerError::from)
         }
     }));
@@ -343,12 +344,15 @@ impl ExecutorPool {
     ///
     /// When `capture_debug` is true, captures source selection, hot buffer
     /// state, and generated SQL for the query debug log.
+    ///
+    /// `utc_offset_secs` is applied to all timestamp values in the result.
     #[allow(clippy::too_many_lines)]
     pub async fn execute(
         &self,
         dsl: &str,
         timeout: Duration,
         capture_debug: bool,
+        utc_offset_secs: i32,
     ) -> ExecuteOutcome {
         let available = self.semaphore.available_permits();
         if available == 0 {
@@ -413,6 +417,7 @@ impl ExecutorPool {
                 &source,
                 hot_buffer.as_ref(),
                 max_result_rows,
+                utc_offset_secs,
                 capture_debug,
                 &fallback_glob,
                 pool_wait_ms,
@@ -555,7 +560,7 @@ mod tests {
         let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
         // Must start with `|` to trigger a parse error — bare text is valid DSL.
         let outcome = pool
-            .execute("| | invalid", Duration::from_secs(10), false)
+            .execute("| | invalid", Duration::from_secs(10), false, 0)
             .await;
         assert!(outcome.result.is_err());
     }
@@ -565,7 +570,7 @@ mod tests {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // just verifying it doesn't panic with a single permit
         let _ = pool
-            .execute("service:test", Duration::from_secs(10), false)
+            .execute("service:test", Duration::from_secs(10), false, 0)
             .await;
     }
 
@@ -577,10 +582,10 @@ mod tests {
         // should have the same number of idle executors before and after.
         let idle_before = pool.idle.lock().len();
         let _ = pool
-            .execute("service:test", Duration::from_secs(10), false)
+            .execute("service:test", Duration::from_secs(10), false, 0)
             .await;
         let _ = pool
-            .execute("service:test", Duration::from_secs(10), false)
+            .execute("service:test", Duration::from_secs(10), false, 0)
             .await;
         let idle_after = pool.idle.lock().len();
 
@@ -606,7 +611,7 @@ mod tests {
     async fn pool_timeout_returns_error() {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // 1ns timeout — the blocking task can't possibly complete this fast.
-        let outcome = pool.execute("*", Duration::from_nanos(1), false).await;
+        let outcome = pool.execute("*", Duration::from_nanos(1), false, 0).await;
         assert!(
             matches!(outcome.result, Err(ServerError::Timeout)),
             "expected Timeout, got: {:?}",
@@ -620,7 +625,7 @@ mod tests {
         let idle_before = pool.idle.lock().len();
 
         // Trigger a timeout.
-        let _ = pool.execute("*", Duration::from_nanos(1), false).await;
+        let _ = pool.execute("*", Duration::from_nanos(1), false, 0).await;
 
         // Wait briefly for the async reclamation task to complete.
         tokio::time::sleep(Duration::from_millis(200)).await;

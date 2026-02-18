@@ -42,15 +42,19 @@ impl Executor {
     }
 
     /// Full pipeline: parse DSL, emit SQL, execute.
+    ///
+    /// `utc_offset_secs` is applied to all timestamp values at format time.
+    /// Pass `0` for UTC display.
     pub fn run_query(
         &self,
         dsl: &str,
         source: &str,
         max_rows: usize,
+        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit(&ast, source)?;
-        self.execute_emitted(&emitted, max_rows)
+        self.execute_emitted(&emitted, max_rows, utc_offset_secs)
     }
 
     /// Full pipeline with hot buffer: parse DSL, emit composite SQL, execute.
@@ -67,10 +71,11 @@ impl Executor {
         source: &str,
         hot_source: &str,
         max_rows: usize,
+        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
-        let result = self.execute_emitted(&emitted, max_rows);
+        let result = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
         match &result {
             // Columns present → real result (possibly empty rows). Return as-is.
             Ok(r) if !r.columns.is_empty() => result,
@@ -80,7 +85,7 @@ impl Executor {
             // ResultTooLarge is excluded: the query worked, just too many rows.
             Ok(_) | Err(EngineError::Database(_) | EngineError::Emit(_)) => {
                 let hot_emitted = emitter::emit(&ast, hot_source)?;
-                match self.execute_emitted(&hot_emitted, max_rows) {
+                match self.execute_emitted(&hot_emitted, max_rows, utc_offset_secs) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
                     Err(EngineError::Emit(_)) => Ok(QueryResult::empty()),
@@ -95,10 +100,13 @@ impl Executor {
     ///
     /// `max_rows` caps the number of result rows to prevent unbounded memory
     /// allocation. Returns [`EngineError::ResultTooLarge`] if exceeded.
+    ///
+    /// `utc_offset_secs` is applied to all timestamp values at format time.
     pub fn execute_emitted(
         &self,
         query: &EmittedQuery,
         max_rows: usize,
+        utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let mut stmt = match self.conn.prepare(&query.sql) {
             Ok(s) => s,
@@ -139,7 +147,7 @@ impl Executor {
             }
             let mut cells = Vec::with_capacity(col_count);
             for i in 0..col_count {
-                cells.push(extract_value(row, i));
+                cells.push(extract_value(row, i, utc_offset_secs));
             }
             rows.push(cells);
         }
@@ -284,7 +292,10 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
 ///
 /// Uses `ValueRef` for type-safe dispatch. Temporal types fall back to
 /// string extraction so duckdb handles its own formatting.
-fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> Value {
+///
+/// `utc_offset_secs` is applied to timestamp values before civil time
+/// formatting. Pass `0` for UTC.
+fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Value {
     match row.get_ref_unwrap(idx) {
         ValueRef::Null => Value::Null,
         ValueRef::Boolean(b) => Value::Boolean(b),
@@ -306,7 +317,9 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> Value {
         ValueRef::Double(f) => Value::Float(f),
         ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
         ValueRef::Blob(bytes) => Value::String(format!("<blob {} bytes>", bytes.len())),
-        ValueRef::Timestamp(unit, val) => Value::String(format_timestamp(unit, val)),
+        ValueRef::Timestamp(unit, val) => {
+            Value::String(format_timestamp(unit, val, utc_offset_secs))
+        }
         ValueRef::Date32(days) => Value::String(format_date(days)),
         ValueRef::Time64(unit, val) => Value::String(format_time(unit, val)),
         // list values from aggregations like LIST(DISTINCT col)
@@ -360,8 +373,8 @@ const fn to_micros(unit: TimeUnit, val: i64) -> i64 {
     clippy::cast_sign_loss,
     clippy::cast_lossless
 )]
-fn format_timestamp(unit: TimeUnit, val: i64) -> String {
-    let micros = to_micros(unit, val);
+fn format_timestamp(unit: TimeUnit, val: i64, utc_offset_secs: i32) -> String {
+    let micros = to_micros(unit, val) + i64::from(utc_offset_secs) * 1_000_000;
 
     let (total_secs, sub_secs) = if micros >= 0 {
         (micros / 1_000_000, (micros % 1_000_000) as u32)

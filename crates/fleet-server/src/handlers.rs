@@ -72,12 +72,21 @@ pub async fn query(
     let query_id = state.query.tracker.start(&verified, &req.query);
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
+    // Resolve timezone from request (default to UTC when absent).
+    let utc_offset_secs = req
+        .timezone
+        .as_deref()
+        .map(fleet_engine::timezone::resolve_utc_offset)
+        .transpose()
+        .map_err(ServerError::BadRequest)?
+        .unwrap_or(0);
+
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
     let outcome = state
         .query
         .pool
-        .execute(&req.query, timeout, capture_debug)
+        .execute(&req.query, timeout, capture_debug, utc_offset_secs)
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -708,10 +717,12 @@ pub async fn export(
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
     let capture_debug = state.query.query_log.is_some();
+    // Exports use UTC — timezone conversion is a display concern for
+    // interactive queries, not bulk data exports.
     let outcome = state
         .query
         .pool
-        .execute(&req.query, timeout, capture_debug)
+        .execute(&req.query, timeout, capture_debug, 0)
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 

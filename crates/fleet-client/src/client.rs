@@ -96,18 +96,30 @@ impl HttpClient {
         format!("{}{path}", self.base_url)
     }
 
-    /// Execute a DSL query with optional pagination.
+    /// Execute a DSL query with optional pagination and timezone.
     pub async fn query_paginated(
         &self,
         dsl: &str,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<QueryResponse, ClientError> {
+        self.query_paginated_tz(dsl, limit, offset, None).await
+    }
+
+    /// Execute a DSL query with optional pagination and explicit timezone.
+    pub async fn query_paginated_tz(
+        &self,
+        dsl: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        timezone: Option<String>,
+    ) -> Result<QueryResponse, ClientError> {
         let url = self.endpoint("/api/v1/query");
         let body = fleet_api::QueryRequest {
             query: dsl.to_owned(),
             limit,
             offset,
+            timezone,
         };
         let req = self.client.post(&url).json(&body);
         self.send_authenticated(req).await
@@ -521,6 +533,7 @@ mod tests {
             query: "service:nginx | stats count()".to_string(),
             limit: Some(10),
             offset: Some(5),
+            timezone: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["query"], "service:nginx | stats count()");
@@ -534,6 +547,7 @@ mod tests {
             query: "service:nginx".to_string(),
             limit: None,
             offset: None,
+            timezone: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["query"], "service:nginx");

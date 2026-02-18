@@ -93,6 +93,8 @@ pub struct App {
     pub live_mode: bool,
     /// When true, Enter executes query and Shift+Enter inserts newline.
     pub enter_executes: bool,
+    /// Timezone configuration string for timestamp display.
+    pub timezone: String,
     /// Maximum events to retain in live streaming buffer.
     max_live_events: usize,
     /// Handle to the live streaming task (if active).
@@ -128,6 +130,7 @@ impl App {
             should_quit: false,
             live_mode: false,
             enter_executes: false,
+            timezone: "local".to_owned(),
             max_live_events: 1000,
             live_task: None,
             query_rx,
@@ -170,12 +173,13 @@ impl App {
         let client = self.client.clone();
         let tx = self.query_tx.clone();
         let tab_idx = self.active_tab_idx;
+        let timezone = self.timezone.clone();
 
         tokio::spawn(async move {
             tracing::info!("background task started for query: {}", query);
             let start = Instant::now();
             let result = client
-                .query_paginated(&query, None, None)
+                .query_paginated_tz(&query, None, None, Some(timezone))
                 .await
                 .map_err(|e| e.to_string());
             let duration = start.elapsed();
@@ -1045,6 +1049,7 @@ pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliE
     let mut app = App::new(client);
     app.max_live_events = config.tail.max_events;
     app.enter_executes = config.ui.enter_executes;
+    app.timezone = config.ui.timezone.clone();
     app.schema_cache = schema;
     app.history_cache = history;
     app.saved_cache = saved;

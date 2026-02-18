@@ -28,6 +28,7 @@ pub async fn run_query(
     data: Option<&str>,
     format: Option<OutputFormat>,
     conn: Option<ConnectionParams>,
+    timezone: &str,
 ) -> Result<(), CliError> {
     let format = format.unwrap_or_else(|| {
         if io::stdout().is_terminal() {
@@ -38,9 +39,9 @@ pub async fn run_query(
     });
 
     let result = if let Some(data) = data {
-        run_embedded_mode(data, query)?
+        run_embedded_mode(data, query, timezone)?
     } else if let Some(conn) = conn {
-        run_daemon_mode(&conn, query).await?
+        run_daemon_mode(&conn, query, timezone).await?
     } else {
         return Err(CliError::Usage(
             "provide --url (daemon mode) or --data (embedded mode)".into(),
@@ -94,17 +95,25 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
 }
 
 /// Connect to the daemon and execute the query over HTTPS.
-async fn run_daemon_mode(conn: &ConnectionParams, query: &str) -> Result<QueryResult, CliError> {
+async fn run_daemon_mode(
+    conn: &ConnectionParams,
+    query: &str,
+    timezone: &str,
+) -> Result<QueryResult, CliError> {
     let client = make_client(conn)?;
-    let response = client.query_paginated(query, None, None).await?;
+    let response = client
+        .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
+        .await?;
     Ok(response.result)
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
-fn run_embedded_mode(data: &str, query: &str) -> Result<QueryResult, CliError> {
+fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryResult, CliError> {
+    let utc_offset_secs =
+        fleet_engine::timezone::resolve_utc_offset(timezone).map_err(CliError::Usage)?;
     let executor = fleet_engine::executor::Executor::new()?;
     // CLI has no server-side row limit — use usize::MAX.
-    Ok(executor.run_query(query, data, usize::MAX)?)
+    Ok(executor.run_query(query, data, usize::MAX, utc_offset_secs)?)
 }
 
 /// Build an `HttpClient` from resolved connection params.

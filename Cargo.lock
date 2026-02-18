@@ -1251,6 +1251,7 @@ dependencies = [
 name = "fleet-engine"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "duckdb",
  "fleet-core",
  "insta",

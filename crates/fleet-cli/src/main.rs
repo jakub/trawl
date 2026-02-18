@@ -136,7 +136,7 @@ async fn run(args: Cli) -> Result<(), CliError> {
                 })
             };
 
-            cli::run_query(&query, data.as_deref(), format, conn).await?;
+            cli::run_query(&query, data.as_deref(), format, conn, &cfg.ui.timezone).await?;
         }
         Some(Command::Validate { query }) => {
             // Validate supports both daemon and local-only mode.
