@@ -638,35 +638,93 @@ impl App {
 
     /// Handle key events when results are focused.
     fn handle_results_key(&mut self, key: event::KeyEvent) {
+        let row_count = self
+            .active_tab()
+            .result
+            .as_ref()
+            .map_or(0, |r| r.result.row_count());
+
         match (key.modifiers, key.code) {
             // Switch back to editor
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.focus = Focus::Editor;
             }
-            // Vertical scrolling
+            // Row selection: Up
             (KeyModifiers::NONE, KeyCode::Up) => {
-                let tab = self.active_tab_mut();
-                tab.scroll_offset = tab.scroll_offset.saturating_sub(1);
+                if row_count > 0 {
+                    let tab = self.active_tab_mut();
+                    tab.selected_row = Some(match tab.selected_row {
+                        Some(r) => r.saturating_sub(1),
+                        None => 0,
+                    });
+                    self.ensure_selected_row_visible();
+                }
             }
+            // Row selection: Down
             (KeyModifiers::NONE, KeyCode::Down) => {
-                let tab = self.active_tab_mut();
-                tab.scroll_offset = tab.scroll_offset.saturating_add(1);
+                if row_count > 0 {
+                    let tab = self.active_tab_mut();
+                    let max_row = row_count.saturating_sub(1);
+                    tab.selected_row = Some(match tab.selected_row {
+                        Some(r) => (r + 1).min(max_row),
+                        None => 0,
+                    });
+                    self.ensure_selected_row_visible();
+                }
             }
+            // Page up: move selection by 10
             (KeyModifiers::NONE, KeyCode::PageUp) => {
-                let tab = self.active_tab_mut();
-                tab.scroll_offset = tab.scroll_offset.saturating_sub(10);
+                if row_count > 0 {
+                    let tab = self.active_tab_mut();
+                    tab.selected_row = Some(match tab.selected_row {
+                        Some(r) => r.saturating_sub(10),
+                        None => 0,
+                    });
+                    self.ensure_selected_row_visible();
+                }
             }
+            // Page down: move selection by 10
             (KeyModifiers::NONE, KeyCode::PageDown) => {
-                let tab = self.active_tab_mut();
-                tab.scroll_offset = tab.scroll_offset.saturating_add(10);
+                if row_count > 0 {
+                    let tab = self.active_tab_mut();
+                    let max_row = row_count.saturating_sub(1);
+                    tab.selected_row = Some(match tab.selected_row {
+                        Some(r) => (r + 10).min(max_row),
+                        None => 0,
+                    });
+                    self.ensure_selected_row_visible();
+                }
             }
+            // Home: jump to first row
             (KeyModifiers::NONE, KeyCode::Home) => {
-                self.active_tab_mut().scroll_offset = 0;
+                if row_count > 0 {
+                    self.active_tab_mut().selected_row = Some(0);
+                    self.ensure_selected_row_visible();
+                }
             }
+            // End: jump to last row
             (KeyModifiers::NONE, KeyCode::End) => {
+                if row_count > 0 {
+                    self.active_tab_mut().selected_row = Some(row_count.saturating_sub(1));
+                    self.ensure_selected_row_visible();
+                }
+            }
+            // Enter: open detail view for selected row
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if self.active_tab().selected_row.is_some() {
+                    let row_index = self.active_tab().selected_row.unwrap();
+                    self.popup = Some(Popup::EventDetail {
+                        row_index,
+                        scroll: 0,
+                    });
+                }
+            }
+            // Esc: deselect row (if no query running)
+            (KeyModifiers::NONE, KeyCode::Esc) => {
                 let tab = self.active_tab_mut();
-                // Set to max value, render will clamp to proper bounds
-                tab.scroll_offset = usize::MAX;
+                if tab.selected_row.is_some() {
+                    tab.selected_row = None;
+                }
             }
             // Horizontal scrolling
             (KeyModifiers::NONE, KeyCode::Left) => {
@@ -690,6 +748,20 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Adjust scroll offset to keep the selected row visible.
+    fn ensure_selected_row_visible(&mut self) {
+        let tab = self.active_tab_mut();
+        if let Some(selected) = tab.selected_row {
+            // Estimate visible rows (will be approximate, but good enough)
+            let visible_rows = 15; // conservative estimate
+            if selected < tab.scroll_offset {
+                tab.scroll_offset = selected;
+            } else if selected >= tab.scroll_offset + visible_rows {
+                tab.scroll_offset = selected - visible_rows + 1;
+            }
         }
     }
 
@@ -837,6 +909,7 @@ impl App {
     }
 
     /// Handle key events when a popup is open.
+    #[allow(clippy::too_many_lines)] // Inherently large popup dispatch
     fn handle_popup_key(&mut self, key: event::KeyEvent) {
         if let Some(popup) = &self.popup {
             match popup {
@@ -881,6 +954,74 @@ impl App {
                             self.popup = Some(Popup::SaveQuery {
                                 input: current_input,
                             });
+                        }
+                        _ => {}
+                    }
+                }
+                Popup::EventDetail {
+                    row_index, scroll, ..
+                } => {
+                    let row_index = *row_index;
+                    let scroll = *scroll;
+                    let row_count = self
+                        .active_tab()
+                        .result
+                        .as_ref()
+                        .map_or(0, |r| r.result.row_count());
+
+                    match (key.modifiers, key.code) {
+                        // Close: Esc or q
+                        (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Char('q')) => {
+                            self.popup = None;
+                        }
+                        // Scroll up
+                        (KeyModifiers::NONE, KeyCode::Up) => {
+                            self.popup = Some(Popup::EventDetail {
+                                row_index,
+                                scroll: scroll.saturating_sub(1),
+                            });
+                        }
+                        // Scroll down
+                        (KeyModifiers::NONE, KeyCode::Down) => {
+                            self.popup = Some(Popup::EventDetail {
+                                row_index,
+                                scroll: scroll + 1,
+                            });
+                        }
+                        // Page scroll
+                        (KeyModifiers::NONE, KeyCode::PageUp) => {
+                            self.popup = Some(Popup::EventDetail {
+                                row_index,
+                                scroll: scroll.saturating_sub(10),
+                            });
+                        }
+                        (KeyModifiers::NONE, KeyCode::PageDown) => {
+                            self.popup = Some(Popup::EventDetail {
+                                row_index,
+                                scroll: scroll + 10,
+                            });
+                        }
+                        // Navigate to prev row
+                        (KeyModifiers::NONE, KeyCode::Char('[')) => {
+                            if row_index > 0 {
+                                let new_idx = row_index - 1;
+                                self.active_tab_mut().selected_row = Some(new_idx);
+                                self.popup = Some(Popup::EventDetail {
+                                    row_index: new_idx,
+                                    scroll: 0,
+                                });
+                            }
+                        }
+                        // Navigate to next row
+                        (KeyModifiers::NONE, KeyCode::Char(']')) => {
+                            if row_index + 1 < row_count {
+                                let new_idx = row_index + 1;
+                                self.active_tab_mut().selected_row = Some(new_idx);
+                                self.popup = Some(Popup::EventDetail {
+                                    row_index: new_idx,
+                                    scroll: 0,
+                                });
+                            }
                         }
                         _ => {}
                     }
@@ -1641,16 +1782,28 @@ mod tests {
     // --- Results key routing ---
 
     #[test]
-    fn results_keys_scroll() {
+    fn results_keys_select_rows() {
         let mut app = test_app();
         app.focus = Focus::Results;
-        assert_eq!(app.active_tab().scroll_offset, 0);
+        // Give it some result data so row selection works
+        app.tabs[0].result = Some(make_query_response(
+            vec!["x"],
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Integer(3)],
+            ],
+        ));
+        assert_eq!(app.active_tab().selected_row, None);
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.active_tab().scroll_offset, 1);
+        assert_eq!(app.active_tab().selected_row, Some(0));
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.active_tab().scroll_offset, 2);
+        assert_eq!(app.active_tab().selected_row, Some(1));
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.active_tab().scroll_offset, 1);
+        assert_eq!(app.active_tab().selected_row, Some(0));
+        // Esc deselects
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.active_tab().selected_row, None);
     }
 
     // --- Channel injection tests (poll_query_results / poll_mutations) ---

@@ -19,6 +19,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Popup::SaveQuery { input } => {
                 render_save_query(frame, input);
             }
+            Popup::EventDetail { row_index, scroll } => {
+                render_event_detail(app, frame, *row_index, *scroll);
+            }
         }
     }
 }
@@ -111,6 +114,70 @@ fn render_save_query(frame: &mut Frame<'_>, input: &str) {
         .block(block)
         .alignment(Alignment::Center)
         .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+}
+
+/// Render the event detail popup (key-value view of a single row).
+fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scroll: usize) {
+    let area = centered_rect(70, 80, frame.area());
+    frame.render_widget(Clear, area);
+
+    let tab = app.active_tab();
+    let Some(response) = &tab.result else {
+        return;
+    };
+
+    let result = &response.result;
+    let Some(row_data) = result.rows.get(row_index) else {
+        return;
+    };
+
+    let title = format!(" Event Detail (row {}) ", row_index + 1);
+    let block = Block::default()
+        .title(title)
+        .title_bottom(" ↑↓: scroll | []: prev/next row | Esc: close ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    // Build key-value lines
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    lines.push(Line::from(""));
+
+    // Find max field name width for alignment
+    let max_name_len = result
+        .columns
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(0);
+
+    for (i, col) in result.columns.iter().enumerate() {
+        let value = row_data
+            .get(i)
+            .map(super::results::value_to_string)
+            .unwrap_or_default();
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:>width$}  ", col.name, width = max_name_len),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(value),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    let max_scroll = lines.len().saturating_sub(1);
+    let clamped_scroll = scroll.min(max_scroll);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((clamped_scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
 }

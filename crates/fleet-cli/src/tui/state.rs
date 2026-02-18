@@ -56,6 +56,13 @@ pub enum Popup {
         /// Current input text.
         input: String,
     },
+    /// Detail view for a single result row.
+    EventDetail {
+        /// Index of the row being viewed.
+        row_index: usize,
+        /// Vertical scroll offset within the detail view.
+        scroll: usize,
+    },
 }
 
 /// Chart visualization mode for results.
