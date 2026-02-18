@@ -740,6 +740,18 @@ impl LiveBuffer {
         }
     }
 
+    /// Pre-seed column ordering from a DSL `fields`/`table` stage.
+    ///
+    /// Events that arrive will slot into these columns first (preserving
+    /// user-specified order), with any extra fields appended afterward.
+    pub fn with_column_order(mut self, columns: Vec<String>) -> Self {
+        for (i, col) in columns.into_iter().enumerate() {
+            self.column_index.insert(col.clone(), i);
+            self.column_names.push(col);
+        }
+        self
+    }
+
     /// Push a log event map into the buffer, extending the column union as needed.
     pub fn push_event(&mut self, event: &serde_json::Map<String, serde_json::Value>) {
         // Extend column set with any new fields.

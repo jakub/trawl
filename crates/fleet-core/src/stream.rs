@@ -172,8 +172,8 @@ fn stage_name(stage: &PipeStage) -> &'static str {
 ///
 /// Cannot derive `Debug` due to `AtomicU64` and `regex::Regex` fields.
 pub enum CompiledStage {
-    /// Keep only the specified fields.
-    Table { fields: HashSet<String> },
+    /// Keep only the specified fields (ordered as the user wrote them).
+    Table { fields: Vec<String> },
     /// Remove the specified fields.
     Drop { fields: HashSet<String> },
     /// Rename fields (from → to).
@@ -1236,6 +1236,27 @@ mod tests {
         assert_eq!(ev.len(), 2);
         assert!(ev.contains_key("host"));
         assert!(ev.contains_key("service"));
+    }
+
+    #[test]
+    fn table_stores_fields_in_user_order() {
+        let stage = compile_table(&TableStage {
+            fields: vec![
+                "timestamp".into(),
+                "event_type".into(),
+                "target".into(),
+                "message".into(),
+            ],
+        });
+        // The compiled stage preserves user-specified field order.
+        let CompiledStage::Table { ref fields } = stage else {
+            panic!("expected Table stage");
+        };
+        assert_eq!(
+            fields,
+            &["timestamp", "event_type", "target", "message"],
+            "Table stage must store fields in user-specified order"
+        );
     }
 
     #[test]

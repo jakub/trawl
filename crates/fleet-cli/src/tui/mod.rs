@@ -876,6 +876,9 @@ impl App {
             task.abort();
         }
 
+        // Extract field order from the DSL so the live buffer preserves it.
+        let field_order = extract_field_order(&query);
+
         let client = self.client.clone();
         let tx = self.query_tx.clone();
         let tab_idx = self.active_tab_idx;
@@ -898,6 +901,9 @@ impl App {
             };
 
             let mut buffer = LiveBuffer::new(max_events);
+            if !field_order.is_empty() {
+                buffer = buffer.with_column_order(field_order);
+            }
             let mut event_count = 0usize;
 
             while let Some(event) = stream.next().await {
@@ -1067,6 +1073,26 @@ pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliE
     terminal.show_cursor()?;
 
     result
+}
+
+/// Extract the user-specified field order from a `fields`/`table` pipe stage.
+///
+/// Returns the mapped column names in user-specified order, or empty vec if
+/// no table stage is present (or the query fails to parse).
+fn extract_field_order(query: &str) -> Vec<String> {
+    let Ok(ast) = fleet_core::parser::parse(query) else {
+        return Vec::new();
+    };
+    for stage in &ast.pipeline {
+        if let fleet_core::ast::PipeStage::Table(t) = &stage.node {
+            return t
+                .fields
+                .iter()
+                .map(|f| fleet_core::emitter::map_field_name(f).to_string())
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 /// Main event loop.
