@@ -28,6 +28,7 @@ pub fn truncate_query(query: &str, max_len: usize) -> String {
     if query.len() <= max_len {
         query.to_owned()
     } else {
-        format!("{}...", &query[..max_len.saturating_sub(3)])
+        let truncated: String = query.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{truncated}...")
     }
 }

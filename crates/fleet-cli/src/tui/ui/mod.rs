@@ -43,10 +43,10 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     status::render(app, frame, chunks[3]);
 
     // Render sidebar overlay (if any).
-    if let Some(sidebar) = app.sidebar {
+    if let Some(ref sidebar) = app.sidebar {
         match sidebar {
-            Sidebar::Help => help::render(app, frame),
-            Sidebar::Schema => schema::render(app, frame),
+            Sidebar::Help { scroll } => help::render(app, frame, *scroll),
+            Sidebar::Schema { scroll } => schema::render(app, frame, *scroll),
             Sidebar::History => history::render(app, frame),
             Sidebar::Saved => saved::render(app, frame),
         }
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn render_with_help_sidebar() {
         let mut app = test_app();
-        app.sidebar = Some(Sidebar::Help);
+        app.sidebar = Some(Sidebar::Help { scroll: 0 });
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();

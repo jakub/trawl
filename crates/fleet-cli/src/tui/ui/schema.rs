@@ -4,12 +4,12 @@ use ratatui::Frame;
 use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::tui::App;
 
 /// Render the schema browser sidebar.
-pub fn render(app: &App, frame: &mut Frame<'_>) {
+pub fn render(app: &App, frame: &mut Frame<'_>, scroll: usize) {
     let area = centered_rect(60, 80, frame.area());
 
     frame.render_widget(Clear, area);
@@ -56,9 +56,17 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             },
         ]);
 
-        let list = List::new(items).block(block.title_bottom(footer).borders(Borders::ALL));
+        // Clamp scroll to valid range
+        let max_scroll = schema.columns.len().saturating_sub(1);
+        let clamped = scroll.min(max_scroll);
 
-        frame.render_widget(list, area);
+        let list = List::new(items)
+            .block(block.title_bottom(footer).borders(Borders::ALL))
+            .highlight_style(Style::default().bg(Color::DarkGray));
+
+        let mut state = ListState::default().with_offset(clamped);
+
+        frame.render_stateful_widget(list, area, &mut state);
     } else {
         // Schema not loaded yet
         let text = Line::from("Schema not available");

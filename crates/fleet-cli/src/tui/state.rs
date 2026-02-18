@@ -16,16 +16,29 @@ pub enum Focus {
 }
 
 /// Active sidebar overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sidebar {
     /// Help overlay (F1).
-    Help,
+    Help { scroll: usize },
     /// Schema browser (F2).
-    Schema,
+    Schema { scroll: usize },
     /// Query history (F3).
     History,
     /// Saved queries (F4).
     Saved,
+}
+
+impl Sidebar {
+    /// Check if this is the same sidebar variant (ignoring scroll state).
+    pub fn same_variant(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Help { .. }, Self::Help { .. })
+                | (Self::Schema { .. }, Self::Schema { .. })
+                | (Self::History, Self::History)
+                | (Self::Saved, Self::Saved)
+        )
+    }
 }
 
 /// Active popup overlay.
@@ -47,27 +60,19 @@ pub enum Popup {
 
 /// Chart visualization mode for results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants used when chart rendering is implemented
 pub enum ChartView {
     /// Tabular view (default).
     Table,
     /// Sparkline view (compact ascii-art).
     Sparkline,
-    /// Bar chart view (categorical).
-    BarChart,
-    /// Line chart view (continuous).
-    LineChart,
 }
 
 impl ChartView {
     /// Cycle to the next view mode.
-    #[allow(dead_code)] // Used when 'v' keybinding is implemented
     pub fn next(self) -> Self {
         match self {
-            // Only cycle between Table and Sparkline for now
-            // (bar/line charts not yet implemented)
             Self::Table => Self::Sparkline,
-            Self::Sparkline | Self::BarChart | Self::LineChart => Self::Table,
+            Self::Sparkline => Self::Table,
         }
     }
 }

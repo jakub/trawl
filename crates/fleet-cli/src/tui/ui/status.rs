@@ -38,7 +38,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     if app.live_mode {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            "[LIVE 5s]",
+            "[LIVE]",
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
@@ -76,10 +76,10 @@ fn get_context_hints(app: &App) -> String {
     use crate::tui::state::Sidebar;
 
     // If sidebar is open, show sidebar-specific hints
-    if let Some(sidebar) = app.sidebar {
+    if let Some(ref sidebar) = app.sidebar {
         return match sidebar {
-            Sidebar::Help => "esc: close help".to_owned(),
-            Sidebar::Schema => "esc: close schema".to_owned(),
+            Sidebar::Help { .. } => "↑↓/PgUp/PgDn: scroll | esc: close help".to_owned(),
+            Sidebar::Schema { .. } => "↑↓/PgUp/PgDn: scroll | esc: close schema".to_owned(),
             Sidebar::History => "↑↓: navigate | enter: load query | esc: close".to_owned(),
             Sidebar::Saved => {
                 "↑↓: navigate | enter: load | backspace: delete | esc: close".to_owned()

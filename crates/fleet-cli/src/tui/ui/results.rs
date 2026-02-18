@@ -23,22 +23,12 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         let is_timechart = is_timechart_result(result);
 
         // Dispatch rendering based on view mode
-        #[allow(clippy::match_same_arms)] // Bar/line chart renderers not yet implemented
         match tab.chart_view {
-            ChartView::Table => render_table(app, frame, area, response),
             ChartView::Sparkline if is_timechart => {
                 render_sparkline(app, frame, area, result);
             }
-            ChartView::BarChart if is_timechart => {
-                // TODO: implement bar chart rendering
-                render_table(app, frame, area, response);
-            }
-            ChartView::LineChart if is_timechart => {
-                // TODO: implement line chart rendering
-                render_table(app, frame, area, response);
-            }
-            // Fallback to table for non-timechart queries
-            _ => render_table(app, frame, area, response),
+            // Table view, or sparkline fallback for non-timechart
+            ChartView::Table | ChartView::Sparkline => render_table(app, frame, area, response),
         }
     } else {
         render_placeholder(app, frame, area);
@@ -412,8 +402,7 @@ fn value_to_string(value: &Value) -> String {
 /// Detect if a query result is from a timechart query.
 ///
 /// Timechart queries always have `_time` as the first column.
-#[allow(dead_code)] // Used when chart rendering is implemented
-fn is_timechart_result(result: &fleet_engine::value::QueryResult) -> bool {
+pub fn is_timechart_result(result: &fleet_engine::value::QueryResult) -> bool {
     result
         .columns
         .first()

@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::tui::App;
 
 /// Render the help overlay.
-pub fn render(_app: &App, frame: &mut Frame<'_>) {
+pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
     let area = centered_rect(60, 70, frame.area());
 
     frame.render_widget(Clear, area);
@@ -75,9 +75,15 @@ pub fn render(_app: &App, frame: &mut Frame<'_>) {
         )),
     ];
 
+    // Clamp scroll to content bounds
+    let max_scroll = help_text.len().saturating_sub(1);
+    let clamped_scroll = scroll.min(max_scroll);
+
+    #[allow(clippy::cast_possible_truncation)] // scroll offset bounded by content length
     let paragraph = Paragraph::new(help_text)
         .block(block)
-        .alignment(Alignment::Left);
+        .alignment(Alignment::Left)
+        .scroll((clamped_scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
 }

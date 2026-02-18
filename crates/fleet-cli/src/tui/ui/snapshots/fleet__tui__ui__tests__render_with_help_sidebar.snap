@@ -25,4 +25,4 @@ expression: terminal.backend().to_string()
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-"idle [editor]                                                    esc: close help"
+"idle [editor]                         ↑↓/PgUp/PgDn: scroll | esc: close help    "

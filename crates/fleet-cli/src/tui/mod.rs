@@ -307,6 +307,7 @@ impl App {
     }
 
     /// Handle a key event.
+    #[allow(clippy::too_many_lines)] // Key dispatch is inherently large
     pub fn handle_key(&mut self, key: event::KeyEvent) {
         // Popups take priority over everything else.
         if self.popup.is_some() {
@@ -323,12 +324,12 @@ impl App {
             }
             // Toggle help: F1
             (KeyModifiers::NONE, KeyCode::F(1)) => {
-                self.toggle_sidebar(Sidebar::Help);
+                self.toggle_sidebar(Sidebar::Help { scroll: 0 });
                 return;
             }
             // Toggle schema: F2
             (KeyModifiers::NONE, KeyCode::F(2)) => {
-                self.toggle_sidebar(Sidebar::Schema);
+                self.toggle_sidebar(Sidebar::Schema { scroll: 0 });
                 return;
             }
             // Toggle history: F3
@@ -358,17 +359,46 @@ impl App {
                 self.active_tab_idx = new_id;
                 return;
             }
-            // Close tab: Ctrl+W
-            (KeyModifiers::CONTROL, KeyCode::Char('w')) if self.tabs.len() > 1 => {
-                self.tabs.remove(self.active_tab_idx);
-                if self.active_tab_idx >= self.tabs.len() {
-                    self.active_tab_idx = self.tabs.len() - 1;
+            // Close tab: Ctrl+Shift+W
+            (_, KeyCode::Char('W'))
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if self.tabs.len() > 1 {
+                    self.tabs.remove(self.active_tab_idx);
+                    if self.active_tab_idx >= self.tabs.len() {
+                        self.active_tab_idx = self.tabs.len() - 1;
+                    }
+                } else {
+                    // Last tab: clear instead of closing
+                    self.active_tab_mut().clear();
                 }
                 return;
             }
-            // Cycle tabs: Shift+Tab
-            (KeyModifiers::SHIFT, KeyCode::BackTab) if self.tabs.len() > 1 => {
-                self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
+            // Next tab: Ctrl+Tab
+            (_, KeyCode::Tab) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.tabs.len() > 1 {
+                    self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
+                }
+                return;
+            }
+            // Prev tab: Ctrl+Shift+Tab
+            (_, KeyCode::BackTab)
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if self.tabs.len() > 1 {
+                    self.active_tab_idx =
+                        (self.active_tab_idx + self.tabs.len() - 1) % self.tabs.len();
+                }
+                return;
+            }
+            // Direct tab jump: Alt+1 through Alt+9
+            (KeyModifiers::ALT, KeyCode::Char(ch @ '1'..='9')) => {
+                let idx = (ch as usize) - ('1' as usize);
+                if idx < self.tabs.len() {
+                    self.active_tab_idx = idx;
+                }
                 return;
             }
             // Save current query: Ctrl+S
@@ -385,15 +415,25 @@ impl App {
         }
 
         // If sidebar is open, handle sidebar-specific keys.
-        if let Some(sidebar) = self.sidebar {
+        if let Some(ref sidebar) = self.sidebar {
             match sidebar {
-                Sidebar::History => self.handle_history_key(key),
-                Sidebar::Saved => self.handle_saved_key(key),
-                _ => {
-                    // Other sidebars don't handle keys yet
+                Sidebar::Help { .. } => {
+                    self.handle_help_key(key);
+                    return;
+                }
+                Sidebar::Schema { .. } => {
+                    self.handle_schema_key(key);
+                    return;
+                }
+                Sidebar::History => {
+                    self.handle_history_key(key);
+                    return;
+                }
+                Sidebar::Saved => {
+                    self.handle_saved_key(key);
+                    return;
                 }
             }
-            return;
         }
 
         // Focus-specific keybindings.
@@ -635,10 +675,17 @@ impl App {
                 let tab = self.active_tab_mut();
                 tab.horizontal_scroll_offset = tab.horizontal_scroll_offset.saturating_add(1);
             }
-            // Cycle chart view
+            // Cycle chart view (only for timechart results)
             (KeyModifiers::NONE, KeyCode::Char('v')) => {
-                let tab = self.active_tab_mut();
-                tab.chart_view = tab.chart_view.next();
+                let is_timechart = self
+                    .active_tab()
+                    .result
+                    .as_ref()
+                    .is_some_and(|r| ui::results::is_timechart_result(&r.result));
+                if is_timechart {
+                    let tab = self.active_tab_mut();
+                    tab.chart_view = tab.chart_view.next();
+                }
             }
             _ => {}
         }
@@ -730,6 +777,60 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Handle key events when help sidebar is focused.
+    fn handle_help_key(&mut self, key: event::KeyEvent) {
+        if let Some(Sidebar::Help { ref mut scroll }) = self.sidebar {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Up) => {
+                    *scroll = scroll.saturating_sub(1);
+                }
+                (KeyModifiers::NONE, KeyCode::Down) => {
+                    *scroll = scroll.saturating_add(1);
+                }
+                (KeyModifiers::NONE, KeyCode::PageUp) => {
+                    *scroll = scroll.saturating_sub(10);
+                }
+                (KeyModifiers::NONE, KeyCode::PageDown) => {
+                    *scroll = scroll.saturating_add(10);
+                }
+                (KeyModifiers::NONE, KeyCode::Home) => {
+                    *scroll = 0;
+                }
+                (KeyModifiers::NONE, KeyCode::End) => {
+                    *scroll = usize::MAX;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Handle key events when schema sidebar is focused.
+    fn handle_schema_key(&mut self, key: event::KeyEvent) {
+        if let Some(Sidebar::Schema { ref mut scroll }) = self.sidebar {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Up) => {
+                    *scroll = scroll.saturating_sub(1);
+                }
+                (KeyModifiers::NONE, KeyCode::Down) => {
+                    *scroll = scroll.saturating_add(1);
+                }
+                (KeyModifiers::NONE, KeyCode::PageUp) => {
+                    *scroll = scroll.saturating_sub(10);
+                }
+                (KeyModifiers::NONE, KeyCode::PageDown) => {
+                    *scroll = scroll.saturating_add(10);
+                }
+                (KeyModifiers::NONE, KeyCode::Home) => {
+                    *scroll = 0;
+                }
+                (KeyModifiers::NONE, KeyCode::End) => {
+                    *scroll = usize::MAX;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -836,15 +937,13 @@ impl App {
 
     /// Toggle a sidebar (close if already open, open otherwise).
     fn toggle_sidebar(&mut self, sidebar: Sidebar) {
-        if self.sidebar == Some(sidebar) {
+        if self
+            .sidebar
+            .as_ref()
+            .is_some_and(|s| s.same_variant(&sidebar))
+        {
             self.sidebar = None;
         } else {
-            // Reset selection when opening sidebars
-            match sidebar {
-                Sidebar::History => self.history_selected_index = 0,
-                Sidebar::Saved => self.saved_selected_index = 0,
-                _ => {}
-            }
             self.sidebar = Some(sidebar);
         }
     }
@@ -1245,7 +1344,7 @@ mod tests {
         let mut app = test_app();
         assert_eq!(app.sidebar, None);
         app.handle_key(key(KeyCode::F(1)));
-        assert_eq!(app.sidebar, Some(Sidebar::Help));
+        assert_eq!(app.sidebar, Some(Sidebar::Help { scroll: 0 }));
         app.handle_key(key(KeyCode::F(1)));
         assert_eq!(app.sidebar, None);
     }
@@ -1254,7 +1353,7 @@ mod tests {
     fn key_f2_toggles_schema() {
         let mut app = test_app();
         app.handle_key(key(KeyCode::F(2)));
-        assert_eq!(app.sidebar, Some(Sidebar::Schema));
+        assert_eq!(app.sidebar, Some(Sidebar::Schema { scroll: 0 }));
         app.handle_key(key(KeyCode::F(2)));
         assert_eq!(app.sidebar, None);
     }
@@ -1280,7 +1379,7 @@ mod tests {
     #[test]
     fn key_esc_closes_sidebar() {
         let mut app = test_app();
-        app.sidebar = Some(Sidebar::Help);
+        app.sidebar = Some(Sidebar::Help { scroll: 0 });
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.sidebar, None);
     }
@@ -1288,7 +1387,7 @@ mod tests {
     #[test]
     fn sidebar_blocks_focus_keys() {
         let mut app = test_app();
-        app.sidebar = Some(Sidebar::Help);
+        app.sidebar = Some(Sidebar::Help { scroll: 0 });
         app.focus = Focus::Editor;
         // Tab should NOT switch focus while sidebar is open
         app.handle_key(key(KeyCode::Tab));
@@ -1307,25 +1406,34 @@ mod tests {
     }
 
     #[test]
-    fn key_ctrl_w_closes_tab() {
+    fn key_ctrl_shift_w_closes_tab() {
         let mut app = test_app();
         // Create a second tab first
         app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.tabs.len(), 2);
-        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(key_mod(
+            KeyCode::Char('W'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(app.tabs.len(), 1);
     }
 
     #[test]
-    fn key_ctrl_w_with_one_tab_is_noop() {
+    fn key_ctrl_shift_w_with_one_tab_clears() {
         let mut app = test_app();
+        // Type something so we can verify it gets cleared
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.active_tab().editor.text(), "x");
+        app.handle_key(key_mod(
+            KeyCode::Char('W'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(app.tabs.len(), 1);
-        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab().editor.text(), "");
     }
 
     #[test]
-    fn key_shift_tab_cycles_tabs() {
+    fn key_ctrl_tab_cycles_tabs() {
         let mut app = test_app();
         // Create 3 tabs total
         app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -1333,13 +1441,57 @@ mod tests {
         assert_eq!(app.tabs.len(), 3);
         assert_eq!(app.active_tab_idx, 2);
 
-        // Cycle: 2 -> 0
-        app.handle_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT));
+        // Cycle forward: 2 -> 0
+        app.handle_key(key_mod(KeyCode::Tab, KeyModifiers::CONTROL));
         assert_eq!(app.active_tab_idx, 0);
 
-        // Cycle: 0 -> 1
-        app.handle_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT));
+        // Cycle forward: 0 -> 1
+        app.handle_key(key_mod(KeyCode::Tab, KeyModifiers::CONTROL));
         assert_eq!(app.active_tab_idx, 1);
+    }
+
+    #[test]
+    fn key_ctrl_shift_tab_cycles_tabs_backward() {
+        let mut app = test_app();
+        // Create 3 tabs total
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab_idx, 2);
+
+        // Cycle backward: 2 -> 1
+        app.handle_key(key_mod(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.active_tab_idx, 1);
+
+        // Cycle backward: 1 -> 0
+        app.handle_key(key_mod(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.active_tab_idx, 0);
+    }
+
+    #[test]
+    fn key_alt_number_jumps_to_tab() {
+        let mut app = test_app();
+        // Create 3 tabs total
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab_idx, 2);
+
+        // Alt+1 -> tab 0
+        app.handle_key(key_mod(KeyCode::Char('1'), KeyModifiers::ALT));
+        assert_eq!(app.active_tab_idx, 0);
+
+        // Alt+3 -> tab 2
+        app.handle_key(key_mod(KeyCode::Char('3'), KeyModifiers::ALT));
+        assert_eq!(app.active_tab_idx, 2);
+
+        // Alt+9 -> out of range, no change
+        app.handle_key(key_mod(KeyCode::Char('9'), KeyModifiers::ALT));
+        assert_eq!(app.active_tab_idx, 2);
     }
 
     // --- Quit ---
