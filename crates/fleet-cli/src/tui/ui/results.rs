@@ -307,7 +307,7 @@ fn render_sparkline(
         Style::default().fg(Color::DarkGray)
     };
 
-    let series = extract_series(result);
+    let (series, total_series) = extract_series(result);
 
     if series.is_empty() {
         // Fallback to placeholder if extraction failed
@@ -403,7 +403,15 @@ fn render_sparkline(
             );
         }
     } else {
-        render_stacked_sparklines(app, frame, area, &series, border_style, time_info);
+        render_stacked_sparklines(
+            app,
+            frame,
+            area,
+            &series,
+            total_series,
+            border_style,
+            time_info,
+        );
     }
 }
 
@@ -413,6 +421,7 @@ fn render_stacked_sparklines(
     frame: &mut Frame<'_>,
     area: Rect,
     series: &[(String, Vec<u64>)],
+    total_series: usize,
     border_style: Style,
     time_info: Option<(String, String, String)>,
 ) {
@@ -422,10 +431,20 @@ fn render_stacked_sparklines(
         " timechart by series ".to_owned()
     };
 
+    let series_info = if series.len() < total_series {
+        format!(
+            " top {} of {} series  •  'v' to toggle view ",
+            series.len(),
+            total_series
+        )
+    } else {
+        format!(" {} series  •  'v' to toggle view ", series.len())
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .title_bottom(format!(" {} series  •  'v' to toggle view ", series.len()))
+        .title_bottom(series_info)
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -633,10 +652,15 @@ fn extract_time_metadata(
 ///
 /// Single series: [(_time, count)] → [("count", [v1, v2, ...])]
 /// Multi series: [(_time, service, count)] → [("nginx", [v1, v2, ...]), ("apache", [...])]
-fn extract_series(result: &fleet_engine::value::QueryResult) -> Vec<(String, Vec<u64>)> {
+///
+/// Returns `(series, total_count)` where `total_count` is the number of distinct series
+/// before any truncation (multi-series are capped to the top 6 by total value).
+fn extract_series(result: &fleet_engine::value::QueryResult) -> (Vec<(String, Vec<u64>)>, usize) {
+    const MAX_SERIES: usize = 6;
+
     // Find the _time column by name (UNION ALL BY NAME can reorder columns)
     let Some(time_col) = result.columns.iter().position(|c| c.name == "_time") else {
-        return vec![];
+        return (vec![], 0);
     };
 
     // Non-_time columns are either metric or group_by + metric
@@ -653,7 +677,7 @@ fn extract_series(result: &fleet_engine::value::QueryResult) -> Vec<(String, Vec
             .iter()
             .map(|row| value_to_u64(&row[metric_idx]))
             .collect();
-        vec![(metric_name.clone(), values)]
+        (vec![(metric_name.clone(), values)], 1)
     } else if other_cols.len() == 2 {
         // Multi series: _time + group_by + metric
         // Determine which is group (string) vs metric (numeric) by sampling the first row,
@@ -667,7 +691,7 @@ fn extract_series(result: &fleet_engine::value::QueryResult) -> Vec<(String, Vec
                 (a, b)
             }
         } else {
-            return vec![];
+            return (vec![], 0);
         };
 
         let mut series_map: HashMap<String, Vec<u64>> = HashMap::new();
@@ -679,12 +703,22 @@ fn extract_series(result: &fleet_engine::value::QueryResult) -> Vec<(String, Vec
         }
 
         let mut series: Vec<(String, Vec<u64>)> = series_map.into_iter().collect();
+        let total = series.len();
+        // Keep top N series by total value (sparkline can't render hundreds of rows)
+        if series.len() > MAX_SERIES {
+            series.sort_by(|a, b| {
+                let sum_b: u64 = b.1.iter().sum();
+                let sum_a: u64 = a.1.iter().sum();
+                sum_b.cmp(&sum_a)
+            });
+            series.truncate(MAX_SERIES);
+        }
         // Sort by label for consistent ordering
         series.sort_by(|a, b| a.0.cmp(&b.0));
-        series
+        (series, total)
     } else {
         // Unsupported format, fallback to empty
-        vec![]
+        (vec![], 0)
     }
 }
 
@@ -723,5 +757,122 @@ fn format_duration(secs: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fleet_engine::value::{Column, QueryResult};
+
+    fn col(name: &str) -> Column {
+        Column {
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn extract_series_multi_series() {
+        let result = QueryResult {
+            columns: vec![col("_time"), col("service"), col("count")],
+            rows: vec![
+                vec![
+                    Value::String("2024-01-01 00:00:00".into()),
+                    Value::String("nginx".into()),
+                    Value::Integer(42),
+                ],
+                vec![
+                    Value::String("2024-01-01 00:00:00".into()),
+                    Value::String("api".into()),
+                    Value::Integer(17),
+                ],
+                vec![
+                    Value::String("2024-01-01 00:05:00".into()),
+                    Value::String("nginx".into()),
+                    Value::Integer(38),
+                ],
+                vec![
+                    Value::String("2024-01-01 00:05:00".into()),
+                    Value::String("api".into()),
+                    Value::Integer(22),
+                ],
+            ],
+        };
+
+        let (series, total) = extract_series(&result);
+        assert_eq!(total, 2);
+        assert_eq!(series.len(), 2);
+        // Sorted alphabetically by label
+        assert_eq!(series[0].0, "api");
+        assert_eq!(series[0].1, vec![17, 22]);
+        assert_eq!(series[1].0, "nginx");
+        assert_eq!(series[1].1, vec![42, 38]);
+    }
+
+    #[test]
+    fn extract_series_single_series() {
+        let result = QueryResult {
+            columns: vec![col("_time"), col("count")],
+            rows: vec![
+                vec![
+                    Value::String("2024-01-01 00:00:00".into()),
+                    Value::Integer(10),
+                ],
+                vec![
+                    Value::String("2024-01-01 00:05:00".into()),
+                    Value::Integer(20),
+                ],
+            ],
+        };
+
+        let (series, total) = extract_series(&result);
+        assert_eq!(total, 1);
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].0, "count");
+        assert_eq!(series[0].1, vec![10, 20]);
+    }
+
+    #[test]
+    fn extract_series_caps_to_top_6() {
+        // Build a result with 10 services
+        let mut rows = Vec::new();
+        for i in 0..10 {
+            rows.push(vec![
+                Value::String("2024-01-01 00:00:00".into()),
+                Value::String(format!("svc-{i}")),
+                Value::Integer((i + 1) * 100), // svc-9 = 1000, svc-0 = 100
+            ]);
+        }
+
+        let result = QueryResult {
+            columns: vec![col("_time"), col("service"), col("count")],
+            rows,
+        };
+
+        let (series, total) = extract_series(&result);
+        assert_eq!(total, 10);
+        assert_eq!(series.len(), 6);
+        // Should keep the top 6 by value (svc-4 through svc-9)
+        // and sort them alphabetically
+        let labels: Vec<&str> = series.iter().map(|s| s.0.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["svc-4", "svc-5", "svc-6", "svc-7", "svc-8", "svc-9"]
+        );
+    }
+
+    #[test]
+    fn is_timechart_result_detects_time_column() {
+        let with_time = QueryResult {
+            columns: vec![col("service"), col("_time"), col("count")],
+            rows: vec![],
+        };
+        assert!(is_timechart_result(&with_time));
+
+        let without_time = QueryResult {
+            columns: vec![col("service"), col("count")],
+            rows: vec![],
+        };
+        assert!(!is_timechart_result(&without_time));
     }
 }
