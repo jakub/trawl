@@ -95,6 +95,10 @@ struct WalLayerInner {
     host: String,
     /// Bytes lost due to WAL write failures (accumulated, reset on report).
     dropped_bytes: AtomicU64,
+    /// Deferred event bus for real-time fanout (SSE streaming, hot buffer).
+    bus: OnceLock<Arc<crate::bus::LocalEventBus>>,
+    /// Event maps accumulated since last flush, for bus publishing.
+    event_maps: Mutex<Vec<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl std::fmt::Debug for WalLayer {
@@ -119,8 +123,17 @@ impl WalLayer {
                 buffer: Mutex::new(Vec::with_capacity(8192)),
                 host,
                 dropped_bytes: AtomicU64::new(0),
+                bus: OnceLock::new(),
+                event_maps: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Inject the event bus for real-time fanout (SSE, hot buffer).
+    /// Called once after `AppState` is constructed. Subsequent calls are
+    /// silently ignored (first write wins).
+    pub fn set_bus(&self, bus: Arc<crate::bus::LocalEventBus>) {
+        let _ = self.inner.bus.set(bus);
     }
 
     /// Flush the buffer to the WAL. Called periodically by the background
@@ -145,12 +158,38 @@ impl WalLayerInner {
             std::mem::take(&mut *buf)
         };
 
+        // Drain event maps regardless of WAL write outcome — they mirror
+        // the byte buffer and must stay in sync.
+        let maps = std::mem::take(&mut *self.event_maps.lock());
+
         if let Err(e) = writer.write("fleetd", &data) {
             // MUST NOT use tracing here — infinite recursion.
             eprintln!("[fleet-telemetry] WAL write failed: {e}");
             self.dropped_bytes
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
         } else {
+            // Publish to event bus for SSE streaming / hot buffer.
+            if let Some(bus) = self.bus.get() {
+                if !maps.is_empty() {
+                    use crate::bus::{EventBus, IngestBatch};
+                    let batch = Arc::new(IngestBatch {
+                        batch_id: format!(
+                            "fleetd_telemetry_{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis()
+                        )
+                        .into(),
+                        service: "fleetd".into(),
+                        events: maps,
+                        byte_size: data.len(),
+                        draining: std::sync::atomic::AtomicBool::new(false),
+                    });
+                    let _ = bus.publish(batch);
+                }
+            }
+
             // Report any previously dropped bytes. Safe from recursion:
             // on_event only buffers, the tracing event will be picked up
             // on the NEXT flush cycle.
@@ -312,6 +351,9 @@ where
         for (k, v) in span_fields {
             record.entry(k).or_insert(v);
         }
+
+        // Clone the map for event bus publishing (before moving into Value).
+        self.inner.event_maps.lock().push(record.clone());
 
         // Serialize and buffer. serde_json::to_vec on Value cannot fail.
         let mut line = serde_json::to_vec(&serde_json::Value::Object(record))
@@ -654,5 +696,45 @@ mod tests {
 
         assert_eq!(parsed["event_type"], "custom_type");
         assert_eq!(parsed["message"], "some random message");
+    }
+
+    #[tokio::test]
+    async fn flush_publishes_to_event_bus() {
+        use crate::bus::{EventBus, EventSubscriber, LocalEventBus};
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer));
+
+        let bus = Arc::new(LocalEventBus::new(16));
+        let mut sub = bus.subscribe();
+
+        let layer = WalLayer::new(handle);
+        layer.set_bus(Arc::clone(&bus));
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!(event_type = "test_bus", user = "alice", "bus test event");
+
+        layer_ref.flush();
+
+        // The batch should arrive on the subscriber.
+        let batch = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("timed out waiting for batch")
+            .expect("recv failed");
+
+        assert_eq!(batch.service.as_ref(), "fleetd");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0]["event_type"], "test_bus");
+        assert_eq!(batch.events[0]["user"], "alice");
+        assert!(batch.byte_size > 0);
+        assert!(batch.batch_id.starts_with("fleetd_telemetry_"));
     }
 }

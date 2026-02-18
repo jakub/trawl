@@ -47,9 +47,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (state, http_config) = AppState::from_config(&config)?;
 
     // Activate internal telemetry by injecting the WAL writer.
-    if let Some((handle, _)) = &telemetry {
+    if let Some((handle, layer)) = &telemetry {
         if let Some(writer) = &state.ingest.wal_writer {
             handle.set(Arc::clone(writer));
+        }
+        // Activate event bus for real-time telemetry fanout (SSE, hot buffer).
+        if let Some(bus) = &state.ingest.event_bus {
+            layer.set_bus(Arc::clone(bus));
         }
     }
 
