@@ -42,7 +42,8 @@ fn extract_service_filter(search: &fleet_core::ast::SearchStage) -> Option<&str>
 /// narrowed to a single service file when `service:X` is present.
 ///
 /// Supports two-tier parquet layout: day-level files for consolidated
-/// historical dates and hour-level files for today/unconsolidated dates.
+/// dates and hour-level files for unconsolidated dates. Both layouts
+/// are checked for all dates, including today.
 /// Checks for day-level files with a cheap `stat()` before falling back
 /// to hourly expansion.
 ///
@@ -92,10 +93,17 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
         let day = cursor.format("%Y-%m-%d").to_string();
 
         if day == today {
-            // Today stays hourly — emit one glob per hour in range.
-            let hour = cursor.format("%H");
-            globs.push(format!("'{base}/{day}/{hour}/{file_pattern}'"));
-            cursor += chrono::Duration::hours(1);
+            // Today may have day-level consolidated files from a
+            // previous server session or an earlier daily rollup.
+            // Check once, then emit hourly globs for the time range.
+            if has_day_level_files(base, &day, &file_pattern) {
+                globs.push(format!("'{base}/{day}/{file_pattern}'"));
+            }
+            while cursor <= end {
+                let hour = cursor.format("%H");
+                globs.push(format!("'{base}/{day}/{hour}/{file_pattern}'"));
+                cursor += chrono::Duration::hours(1);
+            }
         } else {
             // Historical date — check for consolidated day-level file
             // and/or remaining hourly directories. Both can coexist
@@ -478,6 +486,60 @@ mod tests {
         assert_eq!(
             source, "/data/**/api_v2.parquet",
             "dots should be replaced with underscores in file pattern"
+        );
+    }
+
+    #[test]
+    fn today_day_level_files_included() {
+        // When today's data is consolidated at day level (no hourly dirs),
+        // the time-scoped path should include the day-level glob.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let now = chrono::Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+
+        // Create day-level file only (no hourly subdirs).
+        let day_dir = tmp.path().join(&today);
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("fleetd.parquet"), b"data").unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "service:fleetd last:1h", &fallback);
+
+        // Day-level glob must be present so the consolidated file is found.
+        let day_glob = format!("'{base}/{today}/fleetd.parquet'");
+        assert!(
+            source.contains(&day_glob),
+            "expected day-level glob for today, got: {source}"
+        );
+    }
+
+    #[test]
+    fn today_mixed_day_and_hourly() {
+        // Today has both day-level files and hourly dirs — both should appear.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let now = chrono::Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let hour = now.format("%H").to_string();
+
+        let day_dir = tmp.path().join(&today);
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
+        std::fs::create_dir_all(day_dir.join(&hour)).unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "last:1h", &fallback);
+
+        let day_glob = format!("'{base}/{today}/*.parquet'");
+        let hourly_glob = format!("{base}/{today}/{hour}/");
+        assert!(
+            source.contains(&day_glob),
+            "expected day-level glob, got: {source}"
+        );
+        assert!(
+            source.contains(&hourly_glob),
+            "expected hourly glob, got: {source}"
         );
     }
 
