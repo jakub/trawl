@@ -40,6 +40,13 @@ pub enum StreamEvent {
     Event(serde_json::Map<String, serde_json::Value>),
     /// A result row (columnar, for non-streaming use).
     Row(Vec<fleet_engine::value::Value>),
+    /// An aggregation snapshot replacing the entire result set.
+    Snapshot {
+        /// Column names for the snapshot rows.
+        columns: Vec<String>,
+        /// Each row is a field map of column→value.
+        rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    },
     /// Server-side error message.
     Error(String),
     /// Back-pressure notification: the subscriber fell behind and

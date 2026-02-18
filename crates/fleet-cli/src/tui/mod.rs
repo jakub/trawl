@@ -903,6 +903,19 @@ impl App {
                         event_count += 1;
                         tracing::debug!("received stream event, total: {event_count}");
                     }
+                    Ok(StreamEvent::Snapshot {
+                        ref columns,
+                        ref rows,
+                    }) => {
+                        buffer.replace_with_snapshot(columns, rows);
+                        // Snapshots are complete results — send immediately.
+                        let response = buffer.to_query_response();
+                        let _ = tx.send(QueryResult {
+                            tab_idx,
+                            result: Ok(response),
+                            duration: Duration::from_secs(0),
+                        });
+                    }
                     Ok(StreamEvent::Row(_)) => {
                         // Legacy variant — shouldn't appear from SSE stream.
                         tracing::debug!("ignoring unexpected Row variant in live stream");

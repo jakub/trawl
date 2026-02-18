@@ -794,6 +794,32 @@ impl LiveBuffer {
         }
     }
 
+    /// Replace the entire buffer contents with an aggregation snapshot.
+    ///
+    /// Used when the server emits a `snapshot` event (aggregation mode).
+    /// The buffer is cleared and rebuilt from the given columns and rows.
+    pub fn replace_with_snapshot(
+        &mut self,
+        columns: &[String],
+        rows: &[serde_json::Map<String, serde_json::Value>],
+    ) {
+        self.column_names = columns.to_vec();
+        self.column_index.clear();
+        for (i, name) in columns.iter().enumerate() {
+            self.column_index.insert(name.clone(), i);
+        }
+        self.rows.clear();
+        for row_map in rows {
+            let mut row = vec![Value::Null; self.column_names.len()];
+            for (key, json_val) in row_map {
+                if let Some(&idx) = self.column_index.get(key) {
+                    row[idx] = serde_json::from_value(json_val.clone()).unwrap_or(Value::Null);
+                }
+            }
+            self.rows.push_back(row);
+        }
+    }
+
     /// Number of buffered rows.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {

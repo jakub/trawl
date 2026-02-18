@@ -347,6 +347,22 @@ impl HttpClient {
                                 yield StreamEvent::Error(data);
                             }
                         }
+                        Some("snapshot") => {
+                            if let Some(data) = event_data {
+                                // Parse {"columns":[...],"rows":[...]} payload.
+                                #[derive(serde::Deserialize)]
+                                struct SnapshotPayload {
+                                    columns: Vec<String>,
+                                    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+                                }
+                                if let Ok(s) = serde_json::from_str::<SnapshotPayload>(&data) {
+                                    yield StreamEvent::Snapshot {
+                                        columns: s.columns,
+                                        rows: s.rows,
+                                    };
+                                }
+                            }
+                        }
                         Some("lagged") => {
                             if let Some(data) = event_data {
                                 // Parse {"missed": N} payload.
