@@ -429,7 +429,8 @@ impl App {
                 tracing::info!("executing query with enter (enter_executes mode)");
                 self.execute_query();
             }
-            (KeyModifiers::SHIFT, KeyCode::Enter) if self.enter_executes => {
+            // Shift+Enter always inserts newline (both modes)
+            (KeyModifiers::SHIFT, KeyCode::Enter) => {
                 self.active_tab_mut().editor.insert_newline();
             }
             // Clear editor: Ctrl+L
