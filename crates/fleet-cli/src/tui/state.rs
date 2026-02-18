@@ -6,6 +6,73 @@ use std::time::Instant;
 use fleet_client::{PaginationMeta, QueryResponse};
 use fleet_engine::value::{Column, QueryResult, Value};
 
+/// State for vim-style `/` search within results.
+#[derive(Debug, Clone)]
+pub struct ResultsSearch {
+    /// Search query text.
+    pub query: String,
+    /// Whether the search input bar is active (accepting typed chars).
+    pub input_active: bool,
+    /// Matching cell positions: (`row_index`, `col_index`).
+    pub matches: Vec<(usize, usize)>,
+    /// Index into `matches` for the current highlighted match.
+    pub current_match: usize,
+}
+
+impl ResultsSearch {
+    /// Create a new empty search.
+    pub fn new() -> Self {
+        Self {
+            query: String::new(),
+            input_active: true,
+            matches: Vec::new(),
+            current_match: 0,
+        }
+    }
+
+    /// Recompute matches against the given result data.
+    pub fn update_matches(&mut self, result: &QueryResult) {
+        self.matches.clear();
+        if self.query.is_empty() {
+            return;
+        }
+        let needle = self.query.to_lowercase();
+        for (row_idx, row) in result.rows.iter().enumerate() {
+            for (col_idx, value) in row.iter().enumerate() {
+                let display = match value {
+                    Value::Null => "NULL".to_owned(),
+                    Value::Boolean(b) => b.to_string(),
+                    Value::Integer(i) => i.to_string(),
+                    Value::Float(f) => format!("{f:.2}"),
+                    Value::String(s) => s.clone(),
+                    Value::Array(_) => value.to_string(),
+                };
+                if display.to_lowercase().contains(&needle) {
+                    self.matches.push((row_idx, col_idx));
+                }
+            }
+        }
+        // Clamp current_match
+        if self.current_match >= self.matches.len() {
+            self.current_match = 0;
+        }
+    }
+
+    /// Navigate to the next match, wrapping around.
+    pub fn next_match(&mut self) {
+        if !self.matches.is_empty() {
+            self.current_match = (self.current_match + 1) % self.matches.len();
+        }
+    }
+
+    /// Navigate to the previous match, wrapping around.
+    pub fn prev_match(&mut self) {
+        if !self.matches.is_empty() {
+            self.current_match = (self.current_match + self.matches.len() - 1) % self.matches.len();
+        }
+    }
+}
+
 /// Which pane has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {

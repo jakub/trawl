@@ -92,6 +92,15 @@ fn get_context_hints(app: &App) -> String {
         return "F9: stop live tail | F1: help | ctrl+q: quit".to_owned();
     }
 
+    // Results search mode hints
+    if let Some(ref search) = app.results_search {
+        return if search.input_active {
+            "type to search | Enter: confirm | Esc: cancel".to_owned()
+        } else {
+            "n: next | N: prev | /: new search | Esc: close".to_owned()
+        };
+    }
+
     // Focus-specific hints
     match app.focus {
         Focus::Editor => {

@@ -9,13 +9,27 @@ use ratatui::widgets::{
     Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Sparkline, Table,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use ratatui::layout::{Alignment, Direction, Layout};
+use ratatui::text::Span;
 
 use crate::tui::App;
 use crate::tui::state::{ChartView, Focus};
 
-/// Render the results pane.
+/// Render the results pane (table/sparkline + optional search bar).
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    // Split off a search bar row at the bottom if search is active.
+    let (results_area, search_area) = if app.results_search.is_some() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
     let tab = app.active_tab();
 
     if let Some(response) = &tab.result {
@@ -25,14 +39,48 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         // Dispatch rendering based on view mode
         match tab.chart_view {
             ChartView::Sparkline if is_timechart => {
-                render_sparkline(app, frame, area, result);
+                render_sparkline(app, frame, results_area, result);
             }
             // Table view, or sparkline fallback for non-timechart
-            ChartView::Table | ChartView::Sparkline => render_table(app, frame, area, response),
+            ChartView::Table | ChartView::Sparkline => {
+                render_table(app, frame, results_area, response);
+            }
         }
     } else {
-        render_placeholder(app, frame, area);
+        render_placeholder(app, frame, results_area);
     }
+
+    // Render search bar if active.
+    if let (Some(search), Some(bar_area)) = (&app.results_search, search_area) {
+        render_search_bar(frame, search, bar_area);
+    }
+}
+
+/// Render the search input bar at the bottom of the results pane.
+fn render_search_bar(frame: &mut Frame<'_>, search: &crate::tui::state::ResultsSearch, area: Rect) {
+    let match_info = if search.query.is_empty() {
+        String::new()
+    } else if search.matches.is_empty() {
+        " (no matches)".to_owned()
+    } else {
+        format!(" ({}/{})", search.current_match + 1, search.matches.len())
+    };
+
+    let cursor = if search.input_active { "█" } else { "" };
+
+    let line = Line::from(vec![
+        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{}{cursor}", search.query),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let paragraph = Paragraph::new(line)
+        .style(Style::default().bg(Color::Black))
+        .alignment(Alignment::Left);
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the results as a table.
@@ -102,6 +150,15 @@ fn render_table(
             .fg(Color::Yellow),
     );
 
+    // Build search match sets for highlighting.
+    let (match_cells, current_match_cell) = if let Some(ref search) = app.results_search {
+        let set: HashSet<(usize, usize)> = search.matches.iter().copied().collect();
+        let current = search.matches.get(search.current_match).copied();
+        (set, current)
+    } else {
+        (HashSet::new(), None)
+    };
+
     // Build data rows with visible columns, truncating to column width
     let selected_row = tab.selected_row;
     let data_rows: Vec<Row<'_>> = result
@@ -115,12 +172,27 @@ fn render_table(
             let cells: Vec<Cell<'_>> = row_data
                 .iter()
                 .zip(all_widths.iter())
+                .enumerate()
                 .skip(h_scroll)
                 .take(visible_cols)
-                .map(|(value, &width)| {
+                .map(|(col_idx, (value, &width))| {
                     let text = value_to_string(value);
                     let truncated = truncate_with_ellipsis(&text, width as usize);
-                    Cell::from(truncated)
+                    let cell = Cell::from(truncated);
+                    if current_match_cell == Some((abs_row, col_idx)) {
+                        // Current match: bright yellow bg
+                        cell.style(Style::default().bg(Color::Yellow).fg(Color::Black))
+                    } else if match_cells.contains(&(abs_row, col_idx)) {
+                        // Other matches: dim yellow bg
+                        cell.style(
+                            Style::default()
+                                .bg(Color::DarkGray)
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        cell
+                    }
                 })
                 .collect();
             let row = Row::new(cells);

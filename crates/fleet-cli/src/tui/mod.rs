@@ -19,7 +19,7 @@ use std::io;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use self::state::{ChartView, Focus, LiveBuffer, Popup, Sidebar, Tab, TabStatus};
+use self::state::{ChartView, Focus, LiveBuffer, Popup, ResultsSearch, Sidebar, Tab, TabStatus};
 use crate::CliError;
 use crate::config::Config;
 
@@ -95,6 +95,8 @@ pub struct App {
     pub enter_executes: bool,
     /// Timezone configuration string for timestamp display.
     pub timezone: String,
+    /// Active results search (vim-style `/`).
+    pub results_search: Option<ResultsSearch>,
     /// Maximum events to retain in live streaming buffer.
     max_live_events: usize,
     /// Handle to the live streaming task (if active).
@@ -131,6 +133,7 @@ impl App {
             live_mode: false,
             enter_executes: false,
             timezone: "local".to_owned(),
+            results_search: None,
             max_live_events: 1000,
             live_task: None,
             query_rx,
@@ -637,7 +640,14 @@ impl App {
     }
 
     /// Handle key events when results are focused.
+    #[allow(clippy::too_many_lines)] // Key dispatch with search mode requires many arms
     fn handle_results_key(&mut self, key: event::KeyEvent) {
+        // If search input is active, route keys to the search bar first.
+        if self.results_search.as_ref().is_some_and(|s| s.input_active) {
+            self.handle_search_input_key(key);
+            return;
+        }
+
         let row_count = self
             .active_tab()
             .result
@@ -648,6 +658,26 @@ impl App {
             // Switch back to editor
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.focus = Focus::Editor;
+            }
+            // Open search with `/`
+            (KeyModifiers::NONE, KeyCode::Char('/')) => {
+                if self.active_tab().result.is_some() {
+                    self.results_search = Some(ResultsSearch::new());
+                }
+            }
+            // Next match: n
+            (KeyModifiers::NONE, KeyCode::Char('n')) => {
+                if let Some(ref mut search) = self.results_search {
+                    search.next_match();
+                    self.jump_to_current_match();
+                }
+            }
+            // Prev match: N (Shift+n)
+            (KeyModifiers::SHIFT, KeyCode::Char('N')) => {
+                if let Some(ref mut search) = self.results_search {
+                    search.prev_match();
+                    self.jump_to_current_match();
+                }
             }
             // Row selection: Up
             (KeyModifiers::NONE, KeyCode::Up) => {
@@ -719,11 +749,15 @@ impl App {
                     });
                 }
             }
-            // Esc: deselect row (if no query running)
+            // Esc: close search first, then deselect row
             (KeyModifiers::NONE, KeyCode::Esc) => {
-                let tab = self.active_tab_mut();
-                if tab.selected_row.is_some() {
-                    tab.selected_row = None;
+                if self.results_search.is_some() {
+                    self.results_search = None;
+                } else {
+                    let tab = self.active_tab_mut();
+                    if tab.selected_row.is_some() {
+                        tab.selected_row = None;
+                    }
                 }
             }
             // Horizontal scrolling
@@ -748,6 +782,59 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Handle key events for the search input bar (when actively typing a search).
+    fn handle_search_input_key(&mut self, key: event::KeyEvent) {
+        match (key.modifiers, key.code) {
+            // Esc: close search entirely
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.results_search = None;
+            }
+            // Enter: close input but keep highlights (search stays with input_active=false)
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if let Some(ref mut search) = self.results_search {
+                    search.input_active = false;
+                    self.jump_to_current_match();
+                }
+            }
+            // Backspace: delete last char
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                if let Some(ref mut search) = self.results_search {
+                    search.query.pop();
+                }
+                self.recompute_search_matches();
+                self.jump_to_current_match();
+            }
+            // Type characters into search
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(ch)) => {
+                if let Some(ref mut search) = self.results_search {
+                    search.query.push(ch);
+                }
+                self.recompute_search_matches();
+                self.jump_to_current_match();
+            }
+            _ => {}
+        }
+    }
+
+    /// Recompute search matches against the active tab's result data.
+    fn recompute_search_matches(&mut self) {
+        if let Some(ref mut search) = self.results_search {
+            if let Some(ref response) = self.tabs[self.active_tab_idx].result {
+                search.update_matches(&response.result);
+            }
+        }
+    }
+
+    /// Jump to the current search match: select its row and scroll to it.
+    fn jump_to_current_match(&mut self) {
+        if let Some(ref search) = self.results_search {
+            if let Some(&(row_idx, _col_idx)) = search.matches.get(search.current_match) {
+                self.active_tab_mut().selected_row = Some(row_idx);
+                self.ensure_selected_row_visible();
+            }
         }
     }
 
