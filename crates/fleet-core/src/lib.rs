@@ -18,3 +18,6 @@ pub mod eval;
 
 /// In-memory event filter compiled from the search stage.
 pub mod filter;
+
+/// Streaming pipeline compiler and executor.
+pub mod stream;
