@@ -415,7 +415,63 @@ fn render_sparkline(
     }
 }
 
+/// Render y-axis labels and series name for one sparkline row.
+///
+/// When `row_height >= 3`, shows max at top, min at bottom, and the series label
+/// vertically centered. Otherwise falls back to label-only.
+#[allow(clippy::cast_possible_truncation)]
+fn render_series_label(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    label: &str,
+    min_val: u64,
+    max_val: u64,
+    color: Color,
+) {
+    let w = area.width as usize;
+    let display_label = if label.len() > w {
+        format!("{}…", &label[..w - 1])
+    } else {
+        label.to_owned()
+    };
+
+    if area.height >= 3 {
+        // Max value at top
+        frame.render_widget(
+            Paragraph::new(format!("{max_val:>w$}")).style(Style::default().fg(Color::DarkGray)),
+            Rect { height: 1, ..area },
+        );
+
+        // Min value at bottom
+        frame.render_widget(
+            Paragraph::new(format!("{min_val:>w$}")).style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                y: area.y + area.height - 1,
+                height: 1,
+                ..area
+            },
+        );
+
+        // Series label vertically centered
+        frame.render_widget(
+            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(color)),
+            Rect {
+                y: area.y + area.height / 2,
+                height: 1,
+                ..area
+            },
+        );
+    } else {
+        // Too short for y-axis labels — just show the series name
+        frame.render_widget(
+            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(color)),
+            area,
+        );
+    }
+}
+
 /// Render multiple sparklines stacked vertically for multi-series timechart.
+#[allow(clippy::cast_possible_truncation)]
 fn render_stacked_sparklines(
     _app: &App,
     frame: &mut Frame<'_>,
@@ -446,19 +502,27 @@ fn render_stacked_sparklines(
         .title(title)
         .title_bottom(series_info)
         .border_style(border_style)
-        .padding(Padding::horizontal(1));
+        .padding(Padding::new(1, 1, 1, 0));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Calculate per-series height (leave 2 rows for labels)
-    let available_height = inner.height.saturating_sub(2) as usize;
-    let row_height = if series.is_empty() {
+    // Calculate per-series height: 1 row for x-axis labels, 1-row gaps between series
+    let gap_rows = series.len().saturating_sub(1);
+    let available_height = inner.height.saturating_sub(1) as usize; // 1 row for x-axis
+    let total_chart_rows = available_height.saturating_sub(gap_rows);
+    let base_height = if series.is_empty() {
         1
     } else {
-        available_height / series.len()
+        total_chart_rows / series.len()
+    };
+    let remainder = if series.is_empty() {
+        0
+    } else {
+        total_chart_rows % series.len()
     };
 
+    let label_width: u16 = 20;
     let colors = [
         Color::Cyan,
         Color::Yellow,
@@ -468,56 +532,69 @@ fn render_stacked_sparklines(
         Color::Blue,
     ];
 
-    #[allow(clippy::cast_possible_truncation)] // Area height fits in u16
+    let mut y_offset: u16 = 0;
     for (idx, (label, values)) in series.iter().enumerate() {
-        let y_offset = (idx * row_height) as u16;
+        // Distribute remainder rows: first `remainder` series get +1 height
+        let row_height = base_height + usize::from(idx < remainder);
+
         let sparkline_area = Rect {
             x: inner.x,
             y: inner.y + y_offset,
-            width: inner.width.saturating_sub(20), // leave space for label
+            width: inner.width.saturating_sub(label_width),
             height: row_height as u16,
         };
 
-        let label_area = Rect {
-            x: inner.x + inner.width.saturating_sub(18),
-            y: inner.y + y_offset,
-            width: 18,
-            height: row_height as u16,
-        };
+        // Downsample to fit available width (preserves peaks via max-per-bucket)
+        let display_data = downsample(values, sparkline_area.width as usize);
 
-        let max_val = values.iter().max().copied().unwrap_or(100);
+        let max_val = display_data.iter().max().copied().unwrap_or(0);
+        let min_val = display_data.iter().min().copied().unwrap_or(0);
+        let range = (max_val - min_val).max(1);
+
+        // Rebase to 0..range so sparkline uses full vertical extent
+        let rebased: Vec<u64> = display_data.iter().map(|v| v - min_val).collect();
+
         let color = colors[idx % colors.len()];
 
         let sparkline = Sparkline::default()
-            .data(values)
+            .data(&rebased)
             .style(Style::default().fg(color))
-            .max(max_val);
+            .max(range);
 
         frame.render_widget(sparkline, sparkline_area);
 
-        // Render label
-        let label_text = format!("{label} (max:{max_val})");
-        let paragraph = Paragraph::new(label_text).style(Style::default().fg(color));
-        frame.render_widget(paragraph, label_area);
+        // Y-axis labels + centered series name in right-side label area
+        let label_w = label_width - 2;
+        let label_area = Rect {
+            x: inner.x + inner.width.saturating_sub(label_w),
+            y: inner.y + y_offset,
+            width: label_w,
+            height: row_height as u16,
+        };
+        render_series_label(frame, label_area, label, min_val, max_val, color);
+
+        // Advance y_offset: row height + 1 gap row (except after last series)
+        y_offset += row_height as u16;
+        if idx < series.len() - 1 {
+            y_offset += 1;
+        }
     }
 
-    // Render x-axis time labels at the bottom (using the reserved 2 rows)
+    // Render x-axis time labels (1 row at bottom)
     if let Some((start, end, _)) = time_info {
-        let sparkline_width = inner.width.saturating_sub(20) as usize;
+        let sparkline_width = inner.width.saturating_sub(label_width) as usize;
         let start_len = start.len();
         let end_len = end.len();
         let padding = sparkline_width.saturating_sub(start_len + end_len);
 
         let x_axis_text = format!("{start}{}{end}", " ".repeat(padding));
         let x_axis_label = Paragraph::new(x_axis_text).style(Style::default().fg(Color::DarkGray));
-        #[allow(clippy::cast_possible_truncation)]
-        let y = inner.y + (series.len() * row_height) as u16;
         frame.render_widget(
             x_axis_label,
             Rect {
                 x: inner.x,
-                y,
-                width: inner.width.saturating_sub(20),
+                y: inner.y + y_offset,
+                width: inner.width.saturating_sub(label_width),
                 height: 1,
             },
         );
