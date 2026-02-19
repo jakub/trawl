@@ -358,8 +358,8 @@ pub struct LetStage {
 pub enum ExtractMode {
     /// Named-group regex extraction.
     Regex(String),
-    /// Key-value pair extraction (`extract kv`).
-    KeyValue,
+    /// Key-value pair extraction (`extract kv [sep="X"]`).
+    KeyValue { separator: char },
 }
 
 /// `extract "(?P<ip>\\d+)" from message` — regex-based field extraction.

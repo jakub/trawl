@@ -274,9 +274,14 @@ fn process_extract(
             ctx.select = select_items;
             ctx.has_projection = true;
         }
-        ExtractMode::KeyValue => {
+        ExtractMode::KeyValue { .. } => {
+            // kv extraction can't be expressed as SQL (dynamic columns).
+            // The emitter splits the pipeline at this point — this branch
+            // should never be reached because emit_from_state collects kv
+            // and all subsequent stages into rust_stages.
             return Err(EmitError::UnsupportedOperation {
-                message: "extract kv is not yet implemented".to_string(),
+                message: "extract kv reached SQL emitter (should have been split to rust_stages)"
+                    .to_string(),
             });
         }
     }

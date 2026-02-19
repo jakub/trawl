@@ -1,0 +1,9 @@
+---
+source: crates/fleet-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | extract kv sep=\":\"\"#)"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+---
+rust_stages: 1
+  Extract(ExtractStage { mode: KeyValue { separator: ':' }, source_field: None })

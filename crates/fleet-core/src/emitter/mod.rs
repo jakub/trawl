@@ -11,7 +11,7 @@ mod search;
 mod state;
 mod validate;
 
-use crate::ast::Query;
+use crate::ast::{PipeStage, Query, Spanned};
 use state::EmitterState;
 
 pub use fields::map_field_name;
@@ -28,6 +28,13 @@ pub struct EmittedQuery {
     pub sql: String,
     /// Ordered parameter values corresponding to each `?` placeholder.
     pub params: Vec<SqlValue>,
+    /// Pipe stages the executor must apply in Rust after SQL execution.
+    ///
+    /// Non-empty when the pipeline contains operations that can't be
+    /// expressed as SQL (e.g. kv extraction with dynamic columns).
+    /// The executor runs the SQL prefix, then applies these stages
+    /// to the result set using the streaming engine.
+    pub rust_stages: Vec<Spanned<PipeStage>>,
 }
 
 /// A parameter value for a SQL query placeholder.
@@ -98,11 +105,26 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
 
     search::emit_search(&query.search, &mut state);
 
-    for stage in &query.pipeline {
+    let mut rust_stages = Vec::new();
+
+    for (i, stage) in query.pipeline.iter().enumerate() {
+        // Check if this stage is a kv extraction — can't be expressed as SQL.
+        // Collect it and all remaining stages into rust_stages.
+        if matches!(
+            stage.node,
+            PipeStage::Extract(crate::ast::ExtractStage {
+                mode: crate::ast::ExtractMode::KeyValue { .. },
+                ..
+            })
+        ) {
+            rust_stages = query.pipeline[i..].to_vec();
+            break;
+        }
+
         // If a pivot is pending and the next stage isn't another pivot,
         // flush the pivot to a CTE so downstream stages can reference
         // the pivot-generated columns.
-        if state.has_pivot() && !matches!(stage.node, crate::ast::PipeStage::Pivot(_)) {
+        if state.has_pivot() && !matches!(stage.node, PipeStage::Pivot(_)) {
             state.flush_pivot_to_cte();
         }
         pipeline::process_stage(&stage.node, &mut state)?;
@@ -111,7 +133,11 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
     let sql = state.finalize();
     let params = state.into_params();
 
-    Ok(EmittedQuery { sql, params })
+    Ok(EmittedQuery {
+        sql,
+        params,
+        rust_stages,
+    })
 }
 
 #[cfg(test)]
@@ -143,6 +169,12 @@ mod tests {
             out.push_str("\n---\nparams:");
             for (i, p) in result.params.iter().enumerate() {
                 let _ = write!(out, "\n  {i}: {p}");
+            }
+        }
+        if !result.rust_stages.is_empty() {
+            let _ = write!(out, "\n---\nrust_stages: {}", result.rust_stages.len());
+            for stage in &result.rust_stages {
+                let _ = write!(out, "\n  {:?}", stage.node);
             }
         }
         out
@@ -587,8 +619,25 @@ mod tests {
     }
 
     #[test]
-    fn error_extract_kv_not_implemented() {
-        assert_snapshot!(emit_dsl_err("* | extract kv"));
+    fn pipe_extract_kv_basic() {
+        assert_snapshot!(emit_dsl("* | extract kv"));
+    }
+
+    #[test]
+    fn pipe_extract_kv_with_downstream() {
+        assert_snapshot!(emit_dsl(
+            "* | extract kv | where status > 200 | stats count() by method"
+        ));
+    }
+
+    #[test]
+    fn pipe_extract_kv_with_search_prefix() {
+        assert_snapshot!(emit_dsl("service:nginx | extract kv from message | head 5"));
+    }
+
+    #[test]
+    fn pipe_extract_kv_with_sep() {
+        assert_snapshot!(emit_dsl(r#"* | extract kv sep=":""#));
     }
 
     // -----------------------------------------------------------------------

@@ -196,7 +196,10 @@ pub enum CompiledStage {
         source_field: String,
     },
     /// Extract key-value pairs.
-    ExtractKv { source_field: String },
+    ExtractKv {
+        source_field: String,
+        separator: char,
+    },
     /// Deduplicate by field values.
     Dedup {
         fields: Vec<String>,
@@ -225,9 +228,13 @@ impl fmt::Debug for CompiledStage {
                 .debug_struct("ExtractRegex")
                 .field("source_field", source_field)
                 .finish_non_exhaustive(),
-            Self::ExtractKv { source_field } => f
+            Self::ExtractKv {
+                source_field,
+                separator,
+            } => f
                 .debug_struct("ExtractKv")
                 .field("source_field", source_field)
+                .field("separator", separator)
                 .finish(),
             Self::Dedup {
                 fields,
@@ -319,7 +326,10 @@ fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
                 source_field,
             })
         }
-        ExtractMode::KeyValue => Ok(CompiledStage::ExtractKv { source_field }),
+        ExtractMode::KeyValue { separator } => Ok(CompiledStage::ExtractKv {
+            source_field,
+            separator: *separator,
+        }),
     }
 }
 
@@ -420,11 +430,14 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             StageResult::Pass
         }
 
-        CompiledStage::ExtractKv { source_field } => {
+        CompiledStage::ExtractKv {
+            source_field,
+            separator,
+        } => {
             if let Some(Value::String(text)) = event.get(source_field) {
-                let pairs = extract_key_value_pairs(text);
+                let pairs = extract_key_value_pairs(text, *separator);
                 for (k, v) in pairs {
-                    event.insert(k, Value::String(v));
+                    event.insert(k, coerce_kv_value(v));
                 }
             }
             StageResult::Pass
@@ -471,10 +484,29 @@ fn dedup_key(fields: &[String], event: &Map<String, Value>) -> Vec<String> {
     }
 }
 
-/// Extract `key=value` pairs from a string.
+/// Coerce a string value from kv extraction into the most specific JSON type.
 ///
-/// Handles both `key=value` and `key="quoted value"` formats.
-fn extract_key_value_pairs(text: &str) -> Vec<(String, String)> {
+/// Tries integer, then float, then boolean, falling back to string.
+pub fn coerce_kv_value(s: String) -> Value {
+    if let Ok(i) = s.parse::<i64>() {
+        return serde_json::Number::from(i).into();
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return Value::Number(n);
+        }
+    }
+    match s.as_str() {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => Value::String(s),
+    }
+}
+
+/// Extract key-value pairs from a string using the given separator.
+///
+/// Handles both `key<sep>value` and `key<sep>"quoted value"` formats.
+pub fn extract_key_value_pairs(text: &str, separator: char) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut chars = text.char_indices().peekable();
 
@@ -485,7 +517,7 @@ fn extract_key_value_pairs(text: &str) -> Vec<(String, String)> {
             continue;
         }
 
-        // try to find key=value
+        // try to find key<sep>value
         let key_start = i;
         while let Some(&(_, c)) = chars.peek() {
             if c.is_alphanumeric() || c == '_' || c == '.' {
@@ -497,9 +529,9 @@ fn extract_key_value_pairs(text: &str) -> Vec<(String, String)> {
 
         let key_end = chars.peek().map_or(text.len(), |&(i, _)| i);
 
-        // check for '='
-        if chars.peek().is_some_and(|&(_, c)| c == '=') {
-            chars.next(); // consume '='
+        // check for separator
+        if chars.peek().is_some_and(|&(_, c)| c == separator) {
+            chars.next(); // consume separator
             let key = &text[key_start..key_end];
 
             // parse value
@@ -1480,21 +1512,21 @@ mod tests {
     #[test]
     fn extract_kv_basic() {
         let mut stage = compile_extract(&ExtractStage {
-            mode: ExtractMode::KeyValue,
+            mode: ExtractMode::KeyValue { separator: '=' },
             source_field: Some("message".into()),
         })
         .unwrap();
         let mut ev = event(&json!({"message": "user=alice status=200 path=/api"}));
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("user").unwrap(), "alice");
-        assert_eq!(ev.get("status").unwrap(), "200");
+        assert_eq!(ev.get("status").unwrap(), 200); // coerced to int
         assert_eq!(ev.get("path").unwrap(), "/api");
     }
 
     #[test]
     fn extract_kv_quoted_values() {
         let mut stage = compile_extract(&ExtractStage {
-            mode: ExtractMode::KeyValue,
+            mode: ExtractMode::KeyValue { separator: '=' },
             source_field: Some("message".into()),
         })
         .unwrap();
@@ -1502,6 +1534,36 @@ mod tests {
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("user").unwrap(), "alice smith");
         assert_eq!(ev.get("action").unwrap(), "login");
+    }
+
+    #[test]
+    fn extract_kv_custom_separator() {
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::KeyValue { separator: ':' },
+            source_field: Some("message".into()),
+        })
+        .unwrap();
+        let mut ev = event(&json!({"message": "user:alice status:200"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("user").unwrap(), "alice");
+        assert_eq!(ev.get("status").unwrap(), 200);
+    }
+
+    #[test]
+    fn extract_kv_type_coercion() {
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::KeyValue { separator: '=' },
+            source_field: Some("message".into()),
+        })
+        .unwrap();
+        let mut ev =
+            event(&json!({"message": "count=42 rate=1.5 flag=true name=hello empty=false"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("count").unwrap(), 42);
+        assert_eq!(ev.get("rate").unwrap(), 1.5);
+        assert_eq!(ev.get("flag").unwrap(), true);
+        assert_eq!(ev.get("name").unwrap(), "hello");
+        assert_eq!(ev.get("empty").unwrap(), false);
     }
 
     // ── tier 2: dedup ──────────────────────────────────────────────
@@ -1553,7 +1615,7 @@ mod tests {
 
     #[test]
     fn kv_simple_pairs() {
-        let pairs = extract_key_value_pairs("user=alice status=200");
+        let pairs = extract_key_value_pairs("user=alice status=200", '=');
         assert_eq!(
             pairs,
             vec![
@@ -1565,7 +1627,7 @@ mod tests {
 
     #[test]
     fn kv_quoted_value() {
-        let pairs = extract_key_value_pairs(r#"name="John Doe" age=30"#);
+        let pairs = extract_key_value_pairs(r#"name="John Doe" age=30"#, '=');
         assert_eq!(
             pairs,
             vec![
@@ -1577,7 +1639,7 @@ mod tests {
 
     #[test]
     fn kv_with_prefix_text() {
-        let pairs = extract_key_value_pairs("INFO: user=alice action=login");
+        let pairs = extract_key_value_pairs("INFO: user=alice action=login", '=');
         assert_eq!(
             pairs,
             vec![
@@ -1589,8 +1651,20 @@ mod tests {
 
     #[test]
     fn kv_empty_input() {
-        let pairs = extract_key_value_pairs("");
+        let pairs = extract_key_value_pairs("", '=');
         assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn kv_custom_separator() {
+        let pairs = extract_key_value_pairs("user:alice status:200", ':');
+        assert_eq!(
+            pairs,
+            vec![
+                ("user".into(), "alice".into()),
+                ("status".into(), "200".into()),
+            ]
+        );
     }
 
     // ── multi-stage pipeline ───────────────────────────────────────

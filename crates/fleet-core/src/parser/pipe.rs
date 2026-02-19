@@ -263,19 +263,39 @@ fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 /// Parse an extract/rex stage from a given keyword.
 ///
 /// Both `extract` and `rex` support the same syntax:
-/// `KEYWORD "pattern" [from field]` or `KEYWORD kv [from field]`
+/// `KEYWORD "pattern" [from field]` or `KEYWORD kv [sep="X"] [from field]`
 fn extract_like_stage<'src>(
     kw: &'static str,
 ) -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     let from_clause = keyword("from").padded().ignore_then(field_name()).or_not();
 
+    // Optional `sep="X"` clause — a quoted single character.
+    let sep_clause = keyword("sep")
+        .then(just('='))
+        .ignore_then(raw_quoted_string())
+        .padded()
+        .or_not();
+
     let kv_mode = keyword(kw)
         .padded()
         .ignore_then(keyword("kv"))
-        .ignore_then(from_clause.clone())
-        .map(|source_field| {
+        .padded()
+        .ignore_then(sep_clause)
+        .then(from_clause.clone())
+        .map(|(sep_str, source_field)| {
+            let separator = sep_str
+                .and_then(|s| {
+                    let mut chars = s.chars();
+                    let c = chars.next()?;
+                    if chars.next().is_some() {
+                        None // multi-char — will fall back to default
+                    } else {
+                        Some(c)
+                    }
+                })
+                .unwrap_or('=');
             PipeStage::Extract(ExtractStage {
-                mode: ExtractMode::KeyValue,
+                mode: ExtractMode::KeyValue { separator },
                 source_field,
             })
         });
@@ -640,7 +660,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         match &result[0].node {
             PipeStage::Extract(e) => {
-                assert_eq!(e.mode, ExtractMode::KeyValue);
+                assert_eq!(e.mode, ExtractMode::KeyValue { separator: '=' });
                 assert_eq!(e.source_field, Some("raw".to_string()));
             }
             other => panic!("expected Extract, got {other:?}"),
@@ -809,7 +829,7 @@ mod tests {
         let result = pipeline().parse(input).into_result().unwrap();
         match &result[0].node {
             PipeStage::Extract(e) => {
-                assert_eq!(e.mode, ExtractMode::KeyValue);
+                assert_eq!(e.mode, ExtractMode::KeyValue { separator: '=' });
                 assert_eq!(e.source_field, None);
             }
             other => panic!("expected Extract, got {other:?}"),
@@ -822,7 +842,33 @@ mod tests {
         let result = pipeline().parse(input).into_result().unwrap();
         match &result[0].node {
             PipeStage::Extract(e) => {
-                assert_eq!(e.mode, ExtractMode::KeyValue);
+                assert_eq!(e.mode, ExtractMode::KeyValue { separator: '=' });
+                assert_eq!(e.source_field, Some("raw".to_string()));
+            }
+            other => panic!("expected Extract, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_kv_with_sep() {
+        let input = r#"| extract kv sep=":""#;
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Extract(e) => {
+                assert_eq!(e.mode, ExtractMode::KeyValue { separator: ':' });
+                assert_eq!(e.source_field, None);
+            }
+            other => panic!("expected Extract, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_kv_with_sep_and_from() {
+        let input = r#"| extract kv sep=":" from raw"#;
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::Extract(e) => {
+                assert_eq!(e.mode, ExtractMode::KeyValue { separator: ':' });
                 assert_eq!(e.source_field, Some("raw".to_string()));
             }
             other => panic!("expected Extract, got {other:?}"),

@@ -63,10 +63,8 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
                 });
             }
         }
-        ExtractMode::KeyValue => {
-            return Err(EmitError::UnsupportedOperation {
-                message: "extract kv is not yet implemented".to_string(),
-            });
+        ExtractMode::KeyValue { .. } => {
+            // kv extraction is handled post-SQL by the Rust pipeline
         }
     }
     Ok(())
