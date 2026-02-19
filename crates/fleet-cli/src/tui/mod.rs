@@ -1,8 +1,13 @@
 //! TUI application state machine and event loop.
 
+pub mod driver;
 pub mod highlight;
 pub mod state;
 mod ui;
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
@@ -15,10 +20,12 @@ use fleet_client::{
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::io;
-use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+use self::driver::{
+    DriverCommand, DriverData, DriverResponse, ExecuteWaiter, parse_key_string,
+    query_response_to_data,
+};
 use self::state::{
     ChartView, Focus, LiveBuffer, Popup, ResultsSearch, Sidebar, SimpleEditor, Tab, TabStatus,
 };
@@ -111,6 +118,13 @@ pub struct App {
     mutation_rx: mpsc::UnboundedReceiver<MutationResult>,
     /// Sender for mutation operations.
     mutation_tx: mpsc::UnboundedSender<MutationResult>,
+    /// Channel for receiving driver commands from the unix socket.
+    driver_rx: Option<mpsc::UnboundedReceiver<DriverCommand>>,
+    /// Path to the driver socket (for cleanup on exit).
+    driver_socket_path: Option<PathBuf>,
+    /// Pending execute waiter: the socket task blocks on this until
+    /// the matching tab's query completes.
+    driver_execute_waiter: Option<ExecuteWaiter>,
 }
 
 impl App {
@@ -142,6 +156,9 @@ impl App {
             query_tx,
             mutation_rx,
             mutation_tx,
+            driver_rx: None,
+            driver_socket_path: None,
+            driver_execute_waiter: None,
         }
     }
 
@@ -324,9 +341,34 @@ impl App {
                     tab.horizontal_scroll_offset = 0;
                     tab.selected_row = None;
                     tab.column_widths = None;
+
+                    // Notify driver execute waiter if this tab matches.
+                    if self
+                        .driver_execute_waiter
+                        .as_ref()
+                        .is_some_and(|w| w.tab_idx == query_result.tab_idx)
+                    {
+                        let waiter = self.driver_execute_waiter.take().unwrap();
+                        let mut data = query_response_to_data(
+                            self.tabs[query_result.tab_idx].result.as_ref().unwrap(),
+                        );
+                        data.duration_ms = Some(duration_ms);
+                        let _ = waiter.reply.send(DriverResponse::ok_with(data));
+                    }
                 }
-                Err(message) => {
-                    tab.status = TabStatus::Error { message };
+                Err(ref message) => {
+                    // Notify driver execute waiter of failure.
+                    if self
+                        .driver_execute_waiter
+                        .as_ref()
+                        .is_some_and(|w| w.tab_idx == query_result.tab_idx)
+                    {
+                        let waiter = self.driver_execute_waiter.take().unwrap();
+                        let _ = waiter.reply.send(DriverResponse::err(message));
+                    }
+                    tab.status = TabStatus::Error {
+                        message: message.clone(),
+                    };
                 }
             }
         }
@@ -1374,10 +1416,212 @@ impl App {
 
         self.live_mode = false;
     }
+
+    // -- Driver integration ---------------------------------------------------
+
+    /// Start the driver socket listener if a path is provided.
+    fn start_driver(&mut self, path: &Path) {
+        match driver::spawn_listener(path) {
+            Ok(rx) => {
+                self.driver_rx = Some(rx);
+                self.driver_socket_path = Some(path.to_owned());
+                tracing::info!("driver started at {}", path.display());
+            }
+            Err(e) => {
+                tracing::error!("failed to start driver socket: {e}");
+            }
+        }
+    }
+
+    /// Clean up the driver socket file.
+    fn cleanup_driver(&mut self) {
+        if let Some(ref path) = self.driver_socket_path {
+            let _ = std::fs::remove_file(path);
+            tracing::info!("cleaned up driver socket at {}", path.display());
+        }
+    }
+
+    /// Process pending driver commands (up to 10 per tick to avoid starving UI).
+    fn poll_driver_commands<B: ratatui::backend::Backend>(&mut self, terminal: &mut Terminal<B>) {
+        // Take the receiver out to avoid borrow conflicts with &mut self.
+        let Some(mut rx) = self.driver_rx.take() else {
+            return;
+        };
+
+        for _ in 0..10 {
+            let Ok(cmd) = rx.try_recv() else { break };
+
+            tracing::debug!("processing driver command: {:?}", cmd.request);
+
+            match cmd.request {
+                driver::DriverRequest::Status => {
+                    let resp = self.handle_driver_status();
+                    let _ = cmd.reply.send(resp);
+                }
+                driver::DriverRequest::SetQuery { query } => {
+                    self.handle_driver_set_query(&query);
+                    let _ = cmd.reply.send(DriverResponse::ok());
+                }
+                driver::DriverRequest::Execute { .. } => {
+                    self.handle_driver_execute(cmd.reply);
+                    // Don't send reply here — it's deferred until query completes.
+                }
+                driver::DriverRequest::Capture { width, height } => {
+                    let resp = self.handle_driver_capture(terminal, width, height);
+                    let _ = cmd.reply.send(resp);
+                }
+                driver::DriverRequest::Key { key } => {
+                    let resp = self.handle_driver_key(&key);
+                    let _ = cmd.reply.send(resp);
+                }
+                driver::DriverRequest::Keys { keys } => {
+                    let resp = self.handle_driver_keys(&keys);
+                    let _ = cmd.reply.send(resp);
+                }
+                driver::DriverRequest::GetResults { tab } => {
+                    let resp = self.handle_driver_get_results(tab);
+                    let _ = cmd.reply.send(resp);
+                }
+                driver::DriverRequest::Quit => {
+                    let _ = cmd.reply.send(DriverResponse::ok());
+                    self.should_quit = true;
+                }
+            }
+        }
+
+        // Put the receiver back.
+        self.driver_rx = Some(rx);
+    }
+
+    fn handle_driver_status(&self) -> DriverResponse {
+        let tab = self.active_tab();
+        let tab_status = match &tab.status {
+            TabStatus::Idle => "idle",
+            TabStatus::Running { .. } => "running",
+            TabStatus::Success { .. } => "success",
+            TabStatus::Error { .. } => "error",
+        };
+        let (result_rows, result_columns) = match &tab.result {
+            Some(r) => (
+                Some(r.result.row_count()),
+                Some(r.result.columns.iter().map(|c| c.name.clone()).collect()),
+            ),
+            None => (None, None),
+        };
+
+        DriverResponse::ok_with(DriverData {
+            focus: Some(format!("{:?}", self.focus).to_lowercase()),
+            tab_count: Some(self.tabs.len()),
+            active_tab: Some(self.active_tab_idx),
+            tab_status: Some(tab_status.to_owned()),
+            query: Some(tab.editor.text()),
+            live_mode: Some(self.live_mode),
+            result_rows,
+            result_columns,
+            ..DriverData::default()
+        })
+    }
+
+    fn handle_driver_set_query(&mut self, query: &str) {
+        let tab = self.active_tab_mut();
+        tab.editor.clear();
+        tab.editor.insert_text(query);
+    }
+
+    fn handle_driver_execute(&mut self, reply: tokio::sync::oneshot::Sender<DriverResponse>) {
+        // If there's already a waiter, reject.
+        if self.driver_execute_waiter.is_some() {
+            let _ = reply.send(DriverResponse::err("another execute is already pending"));
+            return;
+        }
+
+        // If the editor is empty, reject.
+        if self.active_tab().editor.text().trim().is_empty() {
+            let _ = reply.send(DriverResponse::err("empty query"));
+            return;
+        }
+
+        let tab_idx = self.active_tab_idx;
+        self.driver_execute_waiter = Some(ExecuteWaiter { tab_idx, reply });
+
+        // Trigger query execution (same as F5 / ctrl+enter).
+        self.execute_query();
+    }
+
+    fn handle_driver_capture<B: ratatui::backend::Backend>(
+        &mut self,
+        _real_terminal: &mut Terminal<B>,
+        width: Option<u16>,
+        height: Option<u16>,
+    ) -> DriverResponse {
+        let w = width.unwrap_or(120);
+        let h = height.unwrap_or(40);
+
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut test_terminal = match Terminal::new(backend) {
+            Ok(t) => t,
+            Err(e) => return DriverResponse::err(format!("failed to create test terminal: {e}")),
+        };
+
+        if let Err(e) = test_terminal.draw(|f| ui::render(self, f)) {
+            return DriverResponse::err(format!("render failed: {e}"));
+        }
+
+        let content = test_terminal.backend().to_string();
+
+        DriverResponse::ok_with(DriverData {
+            content: Some(content),
+            width: Some(w),
+            height: Some(h),
+            ..DriverData::default()
+        })
+    }
+
+    fn handle_driver_key(&mut self, key: &str) -> DriverResponse {
+        match parse_key_string(key) {
+            Ok(key_event) => {
+                self.handle_key(key_event);
+                DriverResponse::ok()
+            }
+            Err(e) => DriverResponse::err(e),
+        }
+    }
+
+    fn handle_driver_keys(&mut self, keys: &[String]) -> DriverResponse {
+        for key_str in keys {
+            match parse_key_string(key_str) {
+                Ok(key_event) => self.handle_key(key_event),
+                Err(e) => return DriverResponse::err(format!("key '{key_str}': {e}")),
+            }
+        }
+        DriverResponse::ok()
+    }
+
+    fn handle_driver_get_results(&self, tab: Option<usize>) -> DriverResponse {
+        let tab_idx = tab.unwrap_or(self.active_tab_idx);
+        if tab_idx >= self.tabs.len() {
+            return DriverResponse::err(format!("tab index {tab_idx} out of range"));
+        }
+
+        match &self.tabs[tab_idx].result {
+            Some(response) => DriverResponse::ok_with(query_response_to_data(response)),
+            None => DriverResponse::ok_with(DriverData {
+                row_count: Some(0),
+                columns: Some(Vec::new()),
+                rows: Some(Vec::new()),
+                truncated: Some(false),
+                ..DriverData::default()
+            }),
+        }
+    }
 }
 
 /// Run the TUI application.
-pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliError> {
+pub async fn run(
+    config: &Config,
+    direct_token: Option<&str>,
+    driver_path: Option<&Path>,
+) -> Result<(), CliError> {
     // Load token.
     let token = config.load_token(direct_token)?;
 
@@ -1445,8 +1689,16 @@ pub async fn run(config: &Config, direct_token: Option<&str>) -> Result<(), CliE
     app.history_cache = history;
     app.saved_cache = saved;
 
+    // Start driver socket if requested.
+    if let Some(path) = driver_path {
+        app.start_driver(path);
+    }
+
     // Event loop.
     let result = run_event_loop(&mut terminal, &mut app);
+
+    // Clean up driver socket.
+    app.cleanup_driver();
 
     // Restore terminal.
     disable_raw_mode()?;
@@ -1514,6 +1766,9 @@ fn run_event_loop<B: ratatui::backend::Backend>(
 
         // Poll for mutation results (save/delete operations).
         app.poll_mutations();
+
+        // Poll for driver commands from the unix socket.
+        app.poll_driver_commands(terminal);
 
         // Draw UI.
         terminal.draw(|f| ui::render(app, f))?;

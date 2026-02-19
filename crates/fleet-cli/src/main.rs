@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::process;
 use std::sync::Mutex;
 
@@ -33,6 +34,11 @@ struct Cli {
     /// Config file path (default: ~/.config/fleet/config.toml).
     #[arg(long, short = 'c', global = true)]
     config: Option<String>,
+
+    /// Enable driver mode: listen on a unix socket for programmatic control.
+    /// Uses `~/.config/fleet/driver.sock` by default, or specify a custom path.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    driver: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -117,7 +123,16 @@ async fn run(args: Cli) -> Result<(), CliError> {
                 .with_ansi(false)
                 .init();
 
-            tui::run(&cfg, args.token.as_deref()).await?;
+            // Resolve driver socket path.
+            let driver_path: Option<PathBuf> = args.driver.map(|v| {
+                if v.is_empty() {
+                    tui::driver::default_socket_path()
+                } else {
+                    PathBuf::from(v)
+                }
+            });
+
+            tui::run(&cfg, args.token.as_deref(), driver_path.as_deref()).await?;
         }
         Some(Command::Query {
             query,
