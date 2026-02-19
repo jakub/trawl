@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# fleet-screenshot — capture a screenshot of the fleet TUI window.
+#
+# Identifies the correct iTerm2 window by tracing fleet's PID from the
+# driver socket → TTY → iTerm2 session → CGWindowID → screencapture.
+#
+# Usage: fleet-screenshot [--socket PATH] [OUTPUT]
+#
+# Exit codes:
+#   0 — success (prints output path to stdout)
+#   1 — fleet not found or not running with --driver
+#   2 — iTerm2 window not found
+#   3 — screenshot capture failed
+
+set -euo pipefail
+
+# -- argument parsing ----------------------------------------------------------
+
+SOCKET="$HOME/.config/fleet/driver.sock"
+OUTPUT="/tmp/fleet-screenshot.png"
+SHADOW=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --socket)
+            SOCKET="$2"
+            shift 2
+            ;;
+        --shadow)
+            SHADOW=true
+            shift
+            ;;
+        --help|-h)
+            echo "usage: fleet-screenshot [--socket PATH] [--shadow] [OUTPUT]"
+            echo ""
+            echo "  --socket PATH   driver socket (default: ~/.config/fleet/driver.sock)"
+            echo "  --shadow        include window shadow in capture"
+            echo "  OUTPUT          output file (default: /tmp/fleet-screenshot.png)"
+            exit 0
+            ;;
+        -*)
+            echo "error: unknown flag $1" >&2
+            exit 1
+            ;;
+        *)
+            OUTPUT="$1"
+            shift
+            ;;
+    esac
+done
+
+# -- step 1: find fleet PID from driver socket --------------------------------
+
+if [[ ! -S "$SOCKET" ]]; then
+    echo "error: driver socket not found at $SOCKET" >&2
+    echo "       start fleet with --driver to enable the socket" >&2
+    exit 1
+fi
+
+FLEET_PID=$(lsof -t "$SOCKET" 2>/dev/null | head -1)
+
+if [[ -z "$FLEET_PID" ]]; then
+    echo "error: cannot find fleet process on $SOCKET" >&2
+    exit 1
+fi
+
+# -- step 2: get fleet's controlling TTY ---------------------------------------
+
+FLEET_TTY_RAW=$(ps -o tty= -p "$FLEET_PID" 2>/dev/null | tr -d ' ')
+
+if [[ -z "$FLEET_TTY_RAW" ]] || [[ "$FLEET_TTY_RAW" == "??" ]]; then
+    echo "error: cannot determine fleet's terminal (PID=$FLEET_PID)" >&2
+    exit 1
+fi
+
+FLEET_TTY="/dev/$FLEET_TTY_RAW"
+
+# -- step 3: find iTerm2 window containing this TTY via AppleScript ------------
+
+BOUNDS=$(osascript <<APPLESCRIPT 2>/dev/null || true
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if tty of s is "$FLEET_TTY" then
+                    set b to bounds of w
+                    -- return as "left,top,right,bottom"
+                    return (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text)
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+APPLESCRIPT
+)
+
+if [[ -z "$BOUNDS" ]]; then
+    echo "error: no iTerm2 window found with TTY $FLEET_TTY" >&2
+    exit 2
+fi
+
+# Parse bounds: "left,top,right,bottom" → individual values.
+IFS=',' read -r LEFT TOP RIGHT BOTTOM <<< "$BOUNDS"
+WIDTH=$((RIGHT - LEFT))
+HEIGHT=$((BOTTOM - TOP))
+
+# -- step 4: find CGWindowID by matching bounds --------------------------------
+
+WINDOW_ID=$(swift - "$LEFT" "$TOP" "$WIDTH" "$HEIGHT" 2>/dev/null <<'SWIFT' || true
+import CoreGraphics
+
+let args = CommandLine.arguments
+guard args.count == 5,
+      let bx = Double(args[1]),
+      let by = Double(args[2]),
+      let bw = Double(args[3]),
+      let bh = Double(args[4]) else {
+    exit(1)
+}
+
+guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+    exit(1)
+}
+
+for w in windows {
+    guard let name = w[kCGWindowOwnerName as String] as? String,
+          name == "iTerm2",
+          let wid = w[kCGWindowNumber as String] as? Int,
+          let layer = w[kCGWindowLayer as String] as? Int,
+          layer == 0,
+          let bounds = w[kCGWindowBounds as String] as? [String: Double],
+          let wx = bounds["X"],
+          let wy = bounds["Y"],
+          let ww = bounds["Width"],
+          let wh = bounds["Height"] else { continue }
+
+    // Tolerance for minor rounding differences.
+    if abs(wx - bx) < 3 && abs(wy - by) < 3 &&
+       abs(ww - bw) < 3 && abs(wh - bh) < 3 {
+        print(wid)
+        exit(0)
+    }
+}
+exit(1)
+SWIFT
+)
+
+# -- step 5: capture -----------------------------------------------------------
+
+SHADOW_FLAG="-o"
+if [[ "$SHADOW" == true ]]; then
+    SHADOW_FLAG=""
+fi
+
+if [[ -n "$WINDOW_ID" ]]; then
+    # Window-specific capture (clean, handles overlapping windows).
+    if screencapture -l "$WINDOW_ID" -x $SHADOW_FLAG -t png "$OUTPUT" 2>/dev/null; then
+        echo "$OUTPUT"
+        exit 0
+    fi
+fi
+
+# Fallback: region capture using AppleScript bounds.
+echo "warning: CGWindowID lookup failed, falling back to region capture" >&2
+if screencapture -R "${LEFT},${TOP},${WIDTH},${HEIGHT}" -x -t png "$OUTPUT" 2>/dev/null; then
+    echo "$OUTPUT"
+    exit 0
+fi
+
+echo "error: screenshot capture failed" >&2
+exit 3
