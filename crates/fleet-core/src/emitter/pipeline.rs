@@ -134,14 +134,20 @@ fn process_table(table_stage: &crate::ast::TableStage, ctx: &mut EmitterState) {
     ctx.has_projection = true;
 }
 
-/// Try to extract a bare field name from the first arg of an aggregation.
+/// Try to extract a field name from the first arg of an aggregation.
+///
+/// Recurses through wrapping expressions (function calls, binary ops, unary ops)
+/// to find the innermost field reference. This lets `avg(tonumber(rssi) * -1)`
+/// alias to `avg_rssi` instead of just `avg`.
 fn extract_field_name(arg: Option<&crate::ast::Spanned<crate::ast::Expr>>) -> Option<String> {
-    match arg {
-        Some(spanned) => match &spanned.node {
-            crate::ast::Expr::FieldRef(name) => Some(name.clone()),
-            _ => None,
-        },
-        None => None,
+    use crate::ast::Expr;
+    let expr = &arg?.node;
+    match expr {
+        Expr::FieldRef(name) => Some(name.clone()),
+        Expr::FunctionCall { args, .. } => extract_field_name(args.first()),
+        Expr::Binary { lhs, .. } => extract_field_name(Some(lhs)),
+        Expr::Unary { operand, .. } => extract_field_name(Some(operand)),
+        _ => None,
     }
 }
 
