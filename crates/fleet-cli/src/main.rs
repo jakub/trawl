@@ -1,5 +1,5 @@
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
 
@@ -65,6 +65,79 @@ enum Command {
         /// The fleet DSL query to validate.
         query: String,
     },
+
+    /// Control a running TUI via driver socket.
+    Driver {
+        /// Path to the driver unix socket.
+        #[arg(long, default_value_t = tui::driver::default_socket_path().display().to_string())]
+        socket: String,
+
+        #[command(subcommand)]
+        cmd: DriverSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DriverSubcommand {
+    /// Show TUI state (JSON).
+    Status,
+
+    /// Set editor content and execute query, print results.
+    Query {
+        /// The fleet DSL query.
+        query: String,
+
+        /// Output format (auto-detected if omitted: table for TTY, json for pipes).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+
+        /// Execute timeout in milliseconds.
+        #[arg(long, default_value = "300000")]
+        timeout: u64,
+    },
+
+    /// Set editor content without executing.
+    SetQuery {
+        /// The fleet DSL query.
+        query: String,
+    },
+
+    /// Render TUI to text.
+    Capture {
+        /// Terminal width for capture.
+        #[arg(long, default_value = "120")]
+        width: u16,
+
+        /// Terminal height for capture.
+        #[arg(long, default_value = "40")]
+        height: u16,
+    },
+
+    /// Inject a single keystroke (e.g. "ctrl+enter", "F5", "a").
+    Key {
+        /// Key string to inject.
+        key: String,
+    },
+
+    /// Inject multiple keystrokes sequentially.
+    Keys {
+        /// Key strings to inject.
+        keys: Vec<String>,
+    },
+
+    /// Get structured result data from a tab.
+    GetResults {
+        /// Tab index (0-based, defaults to active tab).
+        #[arg(long)]
+        tab: Option<usize>,
+
+        /// Output format (auto-detected if omitted: table for TTY, json for pipes).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
+
+    /// Request clean TUI exit.
+    Quit,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -167,7 +240,122 @@ async fn run(args: Cli) -> Result<(), CliError> {
 
             cli::run_validate(&query, conn).await?;
         }
+
+        Some(Command::Driver { socket, cmd }) => {
+            run_driver(&socket, cmd).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_driver(socket: &str, cmd: DriverSubcommand) -> Result<(), CliError> {
+    use tui::driver::DriverRequest;
+
+    let socket_path = PathBuf::from(socket);
+
+    match cmd {
+        DriverSubcommand::Status => {
+            let resp = driver_send(&socket_path, &DriverRequest::Status).await?;
+            let json = serde_json::to_string_pretty(&resp.data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            println!("{json}");
+        }
+
+        DriverSubcommand::Query {
+            query,
+            format,
+            timeout,
+        } => {
+            driver_send(
+                &socket_path,
+                &DriverRequest::SetQuery {
+                    query: query.clone(),
+                },
+            )
+            .await?;
+            let resp = driver_send(
+                &socket_path,
+                &DriverRequest::Execute {
+                    timeout_ms: timeout,
+                },
+            )
+            .await?;
+            render_driver_data(&resp.data, format)?;
+        }
+
+        DriverSubcommand::SetQuery { query } => {
+            driver_send(&socket_path, &DriverRequest::SetQuery { query }).await?;
+        }
+
+        DriverSubcommand::Capture { width, height } => {
+            let resp = driver_send(
+                &socket_path,
+                &DriverRequest::Capture {
+                    width: Some(width),
+                    height: Some(height),
+                },
+            )
+            .await?;
+            if let Some(content) = resp.data.content {
+                print!("{content}");
+            }
+        }
+
+        DriverSubcommand::Key { key } => {
+            driver_send(&socket_path, &DriverRequest::Key { key }).await?;
+        }
+
+        DriverSubcommand::Keys { keys } => {
+            driver_send(&socket_path, &DriverRequest::Keys { keys }).await?;
+        }
+
+        DriverSubcommand::GetResults { tab, format } => {
+            let resp = driver_send(&socket_path, &DriverRequest::GetResults { tab }).await?;
+            render_driver_data(&resp.data, format)?;
+        }
+
+        DriverSubcommand::Quit => {
+            driver_send(&socket_path, &DriverRequest::Quit).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Send a driver command and check for protocol-level errors.
+async fn driver_send(
+    socket_path: &Path,
+    request: &tui::driver::DriverRequest,
+) -> Result<tui::driver::DriverResponse, CliError> {
+    let resp = tui::driver::send_command(socket_path, request).await?;
+    if !resp.ok {
+        return Err(CliError::Usage(
+            resp.error.unwrap_or_else(|| "driver command failed".into()),
+        ));
+    }
+    Ok(resp)
+}
+
+/// Render driver response data containing columns + rows.
+fn render_driver_data(
+    data: &tui::driver::DriverData,
+    format: Option<cli::OutputFormat>,
+) -> Result<(), CliError> {
+    let columns = data.columns.as_deref().unwrap_or_default();
+    let rows = data.rows.as_deref().unwrap_or_default();
+
+    let format = format.unwrap_or_else(|| {
+        if io::stdout().is_terminal() {
+            cli::OutputFormat::Table
+        } else {
+            cli::OutputFormat::Json
+        }
+    });
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    cli::render_driver_results(columns, rows, format, &mut out)?;
+    out.flush()?;
     Ok(())
 }

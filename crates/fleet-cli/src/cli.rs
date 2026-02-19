@@ -220,6 +220,106 @@ fn csv_escape_string(s: &str) -> String {
     }
 }
 
+// -- driver output formatters -------------------------------------------------
+
+/// Render driver result data (columns + JSON rows) in the requested format.
+/// Used by `fleet driver query` and `fleet driver get-results`.
+pub fn render_driver_results(
+    columns: &[String],
+    rows: &[Vec<serde_json::Value>],
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    match format {
+        OutputFormat::Table => render_driver_table(columns, rows, out),
+        OutputFormat::Json => render_driver_ndjson(columns, rows, out),
+        OutputFormat::Csv => render_driver_csv(columns, rows, out),
+    }
+}
+
+fn render_driver_table(
+    columns: &[String],
+    rows: &[Vec<serde_json::Value>],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if rows.is_empty() {
+        writeln!(out, "no results")?;
+        return Ok(());
+    }
+
+    let mut table = comfy_table::Table::new();
+    table
+        .load_preset(comfy_table::presets::UTF8_FULL)
+        .apply_modifier(comfy_table::modifiers::UTF8_ROUND_CORNERS)
+        .set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+
+    let headers: Vec<&str> = columns.iter().map(String::as_str).collect();
+    table.set_header(headers);
+
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(json_display).collect();
+        table.add_row(cells);
+    }
+
+    writeln!(out, "{table}")?;
+    writeln!(out, "{} row(s)", rows.len())?;
+    Ok(())
+}
+
+fn render_driver_ndjson(
+    columns: &[String],
+    rows: &[Vec<serde_json::Value>],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    for row in rows {
+        let mut map = serde_json::Map::new();
+        for (col, val) in columns.iter().zip(row.iter()) {
+            map.insert(col.clone(), val.clone());
+        }
+        serde_json::to_writer(&mut *out, &map).map_err(io::Error::other)?;
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+fn render_driver_csv(
+    columns: &[String],
+    rows: &[Vec<serde_json::Value>],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let headers: Vec<String> = columns.iter().map(|c| csv_escape_string(c)).collect();
+    writeln!(out, "{}", headers.join(","))?;
+
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(csv_escape_json).collect();
+        writeln!(out, "{}", cells.join(","))?;
+    }
+    Ok(())
+}
+
+/// Display a JSON value as a human-readable string (for table cells).
+fn json_display(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "null".to_owned(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        // Arrays/objects: compact JSON representation.
+        other => other.to_string(),
+    }
+}
+
+/// CSV-escape a JSON value, applying formula injection protection to strings.
+fn csv_escape_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => csv_escape_string(s),
+        other => csv_escape_string(&other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

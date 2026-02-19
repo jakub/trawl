@@ -19,7 +19,9 @@ use fleet_client::QueryResponse;
 // ---------------------------------------------------------------------------
 
 /// Inbound request from a driver client (deserialized from NDJSON).
-#[derive(Debug, Deserialize)]
+///
+/// Also serializable so the CLI client can construct and send requests.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum DriverRequest {
     /// Introspect current TUI state.
@@ -51,7 +53,7 @@ fn default_timeout_ms() -> u64 {
 }
 
 /// Outbound response to a driver client (serialized as NDJSON).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DriverResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,7 +63,7 @@ pub struct DriverResponse {
 }
 
 /// Response payload variants.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct DriverData {
     // status fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,6 +203,34 @@ fn value_to_json(v: &fleet_engine::value::Value) -> serde_json::Value {
 pub fn default_socket_path() -> PathBuf {
     let config_dir = shellexpand::tilde("~/.config/fleet");
     PathBuf::from(config_dir.as_ref()).join("driver.sock")
+}
+
+// ---------------------------------------------------------------------------
+// Client (used by `fleet driver` subcommands)
+// ---------------------------------------------------------------------------
+
+/// Connect to a running TUI's driver socket, send a request, and return the
+/// response. Short-lived: opens one connection per invocation.
+pub async fn send_command(
+    socket_path: &Path,
+    request: &DriverRequest,
+) -> Result<DriverResponse, std::io::Error> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+
+    let mut json = serde_json::to_string(request)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no response"))?;
+
+    serde_json::from_str(&line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Remove stale socket file if it exists.
