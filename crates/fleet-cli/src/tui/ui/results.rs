@@ -701,47 +701,78 @@ fn extract_series(result: &fleet_engine::value::QueryResult) -> (Vec<(String, Ve
             .map(|row| value_to_u64(&row[metric_idx]))
             .collect();
         (vec![(metric_name.clone(), values)], 1)
-    } else if other_cols.len() == 2 {
-        // Multi series: _time + group_by + metric
-        // Determine which is group (string) vs metric (numeric) by sampling the first row,
-        // since UNION ALL BY NAME can reorder columns arbitrarily.
-        let (group_idx, metric_idx) = if let Some(first_row) = result.rows.first() {
-            let a = other_cols[0];
-            let b = other_cols[1];
-            if matches!(first_row.get(b), Some(Value::String(_))) {
-                (b, a)
-            } else {
-                (a, b)
-            }
-        } else {
+    } else {
+        // 2+ non-time columns. Sample the first row to distinguish:
+        //   - group-by mode: exactly 1 string col (group labels) + 1 numeric col (metric)
+        //   - multi-agg mode: all numeric cols → each column becomes its own series
+        let Some(first_row) = result.rows.first() else {
             return (vec![], 0);
         };
 
-        let mut series_map: HashMap<String, Vec<u64>> = HashMap::new();
+        let string_cols: Vec<usize> = other_cols
+            .iter()
+            .copied()
+            .filter(|&i| matches!(first_row.get(i), Some(Value::String(_))))
+            .collect();
+        let numeric_cols: Vec<usize> = other_cols
+            .iter()
+            .copied()
+            .filter(|&i| !matches!(first_row.get(i), Some(Value::String(_))))
+            .collect();
 
-        for row in &result.rows {
-            let label = value_to_string(&row[group_idx]);
-            let value = value_to_u64(&row[metric_idx]);
-            series_map.entry(label).or_default().push(value);
-        }
+        if string_cols.len() == 1 && numeric_cols.len() == 1 {
+            // Group-by mode: one string col for labels, one numeric col for values
+            let group_idx = string_cols[0];
+            let metric_idx = numeric_cols[0];
 
-        let mut series: Vec<(String, Vec<u64>)> = series_map.into_iter().collect();
-        let total = series.len();
-        // Keep top N series by total value (sparkline can't render hundreds of rows)
-        if series.len() > MAX_SERIES {
-            series.sort_by(|a, b| {
-                let sum_b: u64 = b.1.iter().sum();
-                let sum_a: u64 = a.1.iter().sum();
-                sum_b.cmp(&sum_a)
-            });
-            series.truncate(MAX_SERIES);
+            let mut series_map: HashMap<String, Vec<u64>> = HashMap::new();
+            for row in &result.rows {
+                let label = value_to_string(&row[group_idx]);
+                let value = value_to_u64(&row[metric_idx]);
+                series_map.entry(label).or_default().push(value);
+            }
+
+            let mut series: Vec<(String, Vec<u64>)> = series_map.into_iter().collect();
+            let total = series.len();
+            if series.len() > MAX_SERIES {
+                series.sort_by(|a, b| {
+                    let sum_b: u64 = b.1.iter().sum();
+                    let sum_a: u64 = a.1.iter().sum();
+                    sum_b.cmp(&sum_a)
+                });
+                series.truncate(MAX_SERIES);
+            }
+            series.sort_by(|a, b| a.0.cmp(&b.0));
+            (series, total)
+        } else if string_cols.is_empty() {
+            // Multi-agg mode: each numeric column is its own series, labeled by column name
+            let mut series: Vec<(String, Vec<u64>)> = numeric_cols
+                .iter()
+                .map(|&col_idx| {
+                    let label = result.columns[col_idx].name.clone();
+                    let values: Vec<u64> = result
+                        .rows
+                        .iter()
+                        .map(|row| value_to_u64(&row[col_idx]))
+                        .collect();
+                    (label, values)
+                })
+                .collect();
+            let total = series.len();
+            if series.len() > MAX_SERIES {
+                series.sort_by(|a, b| {
+                    let sum_b: u64 = b.1.iter().sum();
+                    let sum_a: u64 = a.1.iter().sum();
+                    sum_b.cmp(&sum_a)
+                });
+                series.truncate(MAX_SERIES);
+            }
+            series.sort_by(|a, b| a.0.cmp(&b.0));
+            (series, total)
+        } else {
+            // Ambiguous: multiple string cols or mixed in unexpected way
+            (vec![], 0)
         }
-        // Sort by label for consistent ordering
-        series.sort_by(|a, b| a.0.cmp(&b.0));
-        (series, total)
-    } else {
-        // Unsupported format, fallback to empty
-        (vec![], 0)
     }
 }
 
@@ -882,6 +913,129 @@ mod tests {
             labels,
             vec!["svc-4", "svc-5", "svc-6", "svc-7", "svc-8", "svc-9"]
         );
+    }
+
+    #[test]
+    fn extract_series_multi_agg() {
+        // timechart span=5m avg(rssi), avg(noise) → [_time, avg_rssi, avg_noise]
+        let result = QueryResult {
+            columns: vec![col("_time"), col("avg_rssi"), col("avg_noise")],
+            rows: vec![
+                vec![
+                    Value::String("2024-01-01 00:00:00".into()),
+                    Value::Integer(65),
+                    Value::Integer(90),
+                ],
+                vec![
+                    Value::String("2024-01-01 00:05:00".into()),
+                    Value::Integer(70),
+                    Value::Integer(85),
+                ],
+                vec![
+                    Value::String("2024-01-01 00:10:00".into()),
+                    Value::Integer(60),
+                    Value::Integer(92),
+                ],
+            ],
+        };
+
+        let (series, total) = extract_series(&result);
+        assert_eq!(total, 2);
+        assert_eq!(series.len(), 2);
+        // Sorted alphabetically by column name
+        assert_eq!(series[0].0, "avg_noise");
+        assert_eq!(series[0].1, vec![90, 85, 92]);
+        assert_eq!(series[1].0, "avg_rssi");
+        assert_eq!(series[1].1, vec![65, 70, 60]);
+    }
+
+    #[test]
+    fn extract_series_multi_agg_three_cols() {
+        // timechart with 3 aggregations
+        let result = QueryResult {
+            columns: vec![
+                col("_time"),
+                col("avg_rssi"),
+                col("avg_noise"),
+                col("avg_snr"),
+            ],
+            rows: vec![
+                vec![
+                    Value::String("2024-01-01 00:00:00".into()),
+                    Value::Integer(65),
+                    Value::Integer(90),
+                    Value::Integer(25),
+                ],
+                vec![
+                    Value::String("2024-01-01 00:05:00".into()),
+                    Value::Integer(70),
+                    Value::Integer(85),
+                    Value::Integer(30),
+                ],
+            ],
+        };
+
+        let (series, total) = extract_series(&result);
+        assert_eq!(total, 3);
+        assert_eq!(series.len(), 3);
+        assert_eq!(series[0].0, "avg_noise");
+        assert_eq!(series[1].0, "avg_rssi");
+        assert_eq!(series[2].0, "avg_snr");
+    }
+
+    #[test]
+    fn extract_series_multi_agg_capped() {
+        // 8 numeric columns → should cap to 6
+        let cols: Vec<Column> = std::iter::once(col("_time"))
+            .chain((0..8).map(|i| col(&format!("metric_{i}"))))
+            .collect();
+        let row: Vec<Value> = std::iter::once(Value::String("2024-01-01 00:00:00".into()))
+            .chain((0..8).map(|i| Value::Integer((i + 1) * 10)))
+            .collect();
+
+        let result = QueryResult {
+            columns: cols,
+            rows: vec![row],
+        };
+
+        let (series, total) = extract_series(&result);
+        assert_eq!(total, 8);
+        assert_eq!(series.len(), 6);
+        // Should keep the top 6 by value (metric_2 through metric_7, values 30..80)
+        let labels: Vec<&str> = series.iter().map(|s| s.0.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "metric_2", "metric_3", "metric_4", "metric_5", "metric_6", "metric_7"
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_series_group_by_still_works() {
+        // Existing group-by pattern with 2 cols should still work
+        let result = QueryResult {
+            columns: vec![col("_time"), col("service"), col("count")],
+            rows: vec![
+                vec![
+                    Value::String("2024-01-01 00:00:00".into()),
+                    Value::String("nginx".into()),
+                    Value::Integer(42),
+                ],
+                vec![
+                    Value::String("2024-01-01 00:00:00".into()),
+                    Value::String("api".into()),
+                    Value::Integer(17),
+                ],
+            ],
+        };
+
+        let (series, total) = extract_series(&result);
+        assert_eq!(total, 2);
+        assert_eq!(series[0].0, "api");
+        assert_eq!(series[0].1, vec![17]);
+        assert_eq!(series[1].0, "nginx");
+        assert_eq!(series[1].1, vec![42]);
     }
 
     #[test]
