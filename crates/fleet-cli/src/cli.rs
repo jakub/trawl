@@ -430,4 +430,22 @@ mod tests {
             r#""say ""hi""""#
         );
     }
+
+    #[tokio::test]
+    async fn parquet_format_without_output_flag_errors() {
+        let result = run_query(
+            "*",
+            Some("dummy.parquet"),
+            Some(OutputFormat::Parquet),
+            None,
+            None,
+            "UTC",
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("parquet output requires -o"),
+            "expected -o flag error, got: {err}"
+        );
+    }
 }

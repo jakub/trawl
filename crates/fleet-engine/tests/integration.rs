@@ -453,3 +453,66 @@ fn extract_kv_with_search_prefix() {
     let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(col_names.contains(&"method"));
 }
+
+// -- parquet export tests ----------------------------------------------------
+
+#[test]
+fn export_parquet_writes_valid_file() {
+    let (exec, glob) = setup();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_owned();
+    // Remove the temp file so export_parquet creates it fresh.
+    drop(tmp);
+
+    exec.export_parquet("service:nginx | head 3", &glob, &path, 1000)
+        .unwrap();
+
+    // Verify the file exists and is re-readable via DuckDB.
+    assert!(path.exists());
+    let read_glob = format!("{}", path.display());
+    let result = exec.run_query_max("*", &read_glob).unwrap();
+    assert_eq!(result.row_count(), 3);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn export_parquet_with_stats_roundtrips() {
+    let (exec, glob) = setup();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_owned();
+    drop(tmp);
+
+    exec.export_parquet(
+        "* | stats count() by service | sort -count",
+        &glob,
+        &path,
+        1000,
+    )
+    .unwrap();
+
+    let read_glob = format!("{}", path.display());
+    let result = exec.run_query_max("*", &read_glob).unwrap();
+    // 13 rows across nginx/sshd/systemd/kernel = 4 services.
+    assert_eq!(result.row_count(), 4);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn export_parquet_rejects_rust_stages() {
+    let (exec, src) = setup_kv();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_owned();
+    drop(tmp);
+
+    let err = exec
+        .export_parquet("* | extract kv | head 5", &src, &path, 1000)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("post-processing"),
+        "expected post-processing error, got: {err}"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
