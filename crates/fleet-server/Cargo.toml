@@ -26,6 +26,9 @@ flate2 = { workspace = true }
 fs4 = { workspace = true }
 governor = { workspace = true }
 indexmap = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+metrics-process = { workspace = true }
 hyper = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }

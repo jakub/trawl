@@ -48,7 +48,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting fleetd"
     );
 
-    let (mut state, http_config) = AppState::from_config(&config)?;
+    // Install the prometheus metrics recorder before building state.
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install prometheus recorder");
+    metrics_process::Collector::default().describe();
+    fleet_server::metrics::describe_metrics();
+
+    // Spawn upkeep task to prevent histogram bucket memory bloat.
+    let prom_handle = metrics_handle.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            prom_handle.run_upkeep();
+        }
+    });
+
+    let (mut state, http_config) = AppState::from_config(&config, metrics_handle)?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());

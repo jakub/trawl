@@ -95,6 +95,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .nest("/api/v1", authenticated)
         .nest("/api/v1", ingest_routes)
         .route("/api/v1/health", get(handlers::health))
+        .route("/metrics", get(handlers::prometheus_metrics))
         // -- security hardening layers (outermost applied first) --
         .layer(CatchPanicLayer::new())
         .layer(ConcurrencyLimitLayer::new(max_conns))
@@ -170,6 +171,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             ),
     )
     .layer(middleware::from_fn(request_id_middleware))
+    .layer(middleware::from_fn(connection_gauge_middleware))
     .layer(axum::Extension(rate_state))
     .layer(axum::Extension(auth_cache))
     .layer(axum::Extension(key_store))
@@ -187,6 +189,14 @@ async fn request_id_middleware(mut request: Request, next: middleware::Next) -> 
         response.headers_mut().insert("x-request-id", val);
     }
 
+    response
+}
+
+/// Track active HTTP connections via the `fleet_active_connections` gauge.
+async fn connection_gauge_middleware(request: Request, next: middleware::Next) -> Response {
+    metrics::gauge!(crate::metrics::ACTIVE_CONNECTIONS).increment(1.0);
+    let response = next.run(request).await;
+    metrics::gauge!(crate::metrics::ACTIVE_CONNECTIONS).decrement(1.0);
     response
 }
 

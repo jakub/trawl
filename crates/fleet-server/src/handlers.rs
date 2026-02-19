@@ -81,6 +81,7 @@ pub async fn query(
         .map_err(ServerError::BadRequest)?
         .unwrap_or(0);
 
+    let role_str = verified.role.to_string();
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
     let outcome = state
@@ -89,6 +90,7 @@ pub async fn query(
         .execute(&req.query, timeout, capture_debug, utc_offset_secs)
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let duration_secs = start.elapsed().as_secs_f64();
 
     match outcome.result {
         Ok(qr) => {
@@ -126,6 +128,10 @@ pub async fn query(
                 "query complete"
             );
 
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "success").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str.clone())
+                .record(duration_secs);
+
             // Write query debug log entry (success).
             write_query_log(
                 &state,
@@ -149,6 +155,11 @@ pub async fn query(
         }
         Err(ServerError::Timeout) => {
             state.query.tracker.timeout(query_id);
+
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "timeout").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str.clone())
+                .record(duration_secs);
+
             tracing::warn!(
                 event_type = "query_timeout",
                 user = %verified.name,
@@ -176,6 +187,10 @@ pub async fn query(
             // from tracker history and logs.
             let safe_msg = e.safe_message();
             state.query.tracker.fail(query_id, &safe_msg);
+
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "error").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str)
+                .record(duration_secs);
             match &e {
                 ServerError::Engine(
                     fleet_engine::error::EngineError::Parse(_)
@@ -222,6 +237,27 @@ pub async fn query(
             Err(e)
         }
     }
+}
+
+/// `GET /metrics` — prometheus scrape endpoint (unauthenticated).
+///
+/// Collects process metrics and fleet gauges on each scrape, then
+/// renders the prometheus text exposition format.
+#[allow(clippy::unused_async)]
+pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    metrics_process::Collector::default().collect();
+    crate::metrics::collect_gauges(
+        state.query.hot_buffer.as_ref(),
+        state.query.pool.fallback_glob(),
+    );
+    let body = state.metrics_handle.render();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 /// `GET /api/v1/health` — unauthenticated health check.

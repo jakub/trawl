@@ -160,6 +160,7 @@ pub async fn ingest(
         .map_err(|e| ServerError::Internal(format!("ingest task panicked: {e}")))??;
 
     let event_count = parsed.maps.len();
+    metrics::counter!(crate::metrics::INGEST_EVENTS_TOTAL).increment(event_count as u64);
 
     // Publish to event bus (best-effort — WAL is the durability guarantee).
     if let Some(bus) = &state.ingest.event_bus {

@@ -34,6 +34,8 @@ pub struct AppState {
     pub start_time: Instant,
     /// Total queries executed since startup (for stats endpoint).
     pub total_queries: Arc<AtomicU64>,
+    /// Prometheus metrics handle for rendering the scrape endpoint.
+    pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 /// Query execution state: pool, tracker, timeout, and schema cache.
@@ -131,7 +133,10 @@ impl AppState {
     ///
     /// Opens the auth database once at startup. Returns an error if the
     /// database cannot be opened or initialized.
-    pub fn from_config(config: &Config) -> Result<(Self, HttpConfig), fleet_auth::AuthError> {
+    pub fn from_config(
+        config: &Config,
+        metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    ) -> Result<(Self, HttpConfig), fleet_auth::AuthError> {
         let key_store = KeyStore::open(&config.auth.db_path)?;
         let history = HistoryStore::open(&config.auth.db_path)?;
         let saved = SavedQueryStore::open(&config.auth.db_path)?;
@@ -187,6 +192,7 @@ impl AppState {
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),
+            metrics_handle,
         };
 
         let http = HttpConfig {

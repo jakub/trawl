@@ -28,6 +28,7 @@ pub fn spawn_stats_emitter(
     let pool = state.query.pool.clone();
     let sse_semaphore = Arc::clone(&state.query.sse_semaphore);
     let hot_buffer = state.query.hot_buffer.clone();
+    let fallback_glob = pool.fallback_glob().to_string();
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
@@ -45,6 +46,7 @@ pub fn spawn_stats_emitter(
                         &sse_semaphore,
                         hot_buffer.as_ref(),
                     );
+                    crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob);
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::info!(

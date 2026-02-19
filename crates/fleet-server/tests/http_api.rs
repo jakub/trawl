@@ -15,6 +15,17 @@ use fleet_server::config::{
 use fleet_server::state::AppState;
 use fleet_server::transport::http;
 
+/// Create a `PrometheusHandle` for test contexts.
+///
+/// Uses `PrometheusBuilder` with a noop recorder since tests don't scrape
+/// the endpoint. Each call creates an independent recorder which is NOT
+/// installed globally (the handle is self-contained).
+fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle()
+}
+
 /// Find an available port by binding to :0 and reading back the assigned port.
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
@@ -147,7 +158,8 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
         retention: RetentionConfig::default(),
     };
 
-    let (state, http_config) = AppState::from_config(&config).expect("failed to create app state");
+    let (state, http_config) =
+        AppState::from_config(&config, test_metrics_handle()).expect("failed to create app state");
     let server_config = config.server.clone();
     tokio::spawn(async move {
         http::serve(state, &http_config, &server_config)
@@ -222,7 +234,8 @@ async fn setup() -> TestServer {
         retention: RetentionConfig::default(),
     };
 
-    let (state, http_config) = AppState::from_config(&config).expect("failed to create app state");
+    let (state, http_config) =
+        AppState::from_config(&config, test_metrics_handle()).expect("failed to create app state");
 
     // Spawn the HTTPS server in a background task.
     let server_config = config.server.clone();
