@@ -58,6 +58,10 @@ enum Command {
         /// Output format (auto-detected if omitted: table for TTY, json for pipes).
         #[arg(long, short, value_enum)]
         format: Option<cli::OutputFormat>,
+
+        /// Write output to file instead of stdout (required for parquet format).
+        #[arg(long, short)]
+        output: Option<PathBuf>,
     },
 
     /// Validate DSL query syntax without executing.
@@ -211,6 +215,7 @@ async fn run(args: Cli) -> Result<(), CliError> {
             query,
             data,
             format,
+            output,
         }) => {
             // For embedded mode (--data), no server connection needed.
             let conn = if data.is_some() {
@@ -224,7 +229,15 @@ async fn run(args: Cli) -> Result<(), CliError> {
                 })
             };
 
-            cli::run_query(&query, data.as_deref(), format, conn, &cfg.ui.timezone).await?;
+            cli::run_query(
+                &query,
+                data.as_deref(),
+                format,
+                output.as_deref(),
+                conn,
+                &cfg.ui.timezone,
+            )
+            .await?;
         }
         Some(Command::Validate { query }) => {
             // Validate supports both daemon and local-only mode.

@@ -3,6 +3,7 @@
 //! Handles connection management, prepared statements, parameter binding,
 //! and result extraction.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use duckdb::Connection;
@@ -245,6 +246,108 @@ impl Executor {
         }
 
         Ok(values)
+    }
+
+    /// Export query results directly to a Parquet file via `DuckDB` `COPY TO`.
+    ///
+    /// Uses a temp table to stage the query results, then writes them to
+    /// the output path as Snappy-compressed Parquet.
+    ///
+    /// Returns an error if the pipeline contains Rust post-processing stages
+    /// (e.g. `extract kv`) since those can't be expressed as pure SQL.
+    pub fn export_parquet(
+        &self,
+        dsl: &str,
+        source: &str,
+        output_path: &Path,
+        max_rows: usize,
+    ) -> Result<(), EngineError> {
+        let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
+        let emitted = emitter::emit(&ast, source)?;
+        self.export_parquet_from_emitted(&emitted, output_path, max_rows)
+    }
+
+    /// Export with hot buffer union, falling back to hot-only on cold start.
+    pub fn export_parquet_with_hot(
+        &self,
+        dsl: &str,
+        source: &str,
+        hot_source: &str,
+        output_path: &Path,
+        max_rows: usize,
+    ) -> Result<(), EngineError> {
+        let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
+        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
+        match self.export_parquet_from_emitted(&emitted, output_path, max_rows) {
+            // No columns / no parquet files → fall back to hot-only.
+            Err(EngineError::Database(_) | EngineError::Emit(_)) => {
+                let hot_emitted = emitter::emit(&ast, hot_source)?;
+                self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
+            }
+            other => other,
+        }
+    }
+
+    /// Internal: stage an emitted query into a temp table and COPY to parquet.
+    fn export_parquet_from_emitted(
+        &self,
+        emitted: &EmittedQuery,
+        output_path: &Path,
+        max_rows: usize,
+    ) -> Result<(), EngineError> {
+        if !emitted.rust_stages.is_empty() {
+            return Err(EngineError::Emit(
+                fleet_core::emitter::EmitError::UnsupportedOperation {
+                    message: "parquet export is not supported for queries with post-processing stages (e.g. extract kv)".into(),
+                },
+            ));
+        }
+
+        let path_str = output_path.to_str().ok_or_else(|| {
+            EngineError::Emit(fleet_core::emitter::EmitError::UnsupportedOperation {
+                message: "output path is not valid UTF-8".into(),
+            })
+        })?;
+
+        // Create temp table from query results.
+        let create_sql = format!(
+            "CREATE TEMP TABLE __fleet_export AS (SELECT * FROM ({}) LIMIT {max_rows})",
+            emitted.sql
+        );
+
+        let params = bind_params(&emitted.params);
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+
+        let cleanup = |conn: &Connection| {
+            let _ = conn.execute_batch("DROP TABLE IF EXISTS __fleet_export");
+        };
+
+        match self.conn.prepare(&create_sql) {
+            Ok(mut stmt) => {
+                if let Err(e) = stmt.execute(param_refs.as_slice()) {
+                    cleanup(&self.conn);
+                    return Err(e.into());
+                }
+            }
+            Err(e) => {
+                cleanup(&self.conn);
+                return Err(e.into());
+            }
+        }
+
+        // COPY to parquet. Path is validated above (UTF-8), and the temp table
+        // name is a constant — no injection risk.
+        let copy_sql =
+            format!("COPY __fleet_export TO '{path_str}' (FORMAT PARQUET, COMPRESSION SNAPPY)");
+        if let Err(e) = self.conn.execute_batch(&copy_sql) {
+            // Clean up temp table and partial file on error.
+            cleanup(&self.conn);
+            let _ = std::fs::remove_file(output_path);
+            return Err(e.into());
+        }
+
+        cleanup(&self.conn);
+        Ok(())
     }
 }
 

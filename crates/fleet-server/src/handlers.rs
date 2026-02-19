@@ -685,9 +685,10 @@ fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
     }
 }
 
-/// `POST /api/v1/export` — export query results as CSV.
+/// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.
 ///
 /// Bypasses `max_result_rows` in favor of `max_export_rows` to support larger downloads.
+#[allow(clippy::too_many_lines)]
 pub async fn export(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -698,8 +699,7 @@ pub async fn export(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    // Validate format (only CSV for now).
-    let _format = params.format.unwrap_or(fleet_api::ExportFormat::Csv);
+    let format = params.format.unwrap_or(fleet_api::ExportFormat::Csv);
 
     // Get max_export_rows from state.
     let max_export_rows = state.query.max_export_rows;
@@ -710,12 +710,50 @@ pub async fn export(
         user = %verified.name,
         role = %verified.role,
         query = %req.query,
+        %format,
         limit,
         "executing export"
     );
 
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
+
+    // Parquet export uses DuckDB's native COPY TO — no need to materialize
+    // the result set in memory.
+    if format == fleet_api::ExportFormat::Parquet {
+        let bytes = state
+            .query
+            .pool
+            .export_parquet(&req.query, limit, timeout)
+            .await?;
+        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        tracing::info!(
+            event_type = "export_complete",
+            user = %verified.name,
+            query = %req.query,
+            format = "parquet",
+            bytes = bytes.len(),
+            duration_ms,
+            "parquet export complete"
+        );
+
+        return Ok((
+            [
+                (
+                    header::CONTENT_TYPE,
+                    "application/vnd.apache.parquet".to_owned(),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"export.parquet\"".to_owned(),
+                ),
+            ],
+            bytes,
+        ));
+    }
+
+    // CSV and JSON exports: execute query and render in memory.
     let capture_debug = state.query.query_log.is_some();
     // Exports use UTC — timezone conversion is a display concern for
     // interactive queries, not bulk data exports.
@@ -746,15 +784,27 @@ pub async fn export(
     // Limit rows to max_export_rows.
     let limited = result.paginate(0, limit);
 
-    // Generate CSV.
-    let csv = generate_csv(&limited);
+    let (content_type, filename, body) = match format {
+        fleet_api::ExportFormat::Csv => (
+            "text/csv; charset=utf-8".to_owned(),
+            "attachment; filename=\"export.csv\"".to_owned(),
+            generate_csv(&limited).into_bytes(),
+        ),
+        fleet_api::ExportFormat::Json => (
+            "application/x-ndjson".to_owned(),
+            "attachment; filename=\"export.ndjson\"".to_owned(),
+            generate_ndjson(&limited).into_bytes(),
+        ),
+        fleet_api::ExportFormat::Parquet => unreachable!("handled above"),
+    };
 
     tracing::info!(
         event_type = "export_complete",
         user = %verified.name,
         query = %req.query,
+        %format,
         rows = limited.row_count(),
-        bytes = csv.len(),
+        bytes = body.len(),
         duration_ms,
         "export complete"
     );
@@ -769,16 +819,12 @@ pub async fn export(
         None,
     );
 
-    // Return CSV response with proper headers.
     Ok((
         [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"export.csv\"",
-            ),
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_DISPOSITION, filename),
         ],
-        csv,
+        body,
     ))
 }
 
@@ -924,6 +970,28 @@ fn generate_csv(result: &QueryResult) -> String {
     }
 
     csv
+}
+
+/// Generate newline-delimited JSON from query results.
+///
+/// Each row is serialized as a JSON object with column names as keys.
+/// Values use the custom `Serialize` impl on `Value` which maps directly
+/// to JSON primitives.
+fn generate_ndjson(result: &QueryResult) -> String {
+    let mut buf = String::new();
+    for row in &result.rows {
+        let mut map = serde_json::Map::with_capacity(result.columns.len());
+        for (col, val) in result.columns.iter().zip(row.iter()) {
+            map.insert(
+                col.name.clone(),
+                serde_json::to_value(val).expect("Value serialization is infallible"),
+            );
+        }
+        // serde_json::to_string on a Map is infallible for our Value types.
+        buf.push_str(&serde_json::to_string(&map).expect("Map serialization is infallible"));
+        buf.push('\n');
+    }
+    buf
 }
 
 /// Quote a CSV field if it contains special characters (comma, newline, quote).
@@ -1256,6 +1324,35 @@ mod tests {
     fn value_to_string_does_not_sanitize_numbers() {
         assert_eq!(value_to_string(&Value::Integer(-42)).as_ref(), "-42");
         assert_eq!(value_to_string(&Value::Float(-1.5)).as_ref(), "-1.5");
+    }
+
+    #[test]
+    fn ndjson_generation_produces_valid_output() {
+        let result = QueryResult {
+            columns: vec![
+                fleet_engine::value::Column {
+                    name: "host".to_owned(),
+                },
+                fleet_engine::value::Column {
+                    name: "count".to_owned(),
+                },
+            ],
+            rows: vec![
+                vec![Value::String("web-01".to_owned()), Value::Integer(42)],
+                vec![Value::Null, Value::Float(1.5)],
+            ],
+        };
+        let ndjson = generate_ndjson(&result);
+        let lines: Vec<&str> = ndjson.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+
+        let row0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row0["host"], "web-01");
+        assert_eq!(row0["count"], 42);
+
+        let row1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(row1["host"].is_null());
+        assert_eq!(row1["count"], 1.5);
     }
 
     #[test]

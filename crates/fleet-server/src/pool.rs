@@ -534,6 +534,123 @@ impl ExecutorPool {
         &self.fallback_glob
     }
 
+    /// Export query results to Parquet via `DuckDB` `COPY TO`.
+    ///
+    /// Acquires a pool executor, writes to a temp file, and returns the
+    /// raw bytes. Respects the hot buffer for fresh event visibility.
+    pub async fn export_parquet(
+        &self,
+        dsl: &str,
+        max_rows: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ServerError> {
+        let semaphore = Arc::clone(&self.semaphore);
+        let Ok(permit) = semaphore.acquire_owned().await else {
+            return Err(ServerError::Internal("executor pool shut down".into()));
+        };
+
+        let executor = self.take_executor();
+        let dsl = dsl.to_owned();
+        let base_dir = Arc::clone(&self.base_dir);
+        let fallback_glob = Arc::clone(&self.fallback_glob);
+        let hot_buffer = self.hot_buffer.clone();
+
+        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
+
+        let mut task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _ = interrupt_tx.send(executor.interrupt_handle());
+            let source = compute_source(&base_dir, &dsl, &fallback_glob);
+
+            // Write to a temp file, then read it back as bytes.
+            let tmp = tempfile::NamedTempFile::new()
+                .map_err(|e| ServerError::Internal(format!("failed to create temp file: {e}")))?;
+            let tmp_path = tmp.path().to_owned();
+
+            // Snapshot hot buffer for fresh events.
+            let hot_tempfile = hot_buffer
+                .as_ref()
+                .and_then(|hb| hb.snapshot())
+                .and_then(|f| {
+                    if f.path().to_str().is_some() {
+                        Some(f)
+                    } else {
+                        None
+                    }
+                });
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(ref hot_file) = hot_tempfile {
+                    let hot_path = hot_file.path().to_str().unwrap_or_default();
+                    executor.export_parquet_with_hot(&dsl, &source, hot_path, &tmp_path, max_rows)
+                } else {
+                    executor.export_parquet(&dsl, &source, &tmp_path, max_rows)
+                }
+                .map_err(ServerError::from)
+            }));
+
+            let result = match result {
+                Ok(r) => r,
+                Err(payload) => {
+                    let msg = match payload.downcast_ref::<&str>() {
+                        Some(s) => (*s).to_owned(),
+                        None => match payload.downcast_ref::<String>() {
+                            Some(s) => s.clone(),
+                            None => "unknown panic".to_owned(),
+                        },
+                    };
+                    Err(ServerError::Internal(format!("export panicked: {msg}")))
+                }
+            };
+
+            let bytes = result.and_then(|()| {
+                std::fs::read(&tmp_path).map_err(|e| {
+                    ServerError::Internal(format!("failed to read parquet temp file: {e}"))
+                })
+            });
+
+            Ok::<(Executor, Result<Vec<u8>, ServerError>), ServerError>((executor, bytes))
+        });
+
+        let interrupt = interrupt_rx.await.ok();
+
+        let query_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref handle) = interrupt {
+            let h = Arc::clone(handle);
+            self.active_interrupts
+                .lock()
+                .insert(query_id, Box::new(move || h.interrupt()));
+        }
+
+        let outcome = tokio::select! {
+            join_result = &mut task => {
+                match join_result {
+                    Ok(Ok((executor, result))) => {
+                        self.return_executor(executor);
+                        result
+                    }
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(ServerError::Internal(format!("export task panicked: {e}"))),
+                }
+            }
+            () = tokio::time::sleep(timeout) => {
+                if let Some(handle) = &interrupt {
+                    handle.interrupt();
+                }
+                let idle = Arc::clone(&self.idle);
+                tokio::spawn(async move {
+                    if let Ok(Ok((executor, _))) = task.await {
+                        idle.lock().push(executor);
+                    }
+                });
+                Err(ServerError::Timeout)
+            }
+        };
+
+        self.active_interrupts.lock().remove(&query_id);
+        outcome
+    }
+
     /// Introspect the data source schema.
     ///
     /// Uses a fresh connection rather than a pooled executor since schema

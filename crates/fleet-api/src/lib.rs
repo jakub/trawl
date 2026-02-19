@@ -59,12 +59,18 @@ impl std::str::FromStr for QueryStatus {
 pub enum ExportFormat {
     /// RFC 4180 CSV.
     Csv,
+    /// Newline-delimited JSON (one object per line).
+    Json,
+    /// Apache Parquet (columnar, Snappy-compressed).
+    Parquet,
 }
 
 impl fmt::Display for ExportFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Csv => f.write_str("csv"),
+            Self::Json => f.write_str("json"),
+            Self::Parquet => f.write_str("parquet"),
         }
     }
 }
@@ -401,6 +407,17 @@ mod tests {
     #[test]
     fn export_format_display() {
         assert_eq!(ExportFormat::Csv.to_string(), "csv");
+        assert_eq!(ExportFormat::Json.to_string(), "json");
+        assert_eq!(ExportFormat::Parquet.to_string(), "parquet");
+    }
+
+    #[test]
+    fn export_format_roundtrip() {
+        for fmt in [ExportFormat::Csv, ExportFormat::Json, ExportFormat::Parquet] {
+            let json = serde_json::to_string(&fmt).unwrap();
+            let parsed: ExportFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(fmt, parsed);
+        }
     }
 
     #[test]

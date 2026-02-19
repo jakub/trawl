@@ -1,6 +1,7 @@
 //! CLI mode: query execution, validation, and output formatting.
 
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 
 use clap::ValueEnum;
 use fleet_engine::value::{QueryResult, Value};
@@ -13,6 +14,7 @@ pub enum OutputFormat {
     Table,
     Json,
     Csv,
+    Parquet,
 }
 
 /// Resolved connection parameters (after config + env + CLI override merge).
@@ -27,6 +29,7 @@ pub async fn run_query(
     query: &str,
     data: Option<&str>,
     format: Option<OutputFormat>,
+    output: Option<&Path>,
     conn: Option<ConnectionParams>,
     timezone: &str,
 ) -> Result<(), CliError> {
@@ -38,6 +41,19 @@ pub async fn run_query(
         }
     });
 
+    // Parquet output requires -o flag (binary format can't go to stdout).
+    if format == OutputFormat::Parquet && output.is_none() {
+        return Err(CliError::Usage(
+            "parquet output requires -o/--output flag".into(),
+        ));
+    }
+
+    // Parquet export: use DuckDB's native COPY TO directly.
+    if format == OutputFormat::Parquet {
+        let output_path = output.expect("validated above");
+        return run_parquet_export(query, data, conn.as_ref(), output_path).await;
+    }
+
     let result = if let Some(data) = data {
         run_embedded_mode(data, query, timezone)?
     } else if let Some(conn) = conn {
@@ -48,13 +64,24 @@ pub async fn run_query(
         ));
     };
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    match format {
-        OutputFormat::Table => render_table(&result, &mut out)?,
-        OutputFormat::Json => render_ndjson(&result, &mut out)?,
-        OutputFormat::Csv => render_csv(&result, &mut out)?,
+    // Write to file or stdout.
+    if let Some(output_path) = output {
+        let mut file = std::fs::File::create(output_path)?;
+        match format {
+            OutputFormat::Table => render_table(&result, &mut file)?,
+            OutputFormat::Json => render_ndjson(&result, &mut file)?,
+            OutputFormat::Csv => render_csv(&result, &mut file)?,
+            OutputFormat::Parquet => unreachable!("handled above"),
+        }
+    } else {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        match format {
+            OutputFormat::Table => render_table(&result, &mut out)?,
+            OutputFormat::Json => render_ndjson(&result, &mut out)?,
+            OutputFormat::Csv => render_csv(&result, &mut out)?,
+            OutputFormat::Parquet => unreachable!("handled above"),
+        }
     }
 
     Ok(())
@@ -91,6 +118,32 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
         }
     }
 
+    Ok(())
+}
+
+/// Export query results as parquet (embedded or daemon mode).
+async fn run_parquet_export(
+    query: &str,
+    data: Option<&str>,
+    conn: Option<&ConnectionParams>,
+    output_path: &Path,
+) -> Result<(), CliError> {
+    if let Some(data) = data {
+        // Embedded mode: export directly via DuckDB.
+        let executor = fleet_engine::executor::Executor::new()?;
+        executor.export_parquet(query, data, output_path, usize::MAX)?;
+    } else if let Some(conn) = conn {
+        // Daemon mode: fetch parquet bytes via HTTP export endpoint.
+        let client = make_client(conn)?;
+        let bytes = client
+            .export(query, fleet_client::ExportFormat::Parquet, None)
+            .await?;
+        std::fs::write(output_path, &bytes)?;
+    } else {
+        return Err(CliError::Usage(
+            "provide --url (daemon mode) or --data (embedded mode)".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -234,6 +287,12 @@ pub fn render_driver_results(
         OutputFormat::Table => render_driver_table(columns, rows, out),
         OutputFormat::Json => render_driver_ndjson(columns, rows, out),
         OutputFormat::Csv => render_driver_csv(columns, rows, out),
+        OutputFormat::Parquet => {
+            writeln!(
+                out,
+                "parquet format is not supported for driver output, use -o with fleet query instead"
+            )
+        }
     }
 }
 
