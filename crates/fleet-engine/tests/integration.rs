@@ -360,3 +360,96 @@ fn describe_schema_missing_source() {
     let result = exec.describe_schema("/nonexistent/path/**/*.parquet");
     assert!(result.is_err());
 }
+
+// -- extract kv integration tests -------------------------------------------
+
+/// Create a parquet fixture with kv-style messages and return (executor, glob).
+///
+/// Uses a separate directory so the kv fixture doesn't pollute the main
+/// `fixtures/parquet/**/*.parquet` glob used by other tests.
+fn setup_kv() -> (Executor, String) {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("kv");
+    let path = dir.join("kv_logs.parquet");
+    if !path.exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE kv_logs (timestamp TIMESTAMP, host VARCHAR, message VARCHAR);
+             INSERT INTO kv_logs VALUES
+             ('2024-01-15 10:00:00', 'web01', 'method=GET status=200 path=/api duration=0.045'),
+             ('2024-01-15 10:00:01', 'web01', 'method=POST status=500 path=/api/create duration=1.234'),
+             ('2024-01-15 10:00:02', 'web02', 'method=GET status=200 path=/health duration=0.002'),
+             ('2024-01-15 10:00:03', 'web02', 'method=PUT status=404 path=/api/update duration=0.100'),
+             ('2024-01-15 10:00:04', 'web01', 'method=GET status=301 path=/old duration=0.001');",
+        )
+        .unwrap();
+        conn.execute_batch(&format!(
+            "COPY kv_logs TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+    }
+    let exec = Executor::new().expect("executor should initialize");
+    (exec, format!("{}", path.display()))
+}
+
+#[test]
+fn extract_kv_basic_pipeline() {
+    let (exec, src) = setup_kv();
+    let result = exec
+        .run_query("* | extract kv | head 5", &src, 1000, 0)
+        .unwrap();
+    // Should have original columns + extracted kv columns.
+    let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(col_names.contains(&"method"), "missing extracted 'method'");
+    assert!(col_names.contains(&"status"), "missing extracted 'status'");
+    assert!(col_names.contains(&"path"), "missing extracted 'path'");
+    assert!(
+        col_names.contains(&"duration"),
+        "missing extracted 'duration'"
+    );
+    assert_eq!(result.row_count(), 5);
+}
+
+#[test]
+fn extract_kv_with_where() {
+    let (exec, src) = setup_kv();
+    let result = exec
+        .run_query("* | extract kv | where status >= 400", &src, 1000, 0)
+        .unwrap();
+    // status >= 400: 500 and 404 → 2 rows.
+    assert_eq!(result.row_count(), 2);
+}
+
+#[test]
+fn extract_kv_with_stats() {
+    let (exec, src) = setup_kv();
+    let result = exec
+        .run_query(
+            "* | extract kv | stats count() by method | sort -count",
+            &src,
+            1000,
+            0,
+        )
+        .unwrap();
+    // GET: 3, POST: 1, PUT: 1 → 3 groups.
+    assert_eq!(result.row_count(), 3);
+    let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(col_names.contains(&"method"));
+    assert!(col_names.contains(&"count"));
+}
+
+#[test]
+fn extract_kv_with_search_prefix() {
+    let (exec, src) = setup_kv();
+    let result = exec
+        .run_query("host:web01 | extract kv | head 10", &src, 1000, 0)
+        .unwrap();
+    // web01 has 3 rows.
+    assert_eq!(result.row_count(), 3);
+    let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(col_names.contains(&"method"));
+}
