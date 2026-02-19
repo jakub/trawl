@@ -646,14 +646,22 @@ fn extract_time_metadata(
     let first_time = value_to_string(&result.rows[0][time_col]);
     let last_time = value_to_string(&result.rows[result.rows.len() - 1][time_col]);
 
-    // Derive span from the delta between first two time buckets
+    // Derive span from the minimum non-zero delta between consecutive time buckets.
+    // Using min rather than just the first pair handles sparse data (empty buckets
+    // aren't emitted by time_bucket) and group-by rows sharing the same _time.
     let span = if result.rows.len() >= 2 {
-        let t1 = value_to_string(&result.rows[0][time_col]);
-        let t2 = value_to_string(&result.rows[1][time_col]);
-        match (parse_timestamp_secs(&t1), parse_timestamp_secs(&t2)) {
-            (Some(s1), Some(s2)) => format_duration(s2.saturating_sub(s1)),
-            _ => "?".to_owned(),
+        let mut min_delta: Option<u64> = None;
+        for pair in result.rows.windows(2) {
+            let t1 = value_to_string(&pair[0][time_col]);
+            let t2 = value_to_string(&pair[1][time_col]);
+            if let (Some(s1), Some(s2)) = (parse_timestamp_secs(&t1), parse_timestamp_secs(&t2)) {
+                let delta = s2.saturating_sub(s1);
+                if delta > 0 {
+                    min_delta = Some(min_delta.map_or(delta, |prev| prev.min(delta)));
+                }
+            }
         }
+        min_delta.map_or("?".to_owned(), format_duration)
     } else {
         "N/A".to_owned()
     };
