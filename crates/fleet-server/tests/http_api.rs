@@ -582,7 +582,7 @@ async fn validate_query_unknown_function() {
 
     let resp = client.validate("* | stats unknown_func()").await.unwrap();
     assert!(!resp.valid);
-    assert!(resp.errors.iter().any(|e| e.contains("unknown")));
+    assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
 }
 
 #[tokio::test]

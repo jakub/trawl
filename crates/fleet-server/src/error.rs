@@ -68,42 +68,96 @@ impl ServerError {
     }
 }
 
+/// Convert a `ParseError` into a structured `ErrorDetail`.
+fn parse_error_to_detail(e: &fleet_core::parser::ParseError) -> fleet_api::ErrorDetail {
+    fleet_api::ErrorDetail {
+        message: e.message.clone(),
+        span: Some(fleet_api::ErrorSpan {
+            start: e.span.start,
+            end: e.span.end,
+        }),
+        label: e.label.clone(),
+    }
+}
+
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self {
-            // Parse/emit errors and result-too-large are client mistakes.
-            Self::Engine(
-                EngineError::Parse(_) | EngineError::Emit(_) | EngineError::ResultTooLarge(_),
-            ) => (StatusCode::BAD_REQUEST, self.to_string()),
+        use fleet_api::{ErrorCode, ErrorEnvelope};
+
+        let (status, envelope) = match &self {
+            Self::Engine(EngineError::Parse(errors)) => {
+                let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
+                let message = errors
+                    .first()
+                    .map_or("parse error".to_owned(), |e| e.message.clone());
+                (
+                    StatusCode::BAD_REQUEST,
+                    ErrorEnvelope {
+                        code: ErrorCode::ParseError,
+                        message,
+                        details,
+                    },
+                )
+            }
+            Self::Engine(EngineError::Emit(e)) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::ValidationError, e.to_string()),
+            ),
+            Self::Engine(EngineError::ResultTooLarge(n)) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(
+                    ErrorCode::ResultTooLarge,
+                    format!("result exceeded {n} row limit"),
+                ),
+            ),
             // Database errors are server-side — don't leak details.
             Self::Engine(EngineError::Database(_)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "query execution failed".to_owned(),
+                ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),
             ),
             // Auth errors are deliberately opaque.
-            Self::Auth(_) => (StatusCode::UNAUTHORIZED, "authentication failed".to_owned()),
-            Self::Ingest(msg) | Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
-            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-            Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "query timed out".to_owned()),
+            Self::Auth(_) => (
+                StatusCode::UNAUTHORIZED,
+                ErrorEnvelope::simple(ErrorCode::AuthError, "authentication failed"),
+            ),
+            Self::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                ErrorEnvelope::simple(ErrorCode::Unauthorized, msg.clone()),
+            ),
+            Self::Ingest(msg) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::IngestError, msg.clone()),
+            ),
+            Self::BadRequest(msg) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::BadRequest, msg.clone()),
+            ),
+            Self::NotFound(msg) => (
+                StatusCode::NOT_FOUND,
+                ErrorEnvelope::simple(ErrorCode::NotFound, msg.clone()),
+            ),
+            Self::Timeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                ErrorEnvelope::simple(ErrorCode::Timeout, "query timed out"),
+            ),
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "rate limit exceeded".to_owned(),
+                ErrorEnvelope::simple(ErrorCode::RateLimited, "rate limit exceeded"),
             ),
             Self::TooManyStreams => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "too many concurrent streams".to_owned(),
+                ErrorEnvelope::simple(ErrorCode::TooManyStreams, "too many concurrent streams"),
             ),
             Self::Internal(_) => {
                 tracing::error!(event_type = "internal_error", error = %self, "internal server error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".to_owned(),
+                    ErrorEnvelope::simple(ErrorCode::InternalError, "internal server error"),
                 )
             }
         };
 
-        let body = fleet_api::ErrorResponse { error: message };
+        let body = fleet_api::ErrorResponse { error: envelope };
         (status, axum::Json(body)).into_response()
     }
 }

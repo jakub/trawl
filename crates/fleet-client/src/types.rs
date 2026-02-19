@@ -58,9 +58,9 @@ pub enum StreamEvent {
 
 pub use fleet_api::{
     ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,
-    DeleteSavedResponse, ErrorResponse, ExportFormat, ExportRequest, FieldValuesResponse,
-    HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse, IngestResponse,
-    ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus,
-    SavedQueryResponse, SchemaColumnResponse, SchemaResponse, StatsResponse, UpdateSavedRequest,
-    ValidationResponse,
+    DeleteSavedResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse, ErrorSpan,
+    ExportFormat, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
+    HistoryEntryResponse, HistoryResponse, IngestResponse, ListSavedResponse, PaginationMeta,
+    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, SavedQueryResponse,
+    SchemaColumnResponse, SchemaResponse, StatsResponse, UpdateSavedRequest, ValidationResponse,
 };

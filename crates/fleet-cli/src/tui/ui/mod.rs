@@ -171,6 +171,7 @@ mod tests {
         let mut app = test_app();
         app.tabs[0].status = TabStatus::Error {
             message: "parse error: unexpected token".to_owned(),
+            details: Vec::new(),
         };
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();

@@ -77,11 +77,102 @@ impl fmt::Display for ExportFormat {
 
 // -- error -------------------------------------------------------------------
 
+/// Machine-readable error code for structured error responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// DSL syntax error (carries spans).
+    ParseError,
+    /// Semantic validation failure (unknown function, bad arity).
+    ValidationError,
+    /// Query execution failure (details redacted).
+    ExecutionError,
+    /// Result set exceeded the configured row limit.
+    ResultTooLarge,
+    /// Authentication failure.
+    AuthError,
+    /// Insufficient permissions.
+    Unauthorized,
+    /// Generic malformed input.
+    BadRequest,
+    /// Resource not found.
+    NotFound,
+    /// Query exceeded time limit.
+    Timeout,
+    /// Ingestion validation failure.
+    IngestError,
+    /// Rate limit exceeded (429).
+    RateLimited,
+    /// Too many concurrent SSE streams.
+    TooManyStreams,
+    /// Internal server error (500).
+    InternalError,
+}
+
+/// Source location within a query string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorSpan {
+    /// Byte offset of the start of the error region.
+    pub start: usize,
+    /// Byte offset of the end of the error region.
+    pub end: usize,
+}
+
+/// A single diagnostic detail within a structured error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    /// Human-readable description of this specific error.
+    pub message: String,
+    /// Source span within the query text (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<ErrorSpan>,
+    /// Parser context label (e.g. "pipeline", "expression").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl fmt::Display for ErrorDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ref span) = self.span {
+            write!(f, "[{}..{}] {}", span.start, span.end, self.message)?;
+        } else {
+            write!(f, "{}", self.message)?;
+        }
+        if let Some(ref label) = self.label {
+            write!(f, " (while parsing {label})")?;
+        }
+        Ok(())
+    }
+}
+
+/// Structured error envelope with machine-readable code and optional diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorEnvelope {
+    /// Machine-readable error category.
+    pub code: ErrorCode,
+    /// Human-readable summary message.
+    pub message: String,
+    /// Detailed diagnostics (spans, sub-errors). Empty for spanless errors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<ErrorDetail>,
+}
+
+impl ErrorEnvelope {
+    /// Create a simple envelope with no diagnostic details.
+    pub fn simple(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details: Vec::new(),
+        }
+    }
+}
+
 /// Standard error response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
-    /// Human-readable error message.
-    pub error: String,
+    /// Structured error envelope.
+    pub error: ErrorEnvelope,
 }
 
 // -- request types -----------------------------------------------------------
@@ -203,8 +294,8 @@ pub struct PaginationMeta {
 pub struct ValidationResponse {
     /// Whether the query is valid.
     pub valid: bool,
-    /// Validation error messages (empty if valid).
-    pub errors: Vec<String>,
+    /// Validation error details with optional span info (empty if valid).
+    pub errors: Vec<ErrorDetail>,
 }
 
 // -- queries (active/recent) -------------------------------------------------
@@ -423,10 +514,56 @@ mod tests {
     #[test]
     fn error_response_roundtrip() {
         let resp = ErrorResponse {
-            error: "something broke".into(),
+            error: ErrorEnvelope::simple(ErrorCode::InternalError, "something broke"),
         };
         let rt = roundtrip(&resp);
-        assert_eq!(rt.error, "something broke");
+        assert_eq!(rt.error.code, ErrorCode::InternalError);
+        assert_eq!(rt.error.message, "something broke");
+        assert!(rt.error.details.is_empty());
+    }
+
+    #[test]
+    fn error_envelope_with_details_roundtrip() {
+        let resp = ErrorResponse {
+            error: ErrorEnvelope {
+                code: ErrorCode::ParseError,
+                message: "parse error".into(),
+                details: vec![ErrorDetail {
+                    message: "expected pipe stage".into(),
+                    span: Some(ErrorSpan { start: 15, end: 21 }),
+                    label: Some("pipeline".into()),
+                }],
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"parse_error\""));
+        assert!(json.contains("\"start\":15"));
+        let rt: ErrorResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.error.details.len(), 1);
+        assert_eq!(rt.error.details[0].span.as_ref().unwrap().start, 15);
+    }
+
+    #[test]
+    fn error_code_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ParseError).unwrap(),
+            "\"parse_error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ResultTooLarge).unwrap(),
+            "\"result_too_large\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::TooManyStreams).unwrap(),
+            "\"too_many_streams\""
+        );
+    }
+
+    #[test]
+    fn error_envelope_simple_omits_empty_details() {
+        let envelope = ErrorEnvelope::simple(ErrorCode::Timeout, "query timed out");
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(!json.contains("details"));
     }
 
     #[test]

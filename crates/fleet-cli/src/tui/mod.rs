@@ -44,13 +44,22 @@ fn clipboard_set(text: &str) {
     }
 }
 
+/// Error from an async query execution.
+#[derive(Debug)]
+struct QueryError {
+    /// Human-readable error message.
+    message: String,
+    /// Structured error details with optional span info.
+    details: Vec<fleet_client::ErrorDetail>,
+}
+
 /// Result of an async query execution.
 #[derive(Debug)]
 struct QueryResult {
     /// Index of the tab that requested the query.
     tab_idx: usize,
     /// Query execution result.
-    result: Result<QueryResponse, String>,
+    result: Result<QueryResponse, QueryError>,
     /// Execution duration.
     duration: Duration,
 }
@@ -208,7 +217,10 @@ impl App {
             let result = client
                 .query_paginated_tz(&query, None, None, Some(timezone))
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| QueryError {
+                    message: e.to_string(),
+                    details: e.error_details().to_vec(),
+                });
             let duration = start.elapsed();
             tracing::info!(
                 "query completed in {:?}, result: {:?}",
@@ -234,6 +246,7 @@ impl App {
             handle.abort();
             tab.status = TabStatus::Error {
                 message: "cancelled".to_owned(),
+                details: Vec::new(),
             };
             tracing::info!("query cancelled by user");
         }
@@ -356,7 +369,7 @@ impl App {
                         let _ = waiter.reply.send(DriverResponse::ok_with(data));
                     }
                 }
-                Err(ref message) => {
+                Err(ref err) => {
                     // Notify driver execute waiter of failure.
                     if self
                         .driver_execute_waiter
@@ -364,10 +377,11 @@ impl App {
                         .is_some_and(|w| w.tab_idx == query_result.tab_idx)
                     {
                         let waiter = self.driver_execute_waiter.take().unwrap();
-                        let _ = waiter.reply.send(DriverResponse::err(message));
+                        let _ = waiter.reply.send(DriverResponse::err(&err.message));
                     }
                     tab.status = TabStatus::Error {
-                        message: message.clone(),
+                        message: err.message.clone(),
+                        details: err.details.clone(),
                     };
                 }
             }
@@ -1311,7 +1325,10 @@ impl App {
                     tracing::error!("failed to start stream: {e}");
                     let _ = tx.send(QueryResult {
                         tab_idx,
-                        result: Err(e.to_string()),
+                        result: Err(QueryError {
+                            message: e.to_string(),
+                            details: e.error_details().to_vec(),
+                        }),
                         duration: Duration::from_secs(0),
                     });
                     return;
@@ -2197,7 +2214,10 @@ mod tests {
         app.query_tx
             .send(QueryResult {
                 tab_idx: 0,
-                result: Err("something broke".to_owned()),
+                result: Err(QueryError {
+                    message: "something broke".to_owned(),
+                    details: Vec::new(),
+                }),
                 duration: Duration::from_millis(10),
             })
             .unwrap();
@@ -2206,7 +2226,7 @@ mod tests {
 
         assert!(matches!(
             app.tabs[0].status,
-            TabStatus::Error { ref message } if message == "something broke"
+            TabStatus::Error { ref message, .. } if message == "something broke"
         ));
     }
 

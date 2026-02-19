@@ -28,7 +28,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             format!("success ({duration_ms}ms)"),
             Style::default().fg(Color::Green),
         ),
-        TabStatus::Error { message } => {
+        TabStatus::Error { message, .. } => {
             Span::styled(format!("error: {message}"), Style::default().fg(Color::Red))
         }
     };

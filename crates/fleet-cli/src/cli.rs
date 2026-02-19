@@ -55,9 +55,23 @@ pub async fn run_query(
     }
 
     let result = if let Some(data) = data {
-        run_embedded_mode(data, query, timezone)?
+        match run_embedded_mode(data, query, timezone) {
+            Ok(r) => r,
+            Err(CliError::Engine(ref engine_err)) => {
+                render_engine_error(query, engine_err);
+                return Err(CliError::Usage("query failed".into()));
+            }
+            Err(e) => return Err(e),
+        }
     } else if let Some(conn) = conn {
-        run_daemon_mode(&conn, query, timezone).await?
+        match run_daemon_mode(&conn, query, timezone).await {
+            Ok(r) => r,
+            Err(CliError::Client(ref client_err)) => {
+                render_client_error(query, client_err);
+                return Err(CliError::Usage("query failed".into()));
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         return Err(CliError::Usage(
             "provide --url (daemon mode) or --data (embedded mode)".into(),
@@ -100,9 +114,7 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
         if response.valid {
             println!("valid");
         } else {
-            for err in &response.errors {
-                eprintln!("{err}");
-            }
+            render_error_details(query, &response.errors);
             return Err(CliError::Usage("query validation failed".into()));
         }
     } else {
@@ -110,9 +122,8 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
         match fleet_core::parser::parse(query) {
             Ok(_) => println!("valid"),
             Err(errors) => {
-                for err in &errors {
-                    eprintln!("{err}");
-                }
+                let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
+                render_error_details(query, &details);
                 return Err(CliError::Usage("query validation failed".into()));
             }
         }
@@ -270,6 +281,96 @@ fn csv_escape_string(s: &str) -> String {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s
+    }
+}
+
+// -- error rendering ----------------------------------------------------------
+
+/// Convert a `ParseError` to an `ErrorDetail` for display.
+fn parse_error_to_detail(e: &fleet_core::parser::ParseError) -> fleet_client::ErrorDetail {
+    fleet_client::ErrorDetail {
+        message: e.message.clone(),
+        span: Some(fleet_client::ErrorSpan {
+            start: e.span.start,
+            end: e.span.end,
+        }),
+        label: e.label.clone(),
+    }
+}
+
+/// Render structured error details with rustc-style caret underlines to stderr.
+///
+/// For each detail with a span, shows the query text with the error region
+/// underlined:
+/// ```text
+///   level:error | staats count() by host
+///                 ~~~~~~
+///   expected pipe stage
+/// ```
+pub fn render_error_details(query: &str, details: &[fleet_client::ErrorDetail]) {
+    for detail in details {
+        if let Some(ref span) = detail.span {
+            render_span_error(query, span.start, span.end, &detail.message);
+        } else {
+            eprintln!("  {}", detail.message);
+        }
+        eprintln!();
+    }
+}
+
+/// Render a single span error with caret underline.
+fn render_span_error(query: &str, start: usize, end: usize, message: &str) {
+    // Clamp to valid byte boundaries.
+    let start = start.min(query.len());
+    let end = end.min(query.len()).max(start);
+
+    // Find the line containing the span start.
+    let mut line_start = 0;
+    let mut line_end = query.len();
+    for (i, ch) in query.char_indices() {
+        if ch == '\n' {
+            if i < start {
+                line_start = i + 1;
+            }
+            if i >= end && line_end == query.len() {
+                line_end = i;
+            }
+        }
+    }
+
+    let line = &query[line_start..line_end];
+    let col_start = start - line_start;
+    let col_end = (end - line_start).min(line.len());
+    let underline_len = (col_end - col_start).max(1);
+
+    eprintln!();
+    eprintln!("  {line}");
+    eprintln!("  {}{}", " ".repeat(col_start), "~".repeat(underline_len));
+    eprintln!("  {message}");
+}
+
+/// Render a `ClientError` with span details (if available) for CLI output.
+pub fn render_client_error(query: &str, err: &fleet_client::ClientError) {
+    let details = err.error_details();
+    if details.is_empty() {
+        eprintln!("fleet: {err}");
+    } else {
+        if let Some(envelope) = err.error_envelope() {
+            eprintln!("fleet: {:?}: {}", envelope.code, envelope.message);
+        }
+        render_error_details(query, details);
+    }
+}
+
+/// Render an `EngineError` with span details for embedded mode.
+pub fn render_engine_error(query: &str, err: &fleet_engine::error::EngineError) {
+    match err {
+        fleet_engine::error::EngineError::Parse(errors) => {
+            eprintln!("fleet: parse error");
+            let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
+            render_error_details(query, &details);
+        }
+        other => eprintln!("fleet: {other}"),
     }
 }
 

@@ -171,6 +171,8 @@ pub enum TabStatus {
     Error {
         /// Error message.
         message: String,
+        /// Structured error details with optional span info.
+        details: Vec<fleet_client::ErrorDetail>,
     },
 }
 

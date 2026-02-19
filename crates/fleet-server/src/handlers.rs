@@ -420,7 +420,17 @@ pub async fn validate_query(
         })),
         Err(errors) => Ok(Json(ValidationResponse {
             valid: false,
-            errors: errors.into_iter().map(|e| e.to_string()).collect(),
+            errors: errors
+                .iter()
+                .map(|e| fleet_api::ErrorDetail {
+                    message: e.message.clone(),
+                    span: Some(fleet_api::ErrorSpan {
+                        start: e.span.start,
+                        end: e.span.end,
+                    }),
+                    label: e.label.clone(),
+                })
+                .collect(),
         })),
     }
 }

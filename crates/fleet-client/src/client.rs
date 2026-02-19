@@ -438,11 +438,16 @@ impl HttpClient {
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let message = resp
-            .json::<ErrorResponse>()
-            .await
-            .map_or_else(|_| "unknown error".into(), |e| e.error);
-        return Err(ClientError::Server { status, message });
+        let error = resp.json::<ErrorResponse>().await.map_or_else(
+            |_| {
+                fleet_api::ErrorEnvelope::simple(
+                    fleet_api::ErrorCode::InternalError,
+                    "unknown error",
+                )
+            },
+            |e| e.error,
+        );
+        return Err(ClientError::Server { status, error });
     }
     Ok(resp)
 }

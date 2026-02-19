@@ -46,6 +46,12 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 render_table(app, frame, results_area, response);
             }
         }
+    } else if let crate::tui::state::TabStatus::Error {
+        ref message,
+        ref details,
+    } = tab.status
+    {
+        render_error_display(app, frame, results_area, tab, message, details);
     } else {
         render_placeholder(app, frame, results_area);
     }
@@ -292,6 +298,128 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let text = Line::from("no results yet — execute a query with F5");
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
+}
+
+/// Render error details with span highlighting in the results pane.
+///
+/// Shows the error message in red, then the query text with the error
+/// span underlined and a caret line below it.
+#[allow(clippy::too_many_arguments)]
+fn render_error_display(
+    app: &App,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    tab: &crate::tui::state::Tab,
+    message: &str,
+    details: &[fleet_client::ErrorDetail],
+) {
+    let border_style = if app.focus == Focus::Results && app.sidebar.is_none() {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Error ")
+        .border_style(border_style)
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let query_text = tab.editor.text();
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // Error message header.
+    lines.push(Line::from(Span::styled(
+        format!("error: {message}"),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if details.is_empty() || query_text.is_empty() {
+        // No span info — just show the message.
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
+        return;
+    }
+
+    // Render each detail with span highlighting.
+    for detail in details {
+        if let Some(ref span) = detail.span {
+            let start = span.start.min(query_text.len());
+            let end = span.end.min(query_text.len()).max(start);
+
+            // Find the line containing the span.
+            let mut line_start = 0;
+            let mut line_end = query_text.len();
+            for (i, ch) in query_text.char_indices() {
+                if ch == '\n' {
+                    if i < start {
+                        line_start = i + 1;
+                    }
+                    if i >= end && line_end == query_text.len() {
+                        line_end = i;
+                    }
+                }
+            }
+
+            let query_line = &query_text[line_start..line_end];
+            let col_start = start - line_start;
+            let col_end = (end - line_start).min(query_line.len());
+            let underline_len = (col_end - col_start).max(1);
+
+            // Query text with error span highlighted.
+            let before = &query_line[..col_start];
+            let error_region = &query_line[col_start..col_end];
+            let after = &query_line[col_end..];
+
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(before.to_owned(), Style::default().fg(Color::White)),
+                Span::styled(
+                    error_region.to_owned(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::styled(after.to_owned(), Style::default().fg(Color::White)),
+            ]));
+
+            // Caret line.
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::raw(" ".repeat(col_start)),
+                Span::styled("^".repeat(underline_len), Style::default().fg(Color::Red)),
+            ]));
+
+            // Detail message.
+            lines.push(Line::from(Span::styled(
+                format!("  {}", detail.message),
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            if let Some(ref label) = detail.label {
+                lines.push(Line::from(Span::styled(
+                    format!("  while parsing: {label}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            lines.push(Line::from(""));
+        } else {
+            // No span — just the message.
+            lines.push(Line::from(Span::styled(
+                format!("  {}", detail.message),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
 }
 
 /// Render sparkline visualization for timechart results.
