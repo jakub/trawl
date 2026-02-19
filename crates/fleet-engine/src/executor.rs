@@ -54,7 +54,11 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit(&ast, source)?;
-        self.execute_emitted(&emitted, max_rows, utc_offset_secs)
+        let mut result = self.execute_emitted(&emitted, max_rows, utc_offset_secs)?;
+        if !emitted.rust_stages.is_empty() {
+            result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
+        }
+        Ok(result)
     }
 
     /// Full pipeline with hot buffer: parse DSL, emit composite SQL, execute.
@@ -76,9 +80,9 @@ impl Executor {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
         let result = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
-        match &result {
+        let mut result = match &result {
             // Columns present → real result (possibly empty rows). Return as-is.
-            Ok(r) if !r.columns.is_empty() => result,
+            Ok(r) if !r.columns.is_empty() => result?,
             // No columns (no parquet source files), database error (UNION
             // fails on missing source), or binder error remapped to Emit
             // (column not found in empty parquet) → fall back to hot-only.
@@ -88,12 +92,16 @@ impl Executor {
                 match self.execute_emitted(&hot_emitted, max_rows, utc_offset_secs) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
-                    Err(EngineError::Emit(_)) => Ok(QueryResult::empty()),
-                    other => other,
+                    Err(EngineError::Emit(_)) => QueryResult::empty(),
+                    other => other?,
                 }
             }
-            Err(_) => result,
+            Err(_) => result?,
+        };
+        if !emitted.rust_stages.is_empty() {
+            result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
         }
+        Ok(result)
     }
 
     /// Execute a pre-emitted query (SQL + params) against `DuckDB`.
