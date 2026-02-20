@@ -82,13 +82,73 @@ pub enum Focus {
     Results,
 }
 
+/// A profiled column from a service sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfiledColumn {
+    /// Column name.
+    pub name: String,
+    /// `DuckDB` data type string (from schema cache).
+    pub data_type: String,
+    /// Number of non-null values in the sample.
+    pub non_null_count: usize,
+    /// Total rows sampled.
+    pub total_rows: usize,
+    /// Up to 8 distinct sample values (stringified).
+    pub sample_values: Vec<String>,
+}
+
+impl ProfiledColumn {
+    /// Population percentage (0-100).
+    #[allow(clippy::cast_possible_truncation)] // .min(100) guarantees value fits in u8
+    pub fn population_pct(&self) -> u8 {
+        if self.total_rows == 0 {
+            return 0;
+        }
+        ((self.non_null_count * 100) / self.total_rows).min(100) as u8
+    }
+}
+
+/// State machine for the schema browser's two-level hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaView {
+    /// Top-level: list of service names.
+    ServiceList {
+        /// Available service names.
+        services: Vec<String>,
+        /// Currently selected index.
+        selected: usize,
+    },
+    /// Waiting for background query to return sample data.
+    Loading {
+        /// Service being profiled.
+        service: String,
+    },
+    /// Per-service column profile view.
+    ServiceDetail {
+        /// Service name.
+        service: String,
+        /// Profiled columns (only populated ones, sorted by population desc).
+        columns: Vec<ProfiledColumn>,
+        /// Currently selected column index.
+        selected: usize,
+        /// Scroll offset.
+        scroll: usize,
+        /// Which field index has sample values expanded (toggle).
+        expanded: Option<usize>,
+        /// Total rows in the sample.
+        total_rows: usize,
+        /// Total columns in the global schema (for "12/18 fields" display).
+        total_schema_columns: usize,
+    },
+}
+
 /// Active sidebar overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sidebar {
     /// Help overlay (F1).
     Help { scroll: usize },
     /// Schema browser (F2).
-    Schema { scroll: usize },
+    Schema(SchemaView),
     /// Query history (F3).
     History,
     /// Saved queries (F4).
@@ -101,7 +161,7 @@ impl Sidebar {
         matches!(
             (self, other),
             (Self::Help { .. }, Self::Help { .. })
-                | (Self::Schema { .. }, Self::Schema { .. })
+                | (Self::Schema(_), Self::Schema(_))
                 | (Self::History, Self::History)
                 | (Self::Saved, Self::Saved)
         )

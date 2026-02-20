@@ -46,7 +46,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     if let Some(ref sidebar) = app.sidebar {
         match sidebar {
             Sidebar::Help { scroll } => help::render(app, frame, *scroll),
-            Sidebar::Schema { scroll } => schema::render(app, frame, *scroll),
+            Sidebar::Schema(view) => schema::render(app, frame, view),
             Sidebar::History => history::render(app, frame),
             Sidebar::Saved => saved::render(app, frame),
         }

@@ -73,13 +73,19 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 /// Generate context-sensitive keybinding hints.
 fn get_context_hints(app: &App) -> String {
-    use crate::tui::state::Sidebar;
+    use crate::tui::state::{SchemaView, Sidebar};
 
     // If sidebar is open, show sidebar-specific hints
     if let Some(ref sidebar) = app.sidebar {
         return match sidebar {
             Sidebar::Help { .. } => "↑↓/PgUp/PgDn: scroll | esc: close help".to_owned(),
-            Sidebar::Schema { .. } => "↑↓/PgUp/PgDn: scroll | esc: close schema".to_owned(),
+            Sidebar::Schema(SchemaView::ServiceList { .. }) => {
+                "↑↓: select | enter: drill | esc: close".to_owned()
+            }
+            Sidebar::Schema(SchemaView::Loading { .. }) => "loading... | esc: close".to_owned(),
+            Sidebar::Schema(SchemaView::ServiceDetail { .. }) => {
+                "↑↓: select | enter: insert | space: values | esc: back".to_owned()
+            }
             Sidebar::History => "↑↓: navigate | enter: load query | esc: close".to_owned(),
             Sidebar::Saved => {
                 "↑↓: navigate | enter: load | backspace: delete | esc: close".to_owned()

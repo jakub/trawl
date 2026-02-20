@@ -27,7 +27,8 @@ use self::driver::{
     query_response_to_data,
 };
 use self::state::{
-    ChartView, Focus, LiveBuffer, Popup, ResultsSearch, Sidebar, SimpleEditor, Tab, TabStatus,
+    ChartView, Focus, LiveBuffer, Popup, ProfiledColumn, ResultsSearch, SchemaView, Sidebar,
+    SimpleEditor, Tab, TabStatus,
 };
 use crate::CliError;
 use crate::config::Config;
@@ -41,6 +42,95 @@ fn clipboard_get() -> Option<String> {
 fn clipboard_set(text: &str) {
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(text.to_owned());
+    }
+}
+
+/// Analyze query results to compute per-column non-null counts and sample values.
+///
+/// Only columns with at least one non-null value are included. Results are
+/// sorted by population count descending, then name ascending.
+fn profile_columns(
+    response: &QueryResponse,
+    schema_columns: &[(String, String)],
+) -> Vec<ProfiledColumn> {
+    use std::collections::{HashMap, HashSet};
+
+    let total_rows = response.result.rows.len();
+    let col_names: Vec<&str> = response
+        .result
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+
+    let type_map: HashMap<&str, &str> = schema_columns
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+
+    let mut profiled: Vec<ProfiledColumn> = Vec::new();
+
+    for (col_idx, col_name) in col_names.iter().enumerate() {
+        let mut non_null = 0usize;
+        let mut seen_values: Vec<String> = Vec::new();
+        let mut seen_set: HashSet<String> = HashSet::new();
+
+        for row in &response.result.rows {
+            if let Some(val) = row.get(col_idx) {
+                if *val != fleet_engine::value::Value::Null {
+                    non_null += 1;
+                    if seen_set.len() < 8 {
+                        let s = value_display(val);
+                        if seen_set.insert(s.clone()) {
+                            seen_values.push(s);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Skip columns that are entirely null for this service.
+        if non_null == 0 {
+            continue;
+        }
+
+        let data_type = type_map.get(col_name).unwrap_or(&"UNKNOWN").to_string();
+
+        profiled.push(ProfiledColumn {
+            name: (*col_name).to_string(),
+            data_type,
+            non_null_count: non_null,
+            total_rows,
+            sample_values: seen_values,
+        });
+    }
+
+    // Sort by population descending, then name ascending for ties.
+    profiled.sort_by(|a, b| {
+        b.non_null_count
+            .cmp(&a.non_null_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    profiled
+}
+
+/// Format a value for display as a sample value string.
+fn value_display(v: &fleet_engine::value::Value) -> String {
+    use fleet_engine::value::Value;
+    match v {
+        Value::Null => "NULL".to_owned(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => format!("{f:.2}"),
+        Value::String(s) => {
+            if s.len() > 30 {
+                format!("{}...", &s[..27])
+            } else {
+                s.clone()
+            }
+        }
+        Value::Array(arr) => format!("[{} items]", arr.len()),
     }
 }
 
@@ -79,6 +169,15 @@ enum MutationResult {
     },
     /// Mutation failed.
     Error { message: String },
+}
+
+/// Result of a background schema profiling query.
+#[derive(Debug)]
+struct SchemaProfileResult {
+    /// Service that was profiled.
+    service: String,
+    /// Profiled columns + total rows, or error message.
+    result: Result<(Vec<ProfiledColumn>, usize), String>,
 }
 
 /// Main TUI application state.
@@ -127,6 +226,14 @@ pub struct App {
     mutation_rx: mpsc::UnboundedReceiver<MutationResult>,
     /// Sender for mutation operations.
     mutation_tx: mpsc::UnboundedSender<MutationResult>,
+    /// Cached service list (fetched at startup via `field_values("service")`).
+    pub service_list_cache: Option<Vec<String>>,
+    /// Per-service profiled column cache (populated on drill-in).
+    schema_profile_cache: std::collections::HashMap<String, Vec<ProfiledColumn>>,
+    /// Channel for receiving schema profile results from background tasks.
+    schema_profile_rx: mpsc::UnboundedReceiver<SchemaProfileResult>,
+    /// Sender for schema profile background tasks.
+    schema_profile_tx: mpsc::UnboundedSender<SchemaProfileResult>,
     /// Channel for receiving driver commands from the unix socket.
     driver_rx: Option<mpsc::UnboundedReceiver<DriverCommand>>,
     /// Path to the driver socket (for cleanup on exit).
@@ -141,6 +248,7 @@ impl App {
     pub fn new(client: HttpClient) -> Self {
         let (query_tx, query_rx) = mpsc::unbounded_channel();
         let (mutation_tx, mutation_rx) = mpsc::unbounded_channel();
+        let (schema_profile_tx, schema_profile_rx) = mpsc::unbounded_channel();
 
         Self {
             client,
@@ -165,6 +273,10 @@ impl App {
             query_tx,
             mutation_rx,
             mutation_tx,
+            service_list_cache: None,
+            schema_profile_cache: std::collections::HashMap::new(),
+            schema_profile_rx,
+            schema_profile_tx,
             driver_rx: None,
             driver_socket_path: None,
             driver_execute_waiter: None,
@@ -411,7 +523,18 @@ impl App {
             }
             // Toggle schema: F2
             (KeyModifiers::NONE, KeyCode::F(2)) => {
-                self.toggle_sidebar(Sidebar::Schema { scroll: 0 });
+                let view = if let Some(services) = &self.service_list_cache {
+                    SchemaView::ServiceList {
+                        services: services.clone(),
+                        selected: 0,
+                    }
+                } else {
+                    SchemaView::ServiceList {
+                        services: Vec::new(),
+                        selected: 0,
+                    }
+                };
+                self.toggle_sidebar(Sidebar::Schema(view));
                 return;
             }
             // Toggle history: F3
@@ -429,8 +552,14 @@ impl App {
                 self.toggle_live_mode();
                 return;
             }
-            // Close sidebar: Esc (if sidebar is open)
-            (KeyModifiers::NONE, KeyCode::Esc) if self.sidebar.is_some() => {
+            // Close sidebar: Esc (if sidebar is open, but NOT in ServiceDetail — that uses Esc for back)
+            (KeyModifiers::NONE, KeyCode::Esc)
+                if self.sidebar.is_some()
+                    && !matches!(
+                        self.sidebar,
+                        Some(Sidebar::Schema(SchemaView::ServiceDetail { .. }))
+                    ) =>
+            {
                 self.sidebar = None;
                 return;
             }
@@ -496,7 +625,7 @@ impl App {
                     self.handle_help_key(key);
                     return;
                 }
-                Sidebar::Schema { .. } => {
+                Sidebar::Schema(_) => {
                     self.handle_schema_key(key);
                     return;
                 }
@@ -1046,28 +1175,198 @@ impl App {
     }
 
     /// Handle key events when schema sidebar is focused.
+    #[allow(clippy::too_many_lines)]
     fn handle_schema_key(&mut self, key: event::KeyEvent) {
-        if let Some(Sidebar::Schema { ref mut scroll }) = self.sidebar {
-            match (key.modifiers, key.code) {
+        let Some(Sidebar::Schema(ref mut view)) = self.sidebar else {
+            return;
+        };
+
+        match view {
+            SchemaView::ServiceList { services, selected } => match (key.modifiers, key.code) {
                 (KeyModifiers::NONE, KeyCode::Up) => {
-                    *scroll = scroll.saturating_sub(1);
+                    *selected = selected.saturating_sub(1);
                 }
                 (KeyModifiers::NONE, KeyCode::Down) => {
-                    *scroll = scroll.saturating_add(1);
+                    if !services.is_empty() {
+                        *selected = (*selected + 1).min(services.len() - 1);
+                    }
                 }
-                (KeyModifiers::NONE, KeyCode::PageUp) => {
-                    *scroll = scroll.saturating_sub(10);
-                }
-                (KeyModifiers::NONE, KeyCode::PageDown) => {
-                    *scroll = scroll.saturating_add(10);
-                }
-                (KeyModifiers::NONE, KeyCode::Home) => {
-                    *scroll = 0;
-                }
+                (KeyModifiers::NONE, KeyCode::Home) => *selected = 0,
                 (KeyModifiers::NONE, KeyCode::End) => {
-                    *scroll = usize::MAX;
+                    *selected = services.len().saturating_sub(1);
+                }
+                (KeyModifiers::NONE, KeyCode::Enter) => {
+                    if let Some(svc) = services.get(*selected).cloned() {
+                        self.drill_into_service(svc);
+                    }
                 }
                 _ => {}
+            },
+            SchemaView::Loading { .. } => {
+                // No-op while loading (Esc falls through to global handler)
+            }
+            SchemaView::ServiceDetail {
+                columns,
+                selected,
+                expanded,
+                service,
+                ..
+            } => match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Up) => {
+                    *selected = selected.saturating_sub(1);
+                }
+                (KeyModifiers::NONE, KeyCode::Down) => {
+                    if !columns.is_empty() {
+                        *selected = (*selected + 1).min(columns.len() - 1);
+                    }
+                }
+                (KeyModifiers::NONE, KeyCode::PageUp) => {
+                    *selected = selected.saturating_sub(10);
+                }
+                (KeyModifiers::NONE, KeyCode::PageDown) => {
+                    if !columns.is_empty() {
+                        *selected = (*selected + 10).min(columns.len() - 1);
+                    }
+                }
+                (KeyModifiers::NONE, KeyCode::Home) => *selected = 0,
+                (KeyModifiers::NONE, KeyCode::End) => {
+                    *selected = columns.len().saturating_sub(1);
+                }
+                // Enter: insert field name at cursor in editor
+                (KeyModifiers::NONE, KeyCode::Enter) => {
+                    if let Some(col) = columns.get(*selected) {
+                        let name = col.name.clone();
+                        self.tabs[self.active_tab_idx].editor.insert_text(&name);
+                    }
+                }
+                // Space: toggle sample values expansion
+                (KeyModifiers::NONE, KeyCode::Char(' ')) => {
+                    if *expanded == Some(*selected) {
+                        *expanded = None;
+                    } else {
+                        *expanded = Some(*selected);
+                    }
+                }
+                // Esc/Backspace: back to service list
+                (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Backspace) => {
+                    let svc = service.clone();
+                    let services = self.service_list_cache.clone().unwrap_or_default();
+                    let idx = services.iter().position(|s| *s == svc).unwrap_or(0);
+                    self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceList {
+                        services,
+                        selected: idx,
+                    }));
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Drill into a service: check cache or spawn background profiling query.
+    fn drill_into_service(&mut self, service: String) {
+        // Check cache first.
+        if let Some(cached) = self.schema_profile_cache.get(&service) {
+            let total_schema_columns = self.schema_cache.as_ref().map_or(0, |s| s.columns.len());
+            let total_rows = cached.first().map_or(0, |c| c.total_rows);
+            self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceDetail {
+                service,
+                columns: cached.clone(),
+                selected: 0,
+                scroll: 0,
+                expanded: None,
+                total_rows,
+                total_schema_columns,
+            }));
+            return;
+        }
+
+        // Set loading state.
+        self.sidebar = Some(Sidebar::Schema(SchemaView::Loading {
+            service: service.clone(),
+        }));
+
+        // Spawn background query.
+        let client = self.client.clone();
+        let tx = self.schema_profile_tx.clone();
+        let schema_columns: Vec<(String, String)> =
+            self.schema_cache.as_ref().map_or_else(Vec::new, |s| {
+                s.columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect()
+            });
+        let svc = service;
+
+        tokio::spawn(async move {
+            // Quote service name if it contains spaces or special chars.
+            let query = if svc.contains(' ') || svc.contains('"') {
+                format!(r#"service:"{}" | head 100"#, svc.replace('"', r#"\""#))
+            } else {
+                format!("service:{svc} | head 100")
+            };
+
+            let result = client.query_paginated(&query, None, None).await;
+
+            let profiled = match result {
+                Ok(response) => {
+                    let total_rows = response.result.rows.len();
+                    let columns = profile_columns(&response, &schema_columns);
+                    Ok((columns, total_rows))
+                }
+                Err(e) => Err(e.to_string()),
+            };
+
+            let _ = tx.send(SchemaProfileResult {
+                service: svc,
+                result: profiled,
+            });
+        });
+    }
+
+    /// Poll for schema profile results from background tasks.
+    fn poll_schema_profiles(&mut self) {
+        while let Ok(result) = self.schema_profile_rx.try_recv() {
+            match result.result {
+                Ok((columns, total_rows)) => {
+                    // Cache the result.
+                    self.schema_profile_cache
+                        .insert(result.service.clone(), columns.clone());
+
+                    let total_schema_columns =
+                        self.schema_cache.as_ref().map_or(0, |s| s.columns.len());
+
+                    // If we're still in Loading state for this service, transition.
+                    if matches!(
+                        self.sidebar,
+                        Some(Sidebar::Schema(SchemaView::Loading { ref service }))
+                        if *service == result.service
+                    ) {
+                        self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceDetail {
+                            service: result.service,
+                            columns,
+                            selected: 0,
+                            scroll: 0,
+                            expanded: None,
+                            total_rows,
+                            total_schema_columns,
+                        }));
+                    }
+                }
+                Err(msg) => {
+                    tracing::error!("schema profile failed for {}: {}", result.service, msg);
+                    // Go back to service list on error.
+                    if matches!(
+                        self.sidebar,
+                        Some(Sidebar::Schema(SchemaView::Loading { ref service }))
+                        if *service == result.service
+                    ) {
+                        let services = self.service_list_cache.clone().unwrap_or_default();
+                        self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceList {
+                            services,
+                            selected: 0,
+                        }));
+                    }
+                }
             }
         }
     }
@@ -1656,12 +1955,13 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Fetch schema, history, and saved queries in parallel (non-blocking startup).
-    tracing::info!("fetching schema, history, and saved queries");
-    let (schema_result, history_result, saved_result) = tokio::join!(
+    // Fetch schema, history, saved queries, and service list in parallel.
+    tracing::info!("fetching schema, history, saved queries, and service list");
+    let (schema_result, history_result, saved_result, services_result) = tokio::join!(
         client.schema(),
         client.history(Some(100), None),
-        client.list_saved()
+        client.list_saved(),
+        client.field_values("service", Some(500)),
     );
 
     let schema = match schema_result {
@@ -1697,6 +1997,17 @@ pub async fn run(
         }
     };
 
+    let services = match services_result {
+        Ok(fv) => {
+            tracing::info!("service list fetched: {} services", fv.values.len());
+            Some(fv.values)
+        }
+        Err(e) => {
+            tracing::warn!("failed to fetch service list: {}", e);
+            None
+        }
+    };
+
     // Create app with schema, history, and saved queries.
     let mut app = App::new(client);
     app.max_live_events = config.tail.max_events;
@@ -1705,6 +2016,7 @@ pub async fn run(
     app.schema_cache = schema;
     app.history_cache = history;
     app.saved_cache = saved;
+    app.service_list_cache = services;
 
     // Start driver socket if requested.
     if let Some(path) = driver_path {
@@ -1783,6 +2095,9 @@ fn run_event_loop<B: ratatui::backend::Backend>(
 
         // Poll for mutation results (save/delete operations).
         app.poll_mutations();
+
+        // Poll for schema profile results from background tasks.
+        app.poll_schema_profiles();
 
         // Poll for driver commands from the unix socket.
         app.poll_driver_commands(terminal);
@@ -1897,7 +2212,10 @@ mod tests {
     fn key_f2_toggles_schema() {
         let mut app = test_app();
         app.handle_key(key(KeyCode::F(2)));
-        assert_eq!(app.sidebar, Some(Sidebar::Schema { scroll: 0 }));
+        assert!(matches!(
+            app.sidebar,
+            Some(Sidebar::Schema(SchemaView::ServiceList { .. }))
+        ));
         app.handle_key(key(KeyCode::F(2)));
         assert_eq!(app.sidebar, None);
     }
