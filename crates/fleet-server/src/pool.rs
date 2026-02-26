@@ -25,6 +25,12 @@ use crate::error::ServerError;
 use crate::hot_buffer::HotBuffer;
 use crate::source::compute_source;
 
+/// Test-only delay injected into the blocking query task so timeout tests
+/// can reliably win the `select!` race. Zero means no delay. Only compiled
+/// in test builds.
+#[cfg(test)]
+pub(crate) static TEST_QUERY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Type-erased interrupt callback, keyed by monotonic query ID.
 type InterruptMap = HashMap<u64, Box<dyn Fn() + Send + Sync>>;
 
@@ -398,6 +404,17 @@ impl ExecutorPool {
             let _permit = permit; // hold permit until this task completes
             // Send interrupt handle to async side before running the query.
             let _ = interrupt_tx.send(executor.interrupt_handle());
+
+            // Test-only: sleep before the query so timeout tests can
+            // reliably win the select! race against spawn_blocking.
+            #[cfg(test)]
+            {
+                let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
+                if delay > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+            }
+
             let source = compute_source(&base_dir, &dsl, &fallback_glob);
             let file_globs: usize = if source.starts_with('[') {
                 source.matches(',').count() + 1
@@ -726,9 +743,11 @@ mod tests {
 
     #[tokio::test]
     async fn pool_timeout_returns_error() {
+        // Make the blocking task sleep so the timeout reliably fires first.
+        TEST_QUERY_DELAY_MS.store(200, Ordering::Relaxed);
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
-        // 1ns timeout — the blocking task can't possibly complete this fast.
-        let outcome = pool.execute("*", Duration::from_nanos(1), false, 0).await;
+        let outcome = pool.execute("*", Duration::from_millis(10), false, 0).await;
+        TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
         assert!(
             matches!(outcome.result, Err(ServerError::Timeout)),
             "expected Timeout, got: {:?}",
@@ -738,14 +757,18 @@ mod tests {
 
     #[tokio::test]
     async fn pool_executor_reclaimed_after_timeout() {
+        // Make the blocking task sleep so the timeout reliably fires first.
+        TEST_QUERY_DELAY_MS.store(200, Ordering::Relaxed);
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         let idle_before = pool.idle.lock().len();
 
         // Trigger a timeout.
-        let _ = pool.execute("*", Duration::from_nanos(1), false, 0).await;
+        let _ = pool.execute("*", Duration::from_millis(10), false, 0).await;
 
-        // Wait briefly for the async reclamation task to complete.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for the blocking task to finish (200ms delay) + margin
+        // for the async reclamation task to push the executor back.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
 
         let idle_after = pool.idle.lock().len();
         assert_eq!(

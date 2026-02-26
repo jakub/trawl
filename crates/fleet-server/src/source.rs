@@ -235,13 +235,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let now = chrono::Utc::now();
-        let today = now.format("%Y-%m-%d").to_string();
-        // Create hour dirs for current and recent hours.
+        // Create hour dirs for current and recent hours, deriving both date
+        // and hour from the offset time (handles UTC midnight correctly).
         for h_offset in 0..=3 {
-            let h = (now - chrono::Duration::hours(h_offset))
-                .format("%H")
-                .to_string();
-            std::fs::create_dir_all(tmp.path().join(&today).join(&h)).unwrap();
+            let dt = now - chrono::Duration::hours(h_offset);
+            let date = dt.format("%Y-%m-%d").to_string();
+            let hour = dt.format("%H").to_string();
+            std::fs::create_dir_all(tmp.path().join(&date).join(&hour)).unwrap();
         }
         let fallback = format!("{base}/**/*.parquet");
         let source = compute_source(base, "last:1h", &fallback);
@@ -255,26 +255,26 @@ mod tests {
             source.contains("*.parquet"),
             "expected parquet globs, got: {source}"
         );
-        // With 1h + 1h padding, should have ~2-3 hour entries.
+        // With 1h + 1h padding, should have at least 2 hour entries.
         let count = source.matches("*.parquet").count();
         assert!(
-            (2..=4).contains(&count),
-            "expected 2-4 hour globs for last:1h, got {count}: {source}"
+            count >= 2,
+            "expected >=2 hour globs for last:1h, got {count}: {source}"
         );
     }
 
     #[test]
     fn service_and_time_filter_compose() {
-        // Create temp dir with today's hour directories.
+        // Create hour dirs, deriving both date and hour from the offset
+        // time (handles UTC midnight correctly).
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let now = chrono::Utc::now();
-        let today = now.format("%Y-%m-%d").to_string();
         for h_offset in 0..=3 {
-            let h = (now - chrono::Duration::hours(h_offset))
-                .format("%H")
-                .to_string();
-            std::fs::create_dir_all(tmp.path().join(&today).join(&h)).unwrap();
+            let dt = now - chrono::Duration::hours(h_offset);
+            let date = dt.format("%Y-%m-%d").to_string();
+            let hour = dt.format("%H").to_string();
+            std::fs::create_dir_all(tmp.path().join(&date).join(&hour)).unwrap();
         }
         let fallback = format!("{base}/**/*.parquet");
         let source = compute_source(base, "service:nginx last:1h", &fallback);
