@@ -108,6 +108,21 @@ impl ProfiledColumn {
     }
 }
 
+/// Catalog summary for the schema browser header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSummary {
+    /// Earliest date in partition directories.
+    pub earliest_date: Option<String>,
+    /// Latest date in partition directories.
+    pub latest_date: Option<String>,
+    /// Total parquet file size in bytes.
+    pub total_bytes: u64,
+    /// Total parquet file count.
+    pub file_count: u64,
+    /// Hot buffer event count.
+    pub hot_buffer_events: Option<u64>,
+}
+
 /// State machine for the schema browser's two-level hierarchy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaView {
@@ -117,6 +132,8 @@ pub enum SchemaView {
         services: Vec<String>,
         /// Currently selected index.
         selected: usize,
+        /// Catalog summary from enriched schema response.
+        catalog: Option<CatalogSummary>,
     },
     /// Waiting for background query to return sample data.
     Loading {
@@ -133,8 +150,6 @@ pub enum SchemaView {
         selected: usize,
         /// Scroll offset.
         scroll: usize,
-        /// Which field index has sample values expanded (toggle).
-        expanded: Option<usize>,
         /// Total rows in the sample.
         total_rows: usize,
         /// Total columns in the global schema (for "12/18 fields" display).

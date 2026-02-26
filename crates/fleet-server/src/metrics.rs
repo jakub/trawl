@@ -81,7 +81,7 @@ fn collect_parquet_gauges(fallback_glob: &str) {
 }
 
 /// Recursively walk a directory collecting `.parquet` file paths and sizes.
-fn walk_parquet_files(dir: &Path) -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
+pub(crate) fn walk_parquet_files(dir: &Path) -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
     let mut results = Vec::new();
     walk_dir_recursive(dir, &mut results)?;
     Ok(results)

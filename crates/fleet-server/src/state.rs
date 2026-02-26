@@ -117,6 +117,14 @@ pub struct CachedSchema {
     pub result: SchemaResult,
     /// When this cache entry was created.
     pub cached_at: Instant,
+    /// Earliest date from partition directory names (YYYY-MM-DD).
+    pub earliest_date: Option<String>,
+    /// Latest date from partition directory names (YYYY-MM-DD).
+    pub latest_date: Option<String>,
+    /// Total byte size of all parquet files.
+    pub total_bytes: u64,
+    /// Distinct service names from parquet filenames.
+    pub services: Vec<String>,
 }
 
 /// A cached field value sample with an expiry timestamp.

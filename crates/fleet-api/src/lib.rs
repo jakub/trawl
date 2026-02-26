@@ -241,6 +241,24 @@ pub struct SchemaResponse {
     pub file_count: u64,
     /// Whether this result was served from cache.
     pub cached: bool,
+    /// Earliest date found in the partition directory structure (YYYY-MM-DD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_date: Option<String>,
+    /// Latest date found in the partition directory structure (YYYY-MM-DD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_date: Option<String>,
+    /// Total byte size of all parquet files on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// Distinct service names extracted from parquet filenames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<Vec<String>>,
+    /// Current number of events in the hot buffer (not cached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_buffer_events: Option<u64>,
+    /// Current byte size of the hot buffer (not cached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_buffer_bytes: Option<u64>,
 }
 
 /// A single column in the schema response.

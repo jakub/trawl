@@ -280,6 +280,9 @@ pub async fn schema(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
+    // Hot buffer stats are cheap atomics — always read fresh (never cached).
+    let (hot_events, hot_bytes) = hot_buffer_stats(&state);
+
     // Hold the mutex for the full check-then-refresh cycle to prevent
     // thundering herd: only one request refreshes while others wait.
     let mut cache = state.query.schema_cache.lock().await;
@@ -297,6 +300,12 @@ pub async fn schema(
                     .collect(),
                 file_count: cached.result.file_count,
                 cached: true,
+                earliest_date: cached.earliest_date.clone(),
+                latest_date: cached.latest_date.clone(),
+                total_bytes: Some(cached.total_bytes),
+                services: Some(cached.services.clone()),
+                hot_buffer_events: hot_events,
+                hot_buffer_bytes: hot_bytes,
             }));
         }
     }
@@ -304,6 +313,14 @@ pub async fn schema(
     tracing::info!(event_type = "schema_refresh", user = %verified.name, "refreshing schema cache");
     let start = std::time::Instant::now();
     let result = state.query.pool.describe_schema().await?;
+
+    // Walk parquet files for catalog metadata (dates, services, sizes).
+    let fallback_glob = state.query.pool.fallback_glob().clone();
+    let (earliest_date, latest_date, total_bytes, services) =
+        tokio::task::spawn_blocking(move || collect_catalog_metadata(&fallback_glob))
+            .await
+            .unwrap_or_default();
+
     let elapsed = start.elapsed().as_millis();
 
     tracing::info!(
@@ -311,6 +328,7 @@ pub async fn schema(
         user = %verified.name,
         columns = result.columns.len(),
         file_count = result.file_count,
+        services = services.len(),
         duration_ms = elapsed,
         "schema introspection complete"
     );
@@ -324,14 +342,97 @@ pub async fn schema(
             .collect(),
         file_count: result.file_count,
         cached: false,
+        earliest_date: earliest_date.clone(),
+        latest_date: latest_date.clone(),
+        total_bytes: Some(total_bytes),
+        services: Some(services.clone()),
+        hot_buffer_events: hot_events,
+        hot_buffer_bytes: hot_bytes,
     };
 
     *cache = Some(CachedSchema {
         result,
         cached_at: std::time::Instant::now(),
+        earliest_date,
+        latest_date,
+        total_bytes,
+        services,
     });
 
     Ok(Json(response))
+}
+
+/// Read hot buffer event count and byte size (cheap atomic loads).
+fn hot_buffer_stats(state: &AppState) -> (Option<u64>, Option<u64>) {
+    state.query.hot_buffer.as_ref().map_or((None, None), |buf| {
+        (
+            Some(buf.event_count() as u64),
+            Some(buf.byte_count() as u64),
+        )
+    })
+}
+
+/// Parse parquet file paths to extract catalog metadata.
+///
+/// Path structure: `{base}/{YYYY-MM-DD}/{service}.parquet`
+/// or `{base}/{YYYY-MM-DD}/{HH}/{service}.parquet`.
+fn collect_catalog_metadata(
+    fallback_glob: &str,
+) -> (Option<String>, Option<String>, u64, Vec<String>) {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    let base = fallback_glob
+        .find('*')
+        .map_or(fallback_glob, |pos| &fallback_glob[..pos]);
+    let base = Path::new(base.trim_end_matches('/'));
+
+    if !base.is_dir() {
+        return (None, None, 0, Vec::new());
+    }
+
+    let Ok(entries) = crate::metrics::walk_parquet_files(base) else {
+        return (None, None, 0, Vec::new());
+    };
+
+    let mut dates: BTreeSet<String> = BTreeSet::new();
+    let mut services: BTreeSet<String> = BTreeSet::new();
+    let mut total_bytes: u64 = 0;
+
+    for (path, size) in &entries {
+        total_bytes += size;
+
+        // Extract service name from filename stem.
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            services.insert(stem.to_owned());
+        }
+
+        // Walk ancestors looking for a YYYY-MM-DD directory component.
+        for ancestor in path.ancestors().skip(1) {
+            if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
+                if is_date_dir(name) {
+                    dates.insert(name.to_owned());
+                    break;
+                }
+            }
+        }
+    }
+
+    let earliest = dates.iter().next().cloned();
+    let latest = dates.iter().next_back().cloned();
+    let services: Vec<String> = services.into_iter().collect();
+
+    (earliest, latest, total_bytes, services)
+}
+
+/// Check if a directory name looks like YYYY-MM-DD.
+fn is_date_dir(name: &str) -> bool {
+    name.len() == 10
+        && name.as_bytes()[4] == b'-'
+        && name.as_bytes()[7] == b'-'
+        && name[..4].bytes().all(|b| b.is_ascii_digit())
+        && name[5..7].bytes().all(|b| b.is_ascii_digit())
+        && name[8..10].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `GET /api/v1/queries` — view active and recent queries (admin only).

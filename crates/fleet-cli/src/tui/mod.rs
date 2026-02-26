@@ -27,8 +27,8 @@ use self::driver::{
     query_response_to_data,
 };
 use self::state::{
-    ChartView, Focus, LiveBuffer, Popup, ProfiledColumn, ResultsSearch, SchemaView, Sidebar,
-    SimpleEditor, Tab, TabStatus,
+    CatalogSummary, ChartView, Focus, LiveBuffer, Popup, ProfiledColumn, ResultsSearch, SchemaView,
+    Sidebar, SimpleEditor, Tab, TabStatus,
 };
 use crate::CliError;
 use crate::config::Config;
@@ -523,15 +523,18 @@ impl App {
             }
             // Toggle schema: F2
             (KeyModifiers::NONE, KeyCode::F(2)) => {
+                let catalog = self.catalog_summary();
                 let view = if let Some(services) = &self.service_list_cache {
                     SchemaView::ServiceList {
                         services: services.clone(),
                         selected: 0,
+                        catalog,
                     }
                 } else {
                     SchemaView::ServiceList {
                         services: Vec::new(),
                         selected: 0,
+                        catalog,
                     }
                 };
                 self.toggle_sidebar(Sidebar::Schema(view));
@@ -1182,7 +1185,9 @@ impl App {
         };
 
         match view {
-            SchemaView::ServiceList { services, selected } => match (key.modifiers, key.code) {
+            SchemaView::ServiceList {
+                services, selected, ..
+            } => match (key.modifiers, key.code) {
                 (KeyModifiers::NONE, KeyCode::Up) => {
                     *selected = selected.saturating_sub(1);
                 }
@@ -1208,7 +1213,6 @@ impl App {
             SchemaView::ServiceDetail {
                 columns,
                 selected,
-                expanded,
                 service,
                 ..
             } => match (key.modifiers, key.code) {
@@ -1239,22 +1243,16 @@ impl App {
                         self.tabs[self.active_tab_idx].editor.insert_text(&name);
                     }
                 }
-                // Space: toggle sample values expansion
-                (KeyModifiers::NONE, KeyCode::Char(' ')) => {
-                    if *expanded == Some(*selected) {
-                        *expanded = None;
-                    } else {
-                        *expanded = Some(*selected);
-                    }
-                }
                 // Esc/Backspace: back to service list
                 (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Backspace) => {
                     let svc = service.clone();
                     let services = self.service_list_cache.clone().unwrap_or_default();
                     let idx = services.iter().position(|s| *s == svc).unwrap_or(0);
+                    let catalog = self.catalog_summary();
                     self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceList {
                         services,
                         selected: idx,
+                        catalog,
                     }));
                 }
                 _ => {}
@@ -1273,7 +1271,6 @@ impl App {
                 columns: cached.clone(),
                 selected: 0,
                 scroll: 0,
-                expanded: None,
                 total_rows,
                 total_schema_columns,
             }));
@@ -1346,7 +1343,6 @@ impl App {
                             columns,
                             selected: 0,
                             scroll: 0,
-                            expanded: None,
                             total_rows,
                             total_schema_columns,
                         }));
@@ -1361,9 +1357,11 @@ impl App {
                         if *service == result.service
                     ) {
                         let services = self.service_list_cache.clone().unwrap_or_default();
+                        let catalog = self.catalog_summary();
                         self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceList {
                             services,
                             selected: 0,
+                            catalog,
                         }));
                     }
                 }
@@ -1563,6 +1561,21 @@ impl App {
     }
 
     /// Toggle a sidebar (close if already open, open otherwise).
+    /// Build a catalog summary from the cached schema response.
+    fn catalog_summary(&self) -> Option<CatalogSummary> {
+        self.schema_cache.as_ref().and_then(|s| {
+            // Only produce a summary if catalog fields are present.
+            let total_bytes = s.total_bytes?;
+            Some(CatalogSummary {
+                earliest_date: s.earliest_date.clone(),
+                latest_date: s.latest_date.clone(),
+                total_bytes,
+                file_count: s.file_count,
+                hot_buffer_events: s.hot_buffer_events,
+            })
+        })
+    }
+
     fn toggle_sidebar(&mut self, sidebar: Sidebar) {
         if self
             .sidebar

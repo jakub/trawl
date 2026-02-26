@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::tui::state::SchemaView;
+use crate::tui::state::{CatalogSummary, SchemaView};
 
 use super::common::centered_rect;
 
@@ -18,8 +18,12 @@ pub fn render(_app: &crate::tui::App, frame: &mut Frame<'_>, view: &SchemaView) 
     frame.render_widget(Clear, area);
 
     match view {
-        SchemaView::ServiceList { services, selected } => {
-            render_service_list(frame, area, services, *selected);
+        SchemaView::ServiceList {
+            services,
+            selected,
+            catalog,
+        } => {
+            render_service_list(frame, area, services, *selected, catalog.as_ref());
         }
         SchemaView::Loading { service } => render_loading(frame, area, service),
         SchemaView::ServiceDetail {
@@ -27,16 +31,15 @@ pub fn render(_app: &crate::tui::App, frame: &mut Frame<'_>, view: &SchemaView) 
             columns,
             selected,
             scroll: _,
-            expanded,
             total_rows,
             total_schema_columns,
+            ..
         } => render_service_detail(
             frame,
             area,
             service,
             columns,
             *selected,
-            *expanded,
             *total_rows,
             *total_schema_columns,
         ),
@@ -49,6 +52,7 @@ fn render_service_list(
     area: ratatui::layout::Rect,
     services: &[String],
     selected: usize,
+    catalog: Option<&CatalogSummary>,
 ) {
     let title = " Schema Browser (F2) ";
     let footer = Line::from(vec![
@@ -74,13 +78,42 @@ fn render_service_list(
         return;
     }
 
-    let header = ListItem::new(Line::from(vec![
-        Span::styled("Services", Style::default().add_modifier(Modifier::BOLD)),
+    // Build header lines: catalog summary (if available) + service count.
+    let mut header_lines: Vec<Line<'_>> = Vec::new();
+
+    if let Some(cat) = catalog {
+        // Date range line.
+        if let (Some(earliest), Some(latest)) = (&cat.earliest_date, &cat.latest_date) {
+            header_lines.push(Line::from(Span::styled(
+                format!("  {earliest} → {latest}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        // Storage line.
+        let size_str = format_bytes(cat.total_bytes);
+        let mut storage = format!("  {size_str} across {} files", cat.file_count);
+        if let Some(hot) = cat.hot_buffer_events {
+            if hot > 0 {
+                use std::fmt::Write;
+                let _ = write!(storage, " · {hot} buffered");
+            }
+        }
+        header_lines.push(Line::from(Span::styled(
+            storage,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    header_lines.push(Line::from(vec![
+        Span::styled("  Services", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" ({})", services.len()),
             Style::default().fg(Color::DarkGray),
         ),
     ]));
+
+    let header = ListItem::new(header_lines);
 
     let mut items: Vec<ListItem<'_>> = vec![header];
     for svc in services {
@@ -94,9 +127,28 @@ fn render_service_list(
         .block(block)
         .highlight_style(Style::default().bg(Color::DarkGray));
 
-    // +1 for the header line
+    // +1 for the header item
     let mut state = ListState::default().with_selected(Some(selected + 1));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Format a byte count as a human-readable string (e.g. "1.2 GB").
+#[allow(clippy::cast_precision_loss)] // display formatting, precision loss at >4 PB is fine
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Render the loading spinner.
@@ -127,7 +179,6 @@ fn render_service_detail(
     service: &str,
     columns: &[crate::tui::state::ProfiledColumn],
     selected: usize,
-    expanded: Option<usize>,
     total_rows: usize,
     total_schema_columns: usize,
 ) {
@@ -135,8 +186,6 @@ fn render_service_detail(
     let footer = Line::from(vec![
         Span::styled("⏎", Style::default().fg(Color::Cyan)),
         Span::raw(" insert  "),
-        Span::styled("␣", Style::default().fg(Color::Cyan)),
-        Span::raw(" values  "),
         Span::styled("Esc", Style::default().fg(Color::Cyan)),
         Span::raw(" ← back"),
     ]);
@@ -170,7 +219,7 @@ fn render_service_detail(
 
     let mut items: Vec<ListItem<'_>> = vec![header];
 
-    for (idx, col) in columns.iter().enumerate() {
+    for col in columns {
         let pct = col.population_pct();
         let pct_color = if pct >= 80 {
             Color::Green
@@ -180,10 +229,8 @@ fn render_service_detail(
             Color::Red
         };
 
-        let expand_marker = if expanded == Some(idx) { "▼ " } else { "  " };
-
         let line = Line::from(vec![
-            Span::raw(expand_marker),
+            Span::raw("  "),
             Span::styled(format!("{:22}", col.name), Style::default().fg(Color::Cyan)),
             Span::styled(
                 format!("{:12}", col.data_type),
@@ -192,16 +239,15 @@ fn render_service_detail(
             Span::styled(format!("{pct:>3}%"), Style::default().fg(pct_color)),
         ]);
 
-        if expanded == Some(idx) && !col.sample_values.is_empty() {
-            // Multi-line item: column info + sample values.
+        if col.sample_values.is_empty() {
+            items.push(ListItem::new(line));
+        } else {
             let values_str = col.sample_values.join("  ");
             let values_line = Line::from(Span::styled(
                 format!("    {values_str}"),
                 Style::default().fg(Color::DarkGray),
             ));
             items.push(ListItem::new(vec![line, values_line]));
-        } else {
-            items.push(ListItem::new(line));
         }
     }
 
