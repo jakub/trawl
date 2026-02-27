@@ -1,10 +1,10 @@
 //! UI rendering dispatch.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::tui::App;
-use crate::tui::state::{Focus, SidebarSection};
+use crate::tui::state::Focus;
 
 pub mod common;
 pub mod editor;
@@ -14,49 +14,73 @@ pub mod popup;
 pub mod results;
 pub mod saved;
 pub mod schema;
+pub mod sidebar;
 pub mod status;
 pub mod tabs;
 
+/// Width of the activity bar (icon strip) in columns.
+const ACTIVITY_BAR_WIDTH: u16 = 3;
+
 /// Main render function — dispatches to submodules based on app state.
 pub fn render(app: &mut App, frame: &mut Frame<'_>) {
-    // Split the screen into tab bar, editor, results, and status bar.
-    let chunks = Layout::default()
+    // Split the screen into tab bar, main content area, and status bar.
+    let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),      // Tab bar
-            Constraint::Percentage(40), // Editor
-            Constraint::Percentage(55), // Results
+            Constraint::Percentage(40), // Editor row
+            Constraint::Percentage(55), // Results row
             Constraint::Length(1),      // Status bar
         ])
         .split(frame.area());
 
-    // Render tab bar.
-    tabs::render(app, frame, chunks[0]);
+    // Render tab bar and status bar (always full width).
+    tabs::render(app, frame, outer[0]);
+    status::render(app, frame, outer[3]);
 
-    // Render editor pane (needs &mut for scroll adjustment).
-    editor::render(app, frame, chunks[1]);
+    // Compute the left panel width: activity bar + optional sidebar panel.
+    let sidebar_open = app.sidebar.is_some();
+    let left_width = if sidebar_open {
+        ACTIVITY_BAR_WIDTH + app.sidebar_width
+    } else {
+        ACTIVITY_BAR_WIDTH
+    };
 
-    // Render results pane.
-    results::render(app, frame, chunks[2]);
+    // Compute areas for the left panel (spanning editor + results rows)
+    // and the editor/results panes.
+    let left_area = Rect {
+        x: outer[1].x,
+        y: outer[1].y,
+        width: left_width.min(outer[1].width),
+        height: outer[1].height + outer[2].height,
+    };
 
-    // Render status bar.
-    status::render(app, frame, chunks[3]);
+    let editor_area = Rect {
+        x: outer[1].x + left_width,
+        y: outer[1].y,
+        width: outer[1].width.saturating_sub(left_width),
+        height: outer[1].height,
+    };
 
-    // Render sidebar overlay (if any).
-    // TODO: full sidebar renderer will be implemented in ui/sidebar.rs
-    if let Some(ref sb) = app.sidebar {
-        match sb.section {
-            SidebarSection::Schema => { /* TODO: schema tree render */ }
-            SidebarSection::History => history::render(app, frame),
-            SidebarSection::Saved => saved::render(app, frame),
-        }
-    }
+    let results_area = Rect {
+        x: outer[2].x + left_width,
+        y: outer[2].y,
+        width: outer[2].width.saturating_sub(left_width),
+        height: outer[2].height,
+    };
+
+    // Render the activity bar + sidebar panel.
+    sidebar::render(app, frame, left_area);
+
+    // Render editor and results panes.
+    editor::render(app, frame, editor_area);
+    results::render(app, frame, results_area);
 
     // Render popup overlay (if any) — renders on top of everything.
     popup::render(app, frame);
 
     // Set cursor position based on focus (adjusted for scroll offset).
-    if app.focus == Focus::Editor {
+    if app.focus == Focus::Editor && app.popup.is_none() {
         let tab = app.active_tab();
         let (row, col) = tab.editor.cursor;
         let scroll_row = tab.editor.scroll_row;
@@ -64,9 +88,9 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         // +2 for x: border (1) + horizontal padding (1)
         // +1 for y: border (1) only
         #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
-        let x = chunks[1].x + col.saturating_sub(scroll_col) as u16 + 2;
+        let x = editor_area.x + col.saturating_sub(scroll_col) as u16 + 2;
         #[allow(clippy::cast_possible_truncation)]
-        let y = chunks[1].y + row.saturating_sub(scroll_row) as u16 + 1;
+        let y = editor_area.y + row.saturating_sub(scroll_row) as u16 + 1;
         frame.set_cursor_position((x, y));
     }
 }

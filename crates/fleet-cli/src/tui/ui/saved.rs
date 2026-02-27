@@ -1,4 +1,5 @@
-//! Saved queries sidebar (F4).
+//! Saved queries overlay (legacy, replaced by `sidebar.rs` inline renderer).
+#![allow(dead_code, unused_imports)]
 
 use ratatui::Frame;
 use ratatui::layout::Alignment;
@@ -87,4 +88,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     }
 }
 
-use super::common::{centered_rect, truncate_query};
+use super::common::centered_rect;
+
+fn truncate_query(query: &str, max_len: usize) -> String {
+    if query.len() <= max_len {
+        query.to_owned()
+    } else {
+        let truncated: String = query.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{truncated}...")
+    }
+}

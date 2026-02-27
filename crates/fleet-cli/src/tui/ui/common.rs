@@ -22,13 +22,3 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
-
-/// Truncate a query string to max length with ellipsis.
-pub fn truncate_query(query: &str, max_len: usize) -> String {
-    if query.len() <= max_len {
-        query.to_owned()
-    } else {
-        let truncated: String = query.chars().take(max_len.saturating_sub(3)).collect();
-        format!("{truncated}...")
-    }
-}
