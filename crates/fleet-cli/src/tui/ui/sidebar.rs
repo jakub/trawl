@@ -241,9 +241,6 @@ fn flatten_tree(app: &App) -> Vec<TreeNode<'_>> {
         if expanded {
             if let Some(cols) = app.schema_profile_cache.get(svc.as_str()) {
                 for col in cols {
-                    if !filter.is_empty() && !col.name.to_lowercase().contains(&filter) {
-                        continue;
-                    }
                     nodes.push(TreeNode::Field { col });
                 }
             } else {
@@ -386,9 +383,25 @@ fn render_schema_tree(app: &App, frame: &mut Frame<'_>, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let mut state = ListState::default();
+    #[allow(clippy::cast_possible_truncation)]
+    let visible_height = area.height as usize;
+    let offset = compute_center_offset(selected, visible_height, nodes.len());
+    let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Compute scroll offset for center-locked scrolling.
+///
+/// The selected item stays at the vertical midpoint of the visible area,
+/// with context visible above and below.
+fn compute_center_offset(selected: usize, visible_height: usize, total: usize) -> usize {
+    if total <= visible_height {
+        return 0;
+    }
+    let max_offset = total.saturating_sub(visible_height);
+    let ideal = selected.saturating_sub(visible_height / 2);
+    ideal.min(max_offset)
 }
 
 /// Abbreviate a `DuckDB` type name for compact display.
@@ -456,13 +469,17 @@ fn render_history_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
         })
         .collect();
 
+    let total = items.len();
     let list = List::new(items).highlight_style(
         Style::default()
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
 
-    let mut state = ListState::default();
+    #[allow(clippy::cast_possible_truncation)]
+    let visible_height = area.height as usize;
+    let offset = compute_center_offset(selected, visible_height, total);
+    let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -504,13 +521,17 @@ fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
         })
         .collect();
 
+    let total = items.len();
     let list = List::new(items).highlight_style(
         Style::default()
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
 
-    let mut state = ListState::default();
+    #[allow(clippy::cast_possible_truncation)]
+    let visible_height = area.height as usize;
+    let offset = compute_center_offset(selected, visible_height, total);
+    let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
 }

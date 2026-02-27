@@ -1342,14 +1342,7 @@ impl App {
             count += 1; // service node
             if tree.expanded.contains(svc) {
                 if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
-                    if filter.is_empty() {
-                        count += cols.len();
-                    } else {
-                        count += cols
-                            .iter()
-                            .filter(|c| c.name.to_lowercase().contains(&filter))
-                            .count();
-                    }
+                    count += cols.len();
                 } else {
                     count += 1; // loading node
                 }
@@ -1461,9 +1454,6 @@ impl App {
             if tree.expanded.contains(svc) {
                 if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
                     for col in cols {
-                        if !filter.is_empty() && !col.name.to_lowercase().contains(&filter) {
-                            continue;
-                        }
                         if idx == tree.selected {
                             return Some(TreeNodeInfo::Field { name: &col.name });
                         }
@@ -1510,10 +1500,7 @@ impl App {
             idx += 1;
             if tree.expanded.contains(svc) {
                 if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
-                    for col in cols {
-                        if !filter.is_empty() && !col.name.to_lowercase().contains(&filter) {
-                            continue;
-                        }
+                    for _col in cols {
                         if idx == tree.selected {
                             return Some(last_service_idx);
                         }
