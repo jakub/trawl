@@ -12,6 +12,7 @@ use crate::hot_buffer::HotBuffer;
 pub const QUERIES_TOTAL: &str = "fleet_queries_total";
 pub const QUERY_DURATION: &str = "fleet_query_duration_seconds";
 pub const INGEST_EVENTS_TOTAL: &str = "fleet_ingest_events_total";
+pub const INGEST_EVENTS_REJECTED_TOTAL: &str = "fleet_ingest_events_rejected_total";
 pub const HOT_BUFFER_EVENTS: &str = "fleet_hot_buffer_events";
 pub const HOT_BUFFER_BYTES: &str = "fleet_hot_buffer_bytes";
 pub const ACTIVE_CONNECTIONS: &str = "fleet_active_connections";
@@ -26,6 +27,10 @@ pub fn describe_metrics() {
     describe_counter!(QUERIES_TOTAL, "Total number of queries executed");
     describe_histogram!(QUERY_DURATION, "Query execution duration in seconds");
     describe_counter!(INGEST_EVENTS_TOTAL, "Total number of ingested events");
+    describe_counter!(
+        INGEST_EVENTS_REJECTED_TOTAL,
+        "Total number of rejected ingest events"
+    );
     describe_gauge!(
         HOT_BUFFER_EVENTS,
         "Current number of events in the hot buffer"

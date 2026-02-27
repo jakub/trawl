@@ -470,11 +470,39 @@ pub struct DeleteSavedResponse {
 
 // -- ingest ------------------------------------------------------------------
 
+/// A per-event error from the ingest endpoint.
+///
+/// Reported when individual events in a batch fail validation while
+/// other events in the same batch succeed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestEventError {
+    /// Zero-based event index (array position or ndjson line number including blanks).
+    pub index: usize,
+    /// Human-readable error description.
+    pub message: String,
+}
+
 /// Response from the ingest endpoint.
+///
+/// When all events are valid, `rejected` and `errors` are omitted from
+/// the JSON response for backward compatibility.  New clients should
+/// use `#[serde(default)]` on these fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestResponse {
-    /// Number of records accepted.
+    /// Number of records accepted and written to the WAL.
     pub accepted: usize,
+    /// Number of records rejected due to per-event validation errors.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rejected: usize,
+    /// Per-event error details (one entry per rejected event).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<IngestEventError>,
+}
+
+/// Helper for `skip_serializing_if` — serde requires `&T` signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[cfg(test)]
@@ -640,6 +668,56 @@ mod tests {
         assert!(json.contains("\"success\""));
         let rt: HistoryEntryResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.status, QueryStatus::Success);
+    }
+
+    #[test]
+    fn ingest_response_no_errors_omits_fields() {
+        let resp = IngestResponse {
+            accepted: 5,
+            rejected: 0,
+            errors: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"accepted\":5"));
+        assert!(!json.contains("rejected"));
+        assert!(!json.contains("errors"));
+    }
+
+    #[test]
+    fn ingest_response_with_errors_roundtrip() {
+        let resp = IngestResponse {
+            accepted: 8,
+            rejected: 2,
+            errors: vec![
+                IngestEventError {
+                    index: 3,
+                    message: "expected JSON object".into(),
+                },
+                IngestEventError {
+                    index: 7,
+                    message: "missing 'service' field".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"rejected\":2"));
+        assert!(json.contains("\"errors\""));
+        let rt: IngestResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.accepted, 8);
+        assert_eq!(rt.rejected, 2);
+        assert_eq!(rt.errors.len(), 2);
+        assert_eq!(rt.errors[0].index, 3);
+        assert_eq!(rt.errors[1].message, "missing 'service' field");
+    }
+
+    #[test]
+    fn ingest_response_backward_compat_deserialize() {
+        // Old servers return only {"accepted": N} — new clients must handle this.
+        let json = r#"{"accepted": 5}"#;
+        let resp: IngestResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.accepted, 5);
+        assert_eq!(resp.rejected, 0);
+        assert!(resp.errors.is_empty());
     }
 
     #[test]

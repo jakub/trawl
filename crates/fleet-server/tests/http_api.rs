@@ -472,6 +472,56 @@ async fn ingest_rejects_analyst_role() {
     assert_eq!(resp.status(), 401);
 }
 
+#[tokio::test]
+async fn ingest_partial_success() {
+    let server = setup().await;
+    let client = raw_client();
+
+    // 3 ndjson events: good, bad json, good
+    let body = "{\"service\":\"test-svc\",\"message\":\"one\"}\nnot json\n{\"service\":\"test-svc\",\"message\":\"three\"}";
+
+    let resp = client
+        .post(format!("{}/api/v1/ingest", server.url))
+        .header("authorization", format!("Bearer {}", server.ingest_token))
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: fleet_api::IngestResponse = resp.json().await.unwrap();
+    assert_eq!(body.accepted, 2);
+    assert_eq!(body.rejected, 1);
+    assert_eq!(body.errors.len(), 1);
+    assert_eq!(body.errors[0].index, 1);
+}
+
+#[tokio::test]
+async fn ingest_all_rejected_per_event() {
+    let server = setup().await;
+    let client = raw_client();
+
+    // All 3 events are bad (no service field)
+    let body = "{\"message\":\"no svc\"}\n{\"message\":\"also no svc\"}\n{\"message\":\"nope\"}";
+
+    let resp = client
+        .post(format!("{}/api/v1/ingest", server.url))
+        .header("authorization", format!("Bearer {}", server.ingest_token))
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    // Returns 200 even when all events rejected (per-event, not batch-level).
+    assert_eq!(resp.status(), 200);
+    let body: fleet_api::IngestResponse = resp.json().await.unwrap();
+    assert_eq!(body.accepted, 0);
+    assert_eq!(body.rejected, 3);
+    assert_eq!(body.errors.len(), 3);
+}
+
 // -- rate limit tests --------------------------------------------------------
 
 #[tokio::test]

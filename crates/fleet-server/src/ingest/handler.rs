@@ -16,47 +16,75 @@ use serde_json::json;
 use crate::bus::{EventBus as _, IngestBatch};
 use crate::error::ServerError;
 use crate::state::AppState;
-use fleet_api::IngestResponse;
+use fleet_api::{IngestEventError, IngestResponse};
 
 /// Parsed ingest payload ready for WAL write and bus publishing.
 #[derive(Debug)]
 struct ParsedEvents {
-    /// Service name extracted from events.
-    service: String,
+    /// Service name extracted from the first valid event, or `None` if all
+    /// events were rejected.
+    service: Option<String>,
     /// Parsed event objects for in-memory consumers (hot buffer, streaming).
     maps: Vec<serde_json::Map<String, serde_json::Value>>,
     /// Serialized ndjson bytes for WAL write.
     ndjson: Vec<u8>,
+    /// Per-event validation errors accumulated during parsing.
+    errors: Vec<IngestEventError>,
 }
 
 /// Maximum service name length.
 const MAX_SERVICE_NAME_LEN: usize = 128;
 
-/// Validate a service name from an ingest event.
+/// Validate a service name, returning a human-readable error string on failure.
 ///
+/// Pure function used by per-event validation — no `ServerError` dependency.
 /// Only alphanumeric, dash, underscore, and dot are allowed.
 /// Prevents path traversal in WAL directory structure and log injection.
-fn validate_service_name(service: &str) -> Result<(), ServerError> {
+fn validate_service_name_str(service: &str) -> Result<(), String> {
     if service.is_empty() {
-        return Err(ServerError::Ingest("service name cannot be empty".into()));
+        return Err("service name cannot be empty".into());
     }
     if service.len() > MAX_SERVICE_NAME_LEN {
-        return Err(ServerError::Ingest(format!(
+        return Err(format!(
             "service name too long ({} chars, max {MAX_SERVICE_NAME_LEN})",
             service.len()
-        )));
+        ));
     }
     if !service
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     {
-        return Err(ServerError::Ingest(
-            "service name contains invalid characters \
+        return Err("service name contains invalid characters \
              (only alphanumeric, dash, underscore, dot allowed)"
-                .into(),
-        ));
+            .into());
     }
     Ok(())
+}
+
+/// Validate a single event object, returning the service name or an error string.
+///
+/// Checks: is object (caller guarantees), has `service` field, service passes
+/// charset/length validation, service matches batch service (if established).
+fn validate_event(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    batch_service: Option<&str>,
+) -> Result<String, String> {
+    let svc = obj
+        .get("service")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing 'service' field".to_owned())?;
+
+    validate_service_name_str(svc)?;
+
+    if let Some(expected) = batch_service {
+        if svc != expected {
+            return Err(format!(
+                "service mismatch: expected '{expected}', got '{svc}'"
+            ));
+        }
+    }
+
+    Ok(svc.to_owned())
 }
 
 /// Per-request defaults for fields that must always be present in WAL events.
@@ -140,11 +168,22 @@ pub async fn ingest(
             let parse_ms = t1.elapsed().as_millis();
             let ndjson_byte_size = parsed.ndjson.len();
 
-            let t2 = std::time::Instant::now();
-            let wal_path = wal_writer
-                .write(&parsed.service, &parsed.ndjson)
-                .map_err(|e| ServerError::Internal(format!("WAL write failed: {e}")))?;
-            let wal_ms = t2.elapsed().as_millis();
+            // Only write to WAL if we have accepted events.
+            let wal_path = if let Some(ref svc) = parsed.service {
+                let t2 = std::time::Instant::now();
+                let path = wal_writer
+                    .write(svc, &parsed.ndjson)
+                    .map_err(|e| ServerError::Internal(format!("WAL write failed: {e}")))?;
+                let wal_ms_inner = t2.elapsed().as_millis();
+                Some((path, wal_ms_inner))
+            } else {
+                None
+            };
+
+            let (wal_path, wal_ms) = match wal_path {
+                Some((path, ms)) => (Some(path), ms),
+                None => (None, 0),
+            };
 
             Ok((
                 parsed,
@@ -159,19 +198,57 @@ pub async fn ingest(
         .await
         .map_err(|e| ServerError::Internal(format!("ingest task panicked: {e}")))??;
 
-    let event_count = parsed.maps.len();
-    metrics::counter!(crate::metrics::INGEST_EVENTS_TOTAL).increment(event_count as u64);
+    let result = finalize_ingest(
+        &state,
+        parsed,
+        wal_path.as_ref(),
+        ndjson_byte_size,
+        &verified,
+        wire_bytes,
+        compressed,
+        body_bytes,
+        decompress_ms,
+        parse_ms,
+        wal_ms,
+    );
+
+    Ok(Json(result))
+}
+
+/// Post-blocking-task: update metrics, publish to event bus, log, and build response.
+#[allow(clippy::too_many_arguments)]
+fn finalize_ingest(
+    state: &AppState,
+    parsed: ParsedEvents,
+    wal_path: Option<&std::path::PathBuf>,
+    ndjson_byte_size: usize,
+    verified: &VerifiedKey,
+    wire_bytes: usize,
+    compressed: bool,
+    body_bytes: usize,
+    decompress_ms: u128,
+    parse_ms: u128,
+    wal_ms: u128,
+) -> IngestResponse {
+    let accepted = parsed.maps.len();
+    let rejected = parsed.errors.len();
+
+    metrics::counter!(crate::metrics::INGEST_EVENTS_TOTAL).increment(accepted as u64);
+    if rejected > 0 {
+        metrics::counter!(crate::metrics::INGEST_EVENTS_REJECTED_TOTAL).increment(rejected as u64);
+    }
 
     // Publish to event bus (best-effort — WAL is the durability guarantee).
-    if let Some(bus) = &state.ingest.event_bus {
+    if let (Some(bus), Some(wal_path)) = (&state.ingest.event_bus, wal_path) {
         let batch_id: Arc<str> = wal_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .into();
+        let service = parsed.service.as_deref().unwrap_or("unknown");
         let batch = Arc::new(IngestBatch {
             batch_id,
-            service: Arc::from(parsed.service.as_str()),
+            service: Arc::from(service),
             byte_size: ndjson_byte_size,
             events: parsed.maps,
             draining: std::sync::atomic::AtomicBool::new(false),
@@ -181,11 +258,13 @@ pub async fn ingest(
     }
 
     let duration_ms = decompress_ms + parse_ms + wal_ms;
+    let ingest_service = parsed.service.as_deref().unwrap_or("<none>");
     tracing::info!(
         event_type = "ingest_complete",
         user = %verified.name,
-        ingest_service = %parsed.service,
-        events = event_count,
+        ingest_service,
+        accepted,
+        rejected,
         body_bytes,
         wire_bytes,
         compressed,
@@ -193,13 +272,15 @@ pub async fn ingest(
         decompress_ms,
         parse_ms,
         wal_ms,
-        path = %wal_path.display(),
+        path = wal_path.as_ref().map_or("<skipped>", |p| p.to_str().unwrap_or("<non-utf8>")),
         "ingested events to WAL"
     );
 
-    Ok(Json(IngestResponse {
-        accepted: event_count,
-    }))
+    IngestResponse {
+        accepted,
+        rejected,
+        errors: parsed.errors,
+    }
 }
 
 /// Check if the request body is gzip-encoded.
@@ -242,6 +323,8 @@ fn parse_events(data: &[u8], defaults: &IngestDefaults) -> Result<ParsedEvents, 
 /// Parse a JSON array of events (vector's default batch format).
 ///
 /// Converts to ndjson for WAL storage and retains parsed maps for the bus.
+/// Invalid events are accumulated as per-event errors rather than aborting
+/// the entire batch — valid events are still accepted.
 fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, ServerError> {
     let parsed: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| ServerError::Ingest(format!("invalid JSON array: {e}")))?;
@@ -257,28 +340,35 @@ fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvent
     let mut service: Option<String> = None;
     let mut maps = Vec::with_capacity(arr.len());
     let mut ndjson = Vec::new();
+    let mut errors = Vec::new();
 
     for (i, event) in arr.iter().enumerate() {
-        let obj = event
-            .as_object()
-            .ok_or_else(|| ServerError::Ingest(format!("event {}: expected JSON object", i + 1)))?;
+        let Some(obj) = event.as_object() else {
+            errors.push(IngestEventError {
+                index: i,
+                message: "expected JSON object".into(),
+            });
+            continue;
+        };
 
-        let svc = obj
-            .get("service")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                ServerError::Ingest(format!("event {}: missing 'service' field", i + 1))
-            })?;
-
-        if service.is_none() {
-            validate_service_name(svc)?;
-            service = Some(svc.to_owned());
+        match validate_event(obj, service.as_deref()) {
+            Ok(svc) => {
+                if service.is_none() {
+                    service = Some(svc);
+                }
+            }
+            Err(msg) => {
+                errors.push(IngestEventError {
+                    index: i,
+                    message: msg,
+                });
+                continue;
+            }
         }
 
         let mut obj = obj.clone();
         fill_defaults(&mut obj, defaults);
 
-        // Write each event as a ndjson line (from the filled map).
         serde_json::to_writer(&mut ndjson, &obj)
             .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
         ndjson.push(b'\n');
@@ -286,22 +376,24 @@ fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvent
         maps.push(obj);
     }
 
-    let service = service.expect("non-empty array guarantees at least one service");
     Ok(ParsedEvents {
         service,
         maps,
         ndjson,
+        errors,
     })
 }
 
 /// Parse ndjson (newline-delimited JSON objects).
 ///
 /// Retains parsed maps for the bus and re-serializes to ndjson for
-/// consistent WAL bytes (trimmed, one object per line).
+/// consistent WAL bytes (trimmed, one object per line).  Invalid lines
+/// are accumulated as per-event errors rather than aborting the batch.
 fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, ServerError> {
     let mut service: Option<String> = None;
     let mut maps = Vec::new();
     let mut ndjson = Vec::new();
+    let mut errors = Vec::new();
 
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -309,29 +401,43 @@ fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, S
             continue;
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| ServerError::Ingest(format!("line {}: invalid JSON: {e}", i + 1)))?;
+        let parsed: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(IngestEventError {
+                    index: i,
+                    message: format!("invalid JSON: {e}"),
+                });
+                continue;
+            }
+        };
 
-        let obj = parsed
-            .as_object()
-            .ok_or_else(|| ServerError::Ingest(format!("line {}: expected JSON object", i + 1)))?;
+        let Some(obj) = parsed.as_object() else {
+            errors.push(IngestEventError {
+                index: i,
+                message: "expected JSON object".into(),
+            });
+            continue;
+        };
 
-        let svc = obj
-            .get("service")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                ServerError::Ingest(format!("line {}: missing 'service' field", i + 1))
-            })?;
-
-        if service.is_none() {
-            validate_service_name(svc)?;
-            service = Some(svc.to_owned());
+        match validate_event(obj, service.as_deref()) {
+            Ok(svc) => {
+                if service.is_none() {
+                    service = Some(svc);
+                }
+            }
+            Err(msg) => {
+                errors.push(IngestEventError {
+                    index: i,
+                    message: msg,
+                });
+                continue;
+            }
         }
 
         let mut obj = obj.clone();
         fill_defaults(&mut obj, defaults);
 
-        // Re-serialize for consistent ndjson in WAL (from the filled map).
         serde_json::to_writer(&mut ndjson, &obj)
             .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
         ndjson.push(b'\n');
@@ -339,11 +445,11 @@ fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, S
         maps.push(obj);
     }
 
-    let service = service.ok_or_else(|| ServerError::Ingest("no valid events in body".into()))?;
     Ok(ParsedEvents {
         service,
         maps,
         ndjson,
+        errors,
     })
 }
 
@@ -359,40 +465,30 @@ mod tests {
         }
     }
 
+    // --- happy path tests (unchanged semantics) ---
+
     #[test]
     fn parse_ndjson_format() {
         let data = br#"{"service":"nginx","message":"ok"}
 {"service":"nginx","message":"error"}
 "#;
         let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert_eq!(parsed.service, "nginx");
+        assert_eq!(parsed.service.as_deref(), Some("nginx"));
         assert_eq!(parsed.maps.len(), 2);
+        assert!(parsed.errors.is_empty());
     }
 
     #[test]
     fn parse_json_array_format() {
         let data = br#"[{"service":"nginx","message":"ok"},{"service":"nginx","message":"error"}]"#;
         let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert_eq!(parsed.service, "nginx");
+        assert_eq!(parsed.service.as_deref(), Some("nginx"));
         assert_eq!(parsed.maps.len(), 2);
+        assert!(parsed.errors.is_empty());
         // WAL output should be ndjson, not a JSON array.
         let text = std::str::from_utf8(&parsed.ndjson).unwrap();
         assert!(!text.starts_with('['));
         assert_eq!(text.lines().count(), 2);
-    }
-
-    #[test]
-    fn parse_missing_service() {
-        let data = br#"{"message":"no service field"}"#;
-        let err = parse_events(data, &test_defaults()).unwrap_err();
-        assert!(err.to_string().contains("missing 'service'"));
-    }
-
-    #[test]
-    fn parse_invalid_json() {
-        let data = b"not json at all";
-        let err = parse_events(data, &test_defaults()).unwrap_err();
-        assert!(err.to_string().contains("invalid JSON"));
     }
 
     #[test]
@@ -403,44 +499,9 @@ mod tests {
 {"service":"test","message":"world"}
 "#;
         let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert_eq!(parsed.service, "test");
+        assert_eq!(parsed.service.as_deref(), Some("test"));
         assert_eq!(parsed.maps.len(), 2);
-    }
-
-    #[test]
-    fn parse_empty_json_array_rejected() {
-        let data = b"[]";
-        let err = parse_events(data, &test_defaults()).unwrap_err();
-        assert!(err.to_string().contains("empty"));
-    }
-
-    #[test]
-    fn parse_rejects_path_traversal_service() {
-        let data = br#"{"service":"../../etc/passwd","message":"pwned"}"#;
-        let err = parse_events(data, &test_defaults()).unwrap_err();
-        assert!(err.to_string().contains("invalid characters"));
-    }
-
-    #[test]
-    fn parse_rejects_slash_in_service() {
-        let data = br#"{"service":"foo/bar","message":"nope"}"#;
-        let err = parse_events(data, &test_defaults()).unwrap_err();
-        assert!(err.to_string().contains("invalid characters"));
-    }
-
-    #[test]
-    fn parse_rejects_empty_service_name() {
-        let data = br#"{"service":"","message":"empty"}"#;
-        let err = parse_events(data, &test_defaults()).unwrap_err();
-        assert!(err.to_string().contains("cannot be empty"));
-    }
-
-    #[test]
-    fn parse_rejects_long_service_name() {
-        let name = "a".repeat(129);
-        let data = format!(r#"{{"service":"{name}","message":"long"}}"#);
-        let err = parse_events(data.as_bytes(), &test_defaults()).unwrap_err();
-        assert!(err.to_string().contains("too long"));
+        assert!(parsed.errors.is_empty());
     }
 
     #[test]
@@ -449,16 +510,10 @@ mod tests {
         for name in ["nginx", "my-app", "app_v2", "host.name.prod", "A1-B2_c3.d"] {
             let data = format!(r#"{{"service":"{name}","message":"ok"}}"#);
             let parsed = parse_events(data.as_bytes(), &defaults).unwrap();
-            assert_eq!(parsed.service, name);
+            assert_eq!(parsed.service.as_deref(), Some(name));
             assert_eq!(parsed.maps.len(), 1);
+            assert!(parsed.errors.is_empty());
         }
-    }
-
-    #[test]
-    fn parse_json_array_rejects_bad_service() {
-        let data = br#"[{"service":"../evil","message":"nope"}]"#;
-        let err = parse_events(data, &test_defaults()).unwrap_err();
-        assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]
@@ -493,6 +548,159 @@ mod tests {
             parsed.maps[1].get("level").and_then(|v| v.as_str()),
             Some("warn")
         );
+    }
+
+    // --- batch-level errors (still Err, unchanged) ---
+
+    #[test]
+    fn parse_empty_json_array_rejected() {
+        let data = b"[]";
+        let err = parse_events(data, &test_defaults()).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    // --- per-event errors (now Ok with errors, changed from Err) ---
+
+    #[test]
+    fn parse_missing_service() {
+        let data = br#"{"message":"no service field"}"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.maps.is_empty());
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].message.contains("missing 'service'"));
+        assert!(parsed.service.is_none());
+    }
+
+    #[test]
+    fn parse_invalid_json() {
+        let data = b"not json at all";
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.maps.is_empty());
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].message.contains("invalid JSON"));
+        assert!(parsed.service.is_none());
+    }
+
+    #[test]
+    fn parse_rejects_path_traversal_service() {
+        let data = br#"{"service":"../../etc/passwd","message":"pwned"}"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.maps.is_empty());
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].message.contains("invalid characters"));
+    }
+
+    #[test]
+    fn parse_rejects_slash_in_service() {
+        let data = br#"{"service":"foo/bar","message":"nope"}"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.maps.is_empty());
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].message.contains("invalid characters"));
+    }
+
+    #[test]
+    fn parse_rejects_empty_service_name() {
+        let data = br#"{"service":"","message":"empty"}"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.maps.is_empty());
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].message.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn parse_rejects_long_service_name() {
+        let name = "a".repeat(129);
+        let data = format!(r#"{{"service":"{name}","message":"long"}}"#);
+        let parsed = parse_events(data.as_bytes(), &test_defaults()).unwrap();
+        assert!(parsed.maps.is_empty());
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].message.contains("too long"));
+    }
+
+    #[test]
+    fn parse_json_array_rejects_bad_service() {
+        let data = br#"[{"service":"../evil","message":"nope"}]"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.maps.is_empty());
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.errors[0].message.contains("invalid characters"));
+    }
+
+    // --- new partial-success tests ---
+
+    #[test]
+    fn parse_partial_ndjson_bad_middle() {
+        let data = b"{\"service\":\"nginx\",\"message\":\"one\"}\nnot json\n{\"service\":\"nginx\",\"message\":\"three\"}";
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert_eq!(parsed.maps.len(), 2);
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].index, 1);
+        assert!(parsed.errors[0].message.contains("invalid JSON"));
+        assert_eq!(parsed.service.as_deref(), Some("nginx"));
+    }
+
+    #[test]
+    fn parse_partial_array_non_object() {
+        let data = br#"[{"service":"nginx","message":"ok"},"just a string",{"service":"nginx","message":"also ok"}]"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert_eq!(parsed.maps.len(), 2);
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].index, 1);
+        assert!(parsed.errors[0].message.contains("expected JSON object"));
+    }
+
+    #[test]
+    fn parse_service_mismatch_rejected() {
+        let data = b"{\"service\":\"nginx\",\"message\":\"one\"}\n{\"service\":\"apache\",\"message\":\"two\"}";
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert_eq!(parsed.maps.len(), 1);
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].index, 1);
+        assert!(parsed.errors[0].message.contains("service mismatch"));
+        assert_eq!(parsed.service.as_deref(), Some("nginx"));
+    }
+
+    #[test]
+    fn parse_first_event_bad_scans_forward() {
+        let data = b"{\"message\":\"no service\"}\n{\"service\":\"nginx\",\"message\":\"good\"}";
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert_eq!(parsed.maps.len(), 1);
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].index, 0);
+        assert!(parsed.errors[0].message.contains("missing 'service'"));
+        assert_eq!(parsed.service.as_deref(), Some("nginx"));
+    }
+
+    #[test]
+    fn parse_all_events_bad() {
+        let data = b"not json\nalso not json\n{\"no_service\":true}";
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.maps.is_empty());
+        assert_eq!(parsed.errors.len(), 3);
+        assert!(parsed.service.is_none());
+    }
+
+    #[test]
+    fn parse_bad_service_name_scans_forward() {
+        let data = b"{\"service\":\"../../evil\",\"message\":\"bad\"}\n{\"service\":\"nginx\",\"message\":\"good\"}";
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert_eq!(parsed.maps.len(), 1);
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].index, 0);
+        assert!(parsed.errors[0].message.contains("invalid characters"));
+        assert_eq!(parsed.service.as_deref(), Some("nginx"));
+    }
+
+    #[test]
+    fn parse_ndjson_mixed_validity() {
+        // 5 lines: index 0 good, 1 bad json, 2 good, 3 missing service, 4 good
+        let data = b"{\"service\":\"nginx\",\"message\":\"a\"}\nnot json\n{\"service\":\"nginx\",\"message\":\"c\"}\n{\"no_service\":true}\n{\"service\":\"nginx\",\"message\":\"e\"}";
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert_eq!(parsed.maps.len(), 3);
+        assert_eq!(parsed.errors.len(), 2);
+        assert_eq!(parsed.errors[0].index, 1);
+        assert_eq!(parsed.errors[1].index, 3);
     }
 
     // --- defaults tests ---
