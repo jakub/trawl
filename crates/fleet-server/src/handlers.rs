@@ -8,15 +8,17 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::{Extension, Json};
 use fleet_api::{
-    CancelResponse, CreateSavedRequest, DeleteSavedResponse, ExportRequest, FieldValuesResponse,
-    HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse, ListSavedResponse,
-    PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, SavedQueryResponse,
-    SchemaColumnResponse, SchemaResponse, StatsResponse, UpdateSavedRequest, ValidationResponse,
+    CancelResponse, CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, ExportRequest,
+    FieldValuesResponse, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
+    ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
+    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
+    ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse,
+    UpdateSavedRequest, ValidationResponse,
 };
-use fleet_auth::HistoryEntry;
-use fleet_auth::SavedQuery;
 use fleet_auth::keys::VerifiedKey;
 use fleet_auth::roles::Permission;
+use fleet_auth::schedule::{ReportRun, format_interval, parse_interval};
+use fleet_auth::{HistoryEntry, SavedQuery};
 use fleet_engine::value::{QueryResult, Value};
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -813,9 +815,29 @@ pub async fn list_saved(
         .list(key_id)
         .map_err(|e| ServerError::Internal(format!("failed to list saved queries: {e}")))?;
 
-    Ok(Json(ListSavedResponse {
-        queries: queries.into_iter().map(saved_query_response).collect(),
-    }))
+    // Enrich saved queries with schedule info.
+    let schedule_store = state.auth.schedule.lock();
+    let responses: Vec<SavedQueryResponse> = queries
+        .into_iter()
+        .map(|sq| {
+            let schedule = schedule_store
+                .get_schedule_for_saved_query(sq.id, key_id)
+                .ok()
+                .flatten()
+                .map(|s| build_schedule_response(&schedule_store, s));
+            SavedQueryResponse {
+                id: sq.id,
+                name: sq.name,
+                query: sq.query,
+                created_at: sq.created_at,
+                updated_at: sq.updated_at,
+                schedule,
+            }
+        })
+        .collect();
+    drop(schedule_store);
+
+    Ok(Json(ListSavedResponse { queries: responses }))
 }
 
 /// `POST /api/v1/saved` — create a new saved query.
@@ -915,7 +937,7 @@ pub async fn delete_saved(
     Ok(Json(DeleteSavedResponse { deleted: true }))
 }
 
-/// Convert a [`SavedQuery`] into a [`SavedQueryResponse`].
+/// Convert a [`SavedQuery`] into a [`SavedQueryResponse`] (without schedule).
 fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
     SavedQueryResponse {
         id: saved.id,
@@ -925,6 +947,249 @@ fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
         updated_at: saved.updated_at,
         schedule: None,
     }
+}
+
+/// Build a [`ScheduleResponse`] from a schedule, enriched with run metadata.
+fn build_schedule_response(
+    store: &fleet_auth::ScheduleStore,
+    schedule: fleet_auth::Schedule,
+) -> ScheduleResponse {
+    let last_run = store
+        .latest_run(schedule.id)
+        .ok()
+        .flatten()
+        .map(report_run_summary);
+    let total_runs = store.count_runs(schedule.id).unwrap_or(0);
+
+    ScheduleResponse {
+        id: schedule.id,
+        saved_query_id: schedule.saved_query_id,
+        interval: format_interval(schedule.interval_secs),
+        interval_secs: schedule.interval_secs,
+        max_runs: schedule.max_runs,
+        enabled: schedule.enabled,
+        created_at: schedule.created_at,
+        updated_at: schedule.updated_at,
+        last_run,
+        total_runs,
+    }
+}
+
+/// Convert a [`ReportRun`] into a [`ReportRunSummary`].
+fn report_run_summary(run: ReportRun) -> ReportRunSummary {
+    ReportRunSummary {
+        id: run.id,
+        query: run.query,
+        status: run.status,
+        started_at: run.started_at,
+        finished_at: run.finished_at,
+        duration_ms: run.duration_ms,
+        row_count: run.row_count,
+        error_message: run.error_message,
+    }
+}
+
+// -- schedule handlers -------------------------------------------------------
+
+/// Resolve `key_id` from verified token prefix.
+fn resolve_key_id(state: &AppState, verified: &VerifiedKey) -> Result<i64, ServerError> {
+    state
+        .auth
+        .key_store
+        .lock()
+        .get_key_id_by_prefix(&verified.prefix)
+        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))
+}
+
+/// `PUT /api/v1/saved/{id}/schedule` — create or update a schedule.
+pub async fn set_schedule(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path(saved_id): Path<i64>,
+    Json(req): Json<SetScheduleRequest>,
+) -> Result<Json<ScheduleResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SavedQuery) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = resolve_key_id(&state, &verified)?;
+    let interval_secs = parse_interval(&req.interval)
+        .map_err(|e| ServerError::BadRequest(format!("invalid interval: {e}")))?;
+
+    // Verify saved query ownership.
+    state
+        .auth
+        .saved
+        .lock()
+        .list(key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to list saved queries: {e}")))?
+        .iter()
+        .find(|sq| sq.id == saved_id)
+        .ok_or_else(|| ServerError::NotFound("saved query not found or unauthorized".into()))?;
+
+    let schedule_store = state.auth.schedule.lock();
+
+    // Try update first, fall back to create.
+    let schedule = match schedule_store.get_schedule_for_saved_query(saved_id, key_id) {
+        Ok(Some(existing)) => schedule_store
+            .update_schedule(
+                existing.id,
+                key_id,
+                interval_secs,
+                req.max_runs,
+                req.enabled,
+            )
+            .map_err(|e| ServerError::Internal(format!("failed to update schedule: {e}")))?,
+        Ok(None) => schedule_store
+            .create_schedule(saved_id, key_id, interval_secs, req.max_runs)
+            .map_err(|e| ServerError::Internal(format!("failed to create schedule: {e}")))?,
+        Err(e) => {
+            return Err(ServerError::Internal(format!(
+                "failed to check schedule: {e}"
+            )));
+        }
+    };
+
+    let response = build_schedule_response(&schedule_store, schedule);
+    drop(schedule_store);
+
+    Ok(Json(response))
+}
+
+/// `GET /api/v1/saved/{id}/schedule` — get schedule for a saved query.
+pub async fn get_schedule(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path(saved_id): Path<i64>,
+) -> Result<Json<ScheduleResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SavedQuery) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = resolve_key_id(&state, &verified)?;
+    let schedule_store = state.auth.schedule.lock();
+
+    let schedule = schedule_store
+        .get_schedule_for_saved_query(saved_id, key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to get schedule: {e}")))?
+        .ok_or_else(|| ServerError::NotFound("no schedule for this saved query".into()))?;
+
+    let response = build_schedule_response(&schedule_store, schedule);
+    drop(schedule_store);
+
+    Ok(Json(response))
+}
+
+/// `DELETE /api/v1/saved/{id}/schedule` — delete a schedule.
+pub async fn delete_schedule(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path(saved_id): Path<i64>,
+) -> Result<Json<DeleteScheduleResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SavedQuery) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = resolve_key_id(&state, &verified)?;
+
+    state
+        .auth
+        .schedule
+        .lock()
+        .delete_schedule(saved_id, key_id)
+        .map_err(|e| match e {
+            fleet_auth::AuthError::NotFound { .. } => {
+                ServerError::NotFound("schedule not found or unauthorized".into())
+            }
+            e => ServerError::Internal(format!("failed to delete schedule: {e}")),
+        })?;
+
+    Ok(Json(DeleteScheduleResponse { deleted: true }))
+}
+
+/// Query params for listing report runs.
+#[derive(Debug, Deserialize)]
+pub struct ListRunsParams {
+    #[serde(default = "default_runs_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_runs_limit() -> usize {
+    20
+}
+
+/// `GET /api/v1/saved/{id}/runs` — list report runs for a saved query.
+pub async fn list_report_runs(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path(saved_id): Path<i64>,
+    Query(params): Query<ListRunsParams>,
+) -> Result<Json<ListReportRunsResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SavedQuery) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = resolve_key_id(&state, &verified)?;
+    let schedule_store = state.auth.schedule.lock();
+
+    let runs = schedule_store
+        .list_runs(saved_id, key_id, params.limit, params.offset)
+        .map_err(|e| ServerError::Internal(format!("failed to list runs: {e}")))?;
+
+    let total = schedule_store
+        .count_runs_for_saved_query(saved_id, key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to count runs: {e}")))?;
+
+    drop(schedule_store);
+
+    Ok(Json(ListReportRunsResponse {
+        runs: runs.into_iter().map(report_run_summary).collect(),
+        total,
+    }))
+}
+
+/// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.
+pub async fn get_report_run(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path((saved_id, run_id)): Path<(i64, i64)>,
+) -> Result<Json<ReportRunResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SavedQuery) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = resolve_key_id(&state, &verified)?;
+    let schedule_store = state.auth.schedule.lock();
+
+    let run = schedule_store
+        .get_run(run_id, key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to get run: {e}")))?
+        .ok_or_else(|| ServerError::NotFound("report run not found or unauthorized".into()))?;
+
+    // Verify the run belongs to the correct saved query.
+    if run.saved_query_id != saved_id {
+        return Err(ServerError::NotFound(
+            "report run not found for this saved query".into(),
+        ));
+    }
+
+    // Decompress result blob if present.
+    let result = schedule_store
+        .get_run_result(run_id, key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to get run result: {e}")))?
+        .and_then(|compressed| {
+            let decompressed = zstd::decode_all(compressed.as_slice()).ok()?;
+            serde_json::from_slice::<QueryResult>(&decompressed).ok()
+        });
+
+    drop(schedule_store);
+
+    Ok(Json(ReportRunResponse {
+        summary: report_run_summary(run),
+        result,
+    }))
 }
 
 /// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.

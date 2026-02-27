@@ -67,6 +67,14 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             "/saved/{id}",
             put(handlers::update_saved).delete(handlers::delete_saved),
         )
+        .route(
+            "/saved/{id}/schedule",
+            put(handlers::set_schedule)
+                .get(handlers::get_schedule)
+                .delete(handlers::delete_schedule),
+        )
+        .route("/saved/{id}/runs", get(handlers::list_report_runs))
+        .route("/saved/{id}/runs/{run_id}", get(handlers::get_report_run))
         .route("/export", post(handlers::export))
         .route("/stream", get(handlers::stream_query))
         .layer(middleware::from_fn(rate_limit_middleware))
