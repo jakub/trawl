@@ -2990,6 +2990,7 @@ mod tests {
                 query: "level:error".to_owned(),
                 created_at: "2025-01-01T00:00:00Z".to_owned(),
                 updated_at: "2025-01-01T00:00:00Z".to_owned(),
+                schedule: None,
             }],
         };
 
@@ -3023,6 +3024,7 @@ mod tests {
                     query: "a".to_owned(),
                     created_at: String::new(),
                     updated_at: String::new(),
+                    schedule: None,
                 },
                 SavedQueryResponse {
                     id: 2,
@@ -3030,6 +3032,7 @@ mod tests {
                     query: "b".to_owned(),
                     created_at: String::new(),
                     updated_at: String::new(),
+                    schedule: None,
                 },
             ],
         };

@@ -923,6 +923,7 @@ fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
         query: saved.query,
         created_at: saved.created_at,
         updated_at: saved.updated_at,
+        schedule: None,
     }
 }
 

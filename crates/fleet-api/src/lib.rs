@@ -459,12 +459,113 @@ pub struct SavedQueryResponse {
     pub created_at: String,
     /// When the query was last updated (ISO 8601 UTC).
     pub updated_at: String,
+    /// Schedule attached to this saved query (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleResponse>,
 }
 
 /// Response from the delete saved query endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteSavedResponse {
     /// Whether the query was successfully deleted.
+    pub deleted: bool,
+}
+
+// -- schedules ---------------------------------------------------------------
+
+/// Schedule attached to a saved query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleResponse {
+    /// Schedule ID.
+    pub id: i64,
+    /// The saved query this schedule belongs to.
+    pub saved_query_id: i64,
+    /// Human-readable interval (e.g. "5m", "1h").
+    pub interval: String,
+    /// Interval in seconds.
+    pub interval_secs: u64,
+    /// Maximum number of runs (if set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u64>,
+    /// Whether the schedule is active.
+    pub enabled: bool,
+    /// When the schedule was created (ISO 8601 UTC).
+    pub created_at: String,
+    /// When the schedule was last updated (ISO 8601 UTC).
+    pub updated_at: String,
+    /// Most recent report run summary (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<ReportRunSummary>,
+    /// Total number of runs executed.
+    pub total_runs: u64,
+}
+
+/// Request body to create or update a schedule (`PUT /api/v1/saved/{id}/schedule`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetScheduleRequest {
+    /// Interval string (e.g. "5m", "1h", "24h").
+    pub interval: String,
+    /// Maximum number of runs (omit or null for unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u64>,
+    /// Whether the schedule is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Summary of a single report run (no result data).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportRunSummary {
+    /// Run ID.
+    pub id: i64,
+    /// DSL query snapshot at execution time.
+    pub query: String,
+    /// Run status: "running", "success", "error", "timeout".
+    pub status: String,
+    /// When the run started (ISO 8601 UTC).
+    pub started_at: String,
+    /// When the run finished (ISO 8601 UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// Execution duration in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Number of result rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<usize>,
+    /// Error message (if status is "error").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// Paginated list of report runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListReportRunsResponse {
+    /// Report run summaries (most recent first).
+    pub runs: Vec<ReportRunSummary>,
+    /// Total number of runs for this schedule.
+    pub total: usize,
+}
+
+/// Full report run including result data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportRunResponse {
+    /// Run summary metadata.
+    #[serde(flatten)]
+    pub summary: ReportRunSummary,
+    /// Query result (decompressed). Absent for error/running runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<QueryResult>,
+}
+
+/// Response from deleting a schedule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteScheduleResponse {
+    /// Whether a schedule was deleted.
     pub deleted: bool,
 }
 
