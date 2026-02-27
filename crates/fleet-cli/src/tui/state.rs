@@ -135,6 +135,8 @@ pub enum SidebarSection {
     History,
     /// Saved queries.
     Saved,
+    /// Scheduled reports.
+    Reports,
 }
 
 /// Tree state for the schema browser.
@@ -175,6 +177,8 @@ pub struct SidebarState {
     pub history_selected: usize,
     /// Selected index in the saved queries list.
     pub saved_selected: usize,
+    /// Selected index in the reports list.
+    pub reports_selected: usize,
     /// Catalog summary from enriched schema response (used by sidebar renderer).
     #[allow(dead_code)] // Used by sidebar renderer (not yet implemented).
     pub catalog: Option<CatalogSummary>,
@@ -187,6 +191,7 @@ impl SidebarState {
             schema: SchemaTree::new(),
             history_selected: 0,
             saved_selected: 0,
+            reports_selected: 0,
             catalog,
         }
     }
@@ -223,6 +228,15 @@ pub enum Popup {
     Error {
         /// Error message to display.
         message: String,
+    },
+    /// Text input for setting a schedule interval on a saved query.
+    SetSchedule {
+        /// ID of the saved query to schedule.
+        saved_id: i64,
+        /// Name of the query being scheduled.
+        name: String,
+        /// Single-line editor for the interval string.
+        editor: SimpleEditor,
     },
 }
 

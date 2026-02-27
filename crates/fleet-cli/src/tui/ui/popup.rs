@@ -28,6 +28,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Popup::Error { message } => {
                 render_error(frame, message);
             }
+            Popup::SetSchedule { name, editor, .. } => {
+                render_set_schedule(frame, name, editor);
+            }
         }
     }
 }
@@ -226,6 +229,66 @@ fn render_error(frame: &mut Frame<'_>, message: &str) {
         .wrap(ratatui::widgets::Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+/// Render text input dialog for scheduling a saved query.
+fn render_set_schedule(
+    frame: &mut Frame<'_>,
+    name: &str,
+    editor: &crate::tui::state::SimpleEditor,
+) {
+    let area = centered_rect(60, 40, frame.area());
+    let input = editor.text();
+
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Set Schedule ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::Cyan));
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            name,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Interval (e.g. 5m, 1h, 24h):",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("> {input}\u{2588}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter to schedule  |  Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+
+    // Position cursor inside the input field.
+    let cursor_col = editor.cursor.1;
+    #[allow(clippy::cast_possible_truncation)]
+    let cursor_x =
+        area.x + (area.width / 2).saturating_sub((input.len() as u16) / 2) + 2 + cursor_col as u16;
+    let cursor_y = area.y + 6; // Row of the input line within the popup
+    frame.set_cursor_position((cursor_x, cursor_y));
 }
 
 use super::common::centered_rect;

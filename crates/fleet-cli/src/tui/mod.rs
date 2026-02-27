@@ -167,6 +167,10 @@ enum MutationResult {
         /// Name of the query to select after refresh (if any).
         select_name: Option<String>,
     },
+    /// Schedule was set on a saved query.
+    ScheduleSet { saved_query_id: i64 },
+    /// Report run result was loaded.
+    ReportRunLoaded { result: QueryResponse },
     /// Mutation failed.
     Error { message: String },
 }
@@ -447,6 +451,21 @@ impl App {
                         }
                     }
                 }
+                MutationResult::ScheduleSet { saved_query_id } => {
+                    tracing::info!("schedule set for saved query {saved_query_id}");
+                    self.refresh_saved_cache(None);
+                }
+                MutationResult::ReportRunLoaded { result } => {
+                    tracing::info!("report run loaded");
+                    let tab = self.active_tab_mut();
+                    tab.result = Some(result);
+                    tab.status = state::TabStatus::Success { duration_ms: 0 };
+                    tab.selected_row = None;
+                    tab.scroll_offset = 0;
+                    tab.horizontal_scroll_offset = 0;
+                    tab.column_widths = None;
+                    self.focus = Focus::Results;
+                }
                 MutationResult::Error { message } => {
                     tracing::error!("mutation error: {message}");
                     self.popup = Some(Popup::Error { message });
@@ -574,6 +593,11 @@ impl App {
             // F4: open sidebar at saved
             (KeyModifiers::NONE, KeyCode::F(4)) => {
                 self.open_sidebar_section(SidebarSection::Saved);
+                return;
+            }
+            // F6: open sidebar at reports
+            (KeyModifiers::NONE, KeyCode::F(6)) => {
+                self.open_sidebar_section(SidebarSection::Reports);
                 return;
             }
             // Ctrl+P: focus sidebar filter (schema section)
@@ -1186,6 +1210,106 @@ impl App {
                     }
                 }
             }
+            // Schedule: open set-schedule popup
+            (KeyModifiers::NONE, KeyCode::Char('s')) => {
+                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
+                if let Some(ref saved) = self.saved_cache {
+                    if let Some(entry) = saved.queries.get(selected) {
+                        self.popup = Some(Popup::SetSchedule {
+                            saved_id: entry.id,
+                            name: entry.name.clone(),
+                            editor: state::SimpleEditor::new(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle key events for the reports section of the sidebar.
+    fn handle_sidebar_reports_key(&mut self, key: event::KeyEvent) {
+        // Count scheduled queries (derived from saved_cache).
+        let item_count = self.saved_cache.as_ref().map_or(0, |s| {
+            s.queries.iter().filter(|q| q.schedule.is_some()).count()
+        });
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                if let Some(ref mut sb) = self.sidebar {
+                    sb.reports_selected = sb.reports_selected.saturating_sub(1);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                if let Some(ref mut sb) = self.sidebar {
+                    if item_count > 0 {
+                        sb.reports_selected = (sb.reports_selected + 1).min(item_count - 1);
+                    }
+                }
+            }
+            // Enter: load last successful run's results
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.reports_selected);
+                let scheduled: Vec<_> = self.saved_cache.as_ref().map_or(Vec::new(), |s| {
+                    s.queries.iter().filter(|q| q.schedule.is_some()).collect()
+                });
+
+                if let Some(entry) = scheduled.get(selected) {
+                    let saved_id = entry.id;
+                    let client = self.client.clone();
+                    let mutation_tx = self.mutation_tx.clone();
+                    tokio::spawn(async move {
+                        // Get runs, find last successful one, load its result.
+                        match client.list_report_runs(saved_id, Some(20), None).await {
+                            Ok(runs_resp) => {
+                                let last_success =
+                                    runs_resp.runs.iter().find(|r| r.status == "success");
+                                if let Some(run) = last_success {
+                                    match client.get_report_run(saved_id, run.id).await {
+                                        Ok(report) => {
+                                            if let Some(result) = report.result {
+                                                let returned = result.rows.len();
+                                                let _ = mutation_tx.send(
+                                                    MutationResult::ReportRunLoaded {
+                                                        result: QueryResponse {
+                                                            result,
+                                                            truncated: false,
+                                                            pagination:
+                                                                fleet_client::PaginationMeta {
+                                                                    limit: returned,
+                                                                    offset: 0,
+                                                                    returned,
+                                                                },
+                                                        },
+                                                    },
+                                                );
+                                            } else {
+                                                let _ = mutation_tx.send(MutationResult::Error {
+                                                    message: "run has no result data".into(),
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = mutation_tx.send(MutationResult::Error {
+                                                message: format!("failed to load report run: {e}"),
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    let _ = mutation_tx.send(MutationResult::Error {
+                                        message: "no successful runs yet".into(),
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                let _ = mutation_tx.send(MutationResult::Error {
+                                    message: format!("failed to list report runs: {e}"),
+                                });
+                            }
+                        }
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -1216,9 +1340,10 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Char('[')) => {
                 if let Some(ref mut sb) = self.sidebar {
                     let new_section = match sb.section {
-                        SidebarSection::Schema => SidebarSection::Saved,
+                        SidebarSection::Schema => SidebarSection::Reports,
                         SidebarSection::History => SidebarSection::Schema,
                         SidebarSection::Saved => SidebarSection::History,
+                        SidebarSection::Reports => SidebarSection::Saved,
                     };
                     sb.section = new_section;
                     self.sidebar_section_hint = new_section;
@@ -1229,7 +1354,8 @@ impl App {
                     let new_section = match sb.section {
                         SidebarSection::Schema => SidebarSection::History,
                         SidebarSection::History => SidebarSection::Saved,
-                        SidebarSection::Saved => SidebarSection::Schema,
+                        SidebarSection::Saved => SidebarSection::Reports,
+                        SidebarSection::Reports => SidebarSection::Schema,
                     };
                     sb.section = new_section;
                     self.sidebar_section_hint = new_section;
@@ -1251,6 +1377,7 @@ impl App {
                     Some(SidebarSection::Schema) => self.handle_schema_tree_key(key),
                     Some(SidebarSection::History) => self.handle_sidebar_history_key(key),
                     Some(SidebarSection::Saved) => self.handle_sidebar_saved_key(key),
+                    Some(SidebarSection::Reports) => self.handle_sidebar_reports_key(key),
                     None => {}
                 }
             }
@@ -1683,6 +1810,9 @@ impl App {
                         self.popup = None;
                     }
                 }
+                Popup::SetSchedule { .. } => {
+                    self.handle_set_schedule_key(key);
+                }
                 Popup::EventDetail {
                     row_index, scroll, ..
                 } => {
@@ -1775,6 +1905,74 @@ impl App {
             // Delegate all other keys to the editor
             _ => {
                 if let Some(Popup::SaveQuery { ref mut editor }) = self.popup {
+                    match key.code {
+                        KeyCode::Char(ch) => editor.insert_char(ch),
+                        KeyCode::Backspace => editor.delete_char_before(),
+                        KeyCode::Delete => editor.delete_char_at(),
+                        KeyCode::Left => {
+                            editor.clear_selection();
+                            editor.move_left();
+                        }
+                        KeyCode::Right => {
+                            editor.clear_selection();
+                            editor.move_right();
+                        }
+                        KeyCode::Home => {
+                            editor.clear_selection();
+                            editor.move_to_line_start();
+                        }
+                        KeyCode::End => {
+                            editor.clear_selection();
+                            editor.move_to_line_end();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle key events for the set-schedule popup.
+    fn handle_set_schedule_key(&mut self, key: event::KeyEvent) {
+        match (key.modifiers, key.code) {
+            // Confirm: Enter
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if let Some(Popup::SetSchedule {
+                    saved_id,
+                    ref editor,
+                    ..
+                }) = self.popup
+                {
+                    let interval = editor.text().trim().to_owned();
+                    if !interval.is_empty() {
+                        let saved_id_copy = saved_id;
+                        self.popup = None;
+                        let client = self.client.clone();
+                        let mutation_tx = self.mutation_tx.clone();
+                        tokio::spawn(async move {
+                            let result = match client
+                                .set_schedule(saved_id_copy, &interval, None, true)
+                                .await
+                            {
+                                Ok(_) => MutationResult::ScheduleSet {
+                                    saved_query_id: saved_id_copy,
+                                },
+                                Err(e) => MutationResult::Error {
+                                    message: format!("failed to set schedule: {e}"),
+                                },
+                            };
+                            let _ = mutation_tx.send(result);
+                        });
+                    }
+                }
+            }
+            // Cancel: Esc
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.popup = None;
+            }
+            // Delegate all other keys to the editor
+            _ => {
+                if let Some(Popup::SetSchedule { ref mut editor, .. }) = self.popup {
                     match key.code {
                         KeyCode::Char(ch) => editor.insert_char(ch),
                         KeyCode::Backspace => editor.delete_char_before(),

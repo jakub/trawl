@@ -90,7 +90,11 @@ fn get_context_hints(app: &App) -> String {
                     "↑↓: navigate | enter: load query | [/]: sections".to_owned()
                 }
                 SidebarSection::Saved => {
-                    "↑↓: navigate | enter: load | del: delete | [/]: sections".to_owned()
+                    "↑↓: navigate | enter: load | s: schedule | del: delete | [/]: sections"
+                        .to_owned()
+                }
+                SidebarSection::Reports => {
+                    "↑↓: navigate | enter: load last run | [/]: sections".to_owned()
                 }
             };
         }

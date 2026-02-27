@@ -5,7 +5,7 @@ expression: terminal.backend().to_string()
 " S  1 ●                                                  ctrl+t new  ctrl+w clos"
 " H ┌ Query Editor ─────────────────────────────────────────────────────────────┐"
 " Q │                                                                           │"
-"   │                                                                           │"
+" R │                                                                           │"
 "   │                                                                           │"
 "   │                                                                           │"
 "   │                                                                           │"

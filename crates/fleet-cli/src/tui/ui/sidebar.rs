@@ -45,6 +45,7 @@ fn render_activity_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
         (SidebarSection::Schema, "S"),
         (SidebarSection::History, "H"),
         (SidebarSection::Saved, "Q"),
+        (SidebarSection::Reports, "R"),
     ];
 
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -132,6 +133,9 @@ fn render_panel(app: &App, frame: &mut Frame<'_>, area: Rect) {
         SidebarSection::Saved => {
             render_saved_list(app, frame, content_area);
         }
+        SidebarSection::Reports => {
+            render_reports_list(app, frame, content_area);
+        }
     }
 }
 
@@ -141,6 +145,7 @@ fn render_section_tabs(active: SidebarSection, frame: &mut Frame<'_>, area: Rect
         (SidebarSection::Schema, "Schema"),
         (SidebarSection::History, "History"),
         (SidebarSection::Saved, "Saved"),
+        (SidebarSection::Reports, "Reports"),
     ];
 
     let spans: Vec<Span<'_>> = tabs
@@ -512,12 +517,30 @@ fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .queries
         .iter()
         .map(|entry| {
-            let display = if entry.name.len() > max_width {
-                format!("{}…", &entry.name[..max_width.saturating_sub(1)])
+            // Show schedule indicator if the query has one.
+            let schedule_suffix = entry
+                .schedule
+                .as_ref()
+                .map(|s| format!(" [{}]", s.interval))
+                .unwrap_or_default();
+            let name_budget = max_width.saturating_sub(schedule_suffix.len());
+            let display_name = if entry.name.len() > name_budget {
+                format!("{}…", &entry.name[..name_budget.saturating_sub(1)])
             } else {
                 entry.name.clone()
             };
-            ListItem::new(Span::styled(display, Style::default().fg(Color::White)))
+
+            if schedule_suffix.is_empty() {
+                ListItem::new(Span::styled(
+                    display_name,
+                    Style::default().fg(Color::White),
+                ))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::styled(display_name, Style::default().fg(Color::White)),
+                    Span::styled(schedule_suffix, Style::default().fg(Color::DarkGray)),
+                ]))
+            }
         })
         .collect();
 
@@ -534,4 +557,116 @@ fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+// ---------------------------------------------------------------------------
+// Reports list (scheduled saved queries)
+// ---------------------------------------------------------------------------
+
+/// Render the reports list (saved queries with schedules) in the sidebar panel.
+fn render_reports_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let selected = app.sidebar.as_ref().map_or(0, |sb| sb.reports_selected);
+
+    let Some(ref saved) = app.saved_cache else {
+        let paragraph = Paragraph::new("loading...").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(paragraph, area);
+        return;
+    };
+
+    // Filter to only saved queries that have a schedule.
+    let scheduled: Vec<_> = saved
+        .queries
+        .iter()
+        .filter(|q| q.schedule.is_some())
+        .collect();
+
+    if scheduled.is_empty() {
+        let paragraph =
+            Paragraph::new("no scheduled queries").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let max_width = area.width as usize;
+    let items: Vec<ListItem<'_>> = scheduled
+        .iter()
+        .map(|entry| {
+            let sched = entry.schedule.as_ref().unwrap();
+            let interval = &sched.interval;
+
+            // Status indicator based on last run.
+            let (icon, icon_color) = if let Some(ref last) = sched.last_run {
+                match last.status.as_str() {
+                    "success" => ("\u{2713}", Color::Green),  // checkmark
+                    "running" => ("\u{23f3}", Color::Yellow), // hourglass
+                    _ => ("\u{2717}", Color::Red),            // cross
+                }
+            } else {
+                ("\u{00b7}", Color::DarkGray) // middle dot — never run
+            };
+
+            // Time since last run.
+            let age = sched
+                .last_run
+                .as_ref()
+                .and_then(|r| {
+                    r.started_at
+                        .as_str()
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .ok()
+                })
+                .map(format_age)
+                .unwrap_or_default();
+
+            let suffix = format!(" ({interval}) {age}");
+            let name_budget = max_width.saturating_sub(suffix.len() + 2);
+            let display_name = if entry.name.len() > name_budget {
+                format!("{}…", &entry.name[..name_budget.saturating_sub(1)])
+            } else {
+                entry.name.clone()
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+                Span::styled(display_name, Style::default().fg(Color::White)),
+                Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+
+    let total = items.len();
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    #[allow(clippy::cast_possible_truncation)]
+    let visible_height = area.height as usize;
+    let offset = compute_center_offset(selected, visible_height, total);
+    let mut list_state = ListState::default().with_offset(offset);
+    list_state.select(Some(selected));
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Format a time delta as a human-readable age string (e.g. "2m ago", "3h ago").
+fn format_age(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let delta = now.signed_duration_since(dt);
+    let secs = delta.num_seconds();
+    if secs < 0 {
+        return String::new();
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let secs = secs as u64;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
