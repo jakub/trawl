@@ -10,7 +10,7 @@ mod commands;
 
 /// fleet administration tool.
 #[derive(Parser)]
-#[command(name = "fleet-admin", version, about)]
+#[command(name = "fleet-admin", version, long_version = fleet_core::version::long_version(), about)]
 struct Cli {
     /// Path to the auth database file.
     #[arg(long, env = "FLEET_AUTH_DB", default_value = "~/.fleet/auth.db")]

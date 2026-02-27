@@ -15,7 +15,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 /// fleetd — the fleet daemon.
 #[derive(Parser)]
-#[command(name = "fleetd", version, about)]
+#[command(name = "fleetd", version, long_version = fleet_core::version::long_version(), about)]
 struct Cli {
     /// Path to the configuration file.
     #[arg(long, env = "FLEET_CONFIG", default_value = "~/.fleet/fleetd.toml")]
@@ -46,6 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         https_addr = %config.server.http_addr,
         data_path = %config.data.path,
         max_queries = config.server.max_concurrent_queries,
+        version = fleet_core::version::PKG_VERSION,
+        git_sha = fleet_core::version::GIT_SHA,
+        git_date = fleet_core::version::GIT_DATE,
+        rustc = fleet_core::version::RUSTC_VERSION,
+        target = fleet_core::version::TARGET_TRIPLE,
         "starting fleetd"
     );
 

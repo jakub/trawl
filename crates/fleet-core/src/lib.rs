@@ -21,3 +21,6 @@ pub mod filter;
 
 /// Streaming pipeline compiler and executor.
 pub mod stream;
+
+/// Build-time version metadata.
+pub mod version;

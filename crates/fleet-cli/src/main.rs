@@ -13,7 +13,7 @@ mod tui;
 ///
 /// Run with no subcommand to launch the interactive TUI.
 #[derive(Parser)]
-#[command(name = "fleet", version, about)]
+#[command(name = "fleet", version, long_version = fleet_core::version::long_version(), about)]
 struct Cli {
     /// Server URL (default: `https://localhost:5514`).
     #[arg(long, env = "FLEET_URL", global = true)]

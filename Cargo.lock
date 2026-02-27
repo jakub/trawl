@@ -1216,6 +1216,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "fleet-auth",
+ "fleet-core",
  "insta",
  "rcgen",
  "shellexpand",
