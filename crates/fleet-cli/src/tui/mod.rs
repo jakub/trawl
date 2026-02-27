@@ -636,8 +636,17 @@ impl App {
                 }
                 return;
             }
-            // Cycle tabs: Shift+Tab (BackTab) — cycles forward, wrapping around
-            (_, KeyCode::BackTab) => {
+            // Cycle tabs: Ctrl+Up (prev) / Ctrl+Down (next), wrapping around
+            (KeyModifiers::CONTROL, KeyCode::Up) => {
+                if self.tabs.len() > 1 {
+                    self.active_tab_idx = self
+                        .active_tab_idx
+                        .checked_sub(1)
+                        .unwrap_or(self.tabs.len() - 1);
+                }
+                return;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Down) => {
                 if self.tabs.len() > 1 {
                     self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
                 }
@@ -1197,23 +1206,27 @@ impl App {
                 self.sidebar = None;
                 self.focus = Focus::Editor;
             }
-            // Section switching with bare digits
-            (KeyModifiers::NONE, KeyCode::Char('1')) => {
+            // Section cycling: Ctrl+Left (prev) / Ctrl+Right (next)
+            (KeyModifiers::CONTROL, KeyCode::Left) => {
                 if let Some(ref mut sb) = self.sidebar {
-                    sb.section = SidebarSection::Schema;
-                    self.sidebar_section_hint = SidebarSection::Schema;
+                    let new_section = match sb.section {
+                        SidebarSection::Schema => SidebarSection::Saved,
+                        SidebarSection::History => SidebarSection::Schema,
+                        SidebarSection::Saved => SidebarSection::History,
+                    };
+                    sb.section = new_section;
+                    self.sidebar_section_hint = new_section;
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Char('2')) => {
+            (KeyModifiers::CONTROL, KeyCode::Right) => {
                 if let Some(ref mut sb) = self.sidebar {
-                    sb.section = SidebarSection::History;
-                    self.sidebar_section_hint = SidebarSection::History;
-                }
-            }
-            (KeyModifiers::NONE, KeyCode::Char('3')) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    sb.section = SidebarSection::Saved;
-                    self.sidebar_section_hint = SidebarSection::Saved;
+                    let new_section = match sb.section {
+                        SidebarSection::Schema => SidebarSection::History,
+                        SidebarSection::History => SidebarSection::Saved,
+                        SidebarSection::Saved => SidebarSection::Schema,
+                    };
+                    sb.section = new_section;
+                    self.sidebar_section_hint = new_section;
                 }
             }
             // '/' or Ctrl+P: activate filter (schema only)
@@ -2580,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn key_shift_tab_cycles_tabs() {
+    fn key_ctrl_down_cycles_tabs_forward() {
         let mut app = test_app();
         // Create 3 tabs total
         app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -2589,12 +2602,34 @@ mod tests {
         assert_eq!(app.active_tab_idx, 2);
 
         // Cycle forward: 2 -> 0
-        app.handle_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT));
+        app.handle_key(key_mod(KeyCode::Down, KeyModifiers::CONTROL));
         assert_eq!(app.active_tab_idx, 0);
 
         // Cycle forward: 0 -> 1
-        app.handle_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT));
+        app.handle_key(key_mod(KeyCode::Down, KeyModifiers::CONTROL));
         assert_eq!(app.active_tab_idx, 1);
+    }
+
+    #[test]
+    fn key_ctrl_up_cycles_tabs_backward() {
+        let mut app = test_app();
+        // Create 3 tabs total
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.active_tab_idx, 2);
+
+        // Cycle backward: 2 -> 1
+        app.handle_key(key_mod(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab_idx, 1);
+
+        // Cycle backward: 1 -> 0
+        app.handle_key(key_mod(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab_idx, 0);
+
+        // Wrap: 0 -> 2
+        app.handle_key(key_mod(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab_idx, 2);
     }
 
     #[test]

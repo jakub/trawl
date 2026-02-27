@@ -84,13 +84,14 @@ fn get_context_hints(app: &App) -> String {
             }
             return match sb.section {
                 SidebarSection::Schema => {
-                    "↑↓: navigate | →: expand | ←: collapse | /: filter | 1-3: sections".to_owned()
+                    "↑↓: navigate | →: expand | ←: collapse | /: filter | ctrl+←→: sections"
+                        .to_owned()
                 }
                 SidebarSection::History => {
-                    "↑↓: navigate | enter: load query | 1-3: sections".to_owned()
+                    "↑↓: navigate | enter: load query | ctrl+←→: sections".to_owned()
                 }
                 SidebarSection::Saved => {
-                    "↑↓: navigate | enter: load | del: delete | 1-3: sections".to_owned()
+                    "↑↓: navigate | enter: load | del: delete | ctrl+←→: sections".to_owned()
                 }
             };
         }
@@ -127,6 +128,6 @@ fn get_context_hints(app: &App) -> String {
             }
         }
         // Sidebar hints handled by early return above; fallback for safety.
-        Focus::Sidebar => "tab: editor | 1-3: sections | esc: close".to_owned(),
+        Focus::Sidebar => "tab: editor | ctrl+←→: sections | esc: close".to_owned(),
     }
 }
