@@ -56,4 +56,18 @@ pub enum AuthError {
         /// The resource type.
         resource: String,
     },
+
+    /// Schedule interval is below the minimum (60 seconds).
+    #[error("schedule interval {secs}s is below minimum of 60s")]
+    IntervalTooShort {
+        /// The requested interval in seconds.
+        secs: u64,
+    },
+
+    /// A schedule already exists for this saved query.
+    #[error("a schedule already exists for saved query id={saved_query_id}")]
+    ScheduleExists {
+        /// The saved query that already has a schedule.
+        saved_query_id: i64,
+    },
 }

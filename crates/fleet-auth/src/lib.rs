@@ -21,6 +21,9 @@ pub mod history;
 /// `SQLite`-backed saved queries storage.
 pub mod saved;
 
+/// `SQLite`-backed scheduled query execution and report storage.
+pub mod schedule;
+
 /// Token generation, hashing, and verification.
 pub mod token;
 
@@ -29,4 +32,5 @@ pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use keys::{ApiKeyInfo, CreatedKey, VerifiedKey};
 pub use roles::{Permission, Role};
 pub use saved::{SavedQuery, SavedQueryStore};
+pub use schedule::{ReportRun, Schedule, ScheduleStore};
 pub use store::KeyStore;
