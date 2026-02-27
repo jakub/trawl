@@ -2289,6 +2289,7 @@ pub async fn run(
     app.max_live_events = config.tail.max_events;
     app.enter_executes = config.ui.enter_executes;
     app.timezone = config.ui.timezone.clone();
+    app.sidebar_width = config.ui.sidebar_width;
     app.schema_cache = schema;
     app.history_cache = history;
     app.saved_cache = saved;
