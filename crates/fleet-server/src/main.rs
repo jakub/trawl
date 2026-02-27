@@ -27,6 +27,7 @@ struct Cli {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let config_path = resolve_path(&cli.config);
@@ -136,14 +137,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (handle, shutdown_tx)
     };
 
+    // Spawn scheduled query executor.
+    let scheduler_handle = if config.scheduler.enabled {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = fleet_server::scheduler::spawn_scheduler(
+            Arc::clone(&state.auth.schedule),
+            Arc::clone(&state.auth.key_store),
+            state.query.pool.clone(),
+            config.scheduler.clone(),
+            config.server.timeout_secs,
+            shutdown_rx,
+        );
+        Some((handle, shutdown_tx))
+    } else {
+        None
+    };
+
     http::serve(state, &http_config, &config.server).await?;
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
-    // then stats emitter, then hot buffer consumer (stop inserting), then
-    // compaction (may compact final files and drain hot buffer), then
-    // retention, then audit.
+    // then stats emitter, then scheduler (stop issuing new queries), then
+    // hot buffer consumer (stop inserting), then compaction (may compact
+    // final files and drain hot buffer), then retention, then audit.
     shutdown_task(telemetry_handle, "telemetry").await;
     shutdown_task(Some(stats_handle), "stats_emitter").await;
+    shutdown_task(scheduler_handle, "scheduler").await;
     if let Some((compaction_jh, compaction_tx, hot_buf_handle)) = compaction_handle {
         // Stop the hot buffer consumer before compaction so no new
         // batches arrive while compaction is draining.

@@ -384,6 +384,19 @@ impl KeyStore {
             })
     }
 
+    /// Check whether a key is active (not revoked) by its database id.
+    pub fn is_key_active(&self, key_id: i64) -> Result<bool, AuthError> {
+        let active: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT active FROM api_keys WHERE id = ?1",
+                params![key_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(active == Some(1))
+    }
+
     /// Revoke a key by its prefix.
     pub fn revoke_key(&self, prefix: &str) -> Result<ApiKeyInfo, AuthError> {
         let now = Utc::now().to_rfc3339();
