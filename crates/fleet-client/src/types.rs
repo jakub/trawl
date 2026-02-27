@@ -31,6 +31,14 @@ pub(crate) struct ExportRequestRef<'a> {
     pub limit: Option<usize>,
 }
 
+#[derive(Serialize)]
+pub(crate) struct SetScheduleRequestRef<'a> {
+    pub interval: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u64>,
+    pub enabled: bool,
+}
+
 // -- streaming types ---------------------------------------------------------
 
 /// A single event from a live query stream.
@@ -58,9 +66,11 @@ pub enum StreamEvent {
 
 pub use fleet_api::{
     ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,
-    DeleteSavedResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse, ErrorSpan,
-    ExportFormat, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
-    HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse, ListSavedResponse,
-    PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, SavedQueryResponse,
-    SchemaColumnResponse, SchemaResponse, StatsResponse, UpdateSavedRequest, ValidationResponse,
+    DeleteSavedResponse, DeleteScheduleResponse, ErrorCode, ErrorDetail, ErrorEnvelope,
+    ErrorResponse, ErrorSpan, ExportFormat, ExportRequest, FieldValuesResponse, HealthResponse,
+    HealthStatus, HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse,
+    ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
+    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
+    ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse,
+    UpdateSavedRequest, ValidationResponse,
 };

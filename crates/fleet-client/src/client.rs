@@ -8,13 +8,14 @@ use zeroize::Zeroizing;
 
 use crate::error::ClientError;
 use crate::types::{
-    CancelResponse, DeleteSavedResponse, FieldValuesResponse, HealthResponse, HistoryResponse,
-    IngestResponse, ListSavedResponse, QueriesResponse, QueryResponse, SavedQueryResponse,
+    CancelResponse, DeleteSavedResponse, DeleteScheduleResponse, FieldValuesResponse,
+    HealthResponse, HistoryResponse, IngestResponse, ListReportRunsResponse, ListSavedResponse,
+    QueriesResponse, QueryResponse, ReportRunResponse, SavedQueryResponse, ScheduleResponse,
     SchemaResponse, StatsResponse, ValidationResponse,
 };
 use crate::types::{
-    CreateSavedRequestRef, ErrorResponse, ExportRequestRef, StreamEvent, UpdateSavedRequestRef,
-    ValidateRequest,
+    CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
+    UpdateSavedRequestRef, ValidateRequest,
 };
 
 /// HTTP client for the fleet daemon API.
@@ -226,6 +227,70 @@ impl HttpClient {
     pub async fn delete_saved(&self, id: i64) -> Result<DeleteSavedResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{id}"));
         let req = self.client.delete(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Create or update a schedule for a saved query.
+    pub async fn set_schedule(
+        &self,
+        saved_id: i64,
+        interval: &str,
+        max_runs: Option<u64>,
+        enabled: bool,
+    ) -> Result<ScheduleResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/schedule"));
+        let body = SetScheduleRequestRef {
+            interval,
+            max_runs,
+            enabled,
+        };
+        let req = self.client.put(&url).json(&body);
+        self.send_authenticated(req).await
+    }
+
+    /// Get the schedule for a saved query.
+    pub async fn get_schedule(&self, saved_id: i64) -> Result<ScheduleResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/schedule"));
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Delete the schedule for a saved query.
+    pub async fn delete_schedule(
+        &self,
+        saved_id: i64,
+    ) -> Result<DeleteScheduleResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/schedule"));
+        let req = self.client.delete(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// List report runs for a saved query with pagination.
+    pub async fn list_report_runs(
+        &self,
+        saved_id: i64,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ListReportRunsResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/runs"));
+        let mut req = self.client.get(&url);
+        if let Some(l) = limit {
+            req = req.query(&[("limit", l.to_string())]);
+        }
+        if let Some(o) = offset {
+            req = req.query(&[("offset", o.to_string())]);
+        }
+        self.send_authenticated(req).await
+    }
+
+    /// Get a single report run with full result data.
+    pub async fn get_report_run(
+        &self,
+        saved_id: i64,
+        run_id: i64,
+    ) -> Result<ReportRunResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/runs/{run_id}"));
+        let req = self.client.get(&url);
         self.send_authenticated(req).await
     }
 
