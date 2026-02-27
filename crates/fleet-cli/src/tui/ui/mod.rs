@@ -34,9 +34,6 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         ])
         .split(frame.area());
 
-    // Status bar always full width.
-    status::render(app, frame, outer[3]);
-
     // Compute the left panel width: activity bar + optional sidebar panel.
     let sidebar_open = app.sidebar.is_some();
     let left_width = if sidebar_open {
@@ -45,7 +42,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         ACTIVITY_BAR_WIDTH
     };
 
-    // Tab bar aligned with editor/results (offset by sidebar width).
+    // Tab bar and status bar aligned with editor/results (offset by sidebar width).
     let tab_area = Rect {
         x: outer[0].x + left_width,
         y: outer[0].y,
@@ -54,12 +51,20 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     };
     tabs::render(app, frame, tab_area);
 
-    // Left panel spans tab bar + editor + results rows.
+    let status_area = Rect {
+        x: outer[3].x + left_width,
+        y: outer[3].y,
+        width: outer[3].width.saturating_sub(left_width),
+        height: outer[3].height,
+    };
+    status::render(app, frame, status_area);
+
+    // Left panel spans all four rows (tab bar + editor + results + status bar).
     let left_area = Rect {
         x: outer[0].x,
         y: outer[0].y,
         width: left_width.min(outer[0].width),
-        height: outer[0].height + outer[1].height + outer[2].height,
+        height: outer[0].height + outer[1].height + outer[2].height + outer[3].height,
     };
 
     let editor_area = Rect {

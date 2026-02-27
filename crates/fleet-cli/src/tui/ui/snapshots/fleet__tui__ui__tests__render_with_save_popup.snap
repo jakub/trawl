@@ -25,4 +25,4 @@ expression: terminal.backend().to_string()
 "   │                                                                           │"
 "   │                                                                           │"
 "   └───────────────────────────────────────────────────────────────────────────┘"
-"idle [editor]                                 F3: history | F4: saved | F1: help"
+"   idle [editor]                              F3: history | F4: saved | F1: help"
