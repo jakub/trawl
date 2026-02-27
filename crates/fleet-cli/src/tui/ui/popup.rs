@@ -25,6 +25,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Popup::EventDetail { row_index, scroll } => {
                 render_event_detail(app, frame, *row_index, *scroll);
             }
+            Popup::Error { message } => {
+                render_error(frame, message);
+            }
         }
     }
 }
@@ -190,6 +193,37 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         .block(block)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .scroll((clamped_scroll as u16, 0));
+
+    frame.render_widget(paragraph, area);
+}
+
+/// Render an error message popup.
+fn render_error(frame: &mut Frame<'_>, message: &str) {
+    let area = centered_rect(60, 30, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Error ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::Red));
+
+    let text = vec![
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(message, Style::default().fg(Color::Red))),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press Esc to dismiss",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
 }

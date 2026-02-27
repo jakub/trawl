@@ -219,6 +219,11 @@ pub enum Popup {
         /// Vertical scroll offset within the detail view.
         scroll: usize,
     },
+    /// Error message popup (dismissed by Esc/Enter).
+    Error {
+        /// Error message to display.
+        message: String,
+    },
 }
 
 /// Chart visualization mode for results.

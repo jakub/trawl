@@ -449,7 +449,7 @@ impl App {
                 }
                 MutationResult::Error { message } => {
                     tracing::error!("mutation error: {message}");
-                    // TODO: Show error in UI (maybe status bar or popup)
+                    self.popup = Some(Popup::Error { message });
                 }
             }
         }
@@ -1674,6 +1674,14 @@ impl App {
                 }
                 Popup::SaveQuery { .. } => {
                     self.handle_save_query_key(key);
+                }
+                Popup::Error { .. } => {
+                    if matches!(
+                        (key.modifiers, key.code),
+                        (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Enter)
+                    ) {
+                        self.popup = None;
+                    }
                 }
                 Popup::EventDetail {
                     row_index, scroll, ..
@@ -3039,7 +3047,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_mutation_error_is_handled() {
+    fn poll_mutation_error_shows_popup() {
         let mut app = test_app();
         app.mutation_tx
             .send(MutationResult::Error {
@@ -3047,8 +3055,40 @@ mod tests {
             })
             .unwrap();
 
-        // Should not panic
         app.poll_mutations();
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
+    }
+
+    #[test]
+    fn error_popup_dismissed_by_esc() {
+        let mut app = test_app();
+        app.popup = Some(Popup::Error {
+            message: "oops".to_owned(),
+        });
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn error_popup_dismissed_by_enter() {
+        let mut app = test_app();
+        app.popup = Some(Popup::Error {
+            message: "oops".to_owned(),
+        });
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn error_popup_blocks_global_keys() {
+        let mut app = test_app();
+        app.popup = Some(Popup::Error {
+            message: "oops".to_owned(),
+        });
+        // F1 should NOT open help — popup blocks it
+        app.handle_key(key(KeyCode::F(1)));
+        assert!(app.sidebar.is_none());
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
     }
 
     #[test]
