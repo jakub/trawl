@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
-use fleet_auth::{HistoryStore, KeyStore, SavedQueryStore};
+use fleet_auth::{HistoryStore, KeyStore, SavedQueryStore, ScheduleStore};
 use fleet_engine::value::SchemaResult;
 
 use crate::auth::AuthCache;
@@ -75,6 +75,8 @@ pub struct AuthState {
     pub history: Arc<Mutex<HistoryStore>>,
     /// Shared `SavedQueryStore` connection for saved queries.
     pub saved: Arc<Mutex<SavedQueryStore>>,
+    /// Shared `ScheduleStore` connection for scheduled queries and report runs.
+    pub schedule: Arc<Mutex<ScheduleStore>>,
     /// Path to the `SQLite` auth database (kept for admin commands).
     pub db_path: Arc<PathBuf>,
     /// In-memory auth token cache (skips argon2id on hits).
@@ -148,6 +150,7 @@ impl AppState {
         let key_store = KeyStore::open(&config.auth.db_path)?;
         let history = HistoryStore::open(&config.auth.db_path)?;
         let saved = SavedQueryStore::open(&config.auth.db_path)?;
+        let schedule = ScheduleStore::open(&config.auth.db_path)?;
 
         let (wal_writer, event_bus, hot_buffer) = if config.ingest.enabled {
             let writer = WalWriter::new(config.wal_dir());
@@ -191,6 +194,7 @@ impl AppState {
                 key_store: Arc::new(Mutex::new(key_store)),
                 history: Arc::new(Mutex::new(history)),
                 saved: Arc::new(Mutex::new(saved)),
+                schedule: Arc::new(Mutex::new(schedule)),
                 db_path: Arc::new(config.auth.db_path.clone()),
                 auth_cache,
             },

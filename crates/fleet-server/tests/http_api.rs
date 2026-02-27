@@ -10,7 +10,8 @@ use fleet_auth::roles::Role;
 use fleet_auth::store::KeyStore;
 use fleet_client::HttpClient;
 use fleet_server::config::{
-    AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig, ServerConfig,
+    AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig,
+    SchedulerConfig, ServerConfig,
 };
 use fleet_server::state::AppState;
 use fleet_server::transport::http;
@@ -158,6 +159,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
             }
         },
         retention: RetentionConfig::default(),
+        scheduler: SchedulerConfig::default(),
     };
 
     let (state, http_config) =
@@ -236,6 +238,7 @@ async fn setup() -> TestServer {
             }
         },
         retention: RetentionConfig::default(),
+        scheduler: SchedulerConfig::default(),
     };
 
     let (state, http_config) =

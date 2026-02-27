@@ -14,6 +14,8 @@ pub struct Config {
     pub ingest: IngestConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 /// HTTPS listener settings.
@@ -287,6 +289,64 @@ impl Default for RetentionConfig {
             max_age_days: DEFAULT_RETENTION_MAX_AGE_DAYS,
             min_free_disk_bytes: DEFAULT_RETENTION_MIN_FREE_DISK_BYTES,
             retention_interval_secs: DEFAULT_RETENTION_INTERVAL_SECS,
+        }
+    }
+}
+
+/// Scheduler configuration for background query execution.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SchedulerConfig {
+    /// Enable the scheduler. When false, no scheduled queries run.
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
+
+    /// How often the scheduler checks for due schedules (seconds).
+    #[serde(default = "default_scheduler_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+
+    /// Maximum rows stored in a report run result.
+    #[serde(default = "default_scheduler_report_max_rows")]
+    pub report_max_rows: usize,
+
+    /// Maximum runs to keep per schedule (retention).
+    #[serde(default = "default_scheduler_max_runs_per_schedule")]
+    pub max_runs_per_schedule: u64,
+
+    /// Delete report runs older than this many days.
+    #[serde(default = "default_scheduler_report_retention_days")]
+    pub report_retention_days: u64,
+}
+
+const DEFAULT_SCHEDULER_ENABLED: bool = true;
+const DEFAULT_SCHEDULER_POLL_INTERVAL_SECS: u64 = 10;
+const DEFAULT_SCHEDULER_REPORT_MAX_ROWS: usize = 10_000;
+const DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE: u64 = 100;
+const DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS: u64 = 30;
+
+fn default_scheduler_enabled() -> bool {
+    DEFAULT_SCHEDULER_ENABLED
+}
+fn default_scheduler_poll_interval_secs() -> u64 {
+    DEFAULT_SCHEDULER_POLL_INTERVAL_SECS
+}
+fn default_scheduler_report_max_rows() -> usize {
+    DEFAULT_SCHEDULER_REPORT_MAX_ROWS
+}
+fn default_scheduler_max_runs_per_schedule() -> u64 {
+    DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE
+}
+fn default_scheduler_report_retention_days() -> u64 {
+    DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_SCHEDULER_ENABLED,
+            poll_interval_secs: DEFAULT_SCHEDULER_POLL_INTERVAL_SECS,
+            report_max_rows: DEFAULT_SCHEDULER_REPORT_MAX_ROWS,
+            max_runs_per_schedule: DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE,
+            report_retention_days: DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS,
         }
     }
 }
