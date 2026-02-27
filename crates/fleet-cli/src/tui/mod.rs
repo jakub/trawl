@@ -636,8 +636,8 @@ impl App {
                 }
                 return;
             }
-            // Cycle tabs: Ctrl+Up (prev) / Ctrl+Down (next), wrapping around
-            (KeyModifiers::CONTROL, KeyCode::Up) => {
+            // Cycle tabs: Alt+[ (prev) / Alt+] (next), wrapping around
+            (KeyModifiers::ALT, KeyCode::Char('[')) => {
                 if self.tabs.len() > 1 {
                     self.active_tab_idx = self
                         .active_tab_idx
@@ -646,7 +646,7 @@ impl App {
                 }
                 return;
             }
-            (KeyModifiers::CONTROL, KeyCode::Down) => {
+            (KeyModifiers::ALT, KeyCode::Char(']')) => {
                 if self.tabs.len() > 1 {
                     self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
                 }
@@ -732,23 +732,27 @@ impl App {
                 editor.clear_selection();
                 editor.move_to_line_end();
             }
-            // Word movement: Ctrl+Left / Alt+B (readline)
-            (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Char('b')) => {
+            // Word movement: Ctrl+Left / Alt+Left / Alt+B (readline / macOS / linux)
+            (KeyModifiers::CONTROL | KeyModifiers::ALT, KeyCode::Left)
+            | (KeyModifiers::ALT, KeyCode::Char('b')) => {
                 let editor = &mut self.active_tab_mut().editor;
                 editor.clear_selection();
                 editor.move_word_left();
             }
-            // Word movement: Ctrl+Right / Alt+F (readline)
-            (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Char('f')) => {
+            // Word movement: Ctrl+Right / Alt+Right / Alt+F (readline / macOS / linux)
+            (KeyModifiers::CONTROL | KeyModifiers::ALT, KeyCode::Right)
+            | (KeyModifiers::ALT, KeyCode::Char('f')) => {
                 let editor = &mut self.active_tab_mut().editor;
                 editor.clear_selection();
                 editor.move_word_right();
             }
-            // Selection: Shift+Arrow
+            // Selection: Shift+Arrow (Shift+Ctrl or Shift+Alt = select word)
             (_, KeyCode::Left) if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 let editor = &mut self.active_tab_mut().editor;
                 editor.start_selection();
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
                     editor.move_word_left();
                 } else {
                     editor.move_left();
@@ -757,7 +761,9 @@ impl App {
             (_, KeyCode::Right) if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 let editor = &mut self.active_tab_mut().editor;
                 editor.start_selection();
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
                     editor.move_word_right();
                 } else {
                     editor.move_right();
@@ -1206,8 +1212,8 @@ impl App {
                 self.sidebar = None;
                 self.focus = Focus::Editor;
             }
-            // Section cycling: Ctrl+Left (prev) / Ctrl+Right (next)
-            (KeyModifiers::CONTROL, KeyCode::Left) => {
+            // Section cycling: [ (prev) / ] (next)
+            (KeyModifiers::NONE, KeyCode::Char('[')) => {
                 if let Some(ref mut sb) = self.sidebar {
                     let new_section = match sb.section {
                         SidebarSection::Schema => SidebarSection::Saved,
@@ -1218,7 +1224,7 @@ impl App {
                     self.sidebar_section_hint = new_section;
                 }
             }
-            (KeyModifiers::CONTROL, KeyCode::Right) => {
+            (KeyModifiers::NONE, KeyCode::Char(']')) => {
                 if let Some(ref mut sb) = self.sidebar {
                     let new_section = match sb.section {
                         SidebarSection::Schema => SidebarSection::History,
@@ -2593,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn key_ctrl_down_cycles_tabs_forward() {
+    fn key_alt_bracket_cycles_tabs_forward() {
         let mut app = test_app();
         // Create 3 tabs total
         app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -2602,16 +2608,16 @@ mod tests {
         assert_eq!(app.active_tab_idx, 2);
 
         // Cycle forward: 2 -> 0
-        app.handle_key(key_mod(KeyCode::Down, KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char(']'), KeyModifiers::ALT));
         assert_eq!(app.active_tab_idx, 0);
 
         // Cycle forward: 0 -> 1
-        app.handle_key(key_mod(KeyCode::Down, KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char(']'), KeyModifiers::ALT));
         assert_eq!(app.active_tab_idx, 1);
     }
 
     #[test]
-    fn key_ctrl_up_cycles_tabs_backward() {
+    fn key_alt_bracket_cycles_tabs_backward() {
         let mut app = test_app();
         // Create 3 tabs total
         app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -2620,16 +2626,44 @@ mod tests {
         assert_eq!(app.active_tab_idx, 2);
 
         // Cycle backward: 2 -> 1
-        app.handle_key(key_mod(KeyCode::Up, KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char('['), KeyModifiers::ALT));
         assert_eq!(app.active_tab_idx, 1);
 
         // Cycle backward: 1 -> 0
-        app.handle_key(key_mod(KeyCode::Up, KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char('['), KeyModifiers::ALT));
         assert_eq!(app.active_tab_idx, 0);
 
         // Wrap: 0 -> 2
-        app.handle_key(key_mod(KeyCode::Up, KeyModifiers::CONTROL));
+        app.handle_key(key_mod(KeyCode::Char('['), KeyModifiers::ALT));
         assert_eq!(app.active_tab_idx, 2);
+    }
+
+    #[test]
+    fn key_bare_brackets_cycle_sidebar_sections() {
+        let mut app = test_app();
+        // Open sidebar to schema section
+        app.handle_key(key(KeyCode::F(2)));
+        assert_eq!(app.focus, Focus::Sidebar);
+        let section = app.sidebar.as_ref().unwrap().section;
+        assert_eq!(section, SidebarSection::Schema);
+
+        // ] = next: Schema -> History
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(
+            app.sidebar.as_ref().unwrap().section,
+            SidebarSection::History
+        );
+
+        // ] = next: History -> Saved
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(app.sidebar.as_ref().unwrap().section, SidebarSection::Saved);
+
+        // [ = prev: Saved -> History
+        app.handle_key(key(KeyCode::Char('[')));
+        assert_eq!(
+            app.sidebar.as_ref().unwrap().section,
+            SidebarSection::History
+        );
     }
 
     #[test]
