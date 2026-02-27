@@ -42,6 +42,13 @@ impl Executor {
         self.conn.interrupt_handle()
     }
 
+    /// Lightweight health check: runs `SELECT 1` to verify the connection is alive.
+    pub fn ping(&self) -> Result<(), EngineError> {
+        self.conn
+            .query_row("SELECT 1", [], |_row| Ok(()))
+            .map_err(EngineError::from)
+    }
+
     /// Full pipeline: parse DSL, emit SQL, execute.
     ///
     /// `utc_offset_secs` is applied to all timestamp values at format time.

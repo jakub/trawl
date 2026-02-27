@@ -563,10 +563,30 @@ mod tests {
     // ── serde: HealthResponse ────────────────────────────────────────────
 
     #[test]
-    fn health_response_deserializes() {
+    fn health_response_deserializes_ok() {
         let json = r#"{"status": "ok"}"#;
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.status, fleet_api::HealthStatus::Ok);
+        assert!(resp.checks.is_none());
+    }
+
+    #[test]
+    fn health_response_deserializes_degraded() {
+        let json = r#"{"status":"degraded","checks":{"duckdb":"ok","auth_db":"error: db locked","data_path":"ok"}}"#;
+        let resp: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, fleet_api::HealthStatus::Degraded);
+        let checks = resp.checks.unwrap();
+        assert_eq!(checks["duckdb"], "ok");
+        assert!(checks["auth_db"].starts_with("error:"));
+    }
+
+    #[test]
+    fn health_response_deserializes_unavailable() {
+        let json = r#"{"status":"unavailable","checks":{"duckdb":"error: connection lost","auth_db":"ok","data_path":"ok"}}"#;
+        let resp: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, fleet_api::HealthStatus::Unavailable);
+        let checks = resp.checks.unwrap();
+        assert!(checks["duckdb"].starts_with("error:"));
     }
 
     // ── serde: SchemaResponse ───────────────────────────────────────────

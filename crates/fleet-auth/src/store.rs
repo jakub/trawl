@@ -340,6 +340,13 @@ impl KeyStore {
         })
     }
 
+    /// Lightweight health check: runs `SELECT 1` against the `SQLite` connection.
+    pub fn ping(&self) -> Result<(), AuthError> {
+        self.conn
+            .query_row("SELECT 1", [], |_row| Ok(()))
+            .map_err(AuthError::Database)
+    }
+
     /// List all keys. Never exposes hashes.
     ///
     /// If `active_only` is true, only returns non-revoked keys.
@@ -431,6 +438,14 @@ mod tests {
     #[test]
     fn open_in_memory_succeeds() {
         let _store = test_store();
+    }
+
+    #[test]
+    fn ping_succeeds() {
+        let store = test_store();
+        store
+            .ping()
+            .expect("ping should succeed on a valid connection");
     }
 
     #[test]

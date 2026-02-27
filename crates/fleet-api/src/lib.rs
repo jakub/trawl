@@ -4,9 +4,11 @@
 //! `fleet-client` (deserialization) to ensure the API contract stays
 //! in sync across crates.
 
+use std::collections::HashMap;
+use std::fmt;
+
 use fleet_engine::value::{QueryResult, SchemaColumn};
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 // -- common enums ------------------------------------------------------------
 
@@ -14,8 +16,12 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthStatus {
-    /// Service is healthy.
+    /// All subsystems are healthy.
     Ok,
+    /// Non-critical subsystem(s) failed; queries still work.
+    Degraded,
+    /// Critical subsystem(s) failed; service is not ready.
+    Unavailable,
 }
 
 /// Outcome status of a completed query.
@@ -228,6 +234,11 @@ pub struct ExportRequest {
 pub struct HealthResponse {
     /// Daemon health status.
     pub status: HealthStatus,
+    /// Per-subsystem check results (`"ok"` or `"error: ..."`).
+    ///
+    /// Absent in minimal responses for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<HashMap<String, String>>,
 }
 
 // -- schema ------------------------------------------------------------------
@@ -507,10 +518,15 @@ mod tests {
 
     #[test]
     fn health_status_roundtrip() {
-        let json = serde_json::to_string(&HealthStatus::Ok).unwrap();
-        assert_eq!(json, "\"ok\"");
-        let parsed: HealthStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, HealthStatus::Ok);
+        for status in [
+            HealthStatus::Ok,
+            HealthStatus::Degraded,
+            HealthStatus::Unavailable,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: HealthStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+        }
     }
 
     #[test]
@@ -630,8 +646,51 @@ mod tests {
     fn health_response_format() {
         let resp = HealthResponse {
             status: HealthStatus::Ok,
+            checks: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ok\""));
+        // checks omitted when None
+        assert!(!json.contains("checks"));
+    }
+
+    #[test]
+    fn health_status_variants_roundtrip() {
+        for (status, expected) in [
+            (HealthStatus::Ok, "\"ok\""),
+            (HealthStatus::Degraded, "\"degraded\""),
+            (HealthStatus::Unavailable, "\"unavailable\""),
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, expected);
+            let parsed: HealthStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, status);
+        }
+    }
+
+    #[test]
+    fn health_response_with_checks_roundtrip() {
+        let mut checks = HashMap::new();
+        checks.insert("duckdb".into(), "ok".into());
+        checks.insert("auth_db".into(), "error: connection refused".into());
+        let resp = HealthResponse {
+            status: HealthStatus::Degraded,
+            checks: Some(checks),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"degraded\""));
+        assert!(json.contains("\"checks\""));
+        let rt: HealthResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.status, HealthStatus::Degraded);
+        assert!(rt.checks.unwrap().contains_key("duckdb"));
+    }
+
+    #[test]
+    fn health_response_without_checks_deserializes() {
+        // Backward compat: old responses without `checks` field still parse.
+        let json = r#"{"status":"ok"}"#;
+        let resp: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, HealthStatus::Ok);
+        assert!(resp.checks.is_none());
     }
 }

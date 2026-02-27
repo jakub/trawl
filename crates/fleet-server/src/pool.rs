@@ -546,9 +546,42 @@ impl ExecutorPool {
         self.max_concurrent
     }
 
+    /// Get the base data directory path.
+    pub fn base_dir(&self) -> &str {
+        &self.base_dir
+    }
+
     /// Get the fallback glob pattern for queries.
     pub fn fallback_glob(&self) -> &Arc<str> {
         &self.fallback_glob
+    }
+
+    /// Lightweight health check: acquire a permit, grab an executor, run
+    /// `SELECT 1`, and return it. Proves the pool and `DuckDB` are functional.
+    pub async fn ping(&self) -> Result<(), ServerError> {
+        let semaphore = Arc::clone(&self.semaphore);
+        let Ok(permit) = semaphore.acquire_owned().await else {
+            return Err(ServerError::Internal("executor pool shut down".into()));
+        };
+
+        let executor = self.take_executor();
+
+        let (executor, result) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                executor.ping().map_err(ServerError::from)
+            }));
+            let result = match result {
+                Ok(r) => r,
+                Err(_) => Err(ServerError::Internal("ping panicked".into())),
+            };
+            (executor, result)
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("ping task panicked: {e}")))?;
+
+        self.return_executor(executor);
+        result
     }
 
     /// Export query results to Parquet via `DuckDB` `COPY TO`.

@@ -1,7 +1,9 @@
 //! HTTP request handlers for the fleet API.
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::{Extension, Json};
@@ -260,12 +262,101 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
     )
 }
 
-/// `GET /api/v1/health` — unauthenticated health check.
-#[allow(clippy::unused_async)] // axum requires async handlers
-pub async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: HealthStatus::Ok,
-    })
+/// `GET /api/v1/health` — unauthenticated health check with subsystem probes.
+pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
+    // Run duckdb ping (async) concurrently with synchronous checks.
+    let pool = state.query.pool.clone();
+    let duckdb_result = tokio::spawn(async move { pool.ping().await });
+
+    // Auth db: synchronous, runs under the parking_lot mutex.
+    let auth_result = state.auth.key_store.lock().ping();
+
+    // Data path: check that the base directory exists and is readable.
+    let base_dir = state.query.pool.base_dir().to_owned();
+    let data_result = std::fs::metadata(&base_dir)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .map_or_else(
+            || {
+                if base_dir.is_empty() {
+                    Err("base_dir is empty".to_owned())
+                } else {
+                    Err(format!("{base_dir} is not a readable directory"))
+                }
+            },
+            |_| Ok(()),
+        );
+
+    // Await duckdb result.
+    let duckdb_ok = duckdb_result
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+        .and_then(|r| r.map_err(|e| e.to_string()));
+
+    // Build checks map.
+    let mut checks = HashMap::with_capacity(3);
+    let duckdb_healthy = duckdb_ok.is_ok();
+    let auth_healthy = auth_result.is_ok();
+    let data_healthy = data_result.is_ok();
+
+    checks.insert(
+        "duckdb".into(),
+        duckdb_ok.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
+    );
+    checks.insert(
+        "auth_db".into(),
+        auth_result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
+    );
+    checks.insert(
+        "data_path".into(),
+        data_result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
+    );
+
+    // Emit prometheus gauges.
+    metrics::gauge!("fleet_health_check", "subsystem" => "duckdb").set(if duckdb_healthy {
+        1.0
+    } else {
+        0.0
+    });
+    metrics::gauge!("fleet_health_check", "subsystem" => "auth_db").set(if auth_healthy {
+        1.0
+    } else {
+        0.0
+    });
+    metrics::gauge!("fleet_health_check", "subsystem" => "data_path").set(if data_healthy {
+        1.0
+    } else {
+        0.0
+    });
+
+    let status = derive_health_status(duckdb_healthy, auth_healthy, data_healthy);
+    let http_status = match status {
+        HealthStatus::Ok | HealthStatus::Degraded => StatusCode::OK,
+        HealthStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    (
+        http_status,
+        Json(HealthResponse {
+            status,
+            checks: Some(checks),
+        }),
+    )
+}
+
+/// Derive overall health status from individual subsystem results.
+///
+/// - All green → `Ok`
+/// - Any non-critical (`auth_db`, `data_path`) fails → `Degraded`
+/// - Any critical (duckdb) fails → `Unavailable`
+fn derive_health_status(duckdb_ok: bool, auth_ok: bool, data_ok: bool) -> HealthStatus {
+    if !duckdb_ok {
+        return HealthStatus::Unavailable;
+    }
+    if !auth_ok || !data_ok {
+        return HealthStatus::Degraded;
+    }
+    HealthStatus::Ok
 }
 
 /// `GET /api/v1/schema` — introspect the data source schema.
@@ -1516,5 +1607,60 @@ mod tests {
         let csv = generate_csv(&result);
         assert!(csv.contains("'=evil()"));
         assert!(csv.contains("safe"));
+    }
+
+    // -- health status derivation ────────────────────────────────────────
+
+    #[test]
+    fn health_all_ok() {
+        assert_eq!(derive_health_status(true, true, true), HealthStatus::Ok);
+    }
+
+    #[test]
+    fn health_auth_down_is_degraded() {
+        assert_eq!(
+            derive_health_status(true, false, true),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn health_data_path_down_is_degraded() {
+        assert_eq!(
+            derive_health_status(true, true, false),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn health_both_noncritical_down_is_degraded() {
+        assert_eq!(
+            derive_health_status(true, false, false),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn health_duckdb_down_is_unavailable() {
+        assert_eq!(
+            derive_health_status(false, true, true),
+            HealthStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn health_all_down_is_unavailable() {
+        assert_eq!(
+            derive_health_status(false, false, false),
+            HealthStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn health_duckdb_and_noncritical_down_is_unavailable() {
+        assert_eq!(
+            derive_health_status(false, false, true),
+            HealthStatus::Unavailable
+        );
     }
 }

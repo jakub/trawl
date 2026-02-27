@@ -17,6 +17,7 @@ pub const HOT_BUFFER_BYTES: &str = "fleet_hot_buffer_bytes";
 pub const ACTIVE_CONNECTIONS: &str = "fleet_active_connections";
 pub const PARQUET_FILES: &str = "fleet_parquet_files_total";
 pub const PARQUET_BYTES: &str = "fleet_parquet_size_bytes";
+pub const HEALTH_CHECK: &str = "fleet_health_check";
 
 // -- description registration ------------------------------------------------
 
@@ -33,6 +34,10 @@ pub fn describe_metrics() {
     describe_gauge!(ACTIVE_CONNECTIONS, "Number of in-flight HTTP requests");
     describe_gauge!(PARQUET_FILES, "Total number of parquet data files");
     describe_gauge!(PARQUET_BYTES, "Total byte size of parquet data files");
+    describe_gauge!(
+        HEALTH_CHECK,
+        "Subsystem health (1 = ok, 0 = failed), labeled by subsystem"
+    );
 }
 
 // -- gauge collection --------------------------------------------------------
