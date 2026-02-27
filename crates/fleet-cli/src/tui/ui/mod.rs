@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 
 use crate::tui::App;
-use crate::tui::state::{Focus, Sidebar};
+use crate::tui::state::{Focus, SidebarSection};
 
 pub mod common;
 pub mod editor;
@@ -43,12 +43,12 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     status::render(app, frame, chunks[3]);
 
     // Render sidebar overlay (if any).
-    if let Some(ref sidebar) = app.sidebar {
-        match sidebar {
-            Sidebar::Help { scroll } => help::render(app, frame, *scroll),
-            Sidebar::Schema(view) => schema::render(app, frame, view),
-            Sidebar::History => history::render(app, frame),
-            Sidebar::Saved => saved::render(app, frame),
+    // TODO: full sidebar renderer will be implemented in ui/sidebar.rs
+    if let Some(ref sb) = app.sidebar {
+        match sb.section {
+            SidebarSection::Schema => { /* TODO: schema tree render */ }
+            SidebarSection::History => history::render(app, frame),
+            SidebarSection::Saved => saved::render(app, frame),
         }
     }
 
@@ -56,7 +56,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     popup::render(app, frame);
 
     // Set cursor position based on focus (adjusted for scroll offset).
-    if app.sidebar.is_none() && app.focus == Focus::Editor {
+    if app.focus == Focus::Editor {
         let tab = app.active_tab();
         let (row, col) = tab.editor.cursor;
         let scroll_row = tab.editor.scroll_row;
@@ -78,7 +78,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use crate::tui::state::{Popup, Sidebar, TabStatus};
+    use crate::tui::state::{Popup, TabStatus};
     use crate::tui::tests::test_app;
 
     /// Build a successful `QueryResponse` with the given columns and rows.
@@ -180,9 +180,9 @@ mod tests {
     }
 
     #[test]
-    fn render_with_help_sidebar() {
+    fn render_with_help_popup() {
         let mut app = test_app();
-        app.sidebar = Some(Sidebar::Help { scroll: 0 });
+        app.popup = Some(Popup::Help { scroll: 0 });
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();

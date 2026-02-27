@@ -1,6 +1,6 @@
 //! Application state (tabs, focus, queries).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use fleet_client::{PaginationMeta, QueryResponse};
@@ -80,6 +80,8 @@ pub enum Focus {
     Editor,
     /// Results table is focused.
     Results,
+    /// Sidebar panel is focused.
+    Sidebar,
 }
 
 /// A profiled column from a service sample.
@@ -99,6 +101,7 @@ pub struct ProfiledColumn {
 
 impl ProfiledColumn {
     /// Population percentage (0-100).
+    #[allow(dead_code)] // Used by sidebar renderer (not yet implemented).
     #[allow(clippy::cast_possible_truncation)] // .min(100) guarantees value fits in u8
     pub fn population_pct(&self) -> u8 {
         if self.total_rows == 0 {
@@ -123,69 +126,80 @@ pub struct CatalogSummary {
     pub hot_buffer_events: Option<u64>,
 }
 
-/// State machine for the schema browser's two-level hierarchy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SchemaView {
-    /// Top-level: list of service names.
-    ServiceList {
-        /// Available service names.
-        services: Vec<String>,
-        /// Currently selected index.
-        selected: usize,
-        /// Catalog summary from enriched schema response.
-        catalog: Option<CatalogSummary>,
-    },
-    /// Waiting for background query to return sample data.
-    Loading {
-        /// Service being profiled.
-        service: String,
-    },
-    /// Per-service column profile view.
-    ServiceDetail {
-        /// Service name.
-        service: String,
-        /// Profiled columns (only populated ones, sorted by population desc).
-        columns: Vec<ProfiledColumn>,
-        /// Currently selected column index.
-        selected: usize,
-        /// Scroll offset.
-        scroll: usize,
-        /// Total rows in the sample.
-        total_rows: usize,
-        /// Total columns in the global schema (for "12/18 fields" display).
-        total_schema_columns: usize,
-    },
-}
-
-/// Active sidebar overlay.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Sidebar {
-    /// Help overlay (F1).
-    Help { scroll: usize },
-    /// Schema browser (F2).
-    Schema(SchemaView),
-    /// Query history (F3).
+/// Which section is active in the sidebar panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarSection {
+    /// Schema browser tree view.
+    Schema,
+    /// Query history.
     History,
-    /// Saved queries (F4).
+    /// Saved queries.
     Saved,
 }
 
-impl Sidebar {
-    /// Check if this is the same sidebar variant (ignoring scroll state).
-    pub fn same_variant(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Help { .. }, Self::Help { .. })
-                | (Self::Schema(_), Self::Schema(_))
-                | (Self::History, Self::History)
-                | (Self::Saved, Self::Saved)
-        )
+/// Tree state for the schema browser.
+#[derive(Debug, Clone)]
+pub struct SchemaTree {
+    /// Which services are expanded (by name).
+    pub expanded: HashSet<String>,
+    /// Cursor index in the flattened visible list.
+    pub selected: usize,
+    /// Vertical scroll offset.
+    pub scroll: usize,
+    /// Filter text (type-to-filter).
+    pub filter: String,
+    /// Whether the filter input is currently accepting keystrokes.
+    pub filter_active: bool,
+}
+
+impl SchemaTree {
+    pub fn new() -> Self {
+        Self {
+            expanded: HashSet::new(),
+            selected: 0,
+            scroll: 0,
+            filter: String::new(),
+            filter_active: false,
+        }
+    }
+}
+
+/// Persistent sidebar panel state.
+#[derive(Debug, Clone)]
+pub struct SidebarState {
+    /// Which section tab is active.
+    pub section: SidebarSection,
+    /// Schema tree navigation state.
+    pub schema: SchemaTree,
+    /// Selected index in the history list.
+    pub history_selected: usize,
+    /// Selected index in the saved queries list.
+    pub saved_selected: usize,
+    /// Catalog summary from enriched schema response (used by sidebar renderer).
+    #[allow(dead_code)] // Used by sidebar renderer (not yet implemented).
+    pub catalog: Option<CatalogSummary>,
+}
+
+impl SidebarState {
+    pub fn new(catalog: Option<CatalogSummary>) -> Self {
+        Self {
+            section: SidebarSection::Schema,
+            schema: SchemaTree::new(),
+            history_selected: 0,
+            saved_selected: 0,
+            catalog,
+        }
     }
 }
 
 /// Active popup overlay.
 #[derive(Debug, Clone)]
 pub enum Popup {
+    /// Help overlay.
+    Help {
+        /// Vertical scroll offset.
+        scroll: usize,
+    },
     /// Confirm deletion of saved query.
     ConfirmDelete {
         /// ID of the saved query to delete.

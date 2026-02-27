@@ -13,6 +13,9 @@ use crate::tui::state::Popup;
 pub fn render(app: &App, frame: &mut Frame<'_>) {
     if let Some(popup) = &app.popup {
         match popup {
+            Popup::Help { scroll } => {
+                crate::tui::ui::help::render(app, frame, *scroll);
+            }
             Popup::ConfirmDelete { name, .. } => {
                 render_confirm_delete(frame, name);
             }

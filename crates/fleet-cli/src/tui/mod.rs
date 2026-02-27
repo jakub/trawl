@@ -27,8 +27,8 @@ use self::driver::{
     query_response_to_data,
 };
 use self::state::{
-    CatalogSummary, ChartView, Focus, LiveBuffer, Popup, ProfiledColumn, ResultsSearch, SchemaView,
-    Sidebar, SimpleEditor, Tab, TabStatus,
+    CatalogSummary, ChartView, Focus, LiveBuffer, Popup, ProfiledColumn, ResultsSearch,
+    SidebarSection, SidebarState, SimpleEditor, Tab, TabStatus,
 };
 use crate::CliError;
 use crate::config::Config;
@@ -190,8 +190,8 @@ pub struct App {
     pub active_tab_idx: usize,
     /// Which pane has focus.
     pub focus: Focus,
-    /// Active sidebar (if any).
-    pub sidebar: Option<Sidebar>,
+    /// Active sidebar panel (if any).
+    pub sidebar: Option<SidebarState>,
     /// Active popup (if any).
     pub popup: Option<Popup>,
     /// Cached schema response (fetched at startup).
@@ -200,10 +200,11 @@ pub struct App {
     pub history_cache: Option<HistoryResponse>,
     /// Cached saved queries (fetched at startup).
     pub saved_cache: Option<ListSavedResponse>,
-    /// Selected index in history sidebar.
-    pub history_selected_index: usize,
-    /// Selected index in saved queries sidebar.
-    pub saved_selected_index: usize,
+    /// Which sidebar section to highlight in the activity bar when closed.
+    pub sidebar_section_hint: SidebarSection,
+    /// Sidebar width in columns (used by sidebar renderer).
+    #[allow(dead_code)] // Will be used once ui/sidebar.rs is implemented.
+    pub sidebar_width: u16,
     /// Whether to quit the application.
     pub should_quit: bool,
     /// Whether live tail mode is active.
@@ -243,6 +244,21 @@ pub struct App {
     driver_execute_waiter: Option<ExecuteWaiter>,
 }
 
+/// Info about a node in the schema tree (avoids borrow issues in tree methods).
+enum TreeNodeInfo<'a> {
+    Service {
+        name: &'a str,
+        expanded: bool,
+    },
+    Field {
+        name: &'a str,
+    },
+    Loading {
+        #[allow(dead_code)]
+        service: &'a str,
+    },
+}
+
 impl App {
     /// Create a new app with the given client.
     pub fn new(client: HttpClient) -> Self {
@@ -260,8 +276,8 @@ impl App {
             schema_cache: None,
             history_cache: None,
             saved_cache: None,
-            history_selected_index: 0,
-            saved_selected_index: 0,
+            sidebar_section_hint: SidebarSection::Schema,
+            sidebar_width: 32,
             should_quit: false,
             live_mode: false,
             enter_executes: false,
@@ -397,7 +413,7 @@ impl App {
                     // Refresh saved queries cache and select the new query
                     self.refresh_saved_cache(Some(name.clone()));
                     // Open saved queries sidebar to show the new query
-                    self.sidebar = Some(Sidebar::Saved);
+                    self.open_sidebar_section(SidebarSection::Saved);
                 }
                 MutationResult::SavedQueryDeleted { name } => {
                     tracing::info!("saved query deleted: {name}");
@@ -413,7 +429,9 @@ impl App {
                     // If we should select a specific query, find its index
                     if let Some(name) = select_name {
                         if let Some(idx) = saved.queries.iter().position(|q| q.name == name) {
-                            self.saved_selected_index = idx;
+                            if let Some(ref mut sb) = self.sidebar {
+                                sb.saved_selected = idx;
+                            }
                         }
                     }
 
@@ -421,10 +439,11 @@ impl App {
 
                     // Reset selection if it's now out of bounds
                     if let Some(cache) = &self.saved_cache {
-                        if self.saved_selected_index >= cache.queries.len()
-                            && !cache.queries.is_empty()
-                        {
-                            self.saved_selected_index = cache.queries.len().saturating_sub(1);
+                        let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
+                        if selected >= cache.queries.len() && !cache.queries.is_empty() {
+                            if let Some(ref mut sb) = self.sidebar {
+                                sb.saved_selected = cache.queries.len().saturating_sub(1);
+                            }
                         }
                     }
                 }
@@ -516,38 +535,59 @@ impl App {
                 self.should_quit = true;
                 return;
             }
-            // Toggle help: F1
+            // F1 → help popup
             (KeyModifiers::NONE, KeyCode::F(1)) => {
-                self.toggle_sidebar(Sidebar::Help { scroll: 0 });
+                if matches!(self.popup, Some(Popup::Help { .. })) {
+                    self.popup = None;
+                } else {
+                    self.popup = Some(Popup::Help { scroll: 0 });
+                }
                 return;
             }
-            // Toggle schema: F2
-            (KeyModifiers::NONE, KeyCode::F(2)) => {
-                let catalog = self.catalog_summary();
-                let view = if let Some(services) = &self.service_list_cache {
-                    SchemaView::ServiceList {
-                        services: services.clone(),
-                        selected: 0,
-                        catalog,
+            // Ctrl+B: toggle sidebar
+            (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
+                if self.sidebar.is_some() {
+                    self.sidebar = None;
+                    if self.focus == Focus::Sidebar {
+                        self.focus = Focus::Editor;
                     }
                 } else {
-                    SchemaView::ServiceList {
-                        services: Vec::new(),
-                        selected: 0,
-                        catalog,
+                    let catalog = self.catalog_summary();
+                    self.sidebar = Some(SidebarState::new(catalog));
+                    if let Some(ref mut sb) = self.sidebar {
+                        sb.section = self.sidebar_section_hint;
                     }
-                };
-                self.toggle_sidebar(Sidebar::Schema(view));
+                    self.focus = Focus::Sidebar;
+                }
                 return;
             }
-            // Toggle history: F3
+            // F2: open sidebar at schema
+            (KeyModifiers::NONE, KeyCode::F(2)) => {
+                self.open_sidebar_section(SidebarSection::Schema);
+                return;
+            }
+            // F3: open sidebar at history
             (KeyModifiers::NONE, KeyCode::F(3)) => {
-                self.toggle_sidebar(Sidebar::History);
+                self.open_sidebar_section(SidebarSection::History);
                 return;
             }
-            // Toggle saved queries: F4
+            // F4: open sidebar at saved
             (KeyModifiers::NONE, KeyCode::F(4)) => {
-                self.toggle_sidebar(Sidebar::Saved);
+                self.open_sidebar_section(SidebarSection::Saved);
+                return;
+            }
+            // Ctrl+P: focus sidebar filter (schema section)
+            (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
+                if self.sidebar.is_none() {
+                    let catalog = self.catalog_summary();
+                    self.sidebar = Some(SidebarState::new(catalog));
+                }
+                if let Some(ref mut sb) = self.sidebar {
+                    sb.section = SidebarSection::Schema;
+                    sb.schema.filter_active = true;
+                    self.sidebar_section_hint = SidebarSection::Schema;
+                }
+                self.focus = Focus::Sidebar;
                 return;
             }
             // Toggle live tail: F9
@@ -555,15 +595,18 @@ impl App {
                 self.toggle_live_mode();
                 return;
             }
-            // Close sidebar: Esc (if sidebar is open, but NOT in ServiceDetail — that uses Esc for back)
-            (KeyModifiers::NONE, KeyCode::Esc)
-                if self.sidebar.is_some()
-                    && !matches!(
-                        self.sidebar,
-                        Some(Sidebar::Schema(SchemaView::ServiceDetail { .. }))
-                    ) =>
-            {
+            // Close sidebar: Esc (when sidebar is focused)
+            (KeyModifiers::NONE, KeyCode::Esc) if self.focus == Focus::Sidebar => {
+                // If filter is active, close filter first
+                if let Some(ref mut sb) = self.sidebar {
+                    if sb.section == SidebarSection::Schema && sb.schema.filter_active {
+                        sb.schema.filter_active = false;
+                        sb.schema.filter.clear();
+                        return;
+                    }
+                }
                 self.sidebar = None;
+                self.focus = Focus::Editor;
                 return;
             }
             // Cancel running query: Esc (if query is running, no sidebar)
@@ -580,8 +623,8 @@ impl App {
                 self.active_tab_idx = new_id;
                 return;
             }
-            // Close tab: Ctrl+W (when NOT in editor focus — editor uses Ctrl+W for kill-word)
-            (KeyModifiers::CONTROL, KeyCode::Char('w')) if self.focus != Focus::Editor => {
+            // Close tab: Ctrl+W (only from results focus — editor uses Ctrl+W for kill-word)
+            (KeyModifiers::CONTROL, KeyCode::Char('w')) if self.focus == Focus::Results => {
                 if self.tabs.len() > 1 {
                     self.tabs.remove(self.active_tab_idx);
                     if self.active_tab_idx >= self.tabs.len() {
@@ -621,32 +664,11 @@ impl App {
             _ => {}
         }
 
-        // If sidebar is open, handle sidebar-specific keys.
-        if let Some(ref sidebar) = self.sidebar {
-            match sidebar {
-                Sidebar::Help { .. } => {
-                    self.handle_help_key(key);
-                    return;
-                }
-                Sidebar::Schema(_) => {
-                    self.handle_schema_key(key);
-                    return;
-                }
-                Sidebar::History => {
-                    self.handle_history_key(key);
-                    return;
-                }
-                Sidebar::Saved => {
-                    self.handle_saved_key(key);
-                    return;
-                }
-            }
-        }
-
         // Focus-specific keybindings.
         match self.focus {
             Focus::Editor => self.handle_editor_key(key),
             Focus::Results => self.handle_results_key(key),
+            Focus::Sidebar => self.handle_sidebar_key(key),
         }
     }
 
@@ -858,9 +880,13 @@ impl App {
             .map_or(0, |r| r.result.row_count());
 
         match (key.modifiers, key.code) {
-            // Switch back to editor
+            // Tab: cycle to sidebar (if open) or editor
             (KeyModifiers::NONE, KeyCode::Tab) => {
-                self.focus = Focus::Editor;
+                if self.sidebar.is_some() {
+                    self.focus = Focus::Sidebar;
+                } else {
+                    self.focus = Focus::Editor;
+                }
             }
             // Open search with `/`
             (KeyModifiers::NONE, KeyCode::Char('/')) => {
@@ -1061,87 +1087,86 @@ impl App {
         }
     }
 
-    /// Handle key events when history sidebar is focused.
-    fn handle_history_key(&mut self, key: event::KeyEvent) {
+    /// Handle key events for the history section of the sidebar.
+    fn handle_sidebar_history_key(&mut self, key: event::KeyEvent) {
+        let item_count = self.history_cache.as_ref().map_or(0, |h| h.entries.len());
+
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Up) => {
-                if let Some(history) = &self.history_cache {
-                    if !history.entries.is_empty() {
-                        self.history_selected_index = self.history_selected_index.saturating_sub(1);
-                    }
+                if let Some(ref mut sb) = self.sidebar {
+                    sb.history_selected = sb.history_selected.saturating_sub(1);
                 }
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                if let Some(history) = &self.history_cache {
-                    if !history.entries.is_empty() {
-                        let max_index = history.entries.len().saturating_sub(1);
-                        self.history_selected_index =
-                            (self.history_selected_index + 1).min(max_index);
+                if let Some(ref mut sb) = self.sidebar {
+                    if item_count > 0 {
+                        sb.history_selected = (sb.history_selected + 1).min(item_count - 1);
                     }
                 }
             }
+            // Enter: load selected query into editor, focus editor (keep sidebar open)
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                // Load selected query into editor
-                // First, extract the query string (to avoid borrow issues)
+                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.history_selected);
                 let query_text = self
                     .history_cache
                     .as_ref()
-                    .and_then(|h| h.entries.get(self.history_selected_index))
+                    .and_then(|h| h.entries.get(selected))
                     .map(|entry| entry.query.clone());
 
                 if let Some(query) = query_text {
-                    let tab = self.active_tab_mut();
-                    tab.editor.clear();
-                    tab.editor.insert_text(&query);
-                    tab.editor.move_to_line_end();
-                    self.sidebar = None;
+                    let editor = &mut self.active_tab_mut().editor;
+                    editor.clear();
+                    editor.insert_text(&query);
+                    editor.move_to_line_end();
+                    self.focus = Focus::Editor;
                 }
             }
             _ => {}
         }
     }
 
-    /// Handle key events when saved queries sidebar is focused.
-    fn handle_saved_key(&mut self, key: event::KeyEvent) {
+    /// Handle key events for the saved queries section of the sidebar.
+    fn handle_sidebar_saved_key(&mut self, key: event::KeyEvent) {
+        let item_count = self.saved_cache.as_ref().map_or(0, |s| s.queries.len());
+
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Up) => {
-                if let Some(saved) = &self.saved_cache {
-                    if !saved.queries.is_empty() {
-                        self.saved_selected_index = self.saved_selected_index.saturating_sub(1);
-                    }
+                if let Some(ref mut sb) = self.sidebar {
+                    sb.saved_selected = sb.saved_selected.saturating_sub(1);
                 }
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                if let Some(saved) = &self.saved_cache {
-                    if !saved.queries.is_empty() {
-                        let max_index = saved.queries.len().saturating_sub(1);
-                        self.saved_selected_index = (self.saved_selected_index + 1).min(max_index);
+                if let Some(ref mut sb) = self.sidebar {
+                    if item_count > 0 {
+                        sb.saved_selected = (sb.saved_selected + 1).min(item_count - 1);
                     }
                 }
             }
+            // Enter: load selected query into editor, focus editor (keep sidebar open)
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                // Load selected query into editor
+                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
                 let query_text = self
                     .saved_cache
                     .as_ref()
-                    .and_then(|s| s.queries.get(self.saved_selected_index))
+                    .and_then(|s| s.queries.get(selected))
                     .map(|entry| entry.query.clone());
 
                 if let Some(query) = query_text {
-                    let tab = self.active_tab_mut();
-                    tab.editor.clear();
-                    tab.editor.insert_text(&query);
-                    tab.editor.move_to_line_end();
-                    self.sidebar = None;
+                    let editor = &mut self.active_tab_mut().editor;
+                    editor.clear();
+                    editor.insert_text(&query);
+                    editor.move_to_line_end();
+                    self.focus = Focus::Editor;
                 }
             }
-            (KeyModifiers::NONE, KeyCode::Backspace | KeyCode::Delete) => {
-                // Show confirmation popup for delete
-                if let Some(saved) = &self.saved_cache {
-                    if let Some(query) = saved.queries.get(self.saved_selected_index) {
+            // Delete: confirm deletion
+            (KeyModifiers::NONE, KeyCode::Delete | KeyCode::Backspace) => {
+                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
+                if let Some(ref saved) = self.saved_cache {
+                    if let Some(entry) = saved.queries.get(selected) {
                         self.popup = Some(Popup::ConfirmDelete {
-                            saved_id: query.id,
-                            name: query.name.clone(),
+                            saved_id: entry.id,
+                            name: entry.name.clone(),
                         });
                     }
                 }
@@ -1150,137 +1175,393 @@ impl App {
         }
     }
 
-    /// Handle key events when help sidebar is focused.
-    fn handle_help_key(&mut self, key: event::KeyEvent) {
-        if let Some(Sidebar::Help { ref mut scroll }) = self.sidebar {
-            match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Up) => {
-                    *scroll = scroll.saturating_sub(1);
-                }
-                (KeyModifiers::NONE, KeyCode::Down) => {
-                    *scroll = scroll.saturating_add(1);
-                }
-                (KeyModifiers::NONE, KeyCode::PageUp) => {
-                    *scroll = scroll.saturating_sub(10);
-                }
-                (KeyModifiers::NONE, KeyCode::PageDown) => {
-                    *scroll = scroll.saturating_add(10);
-                }
-                (KeyModifiers::NONE, KeyCode::Home) => {
-                    *scroll = 0;
-                }
-                (KeyModifiers::NONE, KeyCode::End) => {
-                    *scroll = usize::MAX;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Handle key events when schema sidebar is focused.
-    #[allow(clippy::too_many_lines)]
-    fn handle_schema_key(&mut self, key: event::KeyEvent) {
-        let Some(Sidebar::Schema(ref mut view)) = self.sidebar else {
+    /// Handle key events when sidebar is focused.
+    fn handle_sidebar_key(&mut self, key: event::KeyEvent) {
+        let Some(ref mut sb) = self.sidebar else {
             return;
         };
 
-        match view {
-            SchemaView::ServiceList {
-                services, selected, ..
-            } => match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Up) => {
-                    *selected = selected.saturating_sub(1);
-                }
-                (KeyModifiers::NONE, KeyCode::Down) => {
-                    if !services.is_empty() {
-                        *selected = (*selected + 1).min(services.len() - 1);
-                    }
-                }
-                (KeyModifiers::NONE, KeyCode::Home) => *selected = 0,
-                (KeyModifiers::NONE, KeyCode::End) => {
-                    *selected = services.len().saturating_sub(1);
-                }
-                (KeyModifiers::NONE, KeyCode::Enter) => {
-                    if let Some(svc) = services.get(*selected).cloned() {
-                        self.drill_into_service(svc);
-                    }
-                }
-                _ => {}
-            },
-            SchemaView::Loading { .. } => {
-                // No-op while loading (Esc falls through to global handler)
-            }
-            SchemaView::ServiceDetail {
-                columns,
-                selected,
-                service,
-                ..
-            } => match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Up) => {
-                    *selected = selected.saturating_sub(1);
-                }
-                (KeyModifiers::NONE, KeyCode::Down) => {
-                    if !columns.is_empty() {
-                        *selected = (*selected + 1).min(columns.len() - 1);
-                    }
-                }
-                (KeyModifiers::NONE, KeyCode::PageUp) => {
-                    *selected = selected.saturating_sub(10);
-                }
-                (KeyModifiers::NONE, KeyCode::PageDown) => {
-                    if !columns.is_empty() {
-                        *selected = (*selected + 10).min(columns.len() - 1);
-                    }
-                }
-                (KeyModifiers::NONE, KeyCode::Home) => *selected = 0,
-                (KeyModifiers::NONE, KeyCode::End) => {
-                    *selected = columns.len().saturating_sub(1);
-                }
-                // Enter: insert field name at cursor in editor
-                (KeyModifiers::NONE, KeyCode::Enter) => {
-                    if let Some(col) = columns.get(*selected) {
-                        let name = col.name.clone();
-                        self.tabs[self.active_tab_idx].editor.insert_text(&name);
-                    }
-                }
-                // Esc/Backspace: back to service list
-                (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Backspace) => {
-                    let svc = service.clone();
-                    let services = self.service_list_cache.clone().unwrap_or_default();
-                    let idx = services.iter().position(|s| *s == svc).unwrap_or(0);
-                    let catalog = self.catalog_summary();
-                    self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceList {
-                        services,
-                        selected: idx,
-                        catalog,
-                    }));
-                }
-                _ => {}
-            },
-        }
-    }
-
-    /// Drill into a service: check cache or spawn background profiling query.
-    fn drill_into_service(&mut self, service: String) {
-        // Check cache first.
-        if let Some(cached) = self.schema_profile_cache.get(&service) {
-            let total_schema_columns = self.schema_cache.as_ref().map_or(0, |s| s.columns.len());
-            let total_rows = cached.first().map_or(0, |c| c.total_rows);
-            self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceDetail {
-                service,
-                columns: cached.clone(),
-                selected: 0,
-                scroll: 0,
-                total_rows,
-                total_schema_columns,
-            }));
+        // Filter input mode captures all keys.
+        if sb.section == SidebarSection::Schema && sb.schema.filter_active {
+            self.handle_sidebar_filter_key(key);
             return;
         }
 
-        // Set loading state.
-        self.sidebar = Some(Sidebar::Schema(SchemaView::Loading {
-            service: service.clone(),
-        }));
+        match (key.modifiers, key.code) {
+            // Tab: cycle focus to editor
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.focus = Focus::Editor;
+            }
+            // Esc: close sidebar
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.sidebar = None;
+                self.focus = Focus::Editor;
+            }
+            // Section switching with bare digits
+            (KeyModifiers::NONE, KeyCode::Char('1')) => {
+                if let Some(ref mut sb) = self.sidebar {
+                    sb.section = SidebarSection::Schema;
+                    self.sidebar_section_hint = SidebarSection::Schema;
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('2')) => {
+                if let Some(ref mut sb) = self.sidebar {
+                    sb.section = SidebarSection::History;
+                    self.sidebar_section_hint = SidebarSection::History;
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('3')) => {
+                if let Some(ref mut sb) = self.sidebar {
+                    sb.section = SidebarSection::Saved;
+                    self.sidebar_section_hint = SidebarSection::Saved;
+                }
+            }
+            // '/' or Ctrl+P: activate filter (schema only)
+            (KeyModifiers::NONE, KeyCode::Char('/'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
+                if let Some(ref mut sb) = self.sidebar {
+                    if sb.section == SidebarSection::Schema {
+                        sb.schema.filter_active = true;
+                    }
+                }
+            }
+            // Section-specific dispatch
+            _ => {
+                let section = self.sidebar.as_ref().map(|s| s.section);
+                match section {
+                    Some(SidebarSection::Schema) => self.handle_schema_tree_key(key),
+                    Some(SidebarSection::History) => self.handle_sidebar_history_key(key),
+                    Some(SidebarSection::Saved) => self.handle_sidebar_saved_key(key),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// Handle key events for the sidebar filter input.
+    fn handle_sidebar_filter_key(&mut self, key: event::KeyEvent) {
+        let Some(ref mut sb) = self.sidebar else {
+            return;
+        };
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                sb.schema.filter_active = false;
+                sb.schema.filter.clear();
+                sb.schema.selected = 0;
+                sb.schema.scroll = 0;
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                sb.schema.filter_active = false;
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                sb.schema.filter.pop();
+                sb.schema.selected = 0;
+                sb.schema.scroll = 0;
+            }
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
+                sb.schema.filter.push(c);
+                sb.schema.selected = 0;
+                sb.schema.scroll = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle key events for the schema tree view.
+    fn handle_schema_tree_key(&mut self, key: event::KeyEvent) {
+        // Compute visible node count for bounds.
+        let node_count = self.visible_tree_node_count();
+
+        let Some(ref mut sb) = self.sidebar else {
+            return;
+        };
+        let tree = &mut sb.schema;
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                tree.selected = tree.selected.saturating_sub(1);
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                if node_count > 0 {
+                    tree.selected = (tree.selected + 1).min(node_count - 1);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::PageUp) => {
+                tree.selected = tree.selected.saturating_sub(10);
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) => {
+                if node_count > 0 {
+                    tree.selected = (tree.selected + 10).min(node_count - 1);
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Home) => {
+                tree.selected = 0;
+            }
+            (KeyModifiers::NONE, KeyCode::End) => {
+                tree.selected = node_count.saturating_sub(1);
+            }
+            // Enter: toggle expand on service, insert field name on field
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                self.handle_tree_enter();
+            }
+            // Right: expand service node
+            (KeyModifiers::NONE, KeyCode::Right) => {
+                self.handle_tree_expand();
+            }
+            // Left: collapse or jump to parent
+            (KeyModifiers::NONE, KeyCode::Left) => {
+                self.handle_tree_collapse();
+            }
+            _ => {}
+        }
+    }
+
+    /// Count visible nodes in the flattened schema tree.
+    fn visible_tree_node_count(&self) -> usize {
+        let services = self.service_list_cache.as_deref().unwrap_or(&[]);
+        let Some(ref sb) = self.sidebar else {
+            return 0;
+        };
+        let tree = &sb.schema;
+        let filter = tree.filter.to_lowercase();
+
+        let mut count = 0;
+        for svc in services {
+            if !filter.is_empty() {
+                let svc_matches = svc.to_lowercase().contains(&filter);
+                let fields_match =
+                    self.schema_profile_cache
+                        .get(svc.as_str())
+                        .is_some_and(|cols| {
+                            cols.iter().any(|c| c.name.to_lowercase().contains(&filter))
+                        });
+                if !svc_matches && !fields_match {
+                    continue;
+                }
+            }
+            count += 1; // service node
+            if tree.expanded.contains(svc) {
+                if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
+                    if filter.is_empty() {
+                        count += cols.len();
+                    } else {
+                        count += cols
+                            .iter()
+                            .filter(|c| c.name.to_lowercase().contains(&filter))
+                            .count();
+                    }
+                } else {
+                    count += 1; // loading node
+                }
+            }
+        }
+        count
+    }
+
+    /// Handle Enter key on a tree node.
+    fn handle_tree_enter(&mut self) {
+        let node_info = self.get_selected_tree_node_info();
+        match node_info {
+            Some(TreeNodeInfo::Service { name, expanded }) => {
+                let name_owned = name.to_owned();
+                if expanded {
+                    if let Some(ref mut sb) = self.sidebar {
+                        sb.schema.expanded.remove(&name_owned);
+                    }
+                } else {
+                    if let Some(ref mut sb) = self.sidebar {
+                        sb.schema.expanded.insert(name_owned.clone());
+                    }
+                    if !self.schema_profile_cache.contains_key(&name_owned) {
+                        self.drill_into_service(name_owned);
+                    }
+                }
+            }
+            Some(TreeNodeInfo::Field { name }) => {
+                let name_owned = name.to_owned();
+                self.tabs[self.active_tab_idx]
+                    .editor
+                    .insert_text(&name_owned);
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle Right arrow on a tree node (expand service).
+    fn handle_tree_expand(&mut self) {
+        let node_info = self.get_selected_tree_node_info();
+        if let Some(TreeNodeInfo::Service {
+            name,
+            expanded: false,
+        }) = node_info
+        {
+            let name_owned = name.to_owned();
+            if let Some(ref mut sb) = self.sidebar {
+                sb.schema.expanded.insert(name_owned.clone());
+            }
+            if !self.schema_profile_cache.contains_key(&name_owned) {
+                self.drill_into_service(name_owned);
+            }
+        }
+    }
+
+    /// Handle Left arrow on a tree node (collapse or jump to parent).
+    fn handle_tree_collapse(&mut self) {
+        let node_info = self.get_selected_tree_node_info();
+        match node_info {
+            Some(TreeNodeInfo::Service {
+                name,
+                expanded: true,
+            }) => {
+                let name_owned = name.to_owned();
+                if let Some(ref mut sb) = self.sidebar {
+                    sb.schema.expanded.remove(&name_owned);
+                }
+            }
+            Some(TreeNodeInfo::Field { .. } | TreeNodeInfo::Loading { .. }) => {
+                // Jump to parent service node.
+                if let Some(parent_idx) = self.find_parent_service_index() {
+                    if let Some(ref mut sb) = self.sidebar {
+                        sb.schema.selected = parent_idx;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Get info about the currently selected tree node.
+    fn get_selected_tree_node_info(&self) -> Option<TreeNodeInfo<'_>> {
+        let services = self.service_list_cache.as_deref().unwrap_or(&[]);
+        let sb = self.sidebar.as_ref()?;
+        let tree = &sb.schema;
+        let filter = tree.filter.to_lowercase();
+
+        let mut idx = 0;
+        for svc in services {
+            if !filter.is_empty() {
+                let svc_matches = svc.to_lowercase().contains(&filter);
+                let fields_match =
+                    self.schema_profile_cache
+                        .get(svc.as_str())
+                        .is_some_and(|cols| {
+                            cols.iter().any(|c| c.name.to_lowercase().contains(&filter))
+                        });
+                if !svc_matches && !fields_match {
+                    continue;
+                }
+            }
+            if idx == tree.selected {
+                return Some(TreeNodeInfo::Service {
+                    name: svc,
+                    expanded: tree.expanded.contains(svc),
+                });
+            }
+            idx += 1;
+            if tree.expanded.contains(svc) {
+                if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
+                    for col in cols {
+                        if !filter.is_empty() && !col.name.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        if idx == tree.selected {
+                            return Some(TreeNodeInfo::Field { name: &col.name });
+                        }
+                        idx += 1;
+                    }
+                } else {
+                    if idx == tree.selected {
+                        return Some(TreeNodeInfo::Loading { service: svc });
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the index of the parent service node for the currently selected field/loading node.
+    #[allow(unused_assignments)] // last_service_idx initial value is a fallback, always overwritten in loop
+    fn find_parent_service_index(&self) -> Option<usize> {
+        let services = self.service_list_cache.as_deref().unwrap_or(&[]);
+        let sb = self.sidebar.as_ref()?;
+        let tree = &sb.schema;
+        let filter = tree.filter.to_lowercase();
+
+        let mut idx = 0;
+        let mut last_service_idx = 0;
+        for svc in services {
+            if !filter.is_empty() {
+                let svc_matches = svc.to_lowercase().contains(&filter);
+                let fields_match =
+                    self.schema_profile_cache
+                        .get(svc.as_str())
+                        .is_some_and(|cols| {
+                            cols.iter().any(|c| c.name.to_lowercase().contains(&filter))
+                        });
+                if !svc_matches && !fields_match {
+                    continue;
+                }
+            }
+            last_service_idx = idx;
+            if idx == tree.selected {
+                return Some(idx); // Already on a service
+            }
+            idx += 1;
+            if tree.expanded.contains(svc) {
+                if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
+                    for col in cols {
+                        if !filter.is_empty() && !col.name.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        if idx == tree.selected {
+                            return Some(last_service_idx);
+                        }
+                        idx += 1;
+                    }
+                } else {
+                    if idx == tree.selected {
+                        return Some(last_service_idx);
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Open the sidebar to a specific section (or toggle if already showing that section).
+    fn open_sidebar_section(&mut self, section: SidebarSection) {
+        if let Some(ref mut sb) = self.sidebar {
+            if sb.section == section {
+                // Already showing this section — close sidebar.
+                self.sidebar = None;
+                if self.focus == Focus::Sidebar {
+                    self.focus = Focus::Editor;
+                }
+            } else {
+                // Switch to the requested section.
+                sb.section = section;
+                self.sidebar_section_hint = section;
+                self.focus = Focus::Sidebar;
+            }
+        } else {
+            // Open sidebar to the requested section.
+            let catalog = self.catalog_summary();
+            let mut sb = SidebarState::new(catalog);
+            sb.section = section;
+            self.sidebar = Some(sb);
+            self.sidebar_section_hint = section;
+            self.focus = Focus::Sidebar;
+        }
+    }
+
+    /// Drill into a service: spawn background profiling query if not cached.
+    fn drill_into_service(&mut self, service: String) {
+        // Already cached — nothing to do.
+        if self.schema_profile_cache.contains_key(&service) {
+            return;
+        }
 
         // Spawn background query.
         let client = self.client.clone();
@@ -1295,7 +1576,6 @@ impl App {
         let svc = service;
 
         tokio::spawn(async move {
-            // Quote service name if it contains spaces or special chars.
             let query = if svc.contains(' ') || svc.contains('"') {
                 format!(r#"service:"{}" | head 100"#, svc.replace('"', r#"\""#))
             } else {
@@ -1324,46 +1604,12 @@ impl App {
     fn poll_schema_profiles(&mut self) {
         while let Ok(result) = self.schema_profile_rx.try_recv() {
             match result.result {
-                Ok((columns, total_rows)) => {
-                    // Cache the result.
+                Ok((columns, _total_rows)) => {
                     self.schema_profile_cache
-                        .insert(result.service.clone(), columns.clone());
-
-                    let total_schema_columns =
-                        self.schema_cache.as_ref().map_or(0, |s| s.columns.len());
-
-                    // If we're still in Loading state for this service, transition.
-                    if matches!(
-                        self.sidebar,
-                        Some(Sidebar::Schema(SchemaView::Loading { ref service }))
-                        if *service == result.service
-                    ) {
-                        self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceDetail {
-                            service: result.service,
-                            columns,
-                            selected: 0,
-                            scroll: 0,
-                            total_rows,
-                            total_schema_columns,
-                        }));
-                    }
+                        .insert(result.service.clone(), columns);
                 }
                 Err(msg) => {
                     tracing::error!("schema profile failed for {}: {}", result.service, msg);
-                    // Go back to service list on error.
-                    if matches!(
-                        self.sidebar,
-                        Some(Sidebar::Schema(SchemaView::Loading { ref service }))
-                        if *service == result.service
-                    ) {
-                        let services = self.service_list_cache.clone().unwrap_or_default();
-                        let catalog = self.catalog_summary();
-                        self.sidebar = Some(Sidebar::Schema(SchemaView::ServiceList {
-                            services,
-                            selected: 0,
-                            catalog,
-                        }));
-                    }
                 }
             }
         }
@@ -1372,8 +1618,38 @@ impl App {
     /// Handle key events when a popup is open.
     #[allow(clippy::too_many_lines)] // Inherently large popup dispatch
     fn handle_popup_key(&mut self, key: event::KeyEvent) {
+        // Help popup needs mutable access to scroll — handle before immutable borrow.
+        if let Some(Popup::Help { ref mut scroll }) = self.popup {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1)) => {
+                    self.popup = None;
+                }
+                (KeyModifiers::NONE, KeyCode::Up) => {
+                    *scroll = scroll.saturating_sub(1);
+                }
+                (KeyModifiers::NONE, KeyCode::Down) => {
+                    *scroll += 1;
+                }
+                (KeyModifiers::NONE, KeyCode::PageUp) => {
+                    *scroll = scroll.saturating_sub(10);
+                }
+                (KeyModifiers::NONE, KeyCode::PageDown) => {
+                    *scroll += 10;
+                }
+                (KeyModifiers::NONE, KeyCode::Home) => {
+                    *scroll = 0;
+                }
+                (KeyModifiers::NONE, KeyCode::End) => {
+                    *scroll = usize::MAX;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if let Some(popup) = &self.popup {
             match popup {
+                Popup::Help { .. } => unreachable!("handled above"),
                 Popup::ConfirmDelete { saved_id, name } => {
                     match (key.modifiers, key.code) {
                         // Confirm deletion: Y or Enter
@@ -1560,7 +1836,6 @@ impl App {
         });
     }
 
-    /// Toggle a sidebar (close if already open, open otherwise).
     /// Build a catalog summary from the cached schema response.
     fn catalog_summary(&self) -> Option<CatalogSummary> {
         self.schema_cache.as_ref().and_then(|s| {
@@ -1574,18 +1849,6 @@ impl App {
                 hot_buffer_events: s.hot_buffer_events,
             })
         })
-    }
-
-    fn toggle_sidebar(&mut self, sidebar: Sidebar) {
-        if self
-            .sidebar
-            .as_ref()
-            .is_some_and(|s| s.same_variant(&sidebar))
-        {
-            self.sidebar = None;
-        } else {
-            self.sidebar = Some(sidebar);
-        }
     }
 
     /// Toggle live tail mode (F9).
@@ -2209,62 +2472,75 @@ mod tests {
         assert_eq!(app.focus, Focus::Editor);
     }
 
+    // --- Help popup tests ---
+
+    #[test]
+    fn key_f1_toggles_help_popup() {
+        let mut app = test_app();
+        assert!(app.popup.is_none());
+        app.handle_key(key(KeyCode::F(1)));
+        assert!(matches!(app.popup, Some(Popup::Help { scroll: 0 })));
+        app.handle_key(key(KeyCode::F(1)));
+        assert!(app.popup.is_none());
+    }
+
     // --- Sidebar toggle tests ---
 
     #[test]
-    fn key_f1_toggles_help() {
-        let mut app = test_app();
-        assert_eq!(app.sidebar, None);
-        app.handle_key(key(KeyCode::F(1)));
-        assert_eq!(app.sidebar, Some(Sidebar::Help { scroll: 0 }));
-        app.handle_key(key(KeyCode::F(1)));
-        assert_eq!(app.sidebar, None);
-    }
-
-    #[test]
-    fn key_f2_toggles_schema() {
+    fn key_f2_toggles_schema_sidebar() {
         let mut app = test_app();
         app.handle_key(key(KeyCode::F(2)));
-        assert!(matches!(
-            app.sidebar,
-            Some(Sidebar::Schema(SchemaView::ServiceList { .. }))
-        ));
+        assert!(app.sidebar.is_some());
+        assert_eq!(
+            app.sidebar.as_ref().unwrap().section,
+            SidebarSection::Schema
+        );
+        assert_eq!(app.focus, Focus::Sidebar);
         app.handle_key(key(KeyCode::F(2)));
-        assert_eq!(app.sidebar, None);
+        assert!(app.sidebar.is_none());
     }
 
     #[test]
-    fn key_f3_toggles_history() {
+    fn key_f3_toggles_history_sidebar() {
         let mut app = test_app();
         app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.sidebar, Some(Sidebar::History));
+        assert!(app.sidebar.is_some());
+        assert_eq!(
+            app.sidebar.as_ref().unwrap().section,
+            SidebarSection::History
+        );
         app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.sidebar, None);
+        assert!(app.sidebar.is_none());
     }
 
     #[test]
-    fn key_f4_toggles_saved() {
+    fn key_f4_toggles_saved_sidebar() {
         let mut app = test_app();
         app.handle_key(key(KeyCode::F(4)));
-        assert_eq!(app.sidebar, Some(Sidebar::Saved));
+        assert!(app.sidebar.is_some());
+        assert_eq!(app.sidebar.as_ref().unwrap().section, SidebarSection::Saved);
         app.handle_key(key(KeyCode::F(4)));
-        assert_eq!(app.sidebar, None);
+        assert!(app.sidebar.is_none());
     }
 
     #[test]
-    fn key_esc_closes_sidebar() {
+    fn key_esc_closes_sidebar_when_focused() {
         let mut app = test_app();
-        app.sidebar = Some(Sidebar::Help { scroll: 0 });
+        let catalog = app.catalog_summary();
+        app.sidebar = Some(SidebarState::new(catalog));
+        app.focus = Focus::Sidebar;
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.sidebar, None);
+        assert!(app.sidebar.is_none());
+        assert_eq!(app.focus, Focus::Editor);
     }
 
     #[test]
-    fn sidebar_blocks_focus_keys() {
+    fn sidebar_tab_cycles_to_editor() {
         let mut app = test_app();
-        app.sidebar = Some(Sidebar::Help { scroll: 0 });
-        app.focus = Focus::Editor;
-        // Tab should NOT switch focus while sidebar is open
+        let catalog = app.catalog_summary();
+        app.sidebar = Some(SidebarState::new(catalog));
+        app.focus = Focus::Sidebar;
+        // Tab from sidebar should go to editor
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Editor);
     }
@@ -2634,8 +2910,9 @@ mod tests {
 
         app.poll_mutations();
 
-        // SavedQueryCreated opens the sidebar to Saved
-        assert_eq!(app.sidebar, Some(Sidebar::Saved));
+        // SavedQueryCreated opens the sidebar to Saved section
+        assert!(app.sidebar.is_some());
+        assert_eq!(app.sidebar.as_ref().unwrap().section, SidebarSection::Saved);
     }
 
     #[test]
@@ -2667,6 +2944,12 @@ mod tests {
     #[test]
     fn poll_mutation_cache_refreshed_selects_name() {
         let mut app = test_app();
+        // Open sidebar so saved_selected can be updated
+        let catalog = app.catalog_summary();
+        let mut sb = SidebarState::new(catalog);
+        sb.section = SidebarSection::Saved;
+        app.sidebar = Some(sb);
+
         let saved = ListSavedResponse {
             queries: vec![
                 SavedQueryResponse {
@@ -2695,7 +2978,7 @@ mod tests {
 
         app.poll_mutations();
 
-        assert_eq!(app.saved_selected_index, 1);
+        assert_eq!(app.sidebar.as_ref().unwrap().saved_selected, 1);
     }
 
     #[test]

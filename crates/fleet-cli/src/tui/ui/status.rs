@@ -49,6 +49,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let focus_text = match app.focus {
         Focus::Editor => " [editor] ",
         Focus::Results => " [results] ",
+        Focus::Sidebar => " [sidebar] ",
     };
     spans.push(Span::raw(focus_text));
 
@@ -73,24 +74,26 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 /// Generate context-sensitive keybinding hints.
 fn get_context_hints(app: &App) -> String {
-    use crate::tui::state::{SchemaView, Sidebar};
+    use crate::tui::state::SidebarSection;
 
-    // If sidebar is open, show sidebar-specific hints
-    if let Some(ref sidebar) = app.sidebar {
-        return match sidebar {
-            Sidebar::Help { .. } => "↑↓/PgUp/PgDn: scroll | esc: close help".to_owned(),
-            Sidebar::Schema(SchemaView::ServiceList { .. }) => {
-                "↑↓: select | enter: drill | esc: close".to_owned()
+    // If sidebar is focused, show sidebar-specific hints.
+    if app.focus == Focus::Sidebar {
+        if let Some(ref sb) = app.sidebar {
+            if sb.section == SidebarSection::Schema && sb.schema.filter_active {
+                return "type to filter | Enter: confirm | Esc: cancel".to_owned();
             }
-            Sidebar::Schema(SchemaView::Loading { .. }) => "loading... | esc: close".to_owned(),
-            Sidebar::Schema(SchemaView::ServiceDetail { .. }) => {
-                "↑↓: select | enter: insert | space: values | esc: back".to_owned()
-            }
-            Sidebar::History => "↑↓: navigate | enter: load query | esc: close".to_owned(),
-            Sidebar::Saved => {
-                "↑↓: navigate | enter: load | backspace: delete | esc: close".to_owned()
-            }
-        };
+            return match sb.section {
+                SidebarSection::Schema => {
+                    "↑↓: navigate | →: expand | ←: collapse | /: filter | 1-3: sections".to_owned()
+                }
+                SidebarSection::History => {
+                    "↑↓: navigate | enter: load query | 1-3: sections".to_owned()
+                }
+                SidebarSection::Saved => {
+                    "↑↓: navigate | enter: load | del: delete | 1-3: sections".to_owned()
+                }
+            };
+        }
     }
 
     // Live mode hints
@@ -123,5 +126,7 @@ fn get_context_hints(app: &App) -> String {
                 "tab: editor | F5: execute query".to_owned()
             }
         }
+        // Sidebar hints handled by early return above; fallback for safety.
+        Focus::Sidebar => "tab: editor | 1-3: sections | esc: close".to_owned(),
     }
 }
