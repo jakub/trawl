@@ -11,9 +11,9 @@ use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 pub enum Role {
     /// Full access — key management, server config, queries, schema.
     Admin,
-    /// Query execution and schema inspection.
+    /// Power user — query execution, schema, saved queries, export, streaming.
     Analyst,
-    /// Query execution and schema inspection (same as analyst for now).
+    /// Basic access — query execution, schema, cancel own queries.
     Reader,
     /// Write-only log ingestion (used by vector/agents).
     Ingest,
@@ -22,13 +22,23 @@ pub enum Role {
 /// Discrete permissions that can be checked against a role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
-    /// Execute search queries.
+    /// Execute search queries, view history, list running queries.
     Query,
     /// Read schema and field catalog.
     SchemaRead,
+    /// Validate DSL syntax without executing.
+    Validate,
+    /// CRUD operations on saved queries.
+    SavedQuery,
+    /// Export query results to file formats.
+    Export,
+    /// Subscribe to live SSE event streams.
+    Stream,
+    /// Cancel running queries (own queries; admin can cancel any via `ServerManage`).
+    QueryCancel,
     /// Manage API keys (create, list, revoke).
     KeyManage,
-    /// Manage server configuration.
+    /// Manage server configuration and view stats.
     ServerManage,
     /// Write events via the ingest endpoint.
     Ingest,
@@ -49,11 +59,28 @@ impl Role {
             Self::Admin => &[
                 Permission::Query,
                 Permission::SchemaRead,
+                Permission::Validate,
+                Permission::SavedQuery,
+                Permission::Export,
+                Permission::Stream,
+                Permission::QueryCancel,
                 Permission::KeyManage,
                 Permission::ServerManage,
             ],
-            // analyst and reader are identical for now — differentiated in phase 7+
-            Self::Analyst | Self::Reader => &[Permission::Query, Permission::SchemaRead],
+            Self::Analyst => &[
+                Permission::Query,
+                Permission::SchemaRead,
+                Permission::Validate,
+                Permission::SavedQuery,
+                Permission::Export,
+                Permission::Stream,
+                Permission::QueryCancel,
+            ],
+            Self::Reader => &[
+                Permission::Query,
+                Permission::SchemaRead,
+                Permission::QueryCancel,
+            ],
             Self::Ingest => &[Permission::Ingest],
         }
     }
@@ -109,23 +136,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admin_has_all_permissions() {
+    fn admin_has_all_non_ingest_permissions() {
         assert!(Role::Admin.has_permission(Permission::Query));
         assert!(Role::Admin.has_permission(Permission::SchemaRead));
+        assert!(Role::Admin.has_permission(Permission::Validate));
+        assert!(Role::Admin.has_permission(Permission::SavedQuery));
+        assert!(Role::Admin.has_permission(Permission::Export));
+        assert!(Role::Admin.has_permission(Permission::Stream));
+        assert!(Role::Admin.has_permission(Permission::QueryCancel));
         assert!(Role::Admin.has_permission(Permission::KeyManage));
         assert!(Role::Admin.has_permission(Permission::ServerManage));
+        // admin and ingest are orthogonal
+        assert!(!Role::Admin.has_permission(Permission::Ingest));
     }
 
     #[test]
-    fn analyst_has_query_and_schema() {
+    fn analyst_has_power_user_permissions() {
         assert!(Role::Analyst.has_permission(Permission::Query));
         assert!(Role::Analyst.has_permission(Permission::SchemaRead));
+        assert!(Role::Analyst.has_permission(Permission::Validate));
+        assert!(Role::Analyst.has_permission(Permission::SavedQuery));
+        assert!(Role::Analyst.has_permission(Permission::Export));
+        assert!(Role::Analyst.has_permission(Permission::Stream));
+        assert!(Role::Analyst.has_permission(Permission::QueryCancel));
     }
 
     #[test]
     fn analyst_cannot_manage_keys_or_server() {
         assert!(!Role::Analyst.has_permission(Permission::KeyManage));
         assert!(!Role::Analyst.has_permission(Permission::ServerManage));
+        assert!(!Role::Analyst.has_permission(Permission::Ingest));
+    }
+
+    #[test]
+    fn reader_has_only_basic_permissions() {
+        assert!(Role::Reader.has_permission(Permission::Query));
+        assert!(Role::Reader.has_permission(Permission::SchemaRead));
+        assert!(Role::Reader.has_permission(Permission::QueryCancel));
+        // reader must NOT have analyst-tier permissions
+        assert!(!Role::Reader.has_permission(Permission::Validate));
+        assert!(!Role::Reader.has_permission(Permission::SavedQuery));
+        assert!(!Role::Reader.has_permission(Permission::Export));
+        assert!(!Role::Reader.has_permission(Permission::Stream));
+        assert!(!Role::Reader.has_permission(Permission::KeyManage));
+        assert!(!Role::Reader.has_permission(Permission::ServerManage));
+        assert!(!Role::Reader.has_permission(Permission::Ingest));
     }
 
     #[test]
@@ -133,24 +188,13 @@ mod tests {
         assert!(Role::Ingest.has_permission(Permission::Ingest));
         assert!(!Role::Ingest.has_permission(Permission::Query));
         assert!(!Role::Ingest.has_permission(Permission::SchemaRead));
+        assert!(!Role::Ingest.has_permission(Permission::Validate));
+        assert!(!Role::Ingest.has_permission(Permission::SavedQuery));
+        assert!(!Role::Ingest.has_permission(Permission::Export));
+        assert!(!Role::Ingest.has_permission(Permission::Stream));
+        assert!(!Role::Ingest.has_permission(Permission::QueryCancel));
         assert!(!Role::Ingest.has_permission(Permission::KeyManage));
         assert!(!Role::Ingest.has_permission(Permission::ServerManage));
-    }
-
-    #[test]
-    fn reader_matches_analyst_permissions() {
-        for perm in [
-            Permission::Query,
-            Permission::SchemaRead,
-            Permission::KeyManage,
-            Permission::ServerManage,
-        ] {
-            assert_eq!(
-                Role::Reader.has_permission(perm),
-                Role::Analyst.has_permission(perm),
-                "reader and analyst should have identical permissions for {perm:?}"
-            );
-        }
     }
 
     #[test]

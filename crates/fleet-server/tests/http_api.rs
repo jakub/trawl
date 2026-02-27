@@ -101,6 +101,7 @@ struct TestServer {
     url: String,
     analyst_token: String,
     admin_token: String,
+    reader_token: String,
     ingest_token: String,
 }
 
@@ -113,6 +114,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
     let store = KeyStore::open(&auth_db).unwrap();
     let analyst = store.create_key("test-key", Role::Analyst, None).unwrap();
     let admin = store.create_key("admin-key", Role::Admin, None).unwrap();
+    let reader = store.create_key("reader-key", Role::Reader, None).unwrap();
     let ingest = store.create_key("ingest-key", Role::Ingest, None).unwrap();
     drop(store);
 
@@ -173,6 +175,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
         url: format!("https://{addr}"),
         analyst_token: analyst.plaintext_token.to_string(),
         admin_token: admin.plaintext_token.to_string(),
+        reader_token: reader.plaintext_token.to_string(),
         ingest_token: ingest.plaintext_token.to_string(),
     }
 }
@@ -187,6 +190,7 @@ async fn setup() -> TestServer {
     let store = KeyStore::open(&auth_db).unwrap();
     let analyst = store.create_key("test-key", Role::Analyst, None).unwrap();
     let admin = store.create_key("admin-key", Role::Admin, None).unwrap();
+    let reader = store.create_key("reader-key", Role::Reader, None).unwrap();
     let ingest = store.create_key("ingest-key", Role::Ingest, None).unwrap();
     drop(store);
 
@@ -255,6 +259,7 @@ async fn setup() -> TestServer {
         url: format!("https://{addr}"),
         analyst_token: analyst.plaintext_token.to_string(),
         admin_token: admin.plaintext_token.to_string(),
+        reader_token: reader.plaintext_token.to_string(),
         ingest_token: ingest.plaintext_token.to_string(),
     }
 }
@@ -400,9 +405,20 @@ async fn queries_shows_history() {
 }
 
 #[tokio::test]
-async fn queries_rejects_non_admin() {
+async fn queries_accessible_by_analyst_and_reader() {
     let server = setup().await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    // Both analyst and reader can list running queries (loosened from admin-only).
+    analyst.queries().await.unwrap();
+    reader.queries().await.unwrap();
+}
+
+#[tokio::test]
+async fn queries_rejects_ingest_role() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let result = client.queries().await;
     assert!(result.is_err());
@@ -411,7 +427,7 @@ async fn queries_rejects_non_admin() {
         fleet_client::ClientError::Server { status, .. } => {
             assert_eq!(status, 401);
         }
-        other => panic!("expected 401 for non-admin, got: {other:?}"),
+        other => panic!("expected 401 for ingest role, got: {other:?}"),
     }
 }
 
@@ -590,13 +606,30 @@ async fn cancel_query_nonexistent_returns_false() {
 }
 
 #[tokio::test]
-async fn cancel_query_by_non_admin_fails() {
+async fn cancel_query_by_analyst_for_nonexistent() {
     let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // Analyst tries to cancel a query they don't own.
-    let result = analyst.cancel_query(1).await;
+    // Analyst gets "cannot cancel" for non-existent queries — no information
+    // disclosure about whether the query ID exists (only admin sees the difference).
+    let result = analyst.cancel_query(9999).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn cancel_query_rejects_ingest_role() {
+    let server = setup().await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+
+    let result = ingest.cancel_query(1).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    match err {
+        fleet_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 401);
+        }
+        other => panic!("expected 401 for ingest role, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -756,4 +789,67 @@ async fn response_includes_ulid_request_id() {
         value.chars().all(|c| c.is_ascii_alphanumeric()),
         "request ID should be alphanumeric crockford base32"
     );
+}
+
+// -- reader role restriction tests -------------------------------------------
+
+/// Helper to assert a client call returns HTTP 401.
+fn assert_401<T: std::fmt::Debug>(result: Result<T, fleet_client::ClientError>) {
+    let err = result.expect_err("expected 401 but got success");
+    match err {
+        fleet_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 401, "expected 401, got {status}");
+        }
+        other => panic!("expected Server error with 401, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn validate_rejects_reader() {
+    let server = setup().await;
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    assert_401(reader.validate("* | head 1").await);
+}
+
+#[tokio::test]
+async fn saved_queries_reject_reader() {
+    let server = setup().await;
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    assert_401(reader.list_saved().await);
+    assert_401(reader.create_saved("test", "* | head 1").await);
+    assert_401(reader.update_saved(1, "* | head 2").await);
+    assert_401(reader.delete_saved(1).await);
+}
+
+#[tokio::test]
+async fn export_rejects_reader() {
+    let server = setup().await;
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    assert_401(
+        reader
+            .export("* | head 1", fleet_api::ExportFormat::Csv, None)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn reader_can_query_and_view_history() {
+    let server = setup().await;
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    // Reader can execute queries.
+    let resp = reader
+        .query_paginated("* | head 1", None, None)
+        .await
+        .unwrap();
+    assert!(!resp.result.columns.is_empty());
+
+    // Reader can view schema.
+    reader.schema().await.unwrap();
+
+    // Reader can view history.
+    reader.history(Some(10), None).await.unwrap();
 }

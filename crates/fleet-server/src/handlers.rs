@@ -526,13 +526,13 @@ fn is_date_dir(name: &str) -> bool {
         && name[8..10].bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `GET /api/v1/queries` — view active and recent queries (admin only).
+/// `GET /api/v1/queries` — view active and recent queries.
 #[allow(clippy::unused_async)]
 pub async fn queries(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<QueriesResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::ServerManage) {
+    if !verified.role.has_permission(Permission::Query) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -544,16 +544,17 @@ pub async fn queries(
 
 /// `DELETE /api/v1/queries/{id}` — cancel a running query by ID.
 ///
-/// Requires either `ServerManage` permission (admin) or ownership of the query.
+/// Admin (`ServerManage`) can cancel any query. `QueryCancel` holders can cancel
+/// their own queries only. Roles without `QueryCancel` are rejected outright.
 pub async fn cancel_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
     Path(query_id): Path<u64>,
 ) -> Result<Json<CancelResponse>, ServerError> {
-    // admin can cancel anything, users can only cancel their own
+    // admin can cancel any query, QueryCancel holders can cancel their own
     let can_cancel = if verified.role.has_permission(Permission::ServerManage) {
         true
-    } else {
+    } else if verified.role.has_permission(Permission::QueryCancel) {
         state
             .query
             .tracker
@@ -561,6 +562,8 @@ pub async fn cancel_query(
             .iter()
             .find(|q| q.id == query_id)
             .is_some_and(|q| q.user == verified.name)
+    } else {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
     };
 
     if !can_cancel {
@@ -591,7 +594,7 @@ pub async fn validate_query(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<ValidationResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.role.has_permission(Permission::Validate) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -792,7 +795,7 @@ pub async fn list_saved(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<ListSavedResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.role.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -821,7 +824,7 @@ pub async fn create_saved(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<CreateSavedRequest>,
 ) -> Result<Json<SavedQueryResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.role.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -854,7 +857,7 @@ pub async fn update_saved(
     Path(id): Path<i64>,
     Json(req): Json<UpdateSavedRequest>,
 ) -> Result<Json<SavedQueryResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.role.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -886,7 +889,7 @@ pub async fn delete_saved(
     Extension(verified): Extension<VerifiedKey>,
     Path(id): Path<i64>,
 ) -> Result<Json<DeleteSavedResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.role.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -933,7 +936,7 @@ pub async fn export(
     Query(params): Query<ExportParams>,
     Json(req): Json<ExportRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.role.has_permission(Permission::Export) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1340,7 +1343,7 @@ pub async fn stream_query(
     >,
     ServerError,
 > {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.role.has_permission(Permission::Stream) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
