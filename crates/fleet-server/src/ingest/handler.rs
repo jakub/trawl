@@ -87,6 +87,26 @@ impl RejectCounts {
             + self.wal_failure
     }
 
+    /// Format non-zero counts as a compact summary (e.g. `"invalid_chars:3, missing_service:1"`).
+    fn summary(&self) -> String {
+        let pairs: &[(u64, &str)] = &[
+            (self.missing_service, "missing_service"),
+            (self.empty_service, "empty_service"),
+            (self.service_too_long, "service_too_long"),
+            (self.invalid_chars, "invalid_chars"),
+            (self.not_object, "not_object"),
+            (self.invalid_json, "invalid_json"),
+            (self.wal_failure, "wal_failure"),
+        ];
+        let mut parts = Vec::new();
+        for &(count, reason) in pairs {
+            if count > 0 {
+                parts.push(format!("{reason}:{count}"));
+            }
+        }
+        parts.join(", ")
+    }
+
     /// Emit non-zero counts as labeled prometheus counters.
     fn emit_metrics(&self) {
         let pairs: &[(u64, &str)] = &[
@@ -349,6 +369,25 @@ fn finalize_ingest(
             .ingest
             .total_rejected
             .fetch_add(rejected as u64, std::sync::atomic::Ordering::Relaxed);
+
+        let reasons = parsed.reject_counts.summary();
+        // Sample up to 5 error messages so rejection causes are queryable
+        // without flooding telemetry with per-event detail.
+        let samples: Vec<&str> = parsed
+            .errors
+            .iter()
+            .take(5)
+            .map(|e| e.message.as_str())
+            .collect();
+        let sample_text = samples.join("; ");
+        tracing::warn!(
+            event_type = "ingest_rejections",
+            user = %verified.name,
+            rejected,
+            reasons,
+            samples = sample_text,
+            "events rejected during ingest"
+        );
     }
 
     // Publish one IngestBatch per service to the event bus.
