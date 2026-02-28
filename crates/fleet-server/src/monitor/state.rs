@@ -57,6 +57,11 @@ pub struct MonitorSnapshot {
 }
 
 /// Tracks counter deltas between ticks to compute rates (events/sec, queries/sec).
+///
+/// Uses an exponential moving average (EMA) to smooth out bursty ingest
+/// patterns. With a smoothing factor of 0.3, it takes ~5 ticks for a
+/// step change to reach ~83% of the new value — enough to eliminate the
+/// 0/1000/0/1000 flicker while still being responsive.
 #[derive(Debug)]
 pub struct RateTracker {
     last_query_count: u64,
@@ -65,6 +70,9 @@ pub struct RateTracker {
     pub query_rate: f64,
     pub ingest_rate: f64,
 }
+
+/// EMA smoothing factor (0..1). Lower = smoother but slower to respond.
+const RATE_SMOOTHING: f64 = 0.3;
 
 impl Default for RateTracker {
     fn default() -> Self {
@@ -86,8 +94,10 @@ impl RateTracker {
         if elapsed > 0.0 {
             let query_delta = total_queries.saturating_sub(self.last_query_count);
             let ingest_delta = total_ingest.saturating_sub(self.last_ingest_count);
-            self.query_rate = query_delta as f64 / elapsed;
-            self.ingest_rate = ingest_delta as f64 / elapsed;
+            let instant_query = query_delta as f64 / elapsed;
+            let instant_ingest = ingest_delta as f64 / elapsed;
+            self.query_rate += RATE_SMOOTHING * (instant_query - self.query_rate);
+            self.ingest_rate += RATE_SMOOTHING * (instant_ingest - self.ingest_rate);
         }
         self.last_query_count = total_queries;
         self.last_ingest_count = total_ingest;
