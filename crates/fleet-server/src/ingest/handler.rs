@@ -185,9 +185,10 @@ fn validate_event(
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     {
         return Err((
-            "service name contains invalid characters \
-             (only alphanumeric, dash, underscore, dot allowed)"
-                .into(),
+            format!(
+                "service '{svc}' contains invalid characters \
+                 (only alphanumeric, dash, underscore, dot allowed)"
+            ),
             RejectReason::InvalidChars,
         ));
     }
