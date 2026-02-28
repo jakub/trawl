@@ -7,8 +7,8 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 - **core**: rust workspace — parser, SQL emitter, DuckDB executor, daemon, CLI, TUI
 - **ingestion**: vector → parquet (columnar, compressed, partitioned by hour)
 - **query engine**: custom DSL → AST → DuckDB SQL (parameterized)
-- **web ui**: rails 8 (thin proxy over fleetd HTTP API)
-- **agent** (v2 scope): signed-template execution on managed endpoints, mTLS, ed25519 signing
+- **web ui** (planned): rails 8 (thin proxy over fleetd HTTP API) — not yet started
+- **agent** (v2 scope): signed-template execution on managed endpoints, mTLS, ed25519 signing — not yet started
 
 ## workspace layout
 
@@ -16,11 +16,12 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 crates/
   fleet-core/     # DSL parser, AST, SQL emitter (pure, no I/O)
   fleet-engine/   # DuckDB integration, query execution
-  fleet-auth/     # API keys, roles, SQLite-backed
-  fleet-server/   # daemon (axum, unix socket, TCP+TLS)
-  fleet-client/   # shared client library
+  fleet-auth/     # API keys, roles, schedules, SQLite-backed
+  fleet-api/      # shared wire types (request/response structs)
+  fleet-server/   # daemon (axum, HTTPS via tokio-rustls)
+  fleet-client/   # typed async HTTP client library
   fleet-cli/      # unified CLI + TUI binary
-  fleet-admin/    # admin CLI (key mgmt, templates, enrollment)
+  fleet-admin/    # admin CLI (key mgmt, TLS cert generation)
 ```
 
 ## key design decisions
@@ -100,6 +101,7 @@ fleet validate --insecure "dsl..."               # prints "valid" or error with 
 - **table**: pretty-printed box-drawing table with row count footer (default for TTY)
 - **json**: one JSON object per row, ndjson-style (default for pipes)
 - **csv**: RFC 4180 with formula injection protection (string values starting with `=`, `+`, `-`, `@`, `\t`, `|` are prefixed with `'`)
+- **parquet**: DuckDB COPY TO with Snappy compression (file output only, requires `--output <path>`)
 
 ### common dev examples
 
@@ -125,31 +127,39 @@ fleet query --data 'data/**/*.parquet' "* | stats count() by service | sort -cou
 
 ### HTTP API
 
-the fleet server exposes a REST API (all routes except `/health` and `/ingest` require bearer token auth):
+the fleet server exposes a REST API. all routes under `/api/v1` except `/health` and `/ingest` require bearer token auth:
 
 | method | path | description |
 |--------|------|-------------|
-| `GET` | `/health` | health check (returns `{"status":"ok"}`) |
-| `POST` | `/query` | execute a DSL query |
-| `POST` | `/validate` | validate DSL syntax |
-| `GET` | `/schema` | get column names and types |
-| `GET` | `/schema/values/{field}` | get distinct values for a field |
-| `GET` | `/queries` | list running queries |
-| `DELETE` | `/queries/{id}` | cancel a running query |
-| `GET` | `/stats` | server statistics |
-| `GET` | `/history` | query execution history |
-| `GET` | `/saved` | list saved queries |
-| `POST` | `/saved` | create a saved query |
-| `PUT` | `/saved/{id}` | update a saved query |
-| `DELETE` | `/saved/{id}` | delete a saved query |
-| `POST` | `/export` | export query results (CSV) |
-| `GET` | `/stream` | SSE stream of query results |
-| `POST` | `/ingest` | ingest log events (JSON array, optional gzip) |
+| `GET` | `/api/v1/health` | health check (unauthenticated) |
+| `POST` | `/api/v1/query` | execute a DSL query |
+| `POST` | `/api/v1/validate` | validate DSL syntax |
+| `GET` | `/api/v1/schema` | get column names and types |
+| `GET` | `/api/v1/schema/values/{field}` | get distinct values for a field |
+| `GET` | `/api/v1/queries` | list running queries |
+| `DELETE` | `/api/v1/queries/{id}` | cancel a running query |
+| `GET` | `/api/v1/stats` | server statistics |
+| `GET` | `/api/v1/history` | query execution history |
+| `GET` | `/api/v1/saved` | list saved queries |
+| `POST` | `/api/v1/saved` | create a saved query |
+| `PUT` | `/api/v1/saved/{id}` | update a saved query |
+| `DELETE` | `/api/v1/saved/{id}` | delete a saved query |
+| `PUT` | `/api/v1/saved/{id}/schedule` | upsert schedule on saved query |
+| `GET` | `/api/v1/saved/{id}/schedule` | get schedule |
+| `DELETE` | `/api/v1/saved/{id}/schedule` | delete schedule |
+| `GET` | `/api/v1/saved/{id}/runs` | list report runs (paginated) |
+| `GET` | `/api/v1/saved/{id}/runs/{run_id}` | get report run with result data |
+| `POST` | `/api/v1/export` | export query results (csv/json/parquet) |
+| `GET` | `/api/v1/stream` | SSE stream of query results |
+| `POST` | `/api/v1/ingest` | ingest log events (JSON array/ndjson, optional gzip) |
+| `GET` | `/metrics` | prometheus metrics (outside /api/v1, unauthenticated) |
 
 ## docs
 
 - `docs/overview.md` — project overview and architecture thesis
 - `docs/initial_plan.md` — 15-phase implementation plan with detailed per-phase breakdowns
+- `docs/architecture-review.md` — comparative analysis vs splunk/datadog, data flow diagram, scaling roadmap
+- `docs/1.0-readiness.md` — current feature inventory and gaps for a 1.0 release
 
 ## DSL quick reference
 
