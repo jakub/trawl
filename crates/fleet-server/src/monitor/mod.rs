@@ -14,6 +14,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -68,18 +69,23 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Drain any pending terminal events (ctrl-c, q).
+                // Raw mode swallows SIGINT, so we must read key events directly.
+                while event::poll(Duration::ZERO)? {
+                    if let Event::Key(key) = event::read()? {
+                        let is_quit = matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
+                            || matches!(key.code, KeyCode::Char('q'));
+                        if is_quit {
+                            // Signal the HTTP server to shut down.
+                            shutdown.notify_waiters();
+                            return Ok(());
+                        }
+                    }
+                }
+
                 let snapshot = monitor.snapshot();
                 terminal.draw(|f| ui::render(&snapshot, f))?;
             }
-            result = tokio::signal::ctrl_c() => {
-                let _ = result;
-                break;
-            }
         }
     }
-
-    // Signal the HTTP server to shut down.
-    shutdown.notify_waiters();
-
-    Ok(())
 }

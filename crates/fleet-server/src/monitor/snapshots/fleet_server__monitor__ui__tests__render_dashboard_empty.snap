@@ -31,4 +31,4 @@ expression: terminal.backend().to_string()
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ctrl-c to quit                                                                 "
+" q or ctrl-c to quit                                                            "

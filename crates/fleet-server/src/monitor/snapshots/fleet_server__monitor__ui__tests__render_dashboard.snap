@@ -31,4 +31,4 @@ expression: terminal.backend().to_string()
 "┌ ACTIVE QUERIES ──────────────────────────────────────────────────────────────┐"
 "│#1248   admin      running 1.2s   service:nginx | timechart span=5m count()   │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" ctrl-c to quit                                                                 "
+" q or ctrl-c to quit                                                            "

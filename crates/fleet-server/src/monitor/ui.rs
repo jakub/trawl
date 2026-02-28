@@ -458,7 +458,7 @@ fn render_active_queries(snapshot: &MonitorSnapshot, frame: &mut Frame<'_>, area
 fn render_footer(snapshot: &MonitorSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let _ = snapshot; // may use later for refresh interval display
     let line = Line::from(vec![Span::styled(
-        " ctrl-c to quit",
+        " q or ctrl-c to quit",
         Style::default().fg(Color::DarkGray),
     )]);
     frame.render_widget(Paragraph::new(line), area);
