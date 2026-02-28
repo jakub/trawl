@@ -100,16 +100,15 @@ fn main() {
     let db_path = PathBuf::from(shellexpand::tilde(&cli.db).as_ref());
 
     // Ensure parent directory exists.
-    if let Some(parent) = db_path.parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "fleet-admin: failed to create directory {}: {e}",
-                    parent.display()
-                );
-                process::exit(1);
-            }
-        }
+    if let Some(parent) = db_path.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "fleet-admin: failed to create directory {}: {e}",
+            parent.display()
+        );
+        process::exit(1);
     }
 
     let store = match KeyStore::open(&db_path) {

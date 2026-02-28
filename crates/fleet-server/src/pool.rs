@@ -220,40 +220,38 @@ fn capture_pool_debug(
     let is_fallback = source == fallback_glob || source.ends_with("/**/*.parquet");
 
     // Re-parse AST to extract filters and emit SQL (cheap, <1ms).
-    let (service_filter, time_filter_secs, sql, params) = if let Ok(ast) =
-        fleet_core::parser::parse(dsl)
-    {
-        let service = ast.search.groups.first().and_then(|g| {
-            g.iter().find_map(|t| {
-                if let fleet_core::ast::SearchToken::FieldFilter(fleet_core::ast::FieldFilter {
-                    field,
-                    op: fleet_core::ast::FilterOp::Eq,
-                    value: fleet_core::ast::FilterValue::Literal(s),
-                }) = &t.node
-                {
-                    if field == "service" {
+    let (service_filter, time_filter_secs, sql, params) =
+        if let Ok(ast) = fleet_core::parser::parse(dsl) {
+            let service = ast.search.groups.first().and_then(|g| {
+                g.iter().find_map(|t| {
+                    if let fleet_core::ast::SearchToken::FieldFilter(fleet_core::ast::FieldFilter {
+                        field,
+                        op: fleet_core::ast::FilterOp::Eq,
+                        value: fleet_core::ast::FilterValue::Literal(s),
+                    }) = &t.node
+                        && field == "service"
+                    {
                         return Some(s.clone());
                     }
-                }
-                None
-            })
-        });
-        let time_secs = ast
-            .search
-            .time_filter
-            .as_ref()
-            .map(|tf| tf.node.duration.to_seconds());
-        let (sql, params) = match fleet_core::emitter::emit(&ast, source) {
-            Ok(emitted) => (
-                emitted.sql,
-                emitted.params.iter().map(ToString::to_string).collect(),
-            ),
-            Err(_) => (String::new(), vec![]),
+                    None
+                })
+            });
+            let time_secs = ast
+                .search
+                .time_filter
+                .as_ref()
+                .map(|tf| tf.node.duration.to_seconds());
+            let (sql, params) = match fleet_core::emitter::emit(&ast, source) {
+                Ok(emitted) => (
+                    emitted.sql,
+                    emitted.params.iter().map(ToString::to_string).collect(),
+                ),
+                Err(_) => (String::new(), vec![]),
+            };
+            (service, time_secs, sql, params)
+        } else {
+            (None, None, String::new(), vec![])
         };
-        (service, time_secs, sql, params)
-    } else {
-        (None, None, String::new(), vec![])
-    };
 
     let (hot_status, hot_events, hot_batches, hot_bytes) = match hot_buffer {
         None => ("disabled", 0, 0, 0),

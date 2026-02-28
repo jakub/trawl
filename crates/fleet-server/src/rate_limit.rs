@@ -78,17 +78,17 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
         .get::<VerifiedKey>()
         .ok_or_else(|| ServerError::Internal("verified key not in extensions".into()))?;
 
-    if let Some(limiter) = rate_state.limiter_for_role(verified.role) {
-        if limiter.check_key(&verified.prefix).is_err() {
-            tracing::warn!(
-                event_type = "rate_limit_exceeded",
-                user = %verified.name,
-                role = %verified.role,
-                prefix = %verified.prefix,
-                "rate limit exceeded"
-            );
-            return Err(ServerError::RateLimited);
-        }
+    if let Some(limiter) = rate_state.limiter_for_role(verified.role)
+        && limiter.check_key(&verified.prefix).is_err()
+    {
+        tracing::warn!(
+            event_type = "rate_limit_exceeded",
+            user = %verified.name,
+            role = %verified.role,
+            prefix = %verified.prefix,
+            "rate limit exceeded"
+        );
+        return Err(ServerError::RateLimited);
     }
 
     Ok(next.run(request).await)

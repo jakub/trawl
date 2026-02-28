@@ -39,7 +39,7 @@ impl Rng {
     }
 
     fn bool(&mut self) -> bool {
-        self.next_u64() % 2 == 0
+        self.next_u64().is_multiple_of(2)
     }
 
     fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {

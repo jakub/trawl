@@ -28,10 +28,9 @@ fn extract_service_filter(search: &fleet_core::ast::SearchStage) -> Option<&str>
             op: FilterOp::Eq,
             value: FilterValue::Literal(s),
         }) = &t.node
+            && field == "service"
         {
-            if field == "service" {
-                return Some(s.as_str());
-            }
+            return Some(s.as_str());
         }
         None
     })

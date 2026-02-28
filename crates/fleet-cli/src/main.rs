@@ -164,10 +164,10 @@ async fn main() {
 
     if let Err(e) = run(args).await {
         // Broken pipe is expected (e.g. `fleet query ... | head`), exit quietly.
-        if let CliError::Io(ref io_err) = e {
-            if io_err.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(1);
-            }
+        if let CliError::Io(ref io_err) = e
+            && io_err.kind() == io::ErrorKind::BrokenPipe
+        {
+            process::exit(1);
         }
         eprintln!("fleet: {e}");
         process::exit(1);

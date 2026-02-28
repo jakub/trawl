@@ -77,27 +77,26 @@ fn get_context_hints(app: &App) -> String {
     use crate::tui::state::SidebarSection;
 
     // If sidebar is focused, show sidebar-specific hints.
-    if app.focus == Focus::Sidebar {
-        if let Some(ref sb) = app.sidebar {
-            if sb.section == SidebarSection::Schema && sb.schema.filter_active {
-                return "type to filter | Enter: confirm | Esc: cancel".to_owned();
-            }
-            return match sb.section {
-                SidebarSection::Schema => {
-                    "↑↓: navigate | →: expand | ←: collapse | /: filter | [/]: sections".to_owned()
-                }
-                SidebarSection::History => {
-                    "↑↓: navigate | enter: load query | [/]: sections".to_owned()
-                }
-                SidebarSection::Saved => {
-                    "↑↓: navigate | enter: load | s: schedule | del: delete | [/]: sections"
-                        .to_owned()
-                }
-                SidebarSection::Reports => {
-                    "↑↓: navigate | enter: load last run | [/]: sections".to_owned()
-                }
-            };
+    if app.focus == Focus::Sidebar
+        && let Some(ref sb) = app.sidebar
+    {
+        if sb.section == SidebarSection::Schema && sb.schema.filter_active {
+            return "type to filter | Enter: confirm | Esc: cancel".to_owned();
         }
+        return match sb.section {
+            SidebarSection::Schema => {
+                "↑↓: navigate | →: expand | ←: collapse | /: filter | [/]: sections".to_owned()
+            }
+            SidebarSection::History => {
+                "↑↓: navigate | enter: load query | [/]: sections".to_owned()
+            }
+            SidebarSection::Saved => {
+                "↑↓: navigate | enter: load | s: schedule | del: delete | [/]: sections".to_owned()
+            }
+            SidebarSection::Reports => {
+                "↑↓: navigate | enter: load last run | [/]: sections".to_owned()
+            }
+        };
     }
 
     // Live mode hints

@@ -76,14 +76,14 @@ fn profile_columns(
         let mut seen_set: HashSet<String> = HashSet::new();
 
         for row in &response.result.rows {
-            if let Some(val) = row.get(col_idx) {
-                if *val != fleet_engine::value::Value::Null {
-                    non_null += 1;
-                    if seen_set.len() < 8 {
-                        let s = value_display(val);
-                        if seen_set.insert(s.clone()) {
-                            seen_values.push(s);
-                        }
+            if let Some(val) = row.get(col_idx)
+                && *val != fleet_engine::value::Value::Null
+            {
+                non_null += 1;
+                if seen_set.len() < 8 {
+                    let s = value_display(val);
+                    if seen_set.insert(s.clone()) {
+                        seen_values.push(s);
                     }
                 }
             }
@@ -431,12 +431,11 @@ impl App {
                     );
 
                     // If we should select a specific query, find its index
-                    if let Some(name) = select_name {
-                        if let Some(idx) = saved.queries.iter().position(|q| q.name == name) {
-                            if let Some(ref mut sb) = self.sidebar {
-                                sb.saved_selected = idx;
-                            }
-                        }
+                    if let Some(name) = select_name
+                        && let Some(idx) = saved.queries.iter().position(|q| q.name == name)
+                        && let Some(ref mut sb) = self.sidebar
+                    {
+                        sb.saved_selected = idx;
                     }
 
                     self.saved_cache = Some(saved);
@@ -444,10 +443,11 @@ impl App {
                     // Reset selection if it's now out of bounds
                     if let Some(cache) = &self.saved_cache {
                         let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
-                        if selected >= cache.queries.len() && !cache.queries.is_empty() {
-                            if let Some(ref mut sb) = self.sidebar {
-                                sb.saved_selected = cache.queries.len().saturating_sub(1);
-                            }
+                        if selected >= cache.queries.len()
+                            && !cache.queries.is_empty()
+                            && let Some(ref mut sb) = self.sidebar
+                        {
+                            sb.saved_selected = cache.queries.len().saturating_sub(1);
                         }
                     }
                 }
@@ -622,12 +622,13 @@ impl App {
             // Close sidebar: Esc (when sidebar is focused)
             (KeyModifiers::NONE, KeyCode::Esc) if self.focus == Focus::Sidebar => {
                 // If filter is active, close filter first
-                if let Some(ref mut sb) = self.sidebar {
-                    if sb.section == SidebarSection::Schema && sb.schema.filter_active {
-                        sb.schema.filter_active = false;
-                        sb.schema.filter.clear();
-                        return;
-                    }
+                if let Some(ref mut sb) = self.sidebar
+                    && sb.section == SidebarSection::Schema
+                    && sb.schema.filter_active
+                {
+                    sb.schema.filter_active = false;
+                    sb.schema.filter.clear();
+                    return;
                 }
                 self.sidebar = None;
                 self.focus = Focus::Editor;
@@ -1095,20 +1096,20 @@ impl App {
 
     /// Recompute search matches against the active tab's result data.
     fn recompute_search_matches(&mut self) {
-        if let Some(ref mut search) = self.results_search {
-            if let Some(ref response) = self.tabs[self.active_tab_idx].result {
-                search.update_matches(&response.result);
-            }
+        if let Some(ref mut search) = self.results_search
+            && let Some(ref response) = self.tabs[self.active_tab_idx].result
+        {
+            search.update_matches(&response.result);
         }
     }
 
     /// Jump to the current search match: select its row and scroll to it.
     fn jump_to_current_match(&mut self) {
-        if let Some(ref search) = self.results_search {
-            if let Some(&(row_idx, _col_idx)) = search.matches.get(search.current_match) {
-                self.active_tab_mut().selected_row = Some(row_idx);
-                self.ensure_selected_row_visible();
-            }
+        if let Some(ref search) = self.results_search
+            && let Some(&(row_idx, _col_idx)) = search.matches.get(search.current_match)
+        {
+            self.active_tab_mut().selected_row = Some(row_idx);
+            self.ensure_selected_row_visible();
         }
     }
 
@@ -1137,10 +1138,10 @@ impl App {
                 }
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    if item_count > 0 {
-                        sb.history_selected = (sb.history_selected + 1).min(item_count - 1);
-                    }
+                if let Some(ref mut sb) = self.sidebar
+                    && item_count > 0
+                {
+                    sb.history_selected = (sb.history_selected + 1).min(item_count - 1);
                 }
             }
             // Enter: load selected query into editor, focus editor (keep sidebar open)
@@ -1175,10 +1176,10 @@ impl App {
                 }
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    if item_count > 0 {
-                        sb.saved_selected = (sb.saved_selected + 1).min(item_count - 1);
-                    }
+                if let Some(ref mut sb) = self.sidebar
+                    && item_count > 0
+                {
+                    sb.saved_selected = (sb.saved_selected + 1).min(item_count - 1);
                 }
             }
             // Enter: load selected query into editor, focus editor (keep sidebar open)
@@ -1201,26 +1202,26 @@ impl App {
             // Delete: confirm deletion
             (KeyModifiers::NONE, KeyCode::Delete | KeyCode::Backspace) => {
                 let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
-                if let Some(ref saved) = self.saved_cache {
-                    if let Some(entry) = saved.queries.get(selected) {
-                        self.popup = Some(Popup::ConfirmDelete {
-                            saved_id: entry.id,
-                            name: entry.name.clone(),
-                        });
-                    }
+                if let Some(ref saved) = self.saved_cache
+                    && let Some(entry) = saved.queries.get(selected)
+                {
+                    self.popup = Some(Popup::ConfirmDelete {
+                        saved_id: entry.id,
+                        name: entry.name.clone(),
+                    });
                 }
             }
             // Schedule: open set-schedule popup
             (KeyModifiers::NONE, KeyCode::Char('s')) => {
                 let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
-                if let Some(ref saved) = self.saved_cache {
-                    if let Some(entry) = saved.queries.get(selected) {
-                        self.popup = Some(Popup::SetSchedule {
-                            saved_id: entry.id,
-                            name: entry.name.clone(),
-                            editor: state::SimpleEditor::new(),
-                        });
-                    }
+                if let Some(ref saved) = self.saved_cache
+                    && let Some(entry) = saved.queries.get(selected)
+                {
+                    self.popup = Some(Popup::SetSchedule {
+                        saved_id: entry.id,
+                        name: entry.name.clone(),
+                        editor: state::SimpleEditor::new(),
+                    });
                 }
             }
             _ => {}
@@ -1241,10 +1242,10 @@ impl App {
                 }
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    if item_count > 0 {
-                        sb.reports_selected = (sb.reports_selected + 1).min(item_count - 1);
-                    }
+                if let Some(ref mut sb) = self.sidebar
+                    && item_count > 0
+                {
+                    sb.reports_selected = (sb.reports_selected + 1).min(item_count - 1);
                 }
             }
             // Enter: load last successful run's results
@@ -1364,10 +1365,10 @@ impl App {
             // '/' or Ctrl+P: activate filter (schema only)
             (KeyModifiers::NONE, KeyCode::Char('/'))
             | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    if sb.section == SidebarSection::Schema {
-                        sb.schema.filter_active = true;
-                    }
+                if let Some(ref mut sb) = self.sidebar
+                    && sb.section == SidebarSection::Schema
+                {
+                    sb.schema.filter_active = true;
                 }
             }
             // Section-specific dispatch
@@ -1559,10 +1560,10 @@ impl App {
             }
             Some(TreeNodeInfo::Field { .. } | TreeNodeInfo::Loading { .. }) => {
                 // Jump to parent service node.
-                if let Some(parent_idx) = self.find_parent_service_index() {
-                    if let Some(ref mut sb) = self.sidebar {
-                        sb.schema.selected = parent_idx;
-                    }
+                if let Some(parent_idx) = self.find_parent_service_index()
+                    && let Some(ref mut sb) = self.sidebar
+                {
+                    sb.schema.selected = parent_idx;
                 }
             }
             _ => {}
@@ -2178,7 +2179,7 @@ impl App {
                 }
 
                 // Send snapshot every 10 events.
-                if event_count % 10 == 0 && event_count > 0 {
+                if event_count.is_multiple_of(10) && event_count > 0 {
                     let response = buffer.to_query_response();
                     tracing::debug!(
                         "sending live buffer snapshot ({} rows)",
@@ -2575,7 +2576,7 @@ fn run_event_loop<B: ratatui::backend::Backend>(
     let mut iteration = 0u64;
     loop {
         iteration += 1;
-        if iteration % 10 == 0 {
+        if iteration.is_multiple_of(10) {
             tracing::debug!("event loop iteration {}", iteration);
         }
 

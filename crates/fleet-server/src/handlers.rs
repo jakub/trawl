@@ -380,27 +380,27 @@ pub async fn schema(
     // thundering herd: only one request refreshes while others wait.
     let mut cache = state.query.schema_cache.lock().await;
 
-    if let Some(cached) = &*cache {
-        if cached.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs {
-            tracing::debug!(event_type = "schema_cache_hit", user = %verified.name, "serving schema from cache");
-            return Ok(Json(SchemaResponse {
-                columns: cached
-                    .result
-                    .columns
-                    .iter()
-                    .cloned()
-                    .map(SchemaColumnResponse::from)
-                    .collect(),
-                file_count: cached.result.file_count,
-                cached: true,
-                earliest_date: cached.earliest_date.clone(),
-                latest_date: cached.latest_date.clone(),
-                total_bytes: Some(cached.total_bytes),
-                services: Some(cached.services.clone()),
-                hot_buffer_events: hot_events,
-                hot_buffer_bytes: hot_bytes,
-            }));
-        }
+    if let Some(cached) = &*cache
+        && cached.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs
+    {
+        tracing::debug!(event_type = "schema_cache_hit", user = %verified.name, "serving schema from cache");
+        return Ok(Json(SchemaResponse {
+            columns: cached
+                .result
+                .columns
+                .iter()
+                .cloned()
+                .map(SchemaColumnResponse::from)
+                .collect(),
+            file_count: cached.result.file_count,
+            cached: true,
+            earliest_date: cached.earliest_date.clone(),
+            latest_date: cached.latest_date.clone(),
+            total_bytes: Some(cached.total_bytes),
+            services: Some(cached.services.clone()),
+            hot_buffer_events: hot_events,
+            hot_buffer_bytes: hot_bytes,
+        }));
     }
 
     tracing::info!(event_type = "schema_refresh", user = %verified.name, "refreshing schema cache");
@@ -502,11 +502,11 @@ fn collect_catalog_metadata(
 
         // Walk ancestors looking for a YYYY-MM-DD directory component.
         for ancestor in path.ancestors().skip(1) {
-            if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
-                if is_date_dir(name) {
-                    dates.insert(name.to_owned());
-                    break;
-                }
+            if let Some(name) = ancestor.file_name().and_then(|n| n.to_str())
+                && is_date_dir(name)
+            {
+                dates.insert(name.to_owned());
+                break;
             }
         }
     }
@@ -669,20 +669,20 @@ pub async fn field_values(
     // Check cache.
     {
         let cache = state.query.field_values_cache.lock().await;
-        if let Some(cached) = cache.get(&field) {
-            if cached.cached_at.elapsed().as_secs() < cache_ttl {
-                tracing::info!(
-                    event_type = "field_values_cache_hit",
-                    user = %verified.name,
-                    field = %field,
-                    "field values served from cache"
-                );
-                return Ok(Json(FieldValuesResponse {
-                    field: field.clone(),
-                    values: cached.values.clone(),
-                    cached: true,
-                }));
-            }
+        if let Some(cached) = cache.get(&field)
+            && cached.cached_at.elapsed().as_secs() < cache_ttl
+        {
+            tracing::info!(
+                event_type = "field_values_cache_hit",
+                user = %verified.name,
+                field = %field,
+                "field values served from cache"
+            );
+            return Ok(Json(FieldValuesResponse {
+                field: field.clone(),
+                values: cached.values.clone(),
+                cached: true,
+            }));
         }
     }
 

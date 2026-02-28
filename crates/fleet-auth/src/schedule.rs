@@ -75,13 +75,13 @@ pub fn parse_interval(s: &str) -> Result<u64, AuthError> {
 
 /// Format seconds into a human-readable duration string (e.g. "5m", "1h", "24h").
 pub fn format_interval(secs: u64) -> String {
-    if secs % 604_800 == 0 {
+    if secs.is_multiple_of(604_800) {
         format!("{}w", secs / 604_800)
-    } else if secs % 86400 == 0 {
+    } else if secs.is_multiple_of(86400) {
         format!("{}d", secs / 86400)
-    } else if secs % 3600 == 0 {
+    } else if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")

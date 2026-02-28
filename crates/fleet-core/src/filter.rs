@@ -133,10 +133,10 @@ impl CompiledFilter {
         now: chrono::DateTime<chrono::Utc>,
     ) -> bool {
         // Check time filter first (global, not per-group).
-        if let Some(tf) = &self.time_filter {
-            if !matches_time_filter_at(event, tf, now) {
-                return false;
-            }
+        if let Some(tf) = &self.time_filter
+            && !matches_time_filter_at(event, tf, now)
+        {
+            return false;
         }
 
         // Empty groups → match everything.

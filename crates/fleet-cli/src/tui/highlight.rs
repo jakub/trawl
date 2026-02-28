@@ -141,10 +141,10 @@ impl Highlighter {
                         break;
                     }
                     // Handle escaped chars in regex
-                    if c == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            regex.push(escaped);
-                        }
+                    if c == '\\'
+                        && let Some(escaped) = chars.next()
+                    {
+                        regex.push(escaped);
                     }
                 }
                 if closed {
@@ -169,10 +169,10 @@ impl Highlighter {
                         break;
                     }
                     // Handle escaped quotes
-                    if c == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            string.push(escaped);
-                        }
+                    if c == '\\'
+                        && let Some(escaped) = chars.next()
+                    {
+                        string.push(escaped);
                     }
                 }
                 tokens.push((TokenType::String, string));
@@ -186,12 +186,12 @@ impl Highlighter {
                     current.clear();
                 }
                 let mut op = std::string::String::from(':');
-                if let Some(&next) = chars.peek() {
-                    if next == '>' || next == '<' || next == '=' || next == '!' {
+                if let Some(&next) = chars.peek()
+                    && (next == '>' || next == '<' || next == '=' || next == '!')
+                {
+                    op.push(chars.next().unwrap());
+                    if chars.peek() == Some(&'=') {
                         op.push(chars.next().unwrap());
-                        if chars.peek() == Some(&'=') {
-                            op.push(chars.next().unwrap());
-                        }
                     }
                 }
                 tokens.push((TokenType::Operator, op));

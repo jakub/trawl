@@ -105,18 +105,18 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
     };
 
     // Fast path: check cache before expensive argon2id verification.
-    if let Some(ref cache) = auth_cache {
-        if let Some(verified) = cache.get(raw_token) {
-            tracing::info!(
-                event_type = "auth_cache_hit",
-                user = %verified.name,
-                path = %path,
-                "authenticated (cached)"
-            );
-            let mut request = request;
-            request.extensions_mut().insert(verified);
-            return Ok(next.run(request).await);
-        }
+    if let Some(ref cache) = auth_cache
+        && let Some(verified) = cache.get(raw_token)
+    {
+        tracing::info!(
+            event_type = "auth_cache_hit",
+            user = %verified.name,
+            path = %path,
+            "authenticated (cached)"
+        );
+        let mut request = request;
+        request.extensions_mut().insert(verified);
+        return Ok(next.run(request).await);
     }
 
     let token = raw_token.to_owned();

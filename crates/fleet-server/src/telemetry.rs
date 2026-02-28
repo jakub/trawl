@@ -169,25 +169,25 @@ impl WalLayerInner {
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
         } else {
             // Publish to event bus for SSE streaming / hot buffer.
-            if let Some(bus) = self.bus.get() {
-                if !maps.is_empty() {
-                    use crate::bus::{EventBus, IngestBatch};
-                    let batch = Arc::new(IngestBatch {
-                        batch_id: format!(
-                            "fleetd_telemetry_{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis()
-                        )
-                        .into(),
-                        service: "fleetd".into(),
-                        events: maps,
-                        byte_size: data.len(),
-                        draining: std::sync::atomic::AtomicBool::new(false),
-                    });
-                    let _ = bus.publish(batch);
-                }
+            if let Some(bus) = self.bus.get()
+                && !maps.is_empty()
+            {
+                use crate::bus::{EventBus, IngestBatch};
+                let batch = Arc::new(IngestBatch {
+                    batch_id: format!(
+                        "fleetd_telemetry_{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                    )
+                    .into(),
+                    service: "fleetd".into(),
+                    events: maps,
+                    byte_size: data.len(),
+                    draining: std::sync::atomic::AtomicBool::new(false),
+                });
+                let _ = bus.publish(batch);
             }
 
             // Report any previously dropped bytes. Safe from recursion:

@@ -412,19 +412,19 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             regex,
             source_field,
         } => {
-            if let Some(Value::String(text)) = event.get(source_field) {
-                if let Some(caps) = regex.captures(text) {
-                    let names: Vec<_> = regex
-                        .capture_names()
-                        .flatten()
-                        .filter_map(|name| {
-                            caps.name(name)
-                                .map(|m| (name.to_string(), m.as_str().to_string()))
-                        })
-                        .collect();
-                    for (name, value) in names {
-                        event.insert(name, Value::String(value));
-                    }
+            if let Some(Value::String(text)) = event.get(source_field)
+                && let Some(caps) = regex.captures(text)
+            {
+                let names: Vec<_> = regex
+                    .capture_names()
+                    .flatten()
+                    .filter_map(|name| {
+                        caps.name(name)
+                            .map(|m| (name.to_string(), m.as_str().to_string()))
+                    })
+                    .collect();
+                for (name, value) in names {
+                    event.insert(name, Value::String(value));
                 }
             }
             StageResult::Pass
@@ -491,10 +491,10 @@ pub fn coerce_kv_value(s: String) -> Value {
     if let Ok(i) = s.parse::<i64>() {
         return serde_json::Number::from(i).into();
     }
-    if let Ok(f) = s.parse::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(f) {
-            return Value::Number(n);
-        }
+    if let Ok(f) = s.parse::<f64>()
+        && let Some(n) = serde_json::Number::from_f64(f)
+    {
+        return Value::Number(n);
     }
     match s.as_str() {
         "true" => Value::Bool(true),
@@ -1023,10 +1023,10 @@ fn make_group_key(group_by: &[String], event: &Map<String, Value>) -> GroupKey {
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
 fn event_time_bucket(event: &Map<String, Value>, span_secs: u64) -> i64 {
     // Try to parse timestamp field as RFC3339
-    if let Some(Value::String(ts)) = event.get("timestamp") {
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-            return dt.timestamp() / span_secs as i64;
-        }
+    if let Some(Value::String(ts)) = event.get("timestamp")
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
+    {
+        return dt.timestamp() / span_secs as i64;
     }
     // Fallback: use current time
     chrono::Utc::now().timestamp() / span_secs as i64
@@ -1043,85 +1043,82 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
     match state {
         AccState::Count(n) => *n += 1,
         AccState::CountField { non_null } => {
-            if let Some(field) = &acc.field {
-                if event.get(field).is_some_and(|v| !v.is_null()) {
-                    *non_null += 1;
-                }
+            if let Some(field) = &acc.field
+                && event.get(field).is_some_and(|v| !v.is_null())
+            {
+                *non_null += 1;
             }
         }
         AccState::Sum(total) => {
-            if let Some(field) = &acc.field {
-                if let Some(v) = extract_f64(event, field) {
-                    *total += v;
-                }
+            if let Some(field) = &acc.field
+                && let Some(v) = extract_f64(event, field)
+            {
+                *total += v;
             }
         }
         AccState::Avg { sum, count } => {
-            if let Some(field) = &acc.field {
-                if let Some(v) = extract_f64(event, field) {
-                    *sum += v;
-                    *count += 1;
-                }
+            if let Some(field) = &acc.field
+                && let Some(v) = extract_f64(event, field)
+            {
+                *sum += v;
+                *count += 1;
             }
         }
         AccState::Min(current) => {
-            if let Some(field) = &acc.field {
-                if let Some(v) = extract_f64(event, field) {
-                    *current = Some(current.map_or(v, |c| c.min(v)));
-                }
+            if let Some(field) = &acc.field
+                && let Some(v) = extract_f64(event, field)
+            {
+                *current = Some(current.map_or(v, |c| c.min(v)));
             }
         }
         AccState::Max(current) => {
-            if let Some(field) = &acc.field {
-                if let Some(v) = extract_f64(event, field) {
-                    *current = Some(current.map_or(v, |c| c.max(v)));
-                }
+            if let Some(field) = &acc.field
+                && let Some(v) = extract_f64(event, field)
+            {
+                *current = Some(current.map_or(v, |c| c.max(v)));
             }
         }
         AccState::Dc(set) | AccState::Values(set) => {
             feed_acc_string_set(acc, set, event);
         }
         AccState::First(stored) => {
-            if stored.is_none() {
-                if let Some(field) = &acc.field {
-                    if let Some(v) = event.get(field) {
-                        *stored = Some(v.clone());
-                    }
-                }
+            if stored.is_none()
+                && let Some(field) = &acc.field
+                && let Some(v) = event.get(field)
+            {
+                *stored = Some(v.clone());
             }
         }
         AccState::Last(stored) => {
-            if let Some(field) = &acc.field {
-                if let Some(v) = event.get(field) {
-                    *stored = Some(v.clone());
-                }
+            if let Some(field) = &acc.field
+                && let Some(v) = event.get(field)
+            {
+                *stored = Some(v.clone());
             }
         }
         AccState::Median(values) | AccState::Percentile { values, .. } => {
             feed_acc_f64_vec(acc, values, event, MAX_EXACT_VALUES);
         }
         AccState::Stddev(welford) => {
-            if let Some(field) = &acc.field {
-                if let Some(v) = extract_f64(event, field) {
-                    welford.update(v);
-                }
+            if let Some(field) = &acc.field
+                && let Some(v) = extract_f64(event, field)
+            {
+                welford.update(v);
             }
         }
     }
 }
 
 fn feed_acc_string_set(acc: &CompiledAcc, set: &mut HashSet<String>, event: &Map<String, Value>) {
-    if let Some(field) = &acc.field {
-        if set.len() < MAX_DISTINCT {
-            if let Some(v) = event.get(field) {
-                if !v.is_null() {
-                    set.insert(match v {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    });
-                }
-            }
-        }
+    if let Some(field) = &acc.field
+        && set.len() < MAX_DISTINCT
+        && let Some(v) = event.get(field)
+        && !v.is_null()
+    {
+        set.insert(match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
     }
 }
 
@@ -1131,12 +1128,11 @@ fn feed_acc_f64_vec(
     event: &Map<String, Value>,
     max: usize,
 ) {
-    if let Some(field) = &acc.field {
-        if values.len() < max {
-            if let Some(v) = extract_f64(event, field) {
-                values.push(v);
-            }
-        }
+    if let Some(field) = &acc.field
+        && values.len() < max
+        && let Some(v) = extract_f64(event, field)
+    {
+        values.push(v);
     }
 }
 
@@ -1174,7 +1170,7 @@ fn snapshot_median(values: &[f64]) -> Value {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         json_f64(f64::midpoint(sorted[mid - 1], sorted[mid]))
     } else {
         json_f64(sorted[mid])

@@ -127,10 +127,8 @@ pub async fn compact_once(
     // After WAL compaction, consolidate older days' hourly files into
     // per-service daily files. This dramatically reduces file count for
     // long lookback queries.
-    if daily_rollup {
-        if let Err(e) = rollup_once(data_dir).await {
-            tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
-        }
+    if daily_rollup && let Err(e) = rollup_once(data_dir).await {
+        tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
     }
 
     Ok(())
@@ -262,10 +260,10 @@ fn collect_service_files(hour_dirs: &[PathBuf]) -> HashMap<String, Vec<PathBuf>>
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "parquet") {
-                if let Some(service) = path.file_stem().and_then(|s| s.to_str()) {
-                    groups.entry(service.to_owned()).or_default().push(path);
-                }
+            if path.extension().is_some_and(|ext| ext == "parquet")
+                && let Some(service) = path.file_stem().and_then(|s| s.to_str())
+            {
+                groups.entry(service.to_owned()).or_default().push(path);
             }
         }
     }
@@ -648,15 +646,13 @@ fn cleanup_tmp_in_dir(dir: &Path, max_age: Duration) {
 
 /// Remove a single `.tmp` file if older than `max_age`.
 fn remove_stale_tmp(path: &Path, max_age: Duration) {
-    if path.extension().is_some_and(|ext| ext == "tmp") {
-        if let Ok(meta) = std::fs::metadata(path) {
-            if let Ok(mtime) = meta.modified() {
-                if SystemTime::now().duration_since(mtime).unwrap_or_default() > max_age {
-                    let _ = std::fs::remove_file(path);
-                    tracing::debug!(event_type = "tmp_cleanup", path = %path.display(), "removed stale tmp file");
-                }
-            }
-        }
+    if path.extension().is_some_and(|ext| ext == "tmp")
+        && let Ok(meta) = std::fs::metadata(path)
+        && let Ok(mtime) = meta.modified()
+        && SystemTime::now().duration_since(mtime).unwrap_or_default() > max_age
+    {
+        let _ = std::fs::remove_file(path);
+        tracing::debug!(event_type = "tmp_cleanup", path = %path.display(), "removed stale tmp file");
     }
 }
 
@@ -675,13 +671,11 @@ fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Result<Vec<Path
         let entry = entry?;
         let path = entry.path();
 
-        if path.extension().is_some_and(|ext| ext == "ndjson") {
-            let metadata = entry.metadata()?;
-            if let Ok(mtime) = metadata.modified() {
-                if now.duration_since(mtime).unwrap_or_default() > min_age {
-                    files.push(path);
-                }
-            }
+        if path.extension().is_some_and(|ext| ext == "ndjson")
+            && let Ok(mtime) = entry.metadata()?.modified()
+            && now.duration_since(mtime).unwrap_or_default() > min_age
+        {
+            files.push(path);
         }
     }
 

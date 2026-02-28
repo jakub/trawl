@@ -66,22 +66,23 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
             let abs_row = scroll_row + i;
             let styled_line = highlighter.highlight_line(line);
 
-            if let Some(((sel_start_row, sel_start_col), (sel_end_row, sel_end_col))) = selection {
-                if abs_row >= sel_start_row && abs_row <= sel_end_row {
-                    // This line is (partially) selected
-                    let line_len = line.chars().count();
-                    let sel_start = if abs_row == sel_start_row {
-                        sel_start_col
-                    } else {
-                        0
-                    };
-                    let sel_end = if abs_row == sel_end_row {
-                        sel_end_col
-                    } else {
-                        line_len
-                    };
-                    return apply_selection_style(styled_line, sel_start, sel_end);
-                }
+            if let Some(((sel_start_row, sel_start_col), (sel_end_row, sel_end_col))) = selection
+                && abs_row >= sel_start_row
+                && abs_row <= sel_end_row
+            {
+                // This line is (partially) selected
+                let line_len = line.chars().count();
+                let sel_start = if abs_row == sel_start_row {
+                    sel_start_col
+                } else {
+                    0
+                };
+                let sel_end = if abs_row == sel_end_row {
+                    sel_end_col
+                } else {
+                    line_len
+                };
+                return apply_selection_style(styled_line, sel_start, sel_end);
             }
 
             styled_line
