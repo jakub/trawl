@@ -156,8 +156,8 @@ the fleet server exposes a REST API. all routes under `/api/v1` except `/health`
 
 ## docs
 
-- `docs/overview.md` — project overview and architecture thesis
-- `docs/initial_plan.md` — 15-phase implementation plan with detailed per-phase breakdowns
+- `docs/legacy/legacy_overview.md` — original project overview and architecture thesis
+- `docs/legacy/legacy_initial_plan.md` — original 15-phase implementation plan
 - `docs/architecture-review.md` — comparative analysis vs splunk/datadog, data flow diagram, scaling roadmap
 - `docs/1.0-readiness.md` — current feature inventory and gaps for a 1.0 release
 
