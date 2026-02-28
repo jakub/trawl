@@ -194,12 +194,12 @@ fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
         "::1".to_owned(),
     ];
 
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(subject_alt_names)
             .map_err(|e| TlsError::Generation(e.to_string()))?;
 
     let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
+    let key_pem = signing_key.serialize_pem();
 
     // Persist so the cert is stable across daemon restarts.
     fs::create_dir_all(&tls_dir).map_err(TlsError::Write)?;
@@ -314,11 +314,11 @@ mod tests {
         // Generate by calling the internal function indirectly — use
         // build_server_config with no paths, but override HOME.
         let san = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(san).unwrap();
 
         let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
+        let key_pem = signing_key.serialize_pem();
 
         fs::write(&cert_path, &cert_pem).unwrap();
         fs::write(&key_path, &key_pem).unwrap();

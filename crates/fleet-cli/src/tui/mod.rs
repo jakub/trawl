@@ -2572,7 +2572,10 @@ fn apply_tz_to_event(event: &mut serde_json::Map<String, serde_json::Value>, utc
 fn run_event_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    CliError: From<B::Error>,
+{
     let mut iteration = 0u64;
     loop {
         iteration += 1;

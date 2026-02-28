@@ -89,10 +89,11 @@ fn generate_test_cert(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let key_path = dir.join("key.pem");
 
     let san = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
-    let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(san).unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(san).unwrap();
 
     std::fs::write(&cert_path, cert.pem()).unwrap();
-    std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
 
     (cert_path, key_path)
 }
