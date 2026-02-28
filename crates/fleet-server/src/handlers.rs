@@ -246,14 +246,17 @@ pub async fn query(
 /// `GET /metrics` — prometheus scrape endpoint (unauthenticated).
 ///
 /// Collects process metrics and fleet gauges on each scrape, then
-/// renders the prometheus text exposition format.
-#[allow(clippy::unused_async)]
+/// renders the prometheus text exposition format. The gauge collection
+/// (which may walk the filesystem on cache miss) runs in `spawn_blocking`
+/// to avoid stalling the async executor.
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    metrics_process::Collector::default().collect();
-    crate::metrics::collect_gauges(
-        state.query.hot_buffer.as_ref(),
-        state.query.pool.fallback_glob(),
-    );
+    let hot_buffer = state.query.hot_buffer.clone();
+    let fallback_glob = state.query.pool.fallback_glob().to_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        metrics_process::Collector::default().collect();
+        crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob);
+    })
+    .await;
     let body = state.metrics_handle.render();
     (
         [(

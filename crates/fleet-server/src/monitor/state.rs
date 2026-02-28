@@ -117,6 +117,9 @@ pub struct MonitorState {
     /// Health check runs on a slower cadence (every N ticks).
     health_counter: u32,
     last_healthy: bool,
+    /// Schedule count cache — sqlite query runs every 30 ticks (~30s at 1s tick).
+    schedule_cache_counter: u32,
+    cached_schedule_count: usize,
 }
 
 impl MonitorState {
@@ -139,6 +142,8 @@ impl MonitorState {
             rate_tracker: RateTracker::default(),
             health_counter: 0,
             last_healthy: true,
+            schedule_cache_counter: 0,
+            cached_schedule_count: 0,
         }
     }
 
@@ -182,17 +187,22 @@ impl MonitorState {
         let sse_available = self.state.query.sse_semaphore.available_permits();
         let sse_active = self.sse_max.saturating_sub(sse_available);
 
-        // Scheduler: count enabled schedules (slower operation, cached in snapshot).
-        let scheduler_schedules = if self.scheduler_enabled {
-            self.state
-                .auth
-                .schedule
-                .lock()
-                .list_enabled_schedules()
-                .map_or(0, |v| v.len())
-        } else {
-            0
-        };
+        // Scheduler: count enabled schedules. Only query sqlite every 30 ticks
+        // (~30s at 1s tick rate) — schedule count changes very rarely.
+        if self.scheduler_enabled {
+            self.schedule_cache_counter += 1;
+            if self.schedule_cache_counter >= 30 {
+                self.schedule_cache_counter = 0;
+                self.cached_schedule_count = self
+                    .state
+                    .auth
+                    .schedule
+                    .lock()
+                    .list_enabled_schedules()
+                    .map_or(0, |v| v.len());
+            }
+        }
+        let scheduler_schedules = self.cached_schedule_count;
 
         // Health check on slower cadence (every 30 ticks).
         self.health_counter += 1;
