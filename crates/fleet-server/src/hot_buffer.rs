@@ -177,10 +177,10 @@ impl HotBuffer {
         // concurrent cache misses (only one thread builds).
         let mut cache = self.snapshot_cache.lock();
 
-        if let Some((cached_gen, ref file)) = *cache {
-            if cached_gen == current_gen {
-                return Some(Arc::clone(file));
-            }
+        if let Some((cached_gen, ref file)) = *cache
+            && cached_gen == current_gen
+        {
+            return Some(Arc::clone(file));
         }
 
         // Cache miss — build under lock so concurrent queries wait.
@@ -256,6 +256,11 @@ impl HotBuffer {
     /// Number of batches in the buffer.
     pub fn batch_count(&self) -> usize {
         self.batches.read().len()
+    }
+
+    /// Buffer configuration (max events, max bytes).
+    pub fn config(&self) -> &HotBufferConfig {
+        &self.config
     }
 }
 

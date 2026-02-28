@@ -100,6 +100,11 @@ pub struct ServerConfig {
     /// Per-role rate limiting (requests per minute). 0 = disabled.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+
+    /// Monitor dashboard refresh interval in milliseconds (default: 1000).
+    /// Only used when fleetd runs interactively with a TTY.
+    #[serde(default = "default_monitor_refresh_ms")]
+    pub monitor_refresh_ms: u64,
 }
 
 /// Per-role rate limits in requests per minute.
@@ -640,6 +645,13 @@ fn default_max_query_history() -> usize {
 
 fn default_max_sse_connections() -> usize {
     DEFAULT_MAX_SSE_CONNECTIONS
+}
+
+/// Default monitor refresh interval (1 second).
+const DEFAULT_MONITOR_REFRESH_MS: u64 = 1000;
+
+fn default_monitor_refresh_ms() -> u64 {
+    DEFAULT_MONITOR_REFRESH_MS
 }
 
 fn default_rate_admin() -> u32 {

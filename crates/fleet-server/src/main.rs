@@ -24,6 +24,11 @@ struct Cli {
     /// Path to ndjson query debug log. Overrides config `server.query_log`.
     #[arg(long, env = "FLEET_QUERY_LOG")]
     query_log: Option<std::path::PathBuf>,
+
+    /// Disable the live monitor dashboard (use traditional log output).
+    /// Useful for systemd, tmux logging, or non-interactive environments.
+    #[arg(long)]
+    no_monitor: bool,
 }
 
 #[tokio::main]
@@ -33,7 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_path(&cli.config);
     let config = Config::from_file(&config_path)?;
 
-    let telemetry = init_tracing(&config)?;
+    // Auto-detect TTY: monitor when interactive, log tail when piped.
+    let monitor_active = std::io::IsTerminal::is_terminal(&std::io::stdout()) && !cli.no_monitor;
+
+    let telemetry = init_tracing(&config, monitor_active)?;
 
     tracing::info!(event_type = "lifecycle", config = %config_path.display(), "configuration loaded");
 
@@ -51,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         git_date = fleet_core::version::GIT_DATE,
         rustc = fleet_core::version::RUSTC_VERSION,
         target = fleet_core::version::TARGET_TRIPLE,
+        monitor = monitor_active,
         "starting fleetd"
     );
 
@@ -158,7 +167,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    http::serve(state, &http_config, &config.server).await?;
+    if monitor_active {
+        // Monitor mode: spawn HTTP server in background, run TUI on main.
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+
+        let http_state = state.clone();
+        let http_shutdown = Arc::clone(&shutdown);
+        let server_config = config.server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = http::serve(
+                http_state,
+                &http_config,
+                &server_config,
+                Some(http_shutdown),
+            )
+            .await
+            {
+                tracing::error!(event_type = "lifecycle", error = %e, "HTTP server error");
+            }
+        });
+
+        // Run monitor on the main task — blocks until ctrl-c.
+        if let Err(e) = fleet_server::monitor::run(
+            state,
+            &config.server.http_addr,
+            config.server.max_sse_connections,
+            config.scheduler.enabled,
+            config.server.monitor_refresh_ms,
+            shutdown,
+        )
+        .await
+        {
+            // Terminal restore happens via TerminalGuard drop, so just log.
+            tracing::error!(event_type = "lifecycle", error = %e, "monitor error");
+        }
+    } else {
+        // Traditional mode: HTTP server runs on main, handles its own shutdown.
+        http::serve(state, &http_config, &config.server, None).await?;
+    }
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
     // then stats emitter, then scheduler (stop issuing new queries), then
@@ -264,13 +310,16 @@ fn spawn_ingest_pipeline(
 ///
 /// When telemetry is disabled and `log_file` is configured, falls back
 /// to the legacy JSON file layer.
+///
+/// When `monitor_active` is true, the stdout `fmt::layer()` is omitted
+/// to avoid corrupting the TUI with interleaved log output.
 fn init_tracing(
     config: &Config,
+    monitor_active: bool,
 ) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
     let make_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| "fleet_server=info".into());
 
-    let stdout_layer = fmt::layer().with_filter(make_filter());
     let use_telemetry = config.internal_telemetry_enabled();
 
     if use_telemetry {
@@ -278,31 +327,59 @@ fn init_tracing(
         let handle = WalHandle::new();
         let wal_layer = WalLayer::new(handle.clone());
         let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>
-        tracing_subscriber::registry()
-            .with(stdout_layer)
-            .with(wal_layer.with_filter(make_filter()))
-            .init();
+
+        if monitor_active {
+            // Skip stdout layer — TUI owns the terminal.
+            tracing_subscriber::registry()
+                .with(wal_layer.with_filter(make_filter()))
+                .init();
+        } else {
+            let stdout_layer = fmt::layer().with_filter(make_filter());
+            tracing_subscriber::registry()
+                .with(stdout_layer)
+                .with(wal_layer.with_filter(make_filter()))
+                .init();
+        }
         Ok(Some((handle, flush_layer)))
     } else if let Some(log_path) = &config.server.log_file {
         // Legacy: JSON file logger.
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)?;
-        let file_layer = fmt::layer()
-            .json()
-            .with_ansi(false)
-            .with_writer(file)
-            .with_filter(make_filter());
-        tracing_subscriber::registry()
-            .with(stdout_layer)
-            .with(file_layer)
-            .init();
+        let open_file = || -> Result<std::fs::File, Box<dyn std::error::Error>> {
+            Ok(std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)?)
+        };
+
+        if monitor_active {
+            let file_layer = fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_writer(open_file()?)
+                .with_filter(make_filter());
+            tracing_subscriber::registry().with(file_layer).init();
+        } else {
+            let stdout_layer = fmt::layer().with_filter(make_filter());
+            let file_layer = fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_writer(open_file()?)
+                .with_filter(make_filter());
+            tracing_subscriber::registry()
+                .with(stdout_layer)
+                .with(file_layer)
+                .init();
+        }
+        Ok(None)
+    } else if monitor_active {
+        // Monitor active, no telemetry, no file — still need a subscriber
+        // but skip stdout to avoid TUI corruption.
+        tracing_subscriber::registry().init();
         Ok(None)
     } else {
+        let stdout_layer = fmt::layer().with_filter(make_filter());
         tracing_subscriber::registry().with(stdout_layer).init();
         Ok(None)
     }

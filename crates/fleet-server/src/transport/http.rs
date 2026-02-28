@@ -219,6 +219,7 @@ pub async fn serve(
     state: AppState,
     http: &HttpConfig,
     config: &ServerConfig,
+    external_shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<(), crate::error::ServerError> {
     let drain_secs = http.shutdown_drain_secs;
     let addr = &config.http_addr;
@@ -253,27 +254,32 @@ pub async fn serve(
 
     // Spawn cert file watcher if reload is enabled and cert paths are configured.
     let reload_interval = config.tls_reload_interval_secs;
-    if reload_interval > 0 {
-        if let (Some(cert), Some(key)) = (&config.tls_cert_path, &config.tls_key_path) {
-            let cert = cert.clone();
-            let key = key.clone();
-            tokio::spawn(tls::cert_reload_task(
-                cert,
-                key,
-                Duration::from_secs(reload_interval),
-                tls_tx,
-            ));
-        }
+    if reload_interval > 0
+        && let (Some(cert), Some(key)) = (&config.tls_cert_path, &config.tls_key_path)
+    {
+        let cert = cert.clone();
+        let key = key.clone();
+        tokio::spawn(tls::cert_reload_task(
+            cert,
+            key,
+            Duration::from_secs(reload_interval),
+            tls_tx,
+        ));
     }
 
-    // Shutdown coordination: Notify fires on SIGINT/SIGTERM.
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let n_signal = Arc::clone(&notify);
-
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        n_signal.notify_waiters();
-    });
+    // Shutdown coordination: use external Notify (from monitor) or spawn
+    // our own signal listener for the non-monitor path.
+    let notify = if let Some(ext) = external_shutdown {
+        ext
+    } else {
+        let n = Arc::new(tokio::sync::Notify::new());
+        let n_signal = Arc::clone(&n);
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            n_signal.notify_waiters();
+        });
+        n
+    };
 
     // Track spawned connection tasks for graceful drain.
     let mut connections = JoinSet::new();

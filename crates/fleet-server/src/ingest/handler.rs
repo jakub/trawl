@@ -76,12 +76,12 @@ fn validate_event(
 
     validate_service_name_str(svc)?;
 
-    if let Some(expected) = batch_service {
-        if svc != expected {
-            return Err(format!(
-                "service mismatch: expected '{expected}', got '{svc}'"
-            ));
-        }
+    if let Some(expected) = batch_service
+        && svc != expected
+    {
+        return Err(format!(
+            "service mismatch: expected '{expected}', got '{svc}'"
+        ));
     }
 
     Ok(svc.to_owned())
@@ -234,8 +234,16 @@ fn finalize_ingest(
     let rejected = parsed.errors.len();
 
     metrics::counter!(crate::metrics::INGEST_EVENTS_TOTAL).increment(accepted as u64);
+    state
+        .ingest
+        .total_events
+        .fetch_add(accepted as u64, std::sync::atomic::Ordering::Relaxed);
     if rejected > 0 {
         metrics::counter!(crate::metrics::INGEST_EVENTS_REJECTED_TOTAL).increment(rejected as u64);
+        state
+            .ingest
+            .total_rejected
+            .fetch_add(rejected as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Publish to event bus (best-effort — WAL is the durability guarantee).

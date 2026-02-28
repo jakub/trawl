@@ -51,12 +51,15 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+crossterm = { workspace = true }
 hostname = { workspace = true }
+ratatui = { workspace = true }
 x509-parser = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
 fleet-client = { workspace = true }
+insta = { workspace = true }
 reqwest = { workspace = true }
 
 [lints]

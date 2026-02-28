@@ -90,6 +90,10 @@ pub struct IngestState {
     pub wal_writer: Option<Arc<WalWriter>>,
     /// Event bus for real-time fanout to subscribers (None if ingest is disabled).
     pub event_bus: Option<Arc<LocalEventBus>>,
+    /// Total events ingested since startup (for monitor dashboard).
+    pub total_events: Arc<AtomicU64>,
+    /// Total events rejected since startup (for monitor dashboard).
+    pub total_rejected: Arc<AtomicU64>,
 }
 
 /// HTTP transport config consumed at router/server construction time.
@@ -201,6 +205,8 @@ impl AppState {
             ingest: IngestState {
                 wal_writer,
                 event_bus,
+                total_events: Arc::new(AtomicU64::new(0)),
+                total_rejected: Arc::new(AtomicU64::new(0)),
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),

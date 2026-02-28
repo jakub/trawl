@@ -143,6 +143,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
             max_sse_connections: 32,
             query_log: None,
             rate_limit,
+            monitor_refresh_ms: 1000,
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig {
@@ -166,7 +167,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
         AppState::from_config(&config, test_metrics_handle()).expect("failed to create app state");
     let server_config = config.server.clone();
     tokio::spawn(async move {
-        http::serve(state, &http_config, &server_config)
+        http::serve(state, &http_config, &server_config, None)
             .await
             .unwrap();
     });
@@ -222,6 +223,7 @@ async fn setup() -> TestServer {
             max_sse_connections: 32,
             query_log: None,
             rate_limit: RateLimitConfig::default(),
+            monitor_refresh_ms: 1000,
         },
         data: DataConfig { path: data_glob },
         auth: AuthConfig {
@@ -247,7 +249,7 @@ async fn setup() -> TestServer {
     // Spawn the HTTPS server in a background task.
     let server_config = config.server.clone();
     tokio::spawn(async move {
-        http::serve(state, &http_config, &server_config)
+        http::serve(state, &http_config, &server_config, None)
             .await
             .unwrap();
     });
