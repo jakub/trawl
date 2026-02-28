@@ -182,12 +182,12 @@ fn validate_event(
     }
     if !svc
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b' ')
     {
         return Err((
             format!(
                 "service '{svc}' contains invalid characters \
-                 (only alphanumeric, dash, underscore, dot allowed)"
+                 (only alphanumeric, dash, underscore, dot, space allowed)"
             ),
             RejectReason::InvalidChars,
         ));
@@ -673,7 +673,14 @@ mod tests {
     #[test]
     fn parse_accepts_valid_service_names() {
         let defaults = test_defaults();
-        for name in ["nginx", "my-app", "app_v2", "host.name.prod", "A1-B2_c3.d"] {
+        for name in [
+            "nginx",
+            "my-app",
+            "app_v2",
+            "host.name.prod",
+            "A1-B2_c3.d",
+            "Activity Monitor",
+        ] {
             let data = format!(r#"{{"service":"{name}","message":"ok"}}"#);
             let parsed = parse_events(data.as_bytes(), &defaults).unwrap();
             assert!(parsed.batches.contains_key(name));
