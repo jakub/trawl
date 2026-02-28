@@ -9,9 +9,6 @@ targets = [
 all-features = true
 
 [advisories]
-# RUSTSEC-2026-0009: time 0.3.45 stack exhaustion via RFC 2822 parsing.
-# fix (0.3.47) requires rust 1.88, our MSRV is 1.85. revisit on next MSRV bump.
-ignore = ["RUSTSEC-2026-0009"]
 yanked = "deny"
 
 [licenses]

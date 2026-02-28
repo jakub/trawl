@@ -36,7 +36,7 @@ crates/
 
 ## tooling
 
-- **edition 2024**, resolver 3, rust-version 1.85 MSRV
+- **edition 2024**, resolver 3, rust-version 1.88 MSRV
 - **clippy pedantic** + `unsafe_code = "forbid"` at workspace level
 - **lefthook** pre-commit: `cargo fmt --check` + `cargo clippy -- -D warnings`
 - **bacon** for continuous clippy-on-save (`bacon` or `bacon test`)
