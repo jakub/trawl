@@ -62,5 +62,22 @@ fleet-client = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true }
 
+[package.metadata.deb]
+name = "fleetd"
+maintainer = "Jakub Burgis <mail@jakub.me>"
+copyright = "2025-2026, Jakub Burgis"
+depends = "$auto"
+section = "net"
+priority = "optional"
+conf-files = ["/etc/fleet/fleetd.toml", "/etc/default/fleetd"]
+systemd-units = { unit-name = "fleetd", enable = true, start = true }
+assets = [
+    ["target/release/fleetd", "usr/bin/", "755"],
+    ["target/release/fleet-admin", "usr/bin/", "755"],
+    ["debian/fleetd.toml", "etc/fleet/", "644"],
+    ["debian/fleetd.default", "etc/default/fleetd", "644"],
+    ["debian/fleet.sysusers.conf", "usr/lib/sysusers.d/fleet.conf", "644"],
+]
+
 [lints]
 workspace = true

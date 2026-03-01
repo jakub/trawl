@@ -36,5 +36,15 @@ unicode-width = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 
+[package.metadata.deb]
+maintainer = "Jakub Burgis <mail@jakub.me>"
+copyright = "2025-2026, Jakub Burgis"
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/fleet", "usr/bin/", "755"],
+]
+
 [lints]
 workspace = true

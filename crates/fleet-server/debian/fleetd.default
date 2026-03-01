@@ -1,0 +1,4 @@
+# Environment overrides for fleetd
+# Uncomment and modify as needed.
+
+# RUST_LOG=fleetd=info

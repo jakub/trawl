@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install zig (cross-compile)
+        if: matrix.cross
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild (cross-compile)
+        if: matrix.cross
+        run: cargo install cargo-zigbuild
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build .deb packages
+        run: |
+          cargo deb -p fleet-server --no-build --target ${{ matrix.target }}
+          cargo deb -p fleet-cli --no-build --target ${{ matrix.target }}
+
+      - name: Create tarball
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          staging="fleet-${tag}-${{ matrix.target }}"
+          mkdir -p "${staging}"
+          cp "target/${{ matrix.target }}/release/fleet" "${staging}/"
+          cp "target/${{ matrix.target }}/release/fleetd" "${staging}/"
+          cp "target/${{ matrix.target }}/release/fleet-admin" "${staging}/"
+          tar czf "${staging}.tar.gz" "${staging}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            fleet-*.tar.gz
+            target/${{ matrix.target }}/debian/*.deb
+          if-no-files-found: error
+
+  release:
+    name: github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find dist -type f | sort
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.deb
+
+  publish-apt:
+    name: publish APT repository
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+        continue-on-error: true
+        id: checkout-pages
+
+      - name: Initialize gh-pages branch
+        if: steps.checkout-pages.outcome == 'failure'
+        run: |
+          git init
+          git checkout --orphan gh-pages
+          git commit --allow-empty -m "init: gh-pages branch"
+
+      - name: Download .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: incoming
+          merge-multiple: true
+
+      - name: Import GPG key
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Build APT repository
+        run: |
+          # Collect .deb files into pool
+          mkdir -p apt/pool
+          find incoming -name '*.deb' -exec cp {} apt/pool/ \;
+          ls -la apt/pool/
+
+          # Generate per-arch Packages indices
+          for arch in amd64 arm64; do
+            dir="apt/dists/stable/main/binary-${arch}"
+            mkdir -p "${dir}"
+
+            # Filter debs for this arch
+            dpkg-scanpackages --arch "${arch}" apt/pool /dev/null > "${dir}/Packages"
+            gzip -9c "${dir}/Packages" > "${dir}/Packages.gz"
+          done
+
+          # Generate Release file
+          cd apt/dists/stable
+          cat > Release <<-EOF
+          Origin: Fleet
+          Label: Fleet
+          Suite: stable
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Date: $(date -Ru)
+          EOF
+
+          # Strip leading whitespace from heredoc
+          sed -i 's/^[[:space:]]*//' Release
+
+          # Add hashes
+          apt-ftparchive release . >> Release
+
+          # Sign
+          gpg_key="$(gpg --list-secret-keys --keyid-format long 2>/dev/null | grep '^sec' | head -1 | awk '{print $2}' | cut -d/ -f2)"
+          gpg --batch --yes --default-key "${gpg_key}" --detach-sign --armor -o Release.gpg Release
+          gpg --batch --yes --default-key "${gpg_key}" --clearsign -o InRelease Release
+
+          cd ../../..
+
+          # Export public key
+          gpg --batch --yes --armor --export "${gpg_key}" > gpg.key
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "apt: update repository for ${GITHUB_REF_NAME}"
+          git push origin gh-pages

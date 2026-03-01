@@ -1,0 +1,116 @@
+# fleetd configuration — installed by the fleetd .deb package
+#
+# All fields shown with their defaults. Uncomment and modify as needed.
+# Byte sizes accept human-readable suffixes: K, M, G, T (binary/1024-based).
+
+[server]
+# Address to bind the HTTPS listener.
+http_addr = "0.0.0.0:5514"
+
+# Query execution timeout (seconds).
+# timeout_secs = 30
+
+# Maximum concurrent queries (bounds the DuckDB executor pool).
+# Defaults to the number of available CPUs.
+# max_concurrent_queries = 4
+
+# Maximum rows a single query can return before being rejected.
+# max_result_rows = 100000
+
+# Maximum rows allowed in CSV export responses.
+# max_export_rows = 1000000
+
+# Maximum request body size (default: 128K).
+# max_request_body_bytes = "128K"
+
+# Maximum concurrent HTTP requests. Returns 503 when exceeded.
+# max_concurrent_requests = 256
+
+# Graceful shutdown drain timeout (seconds).
+# shutdown_drain_secs = 30
+
+# Maximum concurrent SSE streaming connections. Returns 429 when exceeded.
+# max_sse_connections = 32
+
+# TLS certificate and key (PEM format). If omitted, a self-signed
+# certificate is auto-generated at startup. Both must be set or both omitted.
+# tls_cert_path = "/etc/fleet/cert.pem"
+# tls_key_path = "/etc/fleet/key.pem"
+
+# How often to check cert/key files for changes (seconds). 0 = disabled.
+# tls_reload_interval_secs = 300
+
+# CORS allowed origins. Empty list = no CORS headers.
+# cors_allowed_origins = ["https://fleet.example.com"]
+
+# Schema cache TTL (seconds).
+# schema_cache_ttl_secs = 60
+
+# Maximum completed queries kept in the history ring buffer.
+# max_query_history = 1000
+
+# Per-role rate limits (requests per minute). 0 = disabled.
+# [server.rate_limit]
+# admin = 100
+# analyst = 60
+# reader = 30
+# ingest = 1000
+
+[data]
+# Directory containing parquet files.
+path = "/var/lib/fleet/data"
+
+[auth]
+# Path to the SQLite auth database (API keys and roles).
+db_path = "/var/lib/fleet/auth.db"
+
+# How often to poll the auth database for key changes (seconds).
+# audit_interval_secs = 30
+
+# TTL for the in-memory auth token cache (seconds).
+# auth_cache_ttl_secs = 300
+
+[ingest]
+# Whether the ingest endpoint (POST /api/v1/ingest) is enabled.
+# enabled = true
+
+# Maximum request body size for ingest (default: 16M).
+# max_body_bytes = "16M"
+
+# WAL directory for buffering ingested events before compaction.
+# Defaults to {data.path}/wal/ when omitted.
+# wal_dir = "/var/lib/fleet/data/wal"
+
+# How often the compaction task runs (seconds).
+# compaction_interval_secs = 10
+
+# Write internal server events to the ingest pipeline as service:fleetd.
+# internal_telemetry = true
+
+# Consolidate per-service hourly parquet files into daily files.
+# daily_rollup = true
+
+# Capacity of the in-memory event bus broadcast channel.
+# event_bus_capacity = 4096
+
+# Maximum number of events held in the hot buffer.
+# hot_buffer_max_events = 100000
+
+# Maximum estimated memory usage for the hot buffer (default: 100M).
+# hot_buffer_max_bytes = "100M"
+
+# How often server stats are emitted as telemetry events (seconds).
+# stats_interval_secs = 60
+
+# How often buffered tracing events are flushed to WAL (seconds).
+# telemetry_flush_interval_secs = 1
+
+[retention]
+# Delete date directories older than this many days. 0 = disabled.
+# max_age_days = 90
+
+# Delete oldest data if free disk space drops below this threshold. 0 = disabled.
+# min_free_disk_bytes = "1G"
+
+# How often the retention task runs (seconds).
+# retention_interval_secs = 3600

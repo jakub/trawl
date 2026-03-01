@@ -1,0 +1,42 @@
+[Unit]
+Description=Fleet log collection and search daemon
+Documentation=https://github.com/jakub/fleet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/fleetd --config /etc/fleet/fleetd.toml --no-monitor
+User=fleet
+Group=fleet
+EnvironmentFile=-/etc/default/fleetd
+
+# State & logging
+StateDirectory=fleet
+LogsDirectory=fleet
+WorkingDirectory=/var/lib/fleet
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Sandboxing
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/fleet /etc/fleet
+
+# DuckDB may need JIT — do NOT set MemoryDenyWriteExecute
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
