@@ -1359,170 +1359,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fleet-admin"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "comfy-table",
- "fleet-auth",
- "fleet-core",
- "insta",
- "rcgen",
- "shellexpand",
- "time",
-]
-
-[[package]]
-name = "fleet-api"
-version = "0.1.0"
-dependencies = [
- "fleet-engine",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "fleet-auth"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "base64ct",
- "chrono",
- "insta",
- "rand 0.8.5",
- "rusqlite",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "fleet-cli"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "chrono",
- "clap",
- "comfy-table",
- "crossterm 0.29.0",
- "fleet-client",
- "fleet-core",
- "fleet-engine",
- "futures",
- "insta",
- "ratatui",
- "serde",
- "serde_json",
- "shellexpand",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "toml",
- "tracing",
- "tracing-subscriber",
- "unicode-width",
-]
-
-[[package]]
-name = "fleet-client"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "fleet-api",
- "fleet-engine",
- "futures",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "zeroize",
-]
-
-[[package]]
-name = "fleet-core"
-version = "0.1.0"
-dependencies = [
- "aho-corasick",
- "chrono",
- "chumsky",
- "duckdb",
- "insta",
- "regex",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "fleet-engine"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "duckdb",
- "fleet-core",
- "indexmap",
- "insta",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "fleet-server"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "axum",
- "chrono",
- "clap",
- "crossterm 0.29.0",
- "dashmap",
- "duckdb",
- "flate2",
- "fleet-api",
- "fleet-auth",
- "fleet-client",
- "fleet-core",
- "fleet-engine",
- "fs4",
- "governor",
- "hostname",
- "hyper",
- "hyper-util",
- "indexmap",
- "insta",
- "metrics",
- "metrics-exporter-prometheus",
- "metrics-process",
- "parking_lot",
- "rand 0.8.5",
- "ratatui",
- "rcgen",
- "reqwest 0.13.2",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "shellexpand",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "toml",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "ulid",
- "x509-parser",
- "zstd",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4724,6 +4560,170 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "trawl-admin"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "comfy-table",
+ "insta",
+ "rcgen",
+ "shellexpand",
+ "time",
+ "trawl-auth",
+ "trawl-core",
+]
+
+[[package]]
+name = "trawl-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "trawl-engine",
+]
+
+[[package]]
+name = "trawl-auth"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "base64ct",
+ "chrono",
+ "insta",
+ "rand 0.8.5",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "trawl-cli"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "chrono",
+ "clap",
+ "comfy-table",
+ "crossterm 0.29.0",
+ "futures",
+ "insta",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "trawl-client",
+ "trawl-core",
+ "trawl-engine",
+ "unicode-width",
+]
+
+[[package]]
+name = "trawl-client"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "futures",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "trawl-api",
+ "trawl-engine",
+ "zeroize",
+]
+
+[[package]]
+name = "trawl-core"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "chrono",
+ "chumsky",
+ "duckdb",
+ "insta",
+ "regex",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "trawl-engine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "duckdb",
+ "indexmap",
+ "insta",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "trawl-core",
+]
+
+[[package]]
+name = "trawl-server"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "chrono",
+ "clap",
+ "crossterm 0.29.0",
+ "dashmap",
+ "duckdb",
+ "flate2",
+ "fs4",
+ "governor",
+ "hostname",
+ "hyper",
+ "hyper-util",
+ "indexmap",
+ "insta",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-process",
+ "parking_lot",
+ "rand 0.8.5",
+ "ratatui",
+ "rcgen",
+ "reqwest 0.13.2",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "trawl-api",
+ "trawl-auth",
+ "trawl-client",
+ "trawl-core",
+ "trawl-engine",
+ "ulid",
+ "x509-parser",
+ "zstd",
 ]
 
 [[package]]

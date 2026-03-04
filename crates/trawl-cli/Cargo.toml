@@ -1,0 +1,50 @@
+[package]
+name = "trawl-cli"
+description = "CLI tool for querying logs via trawl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "trawl"
+path = "src/main.rs"
+
+[dependencies]
+trawl-client = { workspace = true }
+trawl-core = { workspace = true }
+trawl-engine = { workspace = true }
+arboard = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shellexpand = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+
+[package.metadata.deb]
+maintainer = "Jakub Burgis <mail@jakub.me>"
+copyright = "2025-2026, Jakub Burgis"
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/trawl", "usr/bin/", "755"],
+]
+
+[lints]
+workspace = true
