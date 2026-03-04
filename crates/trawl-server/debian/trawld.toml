@@ -1,4 +1,4 @@
-# fleetd configuration — installed by the fleetd .deb package
+# trawld configuration — installed by the trawld .deb package
 #
 # All fields shown with their defaults. Uncomment and modify as needed.
 # Byte sizes accept human-readable suffixes: K, M, G, T (binary/1024-based).
@@ -34,14 +34,14 @@ http_addr = "0.0.0.0:5514"
 
 # TLS certificate and key (PEM format). If omitted, a self-signed
 # certificate is auto-generated at startup. Both must be set or both omitted.
-# tls_cert_path = "/etc/fleet/cert.pem"
-# tls_key_path = "/etc/fleet/key.pem"
+# tls_cert_path = "/etc/trawl/cert.pem"
+# tls_key_path = "/etc/trawl/key.pem"
 
 # How often to check cert/key files for changes (seconds). 0 = disabled.
 # tls_reload_interval_secs = 300
 
 # CORS allowed origins. Empty list = no CORS headers.
-# cors_allowed_origins = ["https://fleet.example.com"]
+# cors_allowed_origins = ["https://trawl.example.com"]
 
 # Schema cache TTL (seconds).
 # schema_cache_ttl_secs = 60
@@ -58,11 +58,11 @@ http_addr = "0.0.0.0:5514"
 
 [data]
 # Directory containing parquet files.
-path = "/var/lib/fleet/data"
+path = "/var/lib/trawl/data"
 
 [auth]
 # Path to the SQLite auth database (API keys and roles).
-db_path = "/var/lib/fleet/auth.db"
+db_path = "/var/lib/trawl/auth.db"
 
 # How often to poll the auth database for key changes (seconds).
 # audit_interval_secs = 30
@@ -79,12 +79,12 @@ db_path = "/var/lib/fleet/auth.db"
 
 # WAL directory for buffering ingested events before compaction.
 # Defaults to {data.path}/wal/ when omitted.
-# wal_dir = "/var/lib/fleet/data/wal"
+# wal_dir = "/var/lib/trawl/data/wal"
 
 # How often the compaction task runs (seconds).
 # compaction_interval_secs = 10
 
-# Write internal server events to the ingest pipeline as service:fleetd.
+# Write internal server events to the ingest pipeline as service:trawld.
 # internal_telemetry = true
 
 # Consolidate per-service hourly parquet files into daily files.

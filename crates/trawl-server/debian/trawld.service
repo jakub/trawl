@@ -1,20 +1,20 @@
 [Unit]
-Description=Fleet log collection and search daemon
-Documentation=https://github.com/jakub/fleet
+Description=Trawl log collection and search daemon
+Documentation=https://github.com/jakub/trawl
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/fleetd --config /etc/fleet/fleetd.toml --no-monitor
-User=fleet
-Group=fleet
-EnvironmentFile=-/etc/default/fleetd
+ExecStart=/usr/bin/trawld --config /etc/trawl/trawld.toml --no-monitor
+User=trawl
+Group=trawl
+EnvironmentFile=-/etc/default/trawld
 
 # State & logging
-StateDirectory=fleet
-LogsDirectory=fleet
-WorkingDirectory=/var/lib/fleet
+StateDirectory=trawl
+LogsDirectory=trawl
+WorkingDirectory=/var/lib/trawl
 
 # Restart policy
 Restart=on-failure
@@ -33,7 +33,7 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/lib/fleet /etc/fleet
+ReadWritePaths=/var/lib/trawl /etc/trawl
 
 # DuckDB may need JIT — do NOT set MemoryDenyWriteExecute
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

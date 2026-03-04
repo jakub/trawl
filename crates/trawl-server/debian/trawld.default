@@ -1,0 +1,4 @@
+# Environment overrides for trawld
+# Uncomment and modify as needed.
+
+# RUST_LOG=trawld=info
