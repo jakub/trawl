@@ -82,6 +82,10 @@ x509-parser = "0.18"
 zeroize = { version = "1", features = ["derive"] }
 zstd = "0.13"
 
+[profile.release]
+strip = true
+lto = "thin"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
