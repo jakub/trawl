@@ -1,4 +1,4 @@
-# fleetd configuration
+# trawld configuration
 #
 # All fields shown with their defaults. Uncomment and modify as needed.
 # Paths support ~ for $HOME expansion.
@@ -43,12 +43,12 @@
 # Log file path (JSON format). When set, logs go to both stdout and this file.
 # Deprecated when internal_telemetry is enabled — the WAL layer replaces
 # file logging. Stdout remains active for human consumption.
-# log_file = "/var/log/fleetd.log"
+# log_file = "/var/log/trawld.log"
 
 # TLS certificate and key (PEM format). If omitted, a self-signed
 # certificate is auto-generated at startup. Both must be set or both omitted.
-# tls_cert_path = "/etc/fleet/cert.pem"
-# tls_key_path = "/etc/fleet/key.pem"
+# tls_cert_path = "/etc/trawl/cert.pem"
+# tls_key_path = "/etc/trawl/key.pem"
 
 # How often to check cert/key files for changes (seconds). 0 = disabled.
 # Useful with ACME/Let's Encrypt where certs rotate automatically.
@@ -56,8 +56,8 @@
 
 # CORS allowed origins. Empty list (default) means no CORS headers are
 # sent, so the browser's same-origin policy blocks cross-origin requests.
-# Set this when running the web UI on a different origin than fleetd.
-# cors_allowed_origins = ["https://fleet.example.com"]
+# Set this when running the web UI on a different origin than trawld.
+# cors_allowed_origins = ["https://trawl.example.com"]
 
 # Schema cache TTL (seconds). Controls how long GET /schema results are
 # cached before re-introspecting the parquet files.
@@ -78,15 +78,15 @@
 
 [data]
 # Directory containing parquet files. Also accepts a glob pattern
-# (e.g. "/var/lib/fleet/data/**/*.parquet") for backwards compatibility.
-path = "~/.fleet/data"
+# (e.g. "/var/lib/trawl/data/**/*.parquet") for backwards compatibility.
+path = "~/.trawl/data"
 
 [auth]
 # Path to the SQLite auth database (API keys and roles).
-db_path = "~/.fleet/auth.db"
+db_path = "~/.trawl/auth.db"
 
 # How often to poll the auth database for key changes (seconds).
-# Detects keys created/revoked by fleet-admin and emits audit events.
+# Detects keys created/revoked by trawl-admin and emits audit events.
 # Decrease for faster key revocation propagation. 0 = disabled.
 # audit_interval_secs = 30
 
@@ -107,14 +107,14 @@ db_path = "~/.fleet/auth.db"
 
 # WAL directory for buffering ingested events before compaction.
 # Defaults to {data.path}/wal/ when omitted.
-# wal_dir = "~/.fleet/data/wal"
+# wal_dir = "~/.trawl/data/wal"
 
 # How often the compaction task runs (seconds). Controls how quickly
 # WAL files are merged into parquet. Lower = fresher data but more I/O.
 # compaction_interval_secs = 10
 
 # Write internal server events (queries, auth, compaction) to the ingest
-# pipeline as service:fleetd. Enables self-hosted dashboards and audit trails.
+# pipeline as service:trawld. Enables self-hosted dashboards and audit trails.
 # Requires ingest.enabled = true. Replaces the log_file JSON logger.
 # internal_telemetry = true
 

@@ -1,7 +1,7 @@
-# fleet / vector — HTTP ingest sink
+# trawl / vector — HTTP ingest sink
 #
-# ships logs to fleetd's HTTP ingest endpoint instead of writing
-# ndjson files to disk. fleetd handles WAL and parquet compaction.
+# ships logs to trawld's HTTP ingest endpoint instead of writing
+# ndjson files to disk. trawld handles WAL and parquet compaction.
 #
 # replaces the file sink in other vector configs. pair with any
 # source/transform config (homelab.toml, docker.toml, etc.) by
@@ -9,20 +9,20 @@
 #
 # prerequisites:
 #   1. create an ingest API key:
-#      fleet-admin key create --name vector --role ingest
-#   2. set FLEET_INGEST_TOKEN in the environment
+#      trawl-admin key create --name vector --role ingest
+#   2. set TRAWL_INGEST_TOKEN in the environment
 #
 # usage:
-#   FLEET_INGEST_TOKEN=flt_... vector --config config/vector/http-ingest.toml
+#   TRAWL_INGEST_TOKEN=flt_... vector --config config/vector/http-ingest.toml
 
 # ============================================================================
-# SINK — HTTP POST to fleetd ingest endpoint
+# SINK — HTTP POST to trawld ingest endpoint
 # ============================================================================
 #
-# vector batches events and POST's them as ndjson to fleetd.
-# fleetd writes to WAL, then compacts to parquet in the background.
+# vector batches events and POST's them as ndjson to trawld.
+# trawld writes to WAL, then compacts to parquet in the background.
 
-[sinks.fleet_ingest]
+[sinks.trawl_ingest]
 type = "http"
 inputs = [
   "normalize_docker",
@@ -34,16 +34,16 @@ uri = "https://127.0.0.1:5514/api/v1/ingest"
 method = "post"
 compression = "gzip"
 
-[sinks.fleet_ingest.encoding]
+[sinks.trawl_ingest.encoding]
 codec = "json"
 
-[sinks.fleet_ingest.auth]
+[sinks.trawl_ingest.auth]
 strategy = "bearer"
-token = "${FLEET_INGEST_TOKEN}"
+token = "${TRAWL_INGEST_TOKEN}"
 
-[sinks.fleet_ingest.tls]
+[sinks.trawl_ingest.tls]
 verify_certificate = false  # self-signed cert in dev/homelab
 
-[sinks.fleet_ingest.batch]
+[sinks.trawl_ingest.batch]
 max_bytes = 1048576   # 1 MB batches
 timeout_secs = 5

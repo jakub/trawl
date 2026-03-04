@@ -1,14 +1,14 @@
-# fleet / vector — syslog (RFC 5424 / RFC 3164)
+# trawl / vector — syslog (RFC 5424 / RFC 3164)
 #
-# receives syslog over UDP and TCP, normalizes to the fleet schema,
+# receives syslog over UDP and TCP, normalizes to the trawl schema,
 # and writes ndjson partitioned by hour.
 #
 # usage:
 #   vector --config config/vector/syslog.toml
 #
 # send logs here from any syslog-capable device:
-#   *.* @fleet-host:5514          # UDP
-#   *.* @@fleet-host:5514         # TCP
+#   *.* @trawl-host:5514          # UDP
+#   *.* @@trawl-host:5514         # TCP
 
 # -- source: syslog over UDP and TCP ----------------------------------------
 
@@ -22,13 +22,13 @@ type = "syslog"
 mode = "tcp"
 address = "0.0.0.0:5514"
 
-# -- transform: normalize to fleet schema ------------------------------------
+# -- transform: normalize to trawl schema ------------------------------------
 
 [transforms.normalize]
 type = "remap"
 inputs = ["syslog_udp", "syslog_tcp"]
 source = '''
-# fleet schema: timestamp, host, service, level, message,
+# trawl schema: timestamp, host, service, level, message,
 #               status, duration, uri, method, user_name, src_ip
 
 # syslog provides .timestamp already parsed
@@ -40,7 +40,7 @@ source = '''
 # appname from syslog header (e.g. "sshd", "nginx", "kernel")
 .service = .appname
 
-# map syslog severity to fleet levels
+# map syslog severity to trawl levels
 sev = to_string(.severity) ?? "info"
 if sev == "emerg" || sev == "alert" || sev == "crit" || sev == "err" {
   .level = "error"
@@ -68,12 +68,12 @@ del(.source_type)
 
 # -- sink: ndjson files partitioned by hour ----------------------------------
 
-[sinks.fleet_ndjson]
+[sinks.trawl_ndjson]
 type = "file"
 inputs = ["normalize"]
-path = "/var/lib/fleet/logs/%Y-%m-%d/%H/syslog.ndjson"
+path = "/var/lib/trawl/logs/%Y-%m-%d/%H/syslog.ndjson"
 encoding.codec = "json"
 
-[sinks.fleet_ndjson.buffer]
+[sinks.trawl_ndjson.buffer]
 type = "disk"
 max_size = 268435456  # 256 MiB

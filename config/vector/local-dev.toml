@@ -1,19 +1,19 @@
-# fleet / vector — local dev config for macOS
+# trawl / vector — local dev config for macOS
 #
 # collects logs from two sources:
 #   1. demo_logs: generates realistic fake apache/syslog/json logs
 #   2. docker: collects from running containers on this machine
 #
-# writes ndjson to ./data/logs/ relative to the fleet repo root.
+# writes ndjson to ./data/logs/ relative to the trawl repo root.
 #
 # install & run:
 #   brew install vector
 #   vector --config config/vector/local-dev.toml
 #
-# query with fleet:
-#   cargo run -p fleet-cli -- --data "./data/logs/**/*.ndjson" "*"
-#   cargo run -p fleet-cli -- --data "./data/logs/**/*.ndjson" "level:error last:5m"
-#   cargo run -p fleet-cli -- --data "./data/logs/**/*.ndjson" "service:flog | stats count() by host"
+# query with trawl:
+#   cargo run -p trawl-cli -- --data "./data/logs/**/*.ndjson" "*"
+#   cargo run -p trawl-cli -- --data "./data/logs/**/*.ndjson" "level:error last:5m"
+#   cargo run -p trawl-cli -- --data "./data/logs/**/*.ndjson" "service:flog | stats count() by host"
 
 # ============================================================================
 # SOURCES
@@ -160,7 +160,7 @@ del(.source_type)
 # SINK
 # ============================================================================
 
-[sinks.fleet_ndjson]
+[sinks.trawl_ndjson]
 type = "file"
 inputs = [
   "normalize_apache",
@@ -168,6 +168,6 @@ inputs = [
   "normalize_json",
   "normalize_docker",
 ]
-# writes to ./data/logs/ under the fleet repo root
+# writes to ./data/logs/ under the trawl repo root
 path = "data/logs/%Y-%m-%d/%H/{{ service }}.ndjson"
 encoding.codec = "json"
