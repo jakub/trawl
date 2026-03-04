@@ -1,4 +1,4 @@
-# fleet
+# trawl
 
 self-hosted log collection, storage, and search platform for homelabs and small-to-medium infra. splunk-like DSL, zero licensing cost, single-node by design.
 
@@ -7,21 +7,21 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 - **core**: rust workspace — parser, SQL emitter, DuckDB executor, daemon, CLI, TUI
 - **ingestion**: vector → parquet (columnar, compressed, partitioned by hour)
 - **query engine**: custom DSL → AST → DuckDB SQL (parameterized)
-- **web ui** (planned): rails 8 (thin proxy over fleetd HTTP API) — not yet started
+- **web ui** (planned): rails 8 (thin proxy over trawld HTTP API) — not yet started
 - **agent** (v2 scope): signed-template execution on managed endpoints, mTLS, ed25519 signing — not yet started
 
 ## workspace layout
 
 ```
 crates/
-  fleet-core/     # DSL parser, AST, SQL emitter (pure, no I/O)
-  fleet-engine/   # DuckDB integration, query execution
-  fleet-auth/     # API keys, roles, schedules, SQLite-backed
-  fleet-api/      # shared wire types (request/response structs)
-  fleet-server/   # daemon (axum, HTTPS via tokio-rustls)
-  fleet-client/   # typed async HTTP client library
-  fleet-cli/      # unified CLI + TUI binary
-  fleet-admin/    # admin CLI (key mgmt, TLS cert generation)
+  trawl-core/     # DSL parser, AST, SQL emitter (pure, no I/O)
+  trawl-engine/   # DuckDB integration, query execution
+  trawl-auth/     # API keys, roles, schedules, SQLite-backed
+  trawl-api/      # shared wire types (request/response structs)
+  trawl-server/   # daemon (axum, HTTPS via tokio-rustls)
+  trawl-client/   # typed async HTTP client library
+  trawl-cli/      # unified CLI + TUI binary
+  trawl-admin/    # admin CLI (key mgmt, TLS cert generation)
 ```
 
 ## key design decisions
@@ -43,58 +43,58 @@ crates/
 - **cargo-nextest** for testing, **cargo-insta** for snapshot tests
 - **cargo-deny** for license/vulnerability auditing
 
-## using fleet
+## using trawl
 
 ### binaries
 
-- **fleet CLI binary**: `target/debug/fleet` (after `cargo build -p fleet-cli`)
-- the binary name is `fleet`, NOT `fleet-cli` — the crate is `fleet-cli` but the binary is `fleet`
-- the server binary is `target/debug/fleetd` (crate `fleet-server`)
-- admin binary is `target/debug/fleet-admin` (crate `fleet-admin`)
+- **trawl CLI binary**: `target/debug/trawl` (after `cargo build -p trawl-cli`)
+- the binary name is `trawl`, NOT `trawl-cli` — the crate is `trawl-cli` but the binary is `trawl`
+- the server binary is `target/debug/trawld` (crate `trawl-server`)
+- admin binary is `target/debug/trawl-admin` (crate `trawl-admin`)
 
 ### dev server
 
 - development server runs at `https://localhost:5514` with a self-signed cert
-- always pass `--insecure` (or set `FLEET_INSECURE=true`) to accept the self-signed cert
-- environment variables `FLEET_URL` and `FLEET_TOKEN` should already be set (admin-scoped token)
-- env vars override `~/.config/fleet/config.toml`
+- always pass `--insecure` (or set `TRAWL_INSECURE=true`) to accept the self-signed cert
+- environment variables `TRAWL_URL` and `TRAWL_TOKEN` should already be set (admin-scoped token)
+- env vars override `~/.config/trawl/config.toml`
 
 ### CLI modes
 
 **TUI** (interactive):
 ```
-fleet                               # launches TUI (no subcommand)
-fleet --insecure                    # TUI against dev server
+trawl                               # launches TUI (no subcommand)
+trawl --insecure                    # TUI against dev server
 ```
 
 **query** (execute and print):
 ```
-fleet query --insecure "dsl..."                  # auto-detect output: table for TTY, JSON for pipe
-fleet query --insecure -f table "dsl..."         # force table output
-fleet query --insecure -f json "dsl..."          # force JSON (one object per line, ndjson)
-fleet query --insecure -f csv "dsl..."           # CSV output (with formula injection protection)
+trawl query --insecure "dsl..."                  # auto-detect output: table for TTY, JSON for pipe
+trawl query --insecure -f table "dsl..."         # force table output
+trawl query --insecure -f json "dsl..."          # force JSON (one object per line, ndjson)
+trawl query --insecure -f csv "dsl..."           # CSV output (with formula injection protection)
 ```
 
 **embedded mode** (no server, queries parquet files directly):
 ```
-fleet query --data '/path/*.parquet' "dsl..."    # query local parquet files
-fleet query --data 'data/**/*.parquet' "* | stats count() by service"
+trawl query --data '/path/*.parquet' "dsl..."    # query local parquet files
+trawl query --data 'data/**/*.parquet' "* | stats count() by service"
 ```
 
 **validate** (syntax check, hits server for validation endpoint):
 ```
-fleet validate --insecure "dsl..."               # prints "valid" or error with span
+trawl validate --insecure "dsl..."               # prints "valid" or error with span
 ```
 
 ### global flags
 
 | flag | env var | description |
 |------|---------|-------------|
-| `--url <URL>` | `FLEET_URL` | server URL (default: `https://localhost:5514`) |
-| `--token <TOKEN>` | `FLEET_TOKEN` | API token (direct value) |
-| `-k, --token-file <PATH>` | `FLEET_TOKEN_FILE` | path to file containing API token |
-| `--insecure` | `FLEET_INSECURE` | accept self-signed TLS certificates |
-| `-c, --config <PATH>` | — | config file path (default: `~/.config/fleet/config.toml`) |
+| `--url <URL>` | `TRAWL_URL` | server URL (default: `https://localhost:5514`) |
+| `--token <TOKEN>` | `TRAWL_TOKEN` | API token (direct value) |
+| `-k, --token-file <PATH>` | `TRAWL_TOKEN_FILE` | path to file containing API token |
+| `--insecure` | `TRAWL_INSECURE` | accept self-signed TLS certificates |
+| `-c, --config <PATH>` | — | config file path (default: `~/.config/trawl/config.toml`) |
 
 ### output formats
 
@@ -107,27 +107,27 @@ fleet validate --insecure "dsl..."               # prints "valid" or error with 
 
 ```sh
 # recent errors by service
-fleet query --insecure "level:error last:1h | stats count() by service | sort -count | head 10"
+trawl query --insecure "level:error last:1h | stats count() by service | sort -count | head 10"
 
 # browse all data (table output)
-fleet query --insecure -f table "* | head 5 | fields timestamp, host, service, level, message"
+trawl query --insecure -f table "* | head 5 | fields timestamp, host, service, level, message"
 
 # pipe JSON to jq for ad-hoc processing
-fleet query --insecure "last:1h | stats count() by service" | jq '.service'
+trawl query --insecure "last:1h | stats count() by service" | jq '.service'
 
 # export to CSV file
-fleet query --insecure -f csv "last:24h | stats count() by service, level" > report.csv
+trawl query --insecure -f csv "last:24h | stats count() by service, level" > report.csv
 
 # validate a query without executing
-fleet validate --insecure "level:error | stats count() by host"
+trawl validate --insecure "level:error | stats count() by host"
 
 # query local parquet files (no server needed)
-fleet query --data 'data/**/*.parquet' "* | stats count() by service | sort -count"
+trawl query --data 'data/**/*.parquet' "* | stats count() by service | sort -count"
 ```
 
 ### HTTP API
 
-the fleet server exposes a REST API. all routes under `/api/v1` except `/health` and `/ingest` require bearer token auth:
+the trawl server exposes a REST API. all routes under `/api/v1` except `/health` and `/ingest` require bearer token auth:
 
 | method | path | description |
 |--------|------|-------------|

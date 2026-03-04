@@ -1,4 +1,4 @@
-# fleet — Implementation Plan
+# trawl — Implementation Plan
 
 **Version:** 0.1
 **Scope:** Complete project from workspace init through agent deployment
@@ -19,34 +19,34 @@ The goal here isn't shipping features — it's getting comfortable enough with R
 - Set up the workspace structure:
 
 ```
-fleet/
+trawl/
 ├── Cargo.toml          # workspace root
 ├── crates/
-│   ├── fleet-core/
-│   ├── fleet-engine/
-│   ├── fleet-auth/
-│   ├── fleet-server/
-│   ├── fleet-client/
-│   ├── fleet-cli/
-│   └── fleet-admin/
+│   ├── trawl-core/
+│   ├── trawl-engine/
+│   ├── trawl-auth/
+│   ├── trawl-server/
+│   ├── trawl-client/
+│   ├── trawl-cli/
+│   └── trawl-admin/
 ├── templates/          # example signed task templates (later)
 └── tests/              # integration tests
 ```
 
-Start with only `fleet-core` having any code. The other crates exist as empty shells with `Cargo.toml` and a stub `lib.rs` so the workspace compiles. This avoids premature dependency decisions.
+Start with only `trawl-core` having any code. The other crates exist as empty shells with `Cargo.toml` and a stub `lib.rs` so the workspace compiles. This avoids premature dependency decisions.
 
 ### 0.2 Rust Familiarization
 
-Work through these in the context of fleet-core, not as abstract exercises:
+Work through these in the context of trawl-core, not as abstract exercises:
 
 - Define the AST types as enums and structs. This teaches ownership, derive macros, and pattern matching on real project types.
 - Write a few functions that transform AST nodes (e.g., a function that takes a `FieldFilter` and returns a SQL WHERE clause string). This teaches borrowing, string handling, and `Result`.
-- Write tests for those functions using `#[test]` and `assert_eq!`. Get comfortable with `cargo test -p fleet-core`.
+- Write tests for those functions using `#[test]` and `assert_eq!`. Get comfortable with `cargo test -p trawl-core`.
 - Run `cargo clippy` and `cargo fmt` — adopt the habit immediately.
 
 ### 0.3 Deliverable
 
-A compiling workspace with AST types defined in `fleet-core`, a handful of unit tests, and enough Rust familiarity to not panic at every compiler error.
+A compiling workspace with AST types defined in `trawl-core`, a handful of unit tests, and enough Rust familiarity to not panic at every compiler error.
 
 ---
 
@@ -139,7 +139,7 @@ Use the `insta` crate for snapshot testing — it stores expected AST output as 
 
 ### 1.5 Deliverable
 
-`fleet-core` parses the core DSL (search + stats/where/sort/limit/table) into a complete AST, with comprehensive tests and good error messages. No SQL generation yet.
+`trawl-core` parses the core DSL (search + stats/where/sort/limit/table) into a complete AST, with comprehensive tests and good error messages. No SQL generation yet.
 
 ---
 
@@ -205,7 +205,7 @@ Test the CTE flushing logic explicitly: queries that require one CTE, two CTEs, 
 
 ### 2.5 Deliverable
 
-`fleet-core` takes a DSL string and produces valid DuckDB SQL with parameters. No database interaction yet — this is still pure transformation. The full pipeline is: `DSL string → parse → AST → plan → SQL string + params`.
+`trawl-core` takes a DSL string and produces valid DuckDB SQL with parameters. No database interaction yet — this is still pure transformation. The full pipeline is: `DSL string → parse → AST → plan → SQL string + params`.
 
 ---
 
@@ -213,7 +213,7 @@ Test the CTE flushing logic explicitly: queries that require one CTE, two CTEs, 
 
 This is where it becomes a real, usable tool.
 
-### 3.1 The Executor (fleet-engine)
+### 3.1 The Executor (trawl-engine)
 
 Wire up DuckDB via the `duckdb-rs` crate. The executor:
 
@@ -237,15 +237,15 @@ Before you can test real queries, you need data. Write a small utility (can be P
 
 Store these in `tests/fixtures/parquet/`. Use them for integration tests.
 
-### 3.3 The CLI (fleet-cli)
+### 3.3 The CLI (trawl-cli)
 
 A minimal CLI using `clap` for argument parsing:
 
 ```bash
-fleet --data "/path/to/parquet/**/*.parquet" "service:nginx last:1h"
-fleet --data "..." "service:nginx | stats count() by host" --format json
-fleet --data "..." "level:error last:24h" --format csv
-fleet --data "..." "service:nginx last:1h" --format table
+trawl --data "/path/to/parquet/**/*.parquet" "service:nginx last:1h"
+trawl --data "..." "service:nginx | stats count() by host" --format json
+trawl --data "..." "level:error last:24h" --format csv
+trawl --data "..." "service:nginx last:1h" --format table
 ```
 
 Output format auto-detection: table for TTY, JSON for pipes. The `--data` flag points at the parquet glob. Eventually this will be replaced by connecting to the daemon, but for now the CLI embeds the engine directly.
@@ -256,7 +256,7 @@ End-to-end tests that go from DSL string through parsing, SQL generation, DuckDB
 
 ### 3.5 Deliverable
 
-A working CLI tool that queries Parquet files with the fleet DSL. You can `cargo run -p fleet-cli -- --data ./tests/fixtures/parquet "service:nginx level:error last:24h | stats count() by host"` and get results. This is the first "show someone and they get it" moment.
+A working CLI tool that queries Parquet files with the trawl DSL. You can `cargo run -p trawl-cli -- --data ./tests/fixtures/parquet "service:nginx level:error last:24h | stats count() by host"` and get results. This is the first "show someone and they get it" moment.
 
 ---
 
@@ -288,13 +288,13 @@ Iterate on the Vector config and the DSL/emitter based on what you find.
 
 ### 4.3 Deliverable
 
-A working pipeline: real services → Vector → Parquet → fleet CLI. You're using fleet to search your own infrastructure's logs.
+A working pipeline: real services → Vector → Parquet → trawl CLI. You're using trawl to search your own infrastructure's logs.
 
 ---
 
 ## Phase 5: Authentication (Week 10–12)
 
-### 5.1 The Auth Database (fleet-auth)
+### 5.1 The Auth Database (trawl-auth)
 
 SQLite database via `rusqlite`. Tables for API keys, roles, sessions (per the design spec). Implement:
 
@@ -304,29 +304,29 @@ SQLite database via `rusqlite`. Tables for API keys, roles, sessions (per the de
 - Key revocation
 - Role checking (given a verified key, does it have permission for this operation?)
 
-### 5.2 The Admin CLI (fleet-admin)
+### 5.2 The Admin CLI (trawl-admin)
 
 Using `clap` with subcommands:
 
 ```
-fleet-admin keys create --role analyst --name "web-frontend" --expires 90d
-fleet-admin keys list
-fleet-admin keys revoke <prefix>
+trawl-admin keys create --role analyst --name "web-frontend" --expires 90d
+trawl-admin keys list
+trawl-admin keys revoke <prefix>
 ```
 
-At this phase, `fleet-admin` talks directly to the SQLite database (same process). Later, it'll talk to the daemon's API.
+At this phase, `trawl-admin` talks directly to the SQLite database (same process). Later, it'll talk to the daemon's API.
 
 ### 5.3 Deliverable
 
-`fleet-auth` crate with complete key lifecycle management. `fleet-admin` CLI for key operations. Auth database schema finalized.
+`trawl-auth` crate with complete key lifecycle management. `trawl-admin` CLI for key operations. Auth database schema finalized.
 
 ---
 
 ## Phase 6: The Daemon (Week 12–16)
 
-This is the largest single phase. It transforms fleet from a CLI tool into a service.
+This is the largest single phase. It transforms trawl from a CLI tool into a service.
 
-### 6.1 Async Foundation (fleet-server)
+### 6.1 Async Foundation (trawl-server)
 
 Set up the tokio runtime and the core daemon structure:
 
@@ -384,11 +384,11 @@ Expose via `GET /api/v1/schema` and the ndjson `schema` message type.
 
 ### 6.7 Update the CLI
 
-Rewrite `fleet-cli` to connect to the daemon instead of embedding the engine. Use the `fleet-client` crate for connection management. Fall back to embedded mode with `--data` flag for standalone use.
+Rewrite `trawl-cli` to connect to the daemon instead of embedding the engine. Use the `trawl-client` crate for connection management. Fall back to embedded mode with `--data` flag for standalone use.
 
 ### 6.8 Deliverable
 
-`fleetd` runs as a daemon, listens on all three transports, authenticates clients, executes queries against Parquet files, streams results. `fleet` CLI connects to the daemon. The system is fully operational for log search.
+`trawld` runs as a daemon, listens on all three transports, authenticates clients, executes queries against Parquet files, streams results. `trawl` CLI connects to the daemon. The system is fully operational for log search.
 
 ---
 
@@ -451,13 +451,13 @@ Handle SIGHUP: re-read TOML config, apply non-structural changes (log level, que
 
 ### 8.5 Deliverable
 
-fleetd is production-ready for long-running deployment: manages its own storage, exposes metrics for monitoring, can alert on conditions, and can be reconfigured without restart.
+trawld is production-ready for long-running deployment: manages its own storage, exposes metrics for monitoring, can alert on conditions, and can be reconfigured without restart.
 
 ---
 
 ## Phase 9: TUI (Week 20–24)
 
-This is a separate repo using `ratatui` + `crossterm`, depending on the `fleet-client` crate.
+This is a separate repo using `ratatui` + `crossterm`, depending on the `trawl-client` crate.
 
 ### 9.1 Scaffold
 
@@ -491,7 +491,7 @@ AppState {
 
 ### 9.3 Deliverable
 
-A fully functional TUI log viewer. SSH into a box, run `fleet`, search your logs interactively.
+A fully functional TUI log viewer. SSH into a box, run `trawl`, search your logs interactively.
 
 ---
 
@@ -501,12 +501,12 @@ Separate Rails application. This is the most familiar territory.
 
 ### 10.1 Foundation
 
-Standard Rails 8 app. PostgreSQL for application data (user accounts, UI preferences). Communication with fleetd via HTTP using `httpx` or `faraday`.
+Standard Rails 8 app. PostgreSQL for application data (user accounts, UI preferences). Communication with trawld via HTTP using `httpx` or `faraday`.
 
-Build a thin service object that wraps fleetd API calls:
+Build a thin service object that wraps trawld API calls:
 
 ```ruby
-class fleetClient
+class trawlClient
   def query(dsl, limit: 500)
   def schema
   def field_values(field)
@@ -520,7 +520,7 @@ end
 The core experience:
 
 - Text input for DSL queries
-- Turbo Frame for results table (streams results as they arrive from fleetd via SSE proxy)
+- Turbo Frame for results table (streams results as they arrive from trawld via SSE proxy)
 - Column sorting, row expansion for detail view
 - URL-encoded queries so search results are linkable/shareable
 
@@ -530,23 +530,23 @@ Stimulus controller that queries the schema endpoint as the user types. Show a d
 
 ### 10.4 Saved Searches and Dashboards
 
-CRUD for saved queries (stored via fleetd API). Dashboard page that renders multiple saved queries in a configurable grid layout. Each panel is a Turbo Frame that independently loads its results.
+CRUD for saved queries (stored via trawld API). Dashboard page that renders multiple saved queries in a configurable grid layout. Each panel is a Turbo Frame that independently loads its results.
 
 ### 10.5 Admin Pages
 
-API key management, retention configuration, alert rule management, active connections/queries view. All proxied through fleetd's admin API. Gated to admin-role users.
+API key management, retention configuration, alert rule management, active connections/queries view. All proxied through trawld's admin API. Gated to admin-role users.
 
 ### 10.6 Deliverable
 
-A complete web interface for fleet. Search, saved queries, dashboards, admin. Deployed alongside fleetd.
+A complete web interface for trawl. Search, saved queries, dashboards, admin. Deployed alongside trawld.
 
 ---
 
 ## Phase 11: Agent Foundation (Week 28–32)
 
-This is where it gets ambitious. New crates: `fleet-agent`, `fleet-signing`.
+This is where it gets ambitious. New crates: `trawl-agent`, `trawl-signing`.
 
-### 11.1 Signing Infrastructure (fleet-signing)
+### 11.1 Signing Infrastructure (trawl-signing)
 
 The `Signer` trait and the file-based backend. This is the minimum for the system to work:
 
@@ -555,49 +555,49 @@ The `Signer` trait and the file-based backend. This is the minimum for the syste
 - Signing: canonical JSON serialization of template → sign → attach signature
 - Verification: given a template + signature + public key, verify
 
-Extend `fleet-admin`:
+Extend `trawl-admin`:
 
 ```
-fleet-admin signing-key generate --out ~/.fleet/signing.key
-fleet-admin signing-key register <pubkey-path> --name "jake-workstation"
-fleet-admin signing-key list
+trawl-admin signing-key generate --out ~/.trawl/signing.key
+trawl-admin signing-key register <pubkey-path> --name "jake-workstation"
+trawl-admin signing-key list
 ```
 
 ### 11.2 Template Model
 
-Define the template data structures (in `fleet-signing` so both admin and agent can use them):
+Define the template data structures (in `trawl-signing` so both admin and agent can use them):
 
 - Template struct with all constraint fields
 - Signed template wrapper (template + signature metadata)
 - Canonical JSON serialization (deterministic, for signing)
 - Template validation (are constraints consistent? is the command non-empty? is not_after in the future?)
 
-Extend `fleet-admin`:
+Extend `trawl-admin`:
 
 ```
-fleet-admin template create templates/disk-check.toml
-fleet-admin template push templates/disk-check.toml  # sign + upload
-fleet-admin template list
-fleet-admin template revoke <id>
+trawl-admin template create templates/disk-check.toml
+trawl-admin template push templates/disk-check.toml  # sign + upload
+trawl-admin template list
+trawl-admin template revoke <id>
 ```
 
 Server-side: add template storage to the metadata database. API endpoints for template CRUD. Signature verification on upload.
 
 ### 11.3 Enrollment Infrastructure
 
-Internal CA implementation (in `fleet-auth` or a new `fleet-pki` crate):
+Internal CA implementation (in `trawl-auth` or a new `trawl-pki` crate):
 
 - CA key generation and storage (in the auth SQLite database)
 - CSR signing: agent sends a CSR, server signs it with the CA key, returns the certificate
 - Enrollment tokens: short-lived, scoped tokens that authorize a new agent to enroll
 - Certificate revocation list: track revoked agent certs
 
-Extend `fleet-admin`:
+Extend `trawl-admin`:
 
 ```
-fleet-admin enroll-token create --tags linux,webserver --expires 1h
-fleet-admin agents list
-fleet-admin agents revoke <agent-id>
+trawl-admin enroll-token create --tags linux,webserver --expires 1h
+trawl-admin agents list
+trawl-admin agents revoke <agent-id>
 ```
 
 Server-side: enrollment endpoint (`POST /api/v1/agents/enroll`), agent registry in the metadata database.
@@ -610,12 +610,12 @@ The signing and enrollment infrastructure works end-to-end. You can generate sig
 
 ## Phase 12: The Agent (Week 32–36)
 
-### 12.1 Agent Core (fleet-agent)
+### 12.1 Agent Core (trawl-agent)
 
 The agent binary. Minimal dependencies. Build order:
 
 1. **Config loading.** Read the agent TOML config (server address, cert paths, capabilities, allowlists).
-2. **mTLS connection.** Connect to fleetd over HTTPS with client certificate authentication. Verify server cert against the CA cert.
+2. **mTLS connection.** Connect to trawld over HTTPS with client certificate authentication. Verify server cert against the CA cert.
 3. **Check-in loop.** Long poll: `POST /api/v1/agent/checkin`, include agent metadata, receive tasks or wait. Handle connection drops, reconnection with backoff.
 4. **Signature verification.** On receiving a task, deserialize the signed template, verify the signature against the local public key, validate all constraints.
 5. **Task execution.** Shell executor: spawn process, capture stdout/stderr, enforce timeout, check exit code. Start with shell tasks only.
@@ -624,7 +624,7 @@ The agent binary. Minimal dependencies. Build order:
 
 ### 12.2 Server-Side Task Dispatch
 
-Add to fleetd:
+Add to trawld:
 
 - Check-in endpoint: accept agent metadata, return queued tasks matching the agent's tags/capabilities
 - Task submission endpoint: accept a template ID + target + parameters, validate parameters against signed schema, queue the task
@@ -645,23 +645,23 @@ Implement in order:
 
 ### 12.4 Vector Configuration for Agent Output
 
-Add a Vector source that tails the agent output directory. Transform to add `service: "fleet-agent"` metadata. Ship alongside normal logs. Provide example Vector config snippets.
+Add a Vector source that tails the agent output directory. Transform to add `service: "trawl-agent"` metadata. Ship alongside normal logs. Provide example Vector config snippets.
 
 ### 12.5 Integration Testing
 
 End-to-end test:
 
-1. Start fleetd with test config
+1. Start trawld with test config
 2. Create signing key, sign a template
 3. Create enrollment token, enroll a test agent
 4. Submit a task targeting the test agent
 5. Agent checks in, receives task, verifies signature, executes
 6. Agent writes output
-7. Verify output appears (check the file, or if Vector is running, query via fleet)
+7. Verify output appears (check the file, or if Vector is running, query via trawl)
 
 ### 12.6 Deliverable
 
-A working agent that enrolls, checks in, receives signed tasks, executes them, and reports results through the log pipeline. Fleet management basics are operational.
+A working agent that enrolls, checks in, receives signed tasks, executes them, and reports results through the log pipeline. Trawl management basics are operational.
 
 ---
 
@@ -676,18 +676,18 @@ Add a YubiKey PIV backend to the `Signer` trait using the `yubikey` crate:
 - Sign operations: send data to YubiKey, receive signature
 - PIN handling: prompt for PIN, handle lockout/retry
 
-Extend `fleet-admin`:
+Extend `trawl-admin`:
 
 ```
-fleet-admin signing-key generate --backend yubikey --slot 9c
-fleet-admin template push templates/disk-check.toml --backend yubikey
+trawl-admin signing-key generate --backend yubikey --slot 9c
+trawl-admin template push templates/disk-check.toml --backend yubikey
 ```
 
 ### 13.2 FIDO2 Backend
 
 Add FIDO2 credential-based key unlocking:
 
-- Generate a FIDO2 credential tied to fleet
+- Generate a FIDO2 credential tied to trawl
 - Use HMAC-secret extension to derive an encryption key
 - Encrypt a software ed25519 signing key with the derived key
 - On signing: FIDO2 assertion → derive key → decrypt signing key → sign → zero key
@@ -700,7 +700,7 @@ Add to the server:
 
 - Per-key restrictions: which template categories a key can sign
 - Dual authorization: certain categories require two signatures from different keys
-- `fleet-admin template cosign` for the second signature
+- `trawl-admin template cosign` for the second signature
 
 ### 13.4 Deliverable
 
@@ -718,7 +718,7 @@ Build the playbook executor:
 
 1. Playbook is triggered (manually via API, or by an alert rule)
 2. Engine evaluates the first step: look up the template, resolve the target, dispatch
-3. Engine watches for task results in the log stream (query fleet for `task_id:xxx`)
+3. Engine watches for task results in the log stream (query trawl for `task_id:xxx`)
 4. When results arrive, evaluate the next step's condition against the results
 5. If condition is met, dispatch the next step's template with resolved parameters
 6. If `approval_required`, pause and notify via webhook. Resume on approval API call.
@@ -728,7 +728,7 @@ Build the playbook executor:
 
 Playbook conditions (`{{ steps.check_disk.output | parse_df | any(pcent > 90) }}`) need a simple expression evaluator. Options:
 
-- Reuse the DSL expression evaluator from fleet-core (it already handles comparisons, functions, etc.)
+- Reuse the DSL expression evaluator from trawl-core (it already handles comparisons, functions, etc.)
 - Use a lightweight template language (handlebars/tera for Rust)
 - Keep it very simple: just support basic comparisons against task output fields
 
@@ -747,13 +747,13 @@ POST   /api/v1/playbooks/{id}/steps/{n}/approve  # approve pending step
 GET    /api/v1/playbooks/{id}/runs # execution history
 ```
 
-`fleet-admin` commands:
+`trawl-admin` commands:
 
 ```
-fleet-admin playbook create playbooks/investigate-disk.json
-fleet-admin playbook run investigate-disk --hostname web01
-fleet-admin playbook approve <run-id> --step 3
-fleet-admin playbook runs investigate-disk
+trawl-admin playbook create playbooks/investigate-disk.json
+trawl-admin playbook run investigate-disk --hostname web01
+trawl-admin playbook approve <run-id> --step 3
+trawl-admin playbook runs investigate-disk
 ```
 
 ### 14.4 Deliverable
@@ -768,7 +768,7 @@ Server-side playbooks that chain signed templates together based on task results
 
 Multi-stage Dockerfile:
 
-- Build stage: compile all Rust binaries (fleetd, fleet, fleet-admin, fleet-agent)
+- Build stage: compile all Rust binaries (trawld, trawl, trawl-admin, trawl-agent)
 - Runtime stage: minimal base image (distroless or alpine) with binaries + Vector
 - Default config for common use cases
 - Health check configured
@@ -780,8 +780,8 @@ Publish to a container registry (GitHub Container Registry is free for public pa
 
 Service files for:
 
-- `fleetd.service` — the daemon
-- `fleet-agent.service` — the agent (on managed endpoints)
+- `trawld.service` — the daemon
+- `trawl-agent.service` — the agent (on managed endpoints)
 - `vector.service` — if not already managed separately
 
 With proper dependencies, restart policies, and security hardening (PrivateTmp, NoNewPrivileges, etc.).
@@ -801,7 +801,7 @@ Generate from axum route definitions using `utoipa`. Publish alongside the daemo
 
 ### 15.5 Deliverable
 
-fleet is packaged, documented, and deployable by someone other than you.
+trawl is packaged, documented, and deployable by someone other than you.
 
 ---
 
@@ -813,7 +813,7 @@ These aren't phases — they're practices that apply throughout.
 
 **Security review.** At minimum, review auth boundaries (are all endpoints properly gated?), SQL generation (is parameterization consistent?), agent command execution (are allowlists enforced?), and signing verification (are signatures checked before any execution?).
 
-**Dogfooding.** From Phase 4 onward, use fleet to search your own homelab logs. From Phase 12 onward, use the agent to manage your own endpoints. Real usage drives real bug reports.
+**Dogfooding.** From Phase 4 onward, use trawl to search your own homelab logs. From Phase 12 onward, use the agent to manage your own endpoints. Real usage drives real bug reports.
 
 **Performance baseline.** After Phase 3, establish query performance baselines with the fixture data. After Phase 4, baseline with real data. Track regressions. The numbers in the design spec (sub-second filtered queries, 10-60s broad scans) are the targets.
 
@@ -846,7 +846,7 @@ These aren't phases — they're practices that apply throughout.
 - **Week 16** — daemon is operational (authenticated, multi-transport, log search works)
 - **Week 24** — TUI is functional (the "wow, this is actually useful" moment)
 - **Week 28** — web UI is live (feature parity with commercial log viewers for basic use)
-- **Week 36** — agent is deployed (fleet management via signed templates)
+- **Week 36** — agent is deployed (trawl management via signed templates)
 - **Week 44** — full system including playbooks, hardware signing, packaging
 
 These timelines assume roughly half-time effort with heavy Claude Code usage. Full-time would compress by 40-50%. The phases are ordered so that every phase produces something independently useful — you never go more than a few weeks without a tangible deliverable.
@@ -862,5 +862,5 @@ These timelines assume roughly half-time effort with heavy Claude Code usage. Fu
 | Parquet file performance at scale | Queries slower than predicted | Profile early with realistic data volumes. DuckDB's EXPLAIN ANALYZE shows where time is spent. Partitioning strategy is the primary lever. |
 | chumsky learning curve | Parser is hard to debug/modify | chumsky v1 has better docs than v0. Fallback: hand-rolled recursive descent parser (more code but more control, and arguably easier to understand). |
 | Agent security model has gaps | RCE vulnerability in production | The signing model is defense-in-depth by design. Threat model review at Phase 11 start. Start with read-only task types (stats, package_list) before enabling shell. Allowlists are non-negotiable. |
-| Scope creep | Project never finishes | Each phase has a clear deliverable. Phases 11–14 (agent, playbooks) are genuinely optional — fleet is useful without them. Treat them as stretch goals. |
+| Scope creep | Project never finishes | Each phase has a clear deliverable. Phases 11–14 (agent, playbooks) are genuinely optional — trawl is useful without them. Treat them as stretch goals. |
 | Web UI is less engaging to build than the Rust parts | Web UI is half-finished | Phase 10 is deliberately after the fun stuff. The Rails work is familiar and straightforward — it's a thin proxy with standard CRUD. Timebox it: 4 weeks, ship what's done. |
