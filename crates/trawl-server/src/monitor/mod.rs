@@ -1,4 +1,4 @@
-//! Live terminal monitor for fleetd.
+//! Live terminal monitor for trawld.
 //!
 //! Replaces the default stdout log tail when running interactively (TTY
 //! detected). Renders a ratatui dashboard that refreshes on a configurable

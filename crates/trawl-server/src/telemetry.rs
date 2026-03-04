@@ -1,5 +1,5 @@
 //! Internal telemetry: custom tracing [`Layer`] that writes server events
-//! to the ingest WAL as `service:fleetd`.
+//! to the ingest WAL as `service:trawld`.
 //!
 //! ## Bootstrap
 //!
@@ -82,7 +82,7 @@ impl WalHandle {
 // ---------------------------------------------------------------------------
 
 /// Tracing layer that serializes events as ndjson and writes them to the
-/// ingest WAL as `service:fleetd`.
+/// ingest WAL as `service:trawld`.
 #[derive(Clone)]
 pub struct WalLayer {
     inner: Arc<WalLayerInner>,
@@ -162,9 +162,9 @@ impl WalLayerInner {
         // the byte buffer and must stay in sync.
         let maps = std::mem::take(&mut *self.event_maps.lock());
 
-        if let Err(e) = writer.write("fleetd", &data) {
+        if let Err(e) = writer.write("trawld", &data) {
             // MUST NOT use tracing here — infinite recursion.
-            eprintln!("[fleet-telemetry] WAL write failed: {e}");
+            eprintln!("[trawl-telemetry] WAL write failed: {e}");
             self.dropped_bytes
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
         } else {
@@ -175,14 +175,14 @@ impl WalLayerInner {
                 use crate::bus::{EventBus, IngestBatch};
                 let batch = Arc::new(IngestBatch {
                     batch_id: format!(
-                        "fleetd_telemetry_{}",
+                        "trawld_telemetry_{}",
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis()
                     )
                     .into(),
-                    service: "fleetd".into(),
+                    service: "trawld".into(),
                     events: maps,
                     byte_size: data.len(),
                     draining: std::sync::atomic::AtomicBool::new(false),
@@ -340,7 +340,7 @@ where
             "timestamp".into(),
             json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         );
-        record.insert("service".into(), json!("fleetd"));
+        record.insert("service".into(), json!("trawld"));
         record.insert("host".into(), json!(&self.inner.host));
         record.insert("level".into(), json!(metadata.level().as_str()));
         record.insert("target".into(), json!(metadata.target()));
@@ -604,7 +604,7 @@ mod tests {
         let content = std::fs::read_to_string(files[0].path()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
 
-        assert_eq!(parsed["service"], "fleetd");
+        assert_eq!(parsed["service"], "trawld");
         assert_eq!(parsed["event_type"], "test_event");
         assert_eq!(parsed["user"], "alice");
         assert_eq!(parsed["rows"], 42);
@@ -730,11 +730,11 @@ mod tests {
             .expect("timed out waiting for batch")
             .expect("recv failed");
 
-        assert_eq!(batch.service.as_ref(), "fleetd");
+        assert_eq!(batch.service.as_ref(), "trawld");
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0]["event_type"], "test_bus");
         assert_eq!(batch.events[0]["user"], "alice");
         assert!(batch.byte_size > 0);
-        assert!(batch.batch_id.starts_with("fleetd_telemetry_"));
+        assert!(batch.batch_id.starts_with("trawld_telemetry_"));
     }
 }

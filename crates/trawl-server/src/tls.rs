@@ -1,7 +1,7 @@
 //! TLS certificate loading and self-signed certificate generation.
 //!
 //! When no cert/key paths are configured, a self-signed certificate is
-//! auto-generated to `~/.fleet/tls/` and persisted across restarts.
+//! auto-generated to `~/.trawl/tls/` and persisted across restarts.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
-const DEFAULT_TLS_DIR: &str = ".fleet/tls";
+const DEFAULT_TLS_DIR: &str = ".trawl/tls";
 const CERT_FILENAME: &str = "cert.pem";
 const KEY_FILENAME: &str = "key.pem";
 
@@ -157,7 +157,7 @@ fn log_cert_details(pem_bytes: &[u8]) {
     }
 }
 
-/// Resolve the default TLS directory (`~/.fleet/tls/`).
+/// Resolve the default TLS directory (`~/.trawl/tls/`).
 fn default_tls_dir() -> Result<PathBuf, TlsError> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| TlsError::Config("HOME environment variable not set".into()))?;

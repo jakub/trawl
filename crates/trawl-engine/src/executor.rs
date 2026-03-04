@@ -391,7 +391,7 @@ fn remap_binder_error(e: &duckdb::Error) -> EngineError {
     EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message: user_msg })
 }
 
-/// Convert fleet-core `SqlValue` params into duckdb `ToSql` trait objects.
+/// Convert trawl-core `SqlValue` params into duckdb `ToSql` trait objects.
 fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
     params
         .iter()

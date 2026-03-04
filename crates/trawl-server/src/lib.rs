@@ -1,4 +1,4 @@
-//! fleet-server: the fleetd daemon.
+//! trawl-server: the trawld daemon.
 //!
 //! Multi-transport server (HTTP via axum, Unix socket, TCP+TLS) that
 //! authenticates clients, executes queries, and streams results.

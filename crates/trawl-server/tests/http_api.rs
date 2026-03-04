@@ -1,4 +1,4 @@
-//! End-to-end HTTPS API tests for fleetd.
+//! End-to-end HTTPS API tests for trawld.
 //!
 //! Starts a real TLS server on a random port with a self-signed cert,
 //! creates API keys, and verifies the full request lifecycle.

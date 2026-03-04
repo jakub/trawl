@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn test_or_two_groups() {
         let result = search_stage()
-            .parse("service:kernel OR service:fleetd")
+            .parse("service:kernel OR service:trawld")
             .into_result()
             .unwrap();
         assert_eq!(result.groups.len(), 2);
@@ -480,7 +480,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("fleetd".to_string()),
+                value: FilterValue::Literal("trawld".to_string()),
             })
         );
     }

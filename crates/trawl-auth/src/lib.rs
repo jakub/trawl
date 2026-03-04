@@ -1,4 +1,4 @@
-//! fleet-auth: API key management and role-based authorization.
+//! trawl-auth: API key management and role-based authorization.
 //!
 //! `SQLite`-backed store for API keys with three roles (admin, analyst, reader).
 //! Handles key creation, verification, revocation, and permission checking.

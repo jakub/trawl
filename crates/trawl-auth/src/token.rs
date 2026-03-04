@@ -14,7 +14,7 @@ use crate::error::AuthError;
 /// Length of the random token body in bytes.
 const TOKEN_BYTES: usize = 32;
 
-/// The string prefix prepended to all fleet API tokens.
+/// The string prefix prepended to all trawl API tokens.
 const TOKEN_PREFIX: &str = "flt_";
 
 /// Number of characters from the base64url portion used as the key prefix.

@@ -1,7 +1,7 @@
-//! Wire types for the fleet daemon HTTP API.
+//! Wire types for the trawl daemon HTTP API.
 //!
 //! Response types and shared request/enum types are re-exported from
-//! `fleet-api`. Internal request types used only by the client
+//! `trawl-api`. Internal request types used only by the client
 //! (borrowing for zero-copy serialization) are defined here.
 
 use serde::Serialize;
@@ -62,7 +62,7 @@ pub enum StreamEvent {
     Lagged(u64),
 }
 
-// -- re-exports from fleet-api -----------------------------------------------
+// -- re-exports from trawl-api -----------------------------------------------
 
 pub use trawl_api::{
     ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,

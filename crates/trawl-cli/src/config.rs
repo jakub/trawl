@@ -1,4 +1,4 @@
-//! Config file parsing (`~/.config/fleet/config.toml`).
+//! Config file parsing (`~/.config/trawl/config.toml`).
 //!
 //! Shared configuration for both CLI and TUI modes.
 
@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_URL: &str = "https://localhost:5514";
 
 /// Default token file path.
-pub const DEFAULT_TOKEN_FILE: &str = "~/.config/fleet/token";
+pub const DEFAULT_TOKEN_FILE: &str = "~/.config/trawl/token";
 
 /// Default config file path.
-pub const DEFAULT_CONFIG_PATH: &str = "~/.config/fleet/config.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "~/.config/trawl/config.toml";
 
 /// Configuration error.
 #[derive(Debug, thiserror::Error)]
@@ -27,11 +27,11 @@ pub enum ConfigError {
         path: String,
         source: toml::de::Error,
     },
-    #[error("no API token found (set FLEET_TOKEN, use --token, or create {DEFAULT_TOKEN_FILE})")]
+    #[error("no API token found (set TRAWL_TOKEN, use --token, or create {DEFAULT_TOKEN_FILE})")]
     TokenNotFound,
 }
 
-/// Fleet configuration loaded from TOML file.
+/// Trawl configuration loaded from TOML file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Server connection settings.
@@ -184,10 +184,10 @@ impl Config {
 
     /// Apply environment variable overrides.
     pub fn apply_env_overrides(&mut self) {
-        if let Ok(url) = std::env::var("FLEET_URL") {
+        if let Ok(url) = std::env::var("TRAWL_URL") {
             self.server.url = url;
         }
-        if let Ok(token) = std::env::var("FLEET_TOKEN_FILE") {
+        if let Ok(token) = std::env::var("TRAWL_TOKEN_FILE") {
             self.server.token_file = token;
         }
     }
@@ -201,10 +201,10 @@ impl Config {
     /// Load the API token.
     ///
     /// Resolution order:
-    /// 1. `direct_token` (from `--token` flag / `FLEET_TOKEN` env)
+    /// 1. `direct_token` (from `--token` flag / `TRAWL_TOKEN` env)
     /// 2. Token file (from `--token-file` flag / config / default)
     pub fn load_token(&self, direct_token: Option<&str>) -> Result<String, ConfigError> {
-        // Direct token takes precedence (--token flag or FLEET_TOKEN env).
+        // Direct token takes precedence (--token flag or TRAWL_TOKEN env).
         if let Some(token) = direct_token {
             return Ok(token.trim().to_owned());
         }

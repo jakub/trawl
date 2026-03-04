@@ -3,7 +3,7 @@
 //! Emits a `server_stats` INFO event at a fixed interval with
 //! key metrics (pool utilization, hot buffer, uptime). Since
 //! `WalLayer` ingests all tracing events into parquet, these
-//! stats are queryable with fleet's own DSL.
+//! stats are queryable with trawl's own DSL.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

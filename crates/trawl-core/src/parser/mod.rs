@@ -1,4 +1,4 @@
-//! DSL parser for fleet's query language.
+//! DSL parser for trawl.s query language.
 //!
 //! Transforms a query string like `service:nginx level:error last:2h | stats count() by host`
 //! into a structured AST representation.
@@ -45,11 +45,11 @@ impl std::fmt::Display for ParseError {
 /// Maximum query length in bytes. Prevents denial-of-service via pathological parser input.
 const MAX_QUERY_LEN: usize = 65_536;
 
-/// Parse a fleet DSL query string into a structured AST.
+/// Parse a trawl DSL query string into a structured AST.
 ///
 /// # Errors
 ///
-/// Returns a list of parse errors if the input is not valid fleet DSL.
+/// Returns a list of parse errors if the input is not valid trawl DSL.
 pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     if input.len() > MAX_QUERY_LEN {
         return Err(vec![ParseError {

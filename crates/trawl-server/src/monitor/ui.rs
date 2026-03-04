@@ -39,7 +39,7 @@ fn render_header(snapshot: &MonitorSnapshot, frame: &mut Frame<'_>, area: Rect) 
         .split(area);
 
     // Title bar
-    let title = format!(" fleetd v{} ", snapshot.version);
+    let title = format!(" trawld v{} ", snapshot.version);
     let title_line = Line::from(vec![Span::styled(
         title,
         Style::default()

@@ -1,4 +1,4 @@
-//! HTTP client for communicating with fleetd.
+//! HTTP client for communicating with trawld.
 
 use std::pin::Pin;
 
@@ -18,7 +18,7 @@ use crate::types::{
     UpdateSavedRequestRef, ValidateRequest,
 };
 
-/// HTTP client for the fleet daemon API.
+/// HTTP client for the trawl daemon API.
 #[derive(Clone)]
 pub struct HttpClient {
     base_url: String,

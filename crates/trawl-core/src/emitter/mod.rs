@@ -268,12 +268,12 @@ mod tests {
 
     #[test]
     fn search_or_two_services() {
-        assert_snapshot!(emit_dsl("service:kernel OR service:fleetd"));
+        assert_snapshot!(emit_dsl("service:kernel OR service:trawld"));
     }
 
     #[test]
     fn search_or_with_stats() {
-        assert_snapshot!(emit_dsl("service:kernel OR service:fleetd | stats count()"));
+        assert_snapshot!(emit_dsl("service:kernel OR service:trawld | stats count()"));
     }
 
     #[test]
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn rejects_tilde_source() {
         let query = parser::parse("*").unwrap();
-        let result = emit(&query, "~/.fleet/data/*.parquet");
+        let result = emit(&query, "~/.trawl/data/*.parquet");
         assert!(result.is_err());
     }
 

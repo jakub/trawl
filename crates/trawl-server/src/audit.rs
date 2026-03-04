@@ -1,10 +1,10 @@
 //! Key audit polling task.
 //!
 //! Periodically polls the `SQLite` auth database for key changes made by
-//! fleet-admin (which writes directly to the same `auth.db`). Emits
+//! trawl-admin (which writes directly to the same `auth.db`). Emits
 //! `key_created` / `key_revoked` tracing events that flow through the
 //! [`WalLayer`] into parquet, providing an audit trail even though
-//! fleet-admin has no WAL subscriber.
+//! trawl-admin has no WAL subscriber.
 //!
 //! The task snapshots all key states on startup and only emits events for
 //! *changes* detected on subsequent polls (no replay of historical keys).

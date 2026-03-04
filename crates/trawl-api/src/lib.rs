@@ -1,7 +1,7 @@
-//! Shared wire types for the fleet HTTP API.
+//! Shared wire types for the trawl HTTP API.
 //!
-//! These types are used by both `fleet-server` (serialization) and
-//! `fleet-client` (deserialization) to ensure the API contract stays
+//! These types are used by both `trawl-server` (serialization) and
+//! `trawl-client` (deserialization) to ensure the API contract stays
 //! in sync across crates.
 
 use std::collections::HashMap;
@@ -187,7 +187,7 @@ pub struct ErrorResponse {
 /// validation (`POST /api/v1/validate`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {
-    /// The fleet DSL query string.
+    /// The trawl DSL query string.
     pub query: String,
     /// Optional limit for pagination (defaults to server's `max_result_rows`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,21 +206,21 @@ pub struct QueryRequest {
 pub struct CreateSavedRequest {
     /// Display name for the saved query.
     pub name: String,
-    /// The fleet DSL query string.
+    /// The trawl DSL query string.
     pub query: String,
 }
 
 /// Request body for updating a saved query (`PUT /api/v1/saved/{id}`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSavedRequest {
-    /// The new fleet DSL query string.
+    /// The new trawl DSL query string.
     pub query: String,
 }
 
 /// Request body for exporting query results (`POST /api/v1/export`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportRequest {
-    /// The fleet DSL query string.
+    /// The trawl DSL query string.
     pub query: String,
     /// Optional row limit (defaults to server's `max_export_rows`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

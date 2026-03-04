@@ -4,16 +4,16 @@ use std::process;
 use clap::{Parser, Subcommand, ValueEnum};
 use trawl_auth::store::KeyStore;
 
-const DEFAULT_TLS_DIR: &str = "~/.fleet/tls";
+const DEFAULT_TLS_DIR: &str = "~/.trawl/tls";
 
 mod commands;
 
-/// fleet administration tool.
+/// trawl administration tool.
 #[derive(Parser)]
-#[command(name = "fleet-admin", version, long_version = trawl_core::version::long_version(), about)]
+#[command(name = "trawl-admin", version, long_version = trawl_core::version::long_version(), about)]
 struct Cli {
     /// Path to the auth database file.
-    #[arg(long, env = "FLEET_AUTH_DB", default_value = "~/.fleet/auth.db")]
+    #[arg(long, env = "TRAWL_AUTH_DB", default_value = "~/.trawl/auth.db")]
     db: String,
 
     #[command(subcommand)]
@@ -74,7 +74,7 @@ enum KeysAction {
     },
 }
 
-/// Wrapper for clap `ValueEnum` derive (fleet-auth's `Role` uses `FromStr`).
+/// Wrapper for clap `ValueEnum` derive (trawl-auth's `Role` uses `FromStr`).
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum CliRole {
     Admin,
@@ -105,7 +105,7 @@ fn main() {
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         eprintln!(
-            "fleet-admin: failed to create directory {}: {e}",
+            "trawl-admin: failed to create directory {}: {e}",
             parent.display()
         );
         process::exit(1);
@@ -114,7 +114,7 @@ fn main() {
     let store = match KeyStore::open(&db_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("fleet-admin: failed to open auth database: {e}");
+            eprintln!("trawl-admin: failed to open auth database: {e}");
             process::exit(1);
         }
     };
@@ -138,7 +138,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("fleet-admin: {e}");
+        eprintln!("trawl-admin: {e}");
         process::exit(1);
     }
 }

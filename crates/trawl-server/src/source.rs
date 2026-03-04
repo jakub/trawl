@@ -500,13 +500,13 @@ mod tests {
         // Create day-level file only (no hourly subdirs).
         let day_dir = tmp.path().join(&today);
         std::fs::create_dir_all(&day_dir).unwrap();
-        std::fs::write(day_dir.join("fleetd.parquet"), b"data").unwrap();
+        std::fs::write(day_dir.join("trawld.parquet"), b"data").unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "service:fleetd last:1h", &fallback);
+        let source = compute_source(base, "service:trawld last:1h", &fallback);
 
         // Day-level glob must be present so the consolidated file is found.
-        let day_glob = format!("'{base}/{today}/fleetd.parquet'");
+        let day_glob = format!("'{base}/{today}/trawld.parquet'");
         assert!(
             source.contains(&day_glob),
             "expected day-level glob for today, got: {source}"

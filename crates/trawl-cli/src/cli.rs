@@ -353,10 +353,10 @@ fn render_span_error(query: &str, start: usize, end: usize, message: &str) {
 pub fn render_client_error(query: &str, err: &trawl_client::ClientError) {
     let details = err.error_details();
     if details.is_empty() {
-        eprintln!("fleet: {err}");
+        eprintln!("trawl: {err}");
     } else {
         if let Some(envelope) = err.error_envelope() {
-            eprintln!("fleet: {:?}: {}", envelope.code, envelope.message);
+            eprintln!("trawl: {:?}: {}", envelope.code, envelope.message);
         }
         render_error_details(query, details);
     }
@@ -366,18 +366,18 @@ pub fn render_client_error(query: &str, err: &trawl_client::ClientError) {
 pub fn render_engine_error(query: &str, err: &trawl_engine::error::EngineError) {
     match err {
         trawl_engine::error::EngineError::Parse(errors) => {
-            eprintln!("fleet: parse error");
+            eprintln!("trawl: parse error");
             let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
             render_error_details(query, &details);
         }
-        other => eprintln!("fleet: {other}"),
+        other => eprintln!("trawl: {other}"),
     }
 }
 
 // -- driver output formatters -------------------------------------------------
 
 /// Render driver result data (columns + JSON rows) in the requested format.
-/// Used by `fleet driver query` and `fleet driver get-results`.
+/// Used by `trawl driver query` and `trawl driver get-results`.
 pub fn render_driver_results(
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
@@ -391,7 +391,7 @@ pub fn render_driver_results(
         OutputFormat::Parquet => {
             writeln!(
                 out,
-                "parquet format is not supported for driver output, use -o with fleet query instead"
+                "parquet format is not supported for driver output, use -o with trawl query instead"
             )
         }
     }

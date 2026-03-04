@@ -58,7 +58,7 @@ impl KeyStore {
         Self::ensure_restricted_permissions(path.as_ref())?;
         let conn = rusqlite::Connection::open(path)?;
         // WAL mode: better crash safety + allows concurrent reads during writes
-        // (e.g. fleet-admin revoking a key while daemon is authenticating).
+        // (e.g. trawl-admin revoking a key while daemon is authenticating).
         // busy_timeout: retry on SQLITE_BUSY instead of failing immediately.
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         let store = Self { conn };
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn malformed_token_rejected() {
         let store = test_store();
-        let result = store.verify_key("not-a-fleet-token");
+        let result = store.verify_key("not-a-trawl-token");
         assert!(matches!(result, Err(AuthError::MalformedToken(_))));
     }
 

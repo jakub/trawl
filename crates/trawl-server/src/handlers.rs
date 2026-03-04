@@ -1,4 +1,4 @@
-//! HTTP request handlers for the fleet API.
+//! HTTP request handlers for the trawl API.
 
 use std::collections::HashMap;
 
@@ -245,7 +245,7 @@ pub async fn query(
 
 /// `GET /metrics` — prometheus scrape endpoint (unauthenticated).
 ///
-/// Collects process metrics and fleet gauges on each scrape, then
+/// Collects process metrics and trawl gauges on each scrape, then
 /// renders the prometheus text exposition format. The gauge collection
 /// (which may walk the filesystem on cache miss) runs in `spawn_blocking`
 /// to avoid stalling the async executor.
@@ -1434,7 +1434,7 @@ fn build_result_debug(result: Option<&QueryResult>) -> ResultDebug {
     }
 }
 
-/// Convert a fleet `Value` to a `serde_json::Value` for debug log output.
+/// Convert a trawl `Value` to a `serde_json::Value` for debug log output.
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::Null => serde_json::Value::Null,

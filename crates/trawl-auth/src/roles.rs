@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 
-/// The four roles in the fleet permission model.
+/// The four roles in the trawl permission model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {

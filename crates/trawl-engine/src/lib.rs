@@ -1,7 +1,7 @@
-//! fleet-engine: `DuckDB` integration and query execution.
+//! trawl-engine: `DuckDB` integration and query execution.
 //!
 //! This crate owns the database connection lifecycle, query execution,
-//! and result extraction. It takes SQL + parameters from fleet-core's
+//! and result extraction. It takes SQL + parameters from trawl-core's
 //! emitter and executes them against `DuckDB`.
 
 pub mod error;

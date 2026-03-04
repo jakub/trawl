@@ -1,4 +1,4 @@
-//! Shared test utilities for fleet-engine integration tests.
+//! Shared test utilities for trawl-engine integration tests.
 //!
 //! Generates deterministic fixtures (parquet and ndjson) using `DuckDB`
 //! itself, so we don't need arrow/parquet crates or external tooling.

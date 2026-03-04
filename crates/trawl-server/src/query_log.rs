@@ -2,7 +2,7 @@
 //!
 //! One JSON object per query execution, capturing DSL, generated SQL,
 //! source paths, hot buffer state, result sample, and timing. Designed
-//! for `tail -f /tmp/fleet-query.log | jq` debugging workflows.
+//! for `tail -f /tmp/trawl-query.log | jq` debugging workflows.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

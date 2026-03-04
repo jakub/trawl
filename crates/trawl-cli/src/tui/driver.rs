@@ -199,14 +199,14 @@ fn value_to_json(v: &trawl_engine::value::Value) -> serde_json::Value {
 // Socket listener
 // ---------------------------------------------------------------------------
 
-/// Default socket path: `~/.config/fleet/driver.sock`.
+/// Default socket path: `~/.config/trawl/driver.sock`.
 pub fn default_socket_path() -> PathBuf {
-    let config_dir = shellexpand::tilde("~/.config/fleet");
+    let config_dir = shellexpand::tilde("~/.config/trawl");
     PathBuf::from(config_dir.as_ref()).join("driver.sock")
 }
 
 // ---------------------------------------------------------------------------
-// Client (used by `fleet driver` subcommands)
+// Client (used by `trawl driver` subcommands)
 // ---------------------------------------------------------------------------
 
 /// Connect to a running TUI's driver socket, send a request, and return the

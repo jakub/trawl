@@ -13,16 +13,16 @@ use trawl_server::state::AppState;
 use trawl_server::telemetry::{self, WalHandle, WalLayer};
 use trawl_server::transport::http;
 
-/// fleetd — the fleet daemon.
+/// trawld — the trawl daemon.
 #[derive(Parser)]
-#[command(name = "fleetd", version, long_version = trawl_core::version::long_version(), about)]
+#[command(name = "trawld", version, long_version = trawl_core::version::long_version(), about)]
 struct Cli {
     /// Path to the configuration file.
-    #[arg(long, env = "FLEET_CONFIG", default_value = "~/.fleet/fleetd.toml")]
+    #[arg(long, env = "TRAWL_CONFIG", default_value = "~/.trawl/trawld.toml")]
     config: String,
 
     /// Path to ndjson query debug log. Overrides config `server.query_log`.
-    #[arg(long, env = "FLEET_QUERY_LOG")]
+    #[arg(long, env = "TRAWL_QUERY_LOG")]
     query_log: Option<std::path::PathBuf>,
 
     /// Disable the live monitor dashboard (use traditional log output).
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rustc = trawl_core::version::RUSTC_VERSION,
         target = trawl_core::version::TARGET_TRIPLE,
         monitor = monitor_active,
-        "starting fleetd"
+        "starting trawld"
     );
 
     // Install the prometheus metrics recorder before building state.

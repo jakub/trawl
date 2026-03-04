@@ -1,6 +1,6 @@
-//! AST type definitions for the fleet query language.
+//! AST type definitions for the trawl query language.
 //!
-//! These types represent the parsed structure of a fleet DSL query.
+//! These types represent the parsed structure of a trawl DSL query.
 //! The AST is the contract between the parser and the SQL emitter.
 
 use std::fmt;
@@ -27,7 +27,7 @@ impl<T> Spanned<T> {
 // Top-level query
 // ---------------------------------------------------------------------------
 
-/// A complete fleet DSL query: an optional search stage followed by zero or
+/// A complete trawl DSL query: an optional search stage followed by zero or
 /// more pipe stages.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {

@@ -28,7 +28,7 @@ pub fn generate(output_dir: &Path, extra_san: &[String]) -> Result<(), String> {
         .map_err(|e| format!("certificate params failed: {e}"))?;
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "fleet self-signed");
+        .push(rcgen::DnType::CommonName, "trawl self-signed");
     params.not_before = time::OffsetDateTime::now_utc();
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(730);
 
@@ -75,7 +75,7 @@ pub fn generate(output_dir: &Path, extra_san: &[String]) -> Result<(), String> {
 
     println!("cert: {}", cert_path.display());
     println!("key:  {}", key_path.display());
-    eprintln!("done — restart fleetd to pick up the new certificate");
+    eprintln!("done — restart trawld to pick up the new certificate");
 
     Ok(())
 }

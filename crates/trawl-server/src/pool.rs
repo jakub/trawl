@@ -81,7 +81,7 @@ pub struct ExecuteOutcome {
 /// database, sharing cached metadata.
 #[derive(Clone)]
 pub struct ExecutorPool {
-    /// Base directory for parquet data (e.g. `/var/lib/fleet/data`).
+    /// Base directory for parquet data (e.g. `/var/lib/trawl/data`).
     base_dir: Arc<str>,
     /// Full recursive glob for queries without a time filter.
     fallback_glob: Arc<str>,
@@ -92,7 +92,7 @@ pub struct ExecutorPool {
     next_id: Arc<AtomicU64>,
     /// Interrupt callbacks for currently executing queries, keyed by ID
     /// for precise removal on completion. Type-erased to avoid coupling
-    /// to duckdb outside fleet-engine.
+    /// to duckdb outside trawl-engine.
     active_interrupts: Arc<Mutex<InterruptMap>>,
     /// Pre-created executors sharing the same `DuckDB` database.
     /// The semaphore guarantees an executor is available when a permit
@@ -762,14 +762,14 @@ mod tests {
 
     #[test]
     fn fallback_glob_derived_from_base_dir() {
-        let pool = ExecutorPool::new("/var/lib/fleet/data".into(), 1, 100_000, None);
-        assert_eq!(&*pool.fallback_glob, "/var/lib/fleet/data/**/*.parquet");
+        let pool = ExecutorPool::new("/var/lib/trawl/data".into(), 1, 100_000, None);
+        assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
     #[test]
     fn fallback_glob_strips_trailing_slash() {
-        let pool = ExecutorPool::new("/var/lib/fleet/data/".into(), 1, 100_000, None);
-        assert_eq!(&*pool.fallback_glob, "/var/lib/fleet/data/**/*.parquet");
+        let pool = ExecutorPool::new("/var/lib/trawl/data/".into(), 1, 100_000, None);
+        assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
     #[tokio::test]

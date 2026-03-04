@@ -1,17 +1,17 @@
 fn main() {
     let sha = cmd("git", &["rev-parse", "--short", "HEAD"]);
     println!(
-        "cargo:rustc-env=FLEET_GIT_SHA={}",
+        "cargo:rustc-env=TRAWL_GIT_SHA={}",
         sha.as_deref().unwrap_or("unknown")
     );
 
     let dirty = cmd("git", &["status", "--porcelain"])
         .map_or_else(|| "false".to_string(), |s| (!s.is_empty()).to_string());
-    println!("cargo:rustc-env=FLEET_GIT_DIRTY={dirty}");
+    println!("cargo:rustc-env=TRAWL_GIT_DIRTY={dirty}");
 
     let date = cmd("git", &["log", "-1", "--format=%cd", "--date=short"]);
     println!(
-        "cargo:rustc-env=FLEET_GIT_DATE={}",
+        "cargo:rustc-env=TRAWL_GIT_DATE={}",
         date.as_deref().unwrap_or("unknown")
     );
 
@@ -21,12 +21,12 @@ fn main() {
             .map(|l| l.trim_start_matches("release:").trim().to_string())
     });
     println!(
-        "cargo:rustc-env=FLEET_RUSTC_VERSION={}",
+        "cargo:rustc-env=TRAWL_RUSTC_VERSION={}",
         rustc_ver.as_deref().unwrap_or("unknown")
     );
 
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
-    println!("cargo:rustc-env=FLEET_TARGET_TRIPLE={target}");
+    println!("cargo:rustc-env=TRAWL_TARGET_TRIPLE={target}");
 
     // Rerun when git state changes.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();

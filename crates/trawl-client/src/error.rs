@@ -2,7 +2,7 @@
 
 use trawl_api::{ErrorCode, ErrorDetail, ErrorEnvelope};
 
-/// Errors from the fleet client library.
+/// Errors from the trawl client library.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// HTTP transport failure.

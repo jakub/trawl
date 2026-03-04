@@ -76,7 +76,7 @@ pub struct ServerConfig {
     /// logged as ndjson to this file for `tail -f | jq` debugging.
     pub query_log: Option<PathBuf>,
 
-    /// Allowed CORS origins (e.g. `["https://fleet.example.com"]`).
+    /// Allowed CORS origins (e.g. `["https://trawl.example.com"]`).
     /// Empty list (default) means no CORS headers are sent, so the browser's
     /// same-origin policy blocks all cross-origin requests.
     #[serde(default)]
@@ -102,7 +102,7 @@ pub struct ServerConfig {
     pub rate_limit: RateLimitConfig,
 
     /// Monitor dashboard refresh interval in milliseconds (default: 1000).
-    /// Only used when fleetd runs interactively with a TTY.
+    /// Only used when trawld runs interactively with a TTY.
     #[serde(default = "default_monitor_refresh_ms")]
     pub monitor_refresh_ms: u64,
 }
@@ -130,7 +130,7 @@ pub struct RateLimitConfig {
 /// Parquet data source settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DataConfig {
-    /// Directory containing parquet files (e.g. "/var/lib/fleet/data").
+    /// Directory containing parquet files (e.g. "/var/lib/trawl/data").
     ///
     /// Accepts either a bare directory path or a glob pattern for backwards
     /// compatibility. If the path contains glob characters (`*`, `?`, `[`),
@@ -198,8 +198,8 @@ pub struct IngestConfig {
     #[serde(default = "default_compaction_interval_secs")]
     pub compaction_interval_secs: u64,
 
-    /// Write internal server events to the ingest pipeline as `service:fleetd`.
-    /// Enables querying server telemetry via the fleet DSL for dashboards
+    /// Write internal server events to the ingest pipeline as `service:trawld`.
+    /// Enables querying server telemetry via the trawl DSL for dashboards
     /// and audit trails. Default: true (when ingest is enabled).
     #[serde(default = "default_internal_telemetry")]
     pub internal_telemetry: bool,
@@ -583,7 +583,7 @@ pub struct AuthConfig {
     pub db_path: PathBuf,
 
     /// How often to poll the auth database for key changes (seconds).
-    /// Detects keys created/revoked by fleet-admin and emits audit events.
+    /// Detects keys created/revoked by trawl-admin and emits audit events.
     /// Set to 0 to disable. Default: 30.
     #[serde(default = "default_audit_interval_secs")]
     pub audit_interval_secs: u64,
@@ -779,7 +779,7 @@ impl Config {
         if self.ingest.internal_telemetry && self.server.log_file.is_some() {
             warns.push(
                 "log_file is deprecated when internal_telemetry is enabled — \
-                 server events now flow through the ingest pipeline as service:fleetd"
+                 server events now flow through the ingest pipeline as service:trawld"
                     .into(),
             );
         }
@@ -855,16 +855,16 @@ mod tests {
 [server]
 
 [data]
-path = "/var/lib/fleet/data/**/*.parquet"
+path = "/var/lib/trawl/data/**/*.parquet"
 
 [auth]
-db_path = "/var/lib/fleet/auth.db"
+db_path = "/var/lib/trawl/auth.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.http_addr, "127.0.0.1:8080");
         assert_eq!(config.server.timeout_secs, 30);
         assert!(config.server.max_concurrent_queries > 0);
-        assert_eq!(config.data.path, "/var/lib/fleet/data/**/*.parquet");
+        assert_eq!(config.data.path, "/var/lib/trawl/data/**/*.parquet");
         assert!(config.server.log_file.is_none());
         assert!(config.server.tls_cert_path.is_none());
         assert!(config.server.tls_key_path.is_none());
@@ -877,13 +877,13 @@ db_path = "/var/lib/fleet/auth.db"
 http_addr = "0.0.0.0:9090"
 timeout_secs = 60
 max_concurrent_queries = 8
-log_file = "/var/log/fleetd.log"
+log_file = "/var/log/trawld.log"
 
 [data]
 path = "/data/**/*.parquet"
 
 [auth]
-db_path = "~/.fleet/auth.db"
+db_path = "~/.trawl/auth.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.http_addr, "0.0.0.0:9090");
@@ -891,7 +891,7 @@ db_path = "~/.fleet/auth.db"
         assert_eq!(config.server.max_concurrent_queries, 8);
         assert_eq!(
             config.server.log_file.as_deref(),
-            Some(std::path::Path::new("/var/log/fleetd.log"))
+            Some(std::path::Path::new("/var/log/trawld.log"))
         );
     }
 
@@ -942,8 +942,8 @@ db_path = "/tmp/auth.db"
     fn parse_tls_config() {
         let toml = r#"
 [server]
-tls_cert_path = "/etc/fleet/cert.pem"
-tls_key_path = "/etc/fleet/key.pem"
+tls_cert_path = "/etc/trawl/cert.pem"
+tls_key_path = "/etc/trawl/key.pem"
 [data]
 path = "/data/*.parquet"
 [auth]
@@ -952,11 +952,11 @@ db_path = "/tmp/auth.db"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(
             config.server.tls_cert_path.as_deref(),
-            Some(std::path::Path::new("/etc/fleet/cert.pem"))
+            Some(std::path::Path::new("/etc/trawl/cert.pem"))
         );
         assert_eq!(
             config.server.tls_key_path.as_deref(),
-            Some(std::path::Path::new("/etc/fleet/key.pem"))
+            Some(std::path::Path::new("/etc/trawl/key.pem"))
         );
     }
 
@@ -964,7 +964,7 @@ db_path = "/tmp/auth.db"
     fn validation_rejects_partial_tls_config() {
         let toml = r#"
 [server]
-tls_cert_path = "/etc/fleet/cert.pem"
+tls_cert_path = "/etc/trawl/cert.pem"
 [data]
 path = "/data/*.parquet"
 [auth]
@@ -993,8 +993,8 @@ db_path = "/tmp/auth.db"
     fn no_warning_when_tls_cert_configured() {
         let toml = r#"
 [server]
-tls_cert_path = "/etc/fleet/cert.pem"
-tls_key_path = "/etc/fleet/key.pem"
+tls_cert_path = "/etc/trawl/cert.pem"
+tls_key_path = "/etc/trawl/key.pem"
 [data]
 path = "/data/*.parquet"
 [auth]
@@ -1021,25 +1021,25 @@ db_path = "/tmp/auth.db"
     #[test]
     fn base_dir_strips_glob() {
         let data = DataConfig {
-            path: "/var/lib/fleet/data/**/*.parquet".into(),
+            path: "/var/lib/trawl/data/**/*.parquet".into(),
         };
-        assert_eq!(data.base_dir(), std::path::Path::new("/var/lib/fleet/data"));
+        assert_eq!(data.base_dir(), std::path::Path::new("/var/lib/trawl/data"));
     }
 
     #[test]
     fn base_dir_bare_directory() {
         let data = DataConfig {
-            path: "/var/lib/fleet/data".into(),
+            path: "/var/lib/trawl/data".into(),
         };
-        assert_eq!(data.base_dir(), std::path::Path::new("/var/lib/fleet/data"));
+        assert_eq!(data.base_dir(), std::path::Path::new("/var/lib/trawl/data"));
     }
 
     #[test]
     fn parquet_glob_from_directory() {
         let data = DataConfig {
-            path: "/var/lib/fleet/data".into(),
+            path: "/var/lib/trawl/data".into(),
         };
-        assert_eq!(data.parquet_glob(), "/var/lib/fleet/data/**/*.parquet");
+        assert_eq!(data.parquet_glob(), "/var/lib/trawl/data/**/*.parquet");
     }
 
     #[test]
@@ -1053,9 +1053,9 @@ db_path = "/tmp/auth.db"
     #[test]
     fn parquet_glob_strips_trailing_slash() {
         let data = DataConfig {
-            path: "/var/lib/fleet/data/".into(),
+            path: "/var/lib/trawl/data/".into(),
         };
-        assert_eq!(data.parquet_glob(), "/var/lib/fleet/data/**/*.parquet");
+        assert_eq!(data.parquet_glob(), "/var/lib/trawl/data/**/*.parquet");
     }
 
     #[test]
@@ -1081,7 +1081,7 @@ db_path = "/tmp/auth.db"
     fn cors_parses_origins() {
         let toml = r#"
 [server]
-cors_allowed_origins = ["https://fleet.example.com", "https://admin.example.com"]
+cors_allowed_origins = ["https://trawl.example.com", "https://admin.example.com"]
 [data]
 path = "/data/*.parquet"
 [auth]
@@ -1091,7 +1091,7 @@ db_path = "/tmp/auth.db"
         assert_eq!(config.server.cors_allowed_origins.len(), 2);
         assert_eq!(
             config.server.cors_allowed_origins[0],
-            "https://fleet.example.com"
+            "https://trawl.example.com"
         );
     }
 
@@ -1188,7 +1188,7 @@ internal_telemetry = true
     fn internal_telemetry_warns_log_file_deprecated() {
         let toml = r#"
 [server]
-log_file = "/var/log/fleetd.log"
+log_file = "/var/log/trawld.log"
 [data]
 path = "/data"
 [auth]

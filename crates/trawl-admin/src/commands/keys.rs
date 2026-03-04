@@ -1,4 +1,4 @@
-//! Handlers for `fleet-admin keys` subcommands.
+//! Handlers for `trawl-admin keys` subcommands.
 
 use std::time::Duration;
 
