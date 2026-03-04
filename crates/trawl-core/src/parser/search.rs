@@ -212,7 +212,7 @@ pub(crate) fn search_stage<'src>()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{FleetDuration, TimeUnit};
+    use crate::ast::{TimeUnit, TrawlDuration};
 
     #[test]
     fn test_time_filter() {
@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(
             tf.node,
             TimeFilter {
-                duration: FleetDuration {
+                duration: TrawlDuration {
                     quantity: 2,
                     unit: TimeUnit::Hours,
                 },

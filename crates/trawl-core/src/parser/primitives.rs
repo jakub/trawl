@@ -5,7 +5,7 @@
 
 use chumsky::prelude::*;
 
-use crate::ast::{FilterOp, FleetDuration, LiteralValue, Spanned, TimeUnit};
+use crate::ast::{FilterOp, LiteralValue, Spanned, TimeUnit, TrawlDuration};
 
 /// Shorthand for our parser type — `&str` input, `Rich` errors.
 pub(crate) type ParserInput<'src> = &'src str;
@@ -196,7 +196,7 @@ pub(crate) fn time_unit<'src>()
 /// Rejects zero-duration values and durations large enough to overflow
 /// `u64` when converted to seconds.
 pub(crate) fn duration<'src>()
--> impl Parser<'src, ParserInput<'src>, FleetDuration, ParserExtra<'src>> + Clone {
+-> impl Parser<'src, ParserInput<'src>, TrawlDuration, ParserExtra<'src>> + Clone {
     uint()
         .then(time_unit())
         .try_map(|(quantity, unit), span| {
@@ -213,7 +213,7 @@ pub(crate) fn duration<'src>()
             if quantity.checked_mul(multiplier).is_none() {
                 return Err(Rich::custom(span, "duration too large"));
             }
-            Ok(FleetDuration { quantity, unit })
+            Ok(TrawlDuration { quantity, unit })
         })
         .labelled("duration")
 }

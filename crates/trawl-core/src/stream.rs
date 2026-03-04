@@ -787,7 +787,7 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
             let span_secs = s
                 .span
                 .as_ref()
-                .map_or(60, crate::ast::FleetDuration::to_seconds);
+                .map_or(60, crate::ast::TrawlDuration::to_seconds);
             let accumulators: Vec<_> = s.aggregations.iter().map(compile_agg_expr).collect();
             let group_by: Vec<_> = s
                 .group_by

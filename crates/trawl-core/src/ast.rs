@@ -133,17 +133,17 @@ pub struct TextSearch {
 /// Time-range filter (`last:2h`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeFilter {
-    pub duration: FleetDuration,
+    pub duration: TrawlDuration,
 }
 
 /// A duration that preserves the original unit as written by the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FleetDuration {
+pub struct TrawlDuration {
     pub quantity: u64,
     pub unit: TimeUnit,
 }
 
-impl FleetDuration {
+impl TrawlDuration {
     /// Seconds-per-unit multiplier for this duration's time unit.
     #[must_use]
     pub const fn unit_multiplier(&self) -> u64 {
@@ -179,7 +179,7 @@ impl FleetDuration {
     }
 }
 
-impl fmt::Display for FleetDuration {
+impl fmt::Display for TrawlDuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}{}", self.quantity, self.unit)
     }
@@ -379,7 +379,7 @@ pub struct DedupStage {
 /// `timechart span=5m count() by service` — time-bucketed aggregation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimechartStage {
-    pub span: Option<FleetDuration>,
+    pub span: Option<TrawlDuration>,
     pub aggregations: Vec<AggExpr>,
     pub group_by: Vec<String>,
 }

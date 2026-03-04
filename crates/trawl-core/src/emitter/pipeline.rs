@@ -1,4 +1,4 @@
-use crate::ast::{ExtractMode, FleetDuration, PipeStage, SortDirection};
+use crate::ast::{ExtractMode, PipeStage, SortDirection, TrawlDuration};
 
 use super::EmitError;
 use super::SqlValue;
@@ -371,8 +371,8 @@ fn process_timechart(
 }
 
 /// Auto-bucketing heuristic: map time filter duration to a reasonable bucket span.
-fn auto_bucket_interval(time_filter: Option<&crate::ast::FleetDuration>) -> String {
-    let seconds = time_filter.map_or(3600, FleetDuration::to_seconds);
+fn auto_bucket_interval(time_filter: Option<&crate::ast::TrawlDuration>) -> String {
+    let seconds = time_filter.map_or(3600, TrawlDuration::to_seconds);
 
     if seconds <= 3600 {
         "1 minutes"

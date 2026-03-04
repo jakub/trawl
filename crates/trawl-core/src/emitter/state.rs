@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use crate::ast::FleetDuration;
+use crate::ast::TrawlDuration;
 
 use super::SqlValue;
 
@@ -46,7 +46,7 @@ pub(crate) struct EmitterState {
     pub(crate) has_projection: bool,
     /// The time filter from the search stage, used by `timechart` auto-bucketing.
     /// Not reset on CTE flush — this is query-wide context.
-    pub(crate) time_filter: Option<FleetDuration>,
+    pub(crate) time_filter: Option<TrawlDuration>,
     /// Set by `pivot` stage — overrides normal `build_select()` in `finalize()`.
     pivot: Option<PivotSpec>,
     ctes: Vec<Cte>,
