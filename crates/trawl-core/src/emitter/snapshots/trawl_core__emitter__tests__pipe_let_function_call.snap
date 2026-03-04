@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | let host_lower = lower(host)\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('host_lower')), (LOWER("host")) AS "host_lower"
+FROM "_s0"

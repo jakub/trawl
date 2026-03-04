@@ -1,0 +1,5 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_err(r#\"* | extract \"([0-9]+)\" from message\"#)"
+---
+unsupported operation: extract regex must contain at least one named capture group (?P<name>...)

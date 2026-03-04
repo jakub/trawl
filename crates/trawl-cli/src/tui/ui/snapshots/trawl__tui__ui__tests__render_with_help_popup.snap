@@ -1,0 +1,28 @@
+---
+source: crates/trawl-cli/src/tui/ui/mod.rs
+expression: terminal.backend().to_string()
+---
+" S  1 ●                                                  ctrl+t new  ctrl+w clos"
+" H ┌ Query Editor ─────────────────────────────────────────────────────────────┐"
+" Q │                                                                           │"
+" R │                                                                           │"
+"   │            ┌ Help ────────────────────────────────────────┐               │"
+"   │            │                                              │               │"
+"   │            │Ctrl — App Actions                            │               │"
+"   │            │                                              │               │"
+"   │            │  Ctrl+Q          - quit                      │               │"
+"   │            │  Ctrl+T          - new tab                   │               │"
+"   └────────────│  Ctrl+W          - close tab / delete word (e│───────────────┘"
+"   ┌ Results ───│  Ctrl+S          - save current query        │───────────────┐"
+"   │ no results │  Ctrl+L          - clear editor              │               │"
+"   │            │  Ctrl+Enter      - execute query             │               │"
+"   │            │  Ctrl+Z/Y        - undo / redo               │               │"
+"   │            │  Ctrl+C/X/V      - copy / cut / paste        │               │"
+"   │            │  Ctrl+A/E        - line start / end          │               │"
+"   │            │  Ctrl+U/K        - kill to line start / end  │               │"
+"   │            │                                              │               │"
+"   │            └──────────────────────────────────────────────┘               │"
+"   │                                                                           │"
+"   │                                                                           │"
+"   └───────────────────────────────────────────────────────────────────────────┘"
+"   idle [editor]                              F3: history | F4: saved | F1: help"

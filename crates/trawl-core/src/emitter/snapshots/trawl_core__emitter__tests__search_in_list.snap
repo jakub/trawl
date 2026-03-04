@@ -1,0 +1,12 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"status:200,301,404\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE "status" IN (?, ?, ?)
+---
+params:
+  0: 200
+  1: 301
+  2: 404

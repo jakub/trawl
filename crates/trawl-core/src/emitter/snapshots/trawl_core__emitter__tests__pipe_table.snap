@@ -1,0 +1,6 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | table host, service, message\")"
+---
+SELECT "host", "service", "message"
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)

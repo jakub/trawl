@@ -1,0 +1,17 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | let x = duration * 1000 | let y = x + 100\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+), _s1 AS (
+  SELECT COLUMNS(c -> c NOT IN ('x')), (("duration" * ?)) AS "x"
+  FROM "_s0"
+)
+SELECT COLUMNS(c -> c NOT IN ('y')), (("x" + ?)) AS "y"
+FROM "_s1"
+---
+params:
+  0: 1000
+  1: 100

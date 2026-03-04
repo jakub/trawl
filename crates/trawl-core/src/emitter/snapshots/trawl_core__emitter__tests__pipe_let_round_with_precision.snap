@@ -1,0 +1,14 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | let pct = round(count * 100.0 / 1000, 2)\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('pct')), (ROUND((("count" * ?) / ?), 2)) AS "pct"
+FROM "_s0"
+---
+params:
+  0: 100
+  1: 1000

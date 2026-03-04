@@ -1,0 +1,5 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_err(\"* | stats bogus()\")"
+---
+unknown function: bogus

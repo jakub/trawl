@@ -1,0 +1,13 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"service:nginx level:error OR service:postgres level:warn\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE (("service" = ? AND "level" = ?) OR ("service" = ? AND "level" = ?))
+---
+params:
+  0: 'nginx'
+  1: 'error'
+  2: 'postgres'
+  3: 'warn'

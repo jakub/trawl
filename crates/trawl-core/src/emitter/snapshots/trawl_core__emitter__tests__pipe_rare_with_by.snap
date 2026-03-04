@@ -1,0 +1,13 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | rare 5 status by host\")"
+---
+WITH _s0 AS (
+  SELECT "status", "host", COUNT(*) AS "count"
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  GROUP BY "status", "host"
+)
+SELECT *
+FROM "_s0"
+ORDER BY "count" ASC
+LIMIT 5

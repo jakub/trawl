@@ -1,0 +1,9 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"last:7d | timechart count()\")"
+---
+SELECT time_bucket(INTERVAL '1 hours', CAST("timestamp" AS TIMESTAMP)) AS "_time", COUNT(*) AS "count"
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '7 days'
+GROUP BY "_time"
+ORDER BY "_time" ASC

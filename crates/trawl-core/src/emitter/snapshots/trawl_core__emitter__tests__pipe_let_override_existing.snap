@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | let level = lower(level)\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('level')), (LOWER("level")) AS "level"
+FROM "_s0"

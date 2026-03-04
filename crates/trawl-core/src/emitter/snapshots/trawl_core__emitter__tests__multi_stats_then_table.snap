@@ -1,0 +1,15 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"service:nginx | stats avg(duration) by status | table status, avg_duration\")"
+---
+WITH _s0 AS (
+  SELECT "status", AVG("duration") AS "avg_duration"
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  WHERE "service" = ?
+  GROUP BY "status"
+)
+SELECT "status", "avg_duration"
+FROM "_s0"
+---
+params:
+  0: 'nginx'

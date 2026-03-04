@@ -1,0 +1,14 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"service:nginx | extract kv from message | head 5\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE "service" = ?
+---
+params:
+  0: 'nginx'
+---
+rust_stages: 2
+  Extract(ExtractStage { mode: KeyValue { separator: '=' }, source_field: Some("message") })
+  Limit(LimitStage { count: 5 })

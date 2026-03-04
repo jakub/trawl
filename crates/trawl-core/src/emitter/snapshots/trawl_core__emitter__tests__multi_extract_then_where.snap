@@ -1,0 +1,20 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"service:nginx | extract \"(?P<code>[0-9]{3})\" from message | where code == \"500\"\"#)"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  WHERE "service" = ?
+), _s1 AS (
+  SELECT *, nullif(regexp_extract("message", ?, 1), '') AS "code"
+  FROM "_s0"
+)
+SELECT *
+FROM "_s1"
+WHERE ("code" = ?)
+---
+params:
+  0: 'nginx'
+  1: '(?P<code>[0-9]{3})'
+  2: '500'

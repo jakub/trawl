@@ -1,0 +1,5 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_err(r#\"* | let r = round(duration, \"two\")\"#)"
+---
+invalid aggregation: round() argument 2 must be an integer literal

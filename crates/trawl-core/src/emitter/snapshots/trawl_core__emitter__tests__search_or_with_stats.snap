@@ -1,0 +1,11 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"service:kernel OR service:trawld | stats count()\")"
+---
+SELECT COUNT(*) AS "count"
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE (("service" = ?) OR ("service" = ?))
+---
+params:
+  0: 'kernel'
+  1: 'trawld'

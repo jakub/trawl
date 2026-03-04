@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | let a = lower(service), b = length(service)\")"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('a', 'b')), (LOWER("service")) AS "a", (LENGTH("service")) AS "b"
+FROM "_s0"

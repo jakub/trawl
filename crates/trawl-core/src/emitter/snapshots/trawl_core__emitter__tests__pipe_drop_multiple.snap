@@ -1,0 +1,6 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"* | drop message, raw, src_ip\")"
+---
+SELECT * EXCLUDE ("message", "raw", "src_ip")
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
