@@ -57,17 +57,17 @@ jobs:
 
       - name: Build .deb packages
         run: |
-          cargo deb -p fleet-server --no-build --target ${{ matrix.target }}
-          cargo deb -p fleet-cli --no-build --target ${{ matrix.target }}
+          cargo deb -p trawl-server --no-build --target ${{ matrix.target }}
+          cargo deb -p trawl-cli --no-build --target ${{ matrix.target }}
 
       - name: Create tarball
         run: |
           tag="${GITHUB_REF_NAME}"
-          staging="fleet-${tag}-${{ matrix.target }}"
+          staging="trawl-${tag}-${{ matrix.target }}"
           mkdir -p "${staging}"
-          cp "target/${{ matrix.target }}/release/fleet" "${staging}/"
-          cp "target/${{ matrix.target }}/release/fleetd" "${staging}/"
-          cp "target/${{ matrix.target }}/release/fleet-admin" "${staging}/"
+          cp "target/${{ matrix.target }}/release/trawl" "${staging}/"
+          cp "target/${{ matrix.target }}/release/trawld" "${staging}/"
+          cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
           tar czf "${staging}.tar.gz" "${staging}"
 
       - name: Upload artifacts
@@ -75,7 +75,7 @@ jobs:
         with:
           name: dist-${{ matrix.target }}
           path: |
-            fleet-*.tar.gz
+            trawl-*.tar.gz
             target/${{ matrix.target }}/debian/*.deb
           if-no-files-found: error
 
@@ -154,8 +154,8 @@ jobs:
           # Generate Release file
           cd apt/dists/stable
           cat > Release <<-EOF
-          Origin: Fleet
-          Label: Fleet
+          Origin: Trawl
+          Label: Trawl
           Suite: stable
           Codename: stable
           Architectures: amd64 arm64

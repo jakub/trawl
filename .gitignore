@@ -23,7 +23,7 @@
 .bacon-locations
 
 # generated test fixtures
-crates/fleet-engine/tests/fixtures/
+crates/trawl-engine/tests/fixtures/
 
 # vector log data
 data/
