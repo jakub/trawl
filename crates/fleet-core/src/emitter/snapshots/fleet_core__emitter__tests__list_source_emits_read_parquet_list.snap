@@ -1,6 +1,0 @@
----
-source: crates/fleet-core/src/emitter/mod.rs
-expression: format_result(&result)
----
-SELECT *
-FROM read_parquet(['/data/2026-02-12/14/*.parquet', '/data/2026-02-12/15/*.parquet'], union_by_name=true)

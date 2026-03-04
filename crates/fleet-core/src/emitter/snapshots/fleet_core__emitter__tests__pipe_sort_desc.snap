@@ -1,7 +1,0 @@
----
-source: crates/fleet-core/src/emitter/mod.rs
-expression: "emit_dsl(\"* | sort -count\")"
----
-SELECT *
-FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-ORDER BY "count" DESC
