@@ -35,22 +35,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          cache-all-crates: true
 
       - name: Install zig (cross-compile)
         if: matrix.cross
         uses: mlugg/setup-zig@v2
-
-      - name: Install cargo-zigbuild (cross-compile)
-        if: matrix.cross
-        run: cargo install cargo-zigbuild
-
-      - name: Build (native)
-        if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
 
       - name: Install cross-arch dpkg libs (cross-compile)
         if: matrix.cross
@@ -61,8 +50,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libc6-arm64-cross dpkg-dev
 
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild,cargo-deb
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
 
       - name: Build .deb packages
         run: |
@@ -120,7 +118,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: gh-pages
-          fetch-depth: 0
+          fetch-depth: 1
         continue-on-error: true
         id: checkout-pages
 
@@ -144,7 +142,10 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
       - name: Build APT repository
+        shell: bash
         run: |
+          set -euo pipefail
+
           # Collect .deb files into pool
           mkdir -p apt/pool
           find incoming -name '*.deb' -exec cp {} apt/pool/ \;
@@ -154,35 +155,32 @@ jobs:
           for arch in amd64 arm64; do
             dir="apt/dists/stable/main/binary-${arch}"
             mkdir -p "${dir}"
-
-            # Filter debs for this arch
             dpkg-scanpackages --arch "${arch}" apt/pool /dev/null > "${dir}/Packages"
             gzip -9c "${dir}/Packages" > "${dir}/Packages.gz"
           done
 
           # Generate Release file
           cd apt/dists/stable
-          cat > Release <<-EOF
+          cat > Release <<'RELEASE'
           Origin: Trawl
           Label: Trawl
           Suite: stable
           Codename: stable
           Architectures: amd64 arm64
           Components: main
-          Date: $(date -Ru)
-          EOF
-
+          RELEASE
+          # Add dynamic date field
+          echo "Date: $(date -Ru)" >> Release
           # Strip leading whitespace from heredoc
           sed -i 's/^[[:space:]]*//' Release
-
           # Add hashes
           apt-ftparchive release . >> Release
 
           # Sign
-          gpg_key="$(gpg --list-secret-keys --keyid-format long 2>/dev/null | grep '^sec' | head -1 | awk '{print $2}' | cut -d/ -f2)"
+          gpg_key="$(gpg --list-secret-keys --keyid-format long 2>/dev/null \
+            | grep '^sec' | head -1 | awk '{print $2}' | cut -d/ -f2)"
           gpg --batch --yes --default-key "${gpg_key}" --detach-sign --armor -o Release.gpg Release
           gpg --batch --yes --default-key "${gpg_key}" --clearsign -o InRelease Release
-
           cd ../../..
 
           # Export public key
