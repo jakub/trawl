@@ -26,6 +26,11 @@ jobs:
             arch: arm64
             cross: true
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
