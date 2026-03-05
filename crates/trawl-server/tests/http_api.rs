@@ -35,65 +35,98 @@ fn free_port() -> u16 {
 
 /// Generate test parquet fixtures using `DuckDB`.
 ///
-/// Creates per-service parquet files matching the compaction naming
-/// convention (`{service}.parquet`), so service-scoped glob narrowing
-/// works correctly in integration tests.
-fn ensure_fixtures(dir: &std::path::Path) -> String {
-    let parquet_dir = dir.join("parquet");
-    let nginx_path = parquet_dir.join("nginx.parquet");
-    if nginx_path.exists() {
-        return format!("{}/**/*.parquet", parquet_dir.display());
+/// Writes fixtures to a stable path under `CARGO_MANIFEST_DIR` so all
+/// nextest processes share the same files. Uses PID-unique temp files
+/// and atomic rename for race-free coordination.
+fn ensure_fixtures() -> String {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("parquet");
+    let nginx_path = dir.join("nginx.parquet");
+
+    if !nginx_path.exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        let suffix = format!("_{}", std::process::id());
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+
+        conn.execute_batch(
+            "CREATE TABLE logs (
+                timestamp TIMESTAMP,
+                host VARCHAR,
+                service VARCHAR,
+                level VARCHAR,
+                message VARCHAR
+            )",
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO logs VALUES
+            ('2024-01-15 10:00:00', 'web01', 'nginx', 'info', 'request ok'),
+            ('2024-01-15 10:00:01', 'web01', 'nginx', 'error', 'upstream timeout'),
+            ('2024-01-15 10:00:02', 'db01', 'postgres', 'info', 'checkpoint complete')",
+        )
+        .unwrap();
+
+        // Write per-service parquet files to match compaction naming convention.
+        let nginx_tmp = dir.join(format!("nginx{suffix}.parquet"));
+        let postgres_tmp = dir.join(format!("postgres{suffix}.parquet"));
+
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM logs WHERE service = 'nginx') TO '{}' (FORMAT PARQUET)",
+            nginx_tmp.display()
+        ))
+        .unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM logs WHERE service = 'postgres') TO '{}' (FORMAT PARQUET)",
+            postgres_tmp.display()
+        ))
+        .unwrap();
+
+        // Atomic rename — loser's rename fails harmlessly if winner already placed the file.
+        let _ = std::fs::rename(&nginx_tmp, nginx_path);
+        let _ = std::fs::rename(&postgres_tmp, dir.join("postgres.parquet"));
+        // Clean up if we lost the race.
+        let _ = std::fs::remove_file(&nginx_tmp);
+        let _ = std::fs::remove_file(&postgres_tmp);
     }
 
-    std::fs::create_dir_all(&parquet_dir).unwrap();
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-
-    conn.execute_batch(
-        "CREATE TABLE logs (
-            timestamp TIMESTAMP,
-            host VARCHAR,
-            service VARCHAR,
-            level VARCHAR,
-            message VARCHAR
-        )",
-    )
-    .unwrap();
-
-    conn.execute_batch(
-        "INSERT INTO logs VALUES
-        ('2024-01-15 10:00:00', 'web01', 'nginx', 'info', 'request ok'),
-        ('2024-01-15 10:00:01', 'web01', 'nginx', 'error', 'upstream timeout'),
-        ('2024-01-15 10:00:02', 'db01', 'postgres', 'info', 'checkpoint complete')",
-    )
-    .unwrap();
-
-    // Write per-service parquet files to match compaction naming convention.
-    let postgres_path = parquet_dir.join("postgres.parquet");
-    conn.execute_batch(&format!(
-        "COPY (SELECT * FROM logs WHERE service = 'nginx') TO '{}' (FORMAT PARQUET)",
-        nginx_path.display()
-    ))
-    .unwrap();
-    conn.execute_batch(&format!(
-        "COPY (SELECT * FROM logs WHERE service = 'postgres') TO '{}' (FORMAT PARQUET)",
-        postgres_path.display()
-    ))
-    .unwrap();
-
-    format!("{}/**/*.parquet", parquet_dir.display())
+    format!("{}/**/*.parquet", dir.display())
 }
 
-/// Generate a self-signed cert/key pair in the given directory.
-fn generate_test_cert(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+/// Return a shared self-signed cert/key pair, generating on first call.
+///
+/// Uses the same PID-unique temp + atomic rename pattern as fixtures
+/// for race-free coordination across nextest processes.
+fn ensure_test_cert() -> (PathBuf, PathBuf) {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("tls");
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
 
-    let san = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(san).unwrap();
+    if !cert_path.exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        let suffix = format!("_{}", std::process::id());
 
-    std::fs::write(&cert_path, cert.pem()).unwrap();
-    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+        let san = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(san).unwrap();
+
+        let cert_tmp = dir.join(format!("cert{suffix}.pem"));
+        let key_tmp = dir.join(format!("key{suffix}.pem"));
+        std::fs::write(&cert_tmp, cert.pem()).unwrap();
+        std::fs::write(&key_tmp, signing_key.serialize_pem()).unwrap();
+
+        let _ = std::fs::rename(&cert_tmp, &cert_path);
+        let _ = std::fs::rename(&key_tmp, &key_path);
+        // Clean up if we lost the race.
+        let _ = std::fs::remove_file(&cert_tmp);
+        let _ = std::fs::remove_file(&key_tmp);
+    }
 
     (cert_path, key_path)
 }
@@ -107,10 +140,26 @@ struct TestServer {
     ingest_token: String,
 }
 
+/// Poll the health endpoint until the server is ready (up to 1s).
+async fn wait_for_ready(addr: &str) {
+    let poll_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let health_url = format!("https://{addr}/api/v1/health");
+    for _ in 0..100 {
+        if poll_client.get(&health_url).send().await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("test server failed to become ready within 1s");
+}
+
 /// Set up a test server with custom rate limiting for rate limit tests.
 async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let data_glob = ensure_fixtures(tmp.path());
+    let data_glob = ensure_fixtures();
     let auth_db = tmp.path().join("auth.db");
 
     let store = KeyStore::open(&auth_db).unwrap();
@@ -120,7 +169,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
     let ingest = store.create_key("ingest-key", Role::Ingest, None).unwrap();
     drop(store);
 
-    let (cert_path, key_path) = generate_test_cert(tmp.path());
+    let (cert_path, key_path) = ensure_test_cert();
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -173,7 +222,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
             .await
             .unwrap();
     });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    wait_for_ready(&addr).await;
     std::mem::forget(tmp);
 
     TestServer {
@@ -188,7 +237,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
 /// Set up a test server with fixtures and return a `TestServer` handle.
 async fn setup() -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let data_glob = ensure_fixtures(tmp.path());
+    let data_glob = ensure_fixtures();
     let auth_db = tmp.path().join("auth.db");
 
     // Create API keys for all test roles.
@@ -199,8 +248,7 @@ async fn setup() -> TestServer {
     let ingest = store.create_key("ingest-key", Role::Ingest, None).unwrap();
     drop(store);
 
-    // Generate ephemeral self-signed cert.
-    let (cert_path, key_path) = generate_test_cert(tmp.path());
+    let (cert_path, key_path) = ensure_test_cert();
 
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -257,8 +305,7 @@ async fn setup() -> TestServer {
             .unwrap();
     });
 
-    // Give the server a moment to start and bind.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    wait_for_ready(&addr).await;
 
     // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);

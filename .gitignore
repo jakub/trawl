@@ -24,6 +24,7 @@
 
 # generated test fixtures
 crates/trawl-engine/tests/fixtures/
+crates/trawl-server/tests/fixtures/
 
 # vector log data
 data/
