@@ -62,6 +62,7 @@ default = ["bundled"]
 bundled = ["duckdb/bundled", "trawl-engine/bundled"]
 
 [dev-dependencies]
+trawl-auth = { workspace = true, features = ["fast-hash"] }
 trawl-client = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true }

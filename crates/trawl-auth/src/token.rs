@@ -61,8 +61,13 @@ pub fn hash_token(plaintext: &str) -> Result<String, AuthError> {
     use argon2::{Algorithm, Argon2, Params, PasswordHasher as _, Version};
 
     let salt = SaltString::generate(&mut rand::rngs::OsRng);
-    // 128 MiB memory, 3 iterations, 4 lanes — stronger than default for
-    // long-lived admin credentials. key creation is rare so cost is negligible.
+    // Production: 128 MiB memory, 3 iterations, 4 lanes — strong params for
+    // long-lived admin credentials. Key creation is rare so cost is negligible.
+    // Test (fast-hash): 1 MiB, 1 iteration, 1 lane — fast enough to verify
+    // argon2 integration without burning CI time.
+    #[cfg(feature = "fast-hash")]
+    let params = Params::new(1024, 1, 1, None).expect("valid argon2 params");
+    #[cfg(not(feature = "fast-hash"))]
     let params = Params::new(128 * 1024, 3, 4, None).expect("valid argon2 params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
