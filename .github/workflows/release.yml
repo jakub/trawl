@@ -57,8 +57,22 @@ jobs:
         if: matrix.cross
         run: |
           sudo dpkg --add-architecture arm64
-          sudo sed -i '/\[arch=/!s/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main universe" | sudo tee /etc/apt/sources.list.d/arm64.list
+          # Pin existing sources to amd64 — noble runners use DEB822 .sources
+          # files, so patch both formats. Without this, apt tries to fetch
+          # arm64 from mirrors that only carry amd64 and gets 404s.
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] && sudo sed -i '/^Architectures:/!s/^Types: deb/Architectures: amd64\nTypes: deb/' "$f"
+          done
+          for f in /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] && sudo sed -i '/\[arch=/!s/^deb /deb [arch=amd64] /' "$f"
+          done
+          # Add arm64 from ports.ubuntu.com (the only mirror that carries it)
+          codename="$(lsb_release -cs)"
+          printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s %s\n' \
+            "$codename"          "main universe" \
+            "$codename-updates"  "main universe" \
+            "$codename-security" "main universe" \
+            | sudo tee /etc/apt/sources.list.d/arm64.list
           sudo apt-get update
           sudo apt-get install -y libc6-arm64-cross dpkg-dev
 
