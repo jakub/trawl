@@ -13,7 +13,7 @@ publish = false
 [workspace.dependencies]
 # internal crates
 trawl-core = { path = "crates/trawl-core" }
-trawl-engine = { path = "crates/trawl-engine" }
+trawl-engine = { path = "crates/trawl-engine", default-features = false }
 trawl-auth = { path = "crates/trawl-auth" }
 trawl-server = { path = "crates/trawl-server" }
 trawl-api = { path = "crates/trawl-api" }
@@ -32,7 +32,7 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["bracketed-paste"] }
 dashmap = "6"
 comfy-table = "7"
-duckdb = { version = "1.4", features = ["bundled"] }
+duckdb = { version = "1.4" }
 flate2 = "1"
 futures = "0.3"
 fs4 = "0.13"

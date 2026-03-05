@@ -1,0 +1,6 @@
+[env]
+# Safety net: prevents linker errors when a single-crate build doesn't
+# activate the `bundled` feature (e.g. `cargo test -p trawl-api`).
+# Completely ignored when `bundled` is active — the duckdb-sys build.rs
+# never checks this env var in the bundled code path.
+DUCKDB_DOWNLOAD_LIB = "1"

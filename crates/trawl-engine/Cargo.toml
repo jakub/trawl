@@ -20,5 +20,9 @@ thiserror = { workspace = true }
 insta = { workspace = true }
 tempfile = { workspace = true }
 
+[features]
+default = ["bundled"]
+bundled = ["duckdb/bundled"]
+
 [lints]
 workspace = true

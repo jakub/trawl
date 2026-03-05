@@ -57,6 +57,10 @@ ratatui = { workspace = true }
 x509-parser = { workspace = true }
 zstd = { workspace = true }
 
+[features]
+default = ["bundled"]
+bundled = ["duckdb/bundled", "trawl-engine/bundled"]
+
 [dev-dependencies]
 trawl-client = { workspace = true }
 insta = { workspace = true }
