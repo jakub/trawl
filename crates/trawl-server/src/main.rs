@@ -167,6 +167,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let state_dir = config.state_dir();
+
     if monitor_active {
         // Monitor mode: spawn HTTP server in background, run TUI on main.
         let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -174,11 +176,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let http_state = state.clone();
         let http_shutdown = Arc::clone(&shutdown);
         let server_config = config.server.clone();
+        let sd = state_dir.clone();
         tokio::spawn(async move {
             if let Err(e) = http::serve(
                 http_state,
                 &http_config,
                 &server_config,
+                &sd,
                 Some(http_shutdown),
             )
             .await
@@ -203,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         // Traditional mode: HTTP server runs on main, handles its own shutdown.
-        http::serve(state, &http_config, &config.server, None).await?;
+        http::serve(state, &http_config, &config.server, &state_dir, None).await?;
     }
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,

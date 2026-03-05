@@ -765,6 +765,17 @@ impl Config {
             .unwrap_or_else(|| self.data.base_dir().join("wal"))
     }
 
+    /// State directory — parent of the data directory.
+    ///
+    /// Used as the base for auto-generated TLS certs (`{state_dir}/tls/`).
+    /// For the deb package this resolves to `/var/lib/trawl/`.
+    pub fn state_dir(&self) -> PathBuf {
+        self.data
+            .base_dir()
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    }
+
     /// Return warnings about potentially dangerous configuration.
     ///
     /// Called after tracing is initialized so these can be logged.

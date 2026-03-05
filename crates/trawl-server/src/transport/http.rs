@@ -4,6 +4,7 @@
 //! and future mTLS support.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -219,6 +220,7 @@ pub async fn serve(
     state: AppState,
     http: &HttpConfig,
     config: &ServerConfig,
+    state_dir: &Path,
     external_shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<(), crate::error::ServerError> {
     let drain_secs = http.shutdown_drain_secs;
@@ -228,6 +230,7 @@ pub async fn serve(
     let (tls_config, self_signed) = tls::build_server_config(
         config.tls_cert_path.as_deref(),
         config.tls_key_path.as_deref(),
+        state_dir,
     )
     .map_err(|e| crate::error::ServerError::Internal(format!("TLS setup failed: {e}")))?;
 

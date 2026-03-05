@@ -70,6 +70,7 @@ depends = "$auto"
 section = "net"
 priority = "optional"
 conf-files = ["/etc/trawl/trawld.toml", "/etc/default/trawld"]
+maintainer-scripts = "debian/"
 systemd-units = { unit-name = "trawld", enable = true, start = true }
 assets = [
     ["target/release/trawld", "usr/bin/", "755"],

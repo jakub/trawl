@@ -1,7 +1,9 @@
 //! TLS certificate loading and self-signed certificate generation.
 //!
 //! When no cert/key paths are configured, a self-signed certificate is
-//! auto-generated to `~/.trawl/tls/` and persisted across restarts.
+//! auto-generated to `{state_dir}/tls/` and persisted across restarts.
+//! The state directory is typically the parent of the data directory
+//! (e.g. `/var/lib/trawl/tls/` for the deb package).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +15,6 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
-const DEFAULT_TLS_DIR: &str = ".trawl/tls";
 const CERT_FILENAME: &str = "cert.pem";
 const KEY_FILENAME: &str = "key.pem";
 
@@ -51,10 +52,14 @@ pub enum TlsError {
 /// Build a `rustls` [`ServerConfig`] from user-provided cert/key paths,
 /// or auto-generate a self-signed certificate if neither is set.
 ///
+/// `state_dir` is the base directory for auto-generated certs (used as
+/// `{state_dir}/tls/`). Only consulted when both cert/key paths are `None`.
+///
 /// Returns `Err` if only one of cert/key is provided.
 pub fn build_server_config(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
+    state_dir: &Path,
 ) -> Result<(Arc<ServerConfig>, bool), TlsError> {
     let (cert_pem, key_pem, self_signed) = match (cert_path, key_path) {
         (Some(cert), Some(key)) => {
@@ -62,7 +67,8 @@ pub fn build_server_config(
             (c, k, false)
         }
         (None, None) => {
-            let (c, k, generated) = load_or_generate_default()?;
+            let tls_dir = state_dir.join("tls");
+            let (c, k, generated) = load_or_generate_default(&tls_dir)?;
             (c, k, generated)
         }
         _ => {
@@ -157,18 +163,10 @@ fn log_cert_details(pem_bytes: &[u8]) {
     }
 }
 
-/// Resolve the default TLS directory (`~/.trawl/tls/`).
-fn default_tls_dir() -> Result<PathBuf, TlsError> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| TlsError::Config("HOME environment variable not set".into()))?;
-    Ok(PathBuf::from(home).join(DEFAULT_TLS_DIR))
-}
-
 /// Load existing default certs or generate new self-signed ones.
 ///
 /// Returns `(cert_pem, key_pem, was_generated)`.
-fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
-    let tls_dir = default_tls_dir()?;
+fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
     let cert_path = tls_dir.join(CERT_FILENAME);
     let key_path = tls_dir.join(KEY_FILENAME);
 
@@ -202,7 +200,7 @@ fn load_or_generate_default() -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
     let key_pem = signing_key.serialize_pem();
 
     // Persist so the cert is stable across daemon restarts.
-    fs::create_dir_all(&tls_dir).map_err(TlsError::Write)?;
+    fs::create_dir_all(tls_dir).map_err(TlsError::Write)?;
     fs::write(&cert_path, &cert_pem).map_err(TlsError::Write)?;
 
     // Write the private key with restricted permissions from the start
@@ -280,7 +278,8 @@ pub async fn cert_reload_task(
             "TLS certificate files changed, reloading"
         );
 
-        match build_server_config(Some(&cert_path), Some(&key_path)) {
+        // state_dir is unused when both paths are Some, but required by the signature.
+        match build_server_config(Some(&cert_path), Some(&key_path), Path::new("")) {
             Ok((config, _)) => {
                 let acceptor = TlsAcceptor::from(config);
                 if tx.send(acceptor).is_err() {
@@ -324,7 +323,8 @@ mod tests {
         fs::write(&key_path, &key_pem).unwrap();
 
         // Verify we can load them back and build a rustls config.
-        let (config, self_signed) = build_server_config(Some(&cert_path), Some(&key_path)).unwrap();
+        let (config, self_signed) =
+            build_server_config(Some(&cert_path), Some(&key_path), tmp.path()).unwrap();
         assert!(!self_signed);
         assert_eq!(
             config.alpn_protocols,
@@ -337,7 +337,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cert_only = tmp.path().join("cert.pem");
 
-        let result = build_server_config(Some(&cert_only), None);
+        let result = build_server_config(Some(&cert_only), None, tmp.path());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("both"));
@@ -348,7 +348,20 @@ mod tests {
         let result = build_server_config(
             Some(Path::new("/nonexistent/cert.pem")),
             Some(Path::new("/nonexistent/key.pem")),
+            Path::new("/tmp"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn auto_generates_certs_in_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
+        assert!(self_signed);
+
+        // Verify certs were written to {state_dir}/tls/.
+        let tls_dir = tmp.path().join("tls");
+        assert!(tls_dir.join("cert.pem").exists());
+        assert!(tls_dir.join("key.pem").exists());
     }
 }

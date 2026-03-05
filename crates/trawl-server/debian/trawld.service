@@ -33,7 +33,8 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/lib/trawl /etc/trawl
+ReadWritePaths=/var/lib/trawl
+ReadOnlyPaths=/etc/trawl
 
 # DuckDB may need JIT — do NOT set MemoryDenyWriteExecute
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
