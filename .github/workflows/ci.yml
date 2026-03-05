@@ -40,6 +40,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy
+      # Force build script re-run so it re-downloads the prebuilt library.
+      # rust-cache cleans non-standard target dirs (including duckdb-download/)
+      # but preserves stale build script output, causing linker failures.
+      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       - run: cargo clippy --workspace --all-targets --no-default-features
         env:
           DUCKDB_DOWNLOAD_LIB: "1"
@@ -58,6 +62,7 @@ jobs:
         with:
           shared-key: test
       - uses: taiki-e/install-action@nextest
+      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       - run: cargo nextest run --workspace --no-default-features
         env:
           DUCKDB_DOWNLOAD_LIB: "1"
