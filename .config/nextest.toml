@@ -1,0 +1,6 @@
+[test-groups.server-integration]
+max-threads = 4
+
+[[profile.default.overrides]]
+filter = 'binary(http_api) | binary(hot_query)'
+test-group = 'server-integration'
