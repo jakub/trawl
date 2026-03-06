@@ -169,7 +169,11 @@ jobs:
 
       - name: Import GPG key
         run: |
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import || true
+          # Verify the key was actually imported (gpg exits 2 on armor
+          # header warnings from github secrets newline mangling)
+          gpg --list-secret-keys --keyid-format long | grep -q '^sec' \
+            || { echo "::error::GPG secret key not found after import"; exit 1; }
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
