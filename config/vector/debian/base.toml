@@ -1,0 +1,269 @@
+# trawl log forwarder — debian 13 (trixie) base config
+#
+# deployment:
+#   1. install vector: https://vector.dev/docs/setup/installation/package-managers/apt/
+#   2. deploy configs to /etc/vector/vector.d/ (base.toml + service drop-ins)
+#   3. set env vars in /etc/default/vector or vector.service override:
+#      TRAWL_URL=https://trawl.internal:5514
+#      TRAWL_INGEST_TOKEN=<token>
+#   4. create token on trawld host: trawl-admin key create --name vector --role ingest
+#      (same token works for all forwarders — ingest role is write-only)
+#   5. start: systemctl enable --now vector
+#
+# permissions (ansible should handle):
+#   - vector user in: systemd-journal, adm
+#   - for docker.toml: vector user in docker group
+#   - for app-specific logs: add to www-data, postgres, mysql, redis as needed
+#
+# all service drop-ins are safe to deploy everywhere — sources for
+# uninstalled apps simply idle with zero resource cost.
+
+# =============================================================================
+# GLOBAL
+# =============================================================================
+
+data_dir = "/var/lib/vector"
+
+[acknowledgements]
+enabled = true
+
+# =============================================================================
+# SOURCES
+# =============================================================================
+
+# -- journald: all systemd units, current boot only ---------------------------
+# captures: sshd, cron, tailscale, cockpit, ufw (via kernel), and every other
+# systemd-managed service. no unit filtering — collect everything.
+
+[sources.journald]
+type = "journald"
+current_boot_only = true
+
+# -- varlog catch-all: everything not handled by dedicated drop-ins -----------
+# anything that writes directly to /var/log and isn't covered by a service-
+# specific config (dpkg, apt, unattended-upgrades, misc application logs).
+
+[sources.varlog]
+type = "file"
+include = ["/var/log/**/*.log"]
+read_from = "end"
+exclude = [
+  # rsyslog-managed files (already captured via journald)
+  "/var/log/syslog*",
+  "/var/log/auth.log*",
+  "/var/log/kern.log*",
+  "/var/log/daemon.log*",
+  "/var/log/user.log*",
+  "/var/log/mail.*",
+  "/var/log/debug*",
+  "/var/log/messages*",
+
+  # app-specific directories (handled by dedicated drop-ins)
+  "/var/log/nginx/**",
+  "/var/log/apache2/**",
+  "/var/log/postgresql/**",
+  "/var/log/mysql/**",
+  "/var/log/redis/**",
+
+  # fail2ban (handled by drop-in)
+  "/var/log/fail2ban.log*",
+
+  # binary files (not text logs)
+  "/var/log/btmp*",
+  "/var/log/wtmp*",
+  "/var/log/lastlog*",
+  "/var/log/faillog*",
+]
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+
+# -- journald → trawl schema -------------------------------------------------
+# maps systemd journal fields to trawl's expected schema. includes UFW firewall
+# log enhancement: kernel messages containing [UFW are parsed for src/dst/proto.
+
+[transforms.trawl_journal]
+type = "remap"
+inputs = ["journald"]
+source = '''
+# --- service name: best available identifier ---
+unit = to_string(._SYSTEMD_UNIT) ?? ""
+if unit != "" {
+  # strip .service, .scope, .slice, .socket, .target suffixes
+  unit = replace(unit, r'\.(?:service|scope|slice|socket|target)$', "")
+}
+syslog_id = to_string(.SYSLOG_IDENTIFIER) ?? ""
+comm = to_string(._COMM) ?? ""
+
+if unit != "" {
+  .service = unit
+} else if syslog_id != "" {
+  .service = syslog_id
+} else if comm != "" {
+  .service = comm
+} else {
+  .service = "unknown"
+}
+
+# --- log level from journal PRIORITY ---
+# 0=emerg, 1=alert, 2=crit, 3=error, 4=warn, 5=notice, 6=info, 7=debug
+priority = to_int(.PRIORITY) ?? 6
+if priority <= 3 {
+  .level = "error"
+} else if priority == 4 {
+  .level = "warn"
+} else if priority <= 6 {
+  .level = "info"
+} else {
+  .level = "debug"
+}
+
+# --- UFW firewall log enhancement ---
+msg = to_string(.message) ?? ""
+if contains(msg, "[UFW ") {
+  .service = "ufw"
+
+  # extract action for level override
+  ufw_action = ""
+  action_match, err = parse_regex(msg, r'\[UFW (?P<action>\w+)\]')
+  if err == null {
+    ufw_action = action_match.action
+  }
+  if ufw_action == "BLOCK" {
+    .level = "warn"
+  } else if ufw_action == "ALLOW" {
+    .level = "info"
+  }
+
+  # extract network fields
+  src_match, err = parse_regex(msg, r'SRC=(?P<src_ip>\S+)')
+  if err == null { .src_ip = src_match.src_ip }
+
+  dst_match, err = parse_regex(msg, r'DST=(?P<dst_ip>\S+)')
+  if err == null { .dst_ip = dst_match.dst_ip }
+
+  spt_match, err = parse_regex(msg, r'SPT=(?P<src_port>\S+)')
+  if err == null { .src_port = to_int(spt_match.src_port) ?? null }
+
+  dpt_match, err = parse_regex(msg, r'DPT=(?P<dst_port>\S+)')
+  if err == null { .dst_port = to_int(dpt_match.dst_port) ?? null }
+
+  proto_match, err = parse_regex(msg, r'PROTO=(?P<protocol>\S+)')
+  if err == null { .protocol = downcase(proto_match.protocol) }
+}
+
+# --- drop internal journal metadata ---
+# systemd-prefixed fields are internal identifiers, not useful downstream.
+# listed explicitly because VRL closures can't mutate the event.
+del(.__CURSOR)
+del(.__MONOTONIC_TIMESTAMP)
+del(.__REALTIME_TIMESTAMP)
+del(._BOOT_ID)
+del(._CAP_EFFECTIVE)
+del(._CMDLINE)
+del(._COMM)
+del(._EXE)
+del(._GID)
+del(._HOSTNAME)
+del(._MACHINE_ID)
+del(._PID)
+del(._RUNTIME_SCOPE)
+del(._SELINUX_CONTEXT)
+del(._SOURCE_REALTIME_TIMESTAMP)
+del(._STREAM_ID)
+del(._SYSTEMD_CGROUP)
+del(._SYSTEMD_INVOCATION_ID)
+del(._SYSTEMD_SLICE)
+del(._SYSTEMD_UNIT)
+del(._TRANSPORT)
+del(._UID)
+del(.PRIORITY)
+del(.SYSLOG_IDENTIFIER)
+del(.source_type)
+'''
+
+# -- varlog catch-all → trawl schema -----------------------------------------
+# derives service name from the file path. e.g.:
+#   /var/log/dpkg.log → "dpkg"
+#   /var/log/apt/history.log → "apt"
+#   /var/log/unattended-upgrades/unattended-upgrades.log → "unattended-upgrades"
+
+[transforms.trawl_varlog]
+type = "remap"
+inputs = ["varlog"]
+source = '''
+# derive service from file path
+filepath = to_string(.file) ?? ""
+if filepath != "" {
+  # strip /var/log/ prefix and .log suffix, take first path component
+  stripped = replace(filepath, r'^/var/log/', "")
+  parts = split(stripped, "/")
+  if length(parts) > 1 {
+    # subdirectory: use directory name (e.g. apt/history.log → apt)
+    .service = parts[0]
+  } else {
+    # top-level: strip .log extension (e.g. dpkg.log → dpkg)
+    .service = replace(parts[0], r'\.log$', "")
+  }
+} else {
+  .service = "varlog"
+}
+
+# scan message for log level keywords
+msg = downcase(to_string(.message) ?? "")
+if match(msg, r'\b(?:error|fatal|panic|crit)\b') {
+  .level = "error"
+} else if match(msg, r'\b(?:warn|warning)\b') {
+  .level = "warn"
+} else if match(msg, r'\b(?:debug|trace)\b') {
+  .level = "debug"
+} else {
+  .level = "info"
+}
+
+del(.source_type)
+'''
+
+# =============================================================================
+# SINK
+# =============================================================================
+
+# -- HTTP sink to trawld ------------------------------------------------------
+# wildcard input "trawl_*" automatically discovers all normalized transforms
+# from this config AND any drop-in configs loaded via --config-dir.
+# adding a new drop-in requires NO changes to this file.
+
+[sinks.trawld]
+type = "http"
+inputs = ["trawl_*"]
+uri = "${TRAWL_URL}/api/v1/ingest"
+method = "post"
+
+[sinks.trawld.encoding]
+codec = "json"
+
+[sinks.trawld.auth]
+strategy = "bearer"
+token = "${TRAWL_INGEST_TOKEN}"
+
+[sinks.trawld.compression]
+algorithm = "gzip"
+
+[sinks.trawld.batch]
+max_bytes = 1_048_576  # 1 MB
+timeout_secs = 5
+
+[sinks.trawld.buffer]
+type = "disk"
+max_size = 1_073_741_824  # 1 GB — survives trawld downtime
+
+[sinks.trawld.request]
+retry_initial_backoff_secs = 1
+retry_max_backoff_secs = 30
+timeout_secs = 30
+concurrency = "adaptive"
+
+[sinks.trawld.tls]
+# set to true and provide ca_file for production CA verification
+verify_certificate = false

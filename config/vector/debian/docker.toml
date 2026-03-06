@@ -1,0 +1,83 @@
+# trawl drop-in: docker container logs
+#
+# collects from all containers via the docker socket. automatically captures
+# portainer, watchtower, and any other containerized service.
+#
+# retries socket connection if docker is not installed or not running —
+# safe to deploy on non-docker hosts.
+#
+# requires: vector user in docker group
+
+# =============================================================================
+# SOURCE
+# =============================================================================
+
+[sources.docker]
+type = "docker_logs"
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+
+[transforms.trawl_docker]
+type = "remap"
+inputs = ["docker"]
+source = '''
+# --- service name: best available identifier ---
+# priority: compose service label > container name > image name (stripped of tag)
+compose_svc = to_string(.label."com.docker.compose.service") ?? ""
+container = to_string(.container_name) ?? ""
+image = to_string(.image) ?? ""
+
+if compose_svc != "" {
+  .service = compose_svc
+} else if container != "" {
+  # strip leading / from container name (docker API includes it)
+  .service = replace(container, r'^/', "")
+} else if image != "" {
+  # strip tag and registry prefix: registry.io/org/name:tag → name
+  parts = split(image, ":")
+  name = parts[0]
+  name_parts = split(name, "/")
+  .service = name_parts[-1]
+} else {
+  .service = "docker"
+}
+
+# --- host: compose project or container name ---
+compose_project = to_string(.label."com.docker.compose.project") ?? ""
+if compose_project != "" {
+  .host = compose_project
+} else if container != "" {
+  .host = replace(container, r'^/', "")
+}
+
+# --- log level ---
+# stderr → error, otherwise try to detect from message content
+stream = to_string(.stream) ?? ""
+if stream == "stderr" {
+  .level = "error"
+} else {
+  msg = downcase(to_string(.message) ?? "")
+  if match(msg, r'\b(?:error|fatal|panic|crit)\b') {
+    .level = "error"
+  } else if match(msg, r'\b(?:warn|warning)\b') {
+    .level = "warn"
+  } else if match(msg, r'\b(?:debug|trace)\b') {
+    .level = "debug"
+  } else {
+    .level = "info"
+  }
+}
+
+# --- preserve useful docker metadata as extra fields ---
+.container_name = replace(container, r'^/', "")
+.container_id = to_string(.container_id) ?? null
+.image = image
+
+# clean up docker-internal fields
+del(.label)
+del(.stream)
+del(.container_created_at)
+del(.source_type)
+'''

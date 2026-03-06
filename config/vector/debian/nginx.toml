@@ -1,0 +1,97 @@
+# trawl drop-in: nginx access + error logs
+#
+# idles silently if nginx is not installed — vector's file source
+# watches for new files matching the glob pattern.
+
+# =============================================================================
+# SOURCE
+# =============================================================================
+
+[sources.nginx]
+type = "file"
+include = ["/var/log/nginx/*.log"]
+read_from = "end"
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+
+# -- route by filename: access vs error ---------------------------------------
+
+[transforms.route_nginx]
+type = "route"
+inputs = ["nginx"]
+
+[transforms.route_nginx.route]
+access = '.file != null && contains(to_string!(.file), "access")'
+error = '.file != null && contains(to_string!(.file), "error")'
+
+# -- nginx access logs (combined format) --------------------------------------
+
+[transforms.trawl_nginx_access]
+type = "remap"
+inputs = ["route_nginx.access", "route_nginx._unmatched"]
+source = '''
+parsed, err = parse_nginx_log(.message, "combined")
+if err == null {
+  .timestamp = parsed.timestamp
+  .src_ip = parsed.client
+  .method = parsed.method
+  .uri = parsed.path
+  .status = to_int(parsed.status) ?? null
+  .message = .message
+
+  user = to_string(parsed.user) ?? "-"
+  if user != "-" {
+    .user_name = user
+  }
+
+  status = to_int(parsed.status) ?? 0
+  if status >= 500 {
+    .level = "error"
+  } else if status >= 400 {
+    .level = "warn"
+  } else {
+    .level = "info"
+  }
+} else {
+  .level = "info"
+}
+
+.service = "nginx"
+del(.source_type)
+del(.file)
+'''
+
+# -- nginx error logs ---------------------------------------------------------
+
+[transforms.trawl_nginx_error]
+type = "remap"
+inputs = ["route_nginx.error"]
+source = '''
+# nginx error format: YYYY/MM/DD HH:MM:SS [level] PID#TID: *CID message
+parsed, err = parse_regex(
+  .message,
+  r'^(?P<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<severity>\w+)\] (?P<pid>\d+)#(?P<tid>\d+):(?:\s\*\d+)?\s*(?P<msg>.*)'
+)
+if err == null {
+  .message = parsed.msg
+
+  sev = parsed.severity
+  if sev == "emerg" || sev == "alert" || sev == "crit" || sev == "error" {
+    .level = "error"
+  } else if sev == "warn" {
+    .level = "warn"
+  } else if sev == "notice" || sev == "info" {
+    .level = "info"
+  } else {
+    .level = "debug"
+  }
+} else {
+  .level = "error"
+}
+
+.service = "nginx"
+del(.source_type)
+del(.file)
+'''

@@ -1,0 +1,60 @@
+# trawl drop-in: postgresql logs (multiline-aware)
+#
+# idles silently if postgresql is not installed.
+
+# =============================================================================
+# SOURCE
+# =============================================================================
+
+[sources.postgresql]
+type = "file"
+include = ["/var/log/postgresql/*.log"]
+read_from = "end"
+
+[sources.postgresql.multiline]
+start_pattern = '^\d{4}-\d{2}-\d{2}'
+condition_pattern = '^\d{4}-\d{2}-\d{2}'
+mode = "halt_before"
+timeout_ms = 1000
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+
+[transforms.trawl_postgresql]
+type = "remap"
+inputs = ["postgresql"]
+source = '''
+# postgresql log format:
+#   2024-01-15 10:30:45.123 UTC [12345] user@db LOG:  statement: SELECT ...
+#   2024-01-15 10:30:45.123 UTC [12345] LOG:  autovacuum launcher started
+parsed, err = parse_regex(
+  .message,
+  r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \w+) \[(?P<pid>\d+)\] (?:(?P<user>\w+)@(?P<db>\w+) )?(?P<level>\w+):\s+(?P<msg>.*)'
+)
+if err == null {
+  .message = parsed.msg
+
+  if parsed.user != null {
+    .user_name = parsed.user
+  }
+
+  lvl = upcase(to_string(parsed.level))
+  if lvl == "ERROR" || lvl == "FATAL" || lvl == "PANIC" {
+    .level = "error"
+  } else if lvl == "WARNING" {
+    .level = "warn"
+  } else if lvl == "DEBUG" || starts_with(lvl, "DEBUG") {
+    .level = "debug"
+  } else {
+    # LOG, NOTICE, STATEMENT, DETAIL, HINT, CONTEXT
+    .level = "info"
+  }
+} else {
+  .level = "info"
+}
+
+.service = "postgresql"
+del(.source_type)
+del(.file)
+'''

@@ -1,0 +1,64 @@
+# trawl drop-in: redis logs
+#
+# idles silently if redis is not installed.
+
+# =============================================================================
+# SOURCE
+# =============================================================================
+
+[sources.redis]
+type = "file"
+include = ["/var/log/redis/*.log"]
+read_from = "end"
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+
+[transforms.trawl_redis]
+type = "remap"
+inputs = ["redis"]
+source = '''
+# redis log format:
+#   PID:ROLE DD Mon YYYY HH:MM:SS.mmm LEVEL message
+#   e.g.: 12345:M 15 Jan 2024 10:30:45.123 * Server started
+#
+# role codes: M=master, S=replica, C=sentinel, X=sentinel (during failover)
+# level prefixes: .=debug, -=info (verbose), *=notice/warning, #=warning (important)
+parsed, err = parse_regex(
+  .message,
+  r'^(?P<pid>\d+):(?P<role>[MSCX])\s+\d{2}\s+\w+\s+\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(?P<level_char>[.\-*#])\s+(?P<msg>.*)'
+)
+if err == null {
+  .message = parsed.msg
+
+  # map role codes to human-readable names
+  role = parsed.role
+  if role == "M" {
+    .redis_role = "master"
+  } else if role == "S" {
+    .redis_role = "replica"
+  } else if role == "C" || role == "X" {
+    .redis_role = "sentinel"
+  }
+
+  # map level prefix characters
+  lvl = parsed.level_char
+  if lvl == "#" {
+    .level = "warn"
+  } else if lvl == "*" {
+    .level = "info"
+  } else if lvl == "-" {
+    .level = "info"
+  } else {
+    # "." = debug
+    .level = "debug"
+  }
+} else {
+  .level = "info"
+}
+
+.service = "redis"
+del(.source_type)
+del(.file)
+'''

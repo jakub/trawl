@@ -1,0 +1,76 @@
+# trawl drop-in: mysql/mariadb logs (multiline-aware)
+#
+# handles both error log and slow query log formats.
+# idles silently if mysql/mariadb is not installed.
+
+# =============================================================================
+# SOURCE
+# =============================================================================
+
+[sources.mysql]
+type = "file"
+include = ["/var/log/mysql/*.log"]
+read_from = "end"
+
+[sources.mysql.multiline]
+start_pattern = '^\d{4}-\d{2}-\d{2}|^# Time:'
+condition_pattern = '^\d{4}-\d{2}-\d{2}|^# Time:'
+mode = "halt_before"
+timeout_ms = 1000
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+
+[transforms.trawl_mysql]
+type = "remap"
+inputs = ["mysql"]
+source = '''
+msg = to_string(.message) ?? ""
+
+if starts_with(msg, "# Time:") {
+  # --- slow query log entry ---
+  # # Time: 2024-01-15T10:30:45.123456Z
+  # # User@Host: user[user] @ localhost []  Id: 12345
+  # # Query_time: 1.234  Lock_time: 0.001 Rows_sent: 10  Rows_examined: 50000
+  # SELECT ...
+  .level = "warn"
+
+  qt_match, err = parse_regex(msg, r'Query_time:\s*(?P<qt>[\d.]+)')
+  if err == null { .query_time = to_float(qt_match.qt) ?? null }
+
+  lt_match, err = parse_regex(msg, r'Lock_time:\s*(?P<lt>[\d.]+)')
+  if err == null { .lock_time = to_float(lt_match.lt) ?? null }
+
+  re_match, err = parse_regex(msg, r'Rows_examined:\s*(?P<re>\d+)')
+  if err == null { .rows_examined = to_int(re_match.re) ?? null }
+
+} else {
+  # --- error log entry ---
+  # 2024-01-15T10:30:45.123456Z 0 [Note] [MY-010931] [Server] message
+  # 2024-01-15 10:30:45 0 [Warning] message (mariadb variant)
+  parsed, err = parse_regex(
+    msg,
+    r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\s+\d+\s+\[(?P<severity>\w+)\]\s*(?:\[\w+-?\d*\]\s*)*(?:\[\w+\]\s*)?(?P<msg>.*)'
+  )
+  if err == null {
+    .message = parsed.msg
+
+    sev = downcase(to_string(parsed.severity))
+    if sev == "error" {
+      .level = "error"
+    } else if sev == "warning" {
+      .level = "warn"
+    } else {
+      # Note, System, etc.
+      .level = "info"
+    }
+  } else {
+    .level = "info"
+  }
+}
+
+.service = "mysql"
+del(.source_type)
+del(.file)
+'''
