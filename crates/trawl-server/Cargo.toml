@@ -68,7 +68,7 @@ insta = { workspace = true }
 reqwest = { workspace = true }
 
 [package.metadata.deb]
-name = "trawld"
+name = "trawl-server"
 maintainer = "Jakub Burgis <mail@jakub.me>"
 copyright = "2025-2026, Jakub Burgis"
 depends = "$auto"
