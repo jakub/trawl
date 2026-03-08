@@ -194,16 +194,20 @@ jobs:
           find incoming -name '*.deb' -exec cp {} apt/pool/ \;
           ls -la apt/pool/
 
+          # All apt operations run from inside apt/ so that
+          # dpkg-scanpackages produces Filename: pool/... (not apt/pool/...)
+          cd apt
+
           # Generate per-arch Packages indices
           for arch in amd64 arm64; do
-            dir="apt/dists/stable/main/binary-${arch}"
+            dir="dists/stable/main/binary-${arch}"
             mkdir -p "${dir}"
-            dpkg-scanpackages --arch "${arch}" apt/pool /dev/null > "${dir}/Packages"
+            dpkg-scanpackages --arch "${arch}" pool /dev/null > "${dir}/Packages"
             gzip -9c "${dir}/Packages" > "${dir}/Packages.gz"
           done
 
           # Generate Release file
-          cd apt/dists/stable
+          cd dists/stable
           cat > Release <<'RELEASE'
           Origin: Trawl
           Label: Trawl
@@ -224,7 +228,7 @@ jobs:
             | grep '^sec' | head -1 | awk '{print $2}' | cut -d/ -f2)"
           gpg --batch --yes --default-key "${gpg_key}" --detach-sign --armor -o Release.gpg Release
           gpg --batch --yes --default-key "${gpg_key}" --clearsign -o InRelease Release
-          cd ../../..
+          cd "$GITHUB_WORKSPACE"
 
           # Export public key
           gpg --batch --yes --armor --export "${gpg_key}" > gpg.key
