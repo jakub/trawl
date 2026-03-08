@@ -41,6 +41,13 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
+      - name: Set version from tag
+        run: |
+          version="${RELEASE_TAG#v}"
+          echo "Setting workspace version to ${version}"
+          sed -i "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
+          grep '^version' Cargo.toml
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
