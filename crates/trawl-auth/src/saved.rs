@@ -229,11 +229,11 @@ mod tests {
         let key_id = 1;
 
         let saved = store
-            .create(key_id, "nginx errors", "service:nginx level:error")
+            .create(key_id, "nginx errors", "service=nginx level=error")
             .unwrap();
 
         assert_eq!(saved.name, "nginx errors");
-        assert_eq!(saved.query, "service:nginx level:error");
+        assert_eq!(saved.query, "service=nginx level=error");
 
         let list = store.list(key_id).unwrap();
         assert_eq!(list.len(), 1);

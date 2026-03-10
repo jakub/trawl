@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn render_with_query_text() {
         let mut app = test_app();
-        for ch in "level:error".chars() {
+        for ch in "level=error".chars() {
             app.active_tab_mut().editor.insert_char(ch);
         }
         let backend = TestBackend::new(80, 24);

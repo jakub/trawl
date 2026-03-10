@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn query_request_roundtrip() {
         let req = QueryRequest {
-            query: "level:error | stats count()".into(),
+            query: "level=error | stats count()".into(),
             limit: Some(100),
             offset: None,
             timezone: None,

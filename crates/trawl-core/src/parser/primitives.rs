@@ -161,15 +161,17 @@ pub(crate) fn field_name<'src>()
 // filter operators (for field:op value syntax)
 // ---------------------------------------------------------------------------
 
-/// Parse a filter operator, ordered longest-first to avoid prefix ambiguity.
+/// Parse a search-stage filter operator, ordered longest-first to avoid
+/// prefix ambiguity (`>=` before `>`, etc.).
 pub(crate) fn filter_op<'src>()
 -> impl Parser<'src, ParserInput<'src>, FilterOp, ParserExtra<'src>> + Clone {
     choice((
         just(">=").to(FilterOp::Gte),
-        just(">").to(FilterOp::Gt),
         just("<=").to(FilterOp::Lte),
-        just("<").to(FilterOp::Lt),
         just("!=").to(FilterOp::Ne),
+        just(">").to(FilterOp::Gt),
+        just("<").to(FilterOp::Lt),
+        just("=").to(FilterOp::Eq),
     ))
     .labelled("filter operator")
 }
@@ -264,7 +266,7 @@ pub(crate) fn literal<'src>()
 }
 
 // ---------------------------------------------------------------------------
-// bare filter values (for search stage field:value)
+// bare filter values (for search stage field=value)
 // ---------------------------------------------------------------------------
 
 /// Parse a bare (unquoted) value in a field filter — stops at whitespace and `|`.
@@ -390,13 +392,14 @@ mod tests {
             filter_op().parse(">=").into_result().unwrap(),
             FilterOp::Gte
         );
-        assert_eq!(filter_op().parse(">").into_result().unwrap(), FilterOp::Gt);
         assert_eq!(
             filter_op().parse("<=").into_result().unwrap(),
             FilterOp::Lte
         );
-        assert_eq!(filter_op().parse("<").into_result().unwrap(), FilterOp::Lt);
         assert_eq!(filter_op().parse("!=").into_result().unwrap(), FilterOp::Ne);
+        assert_eq!(filter_op().parse(">").into_result().unwrap(), FilterOp::Gt);
+        assert_eq!(filter_op().parse("<").into_result().unwrap(), FilterOp::Lt);
+        assert_eq!(filter_op().parse("=").into_result().unwrap(), FilterOp::Eq);
     }
 
     #[test]

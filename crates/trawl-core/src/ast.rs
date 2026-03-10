@@ -45,13 +45,13 @@ pub struct Query {
 /// Queries without OR have a single group (backward-compatible).
 ///
 /// Time filters are hoisted out of groups and applied globally — a query
-/// like `service:nginx last:2h OR service:postgres` applies the time
+/// like `service=nginx last=2h OR service=postgres` applies the time
 /// filter to both groups.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchStage {
     pub groups: Vec<Vec<Spanned<SearchToken>>>,
     /// Global time filter, hoisted from groups during parsing.
-    /// If multiple `last:` tokens appear, last one wins.
+    /// If multiple `last=` tokens appear, last one wins.
     pub time_filter: Option<Spanned<TimeFilter>>,
 }
 
@@ -68,11 +68,11 @@ impl SearchStage {
 /// A single token in the search stage.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchToken {
-    /// `field:value`, `field:>100`, `field:200,301,404`
+    /// `field=value`, `field>=100`, `field=200,301,404`
     FieldFilter(FieldFilter),
     /// bare word search, optionally negated with `-`
     TextSearch(TextSearch),
-    /// `last:2h`, `last:7d`
+    /// `last=2h`, `last=7d`
     TimeFilter(TimeFilter),
     /// `"exact phrase"`
     QuotedSearch(QuotedSearch),
@@ -130,7 +130,7 @@ pub struct TextSearch {
     pub negated: bool,
 }
 
-/// Time-range filter (`last:2h`).
+/// Time-range filter (`last=2h`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeFilter {
     pub duration: TrawlDuration,
@@ -185,7 +185,7 @@ impl fmt::Display for TrawlDuration {
     }
 }
 
-/// Time units supported by `last:` filters.
+/// Time units supported by `last=` filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeUnit {
     Seconds,

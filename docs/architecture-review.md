@@ -139,7 +139,7 @@ concrete approach: a "query replica" that mounts the same `data/` directory (rea
 
 #### 3. bloom filter sidecars
 
-the biggest query performance gap vs. splunk: high-cardinality exact-match lookups. `service:nginx host:web-42` currently scans ALL parquet row groups even if `web-42` only appears in 3 of 10,000 files.
+the biggest query performance gap vs. splunk: high-cardinality exact-match lookups. `service=nginx host=web-42` currently scans ALL parquet row groups even if `web-42` only appears in 3 of 10,000 files.
 
 - write `.bloom` sidecar files during compaction for high-cardinality fields (`host`, `source`, `ip`)
 - consult them in `compute_source()` to prune the file list before passing to DuckDB

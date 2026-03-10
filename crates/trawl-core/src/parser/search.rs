@@ -14,10 +14,10 @@ use crate::parser::primitives::{
     regex_pattern, spanned,
 };
 
-/// Parse a `last:2h` time filter.
+/// Parse a `last=2h` time filter.
 fn time_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
-    just("last:")
+    just("last=")
         .ignore_then(duration())
         .map(|d| SearchToken::TimeFilter(TimeFilter { duration: d }))
         .labelled("time filter")
@@ -37,14 +37,14 @@ fn has_glob_chars(s: &str) -> bool {
 }
 
 /// Parse the value side of a field filter, handling comma-separated lists,
-/// regex patterns, and glob auto-detection.
+/// regex patterns, quoted strings, and glob auto-detection.
+///
+/// The comparison operator is parsed separately by [`field_filter`]; this
+/// parser only handles the value portion. Returns an auto-detected
+/// [`FilterOp`] that the caller uses to override when appropriate (e.g.
+/// glob `*` or regex `/pattern/` detection).
 fn filter_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, (FilterOp, FilterValue), ParserExtra<'src>> + Clone {
-    // try explicit operator first (>=, >, <=, <, !=)
-    let with_op = filter_op()
-        .then(bare_value())
-        .map(|(op, val)| (op, FilterValue::Literal(val)));
-
     // regex: /pattern/ — must be followed by whitespace, pipe, or end
     let regex_val = regex_pattern()
         .then_ignore(
@@ -56,7 +56,7 @@ fn filter_value<'src>()
         )
         .map(|pat| (FilterOp::Regex, FilterValue::Literal(pat)));
 
-    // quoted value: service:"Activity Monitor" → strips quotes
+    // quoted value: service="Activity Monitor" → strips quotes
     let quoted_val = quoted_string().map(|s| (FilterOp::Eq, FilterValue::Literal(s)));
 
     // bare value(s), possibly comma-separated
@@ -81,25 +81,34 @@ fn filter_value<'src>()
             }
         });
 
-    choice((with_op, regex_val, quoted_val, bare_vals)).labelled("filter value")
+    choice((regex_val, quoted_val, bare_vals)).labelled("filter value")
 }
 
-/// Parse a `field:value` filter, including `field:>100`, `field:200,301,404`,
-/// `field:/pattern/`, and glob auto-detection.
+/// Parse a `field=value` filter, including `field>=100`, `field!=200`,
+/// `field=200,301,404`, `field=/pattern/`, and glob auto-detection.
 ///
-/// Uses `.rewind()` lookahead on `field_name:` so that bare words like `NOT`
-/// don't commit the parser — if the colon is missing, `choice()` backtracks
-/// to `text_search()` instead.
+/// The operator (`=`, `>=`, `<=`, `!=`, `>`, `<`) is parsed as part of the
+/// field filter — no `:` separator. Uses `.rewind()` lookahead on
+/// `field_name + operator` so that bare words like `NOT` or `error` don't
+/// commit the parser.
 fn field_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
-    // lookahead: check ident+colon without consuming, so choice() can backtrack
+    // lookahead: check ident + operator without consuming
     field_name()
-        .then(just(':'))
+        .then(filter_op())
         .rewind()
         .ignore_then(field_name())
-        .then_ignore(just(':'))
+        .then(filter_op())
         .then(filter_value())
-        .map(|(field, (op, value))| SearchToken::FieldFilter(FieldFilter { field, op, value }))
+        .map(|((field, op), (auto_op, value))| {
+            // auto_op overrides for glob/regex detection
+            let final_op = if auto_op == FilterOp::Eq { op } else { auto_op };
+            SearchToken::FieldFilter(FieldFilter {
+                field,
+                op: final_op,
+                value,
+            })
+        })
         .labelled("field filter")
 }
 
@@ -186,7 +195,7 @@ pub(crate) fn search_stage<'src>()
             groups.retain(|g| !g.is_empty());
 
             // Hoist time filters out of groups — they apply globally.
-            // If multiple `last:` tokens appear, last one wins.
+            // If multiple `last=` tokens appear, last one wins.
             let mut time_filter = None;
             for group in &mut groups {
                 group.retain(|t| {
@@ -216,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_time_filter() {
-        let result = search_stage().parse("last:2h").into_result().unwrap();
+        let result = search_stage().parse("last=2h").into_result().unwrap();
         // Time filter is hoisted out of groups.
         assert!(result.groups.is_empty());
         let tf = result.time_filter.expect("time_filter should be hoisted");
@@ -248,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_field_filter_simple() {
-        let result = search_stage().parse("service:nginx").into_result().unwrap();
+        let result = search_stage().parse("service=nginx").into_result().unwrap();
         assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
             result.groups[0][0].node,
@@ -262,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_field_filter_with_op() {
-        let result = search_stage().parse("status:>=400").into_result().unwrap();
+        let result = search_stage().parse("status>=400").into_result().unwrap();
         assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
             result.groups[0][0].node,
@@ -277,7 +286,7 @@ mod tests {
     #[test]
     fn test_field_filter_ne() {
         let result = search_stage()
-            .parse("service:!=kernel")
+            .parse("service!=kernel")
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 1);
@@ -294,7 +303,7 @@ mod tests {
     #[test]
     fn test_field_filter_list() {
         let result = search_stage()
-            .parse("status:200,301,404")
+            .parse("status=200,301,404")
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 1);
@@ -314,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_field_filter_glob() {
-        let result = search_stage().parse("path:/api/*").into_result().unwrap();
+        let result = search_stage().parse("path=/api/*").into_result().unwrap();
         assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
             result.groups[0][0].node,
@@ -329,7 +338,7 @@ mod tests {
     #[test]
     fn test_field_filter_regex() {
         let result = search_stage()
-            .parse("message:/error.*/")
+            .parse("message=/error.*/")
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 1);
@@ -345,9 +354,9 @@ mod tests {
 
     #[test]
     fn test_field_filter_quoted_value() {
-        // service:"kernel" should strip quotes.
+        // service="kernel" should strip quotes.
         let result = search_stage()
-            .parse(r#"service:"kernel""#)
+            .parse(r#"service="kernel""#)
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 1);
@@ -363,9 +372,9 @@ mod tests {
 
     #[test]
     fn test_field_filter_quoted_value_with_spaces() {
-        // service:"Activity Monitor" — quotes allow spaces in field values.
+        // service="Activity Monitor" — quotes allow spaces in field values.
         let result = search_stage()
-            .parse(r#"service:"Activity Monitor""#)
+            .parse(r#"service="Activity Monitor""#)
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 1);
@@ -395,7 +404,7 @@ mod tests {
     #[test]
     fn test_multiple_tokens() {
         let result = search_stage()
-            .parse("service:nginx level:error last:2h")
+            .parse("service=nginx level=error last=2h")
             .into_result()
             .unwrap();
         // Time filter hoisted, 2 tokens remain in group.
@@ -419,9 +428,9 @@ mod tests {
 
     #[test]
     fn test_not_before_field_filter() {
-        // "NOT level:error" — NOT is text search, level:error is field filter.
+        // "NOT level=error" — NOT is text search, level=error is field filter.
         let result = search_stage()
-            .parse("NOT level:error")
+            .parse("NOT level=error")
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 2);
@@ -445,7 +454,7 @@ mod tests {
     #[test]
     fn test_negated_with_field_filter() {
         let result = search_stage()
-            .parse("-debug service:nginx")
+            .parse("-debug service=nginx")
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 2);
@@ -461,7 +470,7 @@ mod tests {
     #[test]
     fn test_or_two_groups() {
         let result = search_stage()
-            .parse("service:kernel OR service:trawld")
+            .parse("service=kernel OR service=trawld")
             .into_result()
             .unwrap();
         assert_eq!(result.groups.len(), 2);
@@ -489,7 +498,7 @@ mod tests {
     fn test_or_implicit_and_binds_tighter() {
         // "a b OR c d" → [[a, b], [c, d]]
         let result = search_stage()
-            .parse("service:nginx level:error OR service:postgres level:warn")
+            .parse("service=nginx level=error OR service=postgres level=warn")
             .into_result()
             .unwrap();
         assert_eq!(result.groups.len(), 2);
@@ -500,7 +509,7 @@ mod tests {
     #[test]
     fn test_or_lowercase() {
         let result = search_stage()
-            .parse("service:a or service:b")
+            .parse("service=a or service=b")
             .into_result()
             .unwrap();
         assert_eq!(result.groups.len(), 2);
@@ -515,9 +524,9 @@ mod tests {
 
     #[test]
     fn test_time_filter_hoisted_from_or_groups() {
-        // `service:nginx last:2h OR service:postgres` — time filter applies globally.
+        // `service=nginx last=2h OR service=postgres` — time filter applies globally.
         let result = search_stage()
-            .parse("service:nginx last:2h OR service:postgres")
+            .parse("service=nginx last=2h OR service=postgres")
             .into_result()
             .unwrap();
         assert_eq!(result.groups.len(), 2);
@@ -540,7 +549,7 @@ mod tests {
     fn test_last_time_filter_wins() {
         // Multiple time filters — last one wins.
         let result = search_stage()
-            .parse("last:1h service:nginx last:2h")
+            .parse("last=1h service=nginx last=2h")
             .into_result()
             .unwrap();
         let tf = result.time_filter.expect("time_filter should be hoisted");
@@ -553,7 +562,7 @@ mod tests {
     #[test]
     fn test_only_time_filter_produces_empty_groups() {
         // A query with only a time filter — groups become empty after hoisting.
-        let result = search_stage().parse("last:5m").into_result().unwrap();
+        let result = search_stage().parse("last=5m").into_result().unwrap();
         assert!(result.groups.is_empty());
         assert!(result.time_filter.is_some());
     }

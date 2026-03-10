@@ -116,11 +116,11 @@ fn random_field_eq(rng: &mut Rng) -> String {
         // String value on string field only.
         let field = rng.pick(STRING_FIELDS);
         let value = rng.pick(STRING_VALS);
-        format!("{field}:{value}")
+        format!("{field}={value}")
     } else {
         // Numeric value on numeric field only.
         let value = rng.pick(INT_VALS);
-        format!("status:{value}")
+        format!("status={value}")
     }
 }
 
@@ -129,7 +129,7 @@ fn random_field_compare(rng: &mut Rng) -> String {
     // to avoid type conversion ambiguity.
     let op = rng.pick(&[">", ">=", "<", "<=", "!="]);
     let value = rng.pick(INT_VALS).unsigned_abs();
-    format!("status:{op}{value}")
+    format!("status{op}{value}")
 }
 
 fn random_field_list(rng: &mut Rng) -> String {
@@ -140,11 +140,11 @@ fn random_field_list(rng: &mut Rng) -> String {
         let values: Vec<String> = (0..count)
             .map(|_| (*rng.pick(STRING_VALS)).to_string())
             .collect();
-        format!("{}:{}", field, values.join(","))
+        format!("{}={}", field, values.join(","))
     } else {
         // Numeric values on status field only.
         let values: Vec<String> = (0..count).map(|_| rng.pick(INT_VALS).to_string()).collect();
-        format!("status:{}", values.join(","))
+        format!("status={}", values.join(","))
     }
 }
 
@@ -169,7 +169,7 @@ fn random_field_glob(rng: &mut Rng) -> String {
     let field = rng.pick(STRING_FIELDS);
     let base = rng.pick(STRING_VALS);
     // Append `*` so the parser auto-detects as glob.
-    format!("{field}:{base}*")
+    format!("{field}={base}*")
 }
 
 // ── Event generation ──────────────────────────────────────────────────

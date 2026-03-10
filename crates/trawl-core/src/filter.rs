@@ -566,11 +566,11 @@ mod tests {
     #[test]
     fn field_eq_string() {
         assert!(matches_event(
-            "service:nginx",
+            "service=nginx",
             r#"{"service": "nginx", "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "service:nginx",
+            "service=nginx",
             r#"{"service": "apache", "message": "ok"}"#
         ));
     }
@@ -579,16 +579,16 @@ mod tests {
     fn field_eq_numeric() {
         // Numeric filter against numeric JSON value.
         assert!(matches_event(
-            "status:200",
+            "status=200",
             r#"{"status": 200, "message": "ok"}"#
         ));
         // Numeric filter against string JSON value (implicit cast).
         assert!(matches_event(
-            "status:200",
+            "status=200",
             r#"{"status": "200", "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "status:200",
+            "status=200",
             r#"{"status": 404, "message": "ok"}"#
         ));
     }
@@ -596,11 +596,11 @@ mod tests {
     #[test]
     fn field_ne() {
         assert!(matches_event(
-            "status:!=200",
+            "status!=200",
             r#"{"status": 404, "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "status:!=200",
+            "status!=200",
             r#"{"status": 200, "message": "ok"}"#
         ));
     }
@@ -608,11 +608,11 @@ mod tests {
     #[test]
     fn field_gt() {
         assert!(matches_event(
-            "status:>400",
+            "status>400",
             r#"{"status": 500, "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "status:>400",
+            "status>400",
             r#"{"status": 200, "message": "ok"}"#
         ));
     }
@@ -620,11 +620,11 @@ mod tests {
     #[test]
     fn field_gte() {
         assert!(matches_event(
-            "status:>=400",
+            "status>=400",
             r#"{"status": 400, "message": "ok"}"#
         ));
         assert!(matches_event(
-            "status:>=400",
+            "status>=400",
             r#"{"status": 500, "message": "ok"}"#
         ));
     }
@@ -632,11 +632,11 @@ mod tests {
     #[test]
     fn field_lt() {
         assert!(matches_event(
-            "status:<300",
+            "status<300",
             r#"{"status": 200, "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "status:<300",
+            "status<300",
             r#"{"status": 500, "message": "ok"}"#
         ));
     }
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn field_lte() {
         assert!(matches_event(
-            "status:<=300",
+            "status<=300",
             r#"{"status": 300, "message": "ok"}"#
         ));
     }
@@ -652,11 +652,11 @@ mod tests {
     #[test]
     fn field_in_list() {
         assert!(matches_event(
-            "status:200,301,404",
+            "status=200,301,404",
             r#"{"status": 301, "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "status:200,301,404",
+            "status=200,301,404",
             r#"{"status": 500, "message": "ok"}"#
         ));
     }
@@ -665,11 +665,11 @@ mod tests {
     fn field_glob() {
         // Parser auto-detects glob from `*` in value.
         assert!(matches_event(
-            "path:/api/*",
+            "path=/api/*",
             r#"{"path": "/api/users", "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "path:/api/*",
+            "path=/api/*",
             r#"{"path": "/web/index", "message": "ok"}"#
         ));
     }
@@ -678,11 +678,11 @@ mod tests {
     fn field_glob_question_mark() {
         // Parser auto-detects glob from `?` in value.
         assert!(matches_event(
-            "host:web-?",
+            "host=web-?",
             r#"{"host": "web-1", "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "host:web-?",
+            "host=web-?",
             r#"{"host": "web-10", "message": "ok"}"#
         ));
     }
@@ -692,11 +692,11 @@ mod tests {
         // `[` alone doesn't trigger glob auto-detection, so include `*`.
         // Character class semantics are covered by glob_conversion_* tests.
         assert!(matches_event(
-            "host:web-[123]*",
+            "host=web-[123]*",
             r#"{"host": "web-2-prod", "message": "ok"}"#
         ));
         assert!(!matches_event(
-            "host:web-[123]*",
+            "host=web-[123]*",
             r#"{"host": "web-5-prod", "message": "ok"}"#
         ));
     }
@@ -704,11 +704,11 @@ mod tests {
     #[test]
     fn field_regex() {
         assert!(matches_event(
-            r"host:/web-\d+/",
+            r"host=/web-\d+/",
             r#"{"host": "web-42", "message": "ok"}"#
         ));
         assert!(!matches_event(
-            r"host:/web-\d+/",
+            r"host=/web-\d+/",
             r#"{"host": "db-01", "message": "ok"}"#
         ));
     }
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn missing_field_no_match() {
         assert!(!matches_event(
-            "service:nginx",
+            "service=nginx",
             r#"{"host": "web-1", "message": "ok"}"#
         ));
     }
@@ -793,38 +793,38 @@ mod tests {
     fn or_groups() {
         // Matches first group.
         assert!(matches_event(
-            "service:nginx OR service:apache",
+            "service=nginx OR service=apache",
             r#"{"service": "nginx", "message": "ok"}"#
         ));
         // Matches second group.
         assert!(matches_event(
-            "service:nginx OR service:apache",
+            "service=nginx OR service=apache",
             r#"{"service": "apache", "message": "ok"}"#
         ));
         // Matches neither.
         assert!(!matches_event(
-            "service:nginx OR service:apache",
+            "service=nginx OR service=apache",
             r#"{"service": "postgres", "message": "ok"}"#
         ));
     }
 
     #[test]
     fn or_groups_with_and() {
-        // `service:nginx level:error OR service:apache level:warn`
+        // `service=nginx level=error OR service=apache level=warn`
         // Group 1: service=nginx AND level=error
         // Group 2: service=apache AND level=warn
         assert!(matches_event(
-            "service:nginx level:error OR service:apache level:warn",
+            "service=nginx level=error OR service=apache level=warn",
             r#"{"service": "nginx", "level": "error", "message": "ok"}"#
         ));
         // Matches group 2.
         assert!(matches_event(
-            "service:nginx level:error OR service:apache level:warn",
+            "service=nginx level=error OR service=apache level=warn",
             r#"{"service": "apache", "level": "warn", "message": "ok"}"#
         ));
         // Neither group fully matches (service=nginx but level=warn).
         assert!(!matches_event(
-            "service:nginx level:error OR service:apache level:warn",
+            "service=nginx level=error OR service=apache level=warn",
             r#"{"service": "nginx", "level": "warn", "message": "ok"}"#
         ));
     }
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn null_field_no_match() {
         assert!(!matches_event(
-            "service:nginx",
+            "service=nginx",
             r#"{"service": null, "message": "ok"}"#
         ));
     }
@@ -982,22 +982,22 @@ mod tests {
 
     #[test]
     fn time_filter_recent_event_matches() {
-        // Event 1 second ago → should match last:1h
+        // Event 1 second ago → should match last=1h
         let recent = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
         let event = event_with_timestamp(&recent);
         assert!(matches_event(
-            "last:1h",
+            "last=1h",
             &serde_json::to_string(&event).unwrap()
         ));
     }
 
     #[test]
     fn time_filter_old_event_excluded() {
-        // Event 2 hours ago → should NOT match last:1h
+        // Event 2 hours ago → should NOT match last=1h
         let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let event = event_with_timestamp(&old);
         assert!(!matches_event(
-            "last:1h",
+            "last=1h",
             &serde_json::to_string(&event).unwrap()
         ));
     }
@@ -1009,35 +1009,35 @@ mod tests {
         let boundary = (chrono::Utc::now() - chrono::Duration::seconds(3599)).to_rfc3339();
         let event = event_with_timestamp(&boundary);
         assert!(matches_event(
-            "last:1h",
+            "last=1h",
             &serde_json::to_string(&event).unwrap()
         ));
     }
 
     #[test]
     fn time_filter_just_past_boundary_excluded() {
-        // Event 1 second past the cutoff → should NOT match last:1h.
+        // Event 1 second past the cutoff → should NOT match last=1h.
         let past = (chrono::Utc::now() - chrono::Duration::seconds(3601)).to_rfc3339();
         let event = event_with_timestamp(&past);
         assert!(!matches_event(
-            "last:1h",
+            "last=1h",
             &serde_json::to_string(&event).unwrap()
         ));
     }
 
     #[test]
     fn time_filter_epoch_seconds_event() {
-        // Epoch-seconds timestamp 1 second ago → should match last:1h.
+        // Epoch-seconds timestamp 1 second ago → should match last=1h.
         let recent_epoch = chrono::Utc::now().timestamp() - 1;
         let event = event_with_epoch_secs(recent_epoch);
         let json = serde_json::to_string(&event).unwrap();
-        assert!(matches_event("last:1h", &json));
+        assert!(matches_event("last=1h", &json));
 
         // Epoch-seconds timestamp 2 hours ago → should NOT match.
         let old_epoch = chrono::Utc::now().timestamp() - 7200;
         let event = event_with_epoch_secs(old_epoch);
         let json = serde_json::to_string(&event).unwrap();
-        assert!(!matches_event("last:1h", &json));
+        assert!(!matches_event("last=1h", &json));
     }
 
     #[test]
@@ -1046,14 +1046,14 @@ mod tests {
         let mut event = serde_json::Map::new();
         event.insert("message".into(), Value::String("test".into()));
         let json = serde_json::to_string(&event).unwrap();
-        assert!(!matches_event("last:1h", &json));
+        assert!(!matches_event("last=1h", &json));
     }
 
     // ── matches_at with explicit timestamp ──────────────────────────
 
     #[test]
     fn matches_at_uses_provided_now() {
-        let query = parser::parse("last:1h").expect("parse should succeed");
+        let query = parser::parse("last=1h").expect("parse should succeed");
         let filter = CompiledFilter::compile(&query.search);
 
         // Event 30 min ago from "now".

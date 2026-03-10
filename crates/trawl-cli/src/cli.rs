@@ -303,7 +303,7 @@ fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_client::Er
 /// For each detail with a span, shows the query text with the error region
 /// underlined:
 /// ```text
-///   level:error | staats count() by host
+///   level=error | staats count() by host
 ///                 ~~~~~~
 ///   expected pipe stage
 /// ```

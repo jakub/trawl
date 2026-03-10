@@ -660,7 +660,7 @@ mod tests {
             .execute(
                 "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![key_id, name, "level:error", &now, &now],
+                params![key_id, name, "level=error", &now, &now],
             )
             .unwrap();
         store.conn.last_insert_rowid()
@@ -824,7 +824,7 @@ mod tests {
 
         // Start a run so we have data in report_runs too.
         let run_id = store
-            .start_run(schedule.id, sq_id, "level:error")
+            .start_run(schedule.id, sq_id, "level=error")
             .unwrap()
             .unwrap();
         store
@@ -855,7 +855,7 @@ mod tests {
         let schedule = store.create_schedule(sq_id, 1, 300, None).unwrap();
 
         let run_id = store
-            .start_run(schedule.id, sq_id, "level:error")
+            .start_run(schedule.id, sq_id, "level=error")
             .unwrap()
             .expect("should start run");
 

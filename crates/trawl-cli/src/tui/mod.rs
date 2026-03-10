@@ -3189,7 +3189,7 @@ mod tests {
             queries: vec![SavedQueryResponse {
                 id: 1,
                 name: "test query".to_owned(),
-                query: "level:error".to_owned(),
+                query: "level=error".to_owned(),
                 created_at: "2025-01-01T00:00:00Z".to_owned(),
                 updated_at: "2025-01-01T00:00:00Z".to_owned(),
                 schedule: None,

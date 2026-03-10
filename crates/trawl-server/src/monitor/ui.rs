@@ -576,7 +576,7 @@ mod tests {
                 CompletedQuerySnapshot {
                     id: 1247,
                     user: "admin".into(),
-                    query: "level:error last:1h | stats count() by service".into(),
+                    query: "level=error last=1h | stats count() by service".into(),
                     duration_ms: 23,
                     rows: Some(142),
                     error: None,
@@ -605,7 +605,7 @@ mod tests {
                 id: 1248,
                 user: "admin".into(),
                 role: "admin".into(),
-                query: "service:nginx | timechart span=5m count()".into(),
+                query: "service=nginx | timechart span=5m count()".into(),
                 running_ms: 1200,
             }],
         }

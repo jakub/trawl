@@ -600,13 +600,13 @@ mod tests {
     #[test]
     fn query_request_serializes() {
         let req = trawl_api::QueryRequest {
-            query: "service:nginx | stats count()".to_string(),
+            query: "service=nginx | stats count()".to_string(),
             limit: Some(10),
             offset: Some(5),
             timezone: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["query"], "service:nginx | stats count()");
+        assert_eq!(json["query"], "service=nginx | stats count()");
         assert_eq!(json["limit"], 10);
         assert_eq!(json["offset"], 5);
     }
@@ -614,13 +614,13 @@ mod tests {
     #[test]
     fn query_request_omits_none() {
         let req = trawl_api::QueryRequest {
-            query: "service:nginx".to_string(),
+            query: "service=nginx".to_string(),
             limit: None,
             offset: None,
             timezone: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["query"], "service:nginx");
+        assert_eq!(json["query"], "service=nginx");
         assert!(json.get("limit").is_none());
         assert!(json.get("offset").is_none());
     }
@@ -689,7 +689,7 @@ mod tests {
             "recent": [{
                 "id": 2,
                 "user": "analyst",
-                "query": "service:nginx",
+                "query": "service=nginx",
                 "duration_ms": 42,
                 "rows": 100,
                 "error": null,

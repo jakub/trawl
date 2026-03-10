@@ -27,7 +27,7 @@ crates/
 ## key design decisions
 
 - single-node only. no clustering, sharding, or multi-tenancy.
-- pipeline-oriented DSL: `service:nginx level:error last:2h | stats count() by host | where count > 10`
+- pipeline-oriented DSL: `service=nginx level=error last=2h | stats count() by host | where count > 10`
 - SQL injection prevention via parameterized queries + field allowlists
 - agent tasks are cryptographically signed offline — compromised server can't create novel execution authority
 - **real-time event bus**: ingested events are published to a `broadcast::channel`-backed bus and stored in a hot buffer, making them queryable within milliseconds of ingest (before WAL compaction to parquet)
@@ -107,19 +107,19 @@ trawl validate --insecure "dsl..."               # prints "valid" or error with 
 
 ```sh
 # recent errors by service
-trawl query --insecure "level:error last:1h | stats count() by service | sort -count | head 10"
+trawl query --insecure "level=error last=1h | stats count() by service | sort -count | head 10"
 
 # browse all data (table output)
 trawl query --insecure -f table "* | head 5 | fields timestamp, host, service, level, message"
 
 # pipe JSON to jq for ad-hoc processing
-trawl query --insecure "last:1h | stats count() by service" | jq '.service'
+trawl query --insecure "last=1h | stats count() by service" | jq '.service'
 
 # export to CSV file
-trawl query --insecure -f csv "last:24h | stats count() by service, level" > report.csv
+trawl query --insecure -f csv "last=24h | stats count() by service, level" > report.csv
 
 # validate a query without executing
-trawl validate --insecure "level:error | stats count() by host"
+trawl validate --insecure "level=error | stats count() by host"
 
 # query local parquet files (no server needed)
 trawl query --data 'data/**/*.parquet' "* | stats count() by service | sort -count"
@@ -175,15 +175,15 @@ search stage is optional. pipelines can start with `|` for raw log access.
 
 **field filters**
 ```
-service:nginx                    # exact match
-status:200,301,404              # IN list (comma-separated)
-status:>=400                    # comparison (>, >=, <, <=, !=)
-path:/api/*                     # glob pattern
-message:/error.*/               # regex pattern (slashes required)
-service:"Activity Monitor"      # quoted values (for spaces/special chars)
+service=nginx                    # exact match
+status=200,301,404              # IN list (comma-separated)
+status>=400                     # comparison (>, >=, <, <=, !=)
+path=/api/*                     # glob pattern
+message=/error.*/               # regex pattern (slashes required)
+service="Activity Monitor"      # quoted values (for spaces/special chars)
 ```
 
-**operators**: `:` (=), `:>`, `:>=`, `:<`, `:<=`, `:!=`
+**operators**: `=`, `!=`, `>`, `>=`, `<`, `<=`
 
 **text search**
 ```
@@ -194,14 +194,14 @@ error                           # bare word (substring match)
 
 **time filters**
 ```
-last:2h                         # units: s, m, h, d, w
-last:7d
-last:30m
+last=2h                         # units: s, m, h, d, w
+last=7d
+last=30m
 ```
 
 **OR grouping**
 ```
-service:nginx OR service:apache # OR-separated groups
+service=nginx OR service=apache # OR-separated groups
 a b OR c d                      # implicit AND within groups: (a AND b) OR (c AND d)
 ```
 
@@ -385,25 +385,25 @@ pivot avg(duration) on service by host
 
 ```
 # errors in the last hour by service
-level:error last:1h | stats count() by service | sort -count
+level=error last=1h | stats count() by service | sort -count
 
 # slow requests by endpoint
-status:200 last:24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10
+status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10
 
 # 4xx/5xx rate by host
-status:>=400 last:2h | stats count() by host, status | where count > 10
+status>=400 last=2h | stats count() by host, status | where count > 10
 
 # extract IPs and count
 "connection from" | rex "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message | stats count() by ip | sort -count
 
 # time series of error rate
-level:error OR level:fatal | timechart span=5m count() by service
+level=error OR level=fatal | timechart span=5m count() by service
 
 # dedup flapping alerts
-service:monitoring | dedup host, alert_name
+service=monitoring | dedup host, alert_name
 
 # pivot status codes by host
-last:1h | pivot count() on status by host
+last=1h | pivot count() on status by host
 
 # last 5 events with renamed columns
 * | rename service as svc, host as hostname | tail 5

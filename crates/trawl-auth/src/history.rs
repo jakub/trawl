@@ -196,7 +196,7 @@ mod tests {
         let key_id = 42;
 
         let id = store
-            .record_query(key_id, "service:nginx | stats count()", 123, 5, "success")
+            .record_query(key_id, "service=nginx | stats count()", 123, 5, "success")
             .unwrap();
 
         assert!(id > 0);
@@ -207,7 +207,7 @@ mod tests {
 
         let entry = &page.entries[0];
         assert_eq!(entry.key_id, key_id);
-        assert_eq!(entry.query, "service:nginx | stats count()");
+        assert_eq!(entry.query, "service=nginx | stats count()");
         assert_eq!(entry.duration_ms, 123);
         assert_eq!(entry.row_count, 5);
         assert_eq!(entry.status, "success");

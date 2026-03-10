@@ -15,7 +15,7 @@ const TIME_FILTER_PADDING_SECS: u64 = 3600;
 /// Extract an exact service name from the search stage, if present.
 ///
 /// Only returns `Some` for single-group queries with a simple equality
-/// filter (`service:nginx`). Multi-group (OR) queries can't be narrowed
+/// filter (`service=nginx`). Multi-group (OR) queries can't be narrowed
 /// to one service safely, and glob/regex operators are also ignored.
 fn extract_service_filter(search: &trawl_core::ast::SearchStage) -> Option<&str> {
     // Can't narrow when OR is involved — different groups may target different services.
@@ -38,7 +38,7 @@ fn extract_service_filter(search: &trawl_core::ast::SearchStage) -> Option<&str>
 
 /// Compute the `read_parquet()` source argument, scoped to relevant
 /// hour-directories when the query contains a time filter and/or
-/// narrowed to a single service file when `service:X` is present.
+/// narrowed to a single service file when `service=X` is present.
 ///
 /// Supports two-tier parquet layout: day-level files for consolidated
 /// dates and hour-level files for unconsolidated dates. Both layouts
@@ -204,21 +204,21 @@ mod tests {
     #[test]
     fn no_time_filter_returns_recursive_glob() {
         // No time filter, no service → broad glob.
-        let source = compute_source("/data", "level:error", "/data/**/*.parquet");
+        let source = compute_source("/data", "level=error", "/data/**/*.parquet");
         assert_eq!(source, "/data/**/*.parquet");
     }
 
     #[test]
     fn service_filter_narrows_glob() {
         // Exact service filter → narrow to service-specific file.
-        let source = compute_source("/data", "service:nginx", "/data/**/*.parquet");
+        let source = compute_source("/data", "service=nginx", "/data/**/*.parquet");
         assert_eq!(source, "/data/**/nginx.parquet");
     }
 
     #[test]
     fn service_glob_keeps_wildcard() {
         // Glob operator on service → can't narrow, keep *.parquet.
-        let source = compute_source("/data", "service:ng*", "/data/**/*.parquet");
+        let source = compute_source("/data", "service=ng*", "/data/**/*.parquet");
         assert_eq!(source, "/data/**/*.parquet");
     }
 
@@ -243,7 +243,7 @@ mod tests {
             std::fs::create_dir_all(tmp.path().join(&date).join(&hour)).unwrap();
         }
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "last:1h", &fallback);
+        let source = compute_source(base, "last=1h", &fallback);
         // Should be a list of hour-directory globs, not the fallback.
         assert!(
             source.starts_with('['),
@@ -258,7 +258,7 @@ mod tests {
         let count = source.matches("*.parquet").count();
         assert!(
             count >= 2,
-            "expected >=2 hour globs for last:1h, got {count}: {source}"
+            "expected >=2 hour globs for last=1h, got {count}: {source}"
         );
     }
 
@@ -276,7 +276,7 @@ mod tests {
             std::fs::create_dir_all(tmp.path().join(&date).join(&hour)).unwrap();
         }
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "service:nginx last:1h", &fallback);
+        let source = compute_source(base, "service=nginx last=1h", &fallback);
         assert!(
             source.starts_with('['),
             "expected list format, got: {source}"
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn strips_trailing_slash() {
-        let source = compute_source("/data/", "last:1h", "/data/**/*.parquet");
+        let source = compute_source("/data/", "last=1h", "/data/**/*.parquet");
         assert!(!source.contains("//"), "double slashes in source: {source}");
     }
 
@@ -311,7 +311,7 @@ mod tests {
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "service:nginx last:48h", &fallback);
+        let source = compute_source(base, "service=nginx last=48h", &fallback);
 
         // Should include day-level path for yesterday (no /HH/ component).
         let expected_day_glob = format!("'{base}/{yesterday}/nginx.parquet'");
@@ -335,7 +335,7 @@ mod tests {
         std::fs::write(hour_dir.join("nginx.parquet"), b"data").unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "service:nginx last:48h", &fallback);
+        let source = compute_source(base, "service=nginx last=48h", &fallback);
 
         // Only hour 14 exists on disk, so only that glob survives filtering.
         let hourly_pattern = format!("{base}/{yesterday}/14/nginx.parquet");
@@ -359,7 +359,7 @@ mod tests {
         std::fs::write(day_dir.join("postgres.parquet"), b"data").unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "last:48h", &fallback);
+        let source = compute_source(base, "last=48h", &fallback);
 
         // Should use day-level glob (*.parquet at date level).
         let expected_day_glob = format!("'{base}/{yesterday}/*.parquet'");
@@ -463,7 +463,7 @@ mod tests {
         std::fs::write(hour_dir.join("postgres.parquet"), b"data").unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "last:48h", &fallback);
+        let source = compute_source(base, "last=48h", &fallback);
 
         // Should include BOTH day-level glob and the existing hourly dir.
         let day_glob = format!("'{base}/{yesterday}/*.parquet'");
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn sanitizes_dotted_service() {
         // Dotted service name should be sanitized to match WAL/compaction filenames.
-        let source = compute_source("/data", "service:api.v2", "/data/**/*.parquet");
+        let source = compute_source("/data", "service=api.v2", "/data/**/*.parquet");
         assert_eq!(
             source, "/data/**/api_v2.parquet",
             "dots should be replaced with underscores in file pattern"
@@ -503,7 +503,7 @@ mod tests {
         std::fs::write(day_dir.join("trawld.parquet"), b"data").unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "service:trawld last:1h", &fallback);
+        let source = compute_source(base, "service=trawld last=1h", &fallback);
 
         // Day-level glob must be present so the consolidated file is found.
         let day_glob = format!("'{base}/{today}/trawld.parquet'");
@@ -528,7 +528,7 @@ mod tests {
         std::fs::create_dir_all(day_dir.join(&hour)).unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "last:1h", &fallback);
+        let source = compute_source(base, "last=1h", &fallback);
 
         let day_glob = format!("'{base}/{today}/*.parquet'");
         let hourly_glob = format!("{base}/{today}/{hour}/");
@@ -547,7 +547,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "service:host.name last:1h", &fallback);
+        let source = compute_source(base, "service=host.name last=1h", &fallback);
 
         // Should use sanitized filename pattern.
         assert!(

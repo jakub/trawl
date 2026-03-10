@@ -10,9 +10,9 @@ use trawl_client::SchemaResponse;
 enum TokenType {
     /// Pipe stages (stats, where, sort, etc.)
     Stage,
-    /// Field filter keywords (service:, level:, last:, etc.)
+    /// Field filter keywords (service=, level=, status>=, etc.)
     FilterKey,
-    /// Operators (|, :, >, >=, ==, etc.)
+    /// Operators (|, =, >, >=, ==, etc.)
     Operator,
     /// Logical keywords (and, or, not, AND, OR, NOT)
     Logical,
@@ -96,11 +96,18 @@ impl Highlighter {
         Line::from(spans)
     }
 
-    /// Post-tokenization pass: if a Field token is immediately followed by a ":"
-    /// operator token, reclassify the Field as `FilterKey`.
+    /// Post-tokenization pass: if a Field token is immediately followed by a
+    /// filter operator (`=`, `>=`, `<=`, `!=`, `>`, `<`), reclassify the Field
+    /// as `FilterKey`.
     fn fix_filter_keys(tokens: &mut [(TokenType, std::string::String)]) {
         for i in 0..tokens.len().saturating_sub(1) {
-            if tokens[i].0 == TokenType::Field && tokens[i + 1].1.starts_with(':') {
+            if tokens[i].0 == TokenType::Field
+                && tokens[i + 1].0 == TokenType::Operator
+                && matches!(
+                    tokens[i + 1].1.as_str(),
+                    "=" | ">=" | "<=" | "!=" | ">" | "<"
+                )
+            {
                 tokens[i].0 = TokenType::FilterKey;
             }
         }
@@ -179,25 +186,6 @@ impl Highlighter {
                 continue;
             }
 
-            // Multi-character operators
-            if ch == ':' {
-                if !current.is_empty() {
-                    tokens.push((Self::classify_word(&current), current.clone()));
-                    current.clear();
-                }
-                let mut op = std::string::String::from(':');
-                if let Some(&next) = chars.peek()
-                    && (next == '>' || next == '<' || next == '=' || next == '!')
-                {
-                    op.push(chars.next().unwrap());
-                    if chars.peek() == Some(&'=') {
-                        op.push(chars.next().unwrap());
-                    }
-                }
-                tokens.push((TokenType::Operator, op));
-                continue;
-            }
-
             // Comparison operators
             if ch == '>' || ch == '<' || ch == '=' || ch == '!' {
                 if !current.is_empty() {
@@ -251,13 +239,7 @@ impl Highlighter {
                 {
                     let mut negated = std::string::String::from('-');
                     while let Some(&c) = chars.peek() {
-                        if c.is_whitespace()
-                            || c == '|'
-                            || c == ':'
-                            || c == '('
-                            || c == ')'
-                            || c == ','
-                        {
+                        if c.is_whitespace() || c == '|' || c == '(' || c == ')' || c == ',' {
                             break;
                         }
                         negated.push(chars.next().unwrap());
@@ -289,11 +271,6 @@ impl Highlighter {
             | "rare" | "drop" | "let" | "eval" | "extract" | "rex" | "rename" | "dedup"
             | "timechart" | "pivot" => return TokenType::Stage,
             _ => {}
-        }
-
-        // Filter keywords (legacy: word ends with colon)
-        if lower.ends_with(':') {
-            return TokenType::FilterKey;
         }
 
         // Logical operators

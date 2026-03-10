@@ -340,7 +340,7 @@ async fn query_with_filter() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client
-        .query_paginated("service:nginx", None, None)
+        .query_paginated("service=nginx", None, None)
         .await
         .unwrap();
     assert_eq!(result.result.row_count(), 2);
@@ -693,7 +693,7 @@ async fn validate_query_valid() {
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
-        .validate("service:nginx | stats count()")
+        .validate("service=nginx | stats count()")
         .await
         .unwrap();
     assert!(resp.valid);
@@ -706,7 +706,7 @@ async fn validate_query_syntax_error() {
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
-        .validate("service:nginx | bad_command")
+        .validate("service=nginx | bad_command")
         .await
         .unwrap();
     assert!(!resp.valid);

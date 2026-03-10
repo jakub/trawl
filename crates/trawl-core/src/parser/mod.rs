@@ -1,6 +1,6 @@
 //! DSL parser for trawl.s query language.
 //!
-//! Transforms a query string like `service:nginx level:error last:2h | stats count() by host`
+//! Transforms a query string like `service=nginx level=error last=2h | stats count() by host`
 //! into a structured AST representation.
 //!
 //! The parser is built in layers:
@@ -137,14 +137,14 @@ mod tests {
 
     #[test]
     fn test_simple_field_filter() {
-        let query = parse("service:nginx").unwrap();
+        let query = parse("service=nginx").unwrap();
         assert_eq!(query.search.groups[0].len(), 1);
         assert_eq!(query.pipeline.len(), 0);
     }
 
     #[test]
     fn test_multi_token_search() {
-        let query = parse("service:nginx level:error last:2h").unwrap();
+        let query = parse("service=nginx level=error last=2h").unwrap();
         // Time filter hoisted, 2 tokens remain in group.
         assert_eq!(query.search.groups[0].len(), 2);
         assert!(query.search.time_filter.is_some());
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_negated_text_search() {
-        let query = parse("-debug service:nginx").unwrap();
+        let query = parse("-debug service=nginx").unwrap();
         assert_eq!(query.search.groups[0].len(), 2);
         assert_eq!(
             query.search.groups[0][0].node,
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_search_with_stats() {
-        let query = parse("service:nginx last:1h | stats count() by host").unwrap();
+        let query = parse("service=nginx last=1h | stats count() by host").unwrap();
         // Time filter hoisted, 1 token remains in group.
         assert_eq!(query.search.groups[0].len(), 1);
         assert!(query.search.time_filter.is_some());
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_full_pipeline() {
-        let query = parse("service:nginx | stats count() by host | where count > 10 | sort -count")
+        let query = parse("service=nginx | stats count() by host | where count > 10 | sort -count")
             .unwrap();
         assert_eq!(query.search.groups[0].len(), 1);
         assert_eq!(query.pipeline.len(), 3);
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn test_stats_avg_table() {
         let query =
-            parse("service:nginx | stats avg(duration) by status | table status, avg_duration")
+            parse("service=nginx | stats avg(duration) by status | table status, avg_duration")
                 .unwrap();
         assert_eq!(query.pipeline.len(), 2);
         match &query.pipeline[0].node {
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn test_complex_query() {
         let query =
-            parse("status:>=400 last:24h | stats count() by host, uri | sort -count | limit 20")
+            parse("status>=400 last=24h | stats count() by host, uri | sort -count | limit 20")
                 .unwrap();
         // Time filter hoisted, 1 token remains in group.
         assert_eq!(query.search.groups[0].len(), 1);
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_error_invalid_pipe_stage() {
-        let result = parse("service:nginx | bogus");
+        let result = parse("service=nginx | bogus");
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(!errors.is_empty());
@@ -259,13 +259,13 @@ mod tests {
 
     #[test]
     fn test_error_missing_stats_agg() {
-        let result = parse("service:nginx | stats");
+        let result = parse("service=nginx | stats");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_error_unclosed_paren() {
-        let result = parse("service:nginx | where (count > 10");
+        let result = parse("service=nginx | where (count > 10");
         assert!(result.is_err());
     }
 

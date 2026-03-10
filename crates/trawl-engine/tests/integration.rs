@@ -37,14 +37,14 @@ fn wildcard_returns_all_rows() {
 #[test]
 fn field_filter_service() {
     let (exec, glob) = setup();
-    let result = exec.run_query_max("service:nginx", &glob).unwrap();
+    let result = exec.run_query_max("service=nginx", &glob).unwrap();
     assert_eq!(result.row_count(), 6);
 }
 
 #[test]
 fn field_filter_level_error() {
     let (exec, glob) = setup();
-    let result = exec.run_query_max("level:error", &glob).unwrap();
+    let result = exec.run_query_max("level=error", &glob).unwrap();
     // nginx 500, nginx 502, sshd "Connection refused"
     assert_eq!(result.row_count(), 3);
 }
@@ -72,7 +72,7 @@ fn quoted_search() {
 #[test]
 fn negated_text_search() {
     let (exec, glob) = setup();
-    let result = exec.run_query_max("-error service:nginx", &glob).unwrap();
+    let result = exec.run_query_max("-error service=nginx", &glob).unwrap();
     // nginx rows whose message does NOT contain "error"
     // excludes the 500 row ("internal server error")
     assert!(result.row_count() < 6);
@@ -82,7 +82,7 @@ fn negated_text_search() {
 #[test]
 fn status_comparison_gte() {
     let (exec, glob) = setup();
-    let result = exec.run_query_max("status:>=400", &glob).unwrap();
+    let result = exec.run_query_max("status>=400", &glob).unwrap();
     // 404, 500, 502
     assert_eq!(result.row_count(), 3);
 }
@@ -90,7 +90,7 @@ fn status_comparison_gte() {
 #[test]
 fn in_list_filter() {
     let (exec, glob) = setup();
-    let result = exec.run_query_max("status:200,301", &glob).unwrap();
+    let result = exec.run_query_max("status=200,301", &glob).unwrap();
     // 2x 200, 1x 301
     assert_eq!(result.row_count(), 3);
 }
@@ -112,7 +112,7 @@ fn stats_with_where_cte() {
     let (exec, glob) = setup();
     let result = exec
         .run_query_max(
-            "service:nginx | stats count() by host | where count > 2",
+            "service=nginx | stats count() by host | where count > 2",
             &glob,
         )
         .unwrap();
@@ -126,7 +126,7 @@ fn sort_and_limit() {
     let (exec, glob) = setup();
     let result = exec
         .run_query_max(
-            "service:nginx | stats count() by host | sort -count | limit 1",
+            "service=nginx | stats count() by host | sort -count | limit 1",
             &glob,
         )
         .unwrap();
@@ -139,7 +139,7 @@ fn sort_and_limit() {
 fn table_projection() {
     let (exec, glob) = setup();
     let result = exec
-        .run_query_max("service:nginx | table host, status, uri", &glob)
+        .run_query_max("service=nginx | table host, status, uri", &glob)
         .unwrap();
     assert_eq!(result.columns.len(), 3);
     assert_eq!(result.columns[0].name, "host");
@@ -153,7 +153,7 @@ fn full_pipeline() {
     let (exec, glob) = setup();
     let result = exec
         .run_query_max(
-            "service:nginx | stats count(), avg(duration) by host | sort -count | limit 5",
+            "service=nginx | stats count(), avg(duration) by host | sort -count | limit 5",
             &glob,
         )
         .unwrap();
@@ -165,7 +165,7 @@ fn full_pipeline() {
 #[test]
 fn empty_result() {
     let (exec, glob) = setup();
-    let result = exec.run_query_max("service:nonexistent", &glob).unwrap();
+    let result = exec.run_query_max("service=nonexistent", &glob).unwrap();
     assert_eq!(result.row_count(), 0);
     // columns should still be present from the parquet schema
     assert!(!result.columns.is_empty());
@@ -175,7 +175,7 @@ fn empty_result() {
 fn time_filter_large_window() {
     let (exec, glob) = setup();
     // fixtures are from 2024-01-15 — use a massive window to include them
-    let result = exec.run_query_max("last:99999d", &glob).unwrap();
+    let result = exec.run_query_max("last=99999d", &glob).unwrap();
     assert_eq!(result.row_count(), 13);
 }
 
@@ -220,7 +220,7 @@ fn drop_columns() {
 fn let_computed_column() {
     let (exec, glob) = setup();
     let result = exec
-        .run_query_max("service:nginx | let duration_ms = duration * 1000", &glob)
+        .run_query_max("service=nginx | let duration_ms = duration * 1000", &glob)
         .unwrap();
     assert_eq!(result.row_count(), 6);
     let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
@@ -232,7 +232,7 @@ fn extract_ip_from_message() {
     let (exec, glob) = setup();
     let result = exec
         .run_query_max(
-            r#"service:sshd | extract "from (?P<extracted_ip>[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+)" from message"#,
+            r#"service=sshd | extract "from (?P<extracted_ip>[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+)" from message"#,
             &glob,
         )
         .unwrap();
@@ -304,7 +304,7 @@ fn json_wildcard_returns_all_rows() {
 #[test]
 fn json_field_filter() {
     let (exec, glob) = setup_json();
-    let result = exec.run_query_max("service:nginx", &glob).unwrap();
+    let result = exec.run_query_max("service=nginx", &glob).unwrap();
     assert_eq!(result.row_count(), 6);
 }
 
@@ -446,7 +446,7 @@ fn extract_kv_with_stats() {
 fn extract_kv_with_search_prefix() {
     let (exec, src) = setup_kv();
     let result = exec
-        .run_query("host:web01 | extract kv | head 10", &src, 1000, 0)
+        .run_query("host=web01 | extract kv | head 10", &src, 1000, 0)
         .unwrap();
     // web01 has 3 rows.
     assert_eq!(result.row_count(), 3);
@@ -464,7 +464,7 @@ fn export_parquet_writes_valid_file() {
     // Remove the temp file so export_parquet creates it fresh.
     drop(tmp);
 
-    exec.export_parquet("service:nginx | head 3", &glob, &path, 1000)
+    exec.export_parquet("service=nginx | head 3", &glob, &path, 1000)
         .unwrap();
 
     // Verify the file exists and is re-readable via DuckDB.

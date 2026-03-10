@@ -186,57 +186,57 @@ mod tests {
 
     #[test]
     fn search_single_field_filter() {
-        assert_snapshot!(emit_dsl("service:nginx"));
+        assert_snapshot!(emit_dsl("service=nginx"));
     }
 
     #[test]
     fn search_multiple_filters() {
-        assert_snapshot!(emit_dsl("service:nginx level:error"));
+        assert_snapshot!(emit_dsl("service=nginx level=error"));
     }
 
     #[test]
     fn search_comparison_gt() {
-        assert_snapshot!(emit_dsl("status:>400"));
+        assert_snapshot!(emit_dsl("status>400"));
     }
 
     #[test]
     fn search_comparison_gte() {
-        assert_snapshot!(emit_dsl("status:>=400"));
+        assert_snapshot!(emit_dsl("status>=400"));
     }
 
     #[test]
     fn search_comparison_lt() {
-        assert_snapshot!(emit_dsl("status:<300"));
+        assert_snapshot!(emit_dsl("status<300"));
     }
 
     #[test]
     fn search_comparison_ne() {
-        assert_snapshot!(emit_dsl("status:!=200"));
+        assert_snapshot!(emit_dsl("status!=200"));
     }
 
     #[test]
     fn search_in_list() {
-        assert_snapshot!(emit_dsl("status:200,301,404"));
+        assert_snapshot!(emit_dsl("status=200,301,404"));
     }
 
     #[test]
     fn search_glob() {
-        assert_snapshot!(emit_dsl("path:glob:/api/*"));
+        assert_snapshot!(emit_dsl("path=glob:/api/*"));
     }
 
     #[test]
     fn search_regex() {
-        assert_snapshot!(emit_dsl(r"host:/web-\d+/"));
+        assert_snapshot!(emit_dsl(r"host=/web-\d+/"));
     }
 
     #[test]
     fn search_time_filter() {
-        assert_snapshot!(emit_dsl("last:2h"));
+        assert_snapshot!(emit_dsl("last=2h"));
     }
 
     #[test]
     fn search_time_filter_days() {
-        assert_snapshot!(emit_dsl("last:7d"));
+        assert_snapshot!(emit_dsl("last=7d"));
     }
 
     #[test]
@@ -262,31 +262,31 @@ mod tests {
     #[test]
     fn search_kitchen_sink() {
         assert_snapshot!(emit_dsl(
-            r#"service:nginx level:error last:2h "connection refused" -debug"#
+            r#"service=nginx level=error last=2h "connection refused" -debug"#
         ));
     }
 
     #[test]
     fn search_or_two_services() {
-        assert_snapshot!(emit_dsl("service:kernel OR service:trawld"));
+        assert_snapshot!(emit_dsl("service=kernel OR service=trawld"));
     }
 
     #[test]
     fn search_or_with_stats() {
-        assert_snapshot!(emit_dsl("service:kernel OR service:trawld | stats count()"));
+        assert_snapshot!(emit_dsl("service=kernel OR service=trawld | stats count()"));
     }
 
     #[test]
     fn search_or_multi_token_groups() {
         assert_snapshot!(emit_dsl(
-            "service:nginx level:error OR service:postgres level:warn"
+            "service=nginx level=error OR service=postgres level=warn"
         ));
     }
 
     #[test]
     fn search_or_with_time_filter() {
         // Time filter should be emitted as top-level WHERE, outside OR parens.
-        assert_snapshot!(emit_dsl("service:nginx last:2h OR service:postgres"));
+        assert_snapshot!(emit_dsl("service=nginx last=2h OR service=postgres"));
     }
 
     // -----------------------------------------------------------------------
@@ -355,21 +355,21 @@ mod tests {
     #[test]
     fn multi_stats_then_where() {
         assert_snapshot!(emit_dsl(
-            "service:nginx | stats count() by host | where count > 10"
+            "service=nginx | stats count() by host | where count > 10"
         ));
     }
 
     #[test]
     fn multi_stats_then_sort_then_limit() {
         assert_snapshot!(emit_dsl(
-            "service:nginx | stats count() by host | sort -count | limit 10"
+            "service=nginx | stats count() by host | sort -count | limit 10"
         ));
     }
 
     #[test]
     fn multi_full_pipeline() {
         assert_snapshot!(emit_dsl(
-            "service:nginx last:2h | stats count() by host | where count > 10 | sort -count | limit 5"
+            "service=nginx last=2h | stats count() by host | where count > 10 | sort -count | limit 5"
         ));
     }
 
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn multi_stats_then_table() {
         assert_snapshot!(emit_dsl(
-            "service:nginx | stats avg(duration) by status | table status, avg_duration"
+            "service=nginx | stats avg(duration) by status | table status, avg_duration"
         ));
     }
 
@@ -442,12 +442,12 @@ mod tests {
 
     #[test]
     fn field_filter_with_numeric_coercion() {
-        assert_snapshot!(emit_dsl("status:200"));
+        assert_snapshot!(emit_dsl("status=200"));
     }
 
     #[test]
     fn field_filter_with_float_coercion() {
-        assert_snapshot!(emit_dsl("score:3.14"));
+        assert_snapshot!(emit_dsl("score=3.14"));
     }
 
     // -----------------------------------------------------------------------
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn pipe_top_with_search() {
-        assert_snapshot!(emit_dsl("service:nginx | top 10 uri"));
+        assert_snapshot!(emit_dsl("service=nginx | top 10 uri"));
     }
 
     #[test]
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn multi_extract_then_where() {
         assert_snapshot!(emit_dsl(
-            r#"service:nginx | extract "(?P<code>[0-9]{3})" from message | where code == "500""#
+            r#"service=nginx | extract "(?P<code>[0-9]{3})" from message | where code == "500""#
         ));
     }
 
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn pipe_extract_kv_with_search_prefix() {
-        assert_snapshot!(emit_dsl("service:nginx | extract kv from message | head 5"));
+        assert_snapshot!(emit_dsl("service=nginx | extract kv from message | head 5"));
     }
 
     #[test]
@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn multi_search_then_dedup() {
-        assert_snapshot!(emit_dsl("service:nginx | dedup host"));
+        assert_snapshot!(emit_dsl("service=nginx | dedup host"));
     }
 
     // -----------------------------------------------------------------------
@@ -680,12 +680,12 @@ mod tests {
 
     #[test]
     fn pipe_timechart_auto_bucket_1h() {
-        assert_snapshot!(emit_dsl("last:1h | timechart count()"));
+        assert_snapshot!(emit_dsl("last=1h | timechart count()"));
     }
 
     #[test]
     fn pipe_timechart_auto_bucket_7d() {
-        assert_snapshot!(emit_dsl("last:7d | timechart count()"));
+        assert_snapshot!(emit_dsl("last=7d | timechart count()"));
     }
 
     #[test]
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn pipe_pivot_with_search() {
         assert_snapshot!(emit_dsl(
-            "service:nginx | pivot avg(duration) on status by host"
+            "service=nginx | pivot avg(duration) on status by host"
         ));
     }
 
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn pipe_timechart_by_then_where() {
         assert_snapshot!(emit_dsl(
-            "last:1h | timechart span=5m count() by level | where count > 10"
+            "last=1h | timechart span=5m count() by level | where count > 10"
         ));
     }
 
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn hot_source_emits_union_all() {
-        let query = parser::parse("service:nginx").unwrap();
+        let query = parser::parse("service=nginx").unwrap();
         let result = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson").unwrap();
         assert_snapshot!(format_result(&result));
     }
