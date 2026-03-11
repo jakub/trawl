@@ -391,21 +391,26 @@ fn finalize_ingest(
         );
     }
 
-    // Publish one IngestBatch per service to the event bus.
-    if let Some(bus) = &state.ingest.event_bus {
-        for (svc, wal_path) in wal_paths {
-            if let Some(batch) = parsed.batches.swap_remove(svc) {
-                let batch_id: Arc<str> = wal_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .into();
-                let ingest_batch = Arc::new(IngestBatch {
-                    batch_id,
-                    service: Arc::from(svc.as_str()),
-                    byte_size: batch.ndjson.len(),
-                    events: batch.maps,
-                });
+    // Build IngestBatch per service, insert into hot buffer synchronously
+    // (so events are visible to queries immediately), then publish to bus
+    // for SSE streaming.
+    for (svc, wal_path) in wal_paths {
+        if let Some(batch) = parsed.batches.swap_remove(svc) {
+            let batch_id: Arc<str> = wal_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .into();
+            let ingest_batch = Arc::new(IngestBatch {
+                batch_id,
+                service: Arc::from(svc.as_str()),
+                byte_size: batch.ndjson.len(),
+                events: batch.maps,
+            });
+            if let Some(buf) = &state.query.hot_buffer {
+                buf.insert(Arc::clone(&ingest_batch));
+            }
+            if let Some(bus) = &state.ingest.event_bus {
                 let subscribers = bus.publish(ingest_batch);
                 tracing::debug!(service = %svc, subscribers, "published batch to event bus");
             }

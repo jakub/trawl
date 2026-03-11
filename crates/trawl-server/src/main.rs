@@ -101,9 +101,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(writer) = &state.ingest.wal_writer {
             handle.set(Arc::clone(writer));
         }
-        // Activate event bus for real-time telemetry fanout (SSE, hot buffer).
+        // Activate event bus for real-time telemetry fanout (SSE streaming).
         if let Some(bus) = &state.ingest.event_bus {
             layer.set_bus(Arc::clone(bus));
+        }
+        // Activate hot buffer for synchronous telemetry event insertion.
+        if let Some(buf) = &state.query.hot_buffer {
+            layer.set_hot_buffer(Arc::clone(buf));
         }
     }
 
@@ -211,21 +215,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
-    // then stats emitter, then scheduler (stop issuing new queries), then
-    // hot buffer consumer (stop inserting), then compaction (may compact
-    // final files and drain hot buffer), then retention, then audit.
+    // then stats emitter, then scheduler (stop issuing new queries),
+    // then compaction (may compact final files and drain hot buffer),
+    // then retention, then audit.
     shutdown_task(telemetry_handle, "telemetry").await;
     shutdown_task(Some(stats_handle), "stats_emitter").await;
     shutdown_task(scheduler_handle, "scheduler").await;
-    if let Some((compaction_jh, compaction_tx, hot_buf_handle)) = compaction_handle {
-        // Stop the hot buffer consumer before compaction so no new
-        // batches arrive while compaction is draining.
-        if let Some((hb_jh, hb_tx)) = hot_buf_handle {
-            drop(hb_tx);
-            if let Err(e) = hb_jh.await {
-                tracing::warn!(event_type = "task_panic", task = "hot_buffer_consumer", error = %e, "task panicked during shutdown");
-            }
-        }
+    if let Some((compaction_jh, compaction_tx)) = compaction_handle {
         shutdown_task(Some((compaction_jh, compaction_tx)), "compaction").await;
     }
     shutdown_task(Some(retention_handle), "retention").await;
@@ -244,14 +240,10 @@ async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name
     }
 }
 
-/// Spawn the ingest pipeline tasks (compaction + hot buffer consumer).
+/// Spawn the ingest pipeline tasks (compaction).
 ///
 /// Returns handles for graceful shutdown, or `None` if ingest is disabled.
-type IngestHandles = (
-    JoinHandle<()>,
-    watch::Sender<bool>,
-    Option<(JoinHandle<()>, watch::Sender<()>)>,
-);
+type IngestHandles = (JoinHandle<()>, watch::Sender<bool>);
 
 fn spawn_ingest_pipeline(
     config: &Config,
@@ -283,16 +275,6 @@ fn spawn_ingest_pipeline(
         "ingest pipeline enabled"
     );
 
-    // Spawn hot buffer consumer if available.
-    let hot_buffer_handle =
-        if let (Some(bus), Some(buf)) = (&state.ingest.event_bus, &state.query.hot_buffer) {
-            let (stx, srx) = tokio::sync::watch::channel(());
-            let h = trawl_server::hot_buffer::spawn_hot_buffer_consumer(bus, Arc::clone(buf), srx);
-            Some((h, stx))
-        } else {
-            None
-        };
-
     let handle = trawl_server::ingest::compaction::spawn_compaction(
         wal_dir,
         data_dir,
@@ -302,7 +284,7 @@ fn spawn_ingest_pipeline(
         shutdown_rx,
     );
 
-    Ok(Some((handle, shutdown_tx, hot_buffer_handle)))
+    Ok(Some((handle, shutdown_tx)))
 }
 
 /// Initialize the tracing subscriber.

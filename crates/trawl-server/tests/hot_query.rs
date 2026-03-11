@@ -1,15 +1,15 @@
 //! Integration test for the full hot buffer pipeline.
 //!
-//! Verifies that events ingested into the WAL and published to the
-//! event bus are immediately visible to queries via the hot buffer,
-//! and that compaction drains the buffer without introducing duplicates.
+//! Verifies that events inserted into the hot buffer are immediately
+//! visible to queries, and that compaction drains the buffer without
+//! introducing duplicates.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use trawl_server::bus::{EventBus, IngestBatch, LocalEventBus};
+use trawl_server::bus::IngestBatch;
 use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
 use trawl_server::ingest::wal::WalWriter;
 use trawl_server::pool::ExecutorPool;
@@ -44,19 +44,10 @@ async fn hot_buffer_makes_events_immediately_queryable() {
 
     // --- set up infrastructure ---
 
-    let bus = Arc::new(LocalEventBus::new(64));
     let hot_buffer = Arc::new(HotBuffer::new(HotBufferConfig {
         max_events: 10_000,
         max_bytes: 10_000_000,
     }));
-
-    // Spawn hot buffer consumer.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    let _consumer_handle = trawl_server::hot_buffer::spawn_hot_buffer_consumer(
-        &bus,
-        Arc::clone(&hot_buffer),
-        shutdown_rx,
-    );
 
     // Create executor pool pointing at our temp data dir.
     let pool = ExecutorPool::new(
@@ -80,7 +71,7 @@ async fn hot_buffer_makes_events_immediately_queryable() {
     let ndjson = events_to_ndjson(&events);
     let wal_path = wal_writer.write("nginx", &ndjson).unwrap();
 
-    // Publish to bus (simulating what the ingest handler does).
+    // Insert directly into hot buffer (simulating what the ingest handler does).
     let batch_id: Arc<str> = wal_path.file_stem().unwrap().to_str().unwrap().into();
     let ndjson_bytes = ndjson.len();
     let batch = Arc::new(IngestBatch {
@@ -89,10 +80,7 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         byte_size: ndjson_bytes,
         events: events.clone(),
     });
-    bus.publish(batch);
-
-    // Give the consumer task a moment to receive and insert.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    hot_buffer.insert(batch);
 
     // --- query BEFORE compaction → events should be visible from hot buffer ---
 
@@ -148,9 +136,6 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         "expected 3 rows from parquet after compaction, got {}",
         query_result_after.rows.len()
     );
-
-    // --- shutdown ---
-    drop(shutdown_tx);
 }
 
 #[tokio::test]
@@ -161,18 +146,10 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let bus = Arc::new(LocalEventBus::new(64));
     let hot_buffer = Arc::new(HotBuffer::new(HotBufferConfig {
         max_events: 10_000,
         max_bytes: 10_000_000,
     }));
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    let _consumer_handle = trawl_server::hot_buffer::spawn_hot_buffer_consumer(
-        &bus,
-        Arc::clone(&hot_buffer),
-        shutdown_rx,
-    );
 
     let pool = ExecutorPool::new(
         data_dir.to_str().unwrap().to_owned(),
@@ -199,8 +176,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         byte_size: ndjson1.len(),
         events: batch1_events,
     });
-    bus.publish(batch1);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    hot_buffer.insert(batch1);
 
     // Compact batch 1 → parquet.
     trawl_server::ingest::compaction::compact_once(
@@ -225,8 +201,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         byte_size: ndjson2.len(),
         events: batch2_events,
     });
-    bus.publish(batch2);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    hot_buffer.insert(batch2);
 
     // --- query → should see both batches without duplicates ---
 
@@ -241,8 +216,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         "expected 3 total rows (2 parquet + 1 hot buffer), got {}",
         query_result.rows.len()
     );
-
-    drop(shutdown_tx);
 }
 
 #[tokio::test]

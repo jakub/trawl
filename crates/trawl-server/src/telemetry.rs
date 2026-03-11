@@ -95,9 +95,11 @@ struct WalLayerInner {
     host: String,
     /// Bytes lost due to WAL write failures (accumulated, reset on report).
     dropped_bytes: AtomicU64,
-    /// Deferred event bus for real-time fanout (SSE streaming, hot buffer).
+    /// Deferred event bus for real-time fanout (SSE streaming).
     bus: OnceLock<Arc<crate::bus::LocalEventBus>>,
-    /// Event maps accumulated since last flush, for bus publishing.
+    /// Deferred hot buffer for synchronous insertion (query freshness).
+    hot_buffer: OnceLock<Arc<crate::hot_buffer::HotBuffer>>,
+    /// Event maps accumulated since last flush, for bus/hot buffer publishing.
     event_maps: Mutex<Vec<serde_json::Map<String, serde_json::Value>>>,
 }
 
@@ -124,16 +126,24 @@ impl WalLayer {
                 host,
                 dropped_bytes: AtomicU64::new(0),
                 bus: OnceLock::new(),
+                hot_buffer: OnceLock::new(),
                 event_maps: Mutex::new(Vec::new()),
             }),
         }
     }
 
-    /// Inject the event bus for real-time fanout (SSE, hot buffer).
+    /// Inject the event bus for real-time fanout (SSE streaming).
     /// Called once after `AppState` is constructed. Subsequent calls are
     /// silently ignored (first write wins).
     pub fn set_bus(&self, bus: Arc<crate::bus::LocalEventBus>) {
         let _ = self.inner.bus.set(bus);
+    }
+
+    /// Inject the hot buffer for synchronous event insertion.
+    /// Called once after `AppState` is constructed. Subsequent calls are
+    /// silently ignored (first write wins).
+    pub fn set_hot_buffer(&self, buf: Arc<crate::hot_buffer::HotBuffer>) {
+        let _ = self.inner.hot_buffer.set(buf);
     }
 
     /// Flush the buffer to the WAL. Called periodically by the background
@@ -167,25 +177,27 @@ impl WalLayerInner {
             eprintln!("[trawl-telemetry] WAL write failed: {e}");
             self.dropped_bytes
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
-        } else {
-            // Publish to event bus for SSE streaming / hot buffer.
-            if let Some(bus) = self.bus.get()
-                && !maps.is_empty()
-            {
-                use crate::bus::{EventBus, IngestBatch};
-                let batch = Arc::new(IngestBatch {
-                    batch_id: format!(
-                        "trawld_telemetry_{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis()
-                    )
-                    .into(),
-                    service: "trawld".into(),
-                    events: maps,
-                    byte_size: data.len(),
-                });
+        } else if !maps.is_empty() {
+            // Insert into hot buffer synchronously (query freshness),
+            // then publish to event bus for SSE streaming.
+            use crate::bus::{EventBus, IngestBatch};
+            let batch = Arc::new(IngestBatch {
+                batch_id: format!(
+                    "trawld_telemetry_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                )
+                .into(),
+                service: "trawld".into(),
+                events: maps,
+                byte_size: data.len(),
+            });
+            if let Some(buf) = self.hot_buffer.get() {
+                buf.insert(Arc::clone(&batch));
+            }
+            if let Some(bus) = self.bus.get() {
                 let _ = bus.publish(batch);
             }
 

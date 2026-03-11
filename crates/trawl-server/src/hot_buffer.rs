@@ -1,6 +1,6 @@
 //! Hot buffer: batch-keyed in-memory event store for query freshness.
 //!
-//! Events land here via the event bus immediately after WAL write.
+//! Events land here via synchronous insertion during ingest/telemetry.
 //! The buffer makes fresh events visible to ALL queries by providing
 //! a temporary ndjson file that the executor can `UNION ALL BY NAME`
 //! with the parquet source.
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
 
-use crate::bus::{EventBus as _, EventSubscriber as _, IngestBatch, LocalEventBus, RecvError};
+use crate::bus::IngestBatch;
 
 /// Configuration for the hot buffer.
 #[derive(Debug, Clone)]
@@ -241,49 +241,6 @@ impl HotBuffer {
     }
 }
 
-/// Spawn a background task that subscribes to the event bus and
-/// inserts batches into the hot buffer.
-///
-/// The task runs until the bus is closed (server shutdown) or
-/// the shutdown signal fires.
-pub fn spawn_hot_buffer_consumer(
-    bus: &Arc<LocalEventBus>,
-    buffer: Arc<HotBuffer>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
-) -> tokio::task::JoinHandle<()> {
-    let mut subscriber = bus.subscribe();
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = subscriber.recv() => {
-                    match result {
-                        Ok(batch) => {
-                            buffer.insert(batch);
-                        }
-                        Err(RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                event_type = "hot_buffer_lag",
-                                missed = n,
-                                "hot buffer consumer lagged — \
-                                 missed events are still in the WAL"
-                            );
-                        }
-                        Err(RecvError::Closed) => {
-                            tracing::info!(event_type = "hot_buffer_shutdown", "event bus closed, hot buffer consumer shutting down");
-                            break;
-                        }
-                    }
-                }
-                _ = shutdown_rx.changed() => {
-                    tracing::info!(event_type = "hot_buffer_shutdown", "hot buffer consumer received shutdown signal");
-                    break;
-                }
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,29 +424,5 @@ mod tests {
         buf.insert(make_batch("batch_001", 2));
         buf.drain(&["nonexistent"]);
         assert_eq!(buf.event_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn consumer_inserts_from_bus() {
-        let bus = Arc::new(LocalEventBus::new(16));
-        let buf = Arc::new(HotBuffer::new(HotBufferConfig {
-            max_events: 1000,
-            max_bytes: 10_000_000,
-        }));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let handle = spawn_hot_buffer_consumer(&bus, Arc::clone(&buf), shutdown_rx);
-
-        // Publish a batch.
-        bus.publish(make_batch("test_001", 5));
-
-        // Give the consumer task a moment to process.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert_eq!(buf.event_count(), 5);
-        assert_eq!(buf.batch_count(), 1);
-
-        // Shut down.
-        drop(shutdown_tx);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
     }
 }
