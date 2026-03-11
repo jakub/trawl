@@ -5,12 +5,11 @@
 //! a temporary ndjson file that the executor can `UNION ALL BY NAME`
 //! with the parquet source.
 //!
-//! Key invariant: a batch is in exactly one place at any time — hot
-//! buffer xor parquet. Compaction marks batches as draining (via
-//! [`mark_draining`](HotBuffer::mark_draining)) before writing
-//! parquet, then calls [`drain`](HotBuffer::drain) after the write
-//! completes. Snapshots skip draining batches, eliminating the
-//! TOCTOU window where events could appear in both sources.
+//! Events stay in the hot buffer until compaction writes parquet and
+//! calls [`drain`](HotBuffer::drain). During the brief window between
+//! parquet write and drain, events may appear in both sources — this
+//! is acceptable (transient overcount). Invisible events (missing from
+//! both sources) are not acceptable.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -45,7 +44,7 @@ pub struct HotBuffer {
     total_events: AtomicUsize,
     total_bytes: AtomicUsize,
     config: HotBufferConfig,
-    /// Monotonic counter bumped on every mutation (insert, drain, `mark_draining`).
+    /// Monotonic counter bumped on every mutation (insert, drain).
     /// Used to invalidate the snapshot cache.
     generation: AtomicU64,
     /// Cached snapshot: `(generation, temp_file)`. Reused across concurrent
@@ -121,23 +120,6 @@ impl HotBuffer {
             || self.total_bytes.load(Ordering::Relaxed) + extra_bytes > self.config.max_bytes
     }
 
-    /// Mark batches as draining before compaction writes parquet.
-    ///
-    /// Sets the `draining` flag on matching batches so that
-    /// [`snapshot`](Self::snapshot) skips them.
-    /// Uses a read lock only — `AtomicBool` provides interior mutability.
-    pub fn mark_draining(&self, batch_ids: &[&str]) {
-        let map = self.batches.read();
-        for id in batch_ids {
-            if let Some(batch) = map.get(*id) {
-                batch
-                    .draining
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        self.generation.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Remove batches that have been compacted to parquet.
     ///
     /// Called after compaction writes parquet — the same batch IDs
@@ -155,9 +137,9 @@ impl HotBuffer {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Get a snapshot of all non-draining buffered events as a temporary ndjson file.
+    /// Get a snapshot of all buffered events as a temporary ndjson file.
     ///
-    /// Returns `None` if the buffer is empty or all batches are draining.
+    /// Returns `None` if the buffer is empty.
     /// Uses a generation-based cache: concurrent queries against an unchanged
     /// buffer share a single snapshot file (1 disk write instead of N).
     /// The `Arc` ensures the temp file stays alive until all queries using it finish.
@@ -201,11 +183,6 @@ impl HotBuffer {
         let mut wrote_any = false;
 
         for batch in map.values() {
-            // Skip batches being drained by compaction.
-            if batch.draining.load(Ordering::Relaxed) {
-                continue;
-            }
-
             for event in &batch.events {
                 // Serialization failure here is very unlikely (we parsed it
                 // successfully during ingest), but log and skip rather than
@@ -309,8 +286,6 @@ pub fn spawn_hot_buffer_consumer(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-
     use super::*;
 
     fn make_batch(id: &str, n: usize) -> Arc<IngestBatch> {
@@ -330,7 +305,6 @@ mod tests {
             service: "test".into(),
             byte_size: n * 50, // rough estimate
             events,
-            draining: AtomicBool::new(false),
         })
     }
 
@@ -351,7 +325,6 @@ mod tests {
             service: "test".into(),
             byte_size,
             events,
-            draining: AtomicBool::new(false),
         })
     }
 
@@ -440,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_draining_excludes_from_snapshot() {
+    fn snapshot_includes_all_batches() {
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
@@ -448,24 +421,32 @@ mod tests {
         buf.insert(make_batch("batch_001", 2));
         buf.insert(make_batch("batch_002", 3));
 
-        buf.mark_draining(&["batch_001"]);
-
-        let tmpfile = buf.snapshot().expect("should have non-draining events");
+        let tmpfile = buf.snapshot().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
-        // Only batch_002's 3 events should be in the snapshot.
-        assert_eq!(content.lines().count(), 3);
+        // All 5 events from both batches should be in the snapshot.
+        assert_eq!(content.lines().count(), 5);
     }
 
     #[test]
-    fn all_draining_returns_none() {
+    fn drain_after_snapshot_leaves_snapshot_valid() {
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
         });
         buf.insert(make_batch("batch_001", 2));
-        buf.mark_draining(&["batch_001"]);
+        buf.insert(make_batch("batch_002", 3));
 
-        assert!(buf.snapshot().is_none());
+        // Take a snapshot (Arc-wrapped temp file).
+        let snapshot = buf.snapshot().expect("should have events");
+        let content_before = std::fs::read_to_string(snapshot.path()).unwrap();
+        assert_eq!(content_before.lines().count(), 5);
+
+        // Drain batch_001 — simulates compaction finishing.
+        buf.drain(&["batch_001"]);
+
+        // The pre-drain snapshot file is still valid (Arc keeps it alive).
+        let content_after = std::fs::read_to_string(snapshot.path()).unwrap();
+        assert_eq!(content_after, content_before);
     }
 
     #[test]

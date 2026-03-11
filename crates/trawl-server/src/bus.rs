@@ -9,7 +9,6 @@
 //! requiring any consumer changes.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 /// A batch of events published to the bus after a successful WAL write.
 ///
@@ -34,9 +33,6 @@ pub struct IngestBatch {
     /// size. The in-memory `Map<String, Value>` uses ~3-5x more memory
     /// due to allocator overhead, hash table structure, and `String` headers.
     pub byte_size: usize,
-    /// Set to `true` by compaction before writing parquet.
-    /// Snapshot generation skips batches with this flag set.
-    pub draining: AtomicBool,
 }
 
 /// Error returned when receiving from a subscriber.
@@ -151,7 +147,6 @@ mod tests {
                 m
             }],
             byte_size: 0,
-            draining: AtomicBool::new(false),
         });
 
         let receivers = bus.publish(Arc::clone(&batch));
@@ -173,7 +168,6 @@ mod tests {
             service: "test".into(),
             events: vec![],
             byte_size: 0,
-            draining: AtomicBool::new(false),
         });
 
         let receivers = bus.publish(Arc::clone(&batch));
@@ -197,7 +191,6 @@ mod tests {
                 service: "test".into(),
                 events: vec![],
                 byte_size: 0,
-                draining: AtomicBool::new(false),
             });
             bus.publish(batch);
         }
@@ -237,7 +230,6 @@ mod tests {
             service: "test".into(),
             events: vec![],
             byte_size: 0,
-            draining: AtomicBool::new(false),
         });
         // Should not panic, returns 0.
         let receivers = bus.publish(batch);

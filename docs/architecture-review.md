@@ -18,7 +18,6 @@ vector (gzip json batch, 1MB/5s)
   every 10s: compaction tick
     scan WAL for .ndjson older than 10s
     → group by service
-    → mark_draining on hot buffer (TOCTOU prevention)
     → spawn_blocking: ephemeral DuckDB
         read_json_auto([wal files]) → CAST timestamp
         → UNION ALL BY NAME with existing parquet (if any)
@@ -49,7 +48,7 @@ vector (gzip json batch, 1MB/5s)
 - **ingest handler** (`trawl-server/src/ingest/handler.rs`): accepts JSON array or ndjson, auto-detected by first byte. all CPU-bound work (gzip, parse, WAL write) runs in `spawn_blocking`. timing captured per phase: `decompress_ms`, `parse_ms`, `wal_ms`.
 - **WAL writer** (`trawl-server/src/ingest/wal.rs`): atomic write via tmp→rename. filename format: `{service}_{unix_millis}_{4_hex_random}.ndjson`. service name validated against `[a-zA-Z0-9\-_.]` to prevent path traversal.
 - **event bus** (`trawl-server/src/bus.rs`): `tokio::sync::broadcast` channel (capacity 4096). publishes `Arc<IngestBatch>` — all subscribers share the same allocation. lossy by design: slow consumers get `RecvError::Lagged(n)`, never block the producer.
-- **hot buffer** (`trawl-server/src/hot_buffer.rs`): `RwLock<IndexMap<Arc<str>, Arc<IngestBatch>>>`. FIFO eviction (100k events / 100MB). generation-based snapshot cache: concurrent queries share a single temp ndjson file via `Arc<NamedTempFile>`. TOCTOU-safe draining protocol: `mark_draining` → write parquet → `drain`.
+- **hot buffer** (`trawl-server/src/hot_buffer.rs`): `RwLock<IndexMap<Arc<str>, Arc<IngestBatch>>>`. FIFO eviction (100k events / 100MB). generation-based snapshot cache: concurrent queries share a single temp ndjson file via `Arc<NamedTempFile>`. events stay in buffer until drain after confirmed parquet write; brief duplicates are acceptable, invisible events are not.
 
 ### query execution
 

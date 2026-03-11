@@ -185,7 +185,6 @@ impl WalLayerInner {
                     service: "trawld".into(),
                     events: maps,
                     byte_size: data.len(),
-                    draining: std::sync::atomic::AtomicBool::new(false),
                 });
                 let _ = bus.publish(batch);
             }

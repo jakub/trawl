@@ -405,7 +405,6 @@ fn finalize_ingest(
                     service: Arc::from(svc.as_str()),
                     byte_size: batch.ndjson.len(),
                     events: batch.maps,
-                    draining: std::sync::atomic::AtomicBool::new(false),
                 });
                 let subscribers = bus.publish(ingest_batch);
                 tracing::debug!(service = %svc, subscribers, "published batch to event bus");

@@ -5,7 +5,6 @@
 //! and that compaction drains the buffer without introducing duplicates.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -89,7 +88,6 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         service: "nginx".into(),
         byte_size: ndjson_bytes,
         events: events.clone(),
-        draining: AtomicBool::new(false),
     });
     bus.publish(batch);
 
@@ -200,7 +198,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         service: "nginx".into(),
         byte_size: ndjson1.len(),
         events: batch1_events,
-        draining: AtomicBool::new(false),
     });
     bus.publish(batch1);
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -227,7 +224,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         service: "nginx".into(),
         byte_size: ndjson2.len(),
         events: batch2_events,
-        draining: AtomicBool::new(false),
     });
     bus.publish(batch2);
     tokio::time::sleep(Duration::from_millis(100)).await;
