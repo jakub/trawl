@@ -52,27 +52,29 @@ crates/
 - the server binary is `target/debug/trawld` (crate `trawl-server`)
 - admin binary is `target/debug/trawl-admin` (crate `trawl-admin`)
 
-### dev server
+### environments
 
-- development server runs at `https://localhost:5514` with a self-signed cert
-- always pass `--insecure` (or set `TRAWL_INSECURE=true`) to accept the self-signed cert
-- environment variables `TRAWL_URL` and `TRAWL_TOKEN` should already be set (admin-scoped token)
-- env vars override `~/.config/trawl/config.toml`
+config uses named profiles (`~/.config/trawl/config.toml`):
+- **base** (no `--profile`): live homelab server at `trawl-01.lab.ktle.net:5514`
+- **dev** (`--profile dev` or `TRAWL_PROFILE=dev`): localhost:5514 with self-signed cert
+
+env vars and CLI flags override profile settings.
 
 ### CLI modes
 
 **TUI** (interactive):
 ```
-trawl                               # launches TUI (no subcommand)
-trawl --insecure                    # TUI against dev server
+trawl                               # launches TUI against base (live) server
+trawl -p dev                        # TUI against dev server
 ```
 
 **query** (execute and print):
 ```
-trawl query --insecure "dsl..."                  # auto-detect output: table for TTY, JSON for pipe
-trawl query --insecure -f table "dsl..."         # force table output
-trawl query --insecure -f json "dsl..."          # force JSON (one object per line, ndjson)
-trawl query --insecure -f csv "dsl..."           # CSV output (with formula injection protection)
+trawl query "dsl..."                             # auto-detect output: table for TTY, JSON for pipe
+trawl query -p dev "dsl..."                      # query dev server
+trawl query -f table "dsl..."                    # force table output
+trawl query -f json "dsl..."                     # force JSON (one object per line, ndjson)
+trawl query -f csv "dsl..."                      # CSV output (with formula injection protection)
 ```
 
 **embedded mode** (no server, queries parquet files directly):
@@ -83,16 +85,17 @@ trawl query --data 'data/**/*.parquet' "* | stats count() by service"
 
 **validate** (syntax check, hits server for validation endpoint):
 ```
-trawl validate --insecure "dsl..."               # prints "valid" or error with span
+trawl validate "dsl..."                          # validates against base server
+trawl validate -p dev "dsl..."                   # validates against dev server
 ```
 
 ### global flags
 
 | flag | env var | description |
 |------|---------|-------------|
+| `-p, --profile <NAME>` | `TRAWL_PROFILE` | named profile from config (overrides `[server]`) |
 | `--url <URL>` | `TRAWL_URL` | server URL (default: `https://localhost:5514`) |
 | `--token <TOKEN>` | `TRAWL_TOKEN` | API token (direct value) |
-| `-k, --token-file <PATH>` | `TRAWL_TOKEN_FILE` | path to file containing API token |
 | `--insecure` | `TRAWL_INSECURE` | accept self-signed TLS certificates |
 | `-c, --config <PATH>` | — | config file path (default: `~/.config/trawl/config.toml`) |
 
@@ -106,20 +109,23 @@ trawl validate --insecure "dsl..."               # prints "valid" or error with 
 ### common dev examples
 
 ```sh
-# recent errors by service
-trawl query --insecure "level=error last=1h | stats count() by service | sort -count | head 10"
+# recent errors by service (live server, base profile)
+trawl query "level=error last=1h | stats count() by service | sort -count | head 10"
+
+# same query against dev server
+trawl query -p dev "level=error last=1h | stats count() by service | sort -count | head 10"
 
 # browse all data (table output)
-trawl query --insecure -f table "* | head 5 | fields timestamp, host, service, level, message"
+trawl query -f table "* | head 5 | fields timestamp, host, service, level, message"
 
 # pipe JSON to jq for ad-hoc processing
-trawl query --insecure "last=1h | stats count() by service" | jq '.service'
+trawl query "last=1h | stats count() by service" | jq '.service'
 
 # export to CSV file
-trawl query --insecure -f csv "last=24h | stats count() by service, level" > report.csv
+trawl query -f csv "last=24h | stats count() by service, level" > report.csv
 
 # validate a query without executing
-trawl validate --insecure "level=error | stats count() by host"
+trawl validate "level=error | stats count() by host"
 
 # query local parquet files (no server needed)
 trawl query --data 'data/**/*.parquet' "* | stats count() by service | sort -count"

@@ -23,13 +23,13 @@ struct Cli {
     #[arg(long, env = "TRAWL_TOKEN", global = true)]
     token: Option<String>,
 
-    /// Path to API token file.
-    #[arg(long, short = 'k', env = "TRAWL_TOKEN_FILE", global = true)]
-    token_file: Option<String>,
-
     /// Accept self-signed TLS certificates.
     #[arg(long, env = "TRAWL_INSECURE", global = true)]
     insecure: bool,
+
+    /// Named profile from config file (overrides [server] settings).
+    #[arg(long, short = 'p', env = "TRAWL_PROFILE", global = true)]
+    profile: Option<String>,
 
     /// Config file path (default: ~/.config/trawl/config.toml).
     #[arg(long, short = 'c', global = true)]
@@ -177,8 +177,10 @@ async fn main() {
 async fn run(args: Cli) -> Result<(), CliError> {
     // Load config file and apply overrides.
     let mut cfg = config::Config::load(args.config.as_deref())?;
-    cfg.apply_env_overrides();
-    cfg.apply_overrides(args.url, args.token_file, args.insecure);
+    if let Some(ref profile) = args.profile {
+        cfg.apply_profile(profile)?;
+    }
+    cfg.apply_overrides(args.url, args.insecure);
 
     match args.command {
         None => {
