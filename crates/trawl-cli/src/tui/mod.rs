@@ -1058,6 +1058,7 @@ impl App {
                     editor.insert_text(&query);
                     editor.move_to_line_end();
                     self.switch_to_main_tab(MainTab::Query);
+                    self.focus = Focus::Editor;
                 }
             }
             _ => {}
@@ -1096,6 +1097,7 @@ impl App {
                     editor.insert_text(&query);
                     editor.move_to_line_end();
                     self.switch_to_main_tab(MainTab::Query);
+                    self.focus = Focus::Editor;
                 }
             }
             // Delete: confirm deletion
