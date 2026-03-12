@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
+use trawl_api::DashboardSnapshot;
 use trawl_auth::{HistoryStore, KeyStore, SavedQueryStore, ScheduleStore};
 use trawl_engine::value::SchemaResult;
 
@@ -36,6 +37,9 @@ pub struct AppState {
     pub total_queries: Arc<AtomicU64>,
     /// Prometheus metrics handle for rendering the scrape endpoint.
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    /// Latest dashboard snapshot, updated every ~1s by the snapshot collector.
+    /// Available even when the terminal monitor is disabled (systemd, `--no-monitor`).
+    pub dashboard_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
 }
 
 /// Query execution state: pool, tracker, timeout, and schema cache.
@@ -211,6 +215,7 @@ impl AppState {
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),
             metrics_handle,
+            dashboard_snapshot: Arc::new(Mutex::new(None)),
         };
 
         let http = HttpConfig {

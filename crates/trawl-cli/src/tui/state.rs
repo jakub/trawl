@@ -95,6 +95,8 @@ pub enum MainTab {
     Schema,
     /// Saved queries.
     Saved,
+    /// Server dashboard (admin only).
+    Dashboard,
 }
 
 /// A profiled column from a service sample.

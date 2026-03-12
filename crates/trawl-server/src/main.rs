@@ -173,6 +173,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state_dir = config.state_dir();
 
+    // Always collect dashboard snapshots (1s interval) so the
+    // /api/v1/dashboard endpoint works even under systemd / --no-monitor.
+    let _snapshot_collector = trawl_server::monitor::spawn_snapshot_collector(
+        state.clone(),
+        config.server.http_addr.clone(),
+        config.server.max_sse_connections,
+        config.scheduler.enabled,
+    );
+
     if monitor_active {
         // Monitor mode: spawn HTTP server in background, run TUI on main.
         let shutdown = Arc::new(tokio::sync::Notify::new());

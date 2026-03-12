@@ -14,12 +14,15 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let width = area.width as usize;
     let mut spans = Vec::new();
 
-    let tabs = [
+    let mut tabs: Vec<(MainTab, &str, &str)> = vec![
         (MainTab::Query, "Query", "M-1"),
         (MainTab::History, "History", "M-2"),
         (MainTab::Schema, "Schema", "M-3"),
         (MainTab::Saved, "Saved", "M-4"),
     ];
+    if app.is_admin {
+        tabs.push((MainTab::Dashboard, "Dashboard", "M-5"));
+    }
 
     for (idx, (tab, label, shortcut)) in tabs.iter().enumerate() {
         let is_active = *tab == app.main_tab;

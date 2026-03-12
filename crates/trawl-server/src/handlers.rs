@@ -10,6 +10,7 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
+use trawl_api::DashboardSnapshot;
 use trawl_api::{
     CancelResponse, CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, ExportRequest,
     FieldValuesResponse, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
@@ -654,6 +655,27 @@ pub async fn stats(
         pool_available: state.query.pool.available_permits(),
         pool_capacity: state.query.pool.capacity(),
     }))
+}
+
+/// `GET /api/v1/dashboard` — full dashboard snapshot (admin only).
+///
+/// Returns the latest [`DashboardSnapshot`] collected by the background
+/// snapshot collector. Available even when the terminal monitor is disabled.
+pub async fn dashboard(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<DashboardSnapshot>, ServerError> {
+    if !verified.role.has_permission(Permission::ServerManage) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let snapshot = state.dashboard_snapshot.lock().clone();
+    match snapshot {
+        Some(s) => Ok(Json(s)),
+        None => Err(ServerError::Internal(
+            "dashboard data not yet available".into(),
+        )),
+    }
 }
 
 /// `GET /api/v1/schema/values/{field}` — sample distinct values for autocomplete.

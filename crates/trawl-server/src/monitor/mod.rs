@@ -42,6 +42,31 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Spawn a background task that collects dashboard snapshots on a 1s interval.
+///
+/// Runs regardless of terminal mode — makes `GET /api/v1/dashboard` available
+/// even when the server runs under systemd (no TTY) or with `--no-monitor`.
+/// The [`RateTracker`](state::RateTracker) inside needs regular ticks to
+/// produce meaningful EMA-smoothed rates, so on-demand computation isn't viable.
+pub fn spawn_snapshot_collector(
+    app_state: AppState,
+    listen_addr: String,
+    sse_max: usize,
+    scheduler_enabled: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut monitor =
+            state::from_app_state(app_state.clone(), &listen_addr, sse_max, scheduler_enabled);
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let snapshot = monitor.snapshot();
+            *app_state.dashboard_snapshot.lock() = Some(snapshot.to_dashboard_snapshot());
+        }
+    })
+}
+
 /// Run the monitor dashboard until shutdown is signalled.
 ///
 /// Sets up the terminal in raw/alternate-screen mode, ticks at

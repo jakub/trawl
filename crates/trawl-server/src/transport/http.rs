@@ -59,6 +59,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/queries", get(handlers::queries))
         .route("/queries/{id}", delete(handlers::cancel_query))
         .route("/stats", get(handlers::stats))
+        .route("/dashboard", get(handlers::dashboard))
         .route("/history", get(handlers::history))
         .route(
             "/saved",

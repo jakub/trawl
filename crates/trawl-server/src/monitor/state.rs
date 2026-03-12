@@ -7,7 +7,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
+use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot, DashboardSnapshot};
 
 use crate::state::AppState;
 
@@ -54,6 +54,39 @@ pub struct MonitorSnapshot {
     // -- queries --
     pub recent_queries: Vec<CompletedQuerySnapshot>,
     pub active_queries: Vec<ActiveQuerySnapshot>,
+}
+
+impl MonitorSnapshot {
+    /// Convert to the shared wire type for API responses and shared rendering.
+    pub fn to_dashboard_snapshot(&self) -> DashboardSnapshot {
+        DashboardSnapshot {
+            hostname: self.hostname.clone(),
+            listen_addr: self.listen_addr.clone(),
+            uptime_secs: self.uptime.as_secs(),
+            version: self.version.to_owned(),
+            healthy: self.healthy,
+            pool_capacity: self.pool_capacity,
+            pool_active: self.pool_active,
+            hot_buffer_events: self.hot_buffer_events,
+            hot_buffer_max_events: self.hot_buffer_max_events,
+            hot_buffer_bytes: self.hot_buffer_bytes,
+            hot_buffer_max_bytes: self.hot_buffer_max_bytes,
+            hot_buffer_batches: self.hot_buffer_batches,
+            total_queries: self.total_queries,
+            query_rate: self.query_rate,
+            query_errors: self.query_errors,
+            query_timeouts: self.query_timeouts,
+            ingest_events: self.ingest_events,
+            ingest_rate: self.ingest_rate,
+            ingest_rejected: self.ingest_rejected,
+            sse_active: self.sse_active,
+            sse_max: self.sse_max,
+            scheduler_enabled: self.scheduler_enabled,
+            scheduler_schedules: self.scheduler_schedules,
+            recent_queries: self.recent_queries.clone(),
+            active_queries: self.active_queries.clone(),
+        }
+    }
 }
 
 /// Tracks counter deltas between ticks to compute rates (events/sec, queries/sec).

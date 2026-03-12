@@ -114,7 +114,7 @@ fn get_context_hints(app: &App, width: usize) -> String {
                     "Enter load | Esc".to_owned()
                 }
             }
-            MainTab::Query => String::new(),
+            MainTab::Query | MainTab::Dashboard => String::new(),
         };
     }
 

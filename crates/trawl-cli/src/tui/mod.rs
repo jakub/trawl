@@ -167,6 +167,8 @@ enum MutationResult {
     },
     /// Schedule was set on a saved query.
     ScheduleSet { saved_query_id: i64 },
+    /// Dashboard snapshot received from server (None on error — clears inflight flag).
+    DashboardUpdate(Option<Box<trawl_client::DashboardSnapshot>>),
     /// Mutation failed.
     Error { message: String },
 }
@@ -181,6 +183,7 @@ struct SchemaProfileResult {
 }
 
 /// Main TUI application state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     /// HTTP client for API calls.
     pub client: HttpClient,
@@ -239,6 +242,14 @@ pub struct App {
     driver_execute_waiter: Option<ExecuteWaiter>,
     /// Server version string (fetched from health endpoint at startup).
     pub server_version: Option<String>,
+    /// Whether the connected user has admin privileges.
+    pub is_admin: bool,
+    /// Cached dashboard snapshot (polled every ~1s for admin users on Dashboard tab).
+    pub dashboard_cache: Option<trawl_client::DashboardSnapshot>,
+    /// Whether a dashboard request is currently in-flight (prevents pileup).
+    dashboard_inflight: bool,
+    /// Counter for dashboard polling (every 10 ticks = ~1s at 100ms poll).
+    dashboard_poll_counter: u32,
 }
 
 /// Info about a node in the schema tree (avoids borrow issues in tree methods).
@@ -292,6 +303,10 @@ impl App {
             driver_socket_path: None,
             driver_execute_waiter: None,
             server_version: None,
+            is_admin: false,
+            dashboard_cache: None,
+            dashboard_inflight: false,
+            dashboard_poll_counter: 0,
         }
     }
 
@@ -439,12 +454,41 @@ impl App {
                     tracing::info!("schedule set for saved query {saved_query_id}");
                     self.refresh_saved_cache(None);
                 }
+                MutationResult::DashboardUpdate(snapshot) => {
+                    if let Some(s) = snapshot {
+                        self.dashboard_cache = Some(*s);
+                    }
+                    self.dashboard_inflight = false;
+                }
                 MutationResult::Error { message } => {
                     tracing::error!("mutation error: {message}");
                     self.popup = Some(Popup::Error { message });
                 }
             }
         }
+    }
+
+    /// Poll the dashboard endpoint when the admin user is viewing the Dashboard tab.
+    fn poll_dashboard(&mut self) {
+        if !self.is_admin || self.main_tab != MainTab::Dashboard || self.dashboard_inflight {
+            return;
+        }
+        self.dashboard_poll_counter += 1;
+        // 10 ticks × 100ms poll interval = ~1s refresh
+        if self.dashboard_poll_counter < 10 {
+            return;
+        }
+        self.dashboard_poll_counter = 0;
+        self.dashboard_inflight = true;
+
+        let client = self.client.clone();
+        let tx = self.mutation_tx.clone();
+        tokio::spawn(async move {
+            // On failure, send None to clear the inflight flag without
+            // replacing the cached snapshot.
+            let snapshot = client.dashboard().await.ok().map(Box::new);
+            let _ = tx.send(MutationResult::DashboardUpdate(snapshot));
+        });
     }
 
     /// Poll for query results and update the tab.
@@ -537,6 +581,10 @@ impl App {
                 self.switch_to_main_tab(MainTab::Saved);
                 return;
             }
+            (KeyModifiers::ALT, KeyCode::Char('5')) if self.is_admin => {
+                self.switch_to_main_tab(MainTab::Dashboard);
+                return;
+            }
             // Toggle live tail: F9
             (KeyModifiers::NONE, KeyCode::F(9)) => {
                 self.toggle_live_mode();
@@ -582,6 +630,7 @@ impl App {
             MainTab::History => self.handle_panel_history_key(key),
             MainTab::Schema => self.handle_panel_schema_key(key),
             MainTab::Saved => self.handle_panel_saved_key(key),
+            MainTab::Dashboard => {} // Read-only dashboard — no interactive keys
         }
     }
 
@@ -2136,14 +2185,15 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Fetch schema, history, saved queries, service list, and server version in parallel.
-    tracing::info!("fetching schema, history, saved queries, service list, and server version");
-    let (schema_result, history_result, saved_result, services_result, health_result) = tokio::join!(
+    // Fetch schema, history, saved queries, service list, server version, and admin status in parallel.
+    tracing::info!("fetching startup data");
+    let (schema_result, history_result, saved_result, services_result, health_result, is_admin) = tokio::join!(
         client.schema(),
         client.history(Some(100), None),
         client.list_saved(),
         client.field_values("service", Some(500)),
         client.health(),
+        async { client.stats().await.is_ok() },
     );
 
     let schema = match schema_result {
@@ -2210,6 +2260,10 @@ pub async fn run(
     app.saved_cache = saved;
     app.service_list_cache = services;
     app.server_version = server_version;
+    app.is_admin = is_admin;
+    if is_admin {
+        tracing::info!("admin privileges detected — Dashboard tab enabled");
+    }
 
     // Start driver socket if requested.
     if let Some(path) = driver_path {
@@ -2294,6 +2348,9 @@ where
 
         // Poll for schema profile results from background tasks.
         app.poll_schema_profiles();
+
+        // Poll for dashboard snapshot updates.
+        app.poll_dashboard();
 
         // Poll for driver commands from the unix socket.
         app.poll_driver_commands(terminal);
