@@ -45,26 +45,24 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let tab = app.active_tab();
 
-    if let Some(response) = &tab.result {
-        let result = &response.result;
-        let is_timechart = is_timechart_result(result);
-
-        // Dispatch rendering based on view mode
-        match tab.chart_view {
-            ChartView::Sparkline if is_timechart => {
-                render_sparkline(app, frame, results_area, result);
-            }
-            // Table view, or sparkline fallback for non-timechart
-            ChartView::Table | ChartView::Sparkline => {
-                render_table(app, frame, results_area, response);
-            }
-        }
-    } else if let crate::tui::state::TabStatus::Error {
+    if let TabStatus::Error {
         ref message,
         ref details,
     } = tab.status
     {
         render_error_display(app, frame, results_area, tab, message, details);
+    } else if let Some(response) = &tab.result {
+        let result = &response.result;
+        let is_timechart = is_timechart_result(result);
+
+        match tab.chart_view {
+            ChartView::Sparkline if is_timechart => {
+                render_sparkline(app, frame, results_area, result);
+            }
+            ChartView::Table | ChartView::Sparkline => {
+                render_table(app, frame, results_area, response);
+            }
+        }
     } else {
         render_placeholder(app, frame, results_area);
     }
