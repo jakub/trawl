@@ -22,6 +22,7 @@ pub mod shutdown;
 pub(crate) mod source;
 pub mod state;
 pub mod stats;
+pub mod syslog;
 pub mod telemetry;
 pub mod tls;
 pub mod tracker;

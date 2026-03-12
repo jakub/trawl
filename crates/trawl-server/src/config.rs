@@ -16,6 +16,8 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub syslog: SyslogConfig,
 }
 
 /// HTTPS listener settings.
@@ -352,6 +354,105 @@ impl Default for SchedulerConfig {
             report_max_rows: DEFAULT_SCHEDULER_REPORT_MAX_ROWS,
             max_runs_per_schedule: DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE,
             report_retention_days: DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS,
+        }
+    }
+}
+
+/// Native syslog listener settings for receiving logs from network appliances.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyslogConfig {
+    /// Enable the syslog listener. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// UDP listen address. Default: "0.0.0.0:1514".
+    #[serde(default = "default_syslog_addr")]
+    pub udp_addr: String,
+
+    /// Enable the UDP listener. Default: true (when syslog is enabled).
+    #[serde(default = "default_true")]
+    pub udp_enabled: bool,
+
+    /// TCP listen address. Default: "0.0.0.0:1514".
+    #[serde(default = "default_syslog_addr")]
+    pub tcp_addr: String,
+
+    /// Enable the TCP listener. Default: true (when syslog is enabled).
+    #[serde(default = "default_true")]
+    pub tcp_enabled: bool,
+
+    /// Maximum concurrent TCP connections. Default: 256.
+    #[serde(default = "default_syslog_max_tcp_connections")]
+    pub max_tcp_connections: usize,
+
+    /// Batch flush interval in milliseconds. Default: 500.
+    #[serde(default = "default_syslog_batch_interval_ms")]
+    pub batch_interval_ms: u64,
+
+    /// Maximum events per batch before forced flush. Default: 1000.
+    #[serde(default = "default_syslog_batch_max_events")]
+    pub batch_max_events: usize,
+
+    /// Default service name when APP-NAME/tag is missing and no source
+    /// IP mapping matches. Default: "syslog".
+    #[serde(default = "default_syslog_default_service")]
+    pub default_service: String,
+
+    /// Source IP allowlist in CIDR notation (e.g. `["192.168.0.0/16"]`).
+    /// Empty list means all source IPs are accepted.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+
+    /// Map source IPs to service names. Takes priority over APP-NAME/tag
+    /// from the syslog message. Useful for appliances that don't set a
+    /// meaningful APP-NAME (e.g. `UniFi` consoles).
+    #[serde(default)]
+    pub source_service_map: std::collections::HashMap<String, String>,
+}
+
+const DEFAULT_SYSLOG_ADDR: &str = "0.0.0.0:1514";
+const DEFAULT_SYSLOG_MAX_TCP_CONNECTIONS: usize = 256;
+const DEFAULT_SYSLOG_BATCH_INTERVAL_MS: u64 = 500;
+const DEFAULT_SYSLOG_BATCH_MAX_EVENTS: usize = 1000;
+
+fn default_syslog_addr() -> String {
+    DEFAULT_SYSLOG_ADDR.to_owned()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_syslog_max_tcp_connections() -> usize {
+    DEFAULT_SYSLOG_MAX_TCP_CONNECTIONS
+}
+
+fn default_syslog_batch_interval_ms() -> u64 {
+    DEFAULT_SYSLOG_BATCH_INTERVAL_MS
+}
+
+fn default_syslog_batch_max_events() -> usize {
+    DEFAULT_SYSLOG_BATCH_MAX_EVENTS
+}
+
+fn default_syslog_default_service() -> String {
+    "syslog".to_owned()
+}
+
+impl Default for SyslogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            udp_addr: DEFAULT_SYSLOG_ADDR.to_owned(),
+            udp_enabled: true,
+            tcp_addr: DEFAULT_SYSLOG_ADDR.to_owned(),
+            tcp_enabled: true,
+            max_tcp_connections: DEFAULT_SYSLOG_MAX_TCP_CONNECTIONS,
+            batch_interval_ms: DEFAULT_SYSLOG_BATCH_INTERVAL_MS,
+            batch_max_events: DEFAULT_SYSLOG_BATCH_MAX_EVENTS,
+            default_service: "syslog".to_owned(),
+            allow_cidrs: Vec::new(),
+            source_service_map: std::collections::HashMap::new(),
         }
     }
 }
@@ -798,6 +899,9 @@ impl Config {
             warns.push(
                 "internal_telemetry requires ingest to be enabled — telemetry disabled".into(),
             );
+        }
+        if self.syslog.enabled && !self.ingest.enabled {
+            warns.push("syslog listener requires ingest to be enabled — syslog disabled".into());
         }
         warns
     }

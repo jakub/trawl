@@ -20,6 +20,10 @@ pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";
 pub const PARQUET_FILES: &str = "trawl_parquet_files_total";
 pub const PARQUET_BYTES: &str = "trawl_parquet_size_bytes";
 pub const HEALTH_CHECK: &str = "trawl_health_check";
+pub const SYSLOG_EVENTS_TOTAL: &str = "trawl_syslog_events_total";
+pub const SYSLOG_PARSE_ERRORS_TOTAL: &str = "trawl_syslog_parse_errors_total";
+pub const SYSLOG_EVENTS_DROPPED_TOTAL: &str = "trawl_syslog_events_dropped_total";
+pub const SYSLOG_TCP_CONNECTIONS: &str = "trawl_syslog_tcp_connections";
 
 // -- description registration ------------------------------------------------
 
@@ -43,6 +47,22 @@ pub fn describe_metrics() {
     describe_gauge!(
         HEALTH_CHECK,
         "Subsystem health (1 = ok, 0 = failed), labeled by subsystem"
+    );
+    describe_counter!(
+        SYSLOG_EVENTS_TOTAL,
+        "Total events ingested via syslog listener"
+    );
+    describe_counter!(
+        SYSLOG_PARSE_ERRORS_TOTAL,
+        "Total unparseable syslog messages"
+    );
+    describe_counter!(
+        SYSLOG_EVENTS_DROPPED_TOTAL,
+        "Syslog events dropped due to backpressure"
+    );
+    describe_gauge!(
+        SYSLOG_TCP_CONNECTIONS,
+        "Current active syslog TCP connections"
     );
 }
 

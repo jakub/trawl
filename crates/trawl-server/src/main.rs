@@ -113,6 +113,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let compaction_handle = spawn_ingest_pipeline(&config, &state)?;
 
+    // Spawn syslog listeners if enabled (requires ingest to be enabled).
+    let syslog_handle = if config.syslog.enabled && config.ingest.enabled {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handles = trawl_server::syslog::spawn_syslog(
+            &config.syslog,
+            Arc::clone(state.ingest.wal_writer.as_ref().expect("ingest enabled")),
+            state.query.hot_buffer.clone(),
+            state.ingest.event_bus.clone(),
+            shutdown_rx,
+        );
+        tracing::info!(
+            event_type = "lifecycle",
+            udp = config.syslog.udp_enabled,
+            tcp = config.syslog.tcp_enabled,
+            udp_addr = %config.syslog.udp_addr,
+            tcp_addr = %config.syslog.tcp_addr,
+            sources = config.syslog.source_service_map.len(),
+            "syslog listener enabled"
+        );
+        Some((handles, shutdown_tx))
+    } else {
+        None
+    };
+
     // Spawn retention task (always-on with defaults).
     let retention_handle = {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -216,11 +240,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
     // then stats emitter, then scheduler (stop issuing new queries),
+    // then syslog (flush final events to WAL before compaction),
     // then compaction (may compact final files and drain hot buffer),
     // then retention, then audit.
     shutdown_task(telemetry_handle, "telemetry").await;
     shutdown_task(Some(stats_handle), "stats_emitter").await;
     shutdown_task(scheduler_handle, "scheduler").await;
+    if let Some((handles, shutdown_tx)) = syslog_handle {
+        let _ = shutdown_tx.send(true);
+        for handle in handles {
+            if let Err(e) = handle.await {
+                tracing::warn!(event_type = "task_panic", task = "syslog", error = %e, "syslog task panicked during shutdown");
+            }
+        }
+    }
     if let Some((compaction_jh, compaction_tx)) = compaction_handle {
         shutdown_task(Some((compaction_jh, compaction_tx)), "compaction").await;
     }
