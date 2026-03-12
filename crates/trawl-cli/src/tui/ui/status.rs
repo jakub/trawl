@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::tui::App;
-use crate::tui::state::{Focus, TabStatus};
+use crate::tui::state::{Focus, MainTab, TabStatus};
 
 /// Render the status bar.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -49,7 +49,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let focus_text = match app.focus {
         Focus::Editor => " [editor] ",
         Focus::Results => " [results] ",
-        Focus::Sidebar => " [sidebar] ",
+        Focus::Panel => " [panel] ",
     };
     spans.push(Span::raw(focus_text));
 
@@ -74,34 +74,26 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 /// Generate context-sensitive keybinding hints.
 fn get_context_hints(app: &App) -> String {
-    use crate::tui::state::SidebarSection;
-
-    // If sidebar is focused, show sidebar-specific hints.
-    if app.focus == Focus::Sidebar
-        && let Some(ref sb) = app.sidebar
-    {
-        if sb.section == SidebarSection::Schema && sb.schema.filter_active {
+    // Panel tab hints
+    if app.focus == Focus::Panel {
+        if app.main_tab == MainTab::Schema && app.panel.schema.filter_active {
             return "type to filter | Enter: confirm | Esc: cancel".to_owned();
         }
-        return match sb.section {
-            SidebarSection::Schema => {
-                "↑↓: navigate | →: expand | ←: collapse | /: filter | [/]: sections".to_owned()
+        return match app.main_tab {
+            MainTab::Schema => {
+                "↑↓: navigate | →: expand | ←: collapse | /: filter | Esc: query".to_owned()
             }
-            SidebarSection::History => {
-                "↑↓: navigate | enter: load query | [/]: sections".to_owned()
+            MainTab::History => "↑↓: navigate | Enter: load query | Esc: query".to_owned(),
+            MainTab::Saved => {
+                "↑↓: navigate | Enter: load | s: schedule | Del: delete | Esc: query".to_owned()
             }
-            SidebarSection::Saved => {
-                "↑↓: navigate | enter: load | s: schedule | del: delete | [/]: sections".to_owned()
-            }
-            SidebarSection::Reports => {
-                "↑↓: navigate | enter: load last run | [/]: sections".to_owned()
-            }
+            MainTab::Query => String::new(),
         };
     }
 
     // Live mode hints
     if app.live_mode {
-        return "F9: stop live tail | F1: help | ctrl+q: quit".to_owned();
+        return "F9: stop live tail | F1: help | Ctrl+Q: quit".to_owned();
     }
 
     // Results search mode hints
@@ -117,19 +109,18 @@ fn get_context_hints(app: &App) -> String {
     match app.focus {
         Focus::Editor => {
             if app.active_tab().editor.text().trim().is_empty() {
-                "F3: history | F4: saved | F1: help".to_owned()
+                "M-2: history | M-4: saved | F1: help".to_owned()
             } else {
-                "F5: execute | ctrl+s: save | ctrl+l: clear".to_owned()
+                "Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear".to_owned()
             }
         }
         Focus::Results => {
             if app.active_tab().result.is_some() {
-                "↑↓: select | Enter: detail | /: search | tab: editor".to_owned()
+                "↑↓: select | Enter: detail | /: search | Tab: editor".to_owned()
             } else {
-                "tab: editor | F5: execute query".to_owned()
+                "Tab: editor | Shift+Enter: execute query".to_owned()
             }
         }
-        // Sidebar hints handled by early return above; fallback for safety.
-        Focus::Sidebar => "tab: editor | [/]: sections | esc: close".to_owned(),
+        Focus::Panel => String::new(),
     }
 }

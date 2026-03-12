@@ -1,4 +1,4 @@
-//! Persistent sidebar panel: activity bar + section content.
+//! Full-width panel content for non-Query tabs (History, Schema, Saved).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -7,80 +7,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::tui::App;
-use crate::tui::state::{Focus, ProfiledColumn, SidebarSection};
+use crate::tui::state::{Focus, MainTab, ProfiledColumn};
 
-/// Width of the activity bar icon strip.
-const ACTIVITY_BAR_WIDTH: u16 = 3;
-
-/// Render the activity bar (always visible) and sidebar panel (when open).
+/// Render panel content based on the active `MainTab`.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let sidebar_open = app.sidebar.is_some();
-
-    if sidebar_open {
-        // Split: activity bar | sidebar panel
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(ACTIVITY_BAR_WIDTH), Constraint::Min(1)])
-            .split(area);
-
-        render_activity_bar(app, frame, chunks[0]);
-        render_panel(app, frame, chunks[1]);
-    } else {
-        // Just the activity bar
-        render_activity_bar(app, frame, area);
-    }
-}
-
-/// Render the 3-column activity bar with section icons.
-fn render_activity_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let active_section = app
-        .sidebar
-        .as_ref()
-        .map_or(app.sidebar_section_hint, |sb| sb.section);
-    let sidebar_open = app.sidebar.is_some();
-
-    // Build lines: one icon per section, vertically stacked at the top,
-    // then fill the rest with empty.
-    let icons = [
-        (SidebarSection::Schema, "S"),
-        (SidebarSection::History, "H"),
-        (SidebarSection::Saved, "Q"),
-        (SidebarSection::Reports, "R"),
-    ];
-
-    let mut lines: Vec<Line<'_>> = Vec::new();
-    for (section, icon) in &icons {
-        let is_active = *section == active_section;
-        let style = if is_active && sidebar_open {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else if is_active {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        // Center the icon in the 3-column width
-        lines.push(Line::from(Span::styled(format!(" {icon} "), style)));
-    }
-
-    // Fill remaining height
-    #[allow(clippy::cast_possible_truncation)]
-    for _ in 0..(area.height as usize).saturating_sub(lines.len()) {
-        lines.push(Line::from("   "));
-    }
-
-    let paragraph = Paragraph::new(lines).style(Style::default().bg(Color::Black));
-    frame.render_widget(paragraph, area);
-}
-
-/// Render the sidebar panel content.
-fn render_panel(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let Some(ref sb) = app.sidebar else {
-        return;
-    };
-
-    let border_style = if app.focus == Focus::Sidebar {
+    let border_style = if app.focus == Focus::Panel {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -94,79 +25,26 @@ fn render_panel(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Split inner into: section tabs (1 line) + optional filter (1 line) + content.
-    let has_filter = sb.section == SidebarSection::Schema;
-    let constraints: Vec<Constraint> = if has_filter {
-        vec![
-            Constraint::Length(1), // section tabs
-            Constraint::Length(1), // filter bar
-            Constraint::Min(1),    // content
-        ]
-    } else {
-        vec![
-            Constraint::Length(1), // section tabs
-            Constraint::Min(1),    // content
-        ]
-    };
+    match app.main_tab {
+        MainTab::Schema => {
+            // Schema has a filter bar above the tree.
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(inner);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(inner);
-
-    render_section_tabs(sb.section, frame, chunks[0]);
-
-    let content_area = if has_filter {
-        render_filter_bar(&sb.schema.filter, sb.schema.filter_active, frame, chunks[1]);
-        chunks[2]
-    } else {
-        chunks[1]
-    };
-
-    match sb.section {
-        SidebarSection::Schema => {
-            render_schema_tree(app, frame, content_area);
+            render_filter_bar(
+                &app.panel.schema.filter,
+                app.panel.schema.filter_active,
+                frame,
+                chunks[0],
+            );
+            render_schema_tree(app, frame, chunks[1]);
         }
-        SidebarSection::History => {
-            render_history_list(app, frame, content_area);
-        }
-        SidebarSection::Saved => {
-            render_saved_list(app, frame, content_area);
-        }
-        SidebarSection::Reports => {
-            render_reports_list(app, frame, content_area);
-        }
+        MainTab::History => render_history_list(app, frame, inner),
+        MainTab::Saved => render_saved_list(app, frame, inner),
+        MainTab::Query => {} // Should not happen — Query tab uses its own layout.
     }
-}
-
-/// Render the section tab bar: [Schema] [History] [Saved].
-fn render_section_tabs(active: SidebarSection, frame: &mut Frame<'_>, area: Rect) {
-    let tabs = [
-        (SidebarSection::Schema, "Schema"),
-        (SidebarSection::History, "History"),
-        (SidebarSection::Saved, "Saved"),
-        (SidebarSection::Reports, "Reports"),
-    ];
-
-    let spans: Vec<Span<'_>> = tabs
-        .iter()
-        .map(|(section, label)| {
-            if *section == active {
-                Span::styled(
-                    format!(" {label} "),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::styled(format!(" {label} "), Style::default().fg(Color::DarkGray))
-            }
-        })
-        .collect();
-
-    let line = Line::from(spans);
-    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Render the filter input bar for schema search.
@@ -211,10 +89,7 @@ enum TreeNode<'a> {
 /// Flatten the schema tree into a linear list for rendering.
 fn flatten_tree(app: &App) -> Vec<TreeNode<'_>> {
     let services = app.service_list_cache.as_deref().unwrap_or(&[]);
-    let Some(ref sb) = app.sidebar else {
-        return Vec::new();
-    };
-    let tree = &sb.schema;
+    let tree = &app.panel.schema;
     let filter = tree.filter.to_lowercase();
 
     let mut nodes = Vec::new();
@@ -287,7 +162,7 @@ fn type_color(data_type: &str) -> Color {
 /// Render the schema tree view.
 fn render_schema_tree(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let nodes = flatten_tree(app);
-    let selected = app.sidebar.as_ref().map_or(0, |sb| sb.schema.selected);
+    let selected = app.panel.schema.selected;
 
     if nodes.is_empty() {
         let msg = if app
@@ -437,12 +312,12 @@ fn abbreviate_type(data_type: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// History list (inline in sidebar)
+// History list
 // ---------------------------------------------------------------------------
 
-/// Render history entries in the sidebar panel.
+/// Render history entries in the panel.
 fn render_history_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let selected = app.sidebar.as_ref().map_or(0, |sb| sb.history_selected);
+    let selected = app.panel.history_selected;
 
     let Some(ref history) = app.history_cache else {
         let paragraph =
@@ -490,12 +365,12 @@ fn render_history_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Saved queries list (inline in sidebar)
+// Saved queries list
 // ---------------------------------------------------------------------------
 
-/// Render saved queries in the sidebar panel.
+/// Render saved queries in the panel.
 fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let selected = app.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
+    let selected = app.panel.saved_selected;
 
     let Some(ref saved) = app.saved_cache else {
         let paragraph =
@@ -557,116 +432,4 @@ fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
-}
-
-// ---------------------------------------------------------------------------
-// Reports list (scheduled saved queries)
-// ---------------------------------------------------------------------------
-
-/// Render the reports list (saved queries with schedules) in the sidebar panel.
-fn render_reports_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let selected = app.sidebar.as_ref().map_or(0, |sb| sb.reports_selected);
-
-    let Some(ref saved) = app.saved_cache else {
-        let paragraph = Paragraph::new("loading...").style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(paragraph, area);
-        return;
-    };
-
-    // Filter to only saved queries that have a schedule.
-    let scheduled: Vec<_> = saved
-        .queries
-        .iter()
-        .filter(|q| q.schedule.is_some())
-        .collect();
-
-    if scheduled.is_empty() {
-        let paragraph =
-            Paragraph::new("no scheduled queries").style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(paragraph, area);
-        return;
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    let max_width = area.width as usize;
-    let items: Vec<ListItem<'_>> = scheduled
-        .iter()
-        .map(|entry| {
-            let sched = entry.schedule.as_ref().unwrap();
-            let interval = &sched.interval;
-
-            // Status indicator based on last run.
-            let (icon, icon_color) = if let Some(ref last) = sched.last_run {
-                match last.status.as_str() {
-                    "success" => ("\u{2713}", Color::Green),  // checkmark
-                    "running" => ("\u{23f3}", Color::Yellow), // hourglass
-                    _ => ("\u{2717}", Color::Red),            // cross
-                }
-            } else {
-                ("\u{00b7}", Color::DarkGray) // middle dot — never run
-            };
-
-            // Time since last run.
-            let age = sched
-                .last_run
-                .as_ref()
-                .and_then(|r| {
-                    r.started_at
-                        .as_str()
-                        .parse::<chrono::DateTime<chrono::Utc>>()
-                        .ok()
-                })
-                .map(format_age)
-                .unwrap_or_default();
-
-            let suffix = format!(" ({interval}) {age}");
-            let name_budget = max_width.saturating_sub(suffix.len() + 2);
-            let display_name = if entry.name.len() > name_budget {
-                format!("{}…", &entry.name[..name_budget.saturating_sub(1)])
-            } else {
-                entry.name.clone()
-            };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-                Span::styled(display_name, Style::default().fg(Color::White)),
-                Span::styled(suffix, Style::default().fg(Color::DarkGray)),
-            ]))
-        })
-        .collect();
-
-    let total = items.len();
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    #[allow(clippy::cast_possible_truncation)]
-    let visible_height = area.height as usize;
-    let offset = compute_center_offset(selected, visible_height, total);
-    let mut list_state = ListState::default().with_offset(offset);
-    list_state.select(Some(selected));
-    frame.render_stateful_widget(list, area, &mut list_state);
-}
-
-/// Format a time delta as a human-readable age string (e.g. "2m ago", "3h ago").
-fn format_age(dt: chrono::DateTime<chrono::Utc>) -> String {
-    let now = chrono::Utc::now();
-    let delta = now.signed_duration_since(dt);
-    let secs = delta.num_seconds();
-    if secs < 0 {
-        return String::new();
-    }
-    #[allow(clippy::cast_sign_loss)]
-    let secs = secs as u64;
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86400)
-    }
 }

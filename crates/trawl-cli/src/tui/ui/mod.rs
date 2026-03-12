@@ -1,29 +1,33 @@
 //! UI rendering dispatch.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 
 use crate::tui::App;
-use crate::tui::state::Focus;
+use crate::tui::state::{Focus, MainTab};
 
 pub mod common;
 pub mod editor;
 pub mod help;
 pub mod history;
+pub mod panels;
 pub mod popup;
 pub mod results;
 pub mod saved;
 pub mod schema;
-pub mod sidebar;
 pub mod status;
 pub mod tabs;
 
-/// Width of the activity bar (icon strip) in columns.
-const ACTIVITY_BAR_WIDTH: u16 = 3;
-
 /// Main render function — dispatches to submodules based on app state.
 pub fn render(app: &mut App, frame: &mut Frame<'_>) {
-    // Split the screen into tab bar, main content area, and status bar.
+    match app.main_tab {
+        MainTab::Query => render_query_layout(app, frame),
+        _ => render_panel_layout(app, frame),
+    }
+}
+
+/// Render the Query tab: tab bar, editor, results, status bar.
+fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -34,59 +38,10 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         ])
         .split(frame.area());
 
-    // Compute the left panel width: activity bar + optional sidebar panel.
-    let sidebar_open = app.sidebar.is_some();
-    let left_width = if sidebar_open {
-        ACTIVITY_BAR_WIDTH + app.sidebar_width
-    } else {
-        ACTIVITY_BAR_WIDTH
-    };
-
-    // Tab bar and status bar aligned with editor/results (offset by sidebar width).
-    let tab_area = Rect {
-        x: outer[0].x + left_width,
-        y: outer[0].y,
-        width: outer[0].width.saturating_sub(left_width),
-        height: outer[0].height,
-    };
-    tabs::render(app, frame, tab_area);
-
-    let status_area = Rect {
-        x: outer[3].x + left_width,
-        y: outer[3].y,
-        width: outer[3].width.saturating_sub(left_width),
-        height: outer[3].height,
-    };
-    status::render(app, frame, status_area);
-
-    // Left panel spans all four rows (tab bar + editor + results + status bar).
-    let left_area = Rect {
-        x: outer[0].x,
-        y: outer[0].y,
-        width: left_width.min(outer[0].width),
-        height: outer[0].height + outer[1].height + outer[2].height + outer[3].height,
-    };
-
-    let editor_area = Rect {
-        x: outer[1].x + left_width,
-        y: outer[1].y,
-        width: outer[1].width.saturating_sub(left_width),
-        height: outer[1].height,
-    };
-
-    let results_area = Rect {
-        x: outer[2].x + left_width,
-        y: outer[2].y,
-        width: outer[2].width.saturating_sub(left_width),
-        height: outer[2].height,
-    };
-
-    // Render the activity bar + sidebar panel.
-    sidebar::render(app, frame, left_area);
-
-    // Render editor and results panes.
-    editor::render(app, frame, editor_area);
-    results::render(app, frame, results_area);
+    tabs::render(app, frame, outer[0]);
+    editor::render(app, frame, outer[1]);
+    results::render(app, frame, outer[2]);
+    status::render(app, frame, outer[3]);
 
     // Render popup overlay (if any) — renders on top of everything.
     popup::render(app, frame);
@@ -100,11 +55,30 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         // +2 for x: border (1) + horizontal padding (1)
         // +1 for y: border (1) only
         #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
-        let x = editor_area.x + col.saturating_sub(scroll_col) as u16 + 2;
+        let x = outer[1].x + col.saturating_sub(scroll_col) as u16 + 2;
         #[allow(clippy::cast_possible_truncation)]
-        let y = editor_area.y + row.saturating_sub(scroll_row) as u16 + 1;
+        let y = outer[1].y + row.saturating_sub(scroll_row) as u16 + 1;
         frame.set_cursor_position((x, y));
     }
+}
+
+/// Render a non-Query tab: tab bar, full-width panel content, status bar.
+fn render_panel_layout(app: &mut App, frame: &mut Frame<'_>) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Tab bar
+            Constraint::Min(1),    // Panel content (full height)
+            Constraint::Length(1), // Status bar
+        ])
+        .split(frame.area());
+
+    tabs::render(app, frame, outer[0]);
+    panels::render(app, frame, outer[1]);
+    status::render(app, frame, outer[2]);
+
+    // Render popup overlay (if any).
+    popup::render(app, frame);
 }
 
 #[cfg(test)]
@@ -194,8 +168,8 @@ mod tests {
                 ],
             ],
         );
-        app.tabs[0].result = Some(response);
-        app.tabs[0].status = TabStatus::Success { duration_ms: 42 };
+        app.tab.result = Some(response);
+        app.tab.status = TabStatus::Success { duration_ms: 42 };
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
@@ -205,7 +179,7 @@ mod tests {
     #[test]
     fn render_with_error_status() {
         let mut app = test_app();
-        app.tabs[0].status = TabStatus::Error {
+        app.tab.status = TabStatus::Error {
             message: "parse error: unexpected token".to_owned(),
             details: Vec::new(),
         };

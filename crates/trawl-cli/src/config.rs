@@ -113,11 +113,6 @@ pub struct UiConfig {
     #[serde(default = "default_tab_width")]
     pub tab_width: usize,
 
-    /// When true, Enter executes the query and Shift+Enter inserts a newline.
-    /// When false (default), Enter inserts a newline and Ctrl+Enter executes.
-    #[serde(default)]
-    pub enter_executes: bool,
-
     /// Timezone for timestamp display.
     ///
     /// - `"local"` (default) — system timezone via `chrono::Local`
@@ -125,10 +120,6 @@ pub struct UiConfig {
     /// - `"+HH:MM"` / `"-HH:MM"` — fixed offset
     #[serde(default = "default_timezone")]
     pub timezone: String,
-
-    /// Sidebar width in columns (default 32).
-    #[serde(default = "default_sidebar_width")]
-    pub sidebar_width: u16,
 }
 
 impl Default for UiConfig {
@@ -138,9 +129,7 @@ impl Default for UiConfig {
             enable_mouse: true,
             auto_save_history: true,
             tab_width: default_tab_width(),
-            enter_executes: false,
             timezone: default_timezone(),
-            sidebar_width: default_sidebar_width(),
         }
     }
 }
@@ -263,10 +252,6 @@ const fn default_tab_width() -> usize {
 
 const fn default_max_events() -> usize {
     1000
-}
-
-const fn default_sidebar_width() -> u16 {
-    32
 }
 
 fn default_timezone() -> String {

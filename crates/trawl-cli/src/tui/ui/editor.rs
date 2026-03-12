@@ -20,7 +20,7 @@ const SELECTION_STYLE: Style = Style::new()
 /// Render the editor pane.
 pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     // Determine border style.
-    let border_style = if app.focus == Focus::Editor && app.sidebar.is_none() {
+    let border_style = if app.focus == Focus::Editor {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
