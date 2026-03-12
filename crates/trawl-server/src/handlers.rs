@@ -345,6 +345,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         Json(HealthResponse {
             status,
             checks: Some(checks),
+            version: Some(trawl_core::version::PKG_VERSION.to_owned()),
         }),
     )
 }

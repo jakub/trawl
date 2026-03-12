@@ -353,9 +353,38 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
-    let text = Line::from("no results yet — execute a query with F5");
-    let paragraph = Paragraph::new(text).block(block);
-    frame.render_widget(paragraph, area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Build splash content lines.
+    let dim = Style::default().fg(Color::DarkGray);
+    let client_version = trawl_core::version::PKG_VERSION;
+    let server_version = app.server_version.as_deref().unwrap_or("\u{2014}");
+
+    let content: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            "trawl",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Help: F1 or https://docs.trawl.sh", dim)),
+        Line::from(Span::styled("Quit: Ctrl-Q", dim)),
+        Line::from(""),
+        Line::from(Span::styled(format!("Client: {client_version}"), dim)),
+        Line::from(Span::styled(format!("Server: {server_version}"), dim)),
+    ];
+
+    // Vertically center by prepending empty lines.
+    #[allow(clippy::cast_possible_truncation)] // content is always 7 lines
+    let content_height = content.len() as u16;
+    let top_pad = (inner.height.saturating_sub(content_height)) / 2;
+    let mut lines: Vec<Line<'_>> = (0..top_pad).map(|_| Line::from("")).collect();
+    lines.extend(content);
+
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(paragraph, inner);
 }
 
 /// Render error details with span highlighting in the results pane.

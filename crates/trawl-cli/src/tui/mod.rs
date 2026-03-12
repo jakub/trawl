@@ -237,6 +237,8 @@ pub struct App {
     /// Pending execute waiter: the socket task blocks on this until
     /// the matching tab's query completes.
     driver_execute_waiter: Option<ExecuteWaiter>,
+    /// Server version string (fetched from health endpoint at startup).
+    pub server_version: Option<String>,
 }
 
 /// Info about a node in the schema tree (avoids borrow issues in tree methods).
@@ -289,6 +291,7 @@ impl App {
             driver_rx: None,
             driver_socket_path: None,
             driver_execute_waiter: None,
+            server_version: None,
         }
     }
 
@@ -2120,13 +2123,14 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Fetch schema, history, saved queries, and service list in parallel.
-    tracing::info!("fetching schema, history, saved queries, and service list");
-    let (schema_result, history_result, saved_result, services_result) = tokio::join!(
+    // Fetch schema, history, saved queries, service list, and server version in parallel.
+    tracing::info!("fetching schema, history, saved queries, service list, and server version");
+    let (schema_result, history_result, saved_result, services_result, health_result) = tokio::join!(
         client.schema(),
         client.history(Some(100), None),
         client.list_saved(),
         client.field_values("service", Some(500)),
+        client.health(),
     );
 
     let schema = match schema_result {
@@ -2173,6 +2177,17 @@ pub async fn run(
         }
     };
 
+    let server_version = match health_result {
+        Ok(h) => {
+            tracing::info!("health check ok, server version: {:?}", h.version);
+            h.version
+        }
+        Err(e) => {
+            tracing::warn!("failed to fetch health: {}", e);
+            None
+        }
+    };
+
     // Create app with schema, history, and saved queries.
     let mut app = App::new(client);
     app.max_live_events = config.tail.max_events;
@@ -2181,6 +2196,7 @@ pub async fn run(
     app.history_cache = history;
     app.saved_cache = saved;
     app.service_list_cache = services;
+    app.server_version = server_version;
 
     // Start driver socket if requested.
     if let Some(path) = driver_path {

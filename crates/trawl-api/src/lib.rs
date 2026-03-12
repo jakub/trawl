@@ -239,6 +239,9 @@ pub struct HealthResponse {
     /// Absent in minimal responses for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<HashMap<String, String>>,
+    /// Server version string (e.g. `"0.1.3"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 // -- schema ------------------------------------------------------------------
@@ -826,11 +829,13 @@ mod tests {
         let resp = HealthResponse {
             status: HealthStatus::Ok,
             checks: None,
+            version: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ok\""));
         // checks omitted when None
         assert!(!json.contains("checks"));
+        assert!(!json.contains("version"));
     }
 
     #[test]
@@ -855,6 +860,7 @@ mod tests {
         let resp = HealthResponse {
             status: HealthStatus::Degraded,
             checks: Some(checks),
+            version: Some("0.1.3".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"degraded\""));
