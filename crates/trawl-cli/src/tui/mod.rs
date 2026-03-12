@@ -27,8 +27,8 @@ use self::driver::{
     query_response_to_data,
 };
 use self::state::{
-    CatalogSummary, ChartView, Focus, LiveBuffer, Popup, ProfiledColumn, ResultsSearch,
-    SidebarSection, SidebarState, SimpleEditor, Tab, TabStatus,
+    ChartView, Focus, LiveBuffer, MainTab, PanelState, Popup, ProfiledColumn, ResultsSearch,
+    SimpleEditor, Tab, TabStatus,
 };
 use crate::CliError;
 use crate::config::Config;
@@ -146,8 +146,6 @@ struct QueryError {
 /// Result of an async query execution.
 #[derive(Debug)]
 struct QueryResult {
-    /// Index of the tab that requested the query.
-    tab_idx: usize,
     /// Query execution result.
     result: Result<QueryResponse, QueryError>,
     /// Execution duration.
@@ -169,8 +167,6 @@ enum MutationResult {
     },
     /// Schedule was set on a saved query.
     ScheduleSet { saved_query_id: i64 },
-    /// Report run result was loaded.
-    ReportRunLoaded { result: QueryResponse },
     /// Mutation failed.
     Error { message: String },
 }
@@ -188,14 +184,16 @@ struct SchemaProfileResult {
 pub struct App {
     /// HTTP client for API calls.
     pub client: HttpClient,
-    /// Open tabs.
-    pub tabs: Vec<Tab>,
-    /// Index of the active tab.
-    pub active_tab_idx: usize,
+    /// The query tab (editor + results).
+    pub tab: Tab,
+    /// Which top-level navigation tab is active.
+    pub main_tab: MainTab,
     /// Which pane has focus.
     pub focus: Focus,
-    /// Active sidebar panel (if any).
-    pub sidebar: Option<SidebarState>,
+    /// Saved focus state for the Query tab (preserved across tab switches).
+    query_focus: Focus,
+    /// Panel state for non-Query tabs (schema tree, history/saved selection).
+    pub panel: PanelState,
     /// Active popup (if any).
     pub popup: Option<Popup>,
     /// Cached schema response (fetched at startup).
@@ -204,17 +202,10 @@ pub struct App {
     pub history_cache: Option<HistoryResponse>,
     /// Cached saved queries (fetched at startup).
     pub saved_cache: Option<ListSavedResponse>,
-    /// Which sidebar section to highlight in the activity bar when closed.
-    pub sidebar_section_hint: SidebarSection,
-    /// Sidebar width in columns (used by sidebar renderer).
-    #[allow(dead_code)] // Will be used once ui/sidebar.rs is implemented.
-    pub sidebar_width: u16,
     /// Whether to quit the application.
     pub should_quit: bool,
     /// Whether live tail mode is active.
     pub live_mode: bool,
-    /// When true, Enter executes query and Shift+Enter inserts newline.
-    pub enter_executes: bool,
     /// Timezone configuration string for timestamp display.
     pub timezone: String,
     /// Active results search (vim-style `/`).
@@ -272,19 +263,17 @@ impl App {
 
         Self {
             client,
-            tabs: vec![Tab::new(0)],
-            active_tab_idx: 0,
+            tab: Tab::new(),
+            main_tab: MainTab::Query,
             focus: Focus::Editor,
-            sidebar: None,
+            query_focus: Focus::Editor,
+            panel: PanelState::new(None),
             popup: None,
             schema_cache: None,
             history_cache: None,
             saved_cache: None,
-            sidebar_section_hint: SidebarSection::Schema,
-            sidebar_width: 32,
             should_quit: false,
             live_mode: false,
-            enter_executes: false,
             timezone: "local".to_owned(),
             results_search: None,
             max_live_events: 1000,
@@ -303,14 +292,14 @@ impl App {
         }
     }
 
-    /// Get the currently active tab.
+    /// Get the query tab.
     pub fn active_tab(&self) -> &Tab {
-        &self.tabs[self.active_tab_idx]
+        &self.tab
     }
 
-    /// Get the currently active tab mutably.
+    /// Get the query tab mutably.
     pub fn active_tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active_tab_idx]
+        &mut self.tab
     }
 
     /// Execute a query in the background.
@@ -340,7 +329,6 @@ impl App {
         // Spawn background task to execute query.
         let client = self.client.clone();
         let tx = self.query_tx.clone();
-        let tab_idx = self.active_tab_idx;
         let timezone = self.timezone.clone();
 
         let handle = tokio::spawn(async move {
@@ -360,11 +348,7 @@ impl App {
                 result.is_ok()
             );
 
-            let _ = tx.send(QueryResult {
-                tab_idx,
-                result,
-                duration,
-            });
+            let _ = tx.send(QueryResult { result, duration });
         });
 
         // Store handle for cancellation.
@@ -416,8 +400,9 @@ impl App {
                     tracing::info!("saved query created: {name}");
                     // Refresh saved queries cache and select the new query
                     self.refresh_saved_cache(Some(name.clone()));
-                    // Open saved queries sidebar to show the new query
-                    self.open_sidebar_section(SidebarSection::Saved);
+                    // Switch to Saved tab to show the new query
+                    self.main_tab = MainTab::Saved;
+                    self.focus = Focus::Panel;
                 }
                 MutationResult::SavedQueryDeleted { name } => {
                     tracing::info!("saved query deleted: {name}");
@@ -433,38 +418,23 @@ impl App {
                     // If we should select a specific query, find its index
                     if let Some(name) = select_name
                         && let Some(idx) = saved.queries.iter().position(|q| q.name == name)
-                        && let Some(ref mut sb) = self.sidebar
                     {
-                        sb.saved_selected = idx;
+                        self.panel.saved_selected = idx;
                     }
 
                     self.saved_cache = Some(saved);
 
                     // Reset selection if it's now out of bounds
                     if let Some(cache) = &self.saved_cache {
-                        let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
-                        if selected >= cache.queries.len()
-                            && !cache.queries.is_empty()
-                            && let Some(ref mut sb) = self.sidebar
-                        {
-                            sb.saved_selected = cache.queries.len().saturating_sub(1);
+                        let selected = self.panel.saved_selected;
+                        if selected >= cache.queries.len() && !cache.queries.is_empty() {
+                            self.panel.saved_selected = cache.queries.len().saturating_sub(1);
                         }
                     }
                 }
                 MutationResult::ScheduleSet { saved_query_id } => {
                     tracing::info!("schedule set for saved query {saved_query_id}");
                     self.refresh_saved_cache(None);
-                }
-                MutationResult::ReportRunLoaded { result } => {
-                    tracing::info!("report run loaded");
-                    let tab = self.active_tab_mut();
-                    tab.result = Some(result);
-                    tab.status = state::TabStatus::Success { duration_ms: 0 };
-                    tab.selected_row = None;
-                    tab.scroll_offset = 0;
-                    tab.horizontal_scroll_offset = 0;
-                    tab.column_widths = None;
-                    self.focus = Focus::Results;
                 }
                 MutationResult::Error { message } => {
                     tracing::error!("mutation error: {message}");
@@ -474,23 +444,17 @@ impl App {
         }
     }
 
-    /// Poll for query results and update tabs.
+    /// Poll for query results and update the tab.
     pub fn poll_query_results(&mut self) {
         while let Ok(query_result) = self.query_rx.try_recv() {
-            tracing::info!("received query result for tab {}", query_result.tab_idx);
-            if query_result.tab_idx >= self.tabs.len() {
-                // Tab was closed while query was running.
-                continue;
-            }
+            tracing::info!("received query result");
 
-            let tab = &mut self.tabs[query_result.tab_idx];
+            let tab = &mut self.tab;
             tab.query_task = None; // Query finished, clear the handle.
 
             match query_result.result {
                 Ok(response) => {
                     // Auto-switch to sparkline view for timechart queries.
-                    // Check for _time in any column position (UNION ALL BY NAME
-                    // can reorder columns vs. the original SELECT order).
                     let is_timechart = response.result.columns.iter().any(|c| c.name == "_time");
                     if is_timechart && tab.chart_view == ChartView::Table {
                         tab.chart_view = ChartView::Sparkline;
@@ -505,27 +469,17 @@ impl App {
                     tab.selected_row = None;
                     tab.column_widths = None;
 
-                    // Notify driver execute waiter if this tab matches.
-                    if self
-                        .driver_execute_waiter
-                        .as_ref()
-                        .is_some_and(|w| w.tab_idx == query_result.tab_idx)
-                    {
+                    // Notify driver execute waiter.
+                    if self.driver_execute_waiter.is_some() {
                         let waiter = self.driver_execute_waiter.take().unwrap();
-                        let mut data = query_response_to_data(
-                            self.tabs[query_result.tab_idx].result.as_ref().unwrap(),
-                        );
+                        let mut data = query_response_to_data(self.tab.result.as_ref().unwrap());
                         data.duration_ms = Some(duration_ms);
                         let _ = waiter.reply.send(DriverResponse::ok_with(data));
                     }
                 }
                 Err(ref err) => {
                     // Notify driver execute waiter of failure.
-                    if self
-                        .driver_execute_waiter
-                        .as_ref()
-                        .is_some_and(|w| w.tab_idx == query_result.tab_idx)
-                    {
+                    if self.driver_execute_waiter.is_some() {
                         let waiter = self.driver_execute_waiter.take().unwrap();
                         let _ = waiter.reply.send(DriverResponse::err(&err.message));
                     }
@@ -563,55 +517,21 @@ impl App {
                 }
                 return;
             }
-            // Ctrl+B: toggle sidebar
-            (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
-                if self.sidebar.is_some() {
-                    self.sidebar = None;
-                    if self.focus == Focus::Sidebar {
-                        self.focus = Focus::Editor;
-                    }
-                } else {
-                    let catalog = self.catalog_summary();
-                    self.sidebar = Some(SidebarState::new(catalog));
-                    if let Some(ref mut sb) = self.sidebar {
-                        sb.section = self.sidebar_section_hint;
-                    }
-                    self.focus = Focus::Sidebar;
-                }
+            // Tab switching: Alt+1 through Alt+4
+            (KeyModifiers::ALT, KeyCode::Char('1')) => {
+                self.switch_to_main_tab(MainTab::Query);
                 return;
             }
-            // F2: open sidebar at schema
-            (KeyModifiers::NONE, KeyCode::F(2)) => {
-                self.open_sidebar_section(SidebarSection::Schema);
+            (KeyModifiers::ALT, KeyCode::Char('2')) => {
+                self.switch_to_main_tab(MainTab::History);
                 return;
             }
-            // F3: open sidebar at history
-            (KeyModifiers::NONE, KeyCode::F(3)) => {
-                self.open_sidebar_section(SidebarSection::History);
+            (KeyModifiers::ALT, KeyCode::Char('3')) => {
+                self.switch_to_main_tab(MainTab::Schema);
                 return;
             }
-            // F4: open sidebar at saved
-            (KeyModifiers::NONE, KeyCode::F(4)) => {
-                self.open_sidebar_section(SidebarSection::Saved);
-                return;
-            }
-            // F6: open sidebar at reports
-            (KeyModifiers::NONE, KeyCode::F(6)) => {
-                self.open_sidebar_section(SidebarSection::Reports);
-                return;
-            }
-            // Ctrl+P: focus sidebar filter (schema section)
-            (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
-                if self.sidebar.is_none() {
-                    let catalog = self.catalog_summary();
-                    self.sidebar = Some(SidebarState::new(catalog));
-                }
-                if let Some(ref mut sb) = self.sidebar {
-                    sb.section = SidebarSection::Schema;
-                    sb.schema.filter_active = true;
-                    self.sidebar_section_hint = SidebarSection::Schema;
-                }
-                self.focus = Focus::Sidebar;
+            (KeyModifiers::ALT, KeyCode::Char('4')) => {
+                self.switch_to_main_tab(MainTab::Saved);
                 return;
             }
             // Toggle live tail: F9
@@ -619,70 +539,21 @@ impl App {
                 self.toggle_live_mode();
                 return;
             }
-            // Close sidebar: Esc (when sidebar is focused)
-            (KeyModifiers::NONE, KeyCode::Esc) if self.focus == Focus::Sidebar => {
-                // If filter is active, close filter first
-                if let Some(ref mut sb) = self.sidebar
-                    && sb.section == SidebarSection::Schema
-                    && sb.schema.filter_active
-                {
-                    sb.schema.filter_active = false;
-                    sb.schema.filter.clear();
+            // Esc: on panel tabs, switch back to Query; on Query, cancel running query
+            (KeyModifiers::NONE, KeyCode::Esc) if self.main_tab != MainTab::Query => {
+                // If schema filter is active, close filter first
+                if self.main_tab == MainTab::Schema && self.panel.schema.filter_active {
+                    self.panel.schema.filter_active = false;
+                    self.panel.schema.filter.clear();
                     return;
                 }
-                self.sidebar = None;
-                self.focus = Focus::Editor;
+                self.switch_to_main_tab(MainTab::Query);
                 return;
             }
-            // Cancel running query: Esc (if query is running, no sidebar)
             (KeyModifiers::NONE, KeyCode::Esc)
                 if matches!(self.active_tab().status, TabStatus::Running { .. }) =>
             {
                 self.cancel_query();
-                return;
-            }
-            // New tab: Ctrl+T
-            (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
-                let new_id = self.tabs.len();
-                self.tabs.push(Tab::new(new_id));
-                self.active_tab_idx = new_id;
-                return;
-            }
-            // Close tab: Ctrl+W (only from results focus — editor uses Ctrl+W for kill-word)
-            (KeyModifiers::CONTROL, KeyCode::Char('w')) if self.focus == Focus::Results => {
-                if self.tabs.len() > 1 {
-                    self.tabs.remove(self.active_tab_idx);
-                    if self.active_tab_idx >= self.tabs.len() {
-                        self.active_tab_idx = self.tabs.len() - 1;
-                    }
-                } else {
-                    // Last tab: clear instead of closing
-                    self.active_tab_mut().clear();
-                }
-                return;
-            }
-            // Cycle tabs: Alt+[ (prev) / Alt+] (next), wrapping around
-            (KeyModifiers::ALT, KeyCode::Char('[')) => {
-                if self.tabs.len() > 1 {
-                    self.active_tab_idx = self
-                        .active_tab_idx
-                        .checked_sub(1)
-                        .unwrap_or(self.tabs.len() - 1);
-                }
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char(']')) => {
-                if self.tabs.len() > 1 {
-                    self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
-                }
-                return;
-            }
-            // Direct tab jump: Alt+1 through Alt+9
-            (KeyModifiers::ALT, KeyCode::Char(ch @ '1'..='9')) => {
-                let idx = (ch as usize) - ('1' as usize);
-                if idx < self.tabs.len() {
-                    self.active_tab_idx = idx;
-                }
                 return;
             }
             // Save current query: Ctrl+S
@@ -698,11 +569,33 @@ impl App {
             _ => {}
         }
 
-        // Focus-specific keybindings.
-        match self.focus {
-            Focus::Editor => self.handle_editor_key(key),
-            Focus::Results => self.handle_results_key(key),
-            Focus::Sidebar => self.handle_sidebar_key(key),
+        // Route to tab-specific key handlers.
+        match self.main_tab {
+            MainTab::Query => match self.focus {
+                Focus::Editor => self.handle_editor_key(key),
+                Focus::Results => self.handle_results_key(key),
+                Focus::Panel => self.focus = Focus::Editor, // shouldn't happen on Query tab
+            },
+            MainTab::History => self.handle_panel_history_key(key),
+            MainTab::Schema => self.handle_panel_schema_key(key),
+            MainTab::Saved => self.handle_panel_saved_key(key),
+        }
+    }
+
+    /// Switch to a main tab, updating focus appropriately.
+    ///
+    /// Saves the current Query focus (Editor/Results) on switch-away and
+    /// restores it on switch-back, so users don't lose context.
+    fn switch_to_main_tab(&mut self, tab: MainTab) {
+        // Save Query focus before switching away.
+        if self.main_tab == MainTab::Query && tab != MainTab::Query {
+            self.query_focus = self.focus;
+        }
+
+        self.main_tab = tab;
+        match tab {
+            MainTab::Query => self.focus = self.query_focus,
+            _ => self.focus = Focus::Panel,
         }
     }
 
@@ -721,25 +614,20 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.focus = Focus::Results;
             }
-            // Execute query: F5 (easier than Ctrl+Enter which varies by terminal)
+            // Execute query: F5
             (KeyModifiers::NONE, KeyCode::F(5)) => {
                 tracing::info!("executing query with F5");
                 self.execute_query();
             }
-            // Execute query: Ctrl+Enter (always executes regardless of config)
+            // Execute query: Ctrl+Enter
             (_, KeyCode::Enter) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 tracing::info!("executing query with ctrl+enter");
                 self.execute_query();
             }
-            // Configurable Enter: when enter_executes=true, Enter executes and Shift+Enter inserts newline
-            (KeyModifiers::NONE, KeyCode::Enter) if self.enter_executes => {
-                tracing::info!("executing query with enter (enter_executes mode)");
-                self.execute_query();
-            }
-            // Shift+Enter always inserts newline (both modes).
-            // iTerm2 sends Shift+Enter as Ctrl+J (ASCII LF), so handle both.
+            // Execute query: Shift+Enter (or iTerm2's Ctrl+J)
             (KeyModifiers::SHIFT, KeyCode::Enter) | (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
-                self.active_tab_mut().editor.insert_newline();
+                tracing::info!("executing query with shift+enter");
+                self.execute_query();
             }
             // Clear editor: Ctrl+L
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
@@ -920,13 +808,9 @@ impl App {
             .map_or(0, |r| r.result.row_count());
 
         match (key.modifiers, key.code) {
-            // Tab: cycle to sidebar (if open) or editor
+            // Tab: cycle to editor
             (KeyModifiers::NONE, KeyCode::Tab) => {
-                if self.sidebar.is_some() {
-                    self.focus = Focus::Sidebar;
-                } else {
-                    self.focus = Focus::Editor;
-                }
+                self.focus = Focus::Editor;
             }
             // Open search with `/`
             (KeyModifiers::NONE, KeyCode::Char('/')) => {
@@ -1097,7 +981,7 @@ impl App {
     /// Recompute search matches against the active tab's result data.
     fn recompute_search_matches(&mut self) {
         if let Some(ref mut search) = self.results_search
-            && let Some(ref response) = self.tabs[self.active_tab_idx].result
+            && let Some(ref response) = self.tab.result
         {
             search.update_matches(&response.result);
         }
@@ -1127,26 +1011,27 @@ impl App {
         }
     }
 
-    /// Handle key events for the history section of the sidebar.
-    fn handle_sidebar_history_key(&mut self, key: event::KeyEvent) {
+    /// Handle key events for the History tab panel.
+    fn handle_panel_history_key(&mut self, key: event::KeyEvent) {
         let item_count = self.history_cache.as_ref().map_or(0, |h| h.entries.len());
 
         match (key.modifiers, key.code) {
+            // Tab: switch back to Query tab
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.switch_to_main_tab(MainTab::Query);
+            }
             (KeyModifiers::NONE, KeyCode::Up) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    sb.history_selected = sb.history_selected.saturating_sub(1);
-                }
+                self.panel.history_selected = self.panel.history_selected.saturating_sub(1);
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                if let Some(ref mut sb) = self.sidebar
-                    && item_count > 0
-                {
-                    sb.history_selected = (sb.history_selected + 1).min(item_count - 1);
+                if item_count > 0 {
+                    self.panel.history_selected =
+                        (self.panel.history_selected + 1).min(item_count - 1);
                 }
             }
-            // Enter: load selected query into editor, focus editor (keep sidebar open)
+            // Enter: load selected query into editor, switch to Query tab
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.history_selected);
+                let selected = self.panel.history_selected;
                 let query_text = self
                     .history_cache
                     .as_ref()
@@ -1154,37 +1039,37 @@ impl App {
                     .map(|entry| entry.query.clone());
 
                 if let Some(query) = query_text {
-                    let editor = &mut self.active_tab_mut().editor;
+                    let editor = &mut self.tab.editor;
                     editor.clear();
                     editor.insert_text(&query);
                     editor.move_to_line_end();
-                    self.focus = Focus::Editor;
+                    self.switch_to_main_tab(MainTab::Query);
                 }
             }
             _ => {}
         }
     }
 
-    /// Handle key events for the saved queries section of the sidebar.
-    fn handle_sidebar_saved_key(&mut self, key: event::KeyEvent) {
+    /// Handle key events for the Saved tab panel.
+    fn handle_panel_saved_key(&mut self, key: event::KeyEvent) {
         let item_count = self.saved_cache.as_ref().map_or(0, |s| s.queries.len());
 
         match (key.modifiers, key.code) {
+            // Tab: switch back to Query tab
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.switch_to_main_tab(MainTab::Query);
+            }
             (KeyModifiers::NONE, KeyCode::Up) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    sb.saved_selected = sb.saved_selected.saturating_sub(1);
-                }
+                self.panel.saved_selected = self.panel.saved_selected.saturating_sub(1);
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                if let Some(ref mut sb) = self.sidebar
-                    && item_count > 0
-                {
-                    sb.saved_selected = (sb.saved_selected + 1).min(item_count - 1);
+                if item_count > 0 {
+                    self.panel.saved_selected = (self.panel.saved_selected + 1).min(item_count - 1);
                 }
             }
-            // Enter: load selected query into editor, focus editor (keep sidebar open)
+            // Enter: load selected query into editor, switch to Query tab
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
+                let selected = self.panel.saved_selected;
                 let query_text = self
                     .saved_cache
                     .as_ref()
@@ -1192,16 +1077,16 @@ impl App {
                     .map(|entry| entry.query.clone());
 
                 if let Some(query) = query_text {
-                    let editor = &mut self.active_tab_mut().editor;
+                    let editor = &mut self.tab.editor;
                     editor.clear();
                     editor.insert_text(&query);
                     editor.move_to_line_end();
-                    self.focus = Focus::Editor;
+                    self.switch_to_main_tab(MainTab::Query);
                 }
             }
             // Delete: confirm deletion
             (KeyModifiers::NONE, KeyCode::Delete | KeyCode::Backspace) => {
-                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
+                let selected = self.panel.saved_selected;
                 if let Some(ref saved) = self.saved_cache
                     && let Some(entry) = saved.queries.get(selected)
                 {
@@ -1213,7 +1098,7 @@ impl App {
             }
             // Schedule: open set-schedule popup
             (KeyModifiers::NONE, KeyCode::Char('s')) => {
-                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
+                let selected = self.panel.saved_selected;
                 if let Some(ref saved) = self.saved_cache
                     && let Some(entry) = saved.queries.get(selected)
                 {
@@ -1228,187 +1113,51 @@ impl App {
         }
     }
 
-    /// Handle key events for the reports section of the sidebar.
-    fn handle_sidebar_reports_key(&mut self, key: event::KeyEvent) {
-        // Count scheduled queries (derived from saved_cache).
-        let item_count = self.saved_cache.as_ref().map_or(0, |s| {
-            s.queries.iter().filter(|q| q.schedule.is_some()).count()
-        });
-
-        match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Up) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    sb.reports_selected = sb.reports_selected.saturating_sub(1);
-                }
-            }
-            (KeyModifiers::NONE, KeyCode::Down) => {
-                if let Some(ref mut sb) = self.sidebar
-                    && item_count > 0
-                {
-                    sb.reports_selected = (sb.reports_selected + 1).min(item_count - 1);
-                }
-            }
-            // Enter: load last successful run's results
-            (KeyModifiers::NONE, KeyCode::Enter) => {
-                let selected = self.sidebar.as_ref().map_or(0, |sb| sb.reports_selected);
-                let scheduled: Vec<_> = self.saved_cache.as_ref().map_or(Vec::new(), |s| {
-                    s.queries.iter().filter(|q| q.schedule.is_some()).collect()
-                });
-
-                if let Some(entry) = scheduled.get(selected) {
-                    let saved_id = entry.id;
-                    let client = self.client.clone();
-                    let mutation_tx = self.mutation_tx.clone();
-                    tokio::spawn(async move {
-                        // Get runs, find last successful one, load its result.
-                        match client.list_report_runs(saved_id, Some(20), None).await {
-                            Ok(runs_resp) => {
-                                let last_success =
-                                    runs_resp.runs.iter().find(|r| r.status == "success");
-                                if let Some(run) = last_success {
-                                    match client.get_report_run(saved_id, run.id).await {
-                                        Ok(report) => {
-                                            if let Some(result) = report.result {
-                                                let returned = result.rows.len();
-                                                let _ = mutation_tx.send(
-                                                    MutationResult::ReportRunLoaded {
-                                                        result: QueryResponse {
-                                                            result,
-                                                            truncated: false,
-                                                            pagination:
-                                                                trawl_client::PaginationMeta {
-                                                                    limit: returned,
-                                                                    offset: 0,
-                                                                    returned,
-                                                                },
-                                                        },
-                                                    },
-                                                );
-                                            } else {
-                                                let _ = mutation_tx.send(MutationResult::Error {
-                                                    message: "run has no result data".into(),
-                                                });
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = mutation_tx.send(MutationResult::Error {
-                                                message: format!("failed to load report run: {e}"),
-                                            });
-                                        }
-                                    }
-                                } else {
-                                    let _ = mutation_tx.send(MutationResult::Error {
-                                        message: "no successful runs yet".into(),
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                let _ = mutation_tx.send(MutationResult::Error {
-                                    message: format!("failed to list report runs: {e}"),
-                                });
-                            }
-                        }
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle key events when sidebar is focused.
-    fn handle_sidebar_key(&mut self, key: event::KeyEvent) {
-        let Some(ref mut sb) = self.sidebar else {
-            return;
-        };
-
+    /// Handle key events for the Schema tab panel.
+    fn handle_panel_schema_key(&mut self, key: event::KeyEvent) {
         // Filter input mode captures all keys.
-        if sb.section == SidebarSection::Schema && sb.schema.filter_active {
-            self.handle_sidebar_filter_key(key);
+        if self.panel.schema.filter_active {
+            self.handle_schema_filter_key(key);
             return;
         }
 
         match (key.modifiers, key.code) {
-            // Tab: cycle focus to editor
+            // Tab: switch back to Query tab
             (KeyModifiers::NONE, KeyCode::Tab) => {
-                self.focus = Focus::Editor;
+                self.switch_to_main_tab(MainTab::Query);
             }
-            // Esc: close sidebar
-            (KeyModifiers::NONE, KeyCode::Esc) => {
-                self.sidebar = None;
-                self.focus = Focus::Editor;
-            }
-            // Section cycling: [ (prev) / ] (next)
-            (KeyModifiers::NONE, KeyCode::Char('[')) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    let new_section = match sb.section {
-                        SidebarSection::Schema => SidebarSection::Reports,
-                        SidebarSection::History => SidebarSection::Schema,
-                        SidebarSection::Saved => SidebarSection::History,
-                        SidebarSection::Reports => SidebarSection::Saved,
-                    };
-                    sb.section = new_section;
-                    self.sidebar_section_hint = new_section;
-                }
-            }
-            (KeyModifiers::NONE, KeyCode::Char(']')) => {
-                if let Some(ref mut sb) = self.sidebar {
-                    let new_section = match sb.section {
-                        SidebarSection::Schema => SidebarSection::History,
-                        SidebarSection::History => SidebarSection::Saved,
-                        SidebarSection::Saved => SidebarSection::Reports,
-                        SidebarSection::Reports => SidebarSection::Schema,
-                    };
-                    sb.section = new_section;
-                    self.sidebar_section_hint = new_section;
-                }
-            }
-            // '/' or Ctrl+P: activate filter (schema only)
+            // '/' or Ctrl+P: activate filter
             (KeyModifiers::NONE, KeyCode::Char('/'))
             | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
-                if let Some(ref mut sb) = self.sidebar
-                    && sb.section == SidebarSection::Schema
-                {
-                    sb.schema.filter_active = true;
-                }
+                self.panel.schema.filter_active = true;
             }
-            // Section-specific dispatch
-            _ => {
-                let section = self.sidebar.as_ref().map(|s| s.section);
-                match section {
-                    Some(SidebarSection::Schema) => self.handle_schema_tree_key(key),
-                    Some(SidebarSection::History) => self.handle_sidebar_history_key(key),
-                    Some(SidebarSection::Saved) => self.handle_sidebar_saved_key(key),
-                    Some(SidebarSection::Reports) => self.handle_sidebar_reports_key(key),
-                    None => {}
-                }
-            }
+            // Delegate to tree navigation
+            _ => self.handle_schema_tree_key(key),
         }
     }
 
-    /// Handle key events for the sidebar filter input.
-    fn handle_sidebar_filter_key(&mut self, key: event::KeyEvent) {
-        let Some(ref mut sb) = self.sidebar else {
-            return;
-        };
+    /// Handle key events for the schema filter input.
+    fn handle_schema_filter_key(&mut self, key: event::KeyEvent) {
+        let tree = &mut self.panel.schema;
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Esc) => {
-                sb.schema.filter_active = false;
-                sb.schema.filter.clear();
-                sb.schema.selected = 0;
-                sb.schema.scroll = 0;
+                tree.filter_active = false;
+                tree.filter.clear();
+                tree.selected = 0;
+                tree.scroll = 0;
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                sb.schema.filter_active = false;
+                tree.filter_active = false;
             }
             (KeyModifiers::NONE, KeyCode::Backspace) => {
-                sb.schema.filter.pop();
-                sb.schema.selected = 0;
-                sb.schema.scroll = 0;
+                tree.filter.pop();
+                tree.selected = 0;
+                tree.scroll = 0;
             }
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-                sb.schema.filter.push(c);
-                sb.schema.selected = 0;
-                sb.schema.scroll = 0;
+                tree.filter.push(c);
+                tree.selected = 0;
+                tree.scroll = 0;
             }
             _ => {}
         }
@@ -1419,10 +1168,7 @@ impl App {
         // Compute visible node count for bounds.
         let node_count = self.visible_tree_node_count();
 
-        let Some(ref mut sb) = self.sidebar else {
-            return;
-        };
-        let tree = &mut sb.schema;
+        let tree = &mut self.panel.schema;
 
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Up) => {
@@ -1466,10 +1212,7 @@ impl App {
     /// Count visible nodes in the flattened schema tree.
     fn visible_tree_node_count(&self) -> usize {
         let services = self.service_list_cache.as_deref().unwrap_or(&[]);
-        let Some(ref sb) = self.sidebar else {
-            return 0;
-        };
-        let tree = &sb.schema;
+        let tree = &self.panel.schema;
         let filter = tree.filter.to_lowercase();
 
         let mut count = 0;
@@ -1505,13 +1248,9 @@ impl App {
             Some(TreeNodeInfo::Service { name, expanded }) => {
                 let name_owned = name.to_owned();
                 if expanded {
-                    if let Some(ref mut sb) = self.sidebar {
-                        sb.schema.expanded.remove(&name_owned);
-                    }
+                    self.panel.schema.expanded.remove(&name_owned);
                 } else {
-                    if let Some(ref mut sb) = self.sidebar {
-                        sb.schema.expanded.insert(name_owned.clone());
-                    }
+                    self.panel.schema.expanded.insert(name_owned.clone());
                     if !self.schema_profile_cache.contains_key(&name_owned) {
                         self.drill_into_service(name_owned);
                     }
@@ -1519,9 +1258,7 @@ impl App {
             }
             Some(TreeNodeInfo::Field { name }) => {
                 let name_owned = name.to_owned();
-                self.tabs[self.active_tab_idx]
-                    .editor
-                    .insert_text(&name_owned);
+                self.tab.editor.insert_text(&name_owned);
             }
             _ => {}
         }
@@ -1536,9 +1273,7 @@ impl App {
         }) = node_info
         {
             let name_owned = name.to_owned();
-            if let Some(ref mut sb) = self.sidebar {
-                sb.schema.expanded.insert(name_owned.clone());
-            }
+            self.panel.schema.expanded.insert(name_owned.clone());
             if !self.schema_profile_cache.contains_key(&name_owned) {
                 self.drill_into_service(name_owned);
             }
@@ -1554,16 +1289,12 @@ impl App {
                 expanded: true,
             }) => {
                 let name_owned = name.to_owned();
-                if let Some(ref mut sb) = self.sidebar {
-                    sb.schema.expanded.remove(&name_owned);
-                }
+                self.panel.schema.expanded.remove(&name_owned);
             }
             Some(TreeNodeInfo::Field { .. } | TreeNodeInfo::Loading { .. }) => {
                 // Jump to parent service node.
-                if let Some(parent_idx) = self.find_parent_service_index()
-                    && let Some(ref mut sb) = self.sidebar
-                {
-                    sb.schema.selected = parent_idx;
+                if let Some(parent_idx) = self.find_parent_service_index() {
+                    self.panel.schema.selected = parent_idx;
                 }
             }
             _ => {}
@@ -1573,8 +1304,7 @@ impl App {
     /// Get info about the currently selected tree node.
     fn get_selected_tree_node_info(&self) -> Option<TreeNodeInfo<'_>> {
         let services = self.service_list_cache.as_deref().unwrap_or(&[]);
-        let sb = self.sidebar.as_ref()?;
-        let tree = &sb.schema;
+        let tree = &self.panel.schema;
         let filter = tree.filter.to_lowercase();
 
         let mut idx = 0;
@@ -1621,8 +1351,7 @@ impl App {
     #[allow(unused_assignments)] // last_service_idx initial value is a fallback, always overwritten in loop
     fn find_parent_service_index(&self) -> Option<usize> {
         let services = self.service_list_cache.as_deref().unwrap_or(&[]);
-        let sb = self.sidebar.as_ref()?;
-        let tree = &sb.schema;
+        let tree = &self.panel.schema;
         let filter = tree.filter.to_lowercase();
 
         let mut idx = 0;
@@ -1662,32 +1391,6 @@ impl App {
             }
         }
         None
-    }
-
-    /// Open the sidebar to a specific section (or toggle if already showing that section).
-    fn open_sidebar_section(&mut self, section: SidebarSection) {
-        if let Some(ref mut sb) = self.sidebar {
-            if sb.section == section {
-                // Already showing this section — close sidebar.
-                self.sidebar = None;
-                if self.focus == Focus::Sidebar {
-                    self.focus = Focus::Editor;
-                }
-            } else {
-                // Switch to the requested section.
-                sb.section = section;
-                self.sidebar_section_hint = section;
-                self.focus = Focus::Sidebar;
-            }
-        } else {
-            // Open sidebar to the requested section.
-            let catalog = self.catalog_summary();
-            let mut sb = SidebarState::new(catalog);
-            sb.section = section;
-            self.sidebar = Some(sb);
-            self.sidebar_section_hint = section;
-            self.focus = Focus::Sidebar;
-        }
     }
 
     /// Drill into a service: spawn background profiling query if not cached.
@@ -2049,21 +1752,6 @@ impl App {
         });
     }
 
-    /// Build a catalog summary from the cached schema response.
-    fn catalog_summary(&self) -> Option<CatalogSummary> {
-        self.schema_cache.as_ref().and_then(|s| {
-            // Only produce a summary if catalog fields are present.
-            let total_bytes = s.total_bytes?;
-            Some(CatalogSummary {
-                earliest_date: s.earliest_date.clone(),
-                latest_date: s.latest_date.clone(),
-                total_bytes,
-                file_count: s.file_count,
-                hot_buffer_events: s.hot_buffer_events,
-            })
-        })
-    }
-
     /// Toggle live tail mode (F9).
     fn toggle_live_mode(&mut self) {
         if self.live_mode {
@@ -2101,7 +1789,6 @@ impl App {
 
         let client = self.client.clone();
         let tx = self.query_tx.clone();
-        let tab_idx = self.active_tab_idx;
         let max_events = self.max_live_events;
 
         let task = tokio::spawn(async move {
@@ -2112,7 +1799,6 @@ impl App {
                 Err(e) => {
                     tracing::error!("failed to start stream: {e}");
                     let _ = tx.send(QueryResult {
-                        tab_idx,
                         result: Err(QueryError {
                             message: e.to_string(),
                             details: e.error_details().to_vec(),
@@ -2153,7 +1839,6 @@ impl App {
                         // Snapshots are complete results — send immediately.
                         let response = buffer.to_query_response();
                         let _ = tx.send(QueryResult {
-                            tab_idx,
                             result: Ok(response),
                             duration: Duration::from_secs(0),
                         });
@@ -2187,7 +1872,6 @@ impl App {
                     );
 
                     let _ = tx.send(QueryResult {
-                        tab_idx,
                         result: Ok(response),
                         duration: Duration::from_secs(0),
                     });
@@ -2198,7 +1882,6 @@ impl App {
             if !buffer.is_empty() {
                 let response = buffer.to_query_response();
                 let _ = tx.send(QueryResult {
-                    tab_idx,
                     result: Ok(response),
                     duration: Duration::from_secs(0),
                 });
@@ -2316,8 +1999,7 @@ impl App {
 
         DriverResponse::ok_with(DriverData {
             focus: Some(format!("{:?}", self.focus).to_lowercase()),
-            tab_count: Some(self.tabs.len()),
-            active_tab: Some(self.active_tab_idx),
+            main_tab: Some(format!("{:?}", self.main_tab).to_lowercase()),
             tab_status: Some(tab_status.to_owned()),
             query: Some(tab.editor.text()),
             live_mode: Some(self.live_mode),
@@ -2346,8 +2028,7 @@ impl App {
             return;
         }
 
-        let tab_idx = self.active_tab_idx;
-        self.driver_execute_waiter = Some(ExecuteWaiter { tab_idx, reply });
+        self.driver_execute_waiter = Some(ExecuteWaiter { reply });
 
         // Trigger query execution (same as F5 / ctrl+enter).
         self.execute_query();
@@ -2402,13 +2083,8 @@ impl App {
         DriverResponse::ok()
     }
 
-    fn handle_driver_get_results(&self, tab: Option<usize>) -> DriverResponse {
-        let tab_idx = tab.unwrap_or(self.active_tab_idx);
-        if tab_idx >= self.tabs.len() {
-            return DriverResponse::err(format!("tab index {tab_idx} out of range"));
-        }
-
-        match &self.tabs[tab_idx].result {
+    fn handle_driver_get_results(&self, _tab: Option<usize>) -> DriverResponse {
+        match &self.tab.result {
             Some(response) => DriverResponse::ok_with(query_response_to_data(response)),
             None => DriverResponse::ok_with(DriverData {
                 row_count: Some(0),
@@ -2500,9 +2176,7 @@ pub async fn run(
     // Create app with schema, history, and saved queries.
     let mut app = App::new(client);
     app.max_live_events = config.tail.max_events;
-    app.enter_executes = config.ui.enter_executes;
     app.timezone = config.ui.timezone.clone();
-    app.sidebar_width = config.ui.sidebar_width;
     app.schema_cache = schema;
     app.history_cache = history;
     app.saved_cache = saved;
@@ -2701,200 +2375,75 @@ mod tests {
         assert!(app.popup.is_none());
     }
 
-    // --- Sidebar toggle tests ---
+    // --- Tab switching tests ---
 
     #[test]
-    fn key_f2_toggles_schema_sidebar() {
+    fn key_alt_1_switches_to_query_tab() {
         let mut app = test_app();
-        app.handle_key(key(KeyCode::F(2)));
-        assert!(app.sidebar.is_some());
-        assert_eq!(
-            app.sidebar.as_ref().unwrap().section,
-            SidebarSection::Schema
-        );
-        assert_eq!(app.focus, Focus::Sidebar);
-        app.handle_key(key(KeyCode::F(2)));
-        assert!(app.sidebar.is_none());
-    }
-
-    #[test]
-    fn key_f3_toggles_history_sidebar() {
-        let mut app = test_app();
-        app.handle_key(key(KeyCode::F(3)));
-        assert!(app.sidebar.is_some());
-        assert_eq!(
-            app.sidebar.as_ref().unwrap().section,
-            SidebarSection::History
-        );
-        app.handle_key(key(KeyCode::F(3)));
-        assert!(app.sidebar.is_none());
-    }
-
-    #[test]
-    fn key_f4_toggles_saved_sidebar() {
-        let mut app = test_app();
-        app.handle_key(key(KeyCode::F(4)));
-        assert!(app.sidebar.is_some());
-        assert_eq!(app.sidebar.as_ref().unwrap().section, SidebarSection::Saved);
-        app.handle_key(key(KeyCode::F(4)));
-        assert!(app.sidebar.is_none());
-    }
-
-    #[test]
-    fn key_esc_closes_sidebar_when_focused() {
-        let mut app = test_app();
-        let catalog = app.catalog_summary();
-        app.sidebar = Some(SidebarState::new(catalog));
-        app.focus = Focus::Sidebar;
-        app.handle_key(key(KeyCode::Esc));
-        assert!(app.sidebar.is_none());
-        assert_eq!(app.focus, Focus::Editor);
-    }
-
-    #[test]
-    fn sidebar_tab_cycles_to_editor() {
-        let mut app = test_app();
-        let catalog = app.catalog_summary();
-        app.sidebar = Some(SidebarState::new(catalog));
-        app.focus = Focus::Sidebar;
-        // Tab from sidebar should go to editor
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Editor);
-    }
-
-    // --- Tab management tests ---
-
-    #[test]
-    fn key_ctrl_t_creates_tab() {
-        let mut app = test_app();
-        assert_eq!(app.tabs.len(), 1);
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 2);
-        assert_eq!(app.active_tab_idx, 1);
-    }
-
-    #[test]
-    fn key_ctrl_w_closes_tab_from_results() {
-        let mut app = test_app();
-        // Create a second tab first
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 2);
-        // Switch to results focus so Ctrl+W closes tab (not kill-word)
-        app.focus = Focus::Results;
-        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 1);
-    }
-
-    #[test]
-    fn key_ctrl_w_in_editor_does_not_close_tab() {
-        let mut app = test_app();
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 2);
-        // In editor focus, Ctrl+W is kill-word, not close tab
-        app.focus = Focus::Editor;
-        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 2);
-    }
-
-    #[test]
-    fn key_ctrl_w_with_one_tab_clears() {
-        let mut app = test_app();
-        // Type something so we can verify it gets cleared
-        app.handle_key(key(KeyCode::Char('x')));
-        assert_eq!(app.active_tab().editor.text(), "x");
-        app.focus = Focus::Results;
-        app.handle_key(key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 1);
-        assert_eq!(app.active_tab().editor.text(), "");
-    }
-
-    #[test]
-    fn key_alt_bracket_cycles_tabs_forward() {
-        let mut app = test_app();
-        // Create 3 tabs total
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 3);
-        assert_eq!(app.active_tab_idx, 2);
-
-        // Cycle forward: 2 -> 0
-        app.handle_key(key_mod(KeyCode::Char(']'), KeyModifiers::ALT));
-        assert_eq!(app.active_tab_idx, 0);
-
-        // Cycle forward: 0 -> 1
-        app.handle_key(key_mod(KeyCode::Char(']'), KeyModifiers::ALT));
-        assert_eq!(app.active_tab_idx, 1);
-    }
-
-    #[test]
-    fn key_alt_bracket_cycles_tabs_backward() {
-        let mut app = test_app();
-        // Create 3 tabs total
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(app.tabs.len(), 3);
-        assert_eq!(app.active_tab_idx, 2);
-
-        // Cycle backward: 2 -> 1
-        app.handle_key(key_mod(KeyCode::Char('['), KeyModifiers::ALT));
-        assert_eq!(app.active_tab_idx, 1);
-
-        // Cycle backward: 1 -> 0
-        app.handle_key(key_mod(KeyCode::Char('['), KeyModifiers::ALT));
-        assert_eq!(app.active_tab_idx, 0);
-
-        // Wrap: 0 -> 2
-        app.handle_key(key_mod(KeyCode::Char('['), KeyModifiers::ALT));
-        assert_eq!(app.active_tab_idx, 2);
-    }
-
-    #[test]
-    fn key_bare_brackets_cycle_sidebar_sections() {
-        let mut app = test_app();
-        // Open sidebar to schema section
-        app.handle_key(key(KeyCode::F(2)));
-        assert_eq!(app.focus, Focus::Sidebar);
-        let section = app.sidebar.as_ref().unwrap().section;
-        assert_eq!(section, SidebarSection::Schema);
-
-        // ] = next: Schema -> History
-        app.handle_key(key(KeyCode::Char(']')));
-        assert_eq!(
-            app.sidebar.as_ref().unwrap().section,
-            SidebarSection::History
-        );
-
-        // ] = next: History -> Saved
-        app.handle_key(key(KeyCode::Char(']')));
-        assert_eq!(app.sidebar.as_ref().unwrap().section, SidebarSection::Saved);
-
-        // [ = prev: Saved -> History
-        app.handle_key(key(KeyCode::Char('[')));
-        assert_eq!(
-            app.sidebar.as_ref().unwrap().section,
-            SidebarSection::History
-        );
-    }
-
-    #[test]
-    fn key_alt_number_jumps_to_tab() {
-        let mut app = test_app();
-        // Create 3 tabs total
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        app.handle_key(key_mod(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert_eq!(app.active_tab_idx, 2);
-
-        // Alt+1 -> tab 0
+        app.main_tab = MainTab::History;
+        app.focus = Focus::Panel;
         app.handle_key(key_mod(KeyCode::Char('1'), KeyModifiers::ALT));
-        assert_eq!(app.active_tab_idx, 0);
+        assert_eq!(app.main_tab, MainTab::Query);
+        assert_eq!(app.focus, Focus::Editor);
+    }
 
-        // Alt+3 -> tab 2
+    #[test]
+    fn key_alt_2_switches_to_history_tab() {
+        let mut app = test_app();
+        app.handle_key(key_mod(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(app.main_tab, MainTab::History);
+        assert_eq!(app.focus, Focus::Panel);
+    }
+
+    #[test]
+    fn key_alt_3_switches_to_schema_tab() {
+        let mut app = test_app();
         app.handle_key(key_mod(KeyCode::Char('3'), KeyModifiers::ALT));
-        assert_eq!(app.active_tab_idx, 2);
+        assert_eq!(app.main_tab, MainTab::Schema);
+        assert_eq!(app.focus, Focus::Panel);
+    }
 
-        // Alt+9 -> out of range, no change
-        app.handle_key(key_mod(KeyCode::Char('9'), KeyModifiers::ALT));
-        assert_eq!(app.active_tab_idx, 2);
+    #[test]
+    fn key_alt_4_switches_to_saved_tab() {
+        let mut app = test_app();
+        app.handle_key(key_mod(KeyCode::Char('4'), KeyModifiers::ALT));
+        assert_eq!(app.main_tab, MainTab::Saved);
+        assert_eq!(app.focus, Focus::Panel);
+    }
+
+    #[test]
+    fn tab_on_panel_switches_to_query() {
+        let mut app = test_app();
+        app.main_tab = MainTab::History;
+        app.focus = Focus::Panel;
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.main_tab, MainTab::Query);
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn focus_preserved_across_tab_switch() {
+        let mut app = test_app();
+        // Start in Results focus
+        app.focus = Focus::Results;
+        // Switch to History
+        app.handle_key(key_mod(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(app.main_tab, MainTab::History);
+        assert_eq!(app.focus, Focus::Panel);
+        // Switch back to Query — should restore Results focus
+        app.handle_key(key_mod(KeyCode::Char('1'), KeyModifiers::ALT));
+        assert_eq!(app.main_tab, MainTab::Query);
+        assert_eq!(app.focus, Focus::Results);
+    }
+
+    #[test]
+    fn key_esc_on_panel_tab_switches_to_query() {
+        let mut app = test_app();
+        app.main_tab = MainTab::History;
+        app.focus = Focus::Panel;
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.main_tab, MainTab::Query);
+        assert_eq!(app.focus, Focus::Editor);
     }
 
     // --- Quit ---
@@ -2930,9 +2479,8 @@ mod tests {
         app.popup = Some(Popup::SaveQuery {
             editor: SimpleEditor::new_single_line(),
         });
-        // F1 should NOT open sidebar while popup is active
+        // F1 should NOT open help while popup is active
         app.handle_key(key(KeyCode::F(1)));
-        assert!(app.sidebar.is_none());
         assert!(app.popup.is_some());
     }
 
@@ -3039,7 +2587,7 @@ mod tests {
         let mut app = test_app();
         app.focus = Focus::Results;
         // Give it some result data so row selection works
-        app.tabs[0].result = Some(make_query_response(
+        app.tab.result = Some(make_query_response(
             vec!["x"],
             vec![
                 vec![Value::Integer(1)],
@@ -3070,7 +2618,6 @@ mod tests {
         );
         app.query_tx
             .send(QueryResult {
-                tab_idx: 0,
                 result: Ok(response),
                 duration: Duration::from_millis(50),
             })
@@ -3078,8 +2625,8 @@ mod tests {
 
         app.poll_query_results();
 
-        assert!(app.tabs[0].result.is_some());
-        assert!(matches!(app.tabs[0].status, TabStatus::Success { .. }));
+        assert!(app.tab.result.is_some());
+        assert!(matches!(app.tab.status, TabStatus::Success { .. }));
     }
 
     #[test]
@@ -3087,7 +2634,6 @@ mod tests {
         let mut app = test_app();
         app.query_tx
             .send(QueryResult {
-                tab_idx: 0,
                 result: Err(QueryError {
                     message: "something broke".to_owned(),
                     details: Vec::new(),
@@ -3099,7 +2645,7 @@ mod tests {
         app.poll_query_results();
 
         assert!(matches!(
-            app.tabs[0].status,
+            app.tab.status,
             TabStatus::Error { ref message, .. } if message == "something broke"
         ));
     }
@@ -3107,13 +2653,12 @@ mod tests {
     #[test]
     fn poll_query_result_resets_scroll() {
         let mut app = test_app();
-        app.tabs[0].scroll_offset = 42;
-        app.tabs[0].horizontal_scroll_offset = 7;
+        app.tab.scroll_offset = 42;
+        app.tab.horizontal_scroll_offset = 7;
 
         let response = make_query_response(vec!["x"], vec![vec![Value::Integer(1)]]);
         app.query_tx
             .send(QueryResult {
-                tab_idx: 0,
                 result: Ok(response),
                 duration: Duration::from_millis(1),
             })
@@ -3121,30 +2666,14 @@ mod tests {
 
         app.poll_query_results();
 
-        assert_eq!(app.tabs[0].scroll_offset, 0);
-        assert_eq!(app.tabs[0].horizontal_scroll_offset, 0);
-    }
-
-    #[test]
-    fn poll_query_result_ignores_closed_tab() {
-        let mut app = test_app();
-        // Send result for tab index 5, which doesn't exist
-        app.query_tx
-            .send(QueryResult {
-                tab_idx: 5,
-                result: Ok(make_query_response(vec!["x"], vec![])),
-                duration: Duration::from_millis(1),
-            })
-            .unwrap();
-
-        // Should not panic
-        app.poll_query_results();
+        assert_eq!(app.tab.scroll_offset, 0);
+        assert_eq!(app.tab.horizontal_scroll_offset, 0);
     }
 
     #[test]
     fn poll_query_result_timechart_auto_switches_view() {
         let mut app = test_app();
-        assert_eq!(app.tabs[0].chart_view, ChartView::Table);
+        assert_eq!(app.tab.chart_view, ChartView::Table);
 
         let response = make_query_response(
             vec!["_time", "count"],
@@ -3155,7 +2684,6 @@ mod tests {
         );
         app.query_tx
             .send(QueryResult {
-                tab_idx: 0,
                 result: Ok(response),
                 duration: Duration::from_millis(1),
             })
@@ -3163,7 +2691,7 @@ mod tests {
 
         app.poll_query_results();
 
-        assert_eq!(app.tabs[0].chart_view, ChartView::Sparkline);
+        assert_eq!(app.tab.chart_view, ChartView::Sparkline);
     }
 
     #[tokio::test]
@@ -3177,9 +2705,9 @@ mod tests {
 
         app.poll_mutations();
 
-        // SavedQueryCreated opens the sidebar to Saved section
-        assert!(app.sidebar.is_some());
-        assert_eq!(app.sidebar.as_ref().unwrap().section, SidebarSection::Saved);
+        // SavedQueryCreated switches to Saved tab
+        assert_eq!(app.main_tab, MainTab::Saved);
+        assert_eq!(app.focus, Focus::Panel);
     }
 
     #[test]
@@ -3212,11 +2740,6 @@ mod tests {
     #[test]
     fn poll_mutation_cache_refreshed_selects_name() {
         let mut app = test_app();
-        // Open sidebar so saved_selected can be updated
-        let catalog = app.catalog_summary();
-        let mut sb = SidebarState::new(catalog);
-        sb.section = SidebarSection::Saved;
-        app.sidebar = Some(sb);
 
         let saved = ListSavedResponse {
             queries: vec![
@@ -3248,7 +2771,7 @@ mod tests {
 
         app.poll_mutations();
 
-        assert_eq!(app.sidebar.as_ref().unwrap().saved_selected, 1);
+        assert_eq!(app.panel.saved_selected, 1);
     }
 
     #[test]
@@ -3292,25 +2815,19 @@ mod tests {
         });
         // F1 should NOT open help — popup blocks it
         app.handle_key(key(KeyCode::F(1)));
-        assert!(app.sidebar.is_none());
         assert!(matches!(app.popup, Some(Popup::Error { .. })));
     }
 
     #[test]
-    fn multiple_results_processed_in_order() {
+    fn multiple_results_last_wins() {
         let mut app = test_app();
-        // Create 3 tabs
-        app.tabs.push(Tab::new(1));
-        app.tabs.push(Tab::new(2));
 
-        for i in 0..3 {
-            let response = make_query_response(
-                vec!["idx"],
-                vec![vec![Value::Integer(i64::try_from(i).unwrap())]],
-            );
+        // Send two results — the last one should be the final state.
+        for i in 0..2 {
+            let response =
+                make_query_response(vec!["idx"], vec![vec![Value::Integer(i64::from(i))]]);
             app.query_tx
                 .send(QueryResult {
-                    tab_idx: i,
                     result: Ok(response),
                     duration: Duration::from_millis(1),
                 })
@@ -3319,12 +2836,9 @@ mod tests {
 
         app.poll_query_results();
 
-        // All 3 tabs should have results
-        for (i, tab) in app.tabs.iter().enumerate() {
-            assert!(
-                tab.result.is_some(),
-                "tab {i} should have received its result"
-            );
-        }
+        assert!(app.tab.result.is_some());
+        // Last result (idx=1) should be the one stored.
+        let rows = &app.tab.result.as_ref().unwrap().result.rows;
+        assert_eq!(rows[0][0], Value::Integer(1));
     }
 }

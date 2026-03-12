@@ -69,9 +69,7 @@ pub struct DriverData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tab_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_tab: Option<usize>,
+    pub main_tab: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,17 +139,14 @@ pub struct DriverCommand {
     pub reply: oneshot::Sender<DriverResponse>,
 }
 
-/// Pending execute waiter: tab index + reply channel.
+/// Pending execute waiter: reply channel for the query tab.
 pub struct ExecuteWaiter {
-    pub tab_idx: usize,
     pub reply: oneshot::Sender<DriverResponse>,
 }
 
 impl std::fmt::Debug for ExecuteWaiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExecuteWaiter")
-            .field("tab_idx", &self.tab_idx)
-            .finish_non_exhaustive()
+        f.debug_struct("ExecuteWaiter").finish_non_exhaustive()
     }
 }
 
@@ -692,13 +687,13 @@ mod tests {
     fn serialize_ok_with_data_skips_none() {
         let resp = DriverResponse::ok_with(DriverData {
             focus: Some("editor".to_owned()),
-            tab_count: Some(2),
+            main_tab: Some("query".to_owned()),
             ..DriverData::default()
         });
         let json: serde_json::Value = serde_json::to_value(resp).unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["focus"], "editor");
-        assert_eq!(json["tab_count"], 2);
+        assert_eq!(json["main_tab"], "query");
         // None fields should be absent
         assert!(json.get("query").is_none());
         assert!(json.get("content").is_none());

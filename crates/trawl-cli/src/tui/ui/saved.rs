@@ -73,7 +73,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             )
             .highlight_symbol("► ");
 
-        let selected = app.sidebar.as_ref().map_or(0, |sb| sb.saved_selected);
+        let selected = app.panel.saved_selected;
         let mut list_state = ListState::default().with_selected(Some(selected));
 
         frame.render_stateful_widget(list, area, &mut list_state);

@@ -97,7 +97,7 @@ fn render_table(
     area: Rect,
     response: &trawl_client::QueryResponse,
 ) {
-    let border_style = if app.focus == Focus::Results && app.sidebar.is_none() {
+    let border_style = if app.focus == Focus::Results {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -116,11 +116,11 @@ fn render_table(
             .min(total_rows.saturating_sub(max_visible_rows))
     };
 
-    // Compute adaptive column widths
-    let all_widths = compute_column_widths(result, v_scroll);
-
     // Calculate how many columns fit on screen
     let available_width = area.width.saturating_sub(4) as usize; // borders + padding
+
+    // Compute adaptive column widths (needs available_width for dynamic cap)
+    let all_widths = compute_column_widths(result, v_scroll, available_width);
     let total_cols = result.columns.len();
     let h_scroll = tab
         .horizontal_scroll_offset
@@ -283,7 +283,7 @@ fn render_table(
 
 /// Render placeholder when no results are available.
 fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let border_style = if app.focus == Focus::Results && app.sidebar.is_none() {
+    let border_style = if app.focus == Focus::Results {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -313,7 +313,7 @@ fn render_error_display(
     message: &str,
     details: &[trawl_client::ErrorDetail],
 ) {
-    let border_style = if app.focus == Focus::Results && app.sidebar.is_none() {
+    let border_style = if app.focus == Focus::Results {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -429,7 +429,7 @@ fn render_sparkline(
     area: Rect,
     result: &trawl_engine::value::QueryResult,
 ) {
-    let border_style = if app.focus == Focus::Results && app.sidebar.is_none() {
+    let border_style = if app.focus == Focus::Results {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -733,10 +733,19 @@ fn render_stacked_sparklines(
 ///
 /// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
 /// the max display width per column, clamped to `[MIN_COL, MAX_COL]`.
-fn compute_column_widths(result: &trawl_engine::value::QueryResult, v_scroll: usize) -> Vec<u16> {
+fn compute_column_widths(
+    result: &trawl_engine::value::QueryResult,
+    v_scroll: usize,
+    available_width: usize,
+) -> Vec<u16> {
     const MIN_COL: usize = 8;
     const MAX_COL: usize = 60;
+    const CELL_PADDING: usize = 3; // ratatui table cell padding/borders
     const SAMPLE_ROWS: usize = 50;
+
+    let total_cols = result.columns.len().max(1);
+    let per_col_budget = (available_width / total_cols).saturating_sub(CELL_PADDING);
+    let max_col = per_col_budget.clamp(MIN_COL, MAX_COL);
 
     result
         .columns
@@ -755,7 +764,7 @@ fn compute_column_widths(result: &trawl_engine::value::QueryResult, v_scroll: us
             }
 
             #[allow(clippy::cast_possible_truncation)]
-            let width = max_width.clamp(MIN_COL, MAX_COL) as u16;
+            let width = max_width.clamp(MIN_COL, max_col) as u16;
             width
         })
         .collect()

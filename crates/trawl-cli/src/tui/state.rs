@@ -80,8 +80,21 @@ pub enum Focus {
     Editor,
     /// Results table is focused.
     Results,
-    /// Sidebar panel is focused.
-    Sidebar,
+    /// Panel content is focused (History/Schema/Saved tab).
+    Panel,
+}
+
+/// Top-level navigation tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainTab {
+    /// Query editor + results.
+    Query,
+    /// Query execution history.
+    History,
+    /// Schema browser.
+    Schema,
+    /// Saved queries.
+    Saved,
 }
 
 /// A profiled column from a service sample.
@@ -126,19 +139,6 @@ pub struct CatalogSummary {
     pub hot_buffer_events: Option<u64>,
 }
 
-/// Which section is active in the sidebar panel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidebarSection {
-    /// Schema browser tree view.
-    Schema,
-    /// Query history.
-    History,
-    /// Saved queries.
-    Saved,
-    /// Scheduled reports.
-    Reports,
-}
-
 /// Tree state for the schema browser.
 #[derive(Debug, Clone)]
 pub struct SchemaTree {
@@ -166,32 +166,26 @@ impl SchemaTree {
     }
 }
 
-/// Persistent sidebar panel state.
+/// Panel state for non-Query tabs (schema, history, saved).
 #[derive(Debug, Clone)]
-pub struct SidebarState {
-    /// Which section tab is active.
-    pub section: SidebarSection,
+pub struct PanelState {
     /// Schema tree navigation state.
     pub schema: SchemaTree,
     /// Selected index in the history list.
     pub history_selected: usize,
     /// Selected index in the saved queries list.
     pub saved_selected: usize,
-    /// Selected index in the reports list.
-    pub reports_selected: usize,
-    /// Catalog summary from enriched schema response (used by sidebar renderer).
-    #[allow(dead_code)] // Used by sidebar renderer (not yet implemented).
+    /// Catalog summary from enriched schema response.
+    #[allow(dead_code)] // Used when reports panel is implemented.
     pub catalog: Option<CatalogSummary>,
 }
 
-impl SidebarState {
+impl PanelState {
     pub fn new(catalog: Option<CatalogSummary>) -> Self {
         Self {
-            section: SidebarSection::Schema,
             schema: SchemaTree::new(),
             history_selected: 0,
             saved_selected: 0,
-            reports_selected: 0,
             catalog,
         }
     }
@@ -1047,12 +1041,9 @@ impl LiveBuffer {
     }
 }
 
-/// A single tab in the TUI.
+/// The query tab state (editor + results).
 #[derive(Debug)]
 pub struct Tab {
-    /// Unique tab ID.
-    #[allow(dead_code)] // Used for tab identification in future features
-    pub id: usize,
     /// Query editor.
     pub editor: SimpleEditor,
     /// Last query result (if any).
@@ -1074,10 +1065,9 @@ pub struct Tab {
 }
 
 impl Tab {
-    /// Create a new tab with the given ID.
-    pub fn new(id: usize) -> Self {
+    /// Create a new tab.
+    pub fn new() -> Self {
         Self {
-            id,
             editor: SimpleEditor::new(),
             result: None,
             scroll_offset: 0,
