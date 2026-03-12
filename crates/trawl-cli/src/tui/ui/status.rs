@@ -166,16 +166,16 @@ fn get_context_hints(app: &App, width: usize) -> String {
         Focus::Results => {
             if app.active_tab().result.is_some() {
                 if width >= 75 {
-                    "↑↓: select | Enter: detail | /: search | Tab: editor".to_owned()
+                    "↑↓: select | Enter: detail | /: search | ←→: scroll | Tab: editor".to_owned()
                 } else if width >= 55 {
                     "↑↓ select | Enter detail | / search | Tab".to_owned()
                 } else {
                     "↑↓ select | Tab".to_owned()
                 }
             } else if width >= 55 {
-                "Tab: editor | Shift+Enter: execute query".to_owned()
+                "Tab: editor".to_owned()
             } else {
-                "Tab editor".to_owned()
+                "Tab".to_owned()
             }
         }
         Focus::Panel => String::new(),

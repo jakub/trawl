@@ -62,14 +62,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         }
     }
 
-    // Add keybinding hints on the right (responsive)
-    let hint = if width >= 75 {
-        "Shift+Enter run  F1 help"
-    } else if width >= 55 {
-        "\u{23ce} run  F1 help"
-    } else {
-        "F1 help"
-    };
+    // Add keybinding hint on the right
+    let hint = "F1 help";
 
     let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
     let padding = width.saturating_sub(left_len + hint.len());
