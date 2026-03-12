@@ -78,5 +78,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Black));
 
-    frame.render_widget(paragraph, area);
+    // Render only on the first row; the rest of the area is a spacer that
+    // inherits the terminal's default background.
+    let tab_row = Rect { height: 1, ..area };
+    frame.render_widget(paragraph, tab_row);
 }
