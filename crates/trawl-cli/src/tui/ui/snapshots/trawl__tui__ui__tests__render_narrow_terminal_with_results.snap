@@ -2,7 +2,7 @@
 source: crates/trawl-cli/src/tui/ui/mod.rs
 expression: terminal.backend().to_string()
 ---
-" Query ✓   History   Schema   Saved      F1 help  "
+" Query ✓   History   Schema   Saved               "
 "                                                  "
 "┌ Query Editor ──────────────────────────────────┐"
 "│                                                │"

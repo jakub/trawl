@@ -62,19 +62,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         }
     }
 
-    // Add keybinding hint on the right
-    let hint = "F1 help";
-
-    let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-    let padding = width.saturating_sub(left_len + hint.len());
-    spans.push(Span::raw(" ".repeat(padding)));
-    spans.push(Span::styled(
-        hint,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    ));
-
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Black));
 
