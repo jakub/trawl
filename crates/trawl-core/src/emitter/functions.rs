@@ -1,5 +1,6 @@
 use super::EmitError;
 use super::fields::quote_field;
+use crate::parser::suggest;
 
 /// Known function names accepted by the emitter.
 pub(crate) const KNOWN_FUNCTIONS: &[&str] = &[
@@ -54,6 +55,7 @@ pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), Emi
     if !KNOWN_FUNCTIONS.contains(&name) {
         return Err(EmitError::UnknownFunction {
             name: name.to_string(),
+            suggestion: suggest::suggest_function(name).map(String::from),
         });
     }
 
@@ -167,6 +169,7 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
         "stddev" => require_one_arg(name, args, |a| format!("STDDEV({a})")),
         _ => Err(EmitError::UnknownFunction {
             name: name.to_string(),
+            suggestion: suggest::suggest_function(name).map(String::from),
         }),
     }
 }
@@ -594,7 +597,8 @@ mod tests {
         assert_eq!(
             err,
             EmitError::UnknownFunction {
-                name: "bogus".to_string()
+                name: "bogus".to_string(),
+                suggestion: None,
             }
         );
     }

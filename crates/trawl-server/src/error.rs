@@ -77,6 +77,7 @@ fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_api::Error
             end: e.span.end,
         }),
         label: e.label.clone(),
+        hint: e.hint.clone(),
     }
 }
 
@@ -201,6 +202,7 @@ mod tests {
             message: "bad syntax".into(),
             span: 0..3,
             label: None,
+            hint: None,
         }]));
         assert!(err.safe_message().contains("bad syntax"));
     }

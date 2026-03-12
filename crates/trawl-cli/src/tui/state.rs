@@ -1064,6 +1064,12 @@ pub struct Tab {
     pub column_widths: Option<Vec<u16>>,
     /// Handle to the running query task (for cancellation).
     pub query_task: Option<tokio::task::JoinHandle<()>>,
+    /// Real-time validation errors from local parsing (separate from execution errors).
+    pub validation_errors: Vec<trawl_core::parser::ParseError>,
+    /// Whether the editor has been modified since last validation.
+    pub validation_dirty: bool,
+    /// Timestamp of the last editor modification (for debounce).
+    pub last_edit_time: Option<std::time::Instant>,
 }
 
 impl Tab {
@@ -1080,6 +1086,9 @@ impl Tab {
             last_visible_rows: 15,
             column_widths: None,
             query_task: None,
+            validation_errors: Vec::new(),
+            validation_dirty: false,
+            last_edit_time: None,
         }
     }
 
@@ -1094,10 +1103,66 @@ impl Tab {
         self.selected_row = None;
         self.last_visible_rows = 15;
         self.column_widths = None;
+        self.validation_errors.clear();
+        self.validation_dirty = false;
+        self.last_edit_time = None;
         // Abort any running query task.
         if let Some(handle) = self.query_task.take() {
             handle.abort();
         }
+    }
+
+    /// Mark the editor content as modified, triggering validation after debounce.
+    pub fn mark_editor_dirty(&mut self) {
+        self.validation_dirty = true;
+        self.last_edit_time = Some(std::time::Instant::now());
+    }
+
+    /// Run debounced validation: parse the query locally and populate `validation_errors`.
+    ///
+    /// Returns `true` if validation was actually performed (debounce elapsed).
+    pub fn maybe_validate(&mut self) -> bool {
+        if !self.validation_dirty {
+            return false;
+        }
+
+        // Debounce: wait 300ms after last edit.
+        if let Some(last_edit) = self.last_edit_time {
+            if last_edit.elapsed() < std::time::Duration::from_millis(300) {
+                return false;
+            }
+        }
+
+        let text = self.editor.text();
+        if text.trim().is_empty() {
+            self.validation_errors.clear();
+            self.validation_dirty = false;
+            return true;
+        }
+
+        match trawl_core::parser::parse(&text) {
+            Ok(query) => match trawl_core::emitter::validate_pipeline(&query.pipeline) {
+                Ok(()) => self.validation_errors.clear(),
+                Err(e) => {
+                    self.validation_errors = vec![trawl_core::parser::ParseError {
+                        message: e.to_string(),
+                        span: 0..text.len(),
+                        label: None,
+                        hint: match &e {
+                            trawl_core::emitter::EmitError::UnknownFunction {
+                                suggestion, ..
+                            } => suggestion.as_ref().map(|s| format!("did you mean '{s}'?")),
+                            _ => None,
+                        },
+                    }];
+                }
+            },
+            Err(errors) => {
+                self.validation_errors = errors;
+            }
+        }
+        self.validation_dirty = false;
+        true
     }
 }
 

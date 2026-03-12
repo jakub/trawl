@@ -26,29 +26,54 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     }
 }
 
-/// Render the Query tab: tab bar, editor, results, status bar.
+/// Render the Query tab: tab bar, editor, [validation hint], results, status bar.
 fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),      // Tab bar (1 row + 1 spacer)
-            Constraint::Percentage(40), // Editor row
-            Constraint::Percentage(55), // Results row
-            Constraint::Length(1),      // Status bar
-        ])
-        .split(frame.area());
+    let has_validation_hint = !app.active_tab().validation_errors.is_empty();
 
-    tabs::render(app, frame, outer[0]);
-    editor::render(app, frame, outer[1]);
+    // Build layout conditionally to avoid affecting percentage distribution
+    // when there is no hint line.
+    let (editor_area, hint_area, results_area, status_area) = if has_validation_hint {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),      // Tab bar
+                Constraint::Percentage(40), // Editor
+                Constraint::Length(1),      // Validation hint
+                Constraint::Percentage(55), // Results
+                Constraint::Length(1),      // Status bar
+            ])
+            .split(frame.area());
+        tabs::render(app, frame, outer[0]);
+        (outer[1], Some(outer[2]), outer[3], outer[4])
+    } else {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),      // Tab bar
+                Constraint::Percentage(40), // Editor
+                Constraint::Percentage(55), // Results
+                Constraint::Length(1),      // Status bar
+            ])
+            .split(frame.area());
+        tabs::render(app, frame, outer[0]);
+        (outer[1], None, outer[2], outer[3])
+    };
+
+    editor::render(app, frame, editor_area);
+
+    // Render validation hint bar if there are errors.
+    if let Some(hint) = hint_area {
+        editor::render_validation_hint(app, frame, hint);
+    }
 
     // Update visible row count for scroll calculations (borders + header = 4 rows overhead).
     #[allow(clippy::cast_possible_truncation)]
-    let results_visible = outer[2].height.saturating_sub(4) as usize;
+    let results_visible = results_area.height.saturating_sub(4) as usize;
     let search_adjust = usize::from(app.results_search.is_some());
     app.active_tab_mut().last_visible_rows = results_visible.saturating_sub(search_adjust).max(1);
 
-    results::render(app, frame, outer[2]);
-    status::render(app, frame, outer[3]);
+    results::render(app, frame, results_area);
+    status::render(app, frame, status_area);
 
     // Render popup overlay (if any) — renders on top of everything.
     popup::render(app, frame);
@@ -62,9 +87,9 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
         // +2 for x: border (1) + horizontal padding (1)
         // +1 for y: border (1) only
         #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
-        let x = outer[1].x + col.saturating_sub(scroll_col) as u16 + 2;
+        let x = editor_area.x + col.saturating_sub(scroll_col) as u16 + 2;
         #[allow(clippy::cast_possible_truncation)]
-        let y = outer[1].y + row.saturating_sub(scroll_row) as u16 + 1;
+        let y = editor_area.y + row.saturating_sub(scroll_row) as u16 + 1;
         frame.set_cursor_position((x, y));
     }
 }

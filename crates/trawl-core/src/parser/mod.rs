@@ -14,6 +14,7 @@ pub(crate) mod expr;
 pub(crate) mod pipe;
 pub(crate) mod primitives;
 pub(crate) mod search;
+pub mod suggest;
 
 use chumsky::prelude::*;
 
@@ -26,6 +27,8 @@ pub struct ParseError {
     pub message: String,
     pub span: std::ops::Range<usize>,
     pub label: Option<String>,
+    /// Optional contextual suggestion (e.g. "did you mean 'stats'?").
+    pub hint: Option<String>,
 }
 
 impl std::fmt::Display for ParseError {
@@ -37,6 +40,9 @@ impl std::fmt::Display for ParseError {
         )?;
         if let Some(label) = &self.label {
             write!(f, " (while parsing {label})")?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(f, " ({hint})")?;
         }
         Ok(())
     }
@@ -59,6 +65,7 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
             ),
             span: 0..input.len(),
             label: None,
+            hint: None,
         }]);
     }
 
@@ -82,43 +89,153 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     let label = e.contexts().next().map(|(l, _)| l.to_string());
 
     // custom errors (e.g. overflow, invalid regex) carry their own message
-    let message = if let RichReason::Custom(msg) = e.reason() {
-        msg.clone()
-    } else {
-        let offset = span.start;
-        let found = if offset >= input.len() {
-            "end of input".to_string()
-        } else {
-            let ch = &input[offset..];
-            let end = ch.char_indices().nth(1).map_or(ch.len(), |(idx, _)| idx);
-            format!("'{}'", &ch[..end])
+    if let RichReason::Custom(msg) = e.reason() {
+        return ParseError {
+            message: msg.clone(),
+            span: span.start..span.end,
+            label,
+            hint: None,
         };
+    }
 
-        let expected: Vec<String> = e
-            .expected()
-            .map(|exp| match exp {
-                chumsky::error::RichPattern::Token(c) => format!("'{}'", &**c),
-                chumsky::error::RichPattern::Label(l) => l.to_string(),
-                chumsky::error::RichPattern::Identifier(id) => format!("`{id}`"),
-                chumsky::error::RichPattern::Any => "any token".to_string(),
-                chumsky::error::RichPattern::SomethingElse => "something else".to_string(),
-                chumsky::error::RichPattern::EndOfInput => "end of input".to_string(),
-                _ => "unknown".to_string(),
-            })
-            .collect();
-
-        if expected.is_empty() {
-            format!("unexpected {found}")
-        } else {
-            format!("found {found}, expected {}", expected.join(" or "))
-        }
+    let offset = span.start;
+    let found = if offset >= input.len() {
+        "end of input".to_string()
+    } else {
+        let ch = &input[offset..];
+        let end = ch.char_indices().nth(1).map_or(ch.len(), |(idx, _)| idx);
+        format!("'{}'", &ch[..end])
     };
+
+    let expected: Vec<String> = e
+        .expected()
+        .map(|exp| match exp {
+            chumsky::error::RichPattern::Token(c) => format!("'{}'", &**c),
+            chumsky::error::RichPattern::Label(l) => l.to_string(),
+            chumsky::error::RichPattern::Identifier(id) => format!("`{id}`"),
+            chumsky::error::RichPattern::Any => "any token".to_string(),
+            chumsky::error::RichPattern::SomethingElse => "something else".to_string(),
+            chumsky::error::RichPattern::EndOfInput => "end of input".to_string(),
+            _ => "unknown".to_string(),
+        })
+        .collect();
+
+    // Detect specific error patterns and produce contextual messages + hints.
+    let (message, hint) = enrich_error(input, offset, &found, &expected, label.as_deref());
 
     ParseError {
         message,
         span: span.start..span.end,
         label,
+        hint,
     }
+}
+
+/// Find the pipe-command word around the error offset, if the error is in
+/// a position that looks like a pipe stage command (i.e. the word follows a `|`).
+///
+/// Returns `Some(word)` if the word is NOT a known pipe stage (i.e. it's a typo),
+/// or `None` if the error isn't in a pipe-command position or the word is valid.
+fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
+    // Find the start of the word containing `offset` by scanning backward.
+    let before = &input[..offset];
+    let word_start = before
+        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+        .map_or(0, |pos| pos + 1);
+
+    // Extract the full word from word_start forward.
+    let candidate: String = input[word_start..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+
+    if candidate.is_empty() {
+        return None;
+    }
+
+    // Check that there's a `|` before this word (with optional whitespace).
+    let prefix = input[..word_start].trim_end();
+    if !prefix.ends_with('|') {
+        return None;
+    }
+
+    // Only return the word if it's NOT a known pipe stage (i.e. it's a typo).
+    if suggest::KNOWN_PIPE_STAGES.contains(&candidate.as_str()) {
+        return None;
+    }
+
+    Some(candidate)
+}
+
+/// Produce an enriched (message, hint) pair based on error context.
+fn enrich_error(
+    input: &str,
+    offset: usize,
+    found: &str,
+    expected: &[String],
+    label: Option<&str>,
+) -> (String, Option<String>) {
+    let expects_pipe_stage = expected.iter().any(|e| e == "pipe stage");
+    let expects_end_quote = expected.iter().any(|e| e == "'\"'");
+    let expects_close_paren = expected.iter().any(|e| e == "')'");
+    let at_end = offset >= input.len();
+
+    // Unknown pipe stage: detected via expected labels, context labels, or
+    // by scanning the input for a pipe character before the error position.
+    // chumsky's choice() combinator may report character-level errors from the
+    // branch that consumed the most input (e.g. "staats" partially matches
+    // "stats"), resulting in no context labels at all — just a single-char
+    // expected token. We detect this by finding the word around the error
+    // offset and checking if it sits right after a `|`.
+    let in_pipe_context =
+        expects_pipe_stage || label == Some("pipe stage") || label == Some("pipeline");
+
+    // Try to find the full word around the error position. When chumsky
+    // points mid-word (partial match), we scan backward from offset to
+    // find the word start.
+    let pipe_word = find_pipe_command_word(input, offset);
+
+    if in_pipe_context || pipe_word.is_some() {
+        if let Some(ref word) = pipe_word {
+            if !suggest::KNOWN_PIPE_STAGES.contains(&word.as_str()) {
+                let hint =
+                    suggest::suggest_pipe_stage(word).map(|s| format!("did you mean '{s}'?"));
+                return (format!("unknown command '{word}'"), hint);
+            }
+        }
+    }
+
+    // Unterminated string literal
+    if at_end && expects_end_quote {
+        return (
+            "unterminated string literal".to_string(),
+            Some("add a closing '\"' to complete the string".to_string()),
+        );
+    }
+
+    // Unmatched opening parenthesis
+    if at_end && expects_close_paren {
+        return (
+            "unmatched opening parenthesis".to_string(),
+            Some("add a closing ')' to match the opening '('".to_string()),
+        );
+    }
+
+    // Missing aggregation after stats
+    if label == Some("stats stage") && expected.iter().any(|e| e == "aggregation expression") {
+        return (
+            format!("found {found}, expected aggregation expression"),
+            Some("stats requires at least one aggregation, e.g. stats count()".to_string()),
+        );
+    }
+
+    // Default: produce the standard message with no hint
+    let message = if expected.is_empty() {
+        format!("unexpected {found}")
+    } else {
+        format!("found {found}, expected {}", expected.join(" or "))
+    };
+    (message, None)
 }
 
 /// Build the top-level query parser: search stage, then pipeline, then EOF.
@@ -324,5 +441,90 @@ mod tests {
         // should contain span info and the error description
         assert!(msg.contains('['));
         assert!(msg.contains(']'));
+    }
+
+    // --- enriched error message tests ---
+
+    #[test]
+    fn test_error_unknown_command_with_suggestion() {
+        let result = parse("| staats count() by host");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors[0].message.contains("unknown command"),
+            "message should say unknown command, got: {}",
+            errors[0].message
+        );
+        assert!(
+            errors[0].message.contains("staats"),
+            "message should contain the typo, got: {}",
+            errors[0].message
+        );
+        assert_eq!(
+            errors[0].hint.as_deref(),
+            Some("did you mean 'stats'?"),
+            "hint should suggest 'stats'"
+        );
+    }
+
+    #[test]
+    fn test_error_unknown_command_no_suggestion() {
+        let result = parse("| zzzzzzz");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors[0].message.contains("unknown command"),
+            "message should say unknown command, got: {}",
+            errors[0].message
+        );
+        assert!(
+            errors[0].hint.is_none(),
+            "hint should be None for unrecognizable command"
+        );
+    }
+
+    #[test]
+    fn test_error_unterminated_string() {
+        let result = parse(r#""unterminated string"#);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors[0].message.contains("unterminated string"),
+            "should detect unterminated string, got: {}",
+            errors[0].message
+        );
+        assert!(errors[0].hint.is_some(), "should provide a hint");
+    }
+
+    #[test]
+    fn test_error_unmatched_paren() {
+        let result = parse("| where (count > 10");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors[0].message.contains("unmatched opening parenthesis"),
+            "should detect unmatched paren, got: {}",
+            errors[0].message
+        );
+        assert!(errors[0].hint.is_some(), "should provide a hint");
+    }
+
+    #[test]
+    fn test_error_display_with_hint() {
+        let result = parse("| staats count()");
+        let errors = result.unwrap_err();
+        let msg = errors[0].to_string();
+        assert!(
+            msg.contains("did you mean"),
+            "display should include hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_error_whre_suggests_where() {
+        let result = parse("| whre count > 10");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors[0].hint.as_deref(), Some("did you mean 'where'?"));
     }
 }

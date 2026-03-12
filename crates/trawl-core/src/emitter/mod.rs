@@ -60,15 +60,28 @@ impl fmt::Display for SqlValue {
 /// Errors that can occur during SQL emission.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitError {
-    UnknownFunction { name: String },
-    InvalidAggregation { message: String },
-    UnsupportedOperation { message: String },
+    UnknownFunction {
+        name: String,
+        suggestion: Option<String>,
+    },
+    InvalidAggregation {
+        message: String,
+    },
+    UnsupportedOperation {
+        message: String,
+    },
 }
 
 impl fmt::Display for EmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownFunction { name } => write!(f, "unknown function: {name}"),
+            Self::UnknownFunction { name, suggestion } => {
+                write!(f, "unknown function: {name}")?;
+                if let Some(s) = suggestion {
+                    write!(f, " (did you mean '{s}'?)")?;
+                }
+                Ok(())
+            }
             Self::InvalidAggregation { message } => write!(f, "invalid aggregation: {message}"),
             Self::UnsupportedOperation { message } => {
                 write!(f, "unsupported operation: {message}")

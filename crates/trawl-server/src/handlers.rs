@@ -606,10 +606,17 @@ pub async fn validate_query(
 
     let result = trawl_core::parser::parse(&req.query).and_then(|ast| {
         trawl_core::emitter::validate_pipeline(&ast.pipeline).map_err(|e| {
+            let hint = match &e {
+                trawl_core::emitter::EmitError::UnknownFunction { suggestion, .. } => {
+                    suggestion.as_ref().map(|s| format!("did you mean '{s}'?"))
+                }
+                _ => None,
+            };
             vec![trawl_core::parser::ParseError {
                 message: e.to_string(),
                 span: 0..req.query.len(),
                 label: Some("validation error".to_string()),
+                hint,
             }]
         })
     });
@@ -630,6 +637,7 @@ pub async fn validate_query(
                         end: e.span.end,
                     }),
                     label: e.label.clone(),
+                    hint: e.hint.clone(),
                 })
                 .collect(),
         })),
