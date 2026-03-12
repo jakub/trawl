@@ -17,19 +17,17 @@ use ratatui::text::Span;
 use crate::tui::App;
 use crate::tui::state::{ChartView, Focus, TabStatus};
 
-/// Build a right-aligned status title line from the current tab status.
-fn status_title(status: &TabStatus) -> Line<'_> {
+/// Build the results pane frame title from the current tab status.
+fn pane_title(status: &TabStatus) -> Line<'_> {
     let (text, color) = match status {
-        TabStatus::Idle => return Line::from(""),
-        TabStatus::Running { .. } => ("Running...".to_owned(), Color::Yellow),
-        TabStatus::Success { duration_ms } => (format!("Success ({duration_ms}ms)"), Color::Green),
-        TabStatus::Error { .. } => ("Error".to_owned(), Color::Red),
+        TabStatus::Idle => return Line::from(" Results "),
+        TabStatus::Running { .. } => (" Running... ", Color::Yellow),
+        TabStatus::Success { duration_ms } => {
+            return Line::from(format!(" Results ({duration_ms}ms) "));
+        }
+        TabStatus::Error { .. } => (" Error ", Color::Red),
     };
-    Line::from(Span::styled(
-        format!(" {text} "),
-        Style::default().fg(color),
-    ))
-    .right_aligned()
+    Line::from(Span::styled(text, Style::default().fg(color)))
 }
 
 /// Render the results pane (table/sparkline + optional search bar).
@@ -248,7 +246,6 @@ fn render_table(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .title_top(status_title(&tab.status))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -340,8 +337,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let tab = app.active_tab();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Results ")
-        .title_top(status_title(&tab.status))
+        .title(pane_title(&tab.status))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -400,8 +396,7 @@ fn render_error_display(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Error ")
-        .title_top(status_title(&tab.status))
+        .title(pane_title(&tab.status))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
