@@ -40,6 +40,13 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
 
     tabs::render(app, frame, outer[0]);
     editor::render(app, frame, outer[1]);
+
+    // Update visible row count for scroll calculations (borders + header = 4 rows overhead).
+    #[allow(clippy::cast_possible_truncation)]
+    let results_visible = outer[2].height.saturating_sub(4) as usize;
+    let search_adjust = usize::from(app.results_search.is_some());
+    app.active_tab_mut().last_visible_rows = results_visible.saturating_sub(search_adjust).max(1);
+
     results::render(app, frame, outer[2]);
     status::render(app, frame, outer[3]);
 

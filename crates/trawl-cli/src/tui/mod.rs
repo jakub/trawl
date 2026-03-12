@@ -858,24 +858,26 @@ impl App {
                     self.ensure_selected_row_visible();
                 }
             }
-            // Page up: move selection by 10
+            // Page up: move selection by one page
             (KeyModifiers::NONE, KeyCode::PageUp) => {
                 if row_count > 0 {
                     let tab = self.active_tab_mut();
+                    let page = tab.last_visible_rows;
                     tab.selected_row = Some(match tab.selected_row {
-                        Some(r) => r.saturating_sub(10),
+                        Some(r) => r.saturating_sub(page),
                         None => 0,
                     });
                     self.ensure_selected_row_visible();
                 }
             }
-            // Page down: move selection by 10
+            // Page down: move selection by one page
             (KeyModifiers::NONE, KeyCode::PageDown) => {
                 if row_count > 0 {
                     let tab = self.active_tab_mut();
+                    let page = tab.last_visible_rows;
                     let max_row = row_count.saturating_sub(1);
                     tab.selected_row = Some(match tab.selected_row {
-                        Some(r) => (r + 10).min(max_row),
+                        Some(r) => (r + page).min(max_row),
                         None => 0,
                     });
                     self.ensure_selected_row_visible();
@@ -1004,8 +1006,7 @@ impl App {
     fn ensure_selected_row_visible(&mut self) {
         let tab = self.active_tab_mut();
         if let Some(selected) = tab.selected_row {
-            // Estimate visible rows (will be approximate, but good enough)
-            let visible_rows = 15; // conservative estimate
+            let visible_rows = tab.last_visible_rows;
             if selected < tab.scroll_offset {
                 tab.scroll_offset = selected;
             } else if selected >= tab.scroll_offset + visible_rows {

@@ -291,7 +291,9 @@ fn render_table(
 
     // Render vertical scrollbar if needed
     if total_rows > max_visible_rows {
-        let mut scrollbar_state = ScrollbarState::new(total_rows).position(v_scroll);
+        let mut scrollbar_state = ScrollbarState::new(total_rows)
+            .position(v_scroll)
+            .viewport_content_length(max_visible_rows);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))

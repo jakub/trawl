@@ -1058,6 +1058,8 @@ pub struct Tab {
     pub chart_view: ChartView,
     /// Currently selected row in results (htop-style highlight bar).
     pub selected_row: Option<usize>,
+    /// Visible row count from last render frame (updated by UI each frame).
+    pub last_visible_rows: usize,
     /// Cached column widths (invalidated on new result).
     pub column_widths: Option<Vec<u16>>,
     /// Handle to the running query task (for cancellation).
@@ -1075,6 +1077,7 @@ impl Tab {
             status: TabStatus::Idle,
             chart_view: ChartView::Table,
             selected_row: None,
+            last_visible_rows: 15,
             column_widths: None,
             query_task: None,
         }
@@ -1089,6 +1092,7 @@ impl Tab {
         self.status = TabStatus::Idle;
         self.chart_view = ChartView::Table;
         self.selected_row = None;
+        self.last_visible_rows = 15;
         self.column_widths = None;
         // Abort any running query task.
         if let Some(handle) = self.query_task.take() {
