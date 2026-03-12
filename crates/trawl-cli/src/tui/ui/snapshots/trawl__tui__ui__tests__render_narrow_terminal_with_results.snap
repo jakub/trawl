@@ -25,4 +25,4 @@ expression: terminal.backend().to_string()
 "│          │          │                          │"
 "│          │          │                          │"
 "└────────────────────────────────────────────────┘"
-" [editor]                                  F1 help"
+" [editor]                              ⏎ execute  "

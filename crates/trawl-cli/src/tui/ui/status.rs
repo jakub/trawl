@@ -147,15 +147,7 @@ fn get_context_hints(app: &App, width: usize) -> String {
     // Focus-specific hints
     match app.focus {
         Focus::Editor => {
-            if app.active_tab().editor.text().trim().is_empty() {
-                if width >= 75 {
-                    "M-2: history | M-4: saved | F1: help".to_owned()
-                } else if width >= 55 {
-                    "M-2 history | M-4 saved | F1 help".to_owned()
-                } else {
-                    "F1 help".to_owned()
-                }
-            } else if width >= 75 {
+            if width >= 75 {
                 "Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear".to_owned()
             } else if width >= 55 {
                 "\u{23ce}: execute | ^S save | ^L clear".to_owned()
