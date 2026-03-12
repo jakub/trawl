@@ -15,7 +15,30 @@ use ratatui::layout::{Alignment, Direction, Layout};
 use ratatui::text::Span;
 
 use crate::tui::App;
-use crate::tui::state::{ChartView, Focus};
+use crate::tui::state::{ChartView, Focus, TabStatus};
+
+/// Build a right-aligned status title line from the current tab status.
+fn status_title(status: &TabStatus) -> Line<'_> {
+    let (text, color) = match status {
+        TabStatus::Idle => return Line::from(""),
+        TabStatus::Running { .. } => ("Running...".to_owned(), Color::Yellow),
+        TabStatus::Success { duration_ms } => (format!("Success ({duration_ms}ms)"), Color::Green),
+        TabStatus::Error { message, .. } => {
+            // Truncate long error messages for the title bar
+            let short = if message.len() > 40 {
+                format!("{}…", &message[..39])
+            } else {
+                message.clone()
+            };
+            (format!("Error: {short}"), Color::Red)
+        }
+    };
+    Line::from(Span::styled(
+        format!(" {text} "),
+        Style::default().fg(color),
+    ))
+    .right_aligned()
+}
 
 /// Render the results pane (table/sparkline + optional search bar).
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -130,8 +153,8 @@ fn render_table(
     let mut cols_width_sum = 0usize;
     let mut visible_cols = 0;
     for w in all_widths.iter().skip(h_scroll) {
-        // +3 for cell padding/borders in ratatui Table
-        let next = cols_width_sum + *w as usize + 3;
+        // +5 for column_spacing(3) + border padding in ratatui Table
+        let next = cols_width_sum + *w as usize + 5;
         if next > available_width && visible_cols > 0 {
             break;
         }
@@ -233,6 +256,7 @@ fn render_table(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
+        .title_top(status_title(&tab.status))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -240,9 +264,41 @@ fn render_table(
         .rows(data_rows)
         .header(header_row)
         .block(block)
-        .widths(widths);
+        .widths(&widths)
+        .column_spacing(3);
 
     frame.render_widget(table, area);
+
+    // Overlay thin grey column dividers in the gaps between columns.
+    // The 3-char column spacing leaves room for ` │ ` between each pair.
+    if visible_cols > 1 {
+        let has_h_scrollbar = total_cols > visible_cols;
+        let divider_style = Style::default().fg(Color::DarkGray);
+        // Start after left border (1) + horizontal padding (1)
+        let inner_x = area.x + 2;
+        let y_start = area.y + 1; // skip top border
+        // Bottom: skip bottom border, and skip h-scrollbar row if present
+        let y_end = area.y + area.height - 1 - u16::from(has_h_scrollbar);
+
+        let mut cumulative_x = inner_x;
+        for (i, &w) in widths.iter().enumerate() {
+            // Advance past the column content
+            if let Constraint::Length(col_w) = w {
+                cumulative_x += col_w;
+            }
+            // Place divider at the midpoint of the 3-char gap (skip after last visible col)
+            if i < visible_cols - 1 {
+                let divider_x = cumulative_x + 1; // middle of 3-char gap
+                let buf = frame.buffer_mut();
+                for y in y_start..y_end {
+                    if divider_x < area.x + area.width - 1 {
+                        buf[(divider_x, y)].set_char('│').set_style(divider_style);
+                    }
+                }
+                cumulative_x += 3; // advance past the gap
+            }
+        }
+    }
 
     // Render vertical scrollbar if needed
     if total_rows > max_visible_rows {
@@ -289,9 +345,11 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let tab = app.active_tab();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Results ")
+        .title_top(status_title(&tab.status))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -322,6 +380,7 @@ fn render_error_display(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Error ")
+        .title_top(status_title(&tab.status))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -740,7 +799,7 @@ fn compute_column_widths(
 ) -> Vec<u16> {
     const MIN_COL: usize = 8;
     const MAX_COL: usize = 60;
-    const CELL_PADDING: usize = 3; // ratatui table cell padding/borders
+    const CELL_PADDING: usize = 5; // ratatui column_spacing(3) + 2 for borders
     const SAMPLE_ROWS: usize = 50;
 
     let total_cols = result.columns.len().max(1);

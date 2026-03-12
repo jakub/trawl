@@ -31,7 +31,7 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),      // Tab bar
+            Constraint::Length(2),      // Tab bar (1 row + 1 spacer)
             Constraint::Percentage(40), // Editor row
             Constraint::Percentage(55), // Results row
             Constraint::Length(1),      // Status bar
@@ -67,7 +67,7 @@ fn render_panel_layout(app: &mut App, frame: &mut Frame<'_>) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Tab bar
+            Constraint::Length(2), // Tab bar (1 row + 1 spacer)
             Constraint::Min(1),    // Panel content (full height)
             Constraint::Length(1), // Status bar
         ])
@@ -207,6 +207,33 @@ mod tests {
         editor.insert_text("my query");
         app.popup = Some(Popup::SaveQuery { editor });
         let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    #[test]
+    fn render_narrow_terminal_with_results() {
+        let mut app = test_app();
+        let response = make_query_response(
+            vec!["host", "service", "count"],
+            vec![
+                vec![
+                    Value::String("web-1".into()),
+                    Value::String("nginx".into()),
+                    Value::Integer(42),
+                ],
+                vec![
+                    Value::String("web-2".into()),
+                    Value::String("api".into()),
+                    Value::Integer(17),
+                ],
+            ],
+        );
+        app.tab.result = Some(response);
+        app.tab.status = TabStatus::Success { duration_ms: 5 };
+        // Narrow terminal: exercises responsive tab labels and status hints
+        let backend = TestBackend::new(50, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());

@@ -3,6 +3,7 @@ source: crates/trawl-cli/src/tui/ui/mod.rs
 expression: terminal.backend().to_string()
 ---
 " M-1 Query   M-2 History   M-3 Schema   M-4 Saved       Shift+Enter run  F1 help"
+"                                                                                "
 "┌ Query Editor ────────────────────────────────────────────────────────────────┐"
 "│                                                                              │"
 "│                                                                              │"
@@ -23,6 +24,5 @@ expression: terminal.backend().to_string()
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
-"│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-"idle [editor]                               M-2: history | M-4: saved | F1: help"
+" [editor]                                   M-2: history | M-4: saved | F1: help"

@@ -11,28 +11,31 @@ use crate::tui::state::{Focus, MainTab, TabStatus};
 
 /// Render the status bar.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let width = area.width as usize;
     let tab = app.active_tab();
 
     let mut spans = Vec::new();
 
-    // Left: status
-    let status_span = match &tab.status {
-        TabStatus::Idle => Span::styled("idle", Style::default().fg(Color::Gray)),
-        TabStatus::Running { .. } => Span::styled(
-            "running...",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        TabStatus::Success { duration_ms } => Span::styled(
-            format!("success ({duration_ms}ms)"),
-            Style::default().fg(Color::Green),
-        ),
-        TabStatus::Error { message, .. } => {
-            Span::styled(format!("error: {message}"), Style::default().fg(Color::Red))
-        }
-    };
-    spans.push(status_span);
+    // Left: status (skip when on Query tab — it's shown in the results title now)
+    if app.main_tab != MainTab::Query {
+        let status_span = match &tab.status {
+            TabStatus::Idle => Span::styled("idle", Style::default().fg(Color::Gray)),
+            TabStatus::Running { .. } => Span::styled(
+                "running...",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TabStatus::Success { duration_ms } => Span::styled(
+                format!("success ({duration_ms}ms)"),
+                Style::default().fg(Color::Green),
+            ),
+            TabStatus::Error { message, .. } => {
+                Span::styled(format!("error: {message}"), Style::default().fg(Color::Red))
+            }
+        };
+        spans.push(status_span);
+    }
 
     // Live mode indicator
     if app.live_mode {
@@ -53,8 +56,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
     spans.push(Span::raw(focus_text));
 
-    // Context-sensitive hints
-    let hints = get_context_hints(app);
+    // Context-sensitive hints (responsive)
+    let hints = get_context_hints(app, width);
 
     // Calculate left side length for padding
     let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
@@ -72,20 +75,44 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Generate context-sensitive keybinding hints.
-fn get_context_hints(app: &App) -> String {
+/// Generate context-sensitive keybinding hints (responsive to terminal width).
+fn get_context_hints(app: &App, width: usize) -> String {
     // Panel tab hints
     if app.focus == Focus::Panel {
         if app.main_tab == MainTab::Schema && app.panel.schema.filter_active {
-            return "type to filter | Enter: confirm | Esc: cancel".to_owned();
+            return if width >= 55 {
+                "type to filter | Enter: confirm | Esc: cancel".to_owned()
+            } else {
+                "Enter: confirm | Esc: cancel".to_owned()
+            };
         }
         return match app.main_tab {
             MainTab::Schema => {
-                "↑↓: navigate | →: expand | ←: collapse | /: filter | Esc: query".to_owned()
+                if width >= 75 {
+                    "↑↓: navigate | →: expand | ←: collapse | /: filter | Esc: query".to_owned()
+                } else if width >= 55 {
+                    "↑↓ navigate | →← expand/collapse | / filter | Esc".to_owned()
+                } else {
+                    "↑↓ navigate | Esc".to_owned()
+                }
             }
-            MainTab::History => "↑↓: navigate | Enter: load query | Esc: query".to_owned(),
+            MainTab::History => {
+                if width >= 75 {
+                    "↑↓: navigate | Enter: load query | Esc: query".to_owned()
+                } else if width >= 55 {
+                    "↑↓ navigate | Enter load | Esc".to_owned()
+                } else {
+                    "Enter load | Esc".to_owned()
+                }
+            }
             MainTab::Saved => {
-                "↑↓: navigate | Enter: load | s: schedule | Del: delete | Esc: query".to_owned()
+                if width >= 75 {
+                    "↑↓: navigate | Enter: load | s: schedule | Del: delete | Esc: query".to_owned()
+                } else if width >= 55 {
+                    "↑↓ navigate | Enter load | s sched | Del | Esc".to_owned()
+                } else {
+                    "Enter load | Esc".to_owned()
+                }
             }
             MainTab::Query => String::new(),
         };
@@ -93,15 +120,27 @@ fn get_context_hints(app: &App) -> String {
 
     // Live mode hints
     if app.live_mode {
-        return "F9: stop live tail | F1: help | Ctrl+Q: quit".to_owned();
+        return if width >= 75 {
+            "F9: stop live tail | F1: help | Ctrl+Q: quit".to_owned()
+        } else if width >= 55 {
+            "F9 stop | F1 help | ^Q quit".to_owned()
+        } else {
+            "F9 stop | ^Q quit".to_owned()
+        };
     }
 
     // Results search mode hints
     if let Some(ref search) = app.results_search {
         return if search.input_active {
-            "type to search | Enter: confirm | Esc: cancel".to_owned()
-        } else {
+            if width >= 55 {
+                "type to search | Enter: confirm | Esc: cancel".to_owned()
+            } else {
+                "Enter: confirm | Esc: cancel".to_owned()
+            }
+        } else if width >= 55 {
             "n: next | N: prev | /: new search | Esc: close".to_owned()
+        } else {
+            "n/N: next/prev | Esc".to_owned()
         };
     }
 
@@ -109,16 +148,34 @@ fn get_context_hints(app: &App) -> String {
     match app.focus {
         Focus::Editor => {
             if app.active_tab().editor.text().trim().is_empty() {
-                "M-2: history | M-4: saved | F1: help".to_owned()
-            } else {
+                if width >= 75 {
+                    "M-2: history | M-4: saved | F1: help".to_owned()
+                } else if width >= 55 {
+                    "M-2 history | M-4 saved | F1 help".to_owned()
+                } else {
+                    "F1 help".to_owned()
+                }
+            } else if width >= 75 {
                 "Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear".to_owned()
+            } else if width >= 55 {
+                "\u{23ce}: execute | ^S save | ^L clear".to_owned()
+            } else {
+                "\u{23ce} execute".to_owned()
             }
         }
         Focus::Results => {
             if app.active_tab().result.is_some() {
-                "↑↓: select | Enter: detail | /: search | Tab: editor".to_owned()
-            } else {
+                if width >= 75 {
+                    "↑↓: select | Enter: detail | /: search | Tab: editor".to_owned()
+                } else if width >= 55 {
+                    "↑↓ select | Enter detail | / search | Tab".to_owned()
+                } else {
+                    "↑↓ select | Tab".to_owned()
+                }
+            } else if width >= 55 {
                 "Tab: editor | Shift+Enter: execute query".to_owned()
+            } else {
+                "Tab editor".to_owned()
             }
         }
         Focus::Panel => String::new(),

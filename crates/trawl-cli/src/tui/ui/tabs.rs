@@ -11,6 +11,7 @@ use crate::tui::state::{MainTab, TabStatus};
 
 /// Render the tab bar at the top of the screen.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let width = area.width as usize;
     let mut spans = Vec::new();
 
     let tabs = [
@@ -31,9 +32,15 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 TabStatus::Success { .. } => (" ✓", Color::Green),
                 TabStatus::Error { .. } => (" ✗", Color::Red),
             };
-            format!(" {shortcut} {label}{indicator} ")
-        } else {
+            if width >= 75 {
+                format!(" {shortcut} {label}{indicator} ")
+            } else {
+                format!(" {label}{indicator} ")
+            }
+        } else if width >= 75 {
             format!(" {shortcut} {label} ")
+        } else {
+            format!(" {label} ")
         };
 
         let style = if is_active {
@@ -55,10 +62,17 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         }
     }
 
-    // Add keybinding hints on the right
+    // Add keybinding hints on the right (responsive)
+    let hint = if width >= 75 {
+        "Shift+Enter run  F1 help"
+    } else if width >= 55 {
+        "\u{23ce} run  F1 help"
+    } else {
+        "F1 help"
+    };
+
     let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-    let hint = "Shift+Enter run  F1 help";
-    let padding = (area.width as usize).saturating_sub(left_len + hint.len());
+    let padding = width.saturating_sub(left_len + hint.len());
     spans.push(Span::raw(" ".repeat(padding)));
     spans.push(Span::styled(
         hint,

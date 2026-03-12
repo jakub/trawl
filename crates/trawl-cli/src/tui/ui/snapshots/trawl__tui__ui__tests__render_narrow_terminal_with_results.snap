@@ -1,0 +1,28 @@
+---
+source: crates/trawl-cli/src/tui/ui/mod.rs
+expression: terminal.backend().to_string()
+---
+" Query ✓   History   Schema   Saved      F1 help  "
+"                                                  "
+"┌ Query Editor ──────────────────────────────────┐"
+"│                                                │"
+"│                                                │"
+"│                                                │"
+"│                                                │"
+"│                                                │"
+"│                                                │"
+"│                                                │"
+"│                                                │"
+"└────────────────────────────────────────────────┘"
+"┌ Results (2 rows, cols 1-3/3) ─── Success (5ms) ┐"
+"│ host     │ service  │ count                    │"
+"│ web-1    │ nginx    │ 42                       │"
+"│ web-2    │ api      │ 17                       │"
+"│          │          │                          │"
+"│          │          │                          │"
+"│          │          │                          │"
+"│          │          │                          │"
+"│          │          │                          │"
+"│          │          │                          │"
+"└────────────────────────────────────────────────┘"
+" [editor]                                  F1 help"
