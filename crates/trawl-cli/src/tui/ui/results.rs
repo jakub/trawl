@@ -23,15 +23,7 @@ fn status_title(status: &TabStatus) -> Line<'_> {
         TabStatus::Idle => return Line::from(""),
         TabStatus::Running { .. } => ("Running...".to_owned(), Color::Yellow),
         TabStatus::Success { duration_ms } => (format!("Success ({duration_ms}ms)"), Color::Green),
-        TabStatus::Error { message, .. } => {
-            // Truncate long error messages for the title bar
-            let short = if message.len() > 40 {
-                format!("{}…", &message[..39])
-            } else {
-                message.clone()
-            };
-            (format!("Error: {short}"), Color::Red)
-        }
+        TabStatus::Error { .. } => ("Error".to_owned(), Color::Red),
     };
     Line::from(Span::styled(
         format!(" {text} "),

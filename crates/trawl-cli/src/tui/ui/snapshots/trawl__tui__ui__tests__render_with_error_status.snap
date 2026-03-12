@@ -14,7 +14,7 @@ expression: terminal.backend().to_string()
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-"┌ Error ───────────────────────────────── Error: parse error: unexpected token ┐"
+"┌ Error ──────────────────────────────────────────────────────────────── Error ┐"
 "│ error: parse error: unexpected token                                         │"
 "│                                                                              │"
 "│                                                                              │"
