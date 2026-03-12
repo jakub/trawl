@@ -230,18 +230,21 @@ fn render_table(
         .map(|&w| Constraint::Length(w))
         .collect();
 
-    let title = format!(
-        " Results ({} rows, cols {}-{}/{}{}) ",
-        total_rows,
-        h_scroll + 1,
-        (h_scroll + visible_cols).min(total_cols),
-        total_cols,
-        if response.truncated {
-            ", truncated"
-        } else {
-            ""
-        }
-    );
+    let title = match tab.status {
+        TabStatus::Running { .. } | TabStatus::Error { .. } => pane_title(&tab.status),
+        _ => Line::from(format!(
+            " Results ({} rows, cols {}-{}/{}{}) ",
+            total_rows,
+            h_scroll + 1,
+            (h_scroll + visible_cols).min(total_cols),
+            total_cols,
+            if response.truncated {
+                ", truncated"
+            } else {
+                ""
+            }
+        )),
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)

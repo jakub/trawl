@@ -945,6 +945,16 @@ impl App {
                     tab.chart_view = tab.chart_view.next();
                 }
             }
+            // Execute query: Ctrl+Enter
+            (_, KeyCode::Enter) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.execute_query();
+            }
+            // Execute query: F5, Shift+Enter, Ctrl+J
+            (KeyModifiers::NONE, KeyCode::F(5))
+            | (KeyModifiers::SHIFT, KeyCode::Enter)
+            | (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
+                self.execute_query();
+            }
             _ => {}
         }
     }
