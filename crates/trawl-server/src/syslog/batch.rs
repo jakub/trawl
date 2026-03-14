@@ -179,3 +179,175 @@ impl SyslogBatcher {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SyslogConfig;
+    use crate::ingest::wal::WalWriter;
+    use serde_json::json;
+
+    /// Create a batcher with a real WAL writer pointing at a temp dir.
+    fn test_batcher(
+        batch_interval_ms: u64,
+        batch_max_events: usize,
+    ) -> (SyslogBatcher, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        wal.ensure_dir().unwrap();
+        let pipeline = Arc::new(PipelineWriter::new(wal, None, None));
+
+        let config = SyslogConfig {
+            batch_interval_ms,
+            batch_max_events,
+            ..SyslogConfig::default()
+        };
+
+        let batcher = SyslogBatcher::new(&config, pipeline);
+        (batcher, tmp)
+    }
+
+    fn make_event(service: &str) -> SyslogEvent {
+        let mut map = Map::new();
+        map.insert("service".into(), json!(service));
+        map.insert("message".into(), json!("test"));
+        SyslogEvent {
+            service: service.to_owned(),
+            map,
+            transport: "udp",
+        }
+    }
+
+    #[tokio::test]
+    async fn batcher_timer_flush() {
+        let (batcher, tmp) = test_batcher(10, 1000); // 10ms interval, high max
+        let sender = batcher.sender();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            batcher.run(shutdown_rx).await;
+        });
+
+        // Send one event
+        sender.send(make_event("test-svc")).await.unwrap();
+
+        // Wait for timer flush (~10ms + some margin)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Shut down and wait
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+
+        // Verify WAL file was created
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        assert!(!files.is_empty(), "WAL file should have been created");
+    }
+
+    #[tokio::test]
+    async fn batcher_max_events_flush() {
+        let (batcher, tmp) = test_batcher(60_000, 3); // long interval, max 3 events
+        let sender = batcher.sender();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            batcher.run(shutdown_rx).await;
+        });
+
+        // Send exactly 3 events — should trigger immediate flush
+        for _ in 0..3 {
+            sender.send(make_event("test-svc")).await.unwrap();
+        }
+
+        // Give spawn_blocking time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "WAL file should have been created by max events flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn batcher_shutdown_flushes_remaining() {
+        let (batcher, tmp) = test_batcher(60_000, 10_000); // long interval, high max
+        let sender = batcher.sender();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            batcher.run(shutdown_rx).await;
+        });
+
+        // Send events (won't trigger timer or max events flush)
+        sender.send(make_event("svc-a")).await.unwrap();
+        sender.send(make_event("svc-b")).await.unwrap();
+
+        // Small delay to ensure events are received
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Shutdown should flush remaining events
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        assert!(
+            files.len() >= 2,
+            "should have WAL files for both services, got {}",
+            files.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn batcher_multi_service_grouping() {
+        let (batcher, tmp) = test_batcher(60_000, 10_000);
+        let sender = batcher.sender();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            batcher.run(shutdown_rx).await;
+        });
+
+        // Send events for different services
+        sender.send(make_event("nginx")).await.unwrap();
+        sender.send(make_event("sshd")).await.unwrap();
+        sender.send(make_event("nginx")).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+
+        // Should have separate WAL files for each service
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+
+        let nginx_files = files
+            .iter()
+            .filter(|f| f.file_name().to_string_lossy().starts_with("nginx"))
+            .count();
+        let sshd_files = files
+            .iter()
+            .filter(|f| f.file_name().to_string_lossy().starts_with("sshd"))
+            .count();
+        assert_eq!(nginx_files, 1, "should have one WAL file for nginx");
+        assert_eq!(sshd_files, 1, "should have one WAL file for sshd");
+    }
+}

@@ -363,3 +363,187 @@ async fn read_octet_counted_or_line(
 
     Ok(Some(msg))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// Helper: bind a TCP listener on a free port, return the address.
+    async fn bind_free() -> (TcpListener, std::net::SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    /// Helper: connect to the listener, return (client, server) stream pair.
+    async fn connect(
+        listener: &TcpListener,
+        addr: std::net::SocketAddr,
+    ) -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let client_fut = tokio::net::TcpStream::connect(addr);
+        let accept_fut = listener.accept();
+        let (client_result, accept_result) = tokio::join!(client_fut, accept_fut);
+        (client_result.unwrap(), accept_result.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn read_line_normal_message() {
+        let (listener, addr) = bind_free().await;
+        let (mut client, server) = connect(&listener, addr).await;
+        let mut reader = BufReader::new(server);
+
+        client
+            .write_all(b"<13>Mar 12 10:00:00 host sshd: test\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = read_line(&mut reader).await.unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("<13>Mar 12 10:00:00 host sshd: test")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_line_oversized_message_returns_empty_and_drains() {
+        let (listener, addr) = bind_free().await;
+        let (mut client, server) = connect(&listener, addr).await;
+        let mut reader = BufReader::new(server);
+
+        // Send a message that exceeds MAX_MESSAGE_SIZE, followed by a normal one
+        let oversized = "x".repeat(MAX_MESSAGE_SIZE + 100);
+        client
+            .write_all(format!("{oversized}\nnormal message\n").as_bytes())
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        // First read should return empty (oversized was discarded)
+        let result1 = read_line(&mut reader).await.unwrap();
+        assert_eq!(result1.as_deref(), Some(""));
+
+        // Second read should get the normal message
+        let result2 = read_line(&mut reader).await.unwrap();
+        assert_eq!(result2.as_deref(), Some("normal message"));
+    }
+
+    #[tokio::test]
+    async fn read_line_eof_returns_none() {
+        let (listener, addr) = bind_free().await;
+        let (client, server) = connect(&listener, addr).await;
+        let mut reader = BufReader::new(server);
+
+        drop(client); // Close connection immediately
+
+        let result = read_line(&mut reader).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_octet_counted_message() {
+        let (listener, addr) = bind_free().await;
+        let (mut client, server) = connect(&listener, addr).await;
+        let mut reader = BufReader::new(server);
+
+        // RFC 6587 octet-counted: "11 hello world" means 11 bytes follow the space
+        client.write_all(b"11 hello world").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = read_octet_counted_or_line(&mut reader).await.unwrap();
+        assert_eq!(result.as_deref(), Some("hello world"));
+    }
+
+    #[tokio::test]
+    async fn read_octet_counted_oversized_returns_error() {
+        let (listener, addr) = bind_free().await;
+        let (mut client, server) = connect(&listener, addr).await;
+        let mut reader = BufReader::new(server);
+
+        // Claim a message of MAX_MESSAGE_SIZE + 1 bytes
+        let length = MAX_MESSAGE_SIZE + 1;
+        client
+            .write_all(format!("{length} ").as_bytes())
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = read_octet_counted_or_line(&mut reader).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn digit_prefixed_line_delimited_fallback() {
+        let (listener, addr) = bind_free().await;
+        let (mut client, server) = connect(&listener, addr).await;
+        let mut reader = BufReader::new(server);
+
+        // A message starting with digits but followed by a newline (not octet-counting)
+        client.write_all(b"42\n").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = read_octet_counted_or_line(&mut reader).await.unwrap();
+        assert_eq!(result.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_idle_timeout() {
+        let (listener, addr) = bind_free().await;
+        let (_client, server) = connect(&listener, addr).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+        let start = tokio::time::Instant::now();
+        handle_tcp_connection(
+            server,
+            "127.0.0.1".parse().unwrap(),
+            tx,
+            &std::collections::HashMap::new(),
+            "syslog",
+            Duration::from_millis(50), // very short timeout for test
+            100_000,
+            100,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // Should have disconnected after ~50ms idle timeout
+        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_max_events_limit() {
+        let (listener, addr) = bind_free().await;
+        let (mut client, server) = connect(&listener, addr).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+        // Send 5 events, set limit to 3
+        let handle = tokio::spawn(async move {
+            handle_tcp_connection(
+                server,
+                "127.0.0.1".parse().unwrap(),
+                tx,
+                &std::collections::HashMap::new(),
+                "syslog",
+                Duration::from_secs(5),
+                3, // max 3 events
+                100,
+            )
+            .await;
+        });
+
+        for _ in 0..5 {
+            client.write_all(b"<13>test message\n").await.unwrap();
+        }
+
+        handle.await.unwrap();
+
+        // Should have received at most 3 events
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+}
