@@ -57,6 +57,10 @@ impl SyslogBatcher {
     }
 
     /// Run the batcher loop until shutdown.
+    ///
+    /// While a flush is in progress (awaiting `spawn_blocking`), the
+    /// channel buffers incoming events (capacity 10k). Senders get
+    /// back-pressure via `try_send` failures at the listener level.
     pub async fn run(mut self, mut shutdown_rx: watch::Receiver<bool>) {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(self.batch_interval_ms));
@@ -76,7 +80,7 @@ impl SyslogBatcher {
                     if *shutdown_rx.borrow() {
                         // Flush remaining events before exiting
                         if pending_count > 0 {
-                            self.flush(&mut pending, &mut pending_count, udp_count, tcp_count);
+                            self.flush(&mut pending, &mut pending_count, udp_count, tcp_count).await;
                         }
                         tracing::info!(
                             event_type = "syslog_batcher_shutdown",
@@ -91,7 +95,7 @@ impl SyslogBatcher {
                     let Some(evt) = event else {
                         // All senders dropped — flush and exit
                         if pending_count > 0 {
-                            self.flush(&mut pending, &mut pending_count, udp_count, tcp_count);
+                            self.flush(&mut pending, &mut pending_count, udp_count, tcp_count).await;
                         }
                         return;
                     };
@@ -108,7 +112,7 @@ impl SyslogBatcher {
                     pending_count += 1;
 
                     if pending_count >= self.batch_max_events {
-                        self.flush(&mut pending, &mut pending_count, udp_count, tcp_count);
+                        self.flush(&mut pending, &mut pending_count, udp_count, tcp_count).await;
                         udp_count = 0;
                         tcp_count = 0;
                     }
@@ -117,7 +121,7 @@ impl SyslogBatcher {
                 // Timer tick — flush if we have pending events
                 _ = interval.tick() => {
                     if pending_count > 0 {
-                        self.flush(&mut pending, &mut pending_count, udp_count, tcp_count);
+                        self.flush(&mut pending, &mut pending_count, udp_count, tcp_count).await;
                         udp_count = 0;
                         tcp_count = 0;
                     }
@@ -126,7 +130,12 @@ impl SyslogBatcher {
         }
     }
 
-    fn flush(
+    /// Flush pending batches through the pipeline in a blocking task.
+    ///
+    /// WAL writes (`std::fs::write` + `std::fs::rename`) are synchronous
+    /// I/O, so we run them on the blocking thread pool to avoid stalling
+    /// the tokio runtime.
+    async fn flush(
         &self,
         pending: &mut IndexMap<String, ServiceBatch>,
         pending_count: &mut usize,
@@ -138,7 +147,17 @@ impl SyslogBatcher {
         let events = *pending_count;
         *pending_count = 0;
 
-        let written = self.pipeline.write(batches);
+        let pipeline = Arc::clone(&self.pipeline);
+        let written = tokio::task::spawn_blocking(move || pipeline.write(batches))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    event_type = "syslog_flush_panic",
+                    error = %e,
+                    "syslog pipeline flush task panicked"
+                );
+                0
+            });
 
         // Update metrics
         metrics::counter!(crate::metrics::INGEST_EVENTS_TOTAL).increment(written as u64);
