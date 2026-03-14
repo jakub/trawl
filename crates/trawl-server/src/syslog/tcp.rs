@@ -181,6 +181,10 @@ async fn handle_tcp_connection(
 }
 
 /// Read a newline-delimited message from the stream.
+///
+/// If the message exceeds `MAX_MESSAGE_SIZE`, the remainder of the line
+/// is drained and discarded. Returns an empty string so the caller skips
+/// the oversized message without silently splitting it into fragments.
 async fn read_line(
     reader: &mut BufReader<tokio::net::TcpStream>,
 ) -> Result<Option<String>, std::io::Error> {
@@ -192,9 +196,42 @@ async fn read_line(
     if bytes_read == 0 {
         return Ok(None);
     }
-    // Strip trailing newline/carriage return
+
+    // If take() capped the read, the line won't end with '\n' — the
+    // message was truncated. Drain the remainder to stay in sync.
+    if !line.ends_with('\n') {
+        drain_to_newline(reader).await?;
+        metrics::counter!(crate::metrics::SYSLOG_PARSE_ERRORS_TOTAL, "transport" => "tcp")
+            .increment(1);
+        tracing::debug!(
+            event_type = "syslog_tcp_oversized",
+            max_bytes = MAX_MESSAGE_SIZE,
+            "TCP syslog message exceeded size limit, discarding"
+        );
+        return Ok(Some(String::new()));
+    }
+
     let trimmed = line.trim_end_matches(['\n', '\r']).to_owned();
     Ok(Some(trimmed))
+}
+
+/// Drain bytes from the reader until a newline is found or EOF.
+///
+/// Used to skip the remainder of an oversized line-delimited message.
+async fn drain_to_newline(
+    reader: &mut BufReader<tokio::net::TcpStream>,
+) -> Result<(), std::io::Error> {
+    loop {
+        let mut discard = String::new();
+        let n = reader
+            .take(MAX_MESSAGE_SIZE as u64)
+            .read_line(&mut discard)
+            .await?;
+        if n == 0 || discard.ends_with('\n') {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Try to read an octet-counted message (RFC 6587).
@@ -234,13 +271,23 @@ async fn read_octet_counted_or_line(
 
         // If we've read too many characters without a separator, treat as newline-delimited
         if prefix.len() > 10 || (!byte.is_ascii_digit() && byte != b'\r') {
-            // Read the rest of the line
+            // Read the rest of the line (bounded to prevent oversized message splitting)
             let mut rest = String::new();
+            let remaining_budget = MAX_MESSAGE_SIZE.saturating_sub(prefix.len());
             reader
-                .take(MAX_MESSAGE_SIZE as u64)
+                .take(remaining_budget as u64)
                 .read_line(&mut rest)
                 .await?;
             prefix.push_str(&rest);
+
+            // If the combined message was truncated, drain the remainder
+            if !prefix.ends_with('\n') {
+                drain_to_newline(reader).await?;
+                metrics::counter!(crate::metrics::SYSLOG_PARSE_ERRORS_TOTAL, "transport" => "tcp")
+                    .increment(1);
+                return Ok(Some(String::new()));
+            }
+
             let trimmed = prefix.trim_end_matches(['\n', '\r']).to_owned();
             return Ok(Some(trimmed));
         }
