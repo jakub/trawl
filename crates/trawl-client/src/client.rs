@@ -11,7 +11,7 @@ use crate::types::{
     CancelResponse, DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse,
     FieldValuesResponse, HealthResponse, HistoryResponse, IngestResponse, ListReportRunsResponse,
     ListSavedResponse, QueriesResponse, QueryResponse, ReportRunResponse, SavedQueryResponse,
-    ScheduleResponse, SchemaResponse, StatsResponse, ValidationResponse,
+    ScheduleResponse, SchemaResponse, StatsResponse, ValidationResponse, WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
@@ -297,6 +297,13 @@ impl HttpClient {
     /// Fetch server stats (admin only).
     pub async fn stats(&self) -> Result<StatsResponse, ClientError> {
         let url = self.endpoint("/api/v1/stats");
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Fetch identity and permissions for the current token.
+    pub async fn whoami(&self) -> Result<WhoAmIResponse, ClientError> {
+        let url = self.endpoint("/api/v1/whoami");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
     }

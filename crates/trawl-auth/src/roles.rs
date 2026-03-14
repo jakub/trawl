@@ -44,6 +44,24 @@ pub enum Permission {
     Ingest,
 }
 
+impl Permission {
+    /// Snake-case string representation for wire formats.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::SchemaRead => "schema_read",
+            Self::Validate => "validate",
+            Self::SavedQuery => "saved_query",
+            Self::Export => "export",
+            Self::Stream => "stream",
+            Self::QueryCancel => "query_cancel",
+            Self::KeyManage => "key_manage",
+            Self::ServerManage => "server_manage",
+            Self::Ingest => "ingest",
+        }
+    }
+}
+
 impl Role {
     /// All defined roles.
     pub const ALL: &[Self] = &[Self::Admin, Self::Analyst, Self::Reader, Self::Ingest];

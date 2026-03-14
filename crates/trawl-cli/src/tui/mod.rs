@@ -2158,6 +2158,7 @@ impl App {
 }
 
 /// Run the TUI application.
+#[allow(clippy::too_many_lines)] // orchestration entry point — splitting adds indirection without clarity
 pub async fn run(
     config: &Config,
     direct_token: Option<&str>,
@@ -2180,15 +2181,22 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Fetch schema, history, saved queries, service list, server version, and admin status in parallel.
+    // Fetch schema, history, saved queries, service list, server version, and permissions in parallel.
     tracing::info!("fetching startup data");
-    let (schema_result, history_result, saved_result, services_result, health_result, is_admin) = tokio::join!(
+    let (
+        schema_result,
+        history_result,
+        saved_result,
+        services_result,
+        health_result,
+        whoami_result,
+    ) = tokio::join!(
         client.schema(),
         client.history(Some(100), None),
         client.list_saved(),
         client.field_values("service", Some(500)),
         client.health(),
-        async { client.stats().await.is_ok() },
+        client.whoami(),
     );
 
     let schema = match schema_result {
@@ -2255,9 +2263,15 @@ pub async fn run(
     app.saved_cache = saved;
     app.service_list_cache = services;
     app.server_version = server_version;
+    let is_admin = whoami_result
+        .as_ref()
+        .map(|w| w.permissions.iter().any(|p| p == "server_manage"))
+        .unwrap_or(false);
     app.dashboard.is_admin = is_admin;
     if is_admin {
         tracing::info!("admin privileges detected — Dashboard tab enabled");
+    } else if let Err(e) = &whoami_result {
+        tracing::warn!("failed to fetch permissions: {e} — Dashboard tab disabled");
     }
 
     // Start driver socket if requested.

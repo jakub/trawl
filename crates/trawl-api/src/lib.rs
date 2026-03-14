@@ -403,6 +403,19 @@ pub struct StatsResponse {
     pub pool_capacity: usize,
 }
 
+// -- whoami ------------------------------------------------------------------
+
+/// Response from the whoami endpoint — token identity and permissions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoAmIResponse {
+    /// Key name (human-readable label).
+    pub name: String,
+    /// Role granted by this key (e.g. "admin", "analyst", "reader", "ingest").
+    pub role: String,
+    /// Permissions granted by this role (e.g. "query", "`server_manage`").
+    pub permissions: Vec<String>,
+}
+
 // -- dashboard ---------------------------------------------------------------
 
 /// Full dashboard snapshot returned by the admin-only dashboard endpoint.
@@ -956,6 +969,20 @@ mod tests {
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.status, HealthStatus::Ok);
         assert!(resp.checks.is_none());
+    }
+
+    #[test]
+    fn whoami_roundtrip() {
+        let resp = WhoAmIResponse {
+            name: "dev-key".into(),
+            role: "admin".into(),
+            permissions: vec!["query".into(), "schema_read".into(), "server_manage".into()],
+        };
+        let rt = roundtrip(&resp);
+        assert_eq!(rt.name, "dev-key");
+        assert_eq!(rt.role, "admin");
+        assert_eq!(rt.permissions.len(), 3);
+        assert!(rt.permissions.contains(&"server_manage".to_owned()));
     }
 
     #[test]

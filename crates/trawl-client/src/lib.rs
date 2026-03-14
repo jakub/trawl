@@ -17,5 +17,5 @@ pub use types::{
     HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse, ListSavedResponse,
     PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, SavedQueryResponse,
     SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent, UpdateSavedRequest,
-    ValidationResponse,
+    ValidationResponse, WhoAmIResponse,
 };

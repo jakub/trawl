@@ -784,6 +784,37 @@ async fn stats_endpoint_analyst_forbidden() {
 }
 
 #[tokio::test]
+async fn whoami_admin_has_server_manage() {
+    let server = setup().await;
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let resp = admin.whoami().await.unwrap();
+    assert_eq!(resp.role, "admin");
+    assert!(resp.permissions.contains(&"server_manage".to_owned()));
+    assert!(resp.permissions.contains(&"query".to_owned()));
+}
+
+#[tokio::test]
+async fn whoami_reader_lacks_server_manage() {
+    let server = setup().await;
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    let resp = reader.whoami().await.unwrap();
+    assert_eq!(resp.role, "reader");
+    assert!(!resp.permissions.contains(&"server_manage".to_owned()));
+    assert!(resp.permissions.contains(&"query".to_owned()));
+}
+
+#[tokio::test]
+async fn whoami_rejects_missing_auth() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, "invalid-token").unwrap();
+
+    let result = client.whoami().await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn field_values_endpoint() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();

@@ -10,14 +10,13 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
-use trawl_api::DashboardSnapshot;
 use trawl_api::{
-    CancelResponse, CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, ExportRequest,
-    FieldValuesResponse, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
-    ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
-    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
-    ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse,
-    UpdateSavedRequest, ValidationResponse,
+    CancelResponse, CreateSavedRequest, DashboardSnapshot, DeleteSavedResponse,
+    DeleteScheduleResponse, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
+    HistoryEntryResponse, HistoryResponse, ListReportRunsResponse, ListSavedResponse,
+    PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse,
+    ReportRunSummary, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
+    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
 use trawl_auth::keys::VerifiedKey;
 use trawl_auth::roles::Permission;
@@ -655,6 +654,25 @@ pub async fn stats(
         pool_available: state.query.pool.available_permits(),
         pool_capacity: state.query.pool.capacity(),
     }))
+}
+
+/// `GET /api/v1/whoami` — returns identity and permissions for the current token.
+///
+/// Available to any authenticated user. No permission check needed — if the
+/// token passed auth middleware, the user is entitled to know their own role.
+pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIResponse> {
+    let permissions = verified
+        .role
+        .permissions()
+        .iter()
+        .map(|p| p.as_str().to_owned())
+        .collect();
+
+    Json(WhoAmIResponse {
+        name: verified.name.clone(),
+        role: verified.role.as_str().to_owned(),
+        permissions,
+    })
 }
 
 /// `GET /api/v1/dashboard` — full dashboard snapshot (admin only).
