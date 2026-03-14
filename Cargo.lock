@@ -4667,6 +4667,7 @@ dependencies = [
  "insta",
  "ratatui",
  "trawl-api",
+ "unicode-width",
 ]
 
 [[package]]

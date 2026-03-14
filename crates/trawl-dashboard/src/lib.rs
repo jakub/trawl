@@ -14,6 +14,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Row, Table};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use trawl_api::DashboardSnapshot;
 
@@ -553,16 +554,27 @@ pub fn format_bytes(bytes: usize) -> String {
     }
 }
 
-/// Truncate a query string to fit within `max_width`, appending "..." if needed.
+/// Truncate a query string to fit within `max_width` display columns,
+/// appending "..." if needed. Uses unicode display width, not byte length.
 pub fn truncate_query(query: &str, max_width: usize) -> String {
     let collapsed: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.len() <= max_width {
-        collapsed
-    } else if max_width > 3 {
-        format!("{}...", &collapsed[..max_width - 3])
-    } else {
-        collapsed[..max_width].to_owned()
+    if UnicodeWidthStr::width(collapsed.as_str()) <= max_width {
+        return collapsed;
     }
+    let suffix = if max_width > 3 { "..." } else { "" };
+    let target = max_width.saturating_sub(suffix.len());
+    let mut result = String::new();
+    let mut width = 0;
+    for ch in collapsed.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > target {
+            break;
+        }
+        result.push(ch);
+        width += ch_width;
+    }
+    result.push_str(suffix);
+    result
 }
 
 #[cfg(test)]
@@ -730,5 +742,33 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(45)), "45s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
         assert_eq!(format_duration(Duration::from_secs(9240)), "2h 34m");
+    }
+
+    #[test]
+    fn truncate_query_ascii() {
+        assert_eq!(truncate_query("short", 10), "short");
+        assert_eq!(
+            truncate_query("a really long query string", 10),
+            "a reall..."
+        );
+        assert_eq!(truncate_query("abc", 3), "abc");
+        assert_eq!(truncate_query("abcd", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_query_multibyte() {
+        // CJK characters are 2 display columns wide.
+        assert_eq!(truncate_query("日本語テスト", 12), "日本語テスト");
+        assert_eq!(truncate_query("日本語テスト", 10), "日本語...");
+    }
+
+    #[test]
+    fn truncate_query_collapses_whitespace() {
+        assert_eq!(truncate_query("a  b   c", 20), "a b c");
+    }
+
+    #[test]
+    fn truncate_query_zero_width() {
+        assert_eq!(truncate_query("abc", 0), "");
     }
 }
