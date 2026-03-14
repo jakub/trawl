@@ -4,6 +4,7 @@
 //! newline-delimited framing (most common) or RFC 6587 octet-counting.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
@@ -76,6 +77,9 @@ pub async fn run_tcp_listener(
                 let conn_sender = sender.clone();
                 let conn_config_service_map = config.source_service_map.clone();
                 let conn_default_service = config.default_service.clone();
+                let idle_timeout = Duration::from_secs(config.tcp_idle_timeout_secs);
+                let max_events = config.max_events_per_connection;
+                let send_failure_limit = config.consecutive_send_failures_limit;
 
                 tokio::spawn(async move {
                     handle_tcp_connection(
@@ -84,6 +88,9 @@ pub async fn run_tcp_listener(
                         conn_sender,
                         &conn_config_service_map,
                         &conn_default_service,
+                        idle_timeout,
+                        max_events,
+                        send_failure_limit,
                     )
                     .await;
 
@@ -99,21 +106,45 @@ pub async fn run_tcp_listener(
 ///
 /// Reads messages using newline-delimited framing. Also supports
 /// RFC 6587 octet-counting if the first byte is a digit.
+///
+/// The connection is closed when:
+/// - the client disconnects or sends EOF
+/// - the idle timeout fires (no data received within the timeout)
+/// - `max_events` events have been processed
+/// - `send_failure_limit` consecutive sends to the batcher fail
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     stream: tokio::net::TcpStream,
     source_ip: std::net::IpAddr,
     sender: SyslogSender,
     source_service_map: &std::collections::HashMap<String, String>,
     default_service: &str,
+    idle_timeout: Duration,
+    max_events: usize,
+    send_failure_limit: usize,
 ) {
     let mut reader = BufReader::new(stream);
+    let mut event_count: usize = 0;
+    let mut consecutive_send_failures: usize = 0;
 
     loop {
-        // Peek at the first byte to detect framing mode
-        let buf = match reader.fill_buf().await {
-            Ok([]) => break, // Connection closed
-            Ok(buf) => buf,
-            Err(e) => {
+        // Wrap the read in an idle timeout — if the client sends nothing
+        // for this long, close the connection to free the permit.
+        let read_result = tokio::time::timeout(idle_timeout, read_message(&mut reader)).await;
+
+        let line = match read_result {
+            Err(_elapsed) => {
+                tracing::debug!(
+                    event_type = "syslog_tcp_idle_timeout",
+                    source = %source_ip,
+                    events = event_count,
+                    "TCP connection idle timeout, closing"
+                );
+                break;
+            }
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break, // EOF
+            Ok(Err(e)) => {
                 tracing::debug!(
                     event_type = "syslog_tcp_read_error",
                     source = %source_ip,
@@ -121,42 +152,6 @@ async fn handle_tcp_connection(
                     "TCP read error"
                 );
                 break;
-            }
-        };
-
-        let first_byte = buf[0];
-
-        let line = if first_byte.is_ascii_digit() {
-            // Might be octet-counting: "123 <...message...>"
-            match read_octet_counted_or_line(&mut reader).await {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::debug!(
-                        event_type = "syslog_tcp_frame_error",
-                        source = %source_ip,
-                        error = %e,
-                        "TCP framing error"
-                    );
-                    metrics::counter!(crate::metrics::SYSLOG_PARSE_ERRORS_TOTAL, "transport" => "tcp")
-                        .increment(1);
-                    break;
-                }
-            }
-        } else {
-            // Newline-delimited framing
-            match read_line(&mut reader).await {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::debug!(
-                        event_type = "syslog_tcp_read_error",
-                        source = %source_ip,
-                        error = %e,
-                        "TCP line read error"
-                    );
-                    break;
-                }
             }
         };
 
@@ -176,7 +171,60 @@ async fn handle_tcp_connection(
 
         if sender.try_send(event).is_err() {
             metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
+            consecutive_send_failures += 1;
+            if consecutive_send_failures >= send_failure_limit {
+                tracing::warn!(
+                    event_type = "syslog_tcp_backpressure_disconnect",
+                    source = %source_ip,
+                    failures = consecutive_send_failures,
+                    "batcher overwhelmed, disconnecting TCP client"
+                );
+                break;
+            }
+        } else {
+            consecutive_send_failures = 0;
         }
+
+        event_count += 1;
+        if event_count >= max_events {
+            tracing::info!(
+                event_type = "syslog_tcp_event_limit",
+                source = %source_ip,
+                events = event_count,
+                "TCP connection reached event limit, closing"
+            );
+            break;
+        }
+    }
+}
+
+/// Read a single syslog message from a TCP stream.
+///
+/// Auto-detects framing mode: if the first byte is a digit, tries
+/// RFC 6587 octet-counting; otherwise uses newline-delimited framing.
+async fn read_message(
+    reader: &mut BufReader<tokio::net::TcpStream>,
+) -> Result<Option<String>, std::io::Error> {
+    // Peek at the first byte to detect framing mode
+    let buf = reader.fill_buf().await?;
+    if buf.is_empty() {
+        return Ok(None); // Connection closed
+    }
+
+    let first_byte = buf[0];
+
+    if first_byte.is_ascii_digit() {
+        // Might be octet-counting: "123 <...message...>"
+        match read_octet_counted_or_line(reader).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                metrics::counter!(crate::metrics::SYSLOG_PARSE_ERRORS_TOTAL, "transport" => "tcp")
+                    .increment(1);
+                Err(e)
+            }
+        }
+    } else {
+        read_line(reader).await
     }
 }
 
