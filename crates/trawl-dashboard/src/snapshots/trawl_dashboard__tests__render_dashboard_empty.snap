@@ -1,5 +1,5 @@
 ---
-source: crates/trawl-server/src/monitor/ui.rs
+source: crates/trawl-dashboard/src/lib.rs
 expression: terminal.backend().to_string()
 ---
 " trawld v0.1.0                                                                  "

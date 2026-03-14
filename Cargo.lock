@@ -4626,6 +4626,7 @@ dependencies = [
  "tracing-subscriber",
  "trawl-client",
  "trawl-core",
+ "trawl-dashboard",
  "trawl-engine",
  "unicode-width",
 ]
@@ -4657,6 +4658,16 @@ dependencies = [
  "regex",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "trawl-dashboard"
+version = "0.1.7"
+dependencies = [
+ "insta",
+ "ratatui",
+ "trawl-api",
+ "unicode-width",
 ]
 
 [[package]]
@@ -4720,6 +4731,7 @@ dependencies = [
  "trawl-auth",
  "trawl-client",
  "trawl-core",
+ "trawl-dashboard",
  "trawl-engine",
  "ulid",
  "x509-parser",

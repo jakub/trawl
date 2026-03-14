@@ -11,12 +11,12 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
 use trawl_api::{
-    CancelResponse, CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, ExportRequest,
-    FieldValuesResponse, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
-    ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
-    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
-    ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse,
-    UpdateSavedRequest, ValidationResponse,
+    CancelResponse, CreateSavedRequest, DashboardSnapshot, DeleteSavedResponse,
+    DeleteScheduleResponse, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
+    HistoryEntryResponse, HistoryResponse, ListReportRunsResponse, ListSavedResponse,
+    PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse,
+    ReportRunSummary, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
+    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
 use trawl_auth::keys::VerifiedKey;
 use trawl_auth::roles::Permission;
@@ -654,6 +654,46 @@ pub async fn stats(
         pool_available: state.query.pool.available_permits(),
         pool_capacity: state.query.pool.capacity(),
     }))
+}
+
+/// `GET /api/v1/whoami` — returns identity and permissions for the current token.
+///
+/// Available to any authenticated user. No permission check needed — if the
+/// token passed auth middleware, the user is entitled to know their own role.
+pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIResponse> {
+    let permissions = verified
+        .role
+        .permissions()
+        .iter()
+        .map(|p| p.as_str().to_owned())
+        .collect();
+
+    Json(WhoAmIResponse {
+        name: verified.name.clone(),
+        role: verified.role.as_str().to_owned(),
+        permissions,
+    })
+}
+
+/// `GET /api/v1/dashboard` — full dashboard snapshot (admin only).
+///
+/// Returns the latest [`DashboardSnapshot`] collected by the background
+/// snapshot collector. Available even when the terminal monitor is disabled.
+pub async fn dashboard(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<DashboardSnapshot>, ServerError> {
+    if !verified.role.has_permission(Permission::ServerManage) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let snapshot = state.dashboard_snapshot.lock().clone();
+    match snapshot {
+        Some(s) => Ok(Json(s)),
+        None => Err(ServerError::ServiceUnavailable(
+            "dashboard data not yet available".into(),
+        )),
+    }
 }
 
 /// `GET /api/v1/schema/values/{field}` — sample distinct values for autocomplete.

@@ -42,26 +42,46 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Spawn a background task that collects dashboard snapshots on a 1s interval.
+///
+/// Runs regardless of terminal mode — makes `GET /api/v1/dashboard` available
+/// even when the server runs under systemd (no TTY) or with `--no-monitor`.
+/// The [`RateTracker`](state::RateTracker) inside needs regular ticks to
+/// produce meaningful EMA-smoothed rates, so on-demand computation isn't viable.
+pub fn spawn_snapshot_collector(
+    app_state: AppState,
+    listen_addr: String,
+    sse_max: usize,
+    scheduler_enabled: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut monitor =
+            state::from_app_state(app_state.clone(), &listen_addr, sse_max, scheduler_enabled);
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let snapshot = monitor.snapshot();
+            *app_state.dashboard_snapshot.lock() = Some(snapshot.to_dashboard_snapshot());
+        }
+    })
+}
+
 /// Run the monitor dashboard until shutdown is signalled.
+///
+/// Reads the shared [`DashboardSnapshot`] produced by
+/// [`spawn_snapshot_collector`] and renders it to the terminal. This
+/// ensures the terminal and HTTP API always show identical metrics.
 ///
 /// Sets up the terminal in raw/alternate-screen mode, ticks at
 /// `refresh_ms` intervals, and restores the terminal on exit.
 /// Notifies `shutdown` on ctrl-c so the HTTP server can drain.
-pub async fn run(
-    app_state: AppState,
-    listen_addr: &str,
-    sse_max: usize,
-    scheduler_enabled: bool,
-    refresh_ms: u64,
-    shutdown: Arc<Notify>,
-) -> io::Result<()> {
+pub async fn run(app_state: AppState, refresh_ms: u64, shutdown: Arc<Notify>) -> io::Result<()> {
     let _guard = TerminalGuard::new()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-
-    let mut monitor = state::from_app_state(app_state, listen_addr, sse_max, scheduler_enabled);
 
     let mut interval = tokio::time::interval(Duration::from_millis(refresh_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -83,8 +103,14 @@ pub async fn run(
                     }
                 }
 
-                let snapshot = monitor.snapshot();
-                terminal.draw(|f| ui::render(&snapshot, f))?;
+                // Read the shared snapshot produced by spawn_snapshot_collector.
+                let snapshot = app_state.dashboard_snapshot.lock().clone();
+                if let Some(ref ds) = snapshot {
+                    let opts = trawl_dashboard::DashboardOptions::default();
+                    terminal.draw(|f| {
+                        trawl_dashboard::render_dashboard(ds, f, f.area(), &opts);
+                    })?;
+                }
             }
         }
     }

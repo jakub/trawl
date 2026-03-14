@@ -16,6 +16,7 @@ trawl-api = { workspace = true }
 trawl-core = { workspace = true }
 trawl-engine = { workspace = true }
 trawl-auth = { workspace = true }
+trawl-dashboard = { workspace = true }
 
 async-stream = { workspace = true }
 axum = { workspace = true }

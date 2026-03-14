@@ -145,6 +145,8 @@ the trawl server exposes a REST API. all routes under `/api/v1` except `/health`
 | `GET` | `/api/v1/queries` | list running queries |
 | `DELETE` | `/api/v1/queries/{id}` | cancel a running query |
 | `GET` | `/api/v1/stats` | server statistics |
+| `GET` | `/api/v1/dashboard` | full dashboard snapshot (admin only) |
+| `GET` | `/api/v1/whoami` | token identity and permissions |
 | `GET` | `/api/v1/history` | query execution history |
 | `GET` | `/api/v1/saved` | list saved queries |
 | `POST` | `/api/v1/saved` | create a saved query |

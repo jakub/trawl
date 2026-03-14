@@ -113,6 +113,8 @@ pub enum ErrorCode {
     TooManyStreams,
     /// Internal server error (500).
     InternalError,
+    /// Service temporarily unavailable (503).
+    ServiceUnavailable,
 }
 
 /// Source location within a query string.
@@ -399,6 +401,96 @@ pub struct StatsResponse {
     pub pool_available: usize,
     /// Total connection pool capacity.
     pub pool_capacity: usize,
+}
+
+// -- whoami ------------------------------------------------------------------
+
+/// Response from the whoami endpoint — token identity and permissions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoAmIResponse {
+    /// Key name (human-readable label).
+    pub name: String,
+    /// Role granted by this key (e.g. "admin", "analyst", "reader", "ingest").
+    pub role: String,
+    /// Permissions granted by this role (e.g. "query", "`server_manage`").
+    pub permissions: Vec<String>,
+}
+
+// -- dashboard ---------------------------------------------------------------
+
+/// Full dashboard snapshot returned by the admin-only dashboard endpoint.
+///
+/// Contains all metrics displayed by the server's live monitor: executor pool,
+/// hot buffer, query throughput, ingest rates, SSE connections, scheduler
+/// status, and recent/active queries. Rates are pre-computed (EMA-smoothed)
+/// by the server — clients render them directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSnapshot {
+    // -- header --
+    /// Server hostname.
+    pub hostname: String,
+    /// Listen address (e.g. "0.0.0.0:5514").
+    pub listen_addr: String,
+    /// Server uptime in seconds.
+    pub uptime_secs: u64,
+    /// Server version string.
+    pub version: String,
+    /// Whether the server considers itself healthy.
+    pub healthy: bool,
+
+    // -- executor pool --
+    /// Total executor pool capacity.
+    pub pool_capacity: usize,
+    /// Currently active (in-use) pool slots.
+    pub pool_active: usize,
+
+    // -- hot buffer --
+    /// Current event count in the hot buffer.
+    pub hot_buffer_events: usize,
+    /// Maximum event capacity.
+    pub hot_buffer_max_events: usize,
+    /// Current byte usage.
+    pub hot_buffer_bytes: usize,
+    /// Maximum byte capacity.
+    pub hot_buffer_max_bytes: usize,
+    /// Number of active batches.
+    pub hot_buffer_batches: usize,
+
+    // -- query throughput --
+    /// Total queries executed since startup.
+    pub total_queries: u64,
+    /// EMA-smoothed query rate (queries/sec).
+    pub query_rate: f64,
+    /// Number of recent queries that resulted in errors.
+    pub query_errors: u64,
+    /// Number of recent queries that timed out.
+    pub query_timeouts: u64,
+
+    // -- ingest --
+    /// Total events ingested since startup.
+    pub ingest_events: u64,
+    /// EMA-smoothed ingest rate (events/sec).
+    pub ingest_rate: f64,
+    /// Total rejected events.
+    pub ingest_rejected: u64,
+
+    // -- SSE --
+    /// Active SSE streaming connections.
+    pub sse_active: usize,
+    /// Maximum SSE connections allowed.
+    pub sse_max: usize,
+
+    // -- scheduler --
+    /// Whether the scheduler is enabled.
+    pub scheduler_enabled: bool,
+    /// Number of active schedules.
+    pub scheduler_schedules: usize,
+
+    // -- queries --
+    /// Recently completed queries (most recent first).
+    pub recent_queries: Vec<CompletedQuerySnapshot>,
+    /// Currently executing queries.
+    pub active_queries: Vec<ActiveQuerySnapshot>,
 }
 
 /// Response from the field values endpoint.
@@ -877,5 +969,73 @@ mod tests {
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.status, HealthStatus::Ok);
         assert!(resp.checks.is_none());
+    }
+
+    #[test]
+    fn whoami_roundtrip() {
+        let resp = WhoAmIResponse {
+            name: "dev-key".into(),
+            role: "admin".into(),
+            permissions: vec!["query".into(), "schema_read".into(), "server_manage".into()],
+        };
+        let rt = roundtrip(&resp);
+        assert_eq!(rt.name, "dev-key");
+        assert_eq!(rt.role, "admin");
+        assert_eq!(rt.permissions.len(), 3);
+        assert!(rt.permissions.contains(&"server_manage".to_owned()));
+    }
+
+    #[test]
+    fn dashboard_snapshot_roundtrip() {
+        let snapshot = DashboardSnapshot {
+            hostname: "test-host".into(),
+            listen_addr: "127.0.0.1:5514".into(),
+            uptime_secs: 9240,
+            version: "0.1.0".into(),
+            healthy: true,
+            pool_capacity: 4,
+            pool_active: 1,
+            hot_buffer_events: 12_847,
+            hot_buffer_max_events: 100_000,
+            hot_buffer_bytes: 4_404_019,
+            hot_buffer_max_bytes: 104_857_600,
+            hot_buffer_batches: 23,
+            total_queries: 1247,
+            query_rate: 2.1,
+            query_errors: 12,
+            query_timeouts: 3,
+            ingest_events: 847_293,
+            ingest_rate: 340.0,
+            ingest_rejected: 47,
+            sse_active: 2,
+            sse_max: 32,
+            scheduler_enabled: true,
+            scheduler_schedules: 3,
+            recent_queries: vec![CompletedQuerySnapshot {
+                id: 1,
+                user: "admin".into(),
+                query: "level=error".into(),
+                duration_ms: 23,
+                rows: Some(42),
+                error: None,
+                timed_out: false,
+            }],
+            active_queries: vec![ActiveQuerySnapshot {
+                id: 2,
+                user: "admin".into(),
+                role: "admin".into(),
+                query: "* | stats count()".into(),
+                running_ms: 500,
+            }],
+        };
+        let rt = roundtrip(&snapshot);
+        assert_eq!(rt.hostname, "test-host");
+        assert_eq!(rt.uptime_secs, 9240);
+        assert_eq!(rt.pool_capacity, 4);
+        assert_eq!(rt.hot_buffer_events, 12_847);
+        assert_eq!(rt.total_queries, 1247);
+        assert!((rt.query_rate - 2.1).abs() < f64::EPSILON);
+        assert_eq!(rt.recent_queries.len(), 1);
+        assert_eq!(rt.active_queries.len(), 1);
     }
 }

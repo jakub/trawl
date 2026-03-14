@@ -22,6 +22,7 @@ pub mod tabs;
 pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     match app.main_tab {
         MainTab::Query => render_query_layout(app, frame),
+        MainTab::Dashboard => render_dashboard_layout(app, frame),
         _ => render_panel_layout(app, frame),
     }
 }
@@ -67,6 +68,47 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
         let y = outer[1].y + row.saturating_sub(scroll_row) as u16 + 1;
         frame.set_cursor_position((x, y));
     }
+}
+
+/// Render the Dashboard tab: tab bar, dashboard content, status bar.
+fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
+    use ratatui::style::{Color, Style};
+    use ratatui::widgets::Paragraph;
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Tab bar (1 row + 1 spacer)
+            Constraint::Min(1),    // Dashboard content (full height)
+            Constraint::Length(1), // Status bar
+        ])
+        .split(frame.area());
+
+    tabs::render(app, frame, outer[0]);
+
+    if let Some(ref snapshot) = app.dashboard.cache {
+        let footer = app
+            .dashboard
+            .last_error
+            .as_deref()
+            .map(|e| format!(" [stale] {e}"));
+        let opts = trawl_dashboard::DashboardOptions {
+            footer_text: footer,
+        };
+        trawl_dashboard::render_dashboard(snapshot, frame, outer[1], &opts);
+    } else if let Some(ref err) = app.dashboard.last_error {
+        let msg = Paragraph::new(format!(" Error: {err}")).style(Style::default().fg(Color::Red));
+        frame.render_widget(msg, outer[1]);
+    } else {
+        let msg =
+            Paragraph::new(" Loading dashboard...").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, outer[1]);
+    }
+
+    status::render(app, frame, outer[2]);
+
+    // Render popup overlay (if any).
+    popup::render(app, frame);
 }
 
 /// Render a non-Query tab: tab bar, full-width panel content, status bar.

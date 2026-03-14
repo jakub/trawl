@@ -12,10 +12,10 @@ pub use client::HttpClient;
 pub use error::ClientError;
 pub use types::{
     ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,
-    DeleteSavedResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse, ErrorSpan,
-    ExportFormat, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
+    DashboardSnapshot, DeleteSavedResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse,
+    ErrorSpan, ExportFormat, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
     HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse, ListSavedResponse,
     PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, SavedQueryResponse,
     SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent, UpdateSavedRequest,
-    ValidationResponse,
+    ValidationResponse, WhoAmIResponse,
 };

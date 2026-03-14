@@ -784,6 +784,65 @@ async fn stats_endpoint_analyst_forbidden() {
 }
 
 #[tokio::test]
+async fn dashboard_rejects_analyst() {
+    let server = setup().await;
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let result = analyst.dashboard().await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
+        other => panic!("expected 401, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dashboard_returns_503_before_collector_runs() {
+    // Test harness doesn't spawn the snapshot collector, so the endpoint
+    // returns 503 Service Unavailable (snapshot is None).
+    let server = setup().await;
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let result = admin.dashboard().await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 503),
+        other => panic!("expected 503, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn whoami_admin_has_server_manage() {
+    let server = setup().await;
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let resp = admin.whoami().await.unwrap();
+    assert_eq!(resp.role, "admin");
+    assert!(resp.permissions.contains(&"server_manage".to_owned()));
+    assert!(resp.permissions.contains(&"query".to_owned()));
+}
+
+#[tokio::test]
+async fn whoami_reader_lacks_server_manage() {
+    let server = setup().await;
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    let resp = reader.whoami().await.unwrap();
+    assert_eq!(resp.role, "reader");
+    assert!(!resp.permissions.contains(&"server_manage".to_owned()));
+    assert!(resp.permissions.contains(&"query".to_owned()));
+}
+
+#[tokio::test]
+async fn whoami_rejects_missing_auth() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, "invalid-token").unwrap();
+
+    let result = client.whoami().await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn field_values_endpoint() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();

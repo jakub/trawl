@@ -16,8 +16,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let mut spans = Vec::new();
 
-    // Left: status (skip when on Query tab — it's shown in the results title now)
-    if app.main_tab != MainTab::Query {
+    // Left: status (skip on Query tab — shown in results title, and Dashboard — has own indicator)
+    if app.main_tab != MainTab::Query && app.main_tab != MainTab::Dashboard {
         let status_span = match &tab.status {
             TabStatus::Idle => Span::styled("idle", Style::default().fg(Color::Gray)),
             TabStatus::Running { .. } => Span::styled(
@@ -114,7 +114,7 @@ fn get_context_hints(app: &App, width: usize) -> String {
                     "Enter load | Esc".to_owned()
                 }
             }
-            MainTab::Query => String::new(),
+            MainTab::Query | MainTab::Dashboard => String::new(),
         };
     }
 

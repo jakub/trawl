@@ -43,7 +43,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         }
         MainTab::History => render_history_list(app, frame, inner),
         MainTab::Saved => render_saved_list(app, frame, inner),
-        MainTab::Query => {} // Should not happen — Query tab uses its own layout.
+        MainTab::Query | MainTab::Dashboard => {} // Use their own layout.
     }
 }
 

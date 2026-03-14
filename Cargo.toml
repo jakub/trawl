@@ -18,6 +18,7 @@ trawl-auth = { path = "crates/trawl-auth" }
 trawl-server = { path = "crates/trawl-server" }
 trawl-api = { path = "crates/trawl-api" }
 trawl-client = { path = "crates/trawl-client" }
+trawl-dashboard = { path = "crates/trawl-dashboard" }
 
 # external deps
 aho-corasick = "1"
