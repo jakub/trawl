@@ -15,6 +15,13 @@ use syslog_loose::Message;
 use super::parse;
 use crate::ingest::pipeline;
 
+/// Maximum number of RFC 5424 structured data elements to extract.
+const MAX_SD_ELEMENTS: usize = 32;
+/// Maximum total structured data params across all elements.
+const MAX_SD_PARAMS_TOTAL: usize = 128;
+/// Maximum length of a structured data field key (`sd_{id}_{param}`).
+const MAX_SD_KEY_LEN: usize = 256;
+
 /// Sanitize a service name: strip invalid characters, truncate, fallback.
 fn sanitize_service(raw: &str) -> Option<String> {
     if raw.is_empty() {
@@ -115,11 +122,20 @@ pub fn syslog_to_event<S: BuildHasher>(
 
     map.insert("syslog_source_ip".into(), json!(source_ip.to_string()));
 
-    // Flatten RFC 5424 structured data elements
-    for element in &msg.structured_data {
+    // Flatten RFC 5424 structured data elements (bounded to prevent
+    // memory exhaustion from malicious messages with huge SD payloads).
+    let mut sd_param_count: usize = 0;
+    'outer: for element in msg.structured_data.iter().take(MAX_SD_ELEMENTS) {
         for (param_name, param_value) in &element.params {
+            if sd_param_count >= MAX_SD_PARAMS_TOTAL {
+                break 'outer;
+            }
             let key = format!("sd_{}_{}", element.id, param_name);
+            if key.len() > MAX_SD_KEY_LEN {
+                continue;
+            }
             map.insert(key, json!(param_value));
+            sd_param_count += 1;
         }
     }
 
