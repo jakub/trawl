@@ -33,6 +33,22 @@ impl Default for DashboardOptions {
     }
 }
 
+/// Standard panel block with dark gray border.
+fn panel_block(title: &str) -> Block<'_> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+}
+
+/// Highlighted panel block (for active queries).
+fn panel_block_highlight(title: &str) -> Block<'_> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+}
+
 /// Render the dashboard into the given area.
 ///
 /// The caller controls placement: the server passes `frame.area()` for
@@ -149,10 +165,7 @@ fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) 
 /// Executor pool panel with gauge.
 #[allow(clippy::cast_precision_loss)] // gauge ratio — pool capacity is small
 fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .title(" EXECUTOR POOL ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel_block(" EXECUTOR POOL ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -191,10 +204,7 @@ fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
 /// Hot buffer fill gauges.
 #[allow(clippy::cast_precision_loss)] // percentage display — precision is irrelevant
 fn render_hot_buffer(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .title(" HOT BUFFER ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel_block(" HOT BUFFER ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -244,10 +254,7 @@ fn render_hot_buffer(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: 
 
 /// Query throughput panel.
 fn render_query_throughput(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .title(" QUERY THROUGHPUT ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel_block(" QUERY THROUGHPUT ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -277,10 +284,7 @@ fn render_query_throughput(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, 
 
 /// Ingest throughput panel.
 fn render_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .title(" INGEST ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel_block(" INGEST ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -307,10 +311,7 @@ fn render_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
 
 /// SSE connections panel.
 fn render_sse(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .title(" SSE STREAMS ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel_block(" SSE STREAMS ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -325,10 +326,7 @@ fn render_sse(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
 
 /// Scheduler status panel.
 fn render_scheduler(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .title(" SCHEDULER ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel_block(" SCHEDULER ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -372,10 +370,7 @@ fn render_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rec
 
 /// Recent completed queries table.
 fn render_recent_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .title(" RECENT QUERIES ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel_block(" RECENT QUERIES ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -438,10 +433,7 @@ fn render_recent_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, ar
 
 /// Active queries table (only shown when non-empty).
 fn render_active_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .title(" ACTIVE QUERIES ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+    let block = panel_block_highlight(" ACTIVE QUERIES ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
