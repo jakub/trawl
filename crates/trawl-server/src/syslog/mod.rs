@@ -17,27 +17,20 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::bus::LocalEventBus;
 use crate::config::SyslogConfig;
-use crate::hot_buffer::HotBuffer;
 use crate::ingest::pipeline::PipelineWriter;
-use crate::ingest::wal::WalWriter;
 
 use self::batch::SyslogBatcher;
 
 /// Spawn all syslog listeners and the batcher task.
 ///
-/// Returns a join handle that completes when all listeners and the batcher
+/// Returns join handles that complete when all listeners and the batcher
 /// have shut down. Send `true` on `shutdown_tx` to initiate graceful shutdown.
 pub fn spawn_syslog(
     config: &SyslogConfig,
-    wal_writer: Arc<WalWriter>,
-    hot_buffer: Option<Arc<HotBuffer>>,
-    event_bus: Option<Arc<LocalEventBus>>,
+    pipeline: Arc<PipelineWriter>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Vec<JoinHandle<()>> {
-    let pipeline = Arc::new(PipelineWriter::new(wal_writer, hot_buffer, event_bus));
-
     let batcher = SyslogBatcher::new(config, pipeline);
     let sender = batcher.sender();
 

@@ -49,8 +49,10 @@ impl ServiceBatch {
 
 /// Shared pipeline writer that encapsulates WAL + hot buffer + event bus.
 ///
-/// Used by both the syslog batcher and (indirectly) the HTTP ingest handler
-/// to write events through the ingest pipeline.
+/// Shared pipeline writer that encapsulates WAL + hot buffer + event bus.
+///
+/// Used by both the syslog batcher and the HTTP ingest handler to write
+/// events through the ingest pipeline.
 #[derive(Debug)]
 pub struct PipelineWriter {
     wal_writer: Arc<WalWriter>,
@@ -71,6 +73,11 @@ impl PipelineWriter {
         }
     }
 
+    /// Access the underlying WAL writer.
+    pub fn wal_writer(&self) -> &Arc<WalWriter> {
+        &self.wal_writer
+    }
+
     /// Write batches through the pipeline: WAL → hot buffer → event bus.
     ///
     /// Returns the number of events successfully written. Events from
@@ -88,11 +95,11 @@ impl PipelineWriter {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        event_type = "syslog_wal_write_failed",
+                        event_type = "pipeline_wal_write_failed",
                         service = %svc,
                         events_lost = event_count,
                         error = %e,
-                        "WAL write failed for syslog batch"
+                        "WAL write failed for batch"
                     );
                 }
             }
@@ -102,7 +109,10 @@ impl PipelineWriter {
     }
 
     /// Publish a successfully-written batch to hot buffer and event bus.
-    fn publish(&self, svc: &str, batch: ServiceBatch, wal_path: &Path) {
+    ///
+    /// Called after WAL writing succeeds to make events immediately
+    /// visible to queries (via hot buffer) and SSE streams (via event bus).
+    pub(crate) fn publish(&self, svc: &str, batch: ServiceBatch, wal_path: &Path) {
         let batch_id: Arc<str> = wal_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -121,7 +131,7 @@ impl PipelineWriter {
         }
         if let Some(bus) = &self.event_bus {
             let subscribers = bus.publish(ingest_batch);
-            tracing::debug!(service = %svc, subscribers, "published syslog batch to event bus");
+            tracing::debug!(service = %svc, subscribers, "published batch to event bus");
         }
     }
 }

@@ -118,9 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handles = trawl_server::syslog::spawn_syslog(
             &config.syslog,
-            Arc::clone(state.ingest.wal_writer.as_ref().expect("ingest enabled")),
-            state.query.hot_buffer.clone(),
-            state.ingest.event_bus.clone(),
+            Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
             shutdown_rx,
         );
         tracing::info!(

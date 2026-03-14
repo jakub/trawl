@@ -16,8 +16,8 @@ use serde_json::json;
 use trawl_auth::keys::VerifiedKey;
 use trawl_auth::roles::Permission;
 
-use crate::bus::{EventBus as _, IngestBatch};
 use crate::error::ServerError;
+use crate::ingest::pipeline::{self, ServiceBatch};
 use crate::state::AppState;
 use trawl_api::{IngestEventError, IngestResponse};
 
@@ -127,13 +127,6 @@ impl RejectCounts {
     }
 }
 
-/// Events for a single service within a mixed batch.
-#[derive(Debug, Default)]
-struct ServiceBatch {
-    maps: Vec<serde_json::Map<String, serde_json::Value>>,
-    ndjson: Vec<u8>,
-}
-
 /// Parsed ingest payload, grouped by service.
 #[derive(Debug)]
 struct ParsedEvents {
@@ -144,9 +137,6 @@ struct ParsedEvents {
     /// Per-reason rejection counts for prometheus labels.
     reject_counts: RejectCounts,
 }
-
-/// Maximum service name length.
-const MAX_SERVICE_NAME_LEN: usize = 128;
 
 /// Validate a single event object, returning the service name or a typed error.
 ///
@@ -171,19 +161,17 @@ fn validate_event(
             RejectReason::EmptyService,
         ));
     }
-    if svc.len() > MAX_SERVICE_NAME_LEN {
+    if svc.len() > pipeline::MAX_SERVICE_NAME_LEN {
         return Err((
             format!(
-                "service name too long ({} chars, max {MAX_SERVICE_NAME_LEN})",
-                svc.len()
+                "service name too long ({} chars, max {})",
+                svc.len(),
+                pipeline::MAX_SERVICE_NAME_LEN,
             ),
             RejectReason::ServiceTooLong,
         ));
     }
-    if !svc
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b' ')
-    {
+    if !svc.bytes().all(pipeline::is_valid_service_char) {
         return Err((
             format!(
                 "service '{svc}' contains invalid characters \
@@ -391,28 +379,12 @@ fn finalize_ingest(
         );
     }
 
-    // Build IngestBatch per service, insert into hot buffer synchronously
-    // (so events are visible to queries immediately), then publish to bus
-    // for SSE streaming.
-    for (svc, wal_path) in wal_paths {
-        if let Some(batch) = parsed.batches.swap_remove(svc) {
-            let batch_id: Arc<str> = wal_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .into();
-            let ingest_batch = Arc::new(IngestBatch {
-                batch_id,
-                service: Arc::from(svc.as_str()),
-                byte_size: batch.ndjson.len(),
-                events: batch.maps,
-            });
-            if let Some(buf) = &state.query.hot_buffer {
-                buf.insert(Arc::clone(&ingest_batch));
-            }
-            if let Some(bus) = &state.ingest.event_bus {
-                let subscribers = bus.publish(ingest_batch);
-                tracing::debug!(service = %svc, subscribers, "published batch to event bus");
+    // Publish each successfully-written batch to hot buffer + event bus
+    // so events are visible to queries and SSE streams immediately.
+    if let Some(pipeline) = &state.ingest.pipeline {
+        for (svc, wal_path) in wal_paths {
+            if let Some(batch) = parsed.batches.swap_remove(svc) {
+                pipeline.publish(svc, batch, wal_path);
             }
         }
     }

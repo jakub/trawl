@@ -13,14 +13,7 @@ use serde_json::{Map, Value, json};
 use syslog_loose::Message;
 
 use super::parse;
-
-/// Service name validation: same charset as the HTTP ingest handler.
-fn is_valid_service_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b' '
-}
-
-/// Maximum service name length (matches HTTP ingest handler).
-const MAX_SERVICE_NAME_LEN: usize = 128;
+use crate::ingest::pipeline;
 
 /// Sanitize a service name: strip invalid characters, truncate, fallback.
 fn sanitize_service(raw: &str) -> Option<String> {
@@ -30,7 +23,7 @@ fn sanitize_service(raw: &str) -> Option<String> {
 
     let sanitized: String = raw
         .bytes()
-        .filter(|b| is_valid_service_char(*b))
+        .filter(|b| pipeline::is_valid_service_char(*b))
         .map(|b| b as char)
         .collect();
 
@@ -38,8 +31,8 @@ fn sanitize_service(raw: &str) -> Option<String> {
         return None;
     }
 
-    if sanitized.len() > MAX_SERVICE_NAME_LEN {
-        Some(sanitized[..MAX_SERVICE_NAME_LEN].to_owned())
+    if sanitized.len() > pipeline::MAX_SERVICE_NAME_LEN {
+        Some(sanitized[..pipeline::MAX_SERVICE_NAME_LEN].to_owned())
     } else {
         Some(sanitized)
     }
