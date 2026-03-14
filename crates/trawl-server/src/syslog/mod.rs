@@ -129,14 +129,20 @@ fn parse_cidrs(cidrs: &[String]) -> Arc<[CidrEntry]> {
 }
 
 fn parse_cidr(cidr: &str) -> Option<CidrEntry> {
-    let (addr_str, prefix_str) = cidr.split_once('/')?;
-    let addr: IpAddr = addr_str.parse().ok()?;
-    let prefix_len: u8 = prefix_str.parse().ok()?;
-    let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
-    if prefix_len > max_prefix {
-        return None;
+    if let Some((addr_str, prefix_str)) = cidr.split_once('/') {
+        let addr: IpAddr = addr_str.parse().ok()?;
+        let prefix_len: u8 = prefix_str.parse().ok()?;
+        let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
+        if prefix_len > max_prefix {
+            return None;
+        }
+        Some(CidrEntry { addr, prefix_len })
+    } else {
+        // Bare IP without prefix — treat as host address (/32 or /128)
+        let addr: IpAddr = cidr.parse().ok()?;
+        let prefix_len = if addr.is_ipv4() { 32 } else { 128 };
+        Some(CidrEntry { addr, prefix_len })
     }
-    Some(CidrEntry { addr, prefix_len })
 }
 
 /// Check if a source IP is allowed by the CIDR allowlist.
@@ -192,6 +198,22 @@ mod tests {
     fn parse_cidr_invalid() {
         assert!(parse_cidr("not-a-cidr").is_none());
         assert!(parse_cidr("192.168.0.0/33").is_none());
-        assert!(parse_cidr("192.168.0.0").is_none());
+        assert!(parse_cidr("/24").is_none());
+    }
+
+    #[test]
+    fn parse_cidr_bare_ipv4() {
+        let entry = parse_cidr("10.0.0.5").unwrap();
+        assert_eq!(entry.prefix_len, 32);
+        assert!(entry.contains("10.0.0.5".parse().unwrap()));
+        assert!(!entry.contains("10.0.0.6".parse().unwrap()));
+    }
+
+    #[test]
+    fn parse_cidr_bare_ipv6() {
+        let entry = parse_cidr("fd00::1").unwrap();
+        assert_eq!(entry.prefix_len, 128);
+        assert!(entry.contains("fd00::1".parse().unwrap()));
+        assert!(!entry.contains("fd00::2".parse().unwrap()));
     }
 }
