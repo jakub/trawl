@@ -88,7 +88,7 @@ The key architectural difference: Datadog indexes everything at ingest time for 
 
 ## Scaling roadmap
 
-See the [data flow](/trawl/architecture/data-flow/) page for details on the ingestion pipeline and query execution path. The architecture supports several scaling extensions without breaking the single-node thesis:
+See the [data flow](/architecture/data-flow/) page for details on the ingestion pipeline and query execution path. The architecture supports several scaling extensions without breaking the single-node thesis:
 
 1. **S3/MinIO cold storage** — extend retention from "however much disk you have" to effectively infinite via DuckDB's `httpfs` extension
 2. **Read-only query replicas** — parquet files are immutable after write; any node with filesystem access can query them

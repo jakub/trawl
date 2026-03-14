@@ -9,7 +9,7 @@ This page is a work in progress. A complete configuration reference is coming so
 
 ## Client configuration
 
-Client config lives at `~/.config/trawl/config.toml`. See the [CLI reference](/trawl/reference/cli/#configuration) for details.
+Client config lives at `~/.config/trawl/config.toml`. See the [CLI reference](/reference/cli/#configuration) for details.
 
 ## Server configuration
 

@@ -2,8 +2,7 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
-  site: 'https://jakub.github.io',
-  base: '/trawl',
+  site: 'https://trawl.sh',
   integrations: [
     starlight({
       title: 'trawl',

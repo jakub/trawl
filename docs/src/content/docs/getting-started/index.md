@@ -9,11 +9,11 @@ The easiest way to install trawl on Debian-based systems. The APT repository is 
 
 ```bash
 # Add the signing key
-curl -fsSL https://jakub.github.io/trawl/gpg.key \
+curl -fsSL https://trawl.sh/gpg.key \
   | sudo gpg --dearmor -o /usr/share/keyrings/trawl.gpg
 
 # Add the repository
-echo "deb [signed-by=/usr/share/keyrings/trawl.gpg] https://jakub.github.io/trawl/apt stable main" \
+echo "deb [signed-by=/usr/share/keyrings/trawl.gpg] https://trawl.sh/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/trawl.list
 
 # Install
@@ -71,4 +71,4 @@ Once installed, you'll need:
 2. **Configure Vector** — point your log sources at trawld's ingest endpoint
 3. **Run your first query** — use `trawl query` or launch the TUI with `trawl`
 
-See [Your First Query](/trawl/getting-started/first-query/) for a walkthrough.
+See [Your First Query](/getting-started/first-query/) for a walkthrough.

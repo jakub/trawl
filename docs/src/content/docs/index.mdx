@@ -7,11 +7,11 @@ hero:
   tagline: Self-hosted log collection, storage, and search. Splunk-like DSL, zero licensing cost, single binary.
   actions:
     - text: Get Started
-      link: /trawl/getting-started/
+      link: /getting-started/
       icon: right-arrow
       variant: primary
     - text: DSL Reference
-      link: /trawl/reference/dsl/
+      link: /reference/dsl/
       icon: open-book
       variant: secondary
     - text: GitHub
@@ -61,8 +61,8 @@ trawl query --data 'data/**/*.parquet' "* | stats count() by service"
 
 ```bash
 # Debian/Ubuntu (APT repository)
-curl -fsSL https://jakub.github.io/trawl/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/trawl.gpg
-echo "deb [signed-by=/usr/share/keyrings/trawl.gpg] https://jakub.github.io/trawl/apt stable main" \
+curl -fsSL https://trawl.sh/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/trawl.gpg
+echo "deb [signed-by=/usr/share/keyrings/trawl.gpg] https://trawl.sh/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/trawl.list
 sudo apt update && sudo apt install trawl trawld
 
@@ -71,4 +71,4 @@ curl -fsSL https://github.com/jakub/trawl/releases/latest/download/trawl-v0.1.8-
   | tar xz
 ```
 
-See the [installation guide](/trawl/getting-started/) for more options.
+See the [installation guide](/getting-started/) for more options.
