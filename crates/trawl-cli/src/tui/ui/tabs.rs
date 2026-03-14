@@ -20,7 +20,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         (MainTab::Schema, "Schema", "M-3"),
         (MainTab::Saved, "Saved", "M-4"),
     ];
-    if app.is_admin {
+    if app.dashboard.is_admin {
         tabs.push((MainTab::Dashboard, "Dashboard", "M-5"));
     }
 

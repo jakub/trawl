@@ -99,6 +99,74 @@ pub enum MainTab {
     Dashboard,
 }
 
+/// State for the admin dashboard tab (polling, caching, permissions).
+pub struct DashboardState {
+    /// Whether the connected user has admin privileges.
+    pub is_admin: bool,
+    /// Cached dashboard snapshot (polled every ~1s when tab is active).
+    pub cache: Option<trawl_client::DashboardSnapshot>,
+    /// Whether a dashboard request is currently in-flight.
+    inflight: bool,
+    /// When the inflight flag was set (for timeout detection).
+    inflight_since: Option<Instant>,
+    /// Counter for dashboard polling (every 10 ticks = ~1s at 100ms poll).
+    poll_counter: u32,
+}
+
+impl DashboardState {
+    pub fn new() -> Self {
+        Self {
+            is_admin: false,
+            cache: None,
+            inflight: false,
+            inflight_since: None,
+            poll_counter: 0,
+        }
+    }
+
+    /// Mark a poll as in-flight.
+    pub fn set_inflight(&mut self) {
+        self.inflight = true;
+        self.inflight_since = Some(Instant::now());
+    }
+
+    /// Clear the in-flight flag (call when result arrives).
+    pub fn clear_inflight(&mut self) {
+        self.inflight = false;
+        self.inflight_since = None;
+    }
+
+    /// Reset the inflight guard if it's been stuck longer than the timeout.
+    /// Returns `true` if the guard was reset (caller should proceed with poll).
+    pub fn check_inflight_timeout(&mut self, timeout: std::time::Duration) -> bool {
+        if self.inflight {
+            if self
+                .inflight_since
+                .is_some_and(|since| since.elapsed() > timeout)
+            {
+                tracing::warn!("dashboard poll timed out — resetting inflight guard");
+                self.clear_inflight();
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Increment the poll counter, returning `true` when it's time to poll.
+    pub fn tick(&mut self) -> bool {
+        self.poll_counter += 1;
+        if self.poll_counter >= 10 {
+            self.poll_counter = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// A profiled column from a service sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfiledColumn {

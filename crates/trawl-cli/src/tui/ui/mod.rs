@@ -83,7 +83,7 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
 
     tabs::render(app, frame, outer[0]);
 
-    if let Some(ref snapshot) = app.dashboard_cache {
+    if let Some(ref snapshot) = app.dashboard.cache {
         let opts = trawl_dashboard::DashboardOptions { footer_text: None };
         trawl_dashboard::render_dashboard(snapshot, frame, outer[1], &opts);
     } else {

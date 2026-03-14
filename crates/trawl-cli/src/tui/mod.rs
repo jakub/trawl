@@ -27,8 +27,8 @@ use self::driver::{
     query_response_to_data,
 };
 use self::state::{
-    ChartView, Focus, LiveBuffer, MainTab, PanelState, Popup, ProfiledColumn, ResultsSearch,
-    SimpleEditor, Tab, TabStatus,
+    ChartView, DashboardState, Focus, LiveBuffer, MainTab, PanelState, Popup, ProfiledColumn,
+    ResultsSearch, SimpleEditor, Tab, TabStatus,
 };
 use crate::CliError;
 use crate::config::Config;
@@ -183,7 +183,6 @@ struct SchemaProfileResult {
 }
 
 /// Main TUI application state.
-#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     /// HTTP client for API calls.
     pub client: HttpClient,
@@ -242,14 +241,8 @@ pub struct App {
     driver_execute_waiter: Option<ExecuteWaiter>,
     /// Server version string (fetched from health endpoint at startup).
     pub server_version: Option<String>,
-    /// Whether the connected user has admin privileges.
-    pub is_admin: bool,
-    /// Cached dashboard snapshot (polled every ~1s for admin users on Dashboard tab).
-    pub dashboard_cache: Option<trawl_client::DashboardSnapshot>,
-    /// Whether a dashboard request is currently in-flight (prevents pileup).
-    dashboard_inflight: bool,
-    /// Counter for dashboard polling (every 10 ticks = ~1s at 100ms poll).
-    dashboard_poll_counter: u32,
+    /// Admin dashboard state (permissions, polling, cache).
+    pub dashboard: DashboardState,
 }
 
 /// Info about a node in the schema tree (avoids borrow issues in tree methods).
@@ -303,10 +296,7 @@ impl App {
             driver_socket_path: None,
             driver_execute_waiter: None,
             server_version: None,
-            is_admin: false,
-            dashboard_cache: None,
-            dashboard_inflight: false,
-            dashboard_poll_counter: 0,
+            dashboard: DashboardState::new(),
         }
     }
 
@@ -456,9 +446,9 @@ impl App {
                 }
                 MutationResult::DashboardUpdate(snapshot) => {
                     if let Some(s) = snapshot {
-                        self.dashboard_cache = Some(*s);
+                        self.dashboard.cache = Some(*s);
                     }
-                    self.dashboard_inflight = false;
+                    self.dashboard.clear_inflight();
                 }
                 MutationResult::Error { message } => {
                     tracing::error!("mutation error: {message}");
@@ -470,16 +460,21 @@ impl App {
 
     /// Poll the dashboard endpoint when the admin user is viewing the Dashboard tab.
     fn poll_dashboard(&mut self) {
-        if !self.is_admin || self.main_tab != MainTab::Dashboard || self.dashboard_inflight {
+        if !self.dashboard.is_admin || self.main_tab != MainTab::Dashboard {
             return;
         }
-        self.dashboard_poll_counter += 1;
+        // Reset inflight guard if stuck >10s (e.g. spawned task panicked).
+        if !self
+            .dashboard
+            .check_inflight_timeout(Duration::from_secs(10))
+        {
+            return;
+        }
         // 10 ticks × 100ms poll interval = ~1s refresh
-        if self.dashboard_poll_counter < 10 {
+        if !self.dashboard.tick() {
             return;
         }
-        self.dashboard_poll_counter = 0;
-        self.dashboard_inflight = true;
+        self.dashboard.set_inflight();
 
         let client = self.client.clone();
         let tx = self.mutation_tx.clone();
@@ -581,7 +576,7 @@ impl App {
                 self.switch_to_main_tab(MainTab::Saved);
                 return;
             }
-            (KeyModifiers::ALT, KeyCode::Char('5')) if self.is_admin => {
+            (KeyModifiers::ALT, KeyCode::Char('5')) if self.dashboard.is_admin => {
                 self.switch_to_main_tab(MainTab::Dashboard);
                 return;
             }
@@ -2260,7 +2255,7 @@ pub async fn run(
     app.saved_cache = saved;
     app.service_list_cache = services;
     app.server_version = server_version;
-    app.is_admin = is_admin;
+    app.dashboard.is_admin = is_admin;
     if is_admin {
         tracing::info!("admin privileges detected — Dashboard tab enabled");
     }
