@@ -672,7 +672,7 @@ pub async fn dashboard(
     let snapshot = state.dashboard_snapshot.lock().clone();
     match snapshot {
         Some(s) => Ok(Json(s)),
-        None => Err(ServerError::Internal(
+        None => Err(ServerError::ServiceUnavailable(
             "dashboard data not yet available".into(),
         )),
     }

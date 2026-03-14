@@ -113,6 +113,8 @@ pub enum ErrorCode {
     TooManyStreams,
     /// Internal server error (500).
     InternalError,
+    /// Service temporarily unavailable (503).
+    ServiceUnavailable,
 }
 
 /// Source location within a query string.

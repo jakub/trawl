@@ -44,6 +44,10 @@ pub enum ServerError {
     #[error("too many concurrent streams")]
     TooManyStreams,
 
+    /// Service temporarily unavailable (startup, data not ready).
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     /// Internal server error (task panics, unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
@@ -63,6 +67,7 @@ impl ServerError {
             Self::NotFound(_) => "not found".to_owned(),
             Self::RateLimited => "rate limit exceeded".to_owned(),
             Self::TooManyStreams => "too many concurrent streams".to_owned(),
+            Self::ServiceUnavailable(_) => "service unavailable".to_owned(),
             other => other.to_string(),
         }
     }
@@ -148,6 +153,10 @@ impl IntoResponse for ServerError {
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorEnvelope::simple(ErrorCode::TooManyStreams, "too many concurrent streams"),
             ),
+            Self::ServiceUnavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, msg.clone()),
+            ),
             Self::Internal(_) => {
                 tracing::error!(event_type = "internal_error", error = %self, "internal server error");
                 (
@@ -209,5 +218,12 @@ mod tests {
     fn safe_message_redacts_internal_errors() {
         let err = ServerError::Internal("db connection string leaked".into());
         assert_eq!(err.safe_message(), "internal error");
+    }
+
+    #[test]
+    fn service_unavailable_maps_to_503() {
+        let err = ServerError::ServiceUnavailable("not ready".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
