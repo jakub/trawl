@@ -1,29 +1,23 @@
-//! Monitor dashboard rendering.
+//! Monitor dashboard rendering tests.
 //!
-//! Thin wrapper over [`trawl_dashboard`] — converts the server-local
-//! [`MonitorSnapshot`] to the shared [`DashboardSnapshot`] wire type
-//! and delegates rendering.
-
-use ratatui::Frame;
-
-use trawl_dashboard::DashboardOptions;
-
-use super::state::MonitorSnapshot;
-
-/// Render the monitor dashboard to the given frame.
-pub fn render(snapshot: &MonitorSnapshot, frame: &mut Frame<'_>) {
-    let ds = snapshot.to_dashboard_snapshot();
-    let opts = DashboardOptions::default();
-    trawl_dashboard::render_dashboard(&ds, frame, frame.area(), &opts);
-}
+//! Tests the `MonitorSnapshot → DashboardSnapshot → render_dashboard` pipeline
+//! used by [`spawn_snapshot_collector`](super::spawn_snapshot_collector).
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::monitor::state::MonitorSnapshot;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
+    use trawl_dashboard::DashboardOptions;
+
+    /// Render a `MonitorSnapshot` through the full server-side pipeline:
+    /// `MonitorSnapshot → DashboardSnapshot → render_dashboard`.
+    fn render(snapshot: &MonitorSnapshot, f: &mut ratatui::Frame<'_>) {
+        let ds = snapshot.to_dashboard_snapshot();
+        let opts = DashboardOptions::default();
+        trawl_dashboard::render_dashboard(&ds, f, f.area(), &opts);
+    }
 
     fn test_snapshot() -> MonitorSnapshot {
         MonitorSnapshot {

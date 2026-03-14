@@ -205,15 +205,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // Run monitor on the main task — blocks until ctrl-c.
-        if let Err(e) = trawl_server::monitor::run(
-            state,
-            &config.server.http_addr,
-            config.server.max_sse_connections,
-            config.scheduler.enabled,
-            config.server.monitor_refresh_ms,
-            shutdown,
-        )
-        .await
+        if let Err(e) =
+            trawl_server::monitor::run(state, config.server.monitor_refresh_ms, shutdown).await
         {
             // Terminal restore happens via TerminalGuard drop, so just log.
             tracing::error!(event_type = "lifecycle", error = %e, "monitor error");
