@@ -17,6 +17,7 @@ use crate::auth::AuthCache;
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
 use crate::hot_buffer::{HotBuffer, HotBufferConfig};
+use crate::ingest::pipeline::PipelineWriter;
 use crate::ingest::wal::WalWriter;
 use crate::pool::ExecutorPool;
 use crate::query_log::QueryLog;
@@ -92,6 +93,8 @@ pub struct AuthState {
 pub struct IngestState {
     /// WAL writer for ingested events (None if ingest is disabled).
     pub wal_writer: Option<Arc<WalWriter>>,
+    /// Shared pipeline writer (WAL + hot buffer + event bus). None if ingest is disabled.
+    pub pipeline: Option<Arc<PipelineWriter>>,
     /// Event bus for real-time fanout to subscribers (None if ingest is disabled).
     pub event_bus: Option<Arc<LocalEventBus>>,
     /// Total events ingested since startup (for monitor dashboard).
@@ -160,20 +163,21 @@ impl AppState {
         let saved = SavedQueryStore::open(&config.auth.db_path)?;
         let schedule = ScheduleStore::open(&config.auth.db_path)?;
 
-        let (wal_writer, event_bus, hot_buffer) = if config.ingest.enabled {
-            let writer = WalWriter::new(config.wal_dir());
-            let bus = LocalEventBus::new(config.ingest.event_bus_capacity);
-            let buffer = HotBuffer::new(HotBufferConfig {
+        let (wal_writer, event_bus, hot_buffer, pipeline) = if config.ingest.enabled {
+            let writer = Arc::new(WalWriter::new(config.wal_dir()));
+            let bus = Arc::new(LocalEventBus::new(config.ingest.event_bus_capacity));
+            let buffer = Arc::new(HotBuffer::new(HotBufferConfig {
                 max_events: config.ingest.hot_buffer_max_events,
                 max_bytes: config.ingest.hot_buffer_max_bytes,
-            });
-            (
-                Some(Arc::new(writer)),
-                Some(Arc::new(bus)),
-                Some(Arc::new(buffer)),
-            )
+            }));
+            let pipeline = Arc::new(PipelineWriter::new(
+                Arc::clone(&writer),
+                Some(Arc::clone(&buffer)),
+                Some(Arc::clone(&bus)),
+            ));
+            (Some(writer), Some(bus), Some(buffer), Some(pipeline))
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let auth_cache = Arc::new(AuthCache::new(std::time::Duration::from_secs(
@@ -208,6 +212,7 @@ impl AppState {
             },
             ingest: IngestState {
                 wal_writer,
+                pipeline,
                 event_bus,
                 total_events: Arc::new(AtomicU64::new(0)),
                 total_rejected: Arc::new(AtomicU64::new(0)),

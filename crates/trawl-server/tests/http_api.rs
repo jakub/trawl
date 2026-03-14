@@ -11,7 +11,7 @@ use trawl_auth::store::KeyStore;
 use trawl_client::HttpClient;
 use trawl_server::config::{
     AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig,
-    SchedulerConfig, ServerConfig,
+    SchedulerConfig, ServerConfig, SyslogConfig,
 };
 use trawl_server::state::AppState;
 use trawl_server::transport::http;
@@ -211,6 +211,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
         },
         retention: RetentionConfig::default(),
         scheduler: SchedulerConfig::default(),
+        syslog: SyslogConfig::default(),
     };
 
     let (state, http_config) =
@@ -291,6 +292,7 @@ async fn setup() -> TestServer {
         },
         retention: RetentionConfig::default(),
         scheduler: SchedulerConfig::default(),
+        syslog: SyslogConfig::default(),
     };
 
     let (state, http_config) =

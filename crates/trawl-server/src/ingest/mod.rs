@@ -2,4 +2,5 @@
 
 pub mod compaction;
 pub mod handler;
+pub mod pipeline;
 pub mod wal;
