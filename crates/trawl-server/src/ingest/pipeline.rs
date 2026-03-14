@@ -14,6 +14,18 @@ use crate::bus::{EventBus as _, IngestBatch, LocalEventBus};
 use crate::hot_buffer::HotBuffer;
 use crate::ingest::wal::WalWriter;
 
+/// Maximum service name length (shared between HTTP and syslog ingest).
+pub const MAX_SERVICE_NAME_LEN: usize = 128;
+
+/// Check if a byte is valid in a service name.
+///
+/// Allows alphanumeric, dash, underscore, dot, and space.
+/// Shared between HTTP ingest (which rejects invalid chars) and
+/// syslog ingest (which strips them).
+pub fn is_valid_service_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b' '
+}
+
 /// Events for a single service within a batch, ready for WAL writing.
 #[derive(Debug, Default)]
 pub struct ServiceBatch {
