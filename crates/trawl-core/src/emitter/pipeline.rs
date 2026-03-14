@@ -385,7 +385,7 @@ fn auto_bucket_interval(time_filter: Option<&crate::ast::TrawlDuration>) -> Stri
     } else if seconds <= 2_592_000 {
         "6 hours"
     } else {
-        "1 hours"
+        "1 days"
     }
     .to_string()
 }

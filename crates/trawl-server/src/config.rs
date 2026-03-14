@@ -428,6 +428,11 @@ pub struct SyslogConfig {
     /// meaningful APP-NAME (e.g. `UniFi` consoles).
     #[serde(default)]
     pub source_service_map: std::collections::HashMap<String, String>,
+
+    /// Channel capacity for the event queue between listeners and batcher.
+    /// Increase for high-volume syslog deployments. Default: 10,000.
+    #[serde(default = "default_syslog_channel_capacity")]
+    pub channel_capacity: usize,
 }
 
 const DEFAULT_SYSLOG_ADDR: &str = "0.0.0.0:1514";
@@ -437,6 +442,7 @@ const DEFAULT_SYSLOG_BATCH_MAX_EVENTS: usize = 1000;
 const DEFAULT_SYSLOG_TCP_IDLE_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SYSLOG_MAX_EVENTS_PER_CONNECTION: usize = 100_000;
 const DEFAULT_SYSLOG_CONSECUTIVE_SEND_FAILURES_LIMIT: usize = 100;
+const DEFAULT_SYSLOG_CHANNEL_CAPACITY: usize = 10_000;
 
 fn default_syslog_addr() -> String {
     DEFAULT_SYSLOG_ADDR.to_owned()
@@ -474,6 +480,10 @@ fn default_syslog_consecutive_send_failures_limit() -> usize {
     DEFAULT_SYSLOG_CONSECUTIVE_SEND_FAILURES_LIMIT
 }
 
+fn default_syslog_channel_capacity() -> usize {
+    DEFAULT_SYSLOG_CHANNEL_CAPACITY
+}
+
 impl Default for SyslogConfig {
     fn default() -> Self {
         Self {
@@ -491,6 +501,7 @@ impl Default for SyslogConfig {
             default_service: "syslog".to_owned(),
             allow_cidrs: Vec::new(),
             source_service_map: std::collections::HashMap::new(),
+            channel_capacity: DEFAULT_SYSLOG_CHANNEL_CAPACITY,
         }
     }
 }

@@ -342,10 +342,11 @@ impl Executor {
             }
         }
 
-        // COPY to parquet. Path is validated above (UTF-8), and the temp table
-        // name is a constant — no injection risk.
+        // COPY to parquet. DuckDB's COPY TO doesn't support parameterized
+        // paths, so we escape single quotes by doubling them (DuckDB convention).
+        let safe_path = path_str.replace('\'', "''");
         let copy_sql =
-            format!("COPY __trawl_export TO '{path_str}' (FORMAT PARQUET, COMPRESSION SNAPPY)");
+            format!("COPY __trawl_export TO '{safe_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)");
         if let Err(e) = self.conn.execute_batch(&copy_sql) {
             // Clean up temp table and partial file on error.
             cleanup(&self.conn);
@@ -358,19 +359,23 @@ impl Executor {
     }
 }
 
+/// `DuckDB` error substring for "no matching files" — verified against `DuckDB` 1.4.x.
+const DUCKDB_NO_FILES_MSG: &str = "No files found that match the pattern";
+/// `DuckDB` error prefix for binder errors — verified against `DuckDB` 1.4.x.
+const DUCKDB_BINDER_ERROR_MSG: &str = "Binder Error";
+
 /// Check if a `DuckDB` error is the "No files found" error from `read_parquet()`
 /// when a glob matches zero files. Semantically this means "no data" — not a
 /// server error.
 fn is_no_files_error(e: &duckdb::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("No files found that match the pattern")
+    e.to_string().contains(DUCKDB_NO_FILES_MSG)
 }
 
 /// Check if a `DuckDB` error is a binder error about a missing column. This is
 /// a user error (querying a nonexistent field), not a server error.
 fn is_binder_column_error(e: &duckdb::Error) -> bool {
     let msg = e.to_string();
-    msg.contains("Binder Error") && (msg.contains("column") || msg.contains("not found"))
+    msg.contains(DUCKDB_BINDER_ERROR_MSG) && (msg.contains("column") || msg.contains("not found"))
 }
 
 /// Remap a `DuckDB` binder error about missing columns to `EngineError::Emit`

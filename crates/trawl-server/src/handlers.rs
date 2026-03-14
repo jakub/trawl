@@ -1334,7 +1334,11 @@ pub async fn export(
             "attachment; filename=\"export.ndjson\"".to_owned(),
             generate_ndjson(&limited).into_bytes(),
         ),
-        trawl_api::ExportFormat::Parquet => unreachable!("handled above"),
+        trawl_api::ExportFormat::Parquet => {
+            return Err(ServerError::Internal(
+                "parquet export reached unexpected code path".into(),
+            ));
+        }
     };
 
     tracing::info!(

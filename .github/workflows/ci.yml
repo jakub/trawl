@@ -67,6 +67,24 @@ jobs:
         env:
           DUCKDB_DOWNLOAD_LIB: "1"
 
+  msrv:
+    name: msrv check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
+      - run: cargo check --workspace --no-default-features
+        env:
+          DUCKDB_DOWNLOAD_LIB: "1"
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

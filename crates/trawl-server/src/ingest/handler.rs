@@ -249,7 +249,7 @@ pub async fn ingest(
         tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
             let t0 = std::time::Instant::now();
             let raw = if compressed {
-                decompress_gzip(&body)?
+                decompress_gzip(&body, body.len())?
             } else {
                 body.to_vec()
             };
@@ -422,13 +422,27 @@ fn is_gzip(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("gzip"))
 }
 
-/// Decompress gzip body.
-fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, ServerError> {
-    let mut decoder = flate2::read::GzDecoder::new(data);
-    let mut decompressed = Vec::new();
+/// Maximum decompression ratio (compressed → decompressed). Prevents
+/// gzip bombs from exhausting memory: a 16 MB payload can expand to at
+/// most 160 MB.
+const MAX_DECOMPRESSION_RATIO: usize = 10;
+
+/// Decompress gzip body with a size cap to prevent decompression bombs.
+fn decompress_gzip(data: &[u8], wire_bytes: usize) -> Result<Vec<u8>, ServerError> {
+    let limit = wire_bytes.saturating_mul(MAX_DECOMPRESSION_RATIO);
+    let decoder = flate2::read::GzDecoder::new(data);
+    // Read up to limit + 1: if we get more than limit bytes, the payload
+    // exceeds the cap and we reject it before allocating further.
+    let mut decompressed = Vec::with_capacity(data.len().min(limit));
     decoder
+        .take(u64::try_from(limit + 1).unwrap_or(u64::MAX))
         .read_to_end(&mut decompressed)
         .map_err(|e| ServerError::Ingest(format!("gzip decompression failed: {e}")))?;
+    if decompressed.len() > limit {
+        return Err(ServerError::Ingest(format!(
+            "decompressed body exceeds {limit} byte limit (ratio > {MAX_DECOMPRESSION_RATIO}x)",
+        )));
+    }
     Ok(decompressed)
 }
 

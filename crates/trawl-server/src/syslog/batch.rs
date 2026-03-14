@@ -26,9 +26,6 @@ pub struct SyslogEvent {
 /// Sender half for submitting events to the batcher.
 pub type SyslogSender = mpsc::Sender<SyslogEvent>;
 
-/// Channel capacity for the event queue between listeners and batcher.
-const CHANNEL_CAPACITY: usize = 10_000;
-
 /// Accumulates syslog events and flushes to the ingest pipeline.
 #[derive(Debug)]
 pub struct SyslogBatcher {
@@ -41,7 +38,7 @@ pub struct SyslogBatcher {
 
 impl SyslogBatcher {
     pub fn new(config: &SyslogConfig, pipeline: Arc<PipelineWriter>) -> Self {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel(config.channel_capacity);
         Self {
             rx,
             tx,

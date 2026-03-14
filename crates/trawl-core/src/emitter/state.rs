@@ -92,12 +92,13 @@ fn validate_source_list(source: &str) -> Result<(), super::EmitError> {
             message: "invalid source list format".to_string(),
         })?;
 
-    for segment in inner.split(", ") {
-        let path = segment
+    for segment in inner.split(',') {
+        let trimmed = segment.trim();
+        let path = trimmed
             .strip_prefix('\'')
             .and_then(|s| s.strip_suffix('\''))
             .ok_or_else(|| super::EmitError::UnsupportedOperation {
-                message: format!("invalid source list element: {segment}"),
+                message: format!("invalid source list element: {trimmed}"),
             })?;
         validate_source_path(path)?;
     }
