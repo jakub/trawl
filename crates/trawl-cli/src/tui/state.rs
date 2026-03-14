@@ -1127,10 +1127,10 @@ impl Tab {
         }
 
         // Debounce: wait 300ms after last edit.
-        if let Some(last_edit) = self.last_edit_time {
-            if last_edit.elapsed() < std::time::Duration::from_millis(300) {
-                return false;
-            }
+        if let Some(last_edit) = self.last_edit_time
+            && last_edit.elapsed() < std::time::Duration::from_millis(300)
+        {
+            return false;
         }
 
         let text = self.editor.text();
@@ -1143,23 +1143,9 @@ impl Tab {
         match trawl_core::parser::parse(&text) {
             Ok(query) => match trawl_core::emitter::validate_pipeline(&query.pipeline) {
                 Ok(()) => self.validation_errors.clear(),
-                Err(e) => {
-                    self.validation_errors = vec![trawl_core::parser::ParseError {
-                        message: e.to_string(),
-                        span: 0..text.len(),
-                        label: None,
-                        hint: match &e {
-                            trawl_core::emitter::EmitError::UnknownFunction {
-                                suggestion, ..
-                            } => suggestion.as_ref().map(|s| format!("did you mean '{s}'?")),
-                            _ => None,
-                        },
-                    }];
-                }
+                Err(e) => self.validation_errors = e.to_parse_errors(text.len()),
             },
-            Err(errors) => {
-                self.validation_errors = errors;
-            }
+            Err(errors) => self.validation_errors = errors,
         }
         self.validation_dirty = false;
         true

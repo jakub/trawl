@@ -26,7 +26,7 @@ pub const KNOWN_PIPE_STAGES: &[&str] = &[
     "pivot",
 ];
 
-/// Known function names (re-exported from emitter for suggestion use).
+/// Known function names — single source of truth, also used by emitter validation.
 pub const KNOWN_FUNCTIONS: &[&str] = &[
     // aggregates
     "count",
@@ -92,11 +92,7 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     for i in 1..=a_len {
         curr[0] = i;
         for j in 1..=b_len {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] {
-                0
-            } else {
-                1
-            };
+            let cost = usize::from(a_chars[i - 1] != b_chars[j - 1]);
             curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
@@ -122,10 +118,8 @@ pub fn suggest_closest<'a>(
 
     for &candidate in candidates {
         let dist = levenshtein(&input_lower, candidate);
-        if dist <= max_distance {
-            if best.is_none() || dist < best.unwrap().1 {
-                best = Some((candidate, dist));
-            }
+        if dist <= max_distance && best.as_ref().is_none_or(|(_, d)| dist < *d) {
+            best = Some((candidate, dist));
         }
     }
 
@@ -205,5 +199,68 @@ mod tests {
     fn suggest_case_insensitive() {
         assert_eq!(suggest_pipe_stage("STATS"), Some("stats"));
         assert_eq!(suggest_pipe_stage("Stats"), Some("stats"));
+    }
+
+    /// Ensures every entry in `KNOWN_PIPE_STAGES` actually parses as a valid
+    /// pipe stage. Catches drift between this list and the parser's `choice()`.
+    #[test]
+    fn known_pipe_stages_all_parse() {
+        for &stage in KNOWN_PIPE_STAGES {
+            // Build a minimal valid query for each stage.
+            let query = match stage {
+                "stats" => "| stats count()".to_string(),
+                "timechart" => "| timechart span=1h count()".to_string(),
+                "where" => "| where x > 1".to_string(),
+                "sort" => "| sort host".to_string(),
+                "limit" | "head" | "tail" => format!("| {stage} 10"),
+                "let" => "| let x = 1".to_string(),
+                "eval" => "| eval x = 1".to_string(),
+                "extract" => r#"| extract "(?P<ip>\d+)" from message"#.to_string(),
+                "rex" => r#"| rex "(?P<ip>\d+)" from message"#.to_string(),
+                "table" | "fields" | "drop" => format!("| {stage} host"),
+                "top" => "| top 5 host".to_string(),
+                "rare" => "| rare 5 host".to_string(),
+                "dedup" => "| dedup host".to_string(),
+                "rename" => "| rename host as hostname".to_string(),
+                "pivot" => "| pivot count() on status".to_string(),
+                _ => panic!("unhandled stage '{stage}' in test — add a case"),
+            };
+            assert!(
+                crate::parser::parse(&query).is_ok(),
+                "KNOWN_PIPE_STAGES entry '{stage}' failed to parse with query: {query}"
+            );
+        }
+    }
+
+    /// Ensures every entry in `KNOWN_FUNCTIONS` is recognized by the emitter
+    /// (catches drift between the list and the emitter's match arms).
+    #[test]
+    fn known_functions_all_validate() {
+        for &func in KNOWN_FUNCTIONS {
+            // Build a query that uses the function in a stats stage.
+            // Functions with 0 args: count, now. Others: pass one dummy arg.
+            let query = match func {
+                "count" | "now" => format!("| stats {func}()"),
+                "if" | "replace" => format!("| let x = {func}(a, b, c)"),
+                "coalesce" => format!("| let x = {func}(a, b)"),
+                "substr" => format!("| let x = {func}(a, 1)"),
+                "round" => format!("| let x = {func}(a)"),
+                // Aggregates use stats, scalars use let/eval
+                _ if crate::emitter::is_aggregate_function(func) => {
+                    format!("| stats {func}(x)")
+                }
+                _ => format!("| let y = {func}(x)"),
+            };
+            let ast = crate::parser::parse(&query)
+                .unwrap_or_else(|e| panic!("'{func}' failed to parse: {e:?}"));
+            let result = crate::emitter::validate_pipeline(&ast.pipeline);
+            assert!(
+                !matches!(
+                    result,
+                    Err(crate::emitter::EmitError::UnknownFunction { .. })
+                ),
+                "KNOWN_FUNCTIONS entry '{func}' rejected as unknown by emitter"
+            );
+        }
     }
 }

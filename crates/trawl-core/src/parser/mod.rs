@@ -175,34 +175,19 @@ fn enrich_error(
     expected: &[String],
     label: Option<&str>,
 ) -> (String, Option<String>) {
-    let expects_pipe_stage = expected.iter().any(|e| e == "pipe stage");
     let expects_end_quote = expected.iter().any(|e| e == "'\"'");
     let expects_close_paren = expected.iter().any(|e| e == "')'");
     let at_end = offset >= input.len();
 
-    // Unknown pipe stage: detected via expected labels, context labels, or
-    // by scanning the input for a pipe character before the error position.
-    // chumsky's choice() combinator may report character-level errors from the
-    // branch that consumed the most input (e.g. "staats" partially matches
-    // "stats"), resulting in no context labels at all — just a single-char
-    // expected token. We detect this by finding the word around the error
-    // offset and checking if it sits right after a `|`.
-    let in_pipe_context =
-        expects_pipe_stage || label == Some("pipe stage") || label == Some("pipeline");
-
-    // Try to find the full word around the error position. When chumsky
-    // points mid-word (partial match), we scan backward from offset to
-    // find the word start.
-    let pipe_word = find_pipe_command_word(input, offset);
-
-    if in_pipe_context || pipe_word.is_some() {
-        if let Some(ref word) = pipe_word {
-            if !suggest::KNOWN_PIPE_STAGES.contains(&word.as_str()) {
-                let hint =
-                    suggest::suggest_pipe_stage(word).map(|s| format!("did you mean '{s}'?"));
-                return (format!("unknown command '{word}'"), hint);
-            }
-        }
+    // Unknown pipe stage: detected by scanning the input for a `|` before
+    // the error position and extracting the word that follows it. chumsky's
+    // choice() combinator may report character-level errors from the branch
+    // that consumed the most input (e.g. "staats" partially matches "stats"),
+    // resulting in no context labels — just a single-char expected token.
+    // We recover the full word by scanning backward from the error offset.
+    if let Some(ref word) = find_pipe_command_word(input, offset) {
+        let hint = suggest::suggest_pipe_stage(word).map(|s| format!("did you mean '{s}'?"));
+        return (format!("unknown command '{word}'"), hint);
     }
 
     // Unterminated string literal

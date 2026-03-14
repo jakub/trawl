@@ -188,7 +188,7 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
         .map_or(s.len(), |(byte_idx, _)| byte_idx)
 }
 
-/// Convert validation error byte spans to per-line (row, col_start, col_end) char regions.
+/// Convert validation error byte spans to per-line `(row, col_start, col_end)` char regions.
 fn compute_error_regions(
     lines: &[String],
     errors: &[trawl_core::parser::ParseError],

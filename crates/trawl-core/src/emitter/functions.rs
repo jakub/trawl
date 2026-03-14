@@ -2,50 +2,8 @@ use super::EmitError;
 use super::fields::quote_field;
 use crate::parser::suggest;
 
-/// Known function names accepted by the emitter.
-pub(crate) const KNOWN_FUNCTIONS: &[&str] = &[
-    // aggregates
-    "count",
-    "avg",
-    "sum",
-    "min",
-    "max",
-    "dc",
-    "distinct_count",
-    "p50",
-    "p90",
-    "p95",
-    "p99",
-    "first",
-    "last",
-    "values",
-    "list",
-    "median",
-    "stddev",
-    // scalars
-    "lower",
-    "upper",
-    "length",
-    "len",
-    "coalesce",
-    "if",
-    "replace",
-    "substr",
-    "trim",
-    "ltrim",
-    "rtrim",
-    "isnull",
-    "isnotnull",
-    "abs",
-    "ceil",
-    "ceiling",
-    "floor",
-    "round",
-    "now",
-    "typeof",
-    "tonumber",
-    "tostring",
-];
+/// Known function names accepted by the emitter (canonical list in `parser::suggest`).
+pub(crate) use crate::parser::suggest::KNOWN_FUNCTIONS;
 
 /// Validate that a function name is known and argument count is correct.
 ///

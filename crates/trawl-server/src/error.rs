@@ -69,7 +69,7 @@ impl ServerError {
 }
 
 /// Convert a `ParseError` into a structured `ErrorDetail`.
-fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_api::ErrorDetail {
+pub(crate) fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_api::ErrorDetail {
     trawl_api::ErrorDetail {
         message: e.message.clone(),
         span: Some(trawl_api::ErrorSpan {
