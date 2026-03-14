@@ -146,6 +146,9 @@ jobs:
     name: publish APT repository
     needs: [build, release]
     runs-on: ubuntu-latest
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -232,6 +235,9 @@ jobs:
 
           # Export public key
           gpg --batch --yes --armor --export "${gpg_key}" > gpg.key
+
+      - name: Clean up incoming artifacts
+        run: rm -rf incoming
 
       - name: Commit and push
         run: |
