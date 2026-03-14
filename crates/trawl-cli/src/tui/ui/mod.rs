@@ -1,7 +1,7 @@
 //! UI rendering dispatch.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 
 use crate::tui::App;
 use crate::tui::state::{Focus, MainTab};
@@ -87,19 +87,15 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
     tabs::render(app, frame, outer[0]);
 
     if let Some(ref snapshot) = app.dashboard.cache {
-        let opts = trawl_dashboard::DashboardOptions { footer_text: None };
+        let footer = app
+            .dashboard
+            .last_error
+            .as_deref()
+            .map(|e| format!(" [stale] {e}"));
+        let opts = trawl_dashboard::DashboardOptions {
+            footer_text: footer,
+        };
         trawl_dashboard::render_dashboard(snapshot, frame, outer[1], &opts);
-        // Show staleness warning if the last poll failed.
-        if let Some(ref err) = app.dashboard.last_error {
-            let warning =
-                Paragraph::new(format!(" [stale] {err}")).style(Style::default().fg(Color::Yellow));
-            let warn_area = Rect {
-                y: outer[1].y + outer[1].height.saturating_sub(1),
-                height: 1,
-                ..outer[1]
-            };
-            frame.render_widget(warning, warn_area);
-        }
     } else if let Some(ref err) = app.dashboard.last_error {
         let msg = Paragraph::new(format!(" Error: {err}")).style(Style::default().fg(Color::Red));
         frame.render_widget(msg, outer[1]);

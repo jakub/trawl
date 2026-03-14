@@ -389,7 +389,7 @@ fn render_recent_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, ar
     let rows: Vec<Row<'_>> = queries
         .iter()
         .map(|q| {
-            let status_style = if q.error.is_some() {
+            let status_style = if q.error.is_some() || q.timed_out {
                 Style::default().fg(Color::Red)
             } else {
                 Style::default().fg(Color::Green)
