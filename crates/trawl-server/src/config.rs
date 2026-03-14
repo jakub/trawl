@@ -398,8 +398,28 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_default_service")]
     pub default_service: String,
 
+    /// TCP idle timeout in seconds. Connections that send no data for
+    /// this long are closed. Default: 60.
+    #[serde(default = "default_syslog_tcp_idle_timeout_secs")]
+    pub tcp_idle_timeout_secs: u64,
+
+    /// Maximum events accepted from a single TCP connection before it
+    /// is closed. Prevents a single sender from monopolizing the
+    /// batcher channel. Default: 100,000.
+    #[serde(default = "default_syslog_max_events_per_connection")]
+    pub max_events_per_connection: usize,
+
+    /// Close a TCP connection after this many consecutive failed sends
+    /// to the batcher (indicates sustained backpressure). Default: 100.
+    #[serde(default = "default_syslog_consecutive_send_failures_limit")]
+    pub consecutive_send_failures_limit: usize,
+
     /// Source IP allowlist in CIDR notation (e.g. `["192.168.0.0/16"]`).
+    /// Bare IPs without a prefix are treated as /32 (IPv4) or /128 (IPv6).
     /// Empty list means all source IPs are accepted.
+    ///
+    /// NOTE: UDP source IPs can be spoofed on the local network. This
+    /// allowlist does not provide authentication for UDP traffic.
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
 
@@ -414,6 +434,9 @@ const DEFAULT_SYSLOG_ADDR: &str = "0.0.0.0:1514";
 const DEFAULT_SYSLOG_MAX_TCP_CONNECTIONS: usize = 256;
 const DEFAULT_SYSLOG_BATCH_INTERVAL_MS: u64 = 500;
 const DEFAULT_SYSLOG_BATCH_MAX_EVENTS: usize = 1000;
+const DEFAULT_SYSLOG_TCP_IDLE_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_SYSLOG_MAX_EVENTS_PER_CONNECTION: usize = 100_000;
+const DEFAULT_SYSLOG_CONSECUTIVE_SEND_FAILURES_LIMIT: usize = 100;
 
 fn default_syslog_addr() -> String {
     DEFAULT_SYSLOG_ADDR.to_owned()
@@ -439,6 +462,18 @@ fn default_syslog_default_service() -> String {
     "syslog".to_owned()
 }
 
+fn default_syslog_tcp_idle_timeout_secs() -> u64 {
+    DEFAULT_SYSLOG_TCP_IDLE_TIMEOUT_SECS
+}
+
+fn default_syslog_max_events_per_connection() -> usize {
+    DEFAULT_SYSLOG_MAX_EVENTS_PER_CONNECTION
+}
+
+fn default_syslog_consecutive_send_failures_limit() -> usize {
+    DEFAULT_SYSLOG_CONSECUTIVE_SEND_FAILURES_LIMIT
+}
+
 impl Default for SyslogConfig {
     fn default() -> Self {
         Self {
@@ -450,6 +485,9 @@ impl Default for SyslogConfig {
             max_tcp_connections: DEFAULT_SYSLOG_MAX_TCP_CONNECTIONS,
             batch_interval_ms: DEFAULT_SYSLOG_BATCH_INTERVAL_MS,
             batch_max_events: DEFAULT_SYSLOG_BATCH_MAX_EVENTS,
+            tcp_idle_timeout_secs: DEFAULT_SYSLOG_TCP_IDLE_TIMEOUT_SECS,
+            max_events_per_connection: DEFAULT_SYSLOG_MAX_EVENTS_PER_CONNECTION,
+            consecutive_send_failures_limit: DEFAULT_SYSLOG_CONSECUTIVE_SEND_FAILURES_LIMIT,
             default_service: "syslog".to_owned(),
             allow_cidrs: Vec::new(),
             source_service_map: std::collections::HashMap::new(),
@@ -935,6 +973,29 @@ impl Config {
             return Err(ConfigError::Validation(
                 "tls_cert_path and tls_key_path must both be set or both omitted".into(),
             ));
+        }
+
+        if self.syslog.enabled {
+            if self.syslog.batch_interval_ms == 0 {
+                return Err(ConfigError::Validation(
+                    "syslog.batch_interval_ms must be > 0".into(),
+                ));
+            }
+            if self.syslog.batch_max_events == 0 {
+                return Err(ConfigError::Validation(
+                    "syslog.batch_max_events must be > 0".into(),
+                ));
+            }
+            if self.syslog.tcp_enabled && self.syslog.max_tcp_connections == 0 {
+                return Err(ConfigError::Validation(
+                    "syslog.max_tcp_connections must be > 0 when TCP is enabled".into(),
+                ));
+            }
+            if self.syslog.tcp_enabled && self.syslog.tcp_idle_timeout_secs == 0 {
+                return Err(ConfigError::Validation(
+                    "syslog.tcp_idle_timeout_secs must be > 0 when TCP is enabled".into(),
+                ));
+            }
         }
 
         Ok(())
