@@ -1,50 +1,9 @@
 use super::EmitError;
 use super::fields::quote_field;
+use crate::parser::suggest;
 
-/// Known function names accepted by the emitter.
-pub(crate) const KNOWN_FUNCTIONS: &[&str] = &[
-    // aggregates
-    "count",
-    "avg",
-    "sum",
-    "min",
-    "max",
-    "dc",
-    "distinct_count",
-    "p50",
-    "p90",
-    "p95",
-    "p99",
-    "first",
-    "last",
-    "values",
-    "list",
-    "median",
-    "stddev",
-    // scalars
-    "lower",
-    "upper",
-    "length",
-    "len",
-    "coalesce",
-    "if",
-    "replace",
-    "substr",
-    "trim",
-    "ltrim",
-    "rtrim",
-    "isnull",
-    "isnotnull",
-    "abs",
-    "ceil",
-    "ceiling",
-    "floor",
-    "round",
-    "now",
-    "typeof",
-    "tonumber",
-    "tostring",
-];
+/// Known function names accepted by the emitter (canonical list in `parser::suggest`).
+pub(crate) use crate::parser::suggest::KNOWN_FUNCTIONS;
 
 /// Validate that a function name is known and argument count is correct.
 ///
@@ -54,6 +13,7 @@ pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), Emi
     if !KNOWN_FUNCTIONS.contains(&name) {
         return Err(EmitError::UnknownFunction {
             name: name.to_string(),
+            suggestion: suggest::suggest_function(name).map(String::from),
         });
     }
 
@@ -167,6 +127,7 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
         "stddev" => require_one_arg(name, args, |a| format!("STDDEV({a})")),
         _ => Err(EmitError::UnknownFunction {
             name: name.to_string(),
+            suggestion: suggest::suggest_function(name).map(String::from),
         }),
     }
 }
@@ -594,7 +555,8 @@ mod tests {
         assert_eq!(
             err,
             EmitError::UnknownFunction {
-                name: "bogus".to_string()
+                name: "bogus".to_string(),
+                suggestion: None,
             }
         );
     }

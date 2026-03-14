@@ -518,6 +518,7 @@ impl App {
                     tab.horizontal_scroll_offset = 0;
                     tab.selected_row = None;
                     tab.column_widths = None;
+                    tab.validation_errors.clear();
 
                     // Notify driver execute waiter.
                     if self.driver_execute_waiter.is_some() {
@@ -687,6 +688,7 @@ impl App {
             // Clear editor: Ctrl+L
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.active_tab_mut().clear();
+                self.active_tab_mut().mark_editor_dirty();
             }
             // Readline: Ctrl+A → line start
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
@@ -760,16 +762,19 @@ impl App {
             // Undo: Ctrl+Z
             (KeyModifiers::CONTROL, KeyCode::Char('z')) => {
                 self.active_tab_mut().editor.undo();
+                self.active_tab_mut().mark_editor_dirty();
             }
             // Redo: Ctrl+Y / Ctrl+Shift+Z
             (KeyModifiers::CONTROL, KeyCode::Char('y')) => {
                 self.active_tab_mut().editor.redo();
+                self.active_tab_mut().mark_editor_dirty();
             }
             (_, KeyCode::Char('Z'))
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.active_tab_mut().editor.redo();
+                self.active_tab_mut().mark_editor_dirty();
             }
             // Clipboard: Ctrl+C (copy), or cancel running query if no selection
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
@@ -783,65 +788,93 @@ impl App {
                 if let Some(text) = self.active_tab().editor.selected_text() {
                     clipboard_set(&text);
                     self.active_tab_mut().editor.delete_selection();
+                    self.active_tab_mut().mark_editor_dirty();
                 }
             }
             // Clipboard: Ctrl+V (paste)
             (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
                 if let Some(text) = clipboard_get() {
-                    let editor = &mut self.active_tab_mut().editor;
-                    editor.delete_selection();
-                    editor.insert_text(&text);
+                    let tab = self.active_tab_mut();
+                    tab.editor.delete_selection();
+                    tab.editor.insert_text(&text);
+                    tab.mark_editor_dirty();
                 }
             }
             // Kill word before cursor: Ctrl+W / Ctrl+Backspace
             (KeyModifiers::CONTROL, KeyCode::Char('w') | KeyCode::Backspace) => {
                 self.active_tab_mut().editor.delete_word_before();
+                self.active_tab_mut().mark_editor_dirty();
             }
             // Kill word after cursor: Ctrl+Delete / Alt+D
             (KeyModifiers::CONTROL, KeyCode::Delete) | (KeyModifiers::ALT, KeyCode::Char('d')) => {
                 self.active_tab_mut().editor.delete_word_after();
+                self.active_tab_mut().mark_editor_dirty();
             }
             // Kill to line start: Ctrl+U
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
                 self.active_tab_mut().editor.delete_to_line_start();
+                self.active_tab_mut().mark_editor_dirty();
             }
             // Kill to line end: Ctrl+K
             (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
                 self.active_tab_mut().editor.delete_to_line_end();
+                self.active_tab_mut().mark_editor_dirty();
             }
             // Handle text editing.
             _ => {
-                let editor = &mut self.active_tab_mut().editor;
-                match key.code {
-                    KeyCode::Char(ch) => editor.insert_char(ch),
-                    KeyCode::Enter => editor.insert_newline(),
-                    KeyCode::Backspace => editor.delete_char_before(),
-                    KeyCode::Delete => editor.delete_char_at(),
+                let tab = self.active_tab_mut();
+                let editor = &mut tab.editor;
+                let text_modified = match key.code {
+                    KeyCode::Char(ch) => {
+                        editor.insert_char(ch);
+                        true
+                    }
+                    KeyCode::Enter => {
+                        editor.insert_newline();
+                        true
+                    }
+                    KeyCode::Backspace => {
+                        editor.delete_char_before();
+                        true
+                    }
+                    KeyCode::Delete => {
+                        editor.delete_char_at();
+                        true
+                    }
                     KeyCode::Left => {
                         editor.clear_selection();
                         editor.move_left();
+                        false
                     }
                     KeyCode::Right => {
                         editor.clear_selection();
                         editor.move_right();
+                        false
                     }
                     KeyCode::Up => {
                         editor.clear_selection();
                         editor.move_up();
+                        false
                     }
                     KeyCode::Down => {
                         editor.clear_selection();
                         editor.move_down();
+                        false
                     }
                     KeyCode::Home => {
                         editor.clear_selection();
                         editor.move_to_line_start();
+                        false
                     }
                     KeyCode::End => {
                         editor.clear_selection();
                         editor.move_to_line_end();
+                        false
                     }
-                    _ => {}
+                    _ => false,
+                };
+                if text_modified {
+                    tab.mark_editor_dirty();
                 }
             }
         }
@@ -2081,6 +2114,7 @@ impl App {
         let tab = self.active_tab_mut();
         tab.editor.clear();
         tab.editor.insert_text(query);
+        tab.mark_editor_dirty();
     }
 
     fn handle_driver_execute(&mut self, reply: tokio::sync::oneshot::Sender<DriverResponse>) {
@@ -2357,6 +2391,9 @@ where
             tracing::debug!("event loop iteration {}", iteration);
         }
 
+        // Run debounced real-time validation on the active tab.
+        app.active_tab_mut().maybe_validate();
+
         // Poll for query results from background tasks.
         app.poll_query_results();
 
@@ -2383,10 +2420,11 @@ where
                 }
                 Event::Paste(text) => {
                     if app.focus == Focus::Editor {
-                        let editor = &mut app.active_tab_mut().editor;
-                        editor.save_snapshot();
-                        editor.delete_selection();
-                        editor.insert_text(&text);
+                        let tab = app.active_tab_mut();
+                        tab.editor.save_snapshot();
+                        tab.editor.delete_selection();
+                        tab.editor.insert_text(&text);
+                        tab.mark_editor_dirty();
                     }
                 }
                 _ => {}

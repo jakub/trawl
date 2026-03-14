@@ -137,6 +137,9 @@ pub struct ErrorDetail {
     /// Parser context label (e.g. "pipeline", "expression").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Contextual suggestion (e.g. "did you mean 'stats'?").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 impl fmt::Display for ErrorDetail {
@@ -148,6 +151,9 @@ impl fmt::Display for ErrorDetail {
         }
         if let Some(ref label) = self.label {
             write!(f, " (while parsing {label})")?;
+        }
+        if let Some(ref hint) = self.hint {
+            write!(f, " ({hint})")?;
         }
         Ok(())
     }
@@ -790,6 +796,7 @@ mod tests {
                     message: "expected pipe stage".into(),
                     span: Some(ErrorSpan { start: 15, end: 21 }),
                     label: Some("pipeline".into()),
+                    hint: None,
                 }],
             },
         };

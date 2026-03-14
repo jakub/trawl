@@ -60,15 +60,28 @@ impl fmt::Display for SqlValue {
 /// Errors that can occur during SQL emission.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitError {
-    UnknownFunction { name: String },
-    InvalidAggregation { message: String },
-    UnsupportedOperation { message: String },
+    UnknownFunction {
+        name: String,
+        suggestion: Option<String>,
+    },
+    InvalidAggregation {
+        message: String,
+    },
+    UnsupportedOperation {
+        message: String,
+    },
 }
 
 impl fmt::Display for EmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownFunction { name } => write!(f, "unknown function: {name}"),
+            Self::UnknownFunction { name, .. } => {
+                write!(f, "unknown function: {name}")?;
+                if let Some(hint) = self.hint() {
+                    write!(f, " ({hint})")?;
+                }
+                Ok(())
+            }
             Self::InvalidAggregation { message } => write!(f, "invalid aggregation: {message}"),
             Self::UnsupportedOperation { message } => {
                 write!(f, "unsupported operation: {message}")
@@ -78,6 +91,32 @@ impl fmt::Display for EmitError {
 }
 
 impl std::error::Error for EmitError {}
+
+impl EmitError {
+    /// Produce a user-facing hint string, if applicable.
+    pub fn hint(&self) -> Option<String> {
+        match self {
+            Self::UnknownFunction {
+                suggestion: Some(s),
+                ..
+            } => Some(format!("did you mean '{s}'?")),
+            _ => None,
+        }
+    }
+
+    /// Convert this emitter error into parse errors with the given query span.
+    ///
+    /// Used by validation endpoints that need to return `Vec<ParseError>`
+    /// from an `EmitError` (server validate handler, TUI real-time validation).
+    pub fn to_parse_errors(&self, query_len: usize) -> Vec<crate::parser::ParseError> {
+        vec![crate::parser::ParseError {
+            message: self.to_string(),
+            span: 0..query_len,
+            label: None,
+            hint: self.hint(),
+        }]
+    }
+}
 
 /// Emit parameterized `DuckDB` SQL from a parsed query.
 ///

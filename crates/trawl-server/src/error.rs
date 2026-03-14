@@ -74,7 +74,7 @@ impl ServerError {
 }
 
 /// Convert a `ParseError` into a structured `ErrorDetail`.
-fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_api::ErrorDetail {
+pub(crate) fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_api::ErrorDetail {
     trawl_api::ErrorDetail {
         message: e.message.clone(),
         span: Some(trawl_api::ErrorSpan {
@@ -82,6 +82,7 @@ fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_api::Error
             end: e.span.end,
         }),
         label: e.label.clone(),
+        hint: e.hint.clone(),
     }
 }
 
@@ -210,6 +211,7 @@ mod tests {
             message: "bad syntax".into(),
             span: 0..3,
             label: None,
+            hint: None,
         }]));
         assert!(err.safe_message().contains("bad syntax"));
     }

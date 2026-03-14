@@ -295,6 +295,7 @@ fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_client::Er
             end: e.span.end,
         }),
         label: e.label.clone(),
+        hint: e.hint.clone(),
     }
 }
 
@@ -305,21 +306,31 @@ fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_client::Er
 /// ```text
 ///   level=error | staats count() by host
 ///                 ~~~~~~
-///   expected pipe stage
+///   error: unknown command 'staats'
+///   hint: did you mean 'stats'?
 /// ```
 pub fn render_error_details(query: &str, details: &[trawl_client::ErrorDetail]) {
     for detail in details {
         if let Some(ref span) = detail.span {
-            render_span_error(query, span.start, span.end, &detail.message);
+            render_span_error(
+                query,
+                span.start,
+                span.end,
+                &detail.message,
+                detail.hint.as_deref(),
+            );
         } else {
             eprintln!("  {}", detail.message);
+            if let Some(ref hint) = detail.hint {
+                eprintln!("  hint: {hint}");
+            }
         }
         eprintln!();
     }
 }
 
-/// Render a single span error with caret underline.
-fn render_span_error(query: &str, start: usize, end: usize, message: &str) {
+/// Render a single span error with caret underline and optional hint.
+fn render_span_error(query: &str, start: usize, end: usize, message: &str, hint: Option<&str>) {
     // Clamp to valid byte boundaries.
     let start = start.min(query.len());
     let end = end.min(query.len()).max(start);
@@ -347,6 +358,9 @@ fn render_span_error(query: &str, start: usize, end: usize, message: &str) {
     eprintln!("  {line}");
     eprintln!("  {}{}", " ".repeat(col_start), "~".repeat(underline_len));
     eprintln!("  {message}");
+    if let Some(hint) = hint {
+        eprintln!("  hint: {hint}");
+    }
 }
 
 /// Render a `ClientError` with span details (if available) for CLI output.
