@@ -105,6 +105,8 @@ pub struct DashboardState {
     pub is_admin: bool,
     /// Cached dashboard snapshot (polled every ~1s when tab is active).
     pub cache: Option<trawl_client::DashboardSnapshot>,
+    /// Last poll error (cleared on success, shown as staleness indicator).
+    pub last_error: Option<String>,
     /// Whether a dashboard request is currently in-flight.
     inflight: bool,
     /// When the inflight flag was set (for timeout detection).
@@ -118,6 +120,7 @@ impl DashboardState {
         Self {
             is_admin: false,
             cache: None,
+            last_error: None,
             inflight: false,
             inflight_since: None,
             poll_counter: 0,

@@ -1,7 +1,7 @@
 //! UI rendering dispatch.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::tui::App;
 use crate::tui::state::{Focus, MainTab};
@@ -72,6 +72,9 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
 
 /// Render the Dashboard tab: tab bar, dashboard content, status bar.
 fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
+    use ratatui::style::{Color, Style};
+    use ratatui::widgets::Paragraph;
+
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -86,9 +89,21 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
     if let Some(ref snapshot) = app.dashboard.cache {
         let opts = trawl_dashboard::DashboardOptions { footer_text: None };
         trawl_dashboard::render_dashboard(snapshot, frame, outer[1], &opts);
+        // Show staleness warning if the last poll failed.
+        if let Some(ref err) = app.dashboard.last_error {
+            let warning =
+                Paragraph::new(format!(" [stale] {err}")).style(Style::default().fg(Color::Yellow));
+            let warn_area = Rect {
+                y: outer[1].y + outer[1].height.saturating_sub(1),
+                height: 1,
+                ..outer[1]
+            };
+            frame.render_widget(warning, warn_area);
+        }
+    } else if let Some(ref err) = app.dashboard.last_error {
+        let msg = Paragraph::new(format!(" Error: {err}")).style(Style::default().fg(Color::Red));
+        frame.render_widget(msg, outer[1]);
     } else {
-        use ratatui::style::{Color, Style};
-        use ratatui::widgets::Paragraph;
         let msg =
             Paragraph::new(" Loading dashboard...").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(msg, outer[1]);

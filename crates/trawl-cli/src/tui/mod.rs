@@ -167,8 +167,8 @@ enum MutationResult {
     },
     /// Schedule was set on a saved query.
     ScheduleSet { saved_query_id: i64 },
-    /// Dashboard snapshot received from server (None on error — clears inflight flag).
-    DashboardUpdate(Option<Box<trawl_client::DashboardSnapshot>>),
+    /// Dashboard snapshot received from server (Err on failure — preserves cached data).
+    DashboardUpdate(Result<Box<trawl_client::DashboardSnapshot>, String>),
     /// Mutation failed.
     Error { message: String },
 }
@@ -444,9 +444,15 @@ impl App {
                     tracing::info!("schedule set for saved query {saved_query_id}");
                     self.refresh_saved_cache(None);
                 }
-                MutationResult::DashboardUpdate(snapshot) => {
-                    if let Some(s) = snapshot {
-                        self.dashboard.cache = Some(*s);
+                MutationResult::DashboardUpdate(result) => {
+                    match result {
+                        Ok(snapshot) => {
+                            self.dashboard.cache = Some(*snapshot);
+                            self.dashboard.last_error = None;
+                        }
+                        Err(msg) => {
+                            self.dashboard.last_error = Some(msg);
+                        }
                     }
                     self.dashboard.clear_inflight();
                 }
@@ -479,10 +485,12 @@ impl App {
         let client = self.client.clone();
         let tx = self.mutation_tx.clone();
         tokio::spawn(async move {
-            // On failure, send None to clear the inflight flag without
-            // replacing the cached snapshot.
-            let snapshot = client.dashboard().await.ok().map(Box::new);
-            let _ = tx.send(MutationResult::DashboardUpdate(snapshot));
+            let result = client
+                .dashboard()
+                .await
+                .map(Box::new)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(MutationResult::DashboardUpdate(result));
         });
     }
 
