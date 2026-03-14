@@ -5,7 +5,7 @@ expression: terminal.backend().to_string()
 " trawld v0.1.0                                                                  "
 " host: test-host  addr: 127.0.0.1:5514  uptime: 2h 34m  health: OK              "
 "┌ EXECUTOR POOL ───────────────┐┌ HOT BUFFER ──────────────────────────────────┐"
-"│ active: 1/4 queued: 0        ││ events: 0 / 100,000 (0.0%)                   │"
+"│ active: 1/4                  ││ events: 0 / 100,000 (0.0%)                   │"
 "│████████     25%              ││ bytes:  0 B / 100.0 MB (0.0%)                │"
 "│                              ││ batches: 0                                   │"
 "└──────────────────────────────┘└──────────────────────────────────────────────┘"

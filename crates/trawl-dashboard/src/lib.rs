@@ -179,15 +179,8 @@ fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(inner);
 
-    let queued = snapshot
-        .pool_active
-        .saturating_sub(snapshot.pool_capacity)
-        .min(snapshot.pool_active);
     let active = snapshot.pool_active.min(snapshot.pool_capacity);
-    let info = format!(
-        " active: {}/{} queued: {}",
-        active, snapshot.pool_capacity, queued
-    );
+    let info = format!(" active: {}/{}", active, snapshot.pool_capacity);
     frame.render_widget(Paragraph::new(info), rows[0]);
 
     let ratio = if snapshot.pool_capacity > 0 {
