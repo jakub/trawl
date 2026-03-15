@@ -1,0 +1,1 @@
+* | let x ="duration * 1000 | eval y = if(isnull(x), 0, x) | fieldw host, y

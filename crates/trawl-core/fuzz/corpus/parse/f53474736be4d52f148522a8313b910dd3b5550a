@@ -1,0 +1,1 @@
+se0rvice | where count > 10 and s1ts != 20

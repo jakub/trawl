@@ -1,0 +1,1 @@
+* | let x = duration000 | eval y = if(isnull(x),(x), 0, x) | fieldw ho

@@ -1,0 +1,1 @@
+"connection from" | rex "(?P<ip>\d+)* from message |ístats count() by ip

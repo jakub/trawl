@@ -1,0 +1,1 @@
+* | table host, service | stats count() by host

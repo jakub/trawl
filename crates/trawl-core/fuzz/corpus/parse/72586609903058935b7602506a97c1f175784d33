@@ -1,0 +1,1 @@
+ast=/pgulast=a1h | timechart sst=/pgpan=u5m count() by servic=e

@@ -1,0 +1,1 @@
+service=nginx last=1h | stats count() by host

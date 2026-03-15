@@ -1,0 +1,1 @@
+* | stats count() by host | stats count() as num_hosts

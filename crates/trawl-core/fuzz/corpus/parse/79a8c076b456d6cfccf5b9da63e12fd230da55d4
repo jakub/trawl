@@ -1,0 +1,1 @@
+last='dtop 10 host by ce | sort -coibe | sort -count

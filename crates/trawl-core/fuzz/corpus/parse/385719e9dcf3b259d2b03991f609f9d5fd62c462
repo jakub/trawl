@@ -1,0 +1,1 @@
+se0rvache  | where count >10| where count > 10 and sts != 20

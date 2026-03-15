@@ -1,0 +1,1 @@
+status>=400 last=24h | stats count() by host, uri | sort -count | limit 20

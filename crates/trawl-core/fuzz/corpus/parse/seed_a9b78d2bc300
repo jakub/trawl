@@ -1,0 +1,1 @@
+* | extract kv | where status > 200 | stats count() by method

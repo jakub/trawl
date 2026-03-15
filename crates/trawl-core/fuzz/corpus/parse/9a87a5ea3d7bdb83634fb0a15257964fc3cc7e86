@@ -1,0 +1,1 @@
+service=nginx OR service=apache | where c§ount > 10 and status != 200

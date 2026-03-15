@@ -1,0 +1,1 @@
+* | timechart span=5m count(), avg(duration) by service

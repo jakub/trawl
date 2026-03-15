@@ -1,0 +1,1 @@
+last=7d | top 1.....................0 host by service | sort -count

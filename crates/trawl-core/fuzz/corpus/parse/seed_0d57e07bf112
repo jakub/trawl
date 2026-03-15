@@ -1,0 +1,1 @@
+* | stats count(), avg(duration) by host | drop avg_duration

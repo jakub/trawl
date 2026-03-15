@@ -1,0 +1,1 @@
+service=nginx | stats avg(duration) by status | table status, avg_duration

@@ -1,0 +1,1 @@
+service=nginx | pivot avg(duration) on status by host

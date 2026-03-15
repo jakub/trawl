@@ -1,0 +1,1 @@
+"connectio= froectio= from" | rex "("connection from" € d+)*

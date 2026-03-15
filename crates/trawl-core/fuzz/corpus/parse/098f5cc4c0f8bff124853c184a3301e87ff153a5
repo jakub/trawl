@@ -1,0 +1,1 @@
+last=7d | top 10 host by service | sort -cout

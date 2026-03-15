@@ -1,0 +1,1 @@
+* | where status in (200, 301, 404)

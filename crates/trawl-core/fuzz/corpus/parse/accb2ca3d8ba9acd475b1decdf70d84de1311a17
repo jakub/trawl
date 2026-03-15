@@ -1,0 +1,1 @@
+se0rvice=nginx OR service=apache | where count > 10 and sts != 200

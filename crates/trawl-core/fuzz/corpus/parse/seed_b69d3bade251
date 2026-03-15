@@ -1,0 +1,1 @@
+* | where status == 404 or status == 500

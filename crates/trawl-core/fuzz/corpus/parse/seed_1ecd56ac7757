@@ -1,0 +1,1 @@
+service=nginx last=2h | stats count() by host | where count > 10 | sort -count | limit 5

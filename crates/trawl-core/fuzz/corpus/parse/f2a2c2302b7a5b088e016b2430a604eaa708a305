@@ -1,0 +1,1 @@
+" coconnection from" | rex "(?P<ip>\d+)" from message | stats count() by ip
