@@ -4602,7 +4602,6 @@ version = "0.1.8"
 dependencies = [
  "serde",
  "serde_json",
- "trawl-engine",
 ]
 
 [[package]]
@@ -4701,6 +4700,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "trawl-api",
  "trawl-core",
 ]
 

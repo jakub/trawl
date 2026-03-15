@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use trawl_engine::value::{QueryResult, SchemaColumn};
+
+pub mod value;
+
+use crate::value::{QueryResult, SchemaColumn};
 
 // -- common enums ------------------------------------------------------------
 

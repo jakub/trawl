@@ -8,4 +8,8 @@ pub mod error;
 pub mod executor;
 pub mod post_process;
 pub mod timezone;
-pub mod value;
+
+// Value types live in trawl-api (the wire types crate); re-exported here
+// so that existing `trawl_engine::value::*` imports across the workspace
+// continue to work without changes.
+pub use trawl_api::value;

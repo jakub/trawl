@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+trawl-api = { workspace = true }
 trawl-core = { workspace = true }
 chrono = { workspace = true }
 duckdb = { workspace = true }
