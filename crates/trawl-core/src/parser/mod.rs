@@ -137,11 +137,20 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
 /// Returns `Some(word)` if the word is NOT a known pipe stage (i.e. it's a typo),
 /// or `None` if the error isn't in a pipe-command position or the word is valid.
 fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
+    // Guard against byte offsets that land inside a multi-byte character.
+    if !input.is_char_boundary(offset) {
+        return None;
+    }
+
     // Find the start of the word containing `offset` by scanning backward.
     let before = &input[..offset];
     let word_start = before
         .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-        .map_or(0, |pos| pos + 1);
+        .map_or(0, |pos| {
+            // Advance past the matched character (which may be multi-byte).
+            let c = input[pos..].chars().next().unwrap_or(' ');
+            pos + c.len_utf8()
+        });
 
     // Extract the full word from word_start forward.
     let candidate: String = input[word_start..]
