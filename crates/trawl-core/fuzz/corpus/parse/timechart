@@ -1,0 +1,1 @@
+last=1h | timechart span=5m count() by service

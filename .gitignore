@@ -33,3 +33,7 @@ data/
 docs/node_modules/
 docs/dist/
 docs/.astro/
+
+# fuzz artifacts
+crates/trawl-core/fuzz/target/
+crates/trawl-core/fuzz/artifacts/

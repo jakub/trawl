@@ -1,0 +1,24 @@
+[package]
+name = "trawl-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+trawl-core = { path = ".." }
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+doc = false
+
+[[bin]]
+name = "parse_emit"
+path = "fuzz_targets/parse_emit.rs"
+doc = false
+
+[workspace]
