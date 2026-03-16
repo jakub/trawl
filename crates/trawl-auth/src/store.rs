@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! `SQLite`-backed storage for API keys.
 //!
 //! [`KeyStore`] owns a `rusqlite::Connection` and provides the full key
@@ -365,6 +369,22 @@ impl KeyStore {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(keys)
+    }
+
+    /// Look up a key's full info by its prefix.
+    ///
+    /// Returns `KeyNotFound` if no key with this prefix exists.
+    pub fn get_key_by_prefix(&self, prefix: &str) -> Result<ApiKeyInfo, AuthError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, prefix, name, role, active, created_at, expires_at, last_used, revoked_at
+             FROM api_keys WHERE prefix = ?1",
+        )?;
+        stmt.query_row(params![prefix], row_to_api_key_info)
+            .optional()
+            .map_err(AuthError::Database)?
+            .ok_or_else(|| AuthError::KeyNotFound {
+                prefix: prefix.to_owned(),
+            })
     }
 
     /// Get the internal database ID for a key by its prefix.

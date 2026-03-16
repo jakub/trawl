@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Periodic server stats emitter.
 //!
 //! Emits a `server_stats` INFO event at a fixed interval with
@@ -29,6 +33,11 @@ pub fn spawn_stats_emitter(
     let sse_semaphore = Arc::clone(&state.query.sse_semaphore);
     let hot_buffer = state.query.hot_buffer.clone();
     let fallback_glob = pool.fallback_glob().to_string();
+    let wal_dir = state
+        .ingest
+        .wal_writer
+        .as_ref()
+        .map(|w| w.dir().to_path_buf());
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
@@ -46,7 +55,7 @@ pub fn spawn_stats_emitter(
                         &sse_semaphore,
                         hot_buffer.as_ref(),
                     );
-                    crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob);
+                    crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob, wal_dir.as_deref());
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::info!(

@@ -1,5 +1,10 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Handlers for `trawl-admin keys` subcommands.
 
+use std::io::{BufRead, Write};
 use std::time::Duration;
 
 use trawl_auth::Role;
@@ -55,10 +60,45 @@ pub fn list(store: &KeyStore, all: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Revoke an API key by prefix.
-pub fn revoke(store: &KeyStore, prefix: &str) -> Result<(), String> {
-    let info = store.revoke_key(prefix).map_err(|e| e.to_string())?;
-    eprintln!("revoked key: {} ({})", info.prefix, info.name);
+/// Revoke an API key by prefix, with interactive confirmation unless `--yes`.
+pub fn revoke(store: &KeyStore, prefix: &str, yes: bool) -> Result<(), String> {
+    let info = store.get_key_by_prefix(prefix).map_err(|e| e.to_string())?;
+
+    if !info.active {
+        return Err(format!(
+            "key {} ({}) is already revoked",
+            info.prefix, info.name
+        ));
+    }
+
+    eprintln!("  prefix:  {}", info.prefix);
+    eprintln!("  name:    {}", info.name);
+    eprintln!("  role:    {}", info.role);
+    eprintln!("  created: {}", format_timestamp(&info.created_at));
+
+    if !yes {
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        if !is_tty {
+            return Err("refusing to revoke without --yes when stdin is not a TTY".into());
+        }
+
+        eprint!("\nrevoke this key? [y/N] ");
+        std::io::stderr().flush().map_err(|e| e.to_string())?;
+
+        let mut answer = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut answer)
+            .map_err(|e| e.to_string())?;
+
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+            eprintln!("aborted");
+            return Ok(());
+        }
+    }
+
+    let revoked = store.revoke_key(prefix).map_err(|e| e.to_string())?;
+    eprintln!("revoked key: {} ({})", revoked.prefix, revoked.name);
     Ok(())
 }
 

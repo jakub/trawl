@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Prometheus metrics: metric name constants, descriptions, and gauge collection.
 
 use std::path::Path;
@@ -24,6 +28,8 @@ pub const SYSLOG_EVENTS_TOTAL: &str = "trawl_syslog_events_total";
 pub const SYSLOG_PARSE_ERRORS_TOTAL: &str = "trawl_syslog_parse_errors_total";
 pub const SYSLOG_EVENTS_DROPPED_TOTAL: &str = "trawl_syslog_events_dropped_total";
 pub const SYSLOG_TCP_CONNECTIONS: &str = "trawl_syslog_tcp_connections";
+pub const WAL_FILES: &str = "trawl_wal_files";
+pub const WAL_BYTES: &str = "trawl_wal_bytes";
 
 // -- description registration ------------------------------------------------
 
@@ -64,6 +70,8 @@ pub fn describe_metrics() {
         SYSLOG_TCP_CONNECTIONS,
         "Current active syslog TCP connections"
     );
+    describe_gauge!(WAL_FILES, "Number of pending WAL (ndjson) files");
+    describe_gauge!(WAL_BYTES, "Total byte size of pending WAL files");
 }
 
 // -- gauge collection --------------------------------------------------------
@@ -92,11 +100,15 @@ fn parquet_cache() -> &'static Mutex<CachedParquetStats> {
     })
 }
 
-/// Update gauges that require periodic polling (hot buffer + parquet files).
+/// Update gauges that require periodic polling (hot buffer + parquet + WAL files).
 ///
 /// Cheap enough to call on every prometheus scrape and in the stats emitter.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
-pub fn collect_gauges(hot_buffer: Option<&Arc<HotBuffer>>, fallback_glob: &str) {
+pub fn collect_gauges(
+    hot_buffer: Option<&Arc<HotBuffer>>,
+    fallback_glob: &str,
+    wal_dir: Option<&Path>,
+) {
     // Hot buffer gauges.
     if let Some(buf) = hot_buffer {
         metrics::gauge!(HOT_BUFFER_EVENTS).set(buf.event_count() as f64);
@@ -105,6 +117,11 @@ pub fn collect_gauges(hot_buffer: Option<&Arc<HotBuffer>>, fallback_glob: &str) 
 
     // Parquet file gauges — walk the glob pattern's parent directory.
     collect_parquet_gauges(fallback_glob);
+
+    // WAL file gauges.
+    if let Some(dir) = wal_dir {
+        collect_wal_gauges(dir);
+    }
 }
 
 /// Scan parquet files on disk and update the file count / byte size gauges.
@@ -186,6 +203,78 @@ fn walk_dir_recursive(
     Ok(())
 }
 
+// -- WAL gauge collection ----------------------------------------------------
+
+/// TTL for the WAL stats cache (same cadence as parquet).
+const WAL_CACHE_TTL_SECS: u64 = 30;
+
+/// Cached WAL file statistics.
+struct CachedWalStats {
+    file_count: u64,
+    total_bytes: u64,
+    last_updated: Option<Instant>,
+}
+
+/// Module-level cache for WAL gauge values.
+fn wal_cache() -> &'static Mutex<CachedWalStats> {
+    static CACHE: OnceLock<Mutex<CachedWalStats>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(CachedWalStats {
+            file_count: 0,
+            total_bytes: 0,
+            last_updated: None,
+        })
+    })
+}
+
+/// Scan WAL directory for `.ndjson` files and update gauge metrics.
+///
+/// Uses a 30s TTL cache to avoid repeated directory scans.
+#[allow(clippy::cast_precision_loss)]
+fn collect_wal_gauges(wal_dir: &Path) {
+    let cache = wal_cache();
+
+    // Fast path: serve from cache if fresh.
+    {
+        let cached = cache.lock().expect("wal cache poisoned");
+        let is_fresh = cached
+            .last_updated
+            .is_some_and(|t| t.elapsed().as_secs() < WAL_CACHE_TTL_SECS);
+        if is_fresh {
+            metrics::gauge!(WAL_FILES).set(cached.file_count as f64);
+            metrics::gauge!(WAL_BYTES).set(cached.total_bytes as f64);
+            return;
+        }
+    }
+
+    if !wal_dir.is_dir() {
+        return;
+    }
+
+    let mut file_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    if let Ok(entries) = std::fs::read_dir(wal_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "ndjson") {
+                file_count += 1;
+                if let Ok(meta) = entry.metadata() {
+                    total_bytes += meta.len();
+                }
+            }
+        }
+    }
+
+    metrics::gauge!(WAL_FILES).set(file_count as f64);
+    metrics::gauge!(WAL_BYTES).set(total_bytes as f64);
+
+    let mut cached = cache.lock().expect("wal cache poisoned");
+    cached.file_count = file_count;
+    cached.total_bytes = total_bytes;
+    cached.last_updated = Some(Instant::now());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +290,6 @@ mod tests {
     #[test]
     fn collect_gauges_no_hot_buffer_no_panic() {
         // With no recorder installed and no hot buffer, should be a no-op.
-        collect_gauges(None, "/nonexistent/path/**/*.parquet");
+        collect_gauges(None, "/nonexistent/path/**/*.parquet", None);
     }
 }

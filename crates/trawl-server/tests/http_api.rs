@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! End-to-end HTTPS API tests for trawld.
 //!
 //! Starts a real TLS server on a random port with a self-signed cert,

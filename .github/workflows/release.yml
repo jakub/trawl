@@ -20,7 +20,7 @@ env:
 jobs:
   build:
     name: build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -28,11 +28,18 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
             cross: false
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             cross: true
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            arch: arm64
+            cross: false
+            os: macos-latest
     steps:
       - name: Free disk space
+        if: runner.os == 'Linux'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
@@ -41,11 +48,20 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Set version from tag
+      - name: Set version from tag (Linux)
+        if: runner.os == 'Linux'
         run: |
           version="${RELEASE_TAG#v}"
           echo "Setting workspace version to ${version}"
           sed -i "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
+          grep '^version' Cargo.toml
+
+      - name: Set version from tag (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          version="${RELEASE_TAG#v}"
+          echo "Setting workspace version to ${version}"
+          sed -i '' "1,/^version = \".*\"/s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
           grep '^version' Cargo.toml
 
       - uses: dtolnay/rust-toolchain@stable
@@ -84,6 +100,7 @@ jobs:
           sudo apt-get install -y libc6-arm64-cross dpkg-dev
 
       - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
         with:
           tool: cargo-zigbuild,cargo-deb
 
@@ -96,6 +113,7 @@ jobs:
         run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
 
       - name: Build .deb packages
+        if: runner.os == 'Linux'
         run: |
           cargo deb -p trawl-server --no-build --no-strip --target ${{ matrix.target }}
           cargo deb -p trawl-cli --no-build --no-strip --target ${{ matrix.target }}
@@ -110,13 +128,19 @@ jobs:
           cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
           tar czf "${staging}.tar.gz" "${staging}"
 
-      - name: Upload artifacts
+      - name: Upload tarball
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
-          path: |
-            trawl-*.tar.gz
-            target/${{ matrix.target }}/debian/*.deb
+          path: trawl-*.tar.gz
+          if-no-files-found: error
+
+      - name: Upload .deb packages
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: target/${{ matrix.target }}/debian/*.deb
           if-no-files-found: error
 
   release:

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! HTTP request handlers for the trawl API.
 
 use std::collections::HashMap;
@@ -252,9 +256,14 @@ pub async fn query(
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let hot_buffer = state.query.hot_buffer.clone();
     let fallback_glob = state.query.pool.fallback_glob().to_owned();
+    let wal_dir = state
+        .ingest
+        .wal_writer
+        .as_ref()
+        .map(|w| w.dir().to_path_buf());
     let _ = tokio::task::spawn_blocking(move || {
         metrics_process::Collector::default().collect();
-        crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob);
+        crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob, wal_dir.as_deref());
     })
     .await;
     let body = state.metrics_handle.render();

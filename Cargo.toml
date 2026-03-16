@@ -5,10 +5,10 @@ default-members = ["crates/trawl-cli", "crates/trawl-admin", "crates/trawl-serve
 resolver = "3"
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.88"
-license = "MIT"
+license = "MPL-2.0"
 publish = false
 
 [workspace.dependencies]

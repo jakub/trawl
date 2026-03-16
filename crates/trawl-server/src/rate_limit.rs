@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Per-role rate limiting middleware using the governor crate (GCRA algorithm).
 //!
 //! Each role gets an independent keyed rate limiter, keyed by API key prefix.

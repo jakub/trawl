@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Semaphore-bounded executor pool for concurrent query execution.
 //!
 //! Pre-creates a pool of [`Executor`] instances sharing the same underlying

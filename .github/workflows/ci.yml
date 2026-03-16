@@ -85,6 +85,19 @@ jobs:
         env:
           DUCKDB_DOWNLOAD_LIB: "1"
 
+  check-macos:
+    name: check (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+      - run: cargo check --workspace --no-default-features
+        env:
+          DUCKDB_DOWNLOAD_LIB: "1"
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::path::PathBuf;
 use std::process;
 
@@ -71,6 +75,9 @@ enum KeysAction {
     Revoke {
         /// The key prefix (shown in `keys list`).
         prefix: String,
+        /// Skip confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
     },
 }
 
@@ -127,7 +134,7 @@ fn main() {
                 expires,
             } => commands::keys::create(&store, &name, role.into(), expires.as_deref()),
             KeysAction::List { all } => commands::keys::list(&store, all),
-            KeysAction::Revoke { prefix } => commands::keys::revoke(&store, &prefix),
+            KeysAction::Revoke { prefix, yes } => commands::keys::revoke(&store, &prefix, yes),
         },
         Command::Tls { action } => match action {
             TlsAction::Generate { output_dir, san } => {
