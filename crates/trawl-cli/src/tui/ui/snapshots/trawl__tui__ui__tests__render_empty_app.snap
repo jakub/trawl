@@ -21,7 +21,7 @@ expression: terminal.backend().to_string()
 "│                       Help: F1 or https://docs.trawl.sh                      │"
 "│                                 Quit: Ctrl-Q                                 │"
 "│                                                                              │"
-"│                                 Client: 0.1.8                                │"
+"│                                 Client: 0.1.9                                │"
 "│                                   Server: —                                  │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
