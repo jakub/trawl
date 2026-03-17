@@ -73,8 +73,20 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
         }]);
     }
 
+    // Strip comments before parsing, replacing with spaces to preserve
+    // byte offsets for error spans.
+    let stripped = strip_comments(input);
+
+    // If the stripped input is all whitespace (e.g. comment-only input),
+    // parse empty string since the parser accepts "" but not "   ".
+    let parse_input = if stripped.trim().is_empty() {
+        ""
+    } else {
+        stripped.as_str()
+    };
+
     let parser = query_parser();
-    let result = parser.parse(input);
+    let result = parser.parse(parse_input);
 
     match result.into_result() {
         Ok(query) => Ok(query),
@@ -83,6 +95,59 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
             .map(|e| rich_to_parse_error(&e, input))
             .collect()),
     }
+}
+
+/// Replace `//` and `#` comments with spaces, preserving byte positions.
+///
+/// Handles `//` (line comment) and `#` (line comment) outside of quoted
+/// strings. Comment content is replaced with spaces so that error spans
+/// remain accurate.
+///
+/// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
+/// treated as a comment start. Use `//` comments on lines containing regex
+/// literals, or move the regex to a different line.
+fn strip_comments(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = bytes.to_vec();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < len {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < len {
+                // skip escaped character inside string
+                i += 2;
+            } else if bytes[i] == b'"' {
+                in_string = false;
+                i += 1;
+            } else {
+                i += 1;
+            }
+        } else if bytes[i] == b'"' {
+            in_string = true;
+            i += 1;
+        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            // // comment — blank to end of line
+            while i < len && bytes[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+        } else if bytes[i] == b'#' {
+            // # comment — blank to end of line
+            while i < len && bytes[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    // We only replaced ASCII bytes with ASCII spaces — multi-byte UTF-8
+    // sequences are untouched (continuation bytes are >= 0x80, never
+    // matching `"`, `#`, `/`, `\`, or `\n`). So from_utf8 always succeeds.
+    String::from_utf8(out).expect("comment stripping only replaces ASCII bytes with spaces")
 }
 
 /// Convert a chumsky `Rich` error into our `ParseError` with a human-friendly message.
@@ -524,5 +589,94 @@ mod tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors[0].hint.as_deref(), Some("did you mean 'where'?"));
+    }
+
+    // --- comment tests ---
+
+    #[test]
+    fn test_hash_comment_stripped() {
+        let query = parse("# this is a comment\nservice=nginx").unwrap();
+        assert_eq!(query.search.groups[0].len(), 1);
+    }
+
+    #[test]
+    fn test_double_slash_comment_stripped() {
+        let query = parse("service=nginx // filter by service\n| stats count()").unwrap();
+        assert_eq!(query.search.groups[0].len(), 1);
+        assert_eq!(query.pipeline.len(), 1);
+    }
+
+    #[test]
+    fn test_comment_inside_string_preserved() {
+        let query = parse(r#""hello # world""#).unwrap();
+        assert_eq!(query.search.groups[0].len(), 1);
+        assert_eq!(
+            query.search.groups[0][0].node,
+            SearchToken::QuotedSearch(QuotedSearch {
+                phrase: "hello # world".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_double_slash_inside_string_preserved() {
+        let query = parse(r#""http://example.com""#).unwrap();
+        assert_eq!(query.search.groups[0].len(), 1);
+        assert_eq!(
+            query.search.groups[0][0].node,
+            SearchToken::QuotedSearch(QuotedSearch {
+                phrase: "http://example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_multiline_comments() {
+        let query =
+            parse("# find errors\nservice=nginx\n// only recent\nlast=1h | stats count() by host")
+                .unwrap();
+        assert_eq!(query.search.groups[0].len(), 1);
+        assert!(query.search.time_filter.is_some());
+        assert_eq!(query.pipeline.len(), 1);
+    }
+
+    #[test]
+    fn test_comment_at_end_of_input() {
+        let query = parse("service=nginx # trailing").unwrap();
+        assert_eq!(query.search.groups[0].len(), 1);
+    }
+
+    #[test]
+    fn test_only_comments() {
+        let query = parse("# just a comment").unwrap();
+        assert!(query.search.groups.is_empty());
+        assert_eq!(query.pipeline.len(), 0);
+    }
+
+    #[test]
+    fn test_only_comments_multiline() {
+        let query = parse("# line 1\n// line 2\n# line 3").unwrap();
+        assert!(query.search.groups.is_empty());
+        assert_eq!(query.pipeline.len(), 0);
+    }
+
+    #[test]
+    fn test_comment_error_spans_match_original() {
+        // error should point to the original input position
+        let result = parse("# comment\n| badstage");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors[0].span.start >= 10, // after "# comment\n"
+            "span should point into original input, got: {:?}",
+            errors[0].span
+        );
+    }
+
+    #[test]
+    fn strip_comments_preserves_length() {
+        let input = "abc # comment\ndef // another\nghi";
+        let stripped = strip_comments(input);
+        assert_eq!(stripped.len(), input.len());
     }
 }
