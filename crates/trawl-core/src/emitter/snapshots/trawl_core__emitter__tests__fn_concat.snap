@@ -1,0 +1,13 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | let full = concat(host, \":\", service)\"#)"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('full')), (CONCAT("host", ?, "service")) AS "full"
+FROM "_s0"
+---
+params:
+  0: ':'

@@ -1,0 +1,16 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | let sev = case(status >= 500, \"5xx\", status >= 400, \"4xx\")\"#)"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('sev')), (CASE WHEN ("status" >= ?) THEN ? WHEN ("status" >= ?) THEN ? END) AS "sev"
+FROM "_s0"
+---
+params:
+  0: 500
+  1: '5xx'
+  2: 400
+  3: '4xx'

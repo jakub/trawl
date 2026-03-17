@@ -1,0 +1,13 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | let hour = date_part(\"hour\", timestamp)\"#)"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('hour')), (DATE_PART(?, "timestamp")) AS "hour"
+FROM "_s0"
+---
+params:
+  0: 'hour'

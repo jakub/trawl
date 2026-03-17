@@ -1,0 +1,13 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | let day = date_trunc(\"day\", timestamp)\"#)"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('day')), (DATE_TRUNC(?, "timestamp")) AS "day"
+FROM "_s0"
+---
+params:
+  0: 'day'

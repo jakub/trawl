@@ -73,6 +73,27 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
     "typeof",
     "tonumber",
     "tostring",
+    // string
+    "contains",
+    "startswith",
+    "endswith",
+    "split",
+    "concat",
+    // date/time
+    "date_part",
+    "date_trunc",
+    "date_diff",
+    "strftime",
+    "strptime",
+    // conditional
+    "case",
+    // json
+    "json",
+    "json_extract",
+    "json_extract_string",
+    "json_valid",
+    "json_keys",
+    "json_array_length",
 ];
 
 /// Compute the Levenshtein edit distance between two strings.
@@ -246,8 +267,22 @@ mod tests {
             let query = match func {
                 "count" | "now" => format!("| stats {func}()"),
                 "if" | "replace" => format!("| let x = {func}(a, b, c)"),
-                "coalesce" => format!("| let x = {func}(a, b)"),
-                "substr" => format!("| let x = {func}(a, 1)"),
+                "coalesce" | "concat" => format!("| let x = {func}(a, b)"),
+                "substr"
+                | "contains"
+                | "startswith"
+                | "endswith"
+                | "date_part"
+                | "date_trunc"
+                | "strftime"
+                | "strptime"
+                | "json"
+                | "json_extract_string"
+                | "json_extract" => {
+                    format!(r#"| let x = {func}(a, "b")"#)
+                }
+                "split" | "date_diff" => format!(r#"| let x = {func}(a, "b", 1)"#),
+                "case" => format!(r#"| let x = {func}(a > 1, "yes", "no")"#),
                 "round" => format!("| let x = {func}(a)"),
                 // Aggregates use stats, scalars use let/eval
                 _ if crate::emitter::is_aggregate_function(func) => {

@@ -360,6 +360,7 @@ fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
 
 // ── scalar functions ───────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
     match name {
         // string
@@ -385,6 +386,67 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
             }
         }
         "substr" => eval_substr(args),
+        "contains" => {
+            if args.len() != 2 {
+                return EvalValue::Null;
+            }
+            match (&args[0], &args[1]) {
+                (EvalValue::Str(s), EvalValue::Str(sub)) => {
+                    EvalValue::Bool(s.contains(sub.as_str()))
+                }
+                _ => EvalValue::Null,
+            }
+        }
+        "startswith" => {
+            if args.len() != 2 {
+                return EvalValue::Null;
+            }
+            match (&args[0], &args[1]) {
+                (EvalValue::Str(s), EvalValue::Str(pre)) => {
+                    EvalValue::Bool(s.starts_with(pre.as_str()))
+                }
+                _ => EvalValue::Null,
+            }
+        }
+        "endswith" => {
+            if args.len() != 2 {
+                return EvalValue::Null;
+            }
+            match (&args[0], &args[1]) {
+                (EvalValue::Str(s), EvalValue::Str(suf)) => {
+                    EvalValue::Bool(s.ends_with(suf.as_str()))
+                }
+                _ => EvalValue::Null,
+            }
+        }
+        "split" => {
+            if args.len() != 3 {
+                return EvalValue::Null;
+            }
+            match (&args[0], &args[1], &args[2]) {
+                (EvalValue::Str(s), EvalValue::Str(delim), EvalValue::Int(idx)) => {
+                    let parts: Vec<&str> = s.split(delim.as_str()).collect();
+                    usize::try_from(*idx)
+                        .ok()
+                        .and_then(|i| parts.get(i))
+                        .map_or(EvalValue::Null, |p| EvalValue::Str((*p).to_string()))
+                }
+                _ => EvalValue::Null,
+            }
+        }
+        "concat" => {
+            let mut result = String::new();
+            for arg in args {
+                match arg {
+                    EvalValue::Str(s) => result.push_str(s),
+                    EvalValue::Int(n) => result.push_str(&n.to_string()),
+                    EvalValue::Float(n) => result.push_str(&n.to_string()),
+                    EvalValue::Bool(b) => result.push_str(&b.to_string()),
+                    EvalValue::Null | EvalValue::Array(_) => return EvalValue::Null,
+                }
+            }
+            EvalValue::Str(result)
+        }
 
         // numeric
         "abs" => args.first().map_or(EvalValue::Null, |v| match v {
@@ -438,8 +500,134 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
             let now = chrono::Utc::now();
             EvalValue::Str(now.to_rfc3339())
         }
+        // conditional
+        "case" => {
+            let pairs = args.len() / 2;
+            for i in 0..pairs {
+                if args[i * 2].is_truthy() {
+                    return args[i * 2 + 1].clone();
+                }
+            }
+            // odd arg count → last arg is default
+            if args.len() % 2 == 1 {
+                args[args.len() - 1].clone()
+            } else {
+                EvalValue::Null
+            }
+        }
+        // json
+        "json" | "json_extract_string" => eval_json_extract_string(args),
+        "json_extract" => eval_json_extract(args),
+        "json_valid" => args.first().map_or(EvalValue::Null, |v| match v {
+            EvalValue::Str(s) => {
+                EvalValue::Bool(serde_json::from_str::<serde_json::Value>(s).is_ok())
+            }
+            _ => EvalValue::Null,
+        }),
+        "json_keys" => args.first().map_or(EvalValue::Null, |v| match v {
+            EvalValue::Str(s) => serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|val| {
+                    val.as_object().map(|obj| {
+                        EvalValue::Array(obj.keys().map(|k| EvalValue::Str(k.clone())).collect())
+                    })
+                })
+                .unwrap_or(EvalValue::Null),
+            _ => EvalValue::Null,
+        }),
+        #[allow(clippy::cast_possible_wrap)]
+        "json_array_length" => args.first().map_or(EvalValue::Null, |v| match v {
+            EvalValue::Str(s) => serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|val| val.as_array().map(|arr| EvalValue::Int(arr.len() as i64)))
+                .unwrap_or(EvalValue::Null),
+            _ => EvalValue::Null,
+        }),
 
         _ => EvalValue::Null,
+    }
+}
+
+/// Convert a `JSONPath` like `$.foo.bar[0]` to a JSON Pointer like `/foo/bar/0`.
+fn jsonpath_to_pointer(path: &str) -> String {
+    let stripped = path.strip_prefix('$').unwrap_or(path);
+    let mut result = String::new();
+    for part in stripped.split('.') {
+        if part.is_empty() {
+            continue;
+        }
+        // handle bracket notation: "items[0]" -> "items" + "0"
+        if let Some(bracket_pos) = part.find('[') {
+            let field = &part[..bracket_pos];
+            if !field.is_empty() {
+                result.push('/');
+                result.push_str(field);
+            }
+            if let Some(idx_str) = part[bracket_pos + 1..].strip_suffix(']') {
+                result.push('/');
+                result.push_str(idx_str);
+            }
+        } else {
+            result.push('/');
+            result.push_str(part);
+        }
+    }
+    result
+}
+
+fn eval_json_extract_string(args: &[EvalValue]) -> EvalValue {
+    if args.len() != 2 {
+        return EvalValue::Null;
+    }
+    match (&args[0], &args[1]) {
+        (EvalValue::Str(json_str), EvalValue::Str(path)) => {
+            let pointer = jsonpath_to_pointer(path);
+            serde_json::from_str::<serde_json::Value>(json_str)
+                .ok()
+                .and_then(|val| {
+                    val.pointer(&pointer).map(|v| match v {
+                        serde_json::Value::String(s) => EvalValue::Str(s.clone()),
+                        other => EvalValue::Str(other.to_string()),
+                    })
+                })
+                .unwrap_or(EvalValue::Null)
+        }
+        _ => EvalValue::Null,
+    }
+}
+
+fn eval_json_extract(args: &[EvalValue]) -> EvalValue {
+    if args.len() != 2 {
+        return EvalValue::Null;
+    }
+    match (&args[0], &args[1]) {
+        (EvalValue::Str(json_str), EvalValue::Str(path)) => {
+            let pointer = jsonpath_to_pointer(path);
+            serde_json::from_str::<serde_json::Value>(json_str)
+                .ok()
+                .and_then(|val| val.pointer(&pointer).map(json_val_to_eval_val))
+                .unwrap_or(EvalValue::Null)
+        }
+        _ => EvalValue::Null,
+    }
+}
+
+fn json_val_to_eval_val(v: &serde_json::Value) -> EvalValue {
+    match v {
+        serde_json::Value::Null => EvalValue::Null,
+        serde_json::Value::Bool(b) => EvalValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                EvalValue::Int(i)
+            } else {
+                EvalValue::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => EvalValue::Str(s.clone()),
+        serde_json::Value::Array(arr) => {
+            EvalValue::Array(arr.iter().map(json_val_to_eval_val).collect())
+        }
+        serde_json::Value::Object(_) => EvalValue::Str(v.to_string()),
     }
 }
 

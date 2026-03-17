@@ -1,0 +1,11 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | where json(message, \"$.user\") == \"alice\"\"#)"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE (JSON_EXTRACT_STRING("message", ?) = ?)
+---
+params:
+  0: '$.user'
+  1: 'alice'

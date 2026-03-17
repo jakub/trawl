@@ -1,0 +1,13 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | let age = date_diff(\"second\", timestamp, now())\"#)"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('age')), (DATE_DIFF(?, "timestamp", now())) AS "age"
+FROM "_s0"
+---
+params:
+  0: 'second'

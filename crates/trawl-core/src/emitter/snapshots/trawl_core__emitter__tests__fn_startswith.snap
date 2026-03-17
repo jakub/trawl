@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | where startswith(path, \"/api/\")\"#)"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE STARTS_WITH("path", ?)
+---
+params:
+  0: '/api/'

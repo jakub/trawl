@@ -41,11 +41,22 @@ pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), Emi
 fn function_arity(name: &str) -> (usize, Option<usize>) {
     match name {
         "count" => (0, Some(1)),
-        "coalesce" => (1, None),
-        "if" | "replace" => (3, Some(3)),
+        "coalesce" | "concat" => (1, None),
+        "if" | "replace" | "split" | "date_diff" => (3, Some(3)),
+        "case" => (2, None),
         "substr" => (2, Some(3)),
         "round" => (1, Some(2)),
         "now" => (0, Some(0)),
+        "contains"
+        | "startswith"
+        | "endswith"
+        | "date_part"
+        | "date_trunc"
+        | "strftime"
+        | "strptime"
+        | "json"
+        | "json_extract_string"
+        | "json_extract" => (2, Some(2)),
         // everything else: exactly 1
         _ => (1, Some(1)),
     }
@@ -56,11 +67,13 @@ fn function_arity(name: &str) -> (usize, Option<usize>) {
 pub(crate) fn literal_int_positions(name: &str) -> &'static [usize] {
     match name {
         "round" => &[1], // precision arg
+        "split" => &[2], // index arg (0-indexed DSL → 1-indexed DuckDB)
         _ => &[],
     }
 }
 
 /// Translate a DSL function call to `DuckDB` SQL.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, EmitError> {
     match name {
         "count" => {
@@ -123,6 +136,66 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
         "typeof" => require_one_arg(name, args, |a| format!("TYPEOF({a})")),
         "tonumber" => require_one_arg(name, args, |a| format!("TRY_CAST({a} AS DOUBLE)")),
         "tostring" => require_one_arg(name, args, |a| format!("CAST({a} AS VARCHAR)")),
+        // string functions
+        "contains" => require_n_args(name, args, 2, |a| format!("CONTAINS({}, {})", a[0], a[1])),
+        "startswith" => require_n_args(name, args, 2, |a| {
+            format!("STARTS_WITH({}, {})", a[0], a[1])
+        }),
+        "endswith" => require_n_args(name, args, 2, |a| format!("SUFFIX({}, {})", a[0], a[1])),
+        "split" => require_n_args(name, args, 3, |a| {
+            // DSL is 0-indexed, DuckDB STRING_SPLIT is 1-indexed
+            let idx: i64 = a[2].parse().expect("split index must be literal int");
+            format!("STRING_SPLIT({}, {})[{}]", a[0], a[1], idx + 1)
+        }),
+        "concat" => {
+            if args.is_empty() {
+                return Err(EmitError::InvalidAggregation {
+                    message: "concat() requires at least one argument".to_string(),
+                });
+            }
+            Ok(format!("CONCAT({})", args.join(", ")))
+        }
+        // date/time functions
+        "date_part" => require_n_args(name, args, 2, |a| format!("DATE_PART({}, {})", a[0], a[1])),
+        "date_trunc" => {
+            require_n_args(name, args, 2, |a| format!("DATE_TRUNC({}, {})", a[0], a[1]))
+        }
+        "date_diff" => require_n_args(name, args, 3, |a| {
+            format!("DATE_DIFF({}, {}, {})", a[0], a[1], a[2])
+        }),
+        // strftime: DSL is (timestamp, format), DuckDB is (format, timestamp) — swap args
+        "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[1], a[0])),
+        "strptime" => require_n_args(name, args, 2, |a| format!("STRPTIME({}, {})", a[0], a[1])),
+        // conditional
+        "case" => {
+            if args.len() < 2 {
+                return Err(EmitError::InvalidAggregation {
+                    message: "case() requires at least 2 arguments".to_string(),
+                });
+            }
+            let mut sql = String::from("CASE");
+            let pairs = args.len() / 2;
+            for i in 0..pairs {
+                use std::fmt::Write as _;
+                let _ = write!(sql, " WHEN {} THEN {}", args[i * 2], args[i * 2 + 1]);
+            }
+            if args.len() % 2 == 1 {
+                use std::fmt::Write as _;
+                let _ = write!(sql, " ELSE {}", args[args.len() - 1]);
+            }
+            sql.push_str(" END");
+            Ok(sql)
+        }
+        // json functions
+        "json" | "json_extract_string" => require_n_args(name, args, 2, |a| {
+            format!("JSON_EXTRACT_STRING({}, {})", a[0], a[1])
+        }),
+        "json_extract" => require_n_args(name, args, 2, |a| {
+            format!("JSON_EXTRACT({}, {})", a[0], a[1])
+        }),
+        "json_valid" => require_one_arg(name, args, |a| format!("JSON_VALID({a})")),
+        "json_keys" => require_one_arg(name, args, |a| format!("JSON_KEYS({a})")),
+        "json_array_length" => require_one_arg(name, args, |a| format!("JSON_ARRAY_LENGTH({a})")),
         // new aggregate functions
         "first" => require_one_arg(name, args, |a| format!("FIRST({a})")),
         "last" => require_one_arg(name, args, |a| format!("LAST({a})")),

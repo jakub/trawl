@@ -849,8 +849,93 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // list-format source paths
+    // new string functions
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn fn_contains() {
+        assert_snapshot!(emit_dsl(r#"* | where contains(message, "error")"#));
+    }
+
+    #[test]
+    fn fn_startswith() {
+        assert_snapshot!(emit_dsl(r#"* | where startswith(path, "/api/")"#));
+    }
+
+    #[test]
+    fn fn_endswith() {
+        assert_snapshot!(emit_dsl(r#"* | where endswith(host, ".local")"#));
+    }
+
+    #[test]
+    fn fn_split() {
+        assert_snapshot!(emit_dsl(r#"* | let seg = split(path, "/", 2)"#));
+    }
+
+    #[test]
+    fn fn_concat() {
+        assert_snapshot!(emit_dsl(r#"* | let full = concat(host, ":", service)"#));
+    }
+
+    // -----------------------------------------------------------------------
+    // date/time functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fn_date_part() {
+        assert_snapshot!(emit_dsl(r#"* | let hour = date_part("hour", timestamp)"#));
+    }
+
+    #[test]
+    fn fn_date_trunc() {
+        assert_snapshot!(emit_dsl(r#"* | let day = date_trunc("day", timestamp)"#));
+    }
+
+    #[test]
+    fn fn_date_diff() {
+        assert_snapshot!(emit_dsl(
+            r#"* | let age = date_diff("second", timestamp, now())"#
+        ));
+    }
+
+    #[test]
+    fn fn_strftime_arg_swap() {
+        assert_snapshot!(emit_dsl(
+            r#"* | let formatted = strftime(timestamp, "%Y-%m-%d")"#
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // case() conditional
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fn_case_with_default() {
+        assert_snapshot!(emit_dsl(
+            r#"* | let sev = case(status >= 500, "server_error", status >= 400, "client_error", "ok")"#
+        ));
+    }
+
+    #[test]
+    fn fn_case_no_default() {
+        assert_snapshot!(emit_dsl(
+            r#"* | let sev = case(status >= 500, "5xx", status >= 400, "4xx")"#
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // json functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fn_json_extract() {
+        assert_snapshot!(emit_dsl(r#"* | where json(message, "$.user") == "alice""#));
+    }
+
+    #[test]
+    fn fn_json_valid() {
+        assert_snapshot!(emit_dsl("* | where json_valid(message)"));
+    }
 
     // -----------------------------------------------------------------------
     // composite hot source
