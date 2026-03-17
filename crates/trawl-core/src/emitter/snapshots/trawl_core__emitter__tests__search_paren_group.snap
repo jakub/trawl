@@ -1,0 +1,11 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"(service=nginx OR service=apache) last=1h\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '1 hours' AND (("service" = ?) OR ("service" = ?))
+---
+params:
+  0: 'nginx'
+  1: 'apache'

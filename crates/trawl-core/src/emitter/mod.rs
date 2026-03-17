@@ -995,6 +995,27 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // NOT and parentheses in search stage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_not_field() {
+        assert_snapshot!(emit_dsl("NOT service=nginx"));
+    }
+
+    #[test]
+    fn search_not_paren_group() {
+        assert_snapshot!(emit_dsl(
+            "NOT (service=nginx OR service=apache) level=error"
+        ));
+    }
+
+    #[test]
+    fn search_paren_group() {
+        assert_snapshot!(emit_dsl("(service=nginx OR service=apache) last=1h"));
+    }
+
     #[test]
     fn error_eventstats_dc() {
         assert_snapshot!(emit_dsl_err("* | eventstats dc(host) by service"));

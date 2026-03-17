@@ -88,6 +88,10 @@ pub enum SearchToken {
     EarliestFilter(String),
     /// `latest="2026-03-14T03:15:00Z"` — absolute upper time bound
     LatestFilter(String),
+    /// `NOT token` or `NOT (group)` — negation of a search token
+    Not(Box<Spanned<SearchToken>>),
+    /// `(token1 token2 OR token3)` — parenthesized OR-of-AND group
+    Group(Vec<Vec<Spanned<SearchToken>>>),
 }
 
 /// A field-value filter with an operator.

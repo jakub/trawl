@@ -50,6 +50,8 @@ struct TimeMatcher {
 enum TokenMatcher {
     Field(FieldMatcher),
     Text(TextMatcher),
+    Not(Box<TokenMatcher>),
+    OrGroup(Vec<Vec<TokenMatcher>>),
 }
 
 struct FieldMatcher {
@@ -249,6 +251,22 @@ fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
                 negated: false,
             }))
         }
+        SearchToken::Not(inner) => {
+            let inner_matcher = compile_token(&inner.node)?;
+            Some(TokenMatcher::Not(Box::new(inner_matcher)))
+        }
+        SearchToken::Group(groups) => {
+            let compiled_groups: Vec<Vec<TokenMatcher>> = groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .filter_map(|t| compile_token(&t.node))
+                        .collect()
+                })
+                .collect();
+            Some(TokenMatcher::OrGroup(compiled_groups))
+        }
     }
 }
 
@@ -292,6 +310,10 @@ impl TokenMatcher {
         match self {
             Self::Field(fm) => fm.matches(event),
             Self::Text(tm) => tm.matches(event),
+            Self::Not(inner) => !inner.matches(event),
+            Self::OrGroup(groups) => groups
+                .iter()
+                .any(|group| group.iter().all(|m| m.matches(event))),
         }
     }
 }

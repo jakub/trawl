@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"NOT service=nginx\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE NOT ("service" = ?)
+---
+params:
+  0: 'nginx'

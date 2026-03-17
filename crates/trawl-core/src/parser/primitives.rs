@@ -277,7 +277,9 @@ pub(crate) fn literal<'src>()
 pub(crate) fn bare_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     any()
-        .filter(|c: &char| !c.is_ascii_whitespace() && *c != '|' && *c != ',')
+        .filter(|c: &char| {
+            !c.is_ascii_whitespace() && *c != '|' && *c != ',' && *c != ')' && *c != '('
+        })
         .repeated()
         .at_least(1)
         .to_slice()

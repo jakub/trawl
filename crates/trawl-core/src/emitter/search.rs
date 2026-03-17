@@ -152,6 +152,32 @@ fn emit_search_token(token: &SearchToken, state: &mut EmitterState) {
             let placeholder = state.push_param(SqlValue::String(pattern));
             state.push_where(format!("\"message\" ILIKE {placeholder}"));
         }
+        SearchToken::Not(inner) => {
+            let clauses = state.collect_where_clauses(|s| {
+                emit_search_token(&inner.node, s);
+            });
+            if !clauses.is_empty() {
+                state.push_where(format!("NOT ({})", clauses.join(" AND ")));
+            }
+        }
+        SearchToken::Group(groups) => {
+            let mut group_conditions = Vec::new();
+            for group in groups {
+                let clauses = state.collect_where_clauses(|s| {
+                    for token in group {
+                        emit_search_token(&token.node, s);
+                    }
+                });
+                if !clauses.is_empty() {
+                    let joined = clauses.join(" AND ");
+                    group_conditions.push(format!("({joined})"));
+                }
+            }
+            if !group_conditions.is_empty() {
+                let or_expr = group_conditions.join(" OR ");
+                state.push_where(format!("({or_expr})"));
+            }
+        }
     }
 }
 

@@ -1,0 +1,12 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"NOT (service=nginx OR service=apache) level=error\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE NOT ((("service" = ?) OR ("service" = ?))) AND "level" = ?
+---
+params:
+  0: 'nginx'
+  1: 'apache'
+  2: 'error'

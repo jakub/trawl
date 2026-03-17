@@ -122,7 +122,7 @@ fn text_search<'src>()
     let negated = just('-')
         .ignore_then(
             any()
-                .filter(|c: &char| !c.is_ascii_whitespace() && *c != '|')
+                .filter(|c: &char| !c.is_ascii_whitespace() && *c != '|' && *c != ')' && *c != '(')
                 .repeated()
                 .at_least(1)
                 .to_slice()
@@ -136,7 +136,9 @@ fn text_search<'src>()
         });
 
     let positive = any()
-        .filter(|c: &char| !c.is_ascii_whitespace() && *c != '|' && *c != '"')
+        .filter(|c: &char| {
+            !c.is_ascii_whitespace() && *c != '|' && *c != '"' && *c != ')' && *c != '('
+        })
         .repeated()
         .at_least(1)
         .to_slice()
@@ -168,18 +170,64 @@ fn latest_filter<'src>()
         .labelled("latest filter")
 }
 
-/// Parse a single search token.
+/// Parse a single search token, including NOT prefix and parenthesized groups.
 fn search_token<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
-    choice((
-        time_filter(),
-        earliest_filter(),
-        latest_filter(),
-        quoted_search(),
-        field_filter(),
-        text_search(),
-    ))
-    .labelled("search token")
+    recursive(|token| {
+        // NOT followed by another token (or group) = negation.
+        // Use rewind-based lookahead: NOT must be followed by something
+        // that's a valid token start, otherwise treat "NOT" as text search.
+        let not_token = keyword("NOT")
+            .then(
+                // Peek ahead: next char after whitespace must be a valid token start.
+                // This prevents "NOT |" or "NOT" at end from being parsed as negation.
+                any()
+                    .filter(|c: &char| {
+                        c.is_alphanumeric() || *c == '_' || *c == '"' || *c == '-' || *c == '('
+                    })
+                    .rewind()
+                    .padded(),
+            )
+            .ignore_then(spanned(token.clone()))
+            .map(|inner| SearchToken::Not(Box::new(inner)));
+
+        // Parenthesized group: (tokens OR tokens)
+        let or_marker = keyword("OR")
+            .or(keyword("or"))
+            .to(TokenOrSep::<Spanned<SearchToken>>::Or);
+        let paren_token = spanned(token).map(TokenOrSep::Token);
+        let paren_group = choice((or_marker, paren_token))
+            .padded()
+            .repeated()
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .delimited_by(just('(').padded(), just(')').padded())
+            .map(|items| {
+                let mut groups: Vec<Vec<_>> = vec![vec![]];
+                for item in items {
+                    match item {
+                        TokenOrSep::Or => groups.push(vec![]),
+                        TokenOrSep::Token(t) => {
+                            groups.last_mut().expect("groups always non-empty").push(t);
+                        }
+                    }
+                }
+                groups.retain(|g| !g.is_empty());
+                SearchToken::Group(groups)
+            });
+
+        // Leaf tokens (non-recursive)
+        let leaf = choice((
+            time_filter(),
+            earliest_filter(),
+            latest_filter(),
+            quoted_search(),
+            field_filter(),
+            text_search(),
+        ));
+
+        choice((not_token, paren_group, leaf)).labelled("search token")
+    })
 }
 
 /// Intermediate enum for parsing OR-separated groups.
@@ -187,6 +235,58 @@ fn search_token<'src>()
 enum TokenOrSep<T> {
     Token(T),
     Or,
+}
+
+/// Recursively extract time filters from a token list, hoisting them globally.
+fn hoist_time_filters(
+    tokens: &mut Vec<Spanned<SearchToken>>,
+    time_filter: &mut Option<Spanned<TimeFilter>>,
+    earliest: &mut Option<Spanned<String>>,
+    latest: &mut Option<Spanned<String>>,
+) {
+    // First, recurse into Group and Not tokens to hoist from nested structures.
+    for token in tokens.iter_mut() {
+        match &mut token.node {
+            SearchToken::Group(groups) => {
+                for group in groups.iter_mut() {
+                    hoist_time_filters(group, time_filter, earliest, latest);
+                }
+                groups.retain(|g| !g.is_empty());
+            }
+            SearchToken::Not(inner) => {
+                // If NOT wraps a time filter, hoist it (time is always global).
+                match &inner.node {
+                    SearchToken::TimeFilter(tf) => {
+                        *time_filter = Some(Spanned::new(tf.clone(), inner.span.clone()));
+                    }
+                    SearchToken::EarliestFilter(ts) => {
+                        *earliest = Some(Spanned::new(ts.clone(), inner.span.clone()));
+                    }
+                    SearchToken::LatestFilter(ts) => {
+                        *latest = Some(Spanned::new(ts.clone(), inner.span.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    // Now remove hoistable tokens from the flat list.
+    tokens.retain(|t| match &t.node {
+        SearchToken::TimeFilter(tf) => {
+            *time_filter = Some(Spanned::new(tf.clone(), t.span.clone()));
+            false
+        }
+        SearchToken::EarliestFilter(ts) => {
+            *earliest = Some(Spanned::new(ts.clone(), t.span.clone()));
+            false
+        }
+        SearchToken::LatestFilter(ts) => {
+            *latest = Some(Spanned::new(ts.clone(), t.span.clone()));
+            false
+        }
+        _ => true,
+    });
 }
 
 /// Parse the full search stage: OR-separated groups of AND-joined tokens.
@@ -224,21 +324,7 @@ pub(crate) fn search_stage<'src>()
             let mut earliest = None;
             let mut latest = None;
             for group in &mut groups {
-                group.retain(|t| match &t.node {
-                    SearchToken::TimeFilter(tf) => {
-                        time_filter = Some(Spanned::new(tf.clone(), t.span.clone()));
-                        false
-                    }
-                    SearchToken::EarliestFilter(ts) => {
-                        earliest = Some(Spanned::new(ts.clone(), t.span.clone()));
-                        false
-                    }
-                    SearchToken::LatestFilter(ts) => {
-                        latest = Some(Spanned::new(ts.clone(), t.span.clone()));
-                        false
-                    }
-                    _ => true,
-                });
+                hoist_time_filters(group, &mut time_filter, &mut earliest, &mut latest);
             }
             // Remove groups that became empty after hoisting.
             groups.retain(|g| !g.is_empty());
@@ -448,8 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_word_not_mistaken_for_field() {
-        // "NOT" should parse as text search, not fail as field_filter.
+    fn test_not_at_end_is_text_search() {
+        // "NOT" at end of input (no following token) → text search.
         let result = search_stage().parse("NOT").into_result().unwrap();
         assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
@@ -462,28 +548,57 @@ mod tests {
     }
 
     #[test]
-    fn test_not_before_field_filter() {
-        // "NOT level=error" — NOT is text search, level=error is field filter.
+    fn test_not_negates_field_filter() {
+        // "NOT level=error" → single NOT(FieldFilter) token.
         let result = search_stage()
             .parse("NOT level=error")
             .into_result()
             .unwrap();
+        assert_eq!(result.groups[0].len(), 1);
+        match &result.groups[0][0].node {
+            SearchToken::Not(inner) => {
+                assert_eq!(
+                    inner.node,
+                    SearchToken::FieldFilter(FieldFilter {
+                        field: "level".to_string(),
+                        op: FilterOp::Eq,
+                        value: FilterValue::Literal("error".to_string()),
+                    })
+                );
+            }
+            other => panic!("expected Not, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_not_parenthesized_group() {
+        // "NOT (service=nginx OR service=apache) level=error"
+        let result = search_stage()
+            .parse("NOT (service=nginx OR service=apache) level=error")
+            .into_result()
+            .unwrap();
         assert_eq!(result.groups[0].len(), 2);
-        assert_eq!(
-            result.groups[0][0].node,
-            SearchToken::TextSearch(TextSearch {
-                term: "NOT".to_string(),
-                negated: false,
-            })
-        );
-        assert_eq!(
+        assert!(matches!(result.groups[0][0].node, SearchToken::Not(_)));
+        assert!(matches!(
             result.groups[0][1].node,
-            SearchToken::FieldFilter(FieldFilter {
-                field: "level".to_string(),
-                op: FilterOp::Eq,
-                value: FilterValue::Literal("error".to_string()),
-            })
-        );
+            SearchToken::FieldFilter(_)
+        ));
+    }
+
+    #[test]
+    fn test_parenthesized_group() {
+        // "(service=nginx OR service=apache)"
+        let result = search_stage()
+            .parse("(service=nginx OR service=apache)")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups[0].len(), 1);
+        match &result.groups[0][0].node {
+            SearchToken::Group(groups) => {
+                assert_eq!(groups.len(), 2);
+            }
+            other => panic!("expected Group, got {other:?}"),
+        }
     }
 
     #[test]
