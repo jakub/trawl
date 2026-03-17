@@ -1,9 +1,20 @@
-# trawl
-
-[![CI](https://github.com/jakub/trawl/actions/workflows/ci.yml/badge.svg)](https://github.com/jakub/trawl/actions/workflows/ci.yml)
-[![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
-
+<p align="center">
+  <a href="https://trawl.sh">
+    <img src="docs/public/trawl.png" alt="trawl" height="150px">
+  </a>
+</p>
+<h1 align="center">trawl</h1>
+<p align="center">
 Self-hosted log collection, storage, and search for homelabs and small-to-medium infrastructure. Splunk-like pipeline DSL, Parquet + DuckDB under the hood, zero licensing cost, single binary.
+</p>
+<p align="center">
+  <a href="https://github.com/jakub/trawl/actions/workflows/ci.yml">
+    <img src="https://github.com/jakub/trawl/actions/workflows/ci.yml/badge.svg" alt="trawl">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-MPL--2.0-blue.svg" alt="trawl">
+  </a>
+</p>
 
 ## Install
 
