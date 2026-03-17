@@ -16,7 +16,17 @@ use super::state::EmitterState;
 /// For single-group queries, emits tokens directly (same as before).
 /// For multi-group (OR) queries, collects each group's clauses and
 /// combines them as `(a AND b) OR (c AND d)`.
-pub(crate) fn emit_search(search: &SearchStage, state: &mut EmitterState) {
+pub(crate) fn emit_search(
+    search: &SearchStage,
+    state: &mut EmitterState,
+) -> Result<(), super::EmitError> {
+    // Mutual exclusivity: last= and earliest=/latest= cannot be combined.
+    if search.time_filter.is_some() && (search.earliest.is_some() || search.latest.is_some()) {
+        return Err(super::EmitError::UnsupportedOperation {
+            message: "cannot combine 'last=' with 'earliest='/'latest='".to_string(),
+        });
+    }
+
     // Emit hoisted time filter as a top-level WHERE clause.
     if let Some(tf) = &search.time_filter {
         let interval = tf.node.duration.to_interval_string();
@@ -24,6 +34,20 @@ pub(crate) fn emit_search(search: &SearchStage, state: &mut EmitterState) {
             "CAST(\"timestamp\" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '{interval}'"
         ));
         state.time_filter = Some(tf.node.duration);
+    }
+
+    // Emit absolute time bounds.
+    if let Some(earliest) = &search.earliest {
+        let p = state.push_param(SqlValue::String(earliest.node.clone()));
+        state.push_where(format!(
+            "CAST(\"timestamp\" AS TIMESTAMP) >= CAST({p} AS TIMESTAMP)"
+        ));
+    }
+    if let Some(latest) = &search.latest {
+        let p = state.push_param(SqlValue::String(latest.node.clone()));
+        state.push_where(format!(
+            "CAST(\"timestamp\" AS TIMESTAMP) < CAST({p} AS TIMESTAMP)"
+        ));
     }
 
     match search.groups.len() {
@@ -56,6 +80,8 @@ pub(crate) fn emit_search(search: &SearchStage, state: &mut EmitterState) {
             }
         }
     }
+
+    Ok(())
 }
 
 fn emit_search_token(token: &SearchToken, state: &mut EmitterState) {
@@ -114,7 +140,9 @@ fn emit_search_token(token: &SearchToken, state: &mut EmitterState) {
                 state.push_where(format!("\"message\" ILIKE {placeholder}"));
             }
         }
-        SearchToken::TimeFilter(_) => {
+        SearchToken::TimeFilter(_)
+        | SearchToken::EarliestFilter(_)
+        | SearchToken::LatestFilter(_) => {
             // Time filters are hoisted out of groups during parsing and
             // emitted as a top-level WHERE clause in `emit_search()`.
             // This arm is a defensive no-op — it should never fire.

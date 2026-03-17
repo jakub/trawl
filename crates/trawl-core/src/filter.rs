@@ -26,6 +26,10 @@ pub struct CompiledFilter {
     groups: Vec<Vec<TokenMatcher>>,
     /// Global time filter (hoisted from groups during parsing).
     time_filter: Option<TimeMatcher>,
+    /// Absolute lower bound (`earliest=`).
+    earliest: Option<chrono::DateTime<chrono::Utc>>,
+    /// Absolute upper bound (`latest=`).
+    latest: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl std::fmt::Debug for CompiledFilter {
@@ -33,6 +37,8 @@ impl std::fmt::Debug for CompiledFilter {
         f.debug_struct("CompiledFilter")
             .field("groups", &self.groups.len())
             .field("time_filter", &self.time_filter.is_some())
+            .field("earliest", &self.earliest)
+            .field("latest", &self.latest)
             .finish()
     }
 }
@@ -100,6 +106,18 @@ impl CompiledFilter {
             duration_secs: tf.node.duration.to_seconds(),
         });
 
+        let earliest = search.earliest.as_ref().and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s.node)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
+
+        let latest = search.latest.as_ref().and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s.node)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
+
         let groups = search
             .groups
             .iter()
@@ -114,6 +132,8 @@ impl CompiledFilter {
         Self {
             groups,
             time_filter,
+            earliest,
+            latest,
         }
     }
 
@@ -141,6 +161,25 @@ impl CompiledFilter {
             && !matches_time_filter_at(event, tf, now)
         {
             return false;
+        }
+
+        // Check absolute time bounds.
+        if self.earliest.is_some() || self.latest.is_some() {
+            if let Some(ts) = extract_event_timestamp(event) {
+                if let Some(earliest) = &self.earliest
+                    && ts < *earliest
+                {
+                    return false;
+                }
+                if let Some(latest) = &self.latest
+                    && ts >= *latest
+                {
+                    return false;
+                }
+            } else {
+                // no timestamp → can't match time bounds
+                return false;
+            }
         }
 
         // Empty groups → match everything.
@@ -194,7 +233,9 @@ fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
                 negated: ts.negated,
             }))
         }
-        SearchToken::TimeFilter(_) => {
+        SearchToken::TimeFilter(_)
+        | SearchToken::EarliestFilter(_)
+        | SearchToken::LatestFilter(_) => {
             // Time filters are hoisted — this shouldn't appear in groups.
             None
         }
@@ -383,6 +424,26 @@ fn apply_f64(a: f64, b: f64, op: CompareOp) -> bool {
 // ---------------------------------------------------------------------------
 // Time filter
 // ---------------------------------------------------------------------------
+
+/// Extract the event timestamp as a UTC datetime.
+fn extract_event_timestamp(
+    event: &serde_json::Map<String, Value>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let ts_val = event.get("timestamp")?;
+    match ts_val {
+        Value::String(s) => parse_timestamp(s),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                parse_epoch_i64(i)
+            } else if let Some(f) = n.as_f64() {
+                parse_epoch_f64(f)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 fn matches_time_filter_at(
     event: &serde_json::Map<String, Value>,

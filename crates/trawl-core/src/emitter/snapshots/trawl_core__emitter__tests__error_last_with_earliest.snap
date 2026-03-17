@@ -1,0 +1,5 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_err(r#\"last=1h earliest=\"2026-03-14T00:00:00Z\"\"#)"
+---
+unsupported operation: cannot combine 'last=' with 'earliest='/'latest='

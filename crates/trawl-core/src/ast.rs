@@ -57,6 +57,10 @@ pub struct SearchStage {
     /// Global time filter, hoisted from groups during parsing.
     /// If multiple `last=` tokens appear, last one wins.
     pub time_filter: Option<Spanned<TimeFilter>>,
+    /// Absolute lower time bound (`earliest="..."`), hoisted from groups.
+    pub earliest: Option<Spanned<String>>,
+    /// Absolute upper time bound (`latest="..."`), hoisted from groups.
+    pub latest: Option<Spanned<String>>,
 }
 
 impl SearchStage {
@@ -80,6 +84,10 @@ pub enum SearchToken {
     TimeFilter(TimeFilter),
     /// `"exact phrase"`
     QuotedSearch(QuotedSearch),
+    /// `earliest="2026-03-14T03:00:00Z"` — absolute lower time bound
+    EarliestFilter(String),
+    /// `latest="2026-03-14T03:15:00Z"` — absolute upper time bound
+    LatestFilter(String),
 }
 
 /// A field-value filter with an operator.

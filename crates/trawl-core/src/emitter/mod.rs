@@ -146,7 +146,7 @@ pub fn emit_with_hot_source(
 fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuery, EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
 
-    search::emit_search(&query.search, &mut state);
+    search::emit_search(&query.search, &mut state)?;
 
     let mut rust_stages = Vec::new();
 
@@ -935,6 +935,27 @@ mod tests {
     #[test]
     fn fn_json_valid() {
         assert_snapshot!(emit_dsl("* | where json_valid(message)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // earliest / latest absolute time bounds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_earliest_latest() {
+        assert_snapshot!(emit_dsl(
+            r#"earliest="2026-03-14T03:00:00Z" latest="2026-03-14T03:15:00Z" level=error"#
+        ));
+    }
+
+    #[test]
+    fn search_earliest_only() {
+        assert_snapshot!(emit_dsl(r#"earliest="2026-03-14T00:00:00Z" level=error"#));
+    }
+
+    #[test]
+    fn error_last_with_earliest() {
+        assert_snapshot!(emit_dsl_err(r#"last=1h earliest="2026-03-14T00:00:00Z""#));
     }
 
     // -----------------------------------------------------------------------

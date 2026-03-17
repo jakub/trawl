@@ -1,0 +1,12 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"earliest=\"2026-03-14T03:00:00Z\" latest=\"2026-03-14T03:15:00Z\" level=error\"#)"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE CAST("timestamp" AS TIMESTAMP) >= CAST(? AS TIMESTAMP) AND CAST("timestamp" AS TIMESTAMP) < CAST(? AS TIMESTAMP) AND "level" = ?
+---
+params:
+  0: '2026-03-14T03:00:00Z'
+  1: '2026-03-14T03:15:00Z'
+  2: 'error'

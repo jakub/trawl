@@ -150,11 +150,31 @@ fn text_search<'src>()
     negated.or(positive).labelled("text search")
 }
 
+/// Parse `earliest="2026-03-14T03:00:00Z"` absolute time bound.
+fn earliest_filter<'src>()
+-> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
+    just("earliest=")
+        .ignore_then(quoted_string())
+        .map(SearchToken::EarliestFilter)
+        .labelled("earliest filter")
+}
+
+/// Parse `latest="2026-03-14T03:15:00Z"` absolute time bound.
+fn latest_filter<'src>()
+-> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
+    just("latest=")
+        .ignore_then(quoted_string())
+        .map(SearchToken::LatestFilter)
+        .labelled("latest filter")
+}
+
 /// Parse a single search token.
 fn search_token<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     choice((
         time_filter(),
+        earliest_filter(),
+        latest_filter(),
         quoted_search(),
         field_filter(),
         text_search(),
@@ -199,16 +219,25 @@ pub(crate) fn search_stage<'src>()
             groups.retain(|g| !g.is_empty());
 
             // Hoist time filters out of groups — they apply globally.
-            // If multiple `last=` tokens appear, last one wins.
+            // If multiple tokens of the same kind appear, last one wins.
             let mut time_filter = None;
+            let mut earliest = None;
+            let mut latest = None;
             for group in &mut groups {
-                group.retain(|t| {
-                    if let SearchToken::TimeFilter(tf) = &t.node {
+                group.retain(|t| match &t.node {
+                    SearchToken::TimeFilter(tf) => {
                         time_filter = Some(Spanned::new(tf.clone(), t.span.clone()));
                         false
-                    } else {
-                        true
                     }
+                    SearchToken::EarliestFilter(ts) => {
+                        earliest = Some(Spanned::new(ts.clone(), t.span.clone()));
+                        false
+                    }
+                    SearchToken::LatestFilter(ts) => {
+                        latest = Some(Spanned::new(ts.clone(), t.span.clone()));
+                        false
+                    }
+                    _ => true,
                 });
             }
             // Remove groups that became empty after hoisting.
@@ -217,6 +246,8 @@ pub(crate) fn search_stage<'src>()
             SearchStage {
                 groups,
                 time_filter,
+                earliest,
+                latest,
             }
         })
         .labelled("search stage")
