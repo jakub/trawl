@@ -2,7 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use crate::ast::{ExtractMode, PipeStage, SortDirection, TrawlDuration};
+use crate::ast::{
+    EventStatsStage, ExtractMode, PipeStage, SampleMode, SortDirection, TrawlDuration,
+};
 
 use super::EmitError;
 use super::SqlValue;
@@ -56,6 +58,11 @@ pub(crate) fn process_stage(pipe: &PipeStage, ctx: &mut EmitterState) -> Result<
             process_rename(r, ctx);
             Ok(())
         }
+        PipeStage::Sample(s) => {
+            process_sample(&s.mode, ctx);
+            Ok(())
+        }
+        PipeStage::EventStats(es) => process_eventstats(es, ctx),
     }
 }
 
@@ -456,5 +463,64 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
 
     ctx.set_pivot(agg_sql, pivot.on_field.clone(), pivot.by.clone());
 
+    Ok(())
+}
+
+fn process_sample(mode: &SampleMode, ctx: &mut EmitterState) {
+    ctx.flush_if(FlushCondition::IfModified);
+    let clause = match mode {
+        SampleMode::Percent(p) => format!("USING SAMPLE {p} PERCENT (bernoulli)"),
+        SampleMode::Count(n) => format!("USING SAMPLE {n} ROWS (reservoir)"),
+    };
+    ctx.sample = Some(clause);
+}
+
+fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
+    ctx.flush_if(FlushCondition::Always);
+
+    let partition = if stage.group_by.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = stage.group_by.iter().map(|f| quote_field(f)).collect();
+        format!("PARTITION BY {}", parts.join(", "))
+    };
+
+    let mut items = vec!["*".to_string()];
+    for agg in &stage.aggregations {
+        // Reject functions not supported as window functions in DuckDB.
+        if matches!(
+            agg.function.as_str(),
+            "dc" | "distinct_count" | "values" | "list"
+        ) {
+            return Err(EmitError::UnsupportedOperation {
+                message: format!(
+                    "{}() is not supported in eventstats (window functions do not support DISTINCT)",
+                    agg.function
+                ),
+            });
+        }
+
+        let arg_strings: Vec<String> = agg
+            .args
+            .iter()
+            .map(|a| emit_expr(a, ctx))
+            .collect::<Result<_, _>>()?;
+        let sql_func = translate_function(&agg.function, &arg_strings)?;
+        let first_arg_name = agg.args.first().and_then(|a| {
+            if let crate::ast::Expr::FieldRef(name) = &a.node {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        });
+        let alias = match &agg.alias {
+            Some(a) => quote_field(a),
+            None => default_agg_alias(&agg.function, first_arg_name),
+        };
+        items.push(format!("{sql_func} OVER ({partition}) AS {alias}"));
+    }
+
+    ctx.select = items;
+    ctx.has_projection = true;
     Ok(())
 }

@@ -1,0 +1,5 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_err(\"* | eventstats dc(host) by service\")"
+---
+unsupported operation: dc() is not supported in eventstats (window functions do not support DISTINCT)

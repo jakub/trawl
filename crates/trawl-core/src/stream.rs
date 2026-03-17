@@ -147,6 +147,14 @@ fn compile_per_event_stage(spanned: &Spanned<PipeStage>) -> Result<CompiledStage
                 reason: "aggregation stages cannot appear as pre/post stages".to_string(),
             })
         }
+        PipeStage::Sample(_) => Err(StreamPlanError::UnsupportedStage {
+            stage: "sample".to_string(),
+            reason: "statistical sampling requires the full dataset".to_string(),
+        }),
+        PipeStage::EventStats(_) => Err(StreamPlanError::UnsupportedStage {
+            stage: "eventstats".to_string(),
+            reason: "window functions require the full dataset".to_string(),
+        }),
     }
 }
 
@@ -167,6 +175,8 @@ fn stage_name(stage: &PipeStage) -> &'static str {
         PipeStage::Pivot(_) => "pivot",
         PipeStage::Tail(_) => "tail",
         PipeStage::Rename(_) => "rename",
+        PipeStage::Sample(_) => "sample",
+        PipeStage::EventStats(_) => "eventstats",
     }
 }
 

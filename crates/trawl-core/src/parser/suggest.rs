@@ -28,6 +28,8 @@ pub const KNOWN_PIPE_STAGES: &[&str] = &[
     "drop",
     "rename",
     "pivot",
+    "sample",
+    "eventstats",
 ];
 
 /// Known function names — single source of truth, also used by emitter validation.
@@ -248,6 +250,8 @@ mod tests {
                 "dedup" => "| dedup host".to_string(),
                 "rename" => "| rename host as hostname".to_string(),
                 "pivot" => "| pivot count() on status".to_string(),
+                "sample" => "| sample 10%".to_string(),
+                "eventstats" => "| eventstats count()".to_string(),
                 _ => panic!("unhandled stage '{stage}' in test — add a case"),
             };
             assert!(

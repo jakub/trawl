@@ -10,9 +10,10 @@
 use chumsky::prelude::*;
 
 use crate::ast::{
-    AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
-    PipeStage, PivotStage, RareStage, RenameStage, SortDirection, SortField, SortStage, Spanned,
-    StatsStage, TableStage, TailStage, TimechartStage, TopStage, WhereStage,
+    AggExpr, DedupStage, DropStage, EventStatsStage, Expr, ExtractMode, ExtractStage, LetStage,
+    LimitStage, PipeStage, PivotStage, RareStage, RenameStage, SampleMode, SampleStage,
+    SortDirection, SortField, SortStage, Spanned, StatsStage, TableStage, TailStage,
+    TimechartStage, TopStage, WhereStage,
 };
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
@@ -438,11 +439,73 @@ fn rename_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
         .labelled("rename stage")
 }
 
+/// Parse a `sample` stage: `sample 10%` or `sample 1000`.
+fn sample_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
+{
+    keyword("sample")
+        .padded()
+        .ignore_then(uint().then(just('%').or_not()))
+        .try_map(|(n, pct), span| {
+            if pct.is_some() {
+                if n == 0 || n > 100 {
+                    return Err(Rich::custom(
+                        span,
+                        "sample percentage must be between 1 and 100",
+                    ));
+                }
+                Ok(PipeStage::Sample(SampleStage {
+                    mode: SampleMode::Percent(n),
+                }))
+            } else {
+                if n == 0 {
+                    return Err(Rich::custom(span, "sample count must be at least 1"));
+                }
+                Ok(PipeStage::Sample(SampleStage {
+                    mode: SampleMode::Count(n),
+                }))
+            }
+        })
+        .labelled("sample stage")
+}
+
+/// Parse an `eventstats` stage: `eventstats agg1(), agg2() [by field1, field2]`.
+fn eventstats_stage<'src>()
+-> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+    keyword("eventstats")
+        .padded()
+        .ignore_then(
+            agg_expr()
+                .separated_by(just(',').padded())
+                .at_least(1)
+                .collect::<Vec<_>>(),
+        )
+        .then(
+            keyword("by")
+                .padded()
+                .ignore_then(
+                    field_name()
+                        .separated_by(just(',').padded())
+                        .at_least(1)
+                        .collect::<Vec<_>>(),
+                )
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .map(|(aggregations, group_by)| {
+            PipeStage::EventStats(EventStatsStage {
+                aggregations,
+                group_by,
+            })
+        })
+        .labelled("eventstats stage")
+}
+
 /// Parse a single pipe stage.
 fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     choice((
         stats_stage(),
+        eventstats_stage(),
         timechart_stage(),
         where_stage(),
         sort_stage(),
@@ -461,6 +524,7 @@ fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         drop_stage(),
         rename_stage(),
         pivot_stage(),
+        sample_stage(),
     ))
     .labelled("pipe stage")
 }

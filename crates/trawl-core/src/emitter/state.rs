@@ -51,6 +51,8 @@ pub(crate) struct EmitterState {
     /// The time filter from the search stage, used by `timechart` auto-bucketing.
     /// Not reset on CTE flush — this is query-wide context.
     pub(crate) time_filter: Option<TrawlDuration>,
+    /// `USING SAMPLE` clause set by `sample` stage.
+    pub(crate) sample: Option<String>,
     /// Set by `pivot` stage — overrides normal `build_select()` in `finalize()`.
     pivot: Option<PivotSpec>,
     ctes: Vec<Cte>,
@@ -179,6 +181,7 @@ impl EmitterState {
             has_aggregation: false,
             has_projection: false,
             time_filter: None,
+            sample: None,
             pivot: None,
             ctes: Vec::new(),
             params: Vec::new(),
@@ -244,6 +247,7 @@ impl EmitterState {
         self.limit = None;
         self.has_aggregation = false;
         self.has_projection = false;
+        self.sample = None;
     }
 
     /// Build a SELECT statement from the current accumulated state.
@@ -261,6 +265,12 @@ impl EmitterState {
         // FROM
         sql.push_str("\nFROM ");
         sql.push_str(&self.source);
+
+        // USING SAMPLE (between FROM and WHERE)
+        if let Some(ref sample) = self.sample {
+            sql.push('\n');
+            sql.push_str(sample);
+        }
 
         // WHERE
         if !self.where_clauses.is_empty() {

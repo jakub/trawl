@@ -953,6 +953,53 @@ mod tests {
         assert_snapshot!(emit_dsl(r#"earliest="2026-03-14T00:00:00Z" level=error"#));
     }
 
+    // -----------------------------------------------------------------------
+    // sample
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_sample_percent() {
+        assert_snapshot!(emit_dsl("* | sample 10%"));
+    }
+
+    #[test]
+    fn pipe_sample_count() {
+        assert_snapshot!(emit_dsl("* | sample 1000"));
+    }
+
+    // -----------------------------------------------------------------------
+    // eventstats
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipe_eventstats_basic() {
+        assert_snapshot!(emit_dsl("* | eventstats avg(duration) by service"));
+    }
+
+    #[test]
+    fn pipe_eventstats_no_by() {
+        assert_snapshot!(emit_dsl("* | eventstats count()"));
+    }
+
+    #[test]
+    fn pipe_eventstats_multi_agg() {
+        assert_snapshot!(emit_dsl(
+            "* | eventstats avg(duration) as avg_dur, count() as total by service"
+        ));
+    }
+
+    #[test]
+    fn pipe_eventstats_then_where() {
+        assert_snapshot!(emit_dsl(
+            "* | eventstats avg(duration) as avg_dur by service | where duration > avg_dur"
+        ));
+    }
+
+    #[test]
+    fn error_eventstats_dc() {
+        assert_snapshot!(emit_dsl_err("* | eventstats dc(host) by service"));
+    }
+
     #[test]
     fn error_last_with_earliest() {
         assert_snapshot!(emit_dsl_err(r#"last=1h earliest="2026-03-14T00:00:00Z""#));

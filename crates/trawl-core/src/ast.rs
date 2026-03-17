@@ -247,6 +247,8 @@ pub enum PipeStage {
     Pivot(PivotStage),
     Tail(TailStage),
     Rename(RenameStage),
+    Sample(SampleStage),
+    EventStats(EventStatsStage),
 }
 
 impl fmt::Display for PipeStage {
@@ -267,6 +269,8 @@ impl fmt::Display for PipeStage {
             Self::Pivot(_) => write!(f, "pivot"),
             Self::Tail(_) => write!(f, "tail"),
             Self::Rename(_) => write!(f, "rename"),
+            Self::Sample(_) => write!(f, "sample"),
+            Self::EventStats(_) => write!(f, "eventstats"),
         }
     }
 }
@@ -414,6 +418,31 @@ pub struct TailStage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenameStage {
     pub renames: Vec<(String, String)>,
+}
+
+/// `eventstats avg(duration) by service` — non-reducing aggregation.
+///
+/// Like `stats` but appends aggregation results back to every row
+/// as window functions instead of collapsing rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventStatsStage {
+    pub aggregations: Vec<AggExpr>,
+    pub group_by: Vec<String>,
+}
+
+/// `sample 10%` or `sample 1000` — statistical sampling.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampleStage {
+    pub mode: SampleMode,
+}
+
+/// Sampling mode: percentage or row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleMode {
+    /// `sample 10%` — bernoulli sampling at given percentage.
+    Percent(u64),
+    /// `sample 1000` — reservoir sampling of N rows.
+    Count(u64),
 }
 
 // ---------------------------------------------------------------------------
