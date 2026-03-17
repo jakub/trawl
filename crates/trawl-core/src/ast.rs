@@ -463,6 +463,8 @@ pub enum BinaryOp {
     Or,
     // pattern
     Matches,
+    Like,
+    ILike,
 }
 
 impl fmt::Display for BinaryOp {
@@ -482,6 +484,8 @@ impl fmt::Display for BinaryOp {
             Self::And => write!(f, "and"),
             Self::Or => write!(f, "or"),
             Self::Matches => write!(f, "matches"),
+            Self::Like => write!(f, "like"),
+            Self::ILike => write!(f, "ilike"),
         }
     }
 }

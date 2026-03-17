@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(r#\"* | where host like \"prod-%\"\"#)"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE ("host" LIKE ?)
+---
+params:
+  0: 'prod-%'

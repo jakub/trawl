@@ -148,6 +148,15 @@ pub(crate) fn expr<'src>()
                         .padded()
                         .ignore_then(choice((regex_literal, additive.clone())))
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Matches, rhs)),
+                    // like / ilike pattern matching
+                    keyword("ilike")
+                        .padded()
+                        .ignore_then(additive.clone())
+                        .map(|rhs| CmpRhs::Binary(BinaryOp::ILike, rhs)),
+                    keyword("like")
+                        .padded()
+                        .ignore_then(additive.clone())
+                        .map(|rhs| CmpRhs::Binary(BinaryOp::Like, rhs)),
                     // other comparison operators
                     cmp_op
                         .then(additive)

@@ -90,6 +90,8 @@ fn emit_binary(lhs: &str, op: BinaryOp, rhs: &str) -> String {
         BinaryOp::Lte => "<=",
         BinaryOp::And => "AND",
         BinaryOp::Or => "OR",
+        BinaryOp::Like => "LIKE",
+        BinaryOp::ILike => "ILIKE",
         BinaryOp::Matches => unreachable!(),
     };
     format!("({lhs} {sql_op} {rhs})")

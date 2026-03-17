@@ -170,6 +170,8 @@ fn eval_binary(lhs: &EvalValue, op: BinaryOp, rhs: &EvalValue) -> EvalValue {
             o == std::cmp::Ordering::Less || o == std::cmp::Ordering::Equal
         }),
         BinaryOp::Matches => eval_matches(lhs, rhs),
+        BinaryOp::Like => eval_like(lhs, rhs, false),
+        BinaryOp::ILike => eval_like(lhs, rhs, true),
         BinaryOp::And | BinaryOp::Or => unreachable!(),
     }
 }
@@ -300,6 +302,38 @@ fn eval_matches(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
             // compile regex on the fly — for hot-path use, the caller
             // should pre-compile via `CompiledStage`
             regex::Regex::new(pattern).map_or(EvalValue::Bool(false), |re| {
+                EvalValue::Bool(re.is_match(text))
+            })
+        }
+        _ => EvalValue::Null,
+    }
+}
+
+/// Evaluate SQL LIKE/ILIKE pattern matching.
+///
+/// `%` matches any sequence, `_` matches a single character.
+fn eval_like(lhs: &EvalValue, rhs: &EvalValue, case_insensitive: bool) -> EvalValue {
+    match (lhs, rhs) {
+        (EvalValue::Str(text), EvalValue::Str(pattern)) => {
+            let mut regex_str = String::from("^");
+            for ch in pattern.chars() {
+                match ch {
+                    '%' => regex_str.push_str(".*"),
+                    '_' => regex_str.push('.'),
+                    // escape regex metacharacters
+                    '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                    | '\\' => {
+                        regex_str.push('\\');
+                        regex_str.push(ch);
+                    }
+                    _ => regex_str.push(ch),
+                }
+            }
+            regex_str.push('$');
+            if case_insensitive {
+                regex_str.insert_str(0, "(?i)");
+            }
+            regex::Regex::new(&regex_str).map_or(EvalValue::Bool(false), |re| {
                 EvalValue::Bool(re.is_match(text))
             })
         }
@@ -846,6 +880,44 @@ mod tests {
             lit_str("^prod-.*"),
         );
         assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+    }
+
+    // ── like / ilike ────────────────────────────────────────────────
+
+    #[test]
+    fn like_percent_wildcard() {
+        let expr = binary(lit_str("prod-web-01"), BinaryOp::Like, lit_str("prod-%"));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+    }
+
+    #[test]
+    fn like_no_match() {
+        let expr = binary(lit_str("staging-01"), BinaryOp::Like, lit_str("prod-%"));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+    }
+
+    #[test]
+    fn like_underscore_wildcard() {
+        let expr = binary(lit_str("a1"), BinaryOp::Like, lit_str("a_"));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+    }
+
+    #[test]
+    fn like_case_sensitive() {
+        let expr = binary(lit_str("PROD-01"), BinaryOp::Like, lit_str("prod-%"));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+    }
+
+    #[test]
+    fn ilike_case_insensitive() {
+        let expr = binary(lit_str("PROD-01"), BinaryOp::ILike, lit_str("prod-%"));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+    }
+
+    #[test]
+    fn like_null_propagation() {
+        let expr = binary(lit_null(), BinaryOp::Like, lit_str("prod-%"));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
     }
 
     // ── unary ──────────────────────────────────────────────────────
