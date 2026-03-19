@@ -2240,7 +2240,7 @@ pub async fn run(
         client.schema(),
         client.history(Some(100), None),
         client.list_saved(),
-        client.field_values("service", Some(500)),
+        client.field_values("service", Some(500), None),
         client.health(),
         client.whoami(),
     );

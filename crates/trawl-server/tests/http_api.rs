@@ -853,7 +853,7 @@ async fn field_values_endpoint() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    let resp = client.field_values("service", Some(5)).await.unwrap();
+    let resp = client.field_values("service", Some(5), None).await.unwrap();
     assert_eq!(resp.field, "service");
     assert!(!resp.values.is_empty());
     assert!(resp.values.iter().any(|v| v == "nginx"));
@@ -865,11 +865,11 @@ async fn field_values_cached() {
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // First request should populate cache.
-    let resp1 = client.field_values("service", None).await.unwrap();
+    let resp1 = client.field_values("service", None, None).await.unwrap();
     assert!(!resp1.cached);
 
     // Second request should hit cache.
-    let resp2 = client.field_values("service", None).await.unwrap();
+    let resp2 = client.field_values("service", None, None).await.unwrap();
     assert!(resp2.cached);
 }
 
@@ -878,7 +878,7 @@ async fn field_values_invalid_field_name() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    let result = client.field_values("bad;name", None).await;
+    let result = client.field_values("bad;name", None, None).await;
     assert!(result.is_err());
     match result.unwrap_err() {
         trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 400),

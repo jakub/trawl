@@ -75,6 +75,7 @@ pub use trawl_api::{
     HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse, IngestEventError,
     IngestResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse,
     QueryRequest, QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary,
-    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest,
-    StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, ServiceColumnStats,
+    ServiceSchema, ServiceSchemaResponse, SetScheduleRequest, StatsResponse, UpdateSavedRequest,
+    ValidationResponse, WhoAmIResponse,
 };

@@ -15,7 +15,8 @@ use crate::types::{
     CancelResponse, DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse,
     FieldValuesResponse, HealthResponse, HistoryResponse, IngestResponse, ListReportRunsResponse,
     ListSavedResponse, QueriesResponse, QueryResponse, ReportRunResponse, SavedQueryResponse,
-    ScheduleResponse, SchemaResponse, StatsResponse, ValidationResponse, WhoAmIResponse,
+    ScheduleResponse, SchemaResponse, ServiceSchemaResponse, StatsResponse, ValidationResponse,
+    WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
@@ -150,6 +151,13 @@ impl HttpClient {
     /// Fetch schema introspection from the daemon.
     pub async fn schema(&self) -> Result<SchemaResponse, ClientError> {
         let url = self.endpoint("/api/v1/schema");
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Fetch rich per-service schema from the daemon's background refresh cache.
+    pub async fn schema_services(&self) -> Result<ServiceSchemaResponse, ClientError> {
+        let url = self.endpoint("/api/v1/schema/services");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
     }
@@ -320,15 +328,21 @@ impl HttpClient {
     }
 
     /// Fetch distinct values for a schema field (for autocomplete).
+    ///
+    /// When `service` is `Some`, values are scoped to that service's files only.
     pub async fn field_values(
         &self,
         field: &str,
         limit: Option<usize>,
+        service: Option<&str>,
     ) -> Result<FieldValuesResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/schema/values/{field}"));
         let mut req = self.client.get(&url);
         if let Some(l) = limit {
             req = req.query(&[("limit", l.to_string())]);
+        }
+        if let Some(svc) = service {
+            req = req.query(&[("service", svc)]);
         }
         self.send_authenticated(req).await
     }
