@@ -240,3 +240,23 @@ pub struct SchemaResult {
     /// Number of parquet files matching the configured glob.
     pub file_count: u64,
 }
+
+/// Per-column statistics from parquet row group metadata.
+///
+/// Returned by [`Executor::parquet_column_stats`] — aggregated across
+/// all row groups in the matched parquet files.
+#[derive(Debug, Clone)]
+pub struct ParquetColumnStats {
+    /// Column name (`path_in_schema`).
+    pub column_name: String,
+    /// Total values across all row groups.
+    pub total_count: u64,
+    /// Total null values across all row groups.
+    pub null_count: u64,
+    /// Minimum value (stringified).
+    pub min_value: Option<String>,
+    /// Maximum value (stringified).
+    pub max_value: Option<String>,
+    /// Total compressed size in bytes.
+    pub compressed_bytes: u64,
+}

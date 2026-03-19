@@ -259,6 +259,80 @@ impl Executor {
         Ok(values)
     }
 
+    /// Extract per-column statistics from parquet row group metadata.
+    ///
+    /// Queries `DuckDB`'s `parquet_metadata()` table function which reads only
+    /// file footers — no row data is touched. Returns aggregate stats per
+    /// column: total values, null count, min/max, and compressed size.
+    pub fn parquet_column_stats(
+        &self,
+        source: &str,
+    ) -> Result<Vec<crate::value::ParquetColumnStats>, EngineError> {
+        emitter::validate_source_path(source)?;
+
+        let sql = r"
+            SELECT
+                path_in_schema AS column_name,
+                SUM(num_values)::BIGINT AS total_count,
+                SUM(stats_null_count)::BIGINT AS null_count,
+                MIN(stats_min_value) AS min_value,
+                MAX(stats_max_value) AS max_value,
+                SUM(total_compressed_size)::BIGINT AS compressed_bytes
+            FROM parquet_metadata(?)
+            GROUP BY path_in_schema
+            ORDER BY path_in_schema
+        ";
+
+        let mut stmt = match self.conn.prepare(sql) {
+            Ok(s) => s,
+            Err(e) if is_no_files_error(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut rows = match stmt.query([source]) {
+            Ok(r) => r,
+            Err(e) if is_no_files_error(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut stats = Vec::new();
+        while let Some(row) = rows.next()? {
+            let column_name: String = row.get(0)?;
+            let total_count: i64 = row.get(1)?;
+            let null_count: i64 = row.get(2)?;
+            let min_value: Option<String> = row.get(3).ok();
+            let max_value: Option<String> = row.get(4).ok();
+            let compressed_bytes: i64 = row.get(5)?;
+
+            stats.push(crate::value::ParquetColumnStats {
+                column_name,
+                total_count: u64::try_from(total_count).unwrap_or(0),
+                null_count: u64::try_from(null_count).unwrap_or(0),
+                min_value,
+                max_value,
+                compressed_bytes: u64::try_from(compressed_bytes).unwrap_or(0),
+            });
+        }
+
+        Ok(stats)
+    }
+
+    /// Sum of `num_rows` from parquet file metadata for total event count.
+    ///
+    /// Uses `parquet_file_metadata()` which reads only file-level metadata
+    /// (not row groups), making it very fast.
+    pub fn parquet_row_counts(&self, source: &str) -> Result<u64, EngineError> {
+        emitter::validate_source_path(source)?;
+
+        let sql = "SELECT COALESCE(SUM(num_rows)::BIGINT, 0) FROM parquet_file_metadata(?)";
+        let count: i64 = match self.conn.query_row(sql, [source], |row| row.get(0)) {
+            Ok(c) => c,
+            Err(e) if is_no_files_error(&e) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     /// Export query results directly to a Parquet file via `DuckDB` `COPY TO`.
     ///
     /// Uses a temp table to stage the query results, then writes them to
