@@ -2,10 +2,403 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Schema browser sidebar (F2).
+//! Schema browser detail pane (right side of horizontal split).
 //!
-//! Placeholder — the tree-based schema renderer will be implemented in
-//! `ui/sidebar.rs` as part of the unified sidebar panel.
+//! Renders contextual statistics for the currently selected tree node:
+//! service overview with sparklines, or field stats with sample values.
 
-// This module is retained so existing imports don't break.
-// The full tree-based rendering will be added in a subsequent commit.
+use std::collections::HashSet;
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Sparkline, Wrap};
+
+use crate::tui::state::SchemaBrowser;
+
+/// Determine what is selected in the tree and render the appropriate detail.
+pub fn render_detail_pane(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect) {
+    let selection = resolve_selection(schema);
+    match selection {
+        Selection::None => {
+            let p = Paragraph::new("select a service or field")
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(p, area);
+        }
+        Selection::CommonHeader => render_common_header_detail(schema, frame, area),
+        Selection::CommonField { name } => render_field_detail(schema, name, None, frame, area),
+        Selection::Service { name } => render_service_detail(schema, name, frame, area),
+        Selection::ServiceField { service, field } => {
+            render_field_detail(schema, field, Some(service), frame, area);
+        }
+    }
+}
+
+enum Selection<'a> {
+    None,
+    CommonHeader,
+    CommonField { name: &'a str },
+    Service { name: &'a str },
+    ServiceField { service: &'a str, field: &'a str },
+}
+
+/// Walk the flattened tree to find what the cursor points at.
+fn resolve_selection(schema: &SchemaBrowser) -> Selection<'_> {
+    let filter = schema.filter.to_lowercase();
+    let common_names: HashSet<&str> = schema
+        .common_fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+
+    let mut idx = 0usize;
+    let target = schema.selected;
+
+    // Common header + fields.
+    if !schema.common_fields.is_empty() {
+        let visible_common: Vec<_> = schema
+            .common_fields
+            .iter()
+            .filter(|f| filter.is_empty() || f.name.to_lowercase().contains(&filter))
+            .collect();
+
+        if !visible_common.is_empty() || filter.is_empty() {
+            if idx == target {
+                return Selection::CommonHeader;
+            }
+            idx += 1;
+            for f in &visible_common {
+                if idx == target {
+                    return Selection::CommonField { name: &f.name };
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    // Services.
+    for svc in &schema.services {
+        let unique_fields: Vec<_> = svc
+            .columns
+            .iter()
+            .filter(|c| !common_names.contains(c.name.as_str()))
+            .collect();
+
+        if !filter.is_empty() {
+            let svc_matches = svc.name.to_lowercase().contains(&filter);
+            let fields_match = unique_fields
+                .iter()
+                .any(|c| c.name.to_lowercase().contains(&filter));
+            if !svc_matches && !fields_match {
+                continue;
+            }
+        }
+
+        if idx == target {
+            return Selection::Service { name: &svc.name };
+        }
+        idx += 1;
+
+        if schema.expanded.contains(&svc.name) {
+            for col in &unique_fields {
+                if idx == target {
+                    return Selection::ServiceField {
+                        service: &svc.name,
+                        field: &col.name,
+                    };
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    Selection::None
+}
+
+/// Render overview for the common fields header.
+fn render_common_header_detail(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "common fields",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "\u{2500}".repeat(area.width.min(35) as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(format!("fields:     {}", schema.common_fields.len())),
+        Line::from(format!("services:   {}", schema.services.len())),
+        Line::default(),
+    ];
+
+    for f in &schema.common_fields {
+        lines.push(Line::from(vec![
+            Span::styled(&f.name, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("  ({})", f.data_type),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(p, area);
+}
+
+/// Render service overview with sparkline.
+#[allow(clippy::too_many_lines)]
+fn render_service_detail(
+    schema: &SchemaBrowser,
+    service_name: &str,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let Some(svc) = schema.services.iter().find(|s| s.name == service_name) else {
+        return;
+    };
+
+    let common_names: HashSet<&str> = schema
+        .common_fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let unique_count = svc
+        .columns
+        .iter()
+        .filter(|c| !common_names.contains(c.name.as_str()))
+        .count();
+    let common_count = svc.columns.len() - unique_count;
+
+    let events_str = format_count(svc.total_events);
+    let bytes_str = format_bytes(svc.total_bytes);
+
+    // Compute approximate rate.
+    let days = svc.daily_event_counts.len().max(1);
+    #[allow(clippy::cast_precision_loss)]
+    let daily_rate = svc.total_events as f64 / days as f64;
+    let hourly_rate = daily_rate / 24.0;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let daily_rate_u = daily_rate.max(0.0) as u64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let hourly_rate_u = hourly_rate.max(0.0) as u64;
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            service_name,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "\u{2500}".repeat(area.width.min(35) as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(format!("events:    {events_str}")),
+        Line::from(format!(
+            "rate:      ~{}/day  ~{}/hr",
+            format_count(daily_rate_u),
+            format_count(hourly_rate_u)
+        )),
+    ];
+
+    if let (Some(earliest), Some(latest)) = (&svc.earliest_date, &svc.latest_date) {
+        lines.push(Line::from(format!(
+            "data:      {earliest} \u{2192} {latest}"
+        )));
+    }
+
+    lines.push(Line::from(format!(
+        "files:     {} ({bytes_str})",
+        svc.file_count
+    )));
+    lines.push(Line::default());
+
+    // Sparkline for daily events.
+    if !svc.daily_event_counts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "daily events:",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Field breakdown.
+    lines.push(Line::default());
+    lines.push(Line::from(format!(
+        "fields: {} total ({unique_count} unique)",
+        svc.columns.len()
+    )));
+
+    if common_count > 0 {
+        let common_list: String = schema
+            .common_fields
+            .iter()
+            .filter(|f| svc.columns.iter().any(|c| c.name == f.name))
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(vec![
+            Span::styled("  common: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(common_list, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    if unique_count > 0 {
+        let unique_list: String = svc
+            .columns
+            .iter()
+            .filter(|c| !common_names.contains(c.name.as_str()))
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(vec![
+            Span::styled("  unique: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(unique_list, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    // Split area: text above, sparkline below (if data).
+    if svc.daily_event_counts.is_empty() {
+        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+        frame.render_widget(p, area);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(area);
+
+        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+        frame.render_widget(p, chunks[0]);
+
+        let data: Vec<u64> = svc.daily_event_counts.iter().map(|d| d.count).collect();
+        let sparkline = Sparkline::default()
+            .data(&data)
+            .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(sparkline, chunks[1]);
+    }
+}
+
+/// Render field detail (common or service-scoped).
+fn render_field_detail(
+    schema: &SchemaBrowser,
+    field_name: &str,
+    service: Option<&str>,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            field_name,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "\u{2500}".repeat(area.width.min(35) as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    // Find the column stats.
+    if let Some(svc_name) = service {
+        // Service-scoped field.
+        if let Some(svc) = schema.services.iter().find(|s| s.name == svc_name)
+            && let Some(col) = svc.columns.iter().find(|c| c.name == field_name)
+        {
+            lines.push(Line::from(format!("type:       {}", col.data_type)));
+            lines.push(Line::from(format!("in:         {svc_name}")));
+
+            if col.total_count > 0 {
+                let non_null = col.total_count - col.null_count;
+                #[allow(clippy::cast_precision_loss)]
+                let pct = (non_null as f64 / col.total_count as f64) * 100.0;
+                lines.push(Line::from(format!(
+                    "non-null:   {pct:.1}% ({})",
+                    format_count(non_null)
+                )));
+            }
+
+            if let (Some(min_v), Some(max_v)) = (&col.min_value, &col.max_value) {
+                lines.push(Line::from(format!("range:      {min_v} \u{2013} {max_v}")));
+            }
+
+            if col.compressed_bytes > 0 {
+                lines.push(Line::from(format!(
+                    "storage:    {}",
+                    format_bytes(col.compressed_bytes)
+                )));
+            }
+        }
+    } else if let Some(cf) = schema.common_fields.iter().find(|f| f.name == field_name) {
+        // Common field — aggregate across services.
+        lines.push(Line::from(format!("type:       {}", cf.data_type)));
+        lines.push(Line::from(format!(
+            "in:         {} services",
+            cf.service_count
+        )));
+
+        if cf.total_count > 0 {
+            let non_null = cf.total_count - cf.null_count;
+            #[allow(clippy::cast_precision_loss)]
+            let pct = (non_null as f64 / cf.total_count as f64) * 100.0;
+            lines.push(Line::from(format!(
+                "non-null:   {pct:.1}% ({})",
+                format_count(non_null)
+            )));
+        }
+
+        if let (Some(min_v), Some(max_v)) = (&cf.min_value, &cf.max_value) {
+            lines.push(Line::from(format!("range:      {min_v} \u{2013} {max_v}")));
+        }
+    }
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(p, area);
+}
+
+// -- format helpers ----------------------------------------------------------
+
+/// Human-readable byte size (KB, MB, GB).
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    if bytes >= GB {
+        #[allow(clippy::cast_precision_loss)]
+        let val = bytes as f64 / GB as f64;
+        format!("{val:.1} GB")
+    } else if bytes >= MB {
+        #[allow(clippy::cast_precision_loss)]
+        let val = bytes as f64 / MB as f64;
+        format!("{val:.1} MB")
+    } else if bytes >= KB {
+        #[allow(clippy::cast_precision_loss)]
+        let val = bytes as f64 / KB as f64;
+        format!("{val:.1} KB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Human-readable event count (K, M, B).
+fn format_count(count: u64) -> String {
+    if count >= 1_000_000_000 {
+        #[allow(clippy::cast_precision_loss)]
+        let val = count as f64 / 1_000_000_000.0;
+        format!("{val:.1}B")
+    } else if count >= 1_000_000 {
+        #[allow(clippy::cast_precision_loss)]
+        let val = count as f64 / 1_000_000.0;
+        format!("{val:.1}M")
+    } else if count >= 1_000 {
+        #[allow(clippy::cast_precision_loss)]
+        let val = count as f64 / 1_000.0;
+        format!("{val:.1}K")
+    } else {
+        count.to_string()
+    }
+}

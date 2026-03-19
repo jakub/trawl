@@ -34,14 +34,23 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     match app.main_tab {
         MainTab::Schema => {
             if let Some(ref schema) = app.panel.schema {
-                // Schema has a filter bar above the tree.
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                // Horizontal split: tree (55%) | detail pane (45%).
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                     .split(inner);
 
-                render_filter_bar(&schema.filter, schema.filter_active, frame, chunks[0]);
-                render_schema_tree(schema, frame, chunks[1]);
+                // Left side: filter bar + tree.
+                let left = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(cols[0]);
+
+                render_filter_bar(&schema.filter, schema.filter_active, frame, left[0]);
+                render_schema_tree(schema, frame, left[1]);
+
+                // Right side: detail pane.
+                super::schema::render_detail_pane(schema, frame, cols[1]);
             } else {
                 let paragraph =
                     Paragraph::new("loading schema...").style(Style::default().fg(Color::DarkGray));
@@ -83,7 +92,7 @@ fn render_filter_bar(filter: &str, active: bool, frame: &mut Frame<'_>, area: Re
 /// A node in the flattened schema tree (computed at render time).
 enum TreeNode<'a> {
     /// Common fields section header.
-    CommonHeader,
+    CommonHeader { field_count: usize },
     /// A common field (present across many services).
     CommonField { name: &'a str, data_type: &'a str },
     /// A service row.
@@ -93,7 +102,12 @@ enum TreeNode<'a> {
         field_count: usize,
     },
     /// A field within a specific service (unique to that service).
-    ServiceField { name: &'a str, data_type: &'a str },
+    ServiceField {
+        name: &'a str,
+        data_type: &'a str,
+        /// Non-null percentage (0-100), if stats available.
+        non_null_pct: Option<u8>,
+    },
 }
 
 /// Flatten the schema tree into a linear list for rendering.
@@ -116,7 +130,9 @@ fn flatten_tree(schema: &SchemaBrowser) -> Vec<TreeNode<'_>> {
             .collect();
 
         if !visible_common.is_empty() || filter.is_empty() {
-            nodes.push(TreeNode::CommonHeader);
+            nodes.push(TreeNode::CommonHeader {
+                field_count: visible_common.len(),
+            });
             for f in &visible_common {
                 nodes.push(TreeNode::CommonField {
                     name: &f.name,
@@ -153,9 +169,17 @@ fn flatten_tree(schema: &SchemaBrowser) -> Vec<TreeNode<'_>> {
 
         if expanded {
             for col in &unique_fields {
+                #[allow(clippy::cast_possible_truncation)]
+                let non_null_pct = if col.total_count > 0 {
+                    let pct = ((col.total_count - col.null_count) * 100) / col.total_count;
+                    Some(pct.min(100) as u8)
+                } else {
+                    None
+                };
                 nodes.push(TreeNode::ServiceField {
                     name: &col.name,
                     data_type: &col.data_type,
+                    non_null_pct,
                 });
             }
         }
@@ -192,6 +216,7 @@ fn type_color(data_type: &str) -> Color {
 }
 
 /// Render the schema tree view.
+#[allow(clippy::too_many_lines)]
 fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect) {
     let nodes = flatten_tree(schema);
     let selected = schema.selected;
@@ -210,14 +235,13 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
     let items: Vec<ListItem<'_>> = nodes
         .iter()
         .map(|node| match node {
-            TreeNode::CommonHeader => ListItem::new(Line::from(Span::styled(
-                "── common fields ──",
+            TreeNode::CommonHeader { field_count } => ListItem::new(Line::from(Span::styled(
+                format!("\u{2605} common ({field_count})"),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             ))),
-            TreeNode::CommonField { name, data_type }
-            | TreeNode::ServiceField { name, data_type } => {
+            TreeNode::CommonField { name, data_type } => {
                 let type_str = abbreviate_type(data_type);
                 let tc = type_color(data_type);
                 ListItem::new(Line::from(vec![
@@ -226,6 +250,35 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
                     Span::raw(" "),
                     Span::styled(type_str, Style::default().fg(tc)),
                 ]))
+            }
+            TreeNode::ServiceField {
+                name,
+                data_type,
+                non_null_pct,
+            } => {
+                let type_str = abbreviate_type(data_type);
+                let tc = type_color(data_type);
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled((*name).to_string(), Style::default().fg(Color::Cyan)),
+                    Span::raw(" "),
+                    Span::styled(type_str, Style::default().fg(tc)),
+                ];
+                if let Some(pct) = non_null_pct {
+                    let pct_color = if *pct >= 80 {
+                        Color::Green
+                    } else if *pct >= 50 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    };
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        format!("{pct:>3}%"),
+                        Style::default().fg(pct_color),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             }
             TreeNode::Service {
                 name,
