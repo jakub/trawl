@@ -57,7 +57,28 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 frame.render_widget(paragraph, inner);
             }
         }
-        MainTab::History => render_history_list(app, frame, inner),
+        MainTab::History => {
+            if let Some(ref history) = app.history_cache {
+                if history.entries.is_empty() {
+                    let paragraph = Paragraph::new("no history yet")
+                        .style(Style::default().fg(Color::DarkGray));
+                    frame.render_widget(paragraph, inner);
+                } else {
+                    // Horizontal split: list (55%) | detail pane (45%).
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                        .split(inner);
+
+                    render_history_list(app, frame, cols[0]);
+                    super::history::render_detail_pane(app, frame, cols[1]);
+                }
+            } else {
+                let paragraph = Paragraph::new("loading history...")
+                    .style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(paragraph, inner);
+            }
+        }
         MainTab::Saved => render_saved_list(app, frame, inner),
         MainTab::Query | MainTab::Dashboard => {} // Use their own layout.
     }
@@ -395,37 +416,37 @@ fn abbreviate_type(data_type: &str) -> String {
 // History list
 // ---------------------------------------------------------------------------
 
-/// Render history entries in the panel.
+/// Render history entries in the left pane (relative time + truncated query).
 fn render_history_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    // Layout: "{4-char time}  {query…} "
+    const TIME_WIDTH: usize = 4;
+    const GAP: usize = 2;
+    const TRAILING: usize = 2; // padding before detail pane
+
     let selected = app.panel.history_selected;
 
-    let Some(ref history) = app.history_cache else {
-        let paragraph =
-            Paragraph::new("loading history...").style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(paragraph, area);
-        return;
-    };
-
-    if history.entries.is_empty() {
-        let paragraph =
-            Paragraph::new("no history yet").style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(paragraph, area);
-        return;
-    }
+    // Caller handles None / empty — we always have entries here.
+    let history = app.history_cache.as_ref().expect("history_cache populated");
 
     #[allow(clippy::cast_possible_truncation)]
-    let max_width = area.width as usize;
+    let max_query = (area.width as usize).saturating_sub(TIME_WIDTH + GAP + TRAILING);
+
     let items: Vec<ListItem<'_>> = history
         .entries
         .iter()
         .map(|entry| {
+            let time_str = format_relative_time(&entry.executed_at);
             let query = entry.query.replace('\n', " ");
-            let display = if query.len() > max_width {
-                format!("{}…", &query[..max_width.saturating_sub(1)])
+            let display = if query.len() > max_query {
+                format!("{}…  ", &query[..max_query.saturating_sub(1)])
             } else {
-                query
+                format!("{query}  ")
             };
-            ListItem::new(Span::styled(display, Style::default().fg(Color::White)))
+            ListItem::new(Line::from(vec![
+                Span::styled(time_str, Style::default().fg(Color::DarkGray)),
+                Span::raw("  "),
+                Span::styled(display, Style::default().fg(Color::White)),
+            ]))
         })
         .collect();
 
@@ -442,6 +463,33 @@ fn render_history_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Format an ISO 8601 timestamp as a compact relative time from now.
+///
+/// Returns a 4-char right-justified string like `" 30m"`, `"  4h"`, `"  2d"`.
+fn format_relative_time(iso_timestamp: &str) -> String {
+    use chrono::{DateTime, Utc};
+
+    let Ok(then) = iso_timestamp.parse::<DateTime<Utc>>() else {
+        return "????".to_owned();
+    };
+
+    let secs = Utc::now().signed_duration_since(then).num_seconds().max(0);
+
+    let label = if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 604_800 {
+        format!("{}d", secs / 86400)
+    } else {
+        format!("{}w", secs / 604_800)
+    };
+
+    format!("{label:>4}")
 }
 
 // ---------------------------------------------------------------------------
@@ -512,4 +560,63 @@ fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_time_seconds() {
+        let now = chrono::Utc::now();
+        let recent = now - chrono::Duration::seconds(30);
+        let result = format_relative_time(&recent.to_rfc3339());
+        assert_eq!(result.len(), 4);
+        assert!(result.trim().ends_with('s'));
+    }
+
+    #[test]
+    fn relative_time_minutes() {
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::minutes(45);
+        let result = format_relative_time(&past.to_rfc3339());
+        assert_eq!(result, " 45m");
+    }
+
+    #[test]
+    fn relative_time_hours() {
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::hours(4);
+        let result = format_relative_time(&past.to_rfc3339());
+        assert_eq!(result, "  4h");
+    }
+
+    #[test]
+    fn relative_time_days() {
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::days(3);
+        let result = format_relative_time(&past.to_rfc3339());
+        assert_eq!(result, "  3d");
+    }
+
+    #[test]
+    fn relative_time_weeks() {
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::weeks(2);
+        let result = format_relative_time(&past.to_rfc3339());
+        assert_eq!(result, "  2w");
+    }
+
+    #[test]
+    fn relative_time_invalid_fallback() {
+        assert_eq!(format_relative_time("garbage"), "????");
+    }
+
+    #[test]
+    fn relative_time_right_justified() {
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::minutes(5);
+        let result = format_relative_time(&past.to_rfc3339());
+        assert_eq!(result, "  5m");
+    }
 }

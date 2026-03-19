@@ -94,8 +94,9 @@ fn get_context_hints(app: &App, width: usize) -> String {
         }
         return match app.main_tab {
             MainTab::Schema => {
-                if width >= 80 {
-                    "↑↓: navigate | →: expand | ←: collapse | Enter: use field | /: filter | Esc: query".to_owned()
+                if width >= 70 {
+                    "↑↓: navigate | →: expand | ←: collapse | Enter: use field | /: filter"
+                        .to_owned()
                 } else if width >= 55 {
                     "↑↓ navigate | →← expand/collapse | Enter: insert | / filter".to_owned()
                 } else {
@@ -103,21 +104,19 @@ fn get_context_hints(app: &App, width: usize) -> String {
                 }
             }
             MainTab::History => {
-                if width >= 75 {
-                    "↑↓: navigate | Enter: load query | Esc: query".to_owned()
-                } else if width >= 55 {
-                    "↑↓ navigate | Enter load | Esc".to_owned()
+                if width >= 55 {
+                    "↑↓: navigate | Enter: load query".to_owned()
                 } else {
-                    "Enter load | Esc".to_owned()
+                    "Enter: load".to_owned()
                 }
             }
             MainTab::Saved => {
-                if width >= 75 {
-                    "↑↓: navigate | Enter: load | s: schedule | Del: delete | Esc: query".to_owned()
-                } else if width >= 55 {
-                    "↑↓ navigate | Enter load | s sched | Del | Esc".to_owned()
+                if width >= 65 {
+                    "↑↓: navigate | Enter: load | s: schedule | Del: delete".to_owned()
+                } else if width >= 45 {
+                    "↑↓ navigate | Enter load | s sched | Del".to_owned()
                 } else {
-                    "Enter load | Esc".to_owned()
+                    "Enter: load".to_owned()
                 }
             }
             MainTab::Query | MainTab::Dashboard => String::new(),

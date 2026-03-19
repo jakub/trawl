@@ -2,118 +2,148 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Query history overlay (legacy, replaced by `sidebar.rs` inline renderer).
-#![allow(dead_code, unused_imports)]
+//! History detail pane (right side of horizontal split).
+//!
+//! Shows metadata and syntax-highlighted query for the selected history entry.
 
 use ratatui::Frame;
-use ratatui::layout::Alignment;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::tui::App;
+use crate::tui::highlight::Highlighter;
 
-/// Render the history sidebar.
-pub fn render(app: &App, frame: &mut Frame<'_>) {
-    let area = centered_rect(80, 80, frame.area());
+/// Render the detail pane for the selected history entry.
+pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let selected = app.panel.history_selected;
+    let Some(ref history) = app.history_cache else {
+        return;
+    };
+    let Some(entry) = history.entries.get(selected) else {
+        return;
+    };
 
-    frame.render_widget(Clear, area);
+    let highlighter = Highlighter::new(app.schema_cache.as_ref());
 
-    let block = Block::default()
-        .title(" Query History (F3) ")
-        .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
-    if let Some(history) = &app.history_cache {
-        if history.entries.is_empty() {
-            let text = Line::from("No query history yet");
-            let paragraph = Paragraph::new(text)
-                .block(block)
-                .alignment(Alignment::Center);
-            frame.render_widget(paragraph, area);
-            return;
-        }
+    // -- status badge --
+    let (status_label, status_color) = match entry.status {
+        trawl_client::QueryStatus::Success => ("success", Color::Green),
+        trawl_client::QueryStatus::Error => ("error", Color::Red),
+        trawl_client::QueryStatus::Timeout => ("timeout", Color::Yellow),
+    };
+    lines.push(Line::from(Span::styled(
+        status_label,
+        Style::default()
+            .fg(status_color)
+            .add_modifier(Modifier::BOLD),
+    )));
 
-        // Build list of history entries
-        let items: Vec<ListItem<'_>> = history
-            .entries
-            .iter()
-            .map(|entry| {
-                // Format: "[timestamp] query (duration, rows, status)"
-                let status_style = match entry.status {
-                    trawl_client::QueryStatus::Success => Style::default().fg(Color::Green),
-                    trawl_client::QueryStatus::Error => Style::default().fg(Color::Red),
-                    trawl_client::QueryStatus::Timeout => Style::default().fg(Color::Yellow),
-                };
+    // -- separator --
+    #[allow(clippy::cast_possible_truncation)]
+    let sep_width = area.width.min(35) as usize;
+    lines.push(Line::from(Span::styled(
+        "\u{2500}".repeat(sep_width),
+        Style::default().fg(Color::DarkGray),
+    )));
 
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!("[{}] ", &entry.executed_at[11..19]), // HH:MM:SS
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        truncate_query(&entry.query, 60),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!(
-                            "({}ms, {} rows, {})",
-                            entry.duration_ms, entry.row_count, entry.status
-                        ),
-                        status_style,
-                    ),
-                ]);
-                ListItem::new(line)
-            })
-            .collect();
+    // -- metadata --
+    lines.push(Line::from(vec![
+        Span::styled("duration   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_duration_ms(entry.duration_ms),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("rows       ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            entry.row_count.to_string(),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("executed   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_full_timestamp(&entry.executed_at),
+            Style::default().fg(Color::White),
+        ),
+    ]));
 
-        let footer = Line::from(vec![
-            Span::raw("Total: "),
-            Span::styled(
-                history.total.to_string(),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" queries | Showing most recent "),
-            Span::styled(
-                history.entries.len().to_string(),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]);
+    lines.push(Line::default());
 
-        let list = List::new(items)
-            .block(block.title_bottom(footer).borders(Borders::ALL))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("► ");
+    // -- syntax-highlighted query (line by line) --
+    for query_line in entry.query.lines() {
+        lines.push(highlighter.highlight_line(query_line));
+    }
 
-        let selected = app.panel.history_selected;
-        let mut list_state = ListState::default().with_selected(Some(selected));
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(p, area);
+}
 
-        frame.render_stateful_widget(list, area, &mut list_state);
+/// Format milliseconds into a human-readable duration.
+fn format_duration_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
+    } else if ms >= 1000 {
+        format!("{}.{}s", ms / 1000, (ms % 1000) / 100)
     } else {
-        // History not loaded
-        let text = Line::from("History not available");
-        let paragraph = Paragraph::new(text)
-            .block(block)
-            .alignment(Alignment::Center);
-
-        frame.render_widget(paragraph, area);
+        format!("{ms}ms")
     }
 }
 
-use super::common::centered_rect;
-
-fn truncate_query(query: &str, max_len: usize) -> String {
-    if query.len() <= max_len {
-        query.to_owned()
+/// Format an ISO 8601 timestamp for display.
+fn format_full_timestamp(iso: &str) -> String {
+    use chrono::{DateTime, Utc};
+    if let Ok(dt) = iso.parse::<DateTime<Utc>>() {
+        dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
     } else {
-        let truncated: String = query.chars().take(max_len.saturating_sub(3)).collect();
-        format!("{truncated}...")
+        iso.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_ms_under_second() {
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(42), "42ms");
+        assert_eq!(format_duration_ms(999), "999ms");
+    }
+
+    #[test]
+    fn duration_ms_seconds() {
+        assert_eq!(format_duration_ms(1000), "1.0s");
+        assert_eq!(format_duration_ms(1200), "1.2s");
+        assert_eq!(format_duration_ms(59_999), "59.9s");
+    }
+
+    #[test]
+    fn duration_ms_minutes() {
+        assert_eq!(format_duration_ms(60_000), "1m 0s");
+        assert_eq!(format_duration_ms(90_000), "1m 30s");
+        assert_eq!(format_duration_ms(150_000), "2m 30s");
+    }
+
+    #[test]
+    fn full_timestamp_valid() {
+        let result = format_full_timestamp("2026-03-18T14:30:00Z");
+        assert_eq!(result, "2026-03-18 14:30:00 UTC");
+    }
+
+    #[test]
+    fn full_timestamp_with_fractional() {
+        let result = format_full_timestamp("2026-03-18T14:30:00.123456Z");
+        assert_eq!(result, "2026-03-18 14:30:00 UTC");
+    }
+
+    #[test]
+    fn full_timestamp_invalid_fallback() {
+        assert_eq!(format_full_timestamp("garbage"), "garbage");
     }
 }
