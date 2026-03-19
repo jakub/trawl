@@ -199,6 +199,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state_dir = config.state_dir();
 
+    // Pre-compute per-service schema metadata in the background.
+    let _schema_refresh = trawl_server::schema_refresh::spawn_schema_refresh(state.clone());
+
     // Always collect dashboard snapshots (1s interval) so the
     // /api/v1/dashboard endpoint works even under systemd / --no-monitor.
     let _snapshot_collector = trawl_server::monitor::spawn_snapshot_collector(

@@ -59,6 +59,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/query", post(handlers::query))
         .route("/validate", post(handlers::validate_query))
         .route("/schema", get(handlers::schema))
+        .route("/schema/services", get(handlers::schema_services))
         .route("/schema/values/{field}", get(handlers::field_values))
         .route("/queries", get(handlers::queries))
         .route("/queries/{id}", delete(handlers::cancel_query))

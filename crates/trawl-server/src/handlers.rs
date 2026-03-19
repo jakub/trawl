@@ -693,6 +693,33 @@ pub async fn dashboard(
     }
 }
 
+/// `GET /api/v1/schema/services` — rich per-service schema from background refresh.
+///
+/// Pure cache read. Returns 503 if the background refresh hasn't completed yet.
+pub async fn schema_services(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<trawl_api::ServiceSchemaResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let (hot_events, hot_bytes) = hot_buffer_stats(&state);
+
+    let cache = state.query.service_schema_cache.lock().clone();
+    match cache {
+        Some(cached) => Ok(Json(trawl_api::ServiceSchemaResponse {
+            services: cached.services,
+            cached: true,
+            hot_buffer_events: hot_events,
+            hot_buffer_bytes: hot_bytes,
+        })),
+        None => Err(ServerError::ServiceUnavailable(
+            "service schema not yet available".into(),
+        )),
+    }
+}
+
 /// `GET /api/v1/schema/values/{field}` — sample distinct values for autocomplete.
 pub async fn field_values(
     State(state): State<AppState>,
@@ -707,10 +734,27 @@ pub async fn field_values(
     let limit = params.limit.unwrap_or(10).min(100); // cap at 100
     let cache_ttl = state.query.schema_cache_ttl_secs;
 
+    // Validate service name if provided (prevent path traversal).
+    if let Some(ref svc) = params.service
+        && !svc
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(ServerError::BadRequest(format!(
+            "invalid service name: {svc}"
+        )));
+    }
+
+    // Cache key includes service scope.
+    let cache_key = match &params.service {
+        Some(svc) => format!("{field}:{svc}"),
+        None => field.clone(),
+    };
+
     // Check cache.
     {
         let cache = state.query.field_values_cache.lock().await;
-        if let Some(cached) = cache.get(&field)
+        if let Some(cached) = cache.get(&cache_key)
             && cached.cached_at.elapsed().as_secs() < cache_ttl
         {
             tracing::info!(
@@ -729,7 +773,15 @@ pub async fn field_values(
 
     // Cache miss — sample from parquet.
     let start = std::time::Instant::now();
-    let glob = state.query.pool.fallback_glob().to_string();
+
+    // Build glob: service-scoped if param present, else fallback.
+    let glob = if let Some(ref svc) = params.service {
+        let base = state.query.pool.fallback_glob();
+        let base_prefix = base.find('*').map_or(base.as_ref(), |pos| &base[..pos]);
+        format!("{base_prefix}**/{svc}.parquet")
+    } else {
+        state.query.pool.fallback_glob().to_string()
+    };
     let field_clone = field.clone();
 
     let values = tokio::task::spawn_blocking(move || {
@@ -746,6 +798,7 @@ pub async fn field_values(
         event_type = "field_values_complete",
         user = %verified.name,
         field = %field,
+        service = params.service.as_deref().unwrap_or("*"),
         values_count = values.len(),
         duration_ms,
         "field values sampled"
@@ -753,7 +806,7 @@ pub async fn field_values(
 
     // Update cache.
     state.query.field_values_cache.lock().await.insert(
-        field.clone(),
+        cache_key,
         CachedFieldValues {
             values: values.clone(),
             cached_at: std::time::Instant::now(),
@@ -771,6 +824,8 @@ pub async fn field_values(
 #[derive(Debug, Deserialize)]
 pub struct FieldValuesParams {
     pub limit: Option<usize>,
+    /// Optional service name to scope values to a single service's files.
+    pub service: Option<String>,
 }
 
 /// `GET /api/v1/history` — retrieve user's query history with pagination.

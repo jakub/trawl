@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
-use trawl_api::DashboardSnapshot;
+use trawl_api::{DashboardSnapshot, ServiceSchema};
 use trawl_auth::{HistoryStore, KeyStore, SavedQueryStore, ScheduleStore};
 use trawl_engine::value::SchemaResult;
 
@@ -69,6 +69,9 @@ pub struct QueryState {
     pub field_values_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedFieldValues>>>,
     /// Hot buffer for fresh events not yet compacted to parquet.
     pub hot_buffer: Option<Arc<HotBuffer>>,
+    /// Pre-computed per-service schema from background refresh job.
+    /// Uses `parking_lot::Mutex` (like `dashboard_snapshot`) for fast reads.
+    pub service_schema_cache: Arc<Mutex<Option<CachedServiceSchema>>>,
     /// Semaphore bounding concurrent SSE streaming connections.
     pub sse_semaphore: Arc<Semaphore>,
     /// Optional ndjson query debug log.
@@ -153,6 +156,15 @@ pub struct CachedFieldValues {
     pub cached_at: Instant,
 }
 
+/// Pre-computed per-service schema from the background refresh job.
+#[derive(Debug, Clone)]
+pub struct CachedServiceSchema {
+    /// Per-service schema and statistics.
+    pub services: Vec<ServiceSchema>,
+    /// When this cache was last refreshed.
+    pub cached_at: Instant,
+}
+
 impl AppState {
     /// Construct app state from a validated [`Config`].
     ///
@@ -203,6 +215,7 @@ impl AppState {
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 hot_buffer,
+                service_schema_cache: Arc::new(Mutex::new(None)),
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
                 query_log: None,
             },

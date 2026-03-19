@@ -22,6 +22,7 @@ pub mod query_log;
 pub mod rate_limit;
 pub mod retention;
 pub mod scheduler;
+pub mod schema_refresh;
 pub mod shutdown;
 pub(crate) mod source;
 pub mod state;
