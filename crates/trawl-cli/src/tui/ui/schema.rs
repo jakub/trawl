@@ -265,10 +265,11 @@ fn render_service_detail(
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(p, area);
     } else {
-        // 5 rows: y-max label (1) + sparkline (2) + x-axis dates (1) + blank (1)
+        // Layout: sparkline (2, y-labels in gutter) + x-axis (1)
+        // y-max in gutter of top row, y-min in gutter of bottom row.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(5)])
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(area);
 
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -279,41 +280,71 @@ fn render_service_detail(
         let min_val = data.iter().copied().min().unwrap_or(0);
         let first_date = &svc.daily_event_counts[0].date;
         let last_date = &svc.daily_event_counts[svc.daily_event_counts.len() - 1].date;
+        let max_label = format_count(max_val);
+        let min_label = format_count(min_val);
 
-        // Sub-layout: y-max label + sparkline (3 rows) + x-axis label (1 row)
+        // Y-axis labels are right-justified in a small gutter, sparkline fills the rest.
+        let gutter: u16 = 5; // enough for "1.2K " or "12.3K"
+
         let spark_area = chunks[1];
-        let spark_rows = Layout::default()
+        let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // y-max label
-                Constraint::Length(2), // sparkline
-                Constraint::Length(1), // y-min + x-axis dates
+                Constraint::Length(2), // sparkline (y-max/y-min in gutter)
+                Constraint::Length(1), // x-axis dates
             ])
             .split(spark_area);
 
-        // Y-max label.
-        let max_label = format_count(max_val);
-        let y_max_line = Line::from(Span::styled(
-            format!("{max_label:>6}"),
+        // Sparkline: 2 rows tall, offset past gutter.
+        let spark_rect = Rect {
+            x: rows[0].x + gutter + 1,
+            width: rows[0].width.saturating_sub(gutter + 1),
+            ..rows[0]
+        };
+        let target_width = spark_rect.width as usize;
+        let display_data = resample(&data, target_width);
+        let sparkline = Sparkline::default()
+            .data(&display_data)
+            .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(sparkline, spark_rect);
+
+        // Y-max label in the gutter of the sparkline's top row.
+        let ymax_rect = Rect {
+            width: gutter,
+            height: 1,
+            ..rows[0]
+        };
+        let y_max = Line::from(Span::styled(
+            format!("{max_label:>gutter$}", gutter = gutter as usize),
             Style::default().fg(Color::DarkGray),
         ));
-        frame.render_widget(Paragraph::new(y_max_line), spark_rows[0]);
+        frame.render_widget(Paragraph::new(y_max), ymax_rect);
 
-        // Sparkline.
-        let sparkline = Sparkline::default()
-            .data(&data)
-            .style(Style::default().fg(Color::Cyan));
-        frame.render_widget(sparkline, spark_rows[1]);
+        // Y-min label in the gutter of the sparkline's bottom row.
+        let ymin_rect = Rect {
+            width: gutter,
+            y: rows[0].y + 1,
+            height: 1,
+            ..rows[0]
+        };
+        let y_min = Line::from(Span::styled(
+            format!("{min_label:>gutter$}", gutter = gutter as usize),
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(y_min), ymin_rect);
 
-        // Bottom row: y-min + padding + start date ... end date.
-        let min_label = format_count(min_val);
+        // X-axis dates, indented past gutter.
         #[allow(clippy::cast_possible_truncation)]
-        let w = spark_rows[2].width as usize;
-        let left = format!("{min_label:>6} {first_date}");
-        let pad = w.saturating_sub(left.len() + last_date.len());
-        let bottom = format!("{left}{}{last_date}", " ".repeat(pad));
-        let bottom_line = Line::from(Span::styled(bottom, Style::default().fg(Color::DarkGray)));
-        frame.render_widget(Paragraph::new(bottom_line), spark_rows[2]);
+        let x_width = rows[1].width.saturating_sub(gutter + 1) as usize;
+        let date_pad = x_width.saturating_sub(first_date.len() + last_date.len());
+        let x_line = format!(
+            "{:>gutter$} {first_date}{}{last_date}",
+            "",
+            " ".repeat(date_pad),
+            gutter = gutter as usize,
+        );
+        let x_axis = Line::from(Span::styled(x_line, Style::default().fg(Color::DarkGray)));
+        frame.render_widget(Paragraph::new(x_axis), rows[1]);
     }
 }
 
@@ -486,4 +517,46 @@ fn format_count(count: u64) -> String {
     } else {
         count.to_string()
     }
+}
+
+/// Resample a data series to exactly `target_len` points using linear interpolation.
+///
+/// When data has fewer points than terminal columns, stretches to fill;
+/// when more, compresses. Returns the original data unchanged if lengths match.
+fn resample(data: &[u64], target_len: usize) -> Vec<u64> {
+    if data.is_empty() || target_len == 0 {
+        return vec![0; target_len];
+    }
+    if data.len() == target_len {
+        return data.to_vec();
+    }
+
+    let src_len = data.len();
+    let mut out = Vec::with_capacity(target_len);
+
+    for i in 0..target_len {
+        // Map output index to a fractional position in the source.
+        #[allow(clippy::cast_precision_loss)]
+        let src_pos = if target_len == 1 {
+            0.0
+        } else {
+            (i as f64) * ((src_len - 1) as f64) / ((target_len - 1) as f64)
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let lo = (src_pos as usize).min(src_len - 1);
+        let hi = (lo + 1).min(src_len - 1);
+        #[allow(clippy::cast_precision_loss)]
+        let frac = src_pos - lo as f64;
+
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let val = (data[lo] as f64 * (1.0 - frac) + data[hi] as f64 * frac).round() as u64;
+        out.push(val);
+    }
+
+    out
 }
