@@ -83,7 +83,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 fn get_context_hints(app: &App, width: usize) -> String {
     // Panel tab hints
     if app.focus == Focus::Panel {
-        if app.main_tab == MainTab::Schema && app.panel.schema.filter_active {
+        if app.main_tab == MainTab::Schema
+            && app.panel.schema.as_ref().is_some_and(|s| s.filter_active)
+        {
             return if width >= 55 {
                 "type to filter | Enter: confirm | Esc: cancel".to_owned()
             } else {

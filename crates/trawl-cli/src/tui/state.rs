@@ -174,51 +174,16 @@ impl DashboardState {
     }
 }
 
-/// A profiled column from a service sample.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfiledColumn {
-    /// Column name.
-    pub name: String,
-    /// `DuckDB` data type string (from schema cache).
-    pub data_type: String,
-    /// Number of non-null values in the sample.
-    pub non_null_count: usize,
-    /// Total rows sampled.
-    pub total_rows: usize,
-    /// Up to 8 distinct sample values (stringified).
-    pub sample_values: Vec<String>,
-}
-
-impl ProfiledColumn {
-    /// Population percentage (0-100).
-    #[allow(dead_code)] // Used by sidebar renderer (not yet implemented).
-    #[allow(clippy::cast_possible_truncation)] // .min(100) guarantees value fits in u8
-    pub fn population_pct(&self) -> u8 {
-        if self.total_rows == 0 {
-            return 0;
-        }
-        ((self.non_null_count * 100) / self.total_rows).min(100) as u8
-    }
-}
-
-/// Catalog summary for the schema browser header.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CatalogSummary {
-    /// Earliest date in partition directories.
-    pub earliest_date: Option<String>,
-    /// Latest date in partition directories.
-    pub latest_date: Option<String>,
-    /// Total parquet file size in bytes.
-    pub total_bytes: u64,
-    /// Total parquet file count.
-    pub file_count: u64,
-    /// Hot buffer event count.
-    pub hot_buffer_events: Option<u64>,
-}
-
-/// Tree state for the schema browser.
+/// Schema browser state — replaces the old per-service profiling approach.
+///
+/// Populated from a single `schema_services()` API call at startup.
+/// The tree is fully navigable immediately — no async loading per service.
 #[derive(Debug, Clone)]
-pub struct SchemaTree {
+pub struct SchemaBrowser {
+    /// Per-service schema from the API response.
+    pub services: Vec<trawl_api::ServiceSchema>,
+    /// Fields present in ≥80% of services (computed client-side).
+    pub common_fields: Vec<CommonField>,
     /// Which services are expanded (by name).
     pub expanded: HashSet<String>,
     /// Cursor index in the flattened visible list.
@@ -231,9 +196,12 @@ pub struct SchemaTree {
     pub filter_active: bool,
 }
 
-impl SchemaTree {
-    pub fn new() -> Self {
+impl SchemaBrowser {
+    pub fn new(services: Vec<trawl_api::ServiceSchema>) -> Self {
+        let common_fields = compute_common_fields(&services);
         Self {
+            services,
+            common_fields,
             expanded: HashSet::new(),
             selected: 0,
             scroll: 0,
@@ -243,27 +211,128 @@ impl SchemaTree {
     }
 }
 
+/// A field present across many services (shown once at tree top).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Stats fields used in phase 6 rendering rewrite
+pub struct CommonField {
+    /// Field name.
+    pub name: String,
+    /// Data type.
+    pub data_type: String,
+    /// How many services contain this field.
+    pub service_count: usize,
+    /// Aggregated null count across services.
+    pub null_count: u64,
+    /// Aggregated total count across services.
+    pub total_count: u64,
+    /// Global min value.
+    pub min_value: Option<String>,
+    /// Global max value.
+    pub max_value: Option<String>,
+}
+
+/// What is selected in the detail pane (right side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Used in phase 6 rendering rewrite
+pub enum DetailSelection {
+    /// Nothing selected.
+    None,
+    /// Common fields header.
+    CommonHeader,
+    /// A specific common field.
+    CommonField { name: String },
+    /// A service header row.
+    Service { name: String },
+    /// A field within a specific service.
+    ServiceField { service: String, field: String },
+}
+
+/// Well-known fields that are always in the common set.
+const WELL_KNOWN_FIELDS: &[&str] = &["timestamp", "host", "service", "level", "message"];
+
+/// Compute common fields from the service list.
+///
+/// A field is "common" if it's in the well-known set OR appears in ≥80%
+/// of services. Well-known fields come first, then threshold-promoted
+/// fields alphabetically.
+pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<CommonField> {
+    use std::collections::HashMap;
+
+    if services.is_empty() {
+        return Vec::new();
+    }
+
+    // Count field occurrences and aggregate stats.
+    let mut field_stats: HashMap<String, CommonField> = HashMap::new();
+    let threshold = (services.len() * 80) / 100;
+
+    for svc in services {
+        for col in &svc.columns {
+            let entry = field_stats
+                .entry(col.name.clone())
+                .or_insert_with(|| CommonField {
+                    name: col.name.clone(),
+                    data_type: col.data_type.clone(),
+                    service_count: 0,
+                    null_count: 0,
+                    total_count: 0,
+                    min_value: None,
+                    max_value: None,
+                });
+            entry.service_count += 1;
+            entry.null_count += col.null_count;
+            entry.total_count += col.total_count;
+            // Update global min/max (lexicographic).
+            if let Some(ref v) = col.min_value
+                && entry.min_value.as_ref().is_none_or(|cur| v < cur)
+            {
+                entry.min_value = Some(v.clone());
+            }
+            if let Some(ref v) = col.max_value
+                && entry.max_value.as_ref().is_none_or(|cur| v > cur)
+            {
+                entry.max_value = Some(v.clone());
+            }
+        }
+    }
+
+    let mut common = Vec::new();
+
+    // Well-known fields first.
+    for &wk in WELL_KNOWN_FIELDS {
+        if let Some(field) = field_stats.remove(wk) {
+            common.push(field);
+        }
+    }
+
+    // Then threshold-promoted fields (alphabetical).
+    let mut promoted: Vec<_> = field_stats
+        .into_values()
+        .filter(|f| f.service_count > threshold)
+        .collect();
+    promoted.sort_by(|a, b| a.name.cmp(&b.name));
+    common.extend(promoted);
+
+    common
+}
+
 /// Panel state for non-Query tabs (schema, history, saved).
 #[derive(Debug, Clone)]
 pub struct PanelState {
-    /// Schema tree navigation state.
-    pub schema: SchemaTree,
+    /// Schema browser state (populated from API, or `None` before first load).
+    pub schema: Option<SchemaBrowser>,
     /// Selected index in the history list.
     pub history_selected: usize,
     /// Selected index in the saved queries list.
     pub saved_selected: usize,
-    /// Catalog summary from enriched schema response.
-    #[allow(dead_code)] // Used when reports panel is implemented.
-    pub catalog: Option<CatalogSummary>,
 }
 
 impl PanelState {
-    pub fn new(catalog: Option<CatalogSummary>) -> Self {
+    pub fn new() -> Self {
         Self {
-            schema: SchemaTree::new(),
+            schema: None,
             history_selected: 0,
             saved_selected: 0,
-            catalog,
         }
     }
 }

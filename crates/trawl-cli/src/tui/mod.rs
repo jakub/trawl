@@ -31,8 +31,8 @@ use self::driver::{
     query_response_to_data,
 };
 use self::state::{
-    ChartView, DashboardState, Focus, LiveBuffer, MainTab, PanelState, Popup, ProfiledColumn,
-    ResultsSearch, SimpleEditor, Tab, TabStatus,
+    ChartView, DashboardState, Focus, LiveBuffer, MainTab, PanelState, Popup, ResultsSearch,
+    SchemaBrowser, SimpleEditor, Tab, TabStatus,
 };
 use crate::CliError;
 use crate::config::Config;
@@ -46,95 +46,6 @@ fn clipboard_get() -> Option<String> {
 fn clipboard_set(text: &str) {
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(text.to_owned());
-    }
-}
-
-/// Analyze query results to compute per-column non-null counts and sample values.
-///
-/// Only columns with at least one non-null value are included. Results are
-/// sorted by population count descending, then name ascending.
-fn profile_columns(
-    response: &QueryResponse,
-    schema_columns: &[(String, String)],
-) -> Vec<ProfiledColumn> {
-    use std::collections::{HashMap, HashSet};
-
-    let total_rows = response.result.rows.len();
-    let col_names: Vec<&str> = response
-        .result
-        .columns
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-
-    let type_map: HashMap<&str, &str> = schema_columns
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.as_str()))
-        .collect();
-
-    let mut profiled: Vec<ProfiledColumn> = Vec::new();
-
-    for (col_idx, col_name) in col_names.iter().enumerate() {
-        let mut non_null = 0usize;
-        let mut seen_values: Vec<String> = Vec::new();
-        let mut seen_set: HashSet<String> = HashSet::new();
-
-        for row in &response.result.rows {
-            if let Some(val) = row.get(col_idx)
-                && *val != trawl_engine::value::Value::Null
-            {
-                non_null += 1;
-                if seen_set.len() < 8 {
-                    let s = value_display(val);
-                    if seen_set.insert(s.clone()) {
-                        seen_values.push(s);
-                    }
-                }
-            }
-        }
-
-        // Skip columns that are entirely null for this service.
-        if non_null == 0 {
-            continue;
-        }
-
-        let data_type = type_map.get(col_name).unwrap_or(&"UNKNOWN").to_string();
-
-        profiled.push(ProfiledColumn {
-            name: (*col_name).to_string(),
-            data_type,
-            non_null_count: non_null,
-            total_rows,
-            sample_values: seen_values,
-        });
-    }
-
-    // Sort by population descending, then name ascending for ties.
-    profiled.sort_by(|a, b| {
-        b.non_null_count
-            .cmp(&a.non_null_count)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-
-    profiled
-}
-
-/// Format a value for display as a sample value string.
-fn value_display(v: &trawl_engine::value::Value) -> String {
-    use trawl_engine::value::Value;
-    match v {
-        Value::Null => "NULL".to_owned(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => format!("{f:.2}"),
-        Value::String(s) => {
-            if s.len() > 30 {
-                format!("{}...", &s[..27])
-            } else {
-                s.clone()
-            }
-        }
-        Value::Array(arr) => format!("[{} items]", arr.len()),
     }
 }
 
@@ -175,15 +86,6 @@ enum MutationResult {
     DashboardUpdate(Result<Box<trawl_client::DashboardSnapshot>, String>),
     /// Mutation failed.
     Error { message: String },
-}
-
-/// Result of a background schema profiling query.
-#[derive(Debug)]
-struct SchemaProfileResult {
-    /// Service that was profiled.
-    service: String,
-    /// Profiled columns + total rows, or error message.
-    result: Result<(Vec<ProfiledColumn>, usize), String>,
 }
 
 /// Main TUI application state.
@@ -228,14 +130,9 @@ pub struct App {
     mutation_rx: mpsc::UnboundedReceiver<MutationResult>,
     /// Sender for mutation operations.
     mutation_tx: mpsc::UnboundedSender<MutationResult>,
-    /// Cached service list (fetched at startup via `field_values("service")`).
-    pub service_list_cache: Option<Vec<String>>,
-    /// Per-service profiled column cache (populated on drill-in).
-    schema_profile_cache: std::collections::HashMap<String, Vec<ProfiledColumn>>,
-    /// Channel for receiving schema profile results from background tasks.
-    schema_profile_rx: mpsc::UnboundedReceiver<SchemaProfileResult>,
-    /// Sender for schema profile background tasks.
-    schema_profile_tx: mpsc::UnboundedSender<SchemaProfileResult>,
+    /// Cache of sample values for (field, optional service) pairs.
+    #[allow(dead_code)] // Populated in phase 6 detail pane
+    pub sample_values_cache: std::collections::HashMap<(String, Option<String>), Vec<String>>,
     /// Channel for receiving driver commands from the unix socket.
     driver_rx: Option<mpsc::UnboundedReceiver<DriverCommand>>,
     /// Path to the driver socket (for cleanup on exit).
@@ -249,27 +146,11 @@ pub struct App {
     pub dashboard: DashboardState,
 }
 
-/// Info about a node in the schema tree (avoids borrow issues in tree methods).
-enum TreeNodeInfo<'a> {
-    Service {
-        name: &'a str,
-        expanded: bool,
-    },
-    Field {
-        name: &'a str,
-    },
-    Loading {
-        #[allow(dead_code)]
-        service: &'a str,
-    },
-}
-
 impl App {
     /// Create a new app with the given client.
     pub fn new(client: HttpClient) -> Self {
         let (query_tx, query_rx) = mpsc::unbounded_channel();
         let (mutation_tx, mutation_rx) = mpsc::unbounded_channel();
-        let (schema_profile_tx, schema_profile_rx) = mpsc::unbounded_channel();
 
         Self {
             client,
@@ -277,7 +158,7 @@ impl App {
             main_tab: MainTab::Query,
             focus: Focus::Editor,
             query_focus: Focus::Editor,
-            panel: PanelState::new(None),
+            panel: PanelState::new(),
             popup: None,
             schema_cache: None,
             history_cache: None,
@@ -292,10 +173,7 @@ impl App {
             query_tx,
             mutation_rx,
             mutation_tx,
-            service_list_cache: None,
-            schema_profile_cache: std::collections::HashMap::new(),
-            schema_profile_rx,
-            schema_profile_tx,
+            sample_values_cache: std::collections::HashMap::new(),
             driver_rx: None,
             driver_socket_path: None,
             driver_execute_waiter: None,
@@ -601,9 +479,13 @@ impl App {
             // Esc: on panel tabs, switch back to Query; on Query, cancel running query
             (KeyModifiers::NONE, KeyCode::Esc) if self.main_tab != MainTab::Query => {
                 // If schema filter is active, close filter first
-                if self.main_tab == MainTab::Schema && self.panel.schema.filter_active {
-                    self.panel.schema.filter_active = false;
-                    self.panel.schema.filter.clear();
+                if self.main_tab == MainTab::Schema
+                    && self.panel.schema.as_ref().is_some_and(|s| s.filter_active)
+                {
+                    if let Some(schema) = self.panel.schema.as_mut() {
+                        schema.filter_active = false;
+                        schema.filter.clear();
+                    }
                     return;
                 }
                 self.switch_to_main_tab(MainTab::Query);
@@ -1220,8 +1102,12 @@ impl App {
 
     /// Handle key events for the Schema tab panel.
     fn handle_panel_schema_key(&mut self, key: event::KeyEvent) {
+        let Some(schema) = self.panel.schema.as_ref() else {
+            return;
+        };
+
         // Filter input mode captures all keys.
-        if self.panel.schema.filter_active {
+        if schema.filter_active {
             self.handle_schema_filter_key(key);
             return;
         }
@@ -1234,7 +1120,9 @@ impl App {
             // '/' or Ctrl+P: activate filter
             (KeyModifiers::NONE, KeyCode::Char('/'))
             | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
-                self.panel.schema.filter_active = true;
+                if let Some(s) = self.panel.schema.as_mut() {
+                    s.filter_active = true;
+                }
             }
             // Delegate to tree navigation
             _ => self.handle_schema_tree_key(key),
@@ -1243,26 +1131,28 @@ impl App {
 
     /// Handle key events for the schema filter input.
     fn handle_schema_filter_key(&mut self, key: event::KeyEvent) {
-        let tree = &mut self.panel.schema;
+        let Some(schema) = self.panel.schema.as_mut() else {
+            return;
+        };
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Esc) => {
-                tree.filter_active = false;
-                tree.filter.clear();
-                tree.selected = 0;
-                tree.scroll = 0;
+                schema.filter_active = false;
+                schema.filter.clear();
+                schema.selected = 0;
+                schema.scroll = 0;
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                tree.filter_active = false;
+                schema.filter_active = false;
             }
             (KeyModifiers::NONE, KeyCode::Backspace) => {
-                tree.filter.pop();
-                tree.selected = 0;
-                tree.scroll = 0;
+                schema.filter.pop();
+                schema.selected = 0;
+                schema.scroll = 0;
             }
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-                tree.filter.push(c);
-                tree.selected = 0;
-                tree.scroll = 0;
+                schema.filter.push(c);
+                schema.selected = 0;
+                schema.scroll = 0;
             }
             _ => {}
         }
@@ -1270,180 +1160,192 @@ impl App {
 
     /// Handle key events for the schema tree view.
     fn handle_schema_tree_key(&mut self, key: event::KeyEvent) {
-        // Compute visible node count for bounds.
+        if self.panel.schema.is_none() {
+            return;
+        }
+
+        // Compute visible node count for bounds (borrows self immutably).
         let node_count = self.visible_tree_node_count();
 
-        let tree = &mut self.panel.schema;
+        // Dispatch Enter/Right/Left to their own methods (which re-borrow self).
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                self.handle_tree_enter();
+                return;
+            }
+            (KeyModifiers::NONE, KeyCode::Right) => {
+                self.handle_tree_expand();
+                return;
+            }
+            (KeyModifiers::NONE, KeyCode::Left) => {
+                self.handle_tree_collapse();
+                return;
+            }
+            _ => {}
+        }
 
+        // Navigation keys that only update cursor position.
+        let schema = self.panel.schema.as_mut().unwrap();
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Up) => {
-                tree.selected = tree.selected.saturating_sub(1);
+                schema.selected = schema.selected.saturating_sub(1);
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
                 if node_count > 0 {
-                    tree.selected = (tree.selected + 1).min(node_count - 1);
+                    schema.selected = (schema.selected + 1).min(node_count - 1);
                 }
             }
             (KeyModifiers::NONE, KeyCode::PageUp) => {
-                tree.selected = tree.selected.saturating_sub(10);
+                schema.selected = schema.selected.saturating_sub(10);
             }
             (KeyModifiers::NONE, KeyCode::PageDown) => {
                 if node_count > 0 {
-                    tree.selected = (tree.selected + 10).min(node_count - 1);
+                    schema.selected = (schema.selected + 10).min(node_count - 1);
                 }
             }
             (KeyModifiers::NONE, KeyCode::Home) => {
-                tree.selected = 0;
+                schema.selected = 0;
             }
             (KeyModifiers::NONE, KeyCode::End) => {
-                tree.selected = node_count.saturating_sub(1);
-            }
-            // Enter: toggle expand on service, insert field name on field
-            (KeyModifiers::NONE, KeyCode::Enter) => {
-                self.handle_tree_enter();
-            }
-            // Right: expand service node
-            (KeyModifiers::NONE, KeyCode::Right) => {
-                self.handle_tree_expand();
-            }
-            // Left: collapse or jump to parent
-            (KeyModifiers::NONE, KeyCode::Left) => {
-                self.handle_tree_collapse();
+                schema.selected = node_count.saturating_sub(1);
             }
             _ => {}
         }
     }
 
     /// Count visible nodes in the flattened schema tree.
+    ///
+    /// Layout: common header + common fields, then per-service rows
+    /// (each service + its unique fields when expanded).
     fn visible_tree_node_count(&self) -> usize {
-        let services = self.service_list_cache.as_deref().unwrap_or(&[]);
-        let tree = &self.panel.schema;
-        let filter = tree.filter.to_lowercase();
+        let Some(schema) = self.panel.schema.as_ref() else {
+            return 0;
+        };
+        let filter = schema.filter.to_lowercase();
+        let common_names: std::collections::HashSet<&str> = schema
+            .common_fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
 
         let mut count = 0;
-        for svc in services {
+
+        // Common fields section.
+        if !schema.common_fields.is_empty() {
+            let any_common_match = filter.is_empty()
+                || schema
+                    .common_fields
+                    .iter()
+                    .any(|f| f.name.to_lowercase().contains(&filter));
+            if any_common_match {
+                count += 1; // header
+                count += schema
+                    .common_fields
+                    .iter()
+                    .filter(|f| filter.is_empty() || f.name.to_lowercase().contains(&filter))
+                    .count();
+            }
+        }
+
+        // Per-service rows.
+        for svc in &schema.services {
+            let unique_fields: Vec<_> = svc
+                .columns
+                .iter()
+                .filter(|c| !common_names.contains(c.name.as_str()))
+                .collect();
+
             if !filter.is_empty() {
-                let svc_matches = svc.to_lowercase().contains(&filter);
-                let fields_match =
-                    self.schema_profile_cache
-                        .get(svc.as_str())
-                        .is_some_and(|cols| {
-                            cols.iter().any(|c| c.name.to_lowercase().contains(&filter))
-                        });
+                let svc_matches = svc.name.to_lowercase().contains(&filter);
+                let fields_match = unique_fields
+                    .iter()
+                    .any(|c| c.name.to_lowercase().contains(&filter));
                 if !svc_matches && !fields_match {
                     continue;
                 }
             }
+
             count += 1; // service node
-            if tree.expanded.contains(svc) {
-                if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
-                    count += cols.len();
-                } else {
-                    count += 1; // loading node
-                }
+            if schema.expanded.contains(&svc.name) {
+                count += unique_fields.len();
             }
         }
         count
     }
 
-    /// Handle Enter key on a tree node.
-    fn handle_tree_enter(&mut self) {
-        let node_info = self.get_selected_tree_node_info();
-        match node_info {
-            Some(TreeNodeInfo::Service { name, expanded }) => {
-                let name_owned = name.to_owned();
-                if expanded {
-                    self.panel.schema.expanded.remove(&name_owned);
-                } else {
-                    self.panel.schema.expanded.insert(name_owned.clone());
-                    if !self.schema_profile_cache.contains_key(&name_owned) {
-                        self.drill_into_service(name_owned);
-                    }
-                }
-            }
-            Some(TreeNodeInfo::Field { name }) => {
-                let name_owned = name.to_owned();
-                self.tab.editor.insert_text(&name_owned);
-            }
-            _ => {}
-        }
-    }
+    /// Resolve the currently selected tree node into an action-relevant enum.
+    ///
+    /// Returns `(kind, name)` where kind is `common_header`, `common_field`,
+    /// `service`, or `service_field`, plus the relevant name string.
+    fn resolve_selected_node(&self) -> Option<(&str, String, Option<String>)> {
+        let schema = self.panel.schema.as_ref()?;
+        let filter = schema.filter.to_lowercase();
+        let common_names: std::collections::HashSet<&str> = schema
+            .common_fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
 
-    /// Handle Right arrow on a tree node (expand service).
-    fn handle_tree_expand(&mut self) {
-        let node_info = self.get_selected_tree_node_info();
-        if let Some(TreeNodeInfo::Service {
-            name,
-            expanded: false,
-        }) = node_info
-        {
-            let name_owned = name.to_owned();
-            self.panel.schema.expanded.insert(name_owned.clone());
-            if !self.schema_profile_cache.contains_key(&name_owned) {
-                self.drill_into_service(name_owned);
-            }
-        }
-    }
-
-    /// Handle Left arrow on a tree node (collapse or jump to parent).
-    fn handle_tree_collapse(&mut self) {
-        let node_info = self.get_selected_tree_node_info();
-        match node_info {
-            Some(TreeNodeInfo::Service {
-                name,
-                expanded: true,
-            }) => {
-                let name_owned = name.to_owned();
-                self.panel.schema.expanded.remove(&name_owned);
-            }
-            Some(TreeNodeInfo::Field { .. } | TreeNodeInfo::Loading { .. }) => {
-                // Jump to parent service node.
-                if let Some(parent_idx) = self.find_parent_service_index() {
-                    self.panel.schema.selected = parent_idx;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Get info about the currently selected tree node.
-    fn get_selected_tree_node_info(&self) -> Option<TreeNodeInfo<'_>> {
-        let services = self.service_list_cache.as_deref().unwrap_or(&[]);
-        let tree = &self.panel.schema;
-        let filter = tree.filter.to_lowercase();
-
+        let target = schema.selected;
         let mut idx = 0;
-        for svc in services {
+
+        // Common fields section.
+        if !schema.common_fields.is_empty() {
+            let visible_common: Vec<_> = schema
+                .common_fields
+                .iter()
+                .filter(|f| filter.is_empty() || f.name.to_lowercase().contains(&filter))
+                .collect();
+            let any_common_match = !visible_common.is_empty() || filter.is_empty();
+
+            if any_common_match && !visible_common.is_empty() {
+                // Header row.
+                if idx == target {
+                    return Some(("common_header", String::new(), None));
+                }
+                idx += 1;
+                for f in &visible_common {
+                    if idx == target {
+                        return Some(("common_field", f.name.clone(), None));
+                    }
+                    idx += 1;
+                }
+            } else if any_common_match {
+                // Header row only (empty visible due to filter edge case).
+                if idx == target {
+                    return Some(("common_header", String::new(), None));
+                }
+                idx += 1;
+            }
+        }
+
+        // Per-service rows.
+        for svc in &schema.services {
+            let unique_fields: Vec<_> = svc
+                .columns
+                .iter()
+                .filter(|c| !common_names.contains(c.name.as_str()))
+                .collect();
+
             if !filter.is_empty() {
-                let svc_matches = svc.to_lowercase().contains(&filter);
-                let fields_match =
-                    self.schema_profile_cache
-                        .get(svc.as_str())
-                        .is_some_and(|cols| {
-                            cols.iter().any(|c| c.name.to_lowercase().contains(&filter))
-                        });
+                let svc_matches = svc.name.to_lowercase().contains(&filter);
+                let fields_match = unique_fields
+                    .iter()
+                    .any(|c| c.name.to_lowercase().contains(&filter));
                 if !svc_matches && !fields_match {
                     continue;
                 }
             }
-            if idx == tree.selected {
-                return Some(TreeNodeInfo::Service {
-                    name: svc,
-                    expanded: tree.expanded.contains(svc),
-                });
+
+            if idx == target {
+                return Some(("service", svc.name.clone(), None));
             }
             idx += 1;
-            if tree.expanded.contains(svc) {
-                if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
-                    for col in cols {
-                        if idx == tree.selected {
-                            return Some(TreeNodeInfo::Field { name: &col.name });
-                        }
-                        idx += 1;
-                    }
-                } else {
-                    if idx == tree.selected {
-                        return Some(TreeNodeInfo::Loading { service: svc });
+
+            if schema.expanded.contains(&svc.name) {
+                for col in &unique_fields {
+                    if idx == target {
+                        return Some(("service_field", col.name.clone(), Some(svc.name.clone())));
                     }
                     idx += 1;
                 }
@@ -1452,43 +1354,64 @@ impl App {
         None
     }
 
-    /// Find the index of the parent service node for the currently selected field/loading node.
+    /// Find the flat index of the parent service node for the currently selected node.
     #[allow(unused_assignments)] // last_service_idx initial value is a fallback, always overwritten in loop
     fn find_parent_service_index(&self) -> Option<usize> {
-        let services = self.service_list_cache.as_deref().unwrap_or(&[]);
-        let tree = &self.panel.schema;
-        let filter = tree.filter.to_lowercase();
+        let schema = self.panel.schema.as_ref()?;
+        let filter = schema.filter.to_lowercase();
+        let common_names: std::collections::HashSet<&str> = schema
+            .common_fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
 
+        let target = schema.selected;
         let mut idx = 0;
         let mut last_service_idx = 0;
-        for svc in services {
+
+        // Skip common fields section.
+        if !schema.common_fields.is_empty() {
+            let any_common_match = filter.is_empty()
+                || schema
+                    .common_fields
+                    .iter()
+                    .any(|f| f.name.to_lowercase().contains(&filter));
+            if any_common_match {
+                idx += 1; // header
+                idx += schema
+                    .common_fields
+                    .iter()
+                    .filter(|f| filter.is_empty() || f.name.to_lowercase().contains(&filter))
+                    .count();
+            }
+        }
+
+        for svc in &schema.services {
+            let unique_fields: Vec<_> = svc
+                .columns
+                .iter()
+                .filter(|c| !common_names.contains(c.name.as_str()))
+                .collect();
+
             if !filter.is_empty() {
-                let svc_matches = svc.to_lowercase().contains(&filter);
-                let fields_match =
-                    self.schema_profile_cache
-                        .get(svc.as_str())
-                        .is_some_and(|cols| {
-                            cols.iter().any(|c| c.name.to_lowercase().contains(&filter))
-                        });
+                let svc_matches = svc.name.to_lowercase().contains(&filter);
+                let fields_match = unique_fields
+                    .iter()
+                    .any(|c| c.name.to_lowercase().contains(&filter));
                 if !svc_matches && !fields_match {
                     continue;
                 }
             }
+
             last_service_idx = idx;
-            if idx == tree.selected {
-                return Some(idx); // Already on a service
+            if idx == target {
+                return Some(idx);
             }
             idx += 1;
-            if tree.expanded.contains(svc) {
-                if let Some(cols) = self.schema_profile_cache.get(svc.as_str()) {
-                    for _col in cols {
-                        if idx == tree.selected {
-                            return Some(last_service_idx);
-                        }
-                        idx += 1;
-                    }
-                } else {
-                    if idx == tree.selected {
+
+            if schema.expanded.contains(&svc.name) {
+                for _ in &unique_fields {
+                    if idx == target {
                         return Some(last_service_idx);
                     }
                     idx += 1;
@@ -1498,62 +1421,56 @@ impl App {
         None
     }
 
-    /// Drill into a service: spawn background profiling query if not cached.
-    fn drill_into_service(&mut self, service: String) {
-        // Already cached — nothing to do.
-        if self.schema_profile_cache.contains_key(&service) {
+    /// Handle Enter key on a tree node.
+    fn handle_tree_enter(&mut self) {
+        let Some((kind, name, _svc)) = self.resolve_selected_node() else {
             return;
-        }
-
-        // Spawn background query.
-        let client = self.client.clone();
-        let tx = self.schema_profile_tx.clone();
-        let schema_columns: Vec<(String, String)> =
-            self.schema_cache.as_ref().map_or_else(Vec::new, |s| {
-                s.columns
-                    .iter()
-                    .map(|c| (c.name.clone(), c.data_type.clone()))
-                    .collect()
-            });
-        let svc = service;
-
-        tokio::spawn(async move {
-            let query = if svc.contains(' ') || svc.contains('"') {
-                format!(r#"service:"{}" | head 100"#, svc.replace('"', r#"\""#))
-            } else {
-                format!("service:{svc} | head 100")
-            };
-
-            let result = client.query_paginated(&query, None, None).await;
-
-            let profiled = match result {
-                Ok(response) => {
-                    let total_rows = response.result.rows.len();
-                    let columns = profile_columns(&response, &schema_columns);
-                    Ok((columns, total_rows))
-                }
-                Err(e) => Err(e.to_string()),
-            };
-
-            let _ = tx.send(SchemaProfileResult {
-                service: svc,
-                result: profiled,
-            });
-        });
-    }
-
-    /// Poll for schema profile results from background tasks.
-    fn poll_schema_profiles(&mut self) {
-        while let Ok(result) = self.schema_profile_rx.try_recv() {
-            match result.result {
-                Ok((columns, _total_rows)) => {
-                    self.schema_profile_cache
-                        .insert(result.service.clone(), columns);
-                }
-                Err(msg) => {
-                    tracing::error!("schema profile failed for {}: {}", result.service, msg);
+        };
+        match kind {
+            "service" => {
+                let schema = self.panel.schema.as_mut().unwrap();
+                if schema.expanded.contains(&name) {
+                    schema.expanded.remove(&name);
+                } else {
+                    schema.expanded.insert(name);
                 }
             }
+            "common_field" | "service_field" => {
+                self.tab.editor.insert_text(&name);
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle Right arrow on a tree node (expand service).
+    fn handle_tree_expand(&mut self) {
+        let Some((kind, name, _)) = self.resolve_selected_node() else {
+            return;
+        };
+        if kind == "service" {
+            let schema = self.panel.schema.as_mut().unwrap();
+            schema.expanded.insert(name);
+        }
+    }
+
+    /// Handle Left arrow on a tree node (collapse or jump to parent).
+    fn handle_tree_collapse(&mut self) {
+        let Some((kind, name, _)) = self.resolve_selected_node() else {
+            return;
+        };
+        match kind {
+            "service" => {
+                let schema = self.panel.schema.as_mut().unwrap();
+                schema.expanded.remove(&name);
+            }
+            "service_field" => {
+                if let Some(parent_idx) = self.find_parent_service_index()
+                    && let Some(schema) = self.panel.schema.as_mut()
+                {
+                    schema.selected = parent_idx;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2227,7 +2144,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Fetch schema, history, saved queries, service list, server version, and permissions in parallel.
+    // Fetch schema, history, saved queries, service schemas, server version, and permissions in parallel.
     tracing::info!("fetching startup data");
     let (
         schema_result,
@@ -2240,7 +2157,7 @@ pub async fn run(
         client.schema(),
         client.history(Some(100), None),
         client.list_saved(),
-        client.field_values("service", Some(500), None),
+        client.schema_services(),
         client.health(),
         client.whoami(),
     );
@@ -2278,13 +2195,13 @@ pub async fn run(
         }
     };
 
-    let services = match services_result {
-        Ok(fv) => {
-            tracing::info!("service list fetched: {} services", fv.values.len());
-            Some(fv.values)
+    let schema_browser = match services_result {
+        Ok(resp) => {
+            tracing::info!("schema services fetched: {} services", resp.services.len());
+            Some(SchemaBrowser::new(resp.services))
         }
         Err(e) => {
-            tracing::warn!("failed to fetch service list: {}", e);
+            tracing::warn!("failed to fetch schema services: {}", e);
             None
         }
     };
@@ -2307,7 +2224,7 @@ pub async fn run(
     app.schema_cache = schema;
     app.history_cache = history;
     app.saved_cache = saved;
-    app.service_list_cache = services;
+    app.panel.schema = schema_browser;
     app.server_version = server_version;
     let is_admin = whoami_result
         .as_ref()
@@ -2403,9 +2320,6 @@ where
 
         // Poll for mutation results (save/delete operations).
         app.poll_mutations();
-
-        // Poll for schema profile results from background tasks.
-        app.poll_schema_profiles();
 
         // Poll for dashboard snapshot updates.
         app.poll_dashboard();

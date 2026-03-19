@@ -12,6 +12,7 @@ name = "trawl"
 path = "src/main.rs"
 
 [dependencies]
+trawl-api = { workspace = true }
 trawl-client = { workspace = true }
 trawl-core = { workspace = true }
 trawl-dashboard = { workspace = true }

@@ -4,6 +4,8 @@
 
 //! Full-width panel content for non-Query tabs (History, Schema, Saved).
 
+use std::collections::HashSet;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -11,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::tui::App;
-use crate::tui::state::{Focus, MainTab, ProfiledColumn};
+use crate::tui::state::{Focus, MainTab, SchemaBrowser};
 
 /// Render panel content based on the active `MainTab`.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -31,19 +33,20 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     match app.main_tab {
         MainTab::Schema => {
-            // Schema has a filter bar above the tree.
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(1)])
-                .split(inner);
+            if let Some(ref schema) = app.panel.schema {
+                // Schema has a filter bar above the tree.
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(inner);
 
-            render_filter_bar(
-                &app.panel.schema.filter,
-                app.panel.schema.filter_active,
-                frame,
-                chunks[0],
-            );
-            render_schema_tree(app, frame, chunks[1]);
+                render_filter_bar(&schema.filter, schema.filter_active, frame, chunks[0]);
+                render_schema_tree(schema, frame, chunks[1]);
+            } else {
+                let paragraph =
+                    Paragraph::new("loading schema...").style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(paragraph, inner);
+            }
         }
         MainTab::History => render_history_list(app, frame, inner),
         MainTab::Saved => render_saved_list(app, frame, inner),
@@ -62,9 +65,9 @@ fn render_filter_bar(filter: &str, active: bool, frame: &mut Frame<'_>, area: Re
     let text = if filter.is_empty() && !active {
         "/ filter".to_owned()
     } else if filter.is_empty() {
-        "/ █".to_owned()
+        "/ \u{2588}".to_owned()
     } else if active {
-        format!("/ {filter}█")
+        format!("/ {filter}\u{2588}")
     } else {
         format!("/ {filter}")
     };
@@ -74,61 +77,86 @@ fn render_filter_bar(filter: &str, active: bool, frame: &mut Frame<'_>, area: Re
 }
 
 // ---------------------------------------------------------------------------
-// Schema tree view
+// Schema tree view (placeholder — phase 6 rewrites this properly)
 // ---------------------------------------------------------------------------
 
 /// A node in the flattened schema tree (computed at render time).
 enum TreeNode<'a> {
+    /// Common fields section header.
+    CommonHeader,
+    /// A common field (present across many services).
+    CommonField { name: &'a str, data_type: &'a str },
+    /// A service row.
     Service {
         name: &'a str,
         expanded: bool,
         field_count: usize,
     },
-    Field {
-        col: &'a ProfiledColumn,
-    },
-    Loading,
+    /// A field within a specific service (unique to that service).
+    ServiceField { name: &'a str, data_type: &'a str },
 }
 
 /// Flatten the schema tree into a linear list for rendering.
-fn flatten_tree(app: &App) -> Vec<TreeNode<'_>> {
-    let services = app.service_list_cache.as_deref().unwrap_or(&[]);
-    let tree = &app.panel.schema;
-    let filter = tree.filter.to_lowercase();
+fn flatten_tree(schema: &SchemaBrowser) -> Vec<TreeNode<'_>> {
+    let filter = schema.filter.to_lowercase();
+    let common_names: HashSet<&str> = schema
+        .common_fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
 
     let mut nodes = Vec::new();
-    for svc in services {
-        // Apply filter: skip services that don't match and have no matching fields.
+
+    // Common fields section.
+    if !schema.common_fields.is_empty() {
+        let visible_common: Vec<_> = schema
+            .common_fields
+            .iter()
+            .filter(|f| filter.is_empty() || f.name.to_lowercase().contains(&filter))
+            .collect();
+
+        if !visible_common.is_empty() || filter.is_empty() {
+            nodes.push(TreeNode::CommonHeader);
+            for f in &visible_common {
+                nodes.push(TreeNode::CommonField {
+                    name: &f.name,
+                    data_type: &f.data_type,
+                });
+            }
+        }
+    }
+
+    // Per-service rows.
+    for svc in &schema.services {
+        let unique_fields: Vec<_> = svc
+            .columns
+            .iter()
+            .filter(|c| !common_names.contains(c.name.as_str()))
+            .collect();
+
         if !filter.is_empty() {
-            let svc_matches = svc.to_lowercase().contains(&filter);
-            let fields_match = app
-                .schema_profile_cache
-                .get(svc.as_str())
-                .is_some_and(|cols| cols.iter().any(|c| c.name.to_lowercase().contains(&filter)));
+            let svc_matches = svc.name.to_lowercase().contains(&filter);
+            let fields_match = unique_fields
+                .iter()
+                .any(|c| c.name.to_lowercase().contains(&filter));
             if !svc_matches && !fields_match {
                 continue;
             }
         }
 
-        let expanded = tree.expanded.contains(svc);
-        let field_count = app
-            .schema_profile_cache
-            .get(svc.as_str())
-            .map_or(0, Vec::len);
-
+        let expanded = schema.expanded.contains(&svc.name);
         nodes.push(TreeNode::Service {
-            name: svc,
+            name: &svc.name,
             expanded,
-            field_count,
+            field_count: unique_fields.len(),
         });
 
         if expanded {
-            if let Some(cols) = app.schema_profile_cache.get(svc.as_str()) {
-                for col in cols {
-                    nodes.push(TreeNode::Field { col });
-                }
-            } else {
-                nodes.push(TreeNode::Loading);
+            for col in &unique_fields {
+                nodes.push(TreeNode::ServiceField {
+                    name: &col.name,
+                    data_type: &col.data_type,
+                });
             }
         }
     }
@@ -164,19 +192,15 @@ fn type_color(data_type: &str) -> Color {
 }
 
 /// Render the schema tree view.
-fn render_schema_tree(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let nodes = flatten_tree(app);
-    let selected = app.panel.schema.selected;
+fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect) {
+    let nodes = flatten_tree(schema);
+    let selected = schema.selected;
 
     if nodes.is_empty() {
-        let msg = if app
-            .service_list_cache
-            .as_ref()
-            .is_some_and(|s| !s.is_empty())
-        {
-            "no matches"
-        } else {
+        let msg = if schema.services.is_empty() {
             "no services"
+        } else {
+            "no matches"
         };
         let paragraph = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(paragraph, area);
@@ -186,18 +210,35 @@ fn render_schema_tree(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let items: Vec<ListItem<'_>> = nodes
         .iter()
         .map(|node| match node {
+            TreeNode::CommonHeader => ListItem::new(Line::from(Span::styled(
+                "── common fields ──",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            TreeNode::CommonField { name, data_type }
+            | TreeNode::ServiceField { name, data_type } => {
+                let type_str = abbreviate_type(data_type);
+                let tc = type_color(data_type);
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled((*name).to_string(), Style::default().fg(Color::Cyan)),
+                    Span::raw(" "),
+                    Span::styled(type_str, Style::default().fg(tc)),
+                ]))
+            }
             TreeNode::Service {
                 name,
                 expanded,
                 field_count,
             } => {
-                let arrow = if *expanded { "▾" } else { "▸" };
+                let arrow = if *expanded { "\u{25be}" } else { "\u{25b8}" };
                 let count_str = if *field_count > 0 {
                     format!(" ({field_count})")
                 } else {
                     String::new()
                 };
-                // Truncate name to fit
+                #[allow(clippy::cast_possible_truncation)]
                 let max_name = (area.width as usize).saturating_sub(6);
                 let display_name = if name.len() > max_name {
                     &name[..max_name]
@@ -215,49 +256,6 @@ fn render_schema_tree(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     Span::styled(count_str, Style::default().fg(Color::DarkGray)),
                 ]))
             }
-            TreeNode::Field { col } => {
-                let pct = col.population_pct();
-                let pct_color = if pct >= 80 {
-                    Color::Green
-                } else if pct >= 50 {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                };
-
-                // Short type abbreviation
-                let type_str = abbreviate_type(&col.data_type);
-                let tc = type_color(&col.data_type);
-
-                // Truncate field name to fit available space
-                // Layout: "  name    TYPE  pct%"
-                let type_width = type_str.len() + 1; // type + space
-                let pct_width = 5; // " 100%"
-                let prefix_width = 2; // "  "
-                let max_name =
-                    (area.width as usize).saturating_sub(prefix_width + type_width + pct_width + 1);
-                let display_name = if col.name.len() > max_name {
-                    &col.name[..max_name]
-                } else {
-                    &col.name
-                };
-
-                // Compute padding between name and type
-                let name_pad = max_name.saturating_sub(display_name.len());
-
-                ListItem::new(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(display_name.to_string(), Style::default().fg(Color::Cyan)),
-                    Span::raw(" ".repeat(name_pad + 1)),
-                    Span::styled(type_str, Style::default().fg(tc)),
-                    Span::raw(" "),
-                    Span::styled(format!("{pct:>3}%"), Style::default().fg(pct_color)),
-                ]))
-            }
-            TreeNode::Loading => ListItem::new(Line::from(Span::styled(
-                "  ⋯ loading...",
-                Style::default().fg(Color::DarkGray),
-            ))),
         })
         .collect();
 
