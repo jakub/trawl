@@ -2027,4 +2027,113 @@ mod tests {
         assert_eq!(row[2], Value::Float(1.5));
         assert_eq!(row[3], Value::Null);
     }
+
+    // --- compute_common_fields tests ---
+
+    fn make_service(name: &str, columns: &[(&str, &str)]) -> trawl_api::ServiceSchema {
+        trawl_api::ServiceSchema {
+            name: name.to_owned(),
+            columns: columns
+                .iter()
+                .map(|(n, t)| trawl_api::ServiceColumnStats {
+                    name: (*n).to_owned(),
+                    data_type: (*t).to_owned(),
+                    null_count: 0,
+                    total_count: 1000,
+                    min_value: None,
+                    max_value: None,
+                    compressed_bytes: 0,
+                })
+                .collect(),
+            earliest_date: None,
+            latest_date: None,
+            file_count: 1,
+            total_bytes: 1024,
+            total_events: 1000,
+            daily_event_counts: vec![],
+        }
+    }
+
+    #[test]
+    fn common_fields_empty_services() {
+        let result = compute_common_fields(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn common_fields_well_known_always_included() {
+        let services = vec![
+            make_service(
+                "nginx",
+                &[
+                    ("timestamp", "TIMESTAMP"),
+                    ("host", "VARCHAR"),
+                    ("status", "INTEGER"),
+                ],
+            ),
+            make_service(
+                "sshd",
+                &[
+                    ("timestamp", "TIMESTAMP"),
+                    ("host", "VARCHAR"),
+                    ("pid", "INTEGER"),
+                ],
+            ),
+        ];
+        let common = compute_common_fields(&services);
+        let names: Vec<&str> = common.iter().map(|f| f.name.as_str()).collect();
+        // timestamp and host are well-known and present in both services.
+        assert!(names.contains(&"timestamp"));
+        assert!(names.contains(&"host"));
+        // status and pid are unique to one service each — not common.
+        assert!(!names.contains(&"status"));
+        assert!(!names.contains(&"pid"));
+    }
+
+    #[test]
+    fn common_fields_well_known_order_preserved() {
+        let services = vec![
+            make_service(
+                "a",
+                &[
+                    ("message", "VARCHAR"),
+                    ("timestamp", "TIMESTAMP"),
+                    ("host", "VARCHAR"),
+                    ("service", "VARCHAR"),
+                    ("level", "VARCHAR"),
+                ],
+            ),
+            make_service(
+                "b",
+                &[
+                    ("message", "VARCHAR"),
+                    ("timestamp", "TIMESTAMP"),
+                    ("host", "VARCHAR"),
+                    ("service", "VARCHAR"),
+                    ("level", "VARCHAR"),
+                ],
+            ),
+        ];
+        let common = compute_common_fields(&services);
+        let names: Vec<&str> = common.iter().map(|f| f.name.as_str()).collect();
+        // Well-known fields should come in the defined order.
+        assert_eq!(names, &["timestamp", "host", "service", "level", "message"]);
+    }
+
+    #[test]
+    fn common_fields_threshold_promotes_frequent_fields() {
+        // 5 services. A field in 5/5 (100%) should be promoted.
+        // A field in 3/5 (60%) should NOT (below 80% threshold).
+        let services = vec![
+            make_service("a", &[("common_f", "VARCHAR"), ("rare_f", "VARCHAR")]),
+            make_service("b", &[("common_f", "VARCHAR"), ("rare_f", "VARCHAR")]),
+            make_service("c", &[("common_f", "VARCHAR"), ("rare_f", "VARCHAR")]),
+            make_service("d", &[("common_f", "VARCHAR")]),
+            make_service("e", &[("common_f", "VARCHAR")]),
+        ];
+        let common = compute_common_fields(&services);
+        let names: Vec<&str> = common.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"common_f")); // 5/5 = 100% > 80%
+        assert!(!names.contains(&"rare_f")); // 3/5 = 60% < 80%
+    }
 }
