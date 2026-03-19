@@ -517,6 +517,78 @@ pub struct FieldValuesResponse {
     pub cached: bool,
 }
 
+// -- service schema (rich per-service metadata) ------------------------------
+
+/// Rich per-service schema response, powered by background parquet metadata scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceSchemaResponse {
+    /// Per-service schema and statistics.
+    pub services: Vec<ServiceSchema>,
+    /// Whether this result was served from cache.
+    pub cached: bool,
+    /// Current hot buffer event count (always fresh, never cached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_buffer_events: Option<u64>,
+    /// Current hot buffer byte size (always fresh, never cached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_buffer_bytes: Option<u64>,
+}
+
+/// Schema and statistics for a single service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceSchema {
+    /// Service name (derived from parquet filename stem).
+    pub name: String,
+    /// Per-column statistics from parquet metadata.
+    pub columns: Vec<ServiceColumnStats>,
+    /// Earliest date directory containing data for this service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_date: Option<String>,
+    /// Latest date directory containing data for this service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_date: Option<String>,
+    /// Number of parquet files for this service.
+    pub file_count: u64,
+    /// Total bytes on disk for this service.
+    pub total_bytes: u64,
+    /// Total row count across all files (from parquet metadata `num_rows`).
+    pub total_events: u64,
+    /// Per-day event counts for sparkline rendering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub daily_event_counts: Vec<DailyCount>,
+}
+
+/// Per-column statistics extracted from parquet row group metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceColumnStats {
+    /// Column name.
+    pub name: String,
+    /// Column data type (e.g. "VARCHAR", "TIMESTAMP").
+    #[serde(rename = "type")]
+    pub data_type: String,
+    /// Exact null count from parquet metadata.
+    pub null_count: u64,
+    /// Total values (rows) across all row groups.
+    pub total_count: u64,
+    /// Minimum value (stringified from parquet column stats).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<String>,
+    /// Maximum value (stringified from parquet column stats).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<String>,
+    /// Total compressed size of this column on disk (bytes).
+    pub compressed_bytes: u64,
+}
+
+/// A single day's event count for sparkline rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyCount {
+    /// Date in YYYY-MM-DD format.
+    pub date: String,
+    /// Number of events on this date.
+    pub count: u64,
+}
+
 // -- history -----------------------------------------------------------------
 
 /// Response from the history endpoint.
@@ -997,6 +1069,60 @@ mod tests {
         assert_eq!(rt.role, "admin");
         assert_eq!(rt.permissions.len(), 3);
         assert!(rt.permissions.contains(&"server_manage".to_owned()));
+    }
+
+    #[test]
+    fn service_schema_response_roundtrip() {
+        let resp = ServiceSchemaResponse {
+            services: vec![ServiceSchema {
+                name: "nginx".into(),
+                columns: vec![ServiceColumnStats {
+                    name: "status".into(),
+                    data_type: "INTEGER".into(),
+                    null_count: 5,
+                    total_count: 1000,
+                    min_value: Some("100".into()),
+                    max_value: Some("599".into()),
+                    compressed_bytes: 4096,
+                }],
+                earliest_date: Some("2026-01-01".into()),
+                latest_date: Some("2026-03-18".into()),
+                file_count: 100,
+                total_bytes: 1_048_576,
+                total_events: 500_000,
+                daily_event_counts: vec![DailyCount {
+                    date: "2026-03-18".into(),
+                    count: 12_345,
+                }],
+            }],
+            cached: true,
+            hot_buffer_events: Some(42),
+            hot_buffer_bytes: Some(8192),
+        };
+        let rt = roundtrip(&resp);
+        assert_eq!(rt.services.len(), 1);
+        assert_eq!(rt.services[0].name, "nginx");
+        assert_eq!(rt.services[0].columns.len(), 1);
+        assert_eq!(rt.services[0].columns[0].null_count, 5);
+        assert_eq!(rt.services[0].total_events, 500_000);
+        assert_eq!(rt.services[0].daily_event_counts.len(), 1);
+        assert!(rt.cached);
+        assert_eq!(rt.hot_buffer_events, Some(42));
+    }
+
+    #[test]
+    fn service_schema_response_empty_omits_optional() {
+        let resp = ServiceSchemaResponse {
+            services: vec![],
+            cached: false,
+            hot_buffer_events: None,
+            hot_buffer_bytes: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("hot_buffer"));
+        let rt: ServiceSchemaResponse = serde_json::from_str(&json).unwrap();
+        assert!(rt.services.is_empty());
+        assert!(!rt.cached);
     }
 
     #[test]
