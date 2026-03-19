@@ -1437,6 +1437,8 @@ impl App {
             }
             "common_field" | "service_field" => {
                 self.tab.editor.insert_text(&name);
+                self.switch_to_main_tab(MainTab::Query);
+                self.focus = Focus::Editor;
             }
             _ => {}
         }

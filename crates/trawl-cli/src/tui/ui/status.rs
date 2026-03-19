@@ -94,12 +94,12 @@ fn get_context_hints(app: &App, width: usize) -> String {
         }
         return match app.main_tab {
             MainTab::Schema => {
-                if width >= 75 {
-                    "↑↓: navigate | →: expand | ←: collapse | /: filter | Esc: query".to_owned()
+                if width >= 80 {
+                    "↑↓: navigate | →: expand | ←: collapse | Enter: use field | /: filter | Esc: query".to_owned()
                 } else if width >= 55 {
-                    "↑↓ navigate | →← expand/collapse | / filter | Esc".to_owned()
+                    "↑↓ navigate | →← expand/collapse | Enter: insert | / filter".to_owned()
                 } else {
-                    "↑↓ navigate | Esc".to_owned()
+                    "↑↓ navigate | Enter: insert".to_owned()
                 }
             }
             MainTab::History => {

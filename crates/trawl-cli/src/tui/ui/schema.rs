@@ -260,24 +260,60 @@ fn render_service_detail(
         ]));
     }
 
-    // Split area: text above, sparkline below (if data).
+    // Split area: text above, sparkline with axis labels below (if data).
     if svc.daily_event_counts.is_empty() {
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(p, area);
     } else {
+        // 5 rows: y-max label (1) + sparkline (2) + x-axis dates (1) + blank (1)
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .constraints([Constraint::Min(1), Constraint::Length(5)])
             .split(area);
 
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(p, chunks[0]);
 
         let data: Vec<u64> = svc.daily_event_counts.iter().map(|d| d.count).collect();
+        let max_val = data.iter().copied().max().unwrap_or(0);
+        let min_val = data.iter().copied().min().unwrap_or(0);
+        let first_date = &svc.daily_event_counts[0].date;
+        let last_date = &svc.daily_event_counts[svc.daily_event_counts.len() - 1].date;
+
+        // Sub-layout: y-max label + sparkline (3 rows) + x-axis label (1 row)
+        let spark_area = chunks[1];
+        let spark_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // y-max label
+                Constraint::Length(2), // sparkline
+                Constraint::Length(1), // y-min + x-axis dates
+            ])
+            .split(spark_area);
+
+        // Y-max label.
+        let max_label = format_count(max_val);
+        let y_max_line = Line::from(Span::styled(
+            format!("{max_label:>6}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(y_max_line), spark_rows[0]);
+
+        // Sparkline.
         let sparkline = Sparkline::default()
             .data(&data)
             .style(Style::default().fg(Color::Cyan));
-        frame.render_widget(sparkline, chunks[1]);
+        frame.render_widget(sparkline, spark_rows[1]);
+
+        // Bottom row: y-min + padding + start date ... end date.
+        let min_label = format_count(min_val);
+        #[allow(clippy::cast_possible_truncation)]
+        let w = spark_rows[2].width as usize;
+        let left = format!("{min_label:>6} {first_date}");
+        let pad = w.saturating_sub(left.len() + last_date.len());
+        let bottom = format!("{left}{}{last_date}", " ".repeat(pad));
+        let bottom_line = Line::from(Span::styled(bottom, Style::default().fg(Color::DarkGray)));
+        frame.render_widget(Paragraph::new(bottom_line), spark_rows[2]);
     }
 }
 
@@ -313,16 +349,14 @@ fn render_field_detail(
 
             if col.total_count > 0 {
                 let non_null = col.total_count - col.null_count;
-                #[allow(clippy::cast_precision_loss)]
-                let pct = (non_null as f64 / col.total_count as f64) * 100.0;
                 lines.push(Line::from(format!(
-                    "non-null:   {pct:.1}% ({})",
-                    format_count(non_null)
+                    "non-null:   {}",
+                    format_non_null_pct(non_null, col.total_count)
                 )));
             }
 
             if let (Some(min_v), Some(max_v)) = (&col.min_value, &col.max_value) {
-                lines.push(Line::from(format!("range:      {min_v} \u{2013} {max_v}")));
+                push_range_lines(&mut lines, min_v, max_v);
             }
 
             if col.compressed_bytes > 0 {
@@ -342,16 +376,14 @@ fn render_field_detail(
 
         if cf.total_count > 0 {
             let non_null = cf.total_count - cf.null_count;
-            #[allow(clippy::cast_precision_loss)]
-            let pct = (non_null as f64 / cf.total_count as f64) * 100.0;
             lines.push(Line::from(format!(
-                "non-null:   {pct:.1}% ({})",
-                format_count(non_null)
+                "non-null:   {}",
+                format_non_null_pct(non_null, cf.total_count)
             )));
         }
 
         if let (Some(min_v), Some(max_v)) = (&cf.min_value, &cf.max_value) {
-            lines.push(Line::from(format!("range:      {min_v} \u{2013} {max_v}")));
+            push_range_lines(&mut lines, min_v, max_v);
         }
     }
 
@@ -360,6 +392,59 @@ fn render_field_detail(
 }
 
 // -- format helpers ----------------------------------------------------------
+
+/// Trim trailing fractional-zero microseconds from timestamp-like strings.
+///
+/// `"2026-03-01 00:00:00.000000"` → `"2026-03-01 00:00:00"`
+/// `"2026-03-01 12:34:56.123000"` → `"2026-03-01 12:34:56.123"`
+/// Non-timestamp strings pass through unchanged.
+fn trim_timestamp(s: &str) -> &str {
+    // Only trim if it looks like a timestamp (contains a dot after a time-like pattern).
+    if let Some(dot_pos) = s.rfind('.') {
+        let after_dot = &s[dot_pos + 1..];
+        if !after_dot.is_empty() && after_dot.bytes().all(|b| b == b'0') {
+            return &s[..dot_pos];
+        }
+        // Trim trailing zeros but keep at least one digit after dot.
+        let trimmed = s.trim_end_matches('0');
+        if trimmed.ends_with('.') {
+            return &s[..dot_pos];
+        }
+        return trimmed;
+    }
+    s
+}
+
+/// Render a range value across one or two lines.
+///
+/// If `min – max` fits on one line after the label, render inline.
+/// Otherwise split across two lines with the continuation indented.
+fn push_range_lines(lines: &mut Vec<Line<'_>>, min_v: &str, max_v: &str) {
+    let min_t = trim_timestamp(min_v);
+    let max_t = trim_timestamp(max_v);
+    // "range:      " is 12 chars
+    let inline = format!("{min_t} \u{2013} {max_t}");
+    if inline.len() <= 40 {
+        lines.push(Line::from(format!("range:      {inline}")));
+    } else {
+        lines.push(Line::from(format!("range:      {min_t} \u{2013}")));
+        lines.push(Line::from(format!("            {max_t}")));
+    }
+}
+
+/// Format non-null percentage with "< 0.1%" for near-zero values.
+fn format_non_null_pct(non_null: u64, total: u64) -> String {
+    if non_null == 0 {
+        return "0%".to_owned();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let pct = (non_null as f64 / total as f64) * 100.0;
+    if pct < 0.1 {
+        format!("< 0.1% ({})", format_count(non_null))
+    } else {
+        format!("{pct:.1}% ({})", format_count(non_null))
+    }
+}
 
 /// Human-readable byte size (KB, MB, GB).
 fn format_bytes(bytes: u64) -> String {

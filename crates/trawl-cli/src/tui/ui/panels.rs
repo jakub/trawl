@@ -105,8 +105,8 @@ enum TreeNode<'a> {
     ServiceField {
         name: &'a str,
         data_type: &'a str,
-        /// Non-null percentage (0-100), if stats available.
-        non_null_pct: Option<u8>,
+        /// Non-null coverage display string (e.g. "99%", "< 1%", "0%").
+        coverage: Option<(String, Color)>,
     },
 }
 
@@ -169,17 +169,33 @@ fn flatten_tree(schema: &SchemaBrowser) -> Vec<TreeNode<'_>> {
 
         if expanded {
             for col in &unique_fields {
-                #[allow(clippy::cast_possible_truncation)]
-                let non_null_pct = if col.total_count > 0 {
-                    let pct = ((col.total_count - col.null_count) * 100) / col.total_count;
-                    Some(pct.min(100) as u8)
+                let coverage = if col.total_count > 0 {
+                    let non_null = col.total_count - col.null_count;
+                    let pct_100 = (non_null * 100) / col.total_count;
+                    if non_null == 0 {
+                        Some(("  0%".to_owned(), Color::Red))
+                    } else if pct_100 == 0 {
+                        // Non-zero but rounds to 0% → show "< 1%"
+                        Some(("< 1%".to_owned(), Color::Red))
+                    } else {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let pct = pct_100.min(100) as u8;
+                        let color = if pct >= 80 {
+                            Color::Green
+                        } else if pct >= 50 {
+                            Color::Yellow
+                        } else {
+                            Color::Red
+                        };
+                        Some((format!("{pct:>3}%"), color))
+                    }
                 } else {
                     None
                 };
                 nodes.push(TreeNode::ServiceField {
                     name: &col.name,
                     data_type: &col.data_type,
-                    non_null_pct,
+                    coverage,
                 });
             }
         }
@@ -254,29 +270,37 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
             TreeNode::ServiceField {
                 name,
                 data_type,
-                non_null_pct,
+                coverage,
             } => {
                 let type_str = abbreviate_type(data_type);
                 let tc = type_color(data_type);
+
+                // Column layout: "   " + name (padded) + " " + type (4) + " " + coverage (4)
+                let indent = 3usize;
+                let type_width = 4usize;
+                let cov_width = 4usize;
+                let overhead = indent + 1 + type_width + 1 + cov_width;
+                #[allow(clippy::cast_possible_truncation)]
+                let max_name = (area.width as usize).saturating_sub(overhead);
+                let display_name = if name.len() > max_name {
+                    &name[..max_name]
+                } else {
+                    name
+                };
+                let name_pad = max_name.saturating_sub(display_name.len());
+
                 let mut spans = vec![
-                    Span::raw("  "),
-                    Span::styled((*name).to_string(), Style::default().fg(Color::Cyan)),
-                    Span::raw(" "),
-                    Span::styled(type_str, Style::default().fg(tc)),
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(
+                        (*display_name).to_string(),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(" ".repeat(name_pad + 1)),
+                    Span::styled(format!("{type_str:<type_width$}"), Style::default().fg(tc)),
                 ];
-                if let Some(pct) = non_null_pct {
-                    let pct_color = if *pct >= 80 {
-                        Color::Green
-                    } else if *pct >= 50 {
-                        Color::Yellow
-                    } else {
-                        Color::Red
-                    };
+                if let Some((ref label, color)) = *coverage {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled(
-                        format!("{pct:>3}%"),
-                        Style::default().fg(pct_color),
-                    ));
+                    spans.push(Span::styled(label.clone(), Style::default().fg(color)));
                 }
                 ListItem::new(Line::from(spans))
             }
