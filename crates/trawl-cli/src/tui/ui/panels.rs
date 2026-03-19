@@ -275,11 +275,12 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
                 let type_str = abbreviate_type(data_type);
                 let tc = type_color(data_type);
 
-                // Column layout: "   " + name (padded) + " " + type (4) + " " + coverage (4)
+                // Column layout: "   " + name (padded) + " " + type (4) + " " + coverage (4) + " "
                 let indent = 3usize;
                 let type_width = 4usize;
                 let cov_width = 4usize;
-                let overhead = indent + 1 + type_width + 1 + cov_width;
+                let trailing = 1usize; // padding before detail pane border
+                let overhead = indent + 1 + type_width + 1 + cov_width + trailing;
                 #[allow(clippy::cast_possible_truncation)]
                 let max_name = (area.width as usize).saturating_sub(overhead);
                 let display_name = if name.len() > max_name {
