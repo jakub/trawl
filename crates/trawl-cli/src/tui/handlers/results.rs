@@ -12,11 +12,22 @@ use super::super::ui;
 
 impl App {
     /// Handle key events when results are focused.
-    #[allow(clippy::too_many_lines)] // Key dispatch with search mode requires many arms
+    #[allow(clippy::too_many_lines)] // Key dispatch with search + column modes requires many arms
     pub(crate) fn handle_results_key(&mut self, key: event::KeyEvent) {
         // If search input is active, route keys to the search bar first.
         if self.results_search.as_ref().is_some_and(|s| s.input_active) {
             self.handle_search_input_key(key);
+            return;
+        }
+
+        // If column mode is active, route to column mode handler.
+        if self
+            .active_tab()
+            .column_config
+            .as_ref()
+            .is_some_and(|c| c.selected.is_some())
+        {
+            self.handle_column_mode_key(key);
             return;
         }
 
@@ -49,6 +60,24 @@ impl App {
                 if let Some(ref mut search) = self.results_search {
                     search.prev_match();
                     self.jump_to_current_match();
+                }
+            }
+            // Enter column mode: c
+            (KeyModifiers::NONE, KeyCode::Char('c')) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config
+                    && config.visible_count() > 0
+                {
+                    let first = config.display_order().into_iter().next();
+                    config.selected = first;
+                }
+            }
+            // Open column picker: H (Shift+h)
+            (KeyModifiers::SHIFT, KeyCode::Char('H')) => {
+                if self.active_tab().column_config.is_some() {
+                    self.popup = Some(Popup::ColumnPicker {
+                        selected: 0,
+                        scroll: 0,
+                    });
                 }
             }
             // Row selection: Up
@@ -175,6 +204,70 @@ impl App {
         }
     }
 
+    /// Handle keys in column mode (cursor on header row).
+    fn handle_column_mode_key(&mut self, key: event::KeyEvent) {
+        match (key.modifiers, key.code) {
+            // Exit column mode
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config {
+                    config.selected = None;
+                }
+            }
+            // Navigate left in display order
+            (KeyModifiers::NONE, KeyCode::Left) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config {
+                    config.move_cursor_left();
+                }
+            }
+            // Navigate right in display order
+            (KeyModifiers::NONE, KeyCode::Right) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config {
+                    config.move_cursor_right();
+                }
+            }
+            // Toggle pin
+            (KeyModifiers::NONE, KeyCode::Char('p')) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config {
+                    config.toggle_pin_selected();
+                }
+            }
+            // Hide column
+            (KeyModifiers::NONE, KeyCode::Char('h')) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config {
+                    config.hide_selected();
+                }
+            }
+            // Widen column
+            (KeyModifiers::NONE, KeyCode::Char('+' | '=')) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config {
+                    config.adjust_selected_width(2);
+                }
+            }
+            // Narrow column
+            (KeyModifiers::NONE, KeyCode::Char('-')) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config {
+                    config.adjust_selected_width(-2);
+                }
+            }
+            // Reset width to auto
+            (KeyModifiers::NONE, KeyCode::Char('0')) => {
+                if let Some(ref mut config) = self.active_tab_mut().column_config {
+                    config.reset_selected_width();
+                }
+            }
+            // Open column picker
+            (KeyModifiers::SHIFT, KeyCode::Char('H')) => {
+                if self.active_tab().column_config.is_some() {
+                    self.popup = Some(Popup::ColumnPicker {
+                        selected: 0,
+                        scroll: 0,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Handle key events for the search input bar (when actively typing a search).
     fn handle_search_input_key(&mut self, key: event::KeyEvent) {
         match (key.modifiers, key.code) {
@@ -214,7 +307,7 @@ impl App {
         if let Some(ref mut search) = self.results_search
             && let Some(ref response) = self.tab.result
         {
-            search.update_matches(&response.result);
+            search.update_matches(&response.result, self.tab.column_config.as_ref());
         }
     }
 

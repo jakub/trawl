@@ -75,6 +75,58 @@ impl App {
                 Popup::SetSchedule { .. } => {
                     self.handle_set_schedule_key(key);
                 }
+                Popup::ColumnPicker { selected, scroll } => {
+                    let selected = *selected;
+                    let scroll = *scroll;
+                    let col_count = self
+                        .active_tab()
+                        .column_config
+                        .as_ref()
+                        .map_or(0, |c| c.columns.len());
+
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Char('q')) => {
+                            self.popup = None;
+                        }
+                        (KeyModifiers::NONE, KeyCode::Up) => {
+                            self.popup = Some(Popup::ColumnPicker {
+                                selected: selected.saturating_sub(1),
+                                scroll: if selected.saturating_sub(1) < scroll {
+                                    selected.saturating_sub(1)
+                                } else {
+                                    scroll
+                                },
+                            });
+                        }
+                        (KeyModifiers::NONE, KeyCode::Down) => {
+                            let new_sel = (selected + 1).min(col_count.saturating_sub(1));
+                            self.popup = Some(Popup::ColumnPicker {
+                                selected: new_sel,
+                                scroll: scroll.max(new_sel.saturating_sub(15)),
+                            });
+                        }
+                        // Toggle visibility
+                        (KeyModifiers::NONE, KeyCode::Char(' ')) => {
+                            if let Some(ref mut config) = self.active_tab_mut().column_config {
+                                let vis = config.visible_count();
+                                if let Some(entry) = config.columns.get_mut(selected)
+                                    && (entry.hidden || vis > 1)
+                                {
+                                    entry.hidden = !entry.hidden;
+                                }
+                            }
+                        }
+                        // Toggle pin
+                        (KeyModifiers::NONE, KeyCode::Char('p')) => {
+                            if let Some(ref mut config) = self.active_tab_mut().column_config
+                                && let Some(entry) = config.columns.get_mut(selected)
+                            {
+                                entry.pinned = !entry.pinned;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 Popup::EventDetail {
                     row_index, scroll, ..
                 } => {

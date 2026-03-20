@@ -29,6 +29,8 @@ pub struct LayoutAreas {
     pub status: Rect,
     /// Active popup overlay area (if any).
     pub popup: Option<Rect>,
+    /// Column header x-ranges for mouse click detection: `(x_start, x_end, original_col_index)`.
+    pub column_header_ranges: Vec<(u16, u16, usize)>,
 }
 
 /// State for vim-style `/` search within results.
@@ -56,7 +58,10 @@ impl ResultsSearch {
     }
 
     /// Recompute matches against the given result data.
-    pub fn update_matches(&mut self, result: &QueryResult) {
+    ///
+    /// If a `ColumnConfig` is provided, hidden columns are skipped — searching
+    /// invisible data is confusing.
+    pub fn update_matches(&mut self, result: &QueryResult, config: Option<&ColumnConfig>) {
         self.matches.clear();
         if self.query.is_empty() {
             return;
@@ -64,6 +69,12 @@ impl ResultsSearch {
         let needle = self.query.to_lowercase();
         for (row_idx, row) in result.rows.iter().enumerate() {
             for (col_idx, value) in row.iter().enumerate() {
+                // Skip hidden columns.
+                if let Some(cfg) = config
+                    && cfg.columns.get(col_idx).is_some_and(|e| e.hidden)
+                {
+                    continue;
+                }
                 let display = match value {
                     Value::Null => "NULL".to_owned(),
                     Value::Boolean(b) => b.to_string(),
@@ -94,6 +105,141 @@ impl ResultsSearch {
     pub fn prev_match(&mut self) {
         if !self.matches.is_empty() {
             self.current_match = (self.current_match + self.matches.len() - 1) % self.matches.len();
+        }
+    }
+}
+
+/// Per-column metadata for visibility, pinning, and width overrides.
+#[derive(Debug, Clone)]
+pub struct ColumnEntry {
+    /// User-set width override. `None` means auto-compute.
+    pub width_override: Option<u16>,
+    /// Whether this column is hidden.
+    pub hidden: bool,
+    /// Whether this column is pinned to the left.
+    pub pinned: bool,
+}
+
+/// Column configuration for the results table (per-result, reset on new query).
+#[derive(Debug, Clone)]
+pub struct ColumnConfig {
+    /// Per-column entries, indexed by original column position.
+    pub columns: Vec<ColumnEntry>,
+    /// Column-mode cursor (original column index). `None` = not in column mode.
+    pub selected: Option<usize>,
+}
+
+impl ColumnConfig {
+    /// Initialize config for `col_count` columns: all visible, none pinned, no overrides.
+    pub fn init(col_count: usize) -> Self {
+        Self {
+            columns: (0..col_count)
+                .map(|_| ColumnEntry {
+                    width_override: None,
+                    hidden: false,
+                    pinned: false,
+                })
+                .collect(),
+            selected: None,
+        }
+    }
+
+    /// Indices of pinned, non-hidden columns in original order.
+    pub fn pinned_indices(&self) -> Vec<usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.pinned && !e.hidden)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Indices of non-pinned, non-hidden columns in original order.
+    pub fn scrollable_indices(&self) -> Vec<usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.pinned && !e.hidden)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Display order: pinned first, then scrollable.
+    pub fn display_order(&self) -> Vec<usize> {
+        let mut order = self.pinned_indices();
+        order.extend(self.scrollable_indices());
+        order
+    }
+
+    /// Number of visible (non-hidden) columns.
+    pub fn visible_count(&self) -> usize {
+        self.columns.iter().filter(|e| !e.hidden).count()
+    }
+
+    /// Move cursor left in display order.
+    pub fn move_cursor_left(&mut self) {
+        let order = self.display_order();
+        if let Some(cur) = self.selected
+            && let Some(pos) = order.iter().position(|&i| i == cur)
+            && pos > 0
+        {
+            self.selected = Some(order[pos - 1]);
+        }
+    }
+
+    /// Move cursor right in display order.
+    pub fn move_cursor_right(&mut self) {
+        let order = self.display_order();
+        if let Some(cur) = self.selected
+            && let Some(pos) = order.iter().position(|&i| i == cur)
+            && pos + 1 < order.len()
+        {
+            self.selected = Some(order[pos + 1]);
+        }
+    }
+
+    /// Toggle pin on the selected column.
+    pub fn toggle_pin_selected(&mut self) {
+        if let Some(idx) = self.selected
+            && let Some(entry) = self.columns.get_mut(idx)
+        {
+            entry.pinned = !entry.pinned;
+        }
+    }
+
+    /// Hide the selected column and advance cursor to the next visible one.
+    pub fn hide_selected(&mut self) {
+        if let Some(idx) = self.selected
+            && self.visible_count() > 1
+        {
+            if let Some(entry) = self.columns.get_mut(idx) {
+                entry.hidden = true;
+            }
+            // Advance cursor to next visible column.
+            let order = self.display_order();
+            self.selected = order.into_iter().next();
+        }
+    }
+
+    /// Adjust selected column width by `delta` (positive = widen, negative = narrow).
+    #[allow(clippy::cast_possible_wrap)] // Column widths are always < 120, safe for i32
+    pub fn adjust_selected_width(&mut self, delta: i32) {
+        if let Some(idx) = self.selected
+            && let Some(entry) = self.columns.get_mut(idx)
+        {
+            let current = i32::from(entry.width_override.unwrap_or(20));
+            #[allow(clippy::cast_sign_loss)]
+            let new_width = (current + delta).clamp(4, 120) as u16;
+            entry.width_override = Some(new_width);
+        }
+    }
+
+    /// Reset selected column width to auto-compute.
+    pub fn reset_selected_width(&mut self) {
+        if let Some(idx) = self.selected
+            && let Some(entry) = self.columns.get_mut(idx)
+        {
+            entry.width_override = None;
         }
     }
 }
@@ -398,6 +544,13 @@ pub enum Popup {
         name: String,
         /// Single-line editor for the interval string.
         editor: SimpleEditor,
+    },
+    /// Column picker checklist for toggling visibility and pinning.
+    ColumnPicker {
+        /// Selected row in the column list.
+        selected: usize,
+        /// Vertical scroll offset.
+        scroll: usize,
     },
 }
 
@@ -1310,8 +1463,8 @@ pub struct Tab {
     pub selected_row: Option<usize>,
     /// Visible row count from last render frame (updated by UI each frame).
     pub last_visible_rows: usize,
-    /// Cached column widths (invalidated on new result).
-    pub column_widths: Option<Vec<u16>>,
+    /// Column configuration (visibility, pinning, width overrides). Reset on new result.
+    pub column_config: Option<ColumnConfig>,
     /// Handle to the running query task (for cancellation).
     pub query_task: Option<tokio::task::JoinHandle<()>>,
     /// Real-time validation errors from local parsing (separate from execution errors).
@@ -1336,7 +1489,7 @@ impl Tab {
             chart_view: ChartView::Table,
             selected_row: None,
             last_visible_rows: 15,
-            column_widths: None,
+            column_config: None,
             query_task: None,
             validation_errors: Vec::new(),
             validation_dirty: false,
@@ -1355,7 +1508,7 @@ impl Tab {
         self.chart_view = ChartView::Table;
         self.selected_row = None;
         self.last_visible_rows = 15;
-        self.column_widths = None;
+        self.column_config = None;
         self.validation_errors.clear();
         self.validation_dirty = false;
         self.last_edit_time = None;

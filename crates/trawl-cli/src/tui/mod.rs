@@ -31,8 +31,8 @@ use trawl_client::{HistoryResponse, HttpClient, ListSavedResponse, QueryResponse
 
 use self::driver::{DriverCommand, DriverResponse, ExecuteWaiter, query_response_to_data};
 use self::state::{
-    ChartView, DashboardState, Focus, LayoutAreas, MainTab, PanelState, Popup, ResultsSearch,
-    SchemaBrowser, SimpleEditor, Tab, TabStatus,
+    ChartView, ColumnConfig, DashboardState, Focus, LayoutAreas, MainTab, PanelState, Popup,
+    ResultsSearch, SchemaBrowser, SimpleEditor, Tab, TabStatus,
 };
 use crate::CliError;
 use crate::config::Config;
@@ -408,7 +408,9 @@ impl App {
                     tab.scroll_offset = 0;
                     tab.horizontal_scroll_offset = 0;
                     tab.selected_row = None;
-                    tab.column_widths = None;
+                    tab.column_config = Some(ColumnConfig::init(
+                        tab.result.as_ref().unwrap().result.columns.len(),
+                    ));
                     tab.validation_errors.clear();
 
                     // Notify driver execute waiter.

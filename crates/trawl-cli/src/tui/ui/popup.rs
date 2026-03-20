@@ -37,6 +37,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Popup::SetSchedule { name, editor, .. } => {
                 render_set_schedule(frame, theme, name, editor);
             }
+            Popup::ColumnPicker { selected, scroll } => {
+                render_column_picker(app, frame, *selected, *scroll);
+            }
         }
     }
 }
@@ -306,6 +309,63 @@ fn render_set_schedule(
         area.x + (area.width / 2).saturating_sub((input.len() as u16) / 2) + 2 + cursor_col as u16;
     let cursor_y = area.y + 6; // Row of the input line within the popup
     frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+/// Render column picker popup — checklist for toggling visibility and pinning.
+fn render_column_picker(app: &App, frame: &mut Frame<'_>, selected: usize, scroll: usize) {
+    let area = centered_rect(50, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let theme = &app.theme;
+    let tab = app.active_tab();
+
+    let Some(config) = &tab.column_config else {
+        return;
+    };
+    let Some(response) = &tab.result else {
+        return;
+    };
+
+    let block = Block::default()
+        .title(" Column Picker ")
+        .title_bottom(" Space: toggle | p: pin | Esc: close ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(theme.surface).fg(theme.text_primary));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let visible_height = inner.height as usize;
+    let total = config.columns.len();
+
+    let max_scroll = total.saturating_sub(visible_height);
+    let clamped_scroll = scroll.min(max_scroll);
+
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(visible_height);
+    for i in clamped_scroll..total.min(clamped_scroll + visible_height) {
+        let entry = &config.columns[i];
+        let name = &response.result.columns[i].name;
+
+        let checkbox = if entry.hidden { "[ ]" } else { "[x]" };
+        let pin_label = if entry.pinned { "  (pinned)" } else { "" };
+        let label = format!(" {checkbox} {name}{pin_label}");
+
+        let style = if i == selected {
+            Style::default()
+                .bg(theme.text_accent)
+                .fg(theme.surface)
+                .add_modifier(Modifier::BOLD)
+        } else if entry.hidden {
+            Style::default().fg(theme.text_muted)
+        } else {
+            Style::default().fg(theme.text_primary)
+        };
+
+        lines.push(Line::from(Span::styled(label, style)));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
 }
 
 use super::common::centered_rect;

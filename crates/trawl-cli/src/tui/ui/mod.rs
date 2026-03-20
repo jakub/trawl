@@ -81,6 +81,7 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
         panel: None,
         status: status_area,
         popup: app.popup.as_ref().map(|p| popup_area(p, frame.area())),
+        column_header_ranges: Vec::new(),
     };
 
     editor::render(app, frame, editor_area);
@@ -97,6 +98,7 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     app.active_tab_mut().last_visible_rows = results_visible.saturating_sub(search_adjust).max(1);
 
     results::render(app, frame, results_area);
+    app.layout.column_header_ranges = results::take_header_ranges();
     status::render(app, frame, status_area);
 
     // Render popup overlay (if any) — renders on top of everything.
@@ -140,6 +142,7 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
         panel: Some(outer[1]),
         status: outer[2],
         popup: app.popup.as_ref().map(|p| popup_area(p, frame.area())),
+        column_header_ranges: Vec::new(),
     };
 
     tabs::render(app, frame, outer[0]);
@@ -188,6 +191,7 @@ fn render_panel_layout(app: &mut App, frame: &mut Frame<'_>) {
         panel: Some(outer[1]),
         status: outer[2],
         popup: app.popup.as_ref().map(|p| popup_area(p, frame.area())),
+        column_header_ranges: Vec::new(),
     };
 
     tabs::render(app, frame, outer[0]);
@@ -210,6 +214,7 @@ fn popup_area(popup: &Popup, frame_area: Rect) -> Rect {
         Popup::ConfirmDelete { .. } | Popup::SaveQuery { .. } => centered_rect(60, 35, frame_area),
         Popup::Error { .. } => centered_rect(60, 30, frame_area),
         Popup::SetSchedule { .. } => centered_rect(60, 40, frame_area),
+        Popup::ColumnPicker { .. } => centered_rect(50, 60, frame_area),
     }
 }
 

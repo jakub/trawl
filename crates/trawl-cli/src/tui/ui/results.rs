@@ -19,7 +19,7 @@ use ratatui::layout::{Alignment, Direction, Layout};
 use ratatui::text::Span;
 
 use crate::tui::App;
-use crate::tui::state::{ChartView, Focus, TabStatus};
+use crate::tui::state::{ChartView, ColumnConfig, Focus, TabStatus};
 use crate::tui::theme::Theme;
 
 /// Build the results pane frame title from the current tab status.
@@ -112,8 +112,8 @@ fn render_search_bar(
     frame.render_widget(paragraph, area);
 }
 
-/// Render the results as a table.
-#[allow(clippy::too_many_lines)] // Table rendering + scrollbars requires detailed logic
+/// Render the results as a table with pinned/scrollable column regions.
+#[allow(clippy::too_many_lines)] // Table rendering + column regions + scrollbars
 fn render_table(
     app: &App,
     frame: &mut Frame<'_>,
@@ -129,6 +129,7 @@ fn render_table(
 
     let tab = app.active_tab();
     let result = &response.result;
+    let config = tab.column_config.as_ref();
 
     // Calculate visible row range first (needed for column width sampling)
     let max_visible_rows = area.height.saturating_sub(4) as usize; // -4 for borders and header
@@ -143,38 +144,105 @@ fn render_table(
     // Calculate how many columns fit on screen
     let available_width = area.width.saturating_sub(4) as usize; // borders + padding
 
-    // Compute adaptive column widths (needs available_width for dynamic cap)
-    let all_widths = compute_column_widths(result, v_scroll, available_width);
+    // Compute adaptive column widths for ALL columns
+    let all_widths = compute_column_widths(result, v_scroll, available_width, config);
     let total_cols = result.columns.len();
+
+    // Partition into pinned and scrollable indices
+    let pinned = config.map_or_else(Vec::new, ColumnConfig::pinned_indices);
+    let scrollable = config.map_or_else(
+        || (0..total_cols).collect::<Vec<_>>(),
+        ColumnConfig::scrollable_indices,
+    );
+
+    // Check if all columns are hidden
+    let visible_count = config.map_or(total_cols, ColumnConfig::visible_count);
+    if visible_count == 0 {
+        render_all_hidden_placeholder(app, frame, area);
+        return;
+    }
+
+    // Compute pinned area width (sum of pinned col widths + spacing)
+    let pinned_width: usize = pinned
+        .iter()
+        .enumerate()
+        .map(|(i, &col_idx)| {
+            let w = all_widths[col_idx] as usize;
+            if i < pinned.len().saturating_sub(1) {
+                w + 3 // column spacing
+            } else {
+                w
+            }
+        })
+        .sum();
+
+    // Separator takes 2 chars (" ┃") if there are pinned columns AND scrollable columns
+    let separator_width = if !pinned.is_empty() && !scrollable.is_empty() {
+        2
+    } else {
+        0
+    };
+
+    let scrollable_budget = available_width
+        .saturating_sub(pinned_width)
+        .saturating_sub(separator_width);
+
+    // Clamp h_scroll to scrollable range
     let h_scroll = tab
         .horizontal_scroll_offset
-        .min(total_cols.saturating_sub(1));
+        .min(scrollable.len().saturating_sub(1));
 
-    // Find how many columns fit starting from h_scroll
+    // Find how many scrollable columns fit starting from h_scroll
     let mut cols_width_sum = 0usize;
-    let mut visible_cols = 0;
-    for w in all_widths.iter().skip(h_scroll) {
-        // +5 for column_spacing(3) + border padding in ratatui Table
-        let next = cols_width_sum + *w as usize + 5;
-        if next > available_width && visible_cols > 0 {
+    let mut visible_scrollable = 0;
+    for &col_idx in scrollable.iter().skip(h_scroll) {
+        let next = cols_width_sum + all_widths[col_idx] as usize + 5;
+        if next > scrollable_budget && visible_scrollable > 0 {
             break;
         }
         cols_width_sum = next;
-        visible_cols += 1;
+        visible_scrollable += 1;
     }
-    let visible_cols = visible_cols.max(1).min(total_cols - h_scroll);
+    let visible_scrollable = visible_scrollable
+        .max(usize::from(!scrollable.is_empty()))
+        .min(scrollable.len().saturating_sub(h_scroll));
 
-    // Build header with visible columns
-    let header_row = Row::new(
-        result
-            .columns
-            .iter()
-            .skip(h_scroll)
-            .take(visible_cols)
-            .map(|col| Cell::from(col.name.as_str()))
-            .collect::<Vec<_>>(),
-    )
-    .style(
+    // Combined display columns: pinned + visible scrollable
+    let display_cols: Vec<usize> = pinned
+        .iter()
+        .copied()
+        .chain(
+            scrollable
+                .iter()
+                .skip(h_scroll)
+                .take(visible_scrollable)
+                .copied(),
+        )
+        .collect();
+    let total_display = display_cols.len();
+    let pinned_count = pinned.len();
+
+    // Column mode cursor (original index)
+    let col_cursor = config.and_then(|c| c.selected);
+
+    // Build header row
+    let header_cells: Vec<Cell<'_>> = display_cols
+        .iter()
+        .map(|&col_idx| {
+            let cell = Cell::from(result.columns[col_idx].name.as_str());
+            if col_cursor == Some(col_idx) {
+                cell.style(
+                    Style::default()
+                        .bg(theme.text_accent)
+                        .fg(theme.surface)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                cell
+            }
+        })
+        .collect();
+    let header_row = Row::new(header_cells).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(theme.table_header),
@@ -189,7 +257,7 @@ fn render_table(
         (HashSet::new(), None)
     };
 
-    // Build data rows with visible columns, truncating to column width
+    // Build data rows
     let selected_row = tab.selected_row;
     let data_rows: Vec<Row<'_>> = result
         .rows
@@ -199,25 +267,21 @@ fn render_table(
         .enumerate()
         .map(|(display_idx, row_data)| {
             let abs_row = v_scroll + display_idx;
-            let cells: Vec<Cell<'_>> = row_data
+            let cells: Vec<Cell<'_>> = display_cols
                 .iter()
-                .zip(all_widths.iter())
-                .enumerate()
-                .skip(h_scroll)
-                .take(visible_cols)
-                .map(|(col_idx, (value, &width))| {
+                .map(|&col_idx| {
+                    let value = &row_data[col_idx];
+                    let width = all_widths[col_idx] as usize;
                     let text = value_to_string(value);
-                    let truncated = truncate_with_ellipsis(&text, width as usize);
+                    let truncated = truncate_with_ellipsis(&text, width);
                     let cell = Cell::from(truncated);
                     if current_match_cell == Some((abs_row, col_idx)) {
-                        // Current match: bright highlight bg
                         cell.style(
                             Style::default()
                                 .bg(theme.search_match_active)
                                 .fg(theme.surface),
                         )
                     } else if match_cells.contains(&(abs_row, col_idx)) {
-                        // Other matches: dim highlight bg
                         cell.style(
                             Style::default()
                                 .bg(theme.search_match_other)
@@ -242,27 +306,37 @@ fn render_table(
         })
         .collect();
 
-    let widths: Vec<Constraint> = all_widths
+    let widths: Vec<Constraint> = display_cols
         .iter()
-        .skip(h_scroll)
-        .take(visible_cols)
-        .map(|&w| Constraint::Length(w))
+        .map(|&col_idx| Constraint::Length(all_widths[col_idx]))
         .collect();
 
+    // Build title
+    let pinned_info = if pinned_count > 0 {
+        format!(", {pinned_count} pinned")
+    } else {
+        String::new()
+    };
+    let hidden_count = total_cols.saturating_sub(visible_count);
+    let hidden_info = if hidden_count > 0 {
+        format!(", {hidden_count} hidden")
+    } else {
+        String::new()
+    };
     let title = match tab.status {
         TabStatus::Running { .. } | TabStatus::Error { .. } => pane_title(&tab.status, theme),
-        _ => Line::from(format!(
-            " Results ({} rows, cols {}-{}/{}{}) ",
-            total_rows,
-            h_scroll + 1,
-            (h_scroll + visible_cols).min(total_cols),
-            total_cols,
-            if response.truncated {
-                ", truncated"
-            } else {
-                ""
-            }
-        )),
+        _ => {
+            let scroll_start = pinned_count + h_scroll + 1;
+            let scroll_end = (pinned_count + h_scroll + visible_scrollable).min(visible_count);
+            Line::from(format!(
+                " Results ({total_rows} rows, cols {scroll_start}-{scroll_end}/{visible_count}{pinned_info}{hidden_info}{}) ",
+                if response.truncated {
+                    ", truncated"
+                } else {
+                    ""
+                }
+            ))
+        }
     };
 
     let block = Block::default()
@@ -280,34 +354,41 @@ fn render_table(
 
     frame.render_widget(table, area);
 
-    // Overlay thin grey column dividers in the gaps between columns.
-    // The 3-char column spacing leaves room for ` │ ` between each pair.
-    if visible_cols > 1 {
-        let has_h_scrollbar = total_cols > visible_cols;
-        let divider_style = Style::default().fg(theme.border_unfocused);
-        // Start after left border (1) + horizontal padding (1)
-        let inner_x = area.x + 2;
-        let y_start = area.y + 1; // skip top border
-        // Bottom: skip bottom border, and skip h-scrollbar row if present
-        let y_end = area.y + area.height - 1 - u16::from(has_h_scrollbar);
+    // Store column header x-ranges for mouse hit-testing and overlay dividers.
+    let inner_x = area.x + 2; // border + padding
+    let mut cumulative_x = inner_x;
+    let mut header_ranges: Vec<(u16, u16, usize)> = Vec::with_capacity(total_display);
 
-        let mut cumulative_x = inner_x;
-        for (i, &w) in widths.iter().enumerate() {
-            // Advance past the column content
-            if let Constraint::Length(col_w) = w {
-                cumulative_x += col_w;
-            }
-            // Place divider at the midpoint of the 3-char gap (skip after last visible col)
-            if i < visible_cols - 1 {
-                let divider_x = cumulative_x + 1; // middle of 3-char gap
-                let buf = frame.buffer_mut();
-                for y in y_start..y_end {
-                    if divider_x < area.x + area.width - 1 {
-                        buf[(divider_x, y)].set_char('│').set_style(divider_style);
-                    }
+    let has_h_scrollbar = scrollable.len() > visible_scrollable;
+    let divider_style = Style::default().fg(theme.border_unfocused);
+    let y_start = area.y + 1;
+    let y_end = area.y + area.height - 1 - u16::from(has_h_scrollbar);
+
+    for (i, &col_idx) in display_cols.iter().enumerate() {
+        let col_w = all_widths[col_idx];
+        let x_start = cumulative_x;
+        let x_end = cumulative_x + col_w;
+        header_ranges.push((x_start, x_end, col_idx));
+        cumulative_x += col_w;
+
+        if i < total_display - 1 {
+            // Determine divider character: thick separator between pinned and scrollable
+            let is_pin_boundary = i + 1 == pinned_count && pinned_count > 0;
+            let divider_char = if is_pin_boundary { '┃' } else { '│' };
+            let divider_x = cumulative_x + 1; // middle of 3-char gap
+            let buf = frame.buffer_mut();
+            for y in y_start..y_end {
+                if divider_x < area.x + area.width - 1 {
+                    buf[(divider_x, y)]
+                        .set_char(divider_char)
+                        .set_style(if is_pin_boundary {
+                            Style::default().fg(theme.text_muted)
+                        } else {
+                            divider_style
+                        });
                 }
-                cumulative_x += 3; // advance past the gap
             }
+            cumulative_x += 3; // column spacing
         }
     }
 
@@ -331,9 +412,9 @@ fn render_table(
         );
     }
 
-    // Render horizontal scrollbar if needed
-    if total_cols > visible_cols {
-        let mut scrollbar_state = ScrollbarState::new(total_cols).position(h_scroll);
+    // Render horizontal scrollbar over scrollable columns only
+    if has_h_scrollbar {
+        let mut scrollbar_state = ScrollbarState::new(scrollable.len()).position(h_scroll);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
             .begin_symbol(Some("←"))
@@ -348,6 +429,53 @@ fn render_table(
             &mut scrollbar_state,
         );
     }
+
+    // Write header ranges back to app layout for mouse click detection.
+    // SAFETY: we need &mut App here but only have &App. The caller (render())
+    // has &mut App and will copy this data out after render_table returns.
+    // Instead, we return it via a thread-local.
+    HEADER_RANGES.with(|cell| {
+        *cell.borrow_mut() = header_ranges;
+    });
+}
+
+/// Render placeholder when all columns are hidden.
+fn render_all_hidden_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let theme = &app.theme;
+    let border_style = if app.focus == Focus::Results {
+        Style::default().fg(theme.border_focused)
+    } else {
+        Style::default().fg(theme.border_unfocused)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Results ")
+        .border_style(border_style)
+        .padding(Padding::horizontal(1));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let text = Paragraph::new("All columns hidden — press H to restore")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(theme.text_muted));
+    frame.render_widget(text, inner);
+}
+
+std::thread_local! {
+    /// Thread-local storage for column header ranges computed during render.
+    /// Extracted by the caller after `render_table` returns.
+    static HEADER_RANGES: std::cell::RefCell<Vec<(u16, u16, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take the column header ranges computed during the last `render_table` call.
+///
+/// Returns the ranges and clears the thread-local. Called by the UI dispatcher
+/// to populate `LayoutAreas::column_header_ranges`.
+pub fn take_header_ranges() -> Vec<(u16, u16, usize)> {
+    HEADER_RANGES.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 /// Render placeholder when no results are available.
@@ -835,18 +963,22 @@ fn render_stacked_sparklines(
 ///
 /// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
 /// the max display width per column, clamped to `[MIN_COL, MAX_COL]`.
+/// Respects `width_override` from `ColumnConfig`; hidden columns get width 0.
 fn compute_column_widths(
     result: &trawl_engine::value::QueryResult,
     v_scroll: usize,
     available_width: usize,
+    config: Option<&ColumnConfig>,
 ) -> Vec<u16> {
     const MIN_COL: usize = 8;
     const MAX_COL: usize = 60;
     const CELL_PADDING: usize = 5; // ratatui column_spacing(3) + 2 for borders
     const SAMPLE_ROWS: usize = 50;
 
-    let total_cols = result.columns.len().max(1);
-    let per_col_budget = (available_width / total_cols).saturating_sub(CELL_PADDING);
+    let visible_count = config
+        .map_or(result.columns.len(), ColumnConfig::visible_count)
+        .max(1);
+    let per_col_budget = (available_width / visible_count).saturating_sub(CELL_PADDING);
     let max_col = per_col_budget.clamp(MIN_COL, MAX_COL);
 
     result
@@ -854,6 +986,17 @@ fn compute_column_widths(
         .iter()
         .enumerate()
         .map(|(col_idx, col)| {
+            // Hidden columns get zero width.
+            if let Some(cfg) = config {
+                if cfg.columns.get(col_idx).is_some_and(|e| e.hidden) {
+                    return 0;
+                }
+                // If user set a width override, use it directly.
+                if let Some(w) = cfg.columns.get(col_idx).and_then(|e| e.width_override) {
+                    return w;
+                }
+            }
+
             let mut max_width = col.name.len();
 
             for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {

@@ -148,13 +148,29 @@ impl App {
         tab.editor.place_cursor(target_row, target_col);
     }
 
-    /// Select a result row at the clicked position.
-    fn handle_results_click(&mut self, _col: u16, row: u16, area: Rect) {
+    /// Select a result row at the clicked position, or enter column mode on header click.
+    fn handle_results_click(&mut self, col: u16, row: u16, area: Rect) {
         let row_count = self
             .active_tab()
             .result
             .as_ref()
             .map_or(0, |r| r.result.row_count());
+
+        // Header row: area.y + 1 (border).
+        let header_y = area.y + 1;
+        if row == header_y {
+            // Check if click hits a column header.
+            for &(x_start, x_end, col_idx) in &self.layout.column_header_ranges {
+                if col >= x_start && col < x_end {
+                    if let Some(ref mut config) = self.active_tab_mut().column_config {
+                        config.selected = Some(col_idx);
+                    }
+                    return;
+                }
+            }
+            return;
+        }
+
         if row_count == 0 {
             return;
         }
@@ -289,9 +305,14 @@ impl App {
         }
     }
 
-    /// Scroll inside a popup (Help or `EventDetail`).
+    /// Scroll inside a popup (Help, `EventDetail`, `ColumnPicker`).
     fn handle_popup_scroll(&mut self, delta: i32) {
-        if let Some(Popup::Help { scroll } | Popup::EventDetail { scroll, .. }) = &mut self.popup {
+        if let Some(
+            Popup::Help { scroll }
+            | Popup::EventDetail { scroll, .. }
+            | Popup::ColumnPicker { scroll, .. },
+        ) = &mut self.popup
+        {
             *scroll = apply_scroll_delta(*scroll, delta, usize::MAX / 2);
         }
     }
