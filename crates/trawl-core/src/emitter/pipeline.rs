@@ -103,6 +103,7 @@ fn process_stats(
 
     ctx.select = select_items;
     ctx.has_aggregation = true;
+    ctx.had_explicit_columns = true;
 
     Ok(())
 }
@@ -143,6 +144,7 @@ fn process_table(table_stage: &crate::ast::TableStage, ctx: &mut EmitterState) {
 
     ctx.select = table_stage.fields.iter().map(|f| quote_field(f)).collect();
     ctx.has_projection = true;
+    ctx.had_explicit_columns = true;
 }
 
 /// Try to extract a field name from the first arg of an aggregation.
@@ -197,6 +199,7 @@ fn process_frequency(
     ctx.select = select_items;
     ctx.group_by = group_items;
     ctx.has_aggregation = true;
+    ctx.had_explicit_columns = true;
 
     // flush aggregation to CTE, then sort+limit on the result
     ctx.flush_to_cte();
@@ -377,6 +380,7 @@ fn process_timechart(
     ctx.group_by = group_items;
     ctx.order_by.push("\"_time\" ASC".to_string());
     ctx.has_aggregation = true;
+    ctx.had_explicit_columns = true;
 
     Ok(())
 }
@@ -462,6 +466,7 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
     let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings)?;
 
     ctx.set_pivot(agg_sql, pivot.on_field.clone(), pivot.by.clone());
+    ctx.had_explicit_columns = true;
 
     Ok(())
 }

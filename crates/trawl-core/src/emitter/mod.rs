@@ -39,6 +39,10 @@ pub struct EmittedQuery {
     /// The executor runs the SQL prefix, then applies these stages
     /// to the result set using the streaming engine.
     pub rust_stages: Vec<Spanned<PipeStage>>,
+    /// Whether the executor should reorder result columns to put well-known
+    /// fields first. `true` when the pipeline has no explicit column selection
+    /// or aggregation — i.e. the column set comes from `SELECT *`.
+    pub needs_column_reorder: bool,
 }
 
 /// A parameter value for a SQL query placeholder.
@@ -173,6 +177,7 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
         pipeline::process_stage(&stage.node, &mut state)?;
     }
 
+    let needs_column_reorder = state.needs_column_reorder();
     let sql = state.finalize();
     let params = state.into_params();
 
@@ -180,6 +185,7 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
         sql,
         params,
         rust_stages,
+        needs_column_reorder,
     })
 }
 

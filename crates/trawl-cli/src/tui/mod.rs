@@ -409,7 +409,7 @@ impl App {
                     tab.horizontal_scroll_offset = 0;
                     tab.selected_row = None;
                     tab.column_config = Some(ColumnConfig::init(
-                        tab.result.as_ref().unwrap().result.columns.len(),
+                        &tab.result.as_ref().unwrap().result.columns,
                     ));
                     tab.validation_errors.clear();
 

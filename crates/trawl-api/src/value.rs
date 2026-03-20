@@ -165,6 +165,13 @@ impl fmt::Display for Value {
     }
 }
 
+/// Fields that appear first in reordered query results.
+///
+/// When a query has no explicit column selection (`table`/`fields`) and no
+/// aggregation (`stats`/`top`/etc.), columns are reordered so these appear
+/// first in this order, followed by remaining columns in their original order.
+pub const WELL_KNOWN_LOG_FIELDS: &[&str] = &["timestamp", "host", "service", "level", "message"];
+
 /// Column metadata from a query result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Column {
@@ -199,6 +206,47 @@ impl QueryResult {
     /// Whether the result set is empty.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// Reorder columns so `preferred` field names appear first.
+    ///
+    /// Fields in `preferred` that exist in the result are moved to the front
+    /// (in the order they appear in `preferred`), followed by all remaining
+    /// columns in their original order. Missing fields are silently skipped.
+    ///
+    /// Both `columns` and every row in `rows` are permuted together.
+    pub fn reorder_columns(&mut self, preferred: &[&str]) {
+        if self.columns.is_empty() {
+            return;
+        }
+
+        let mut order: Vec<usize> = Vec::with_capacity(self.columns.len());
+        let mut used = vec![false; self.columns.len()];
+
+        for &pref in preferred {
+            if let Some(idx) = self.columns.iter().position(|c| c.name == pref)
+                && !used[idx]
+            {
+                order.push(idx);
+                used[idx] = true;
+            }
+        }
+        for (i, &u) in used.iter().enumerate() {
+            if !u {
+                order.push(i);
+            }
+        }
+
+        // Skip allocation if already in order.
+        if order.iter().enumerate().all(|(new, &old)| new == old) {
+            return;
+        }
+
+        self.columns = order.iter().map(|&i| self.columns[i].clone()).collect();
+        for row in &mut self.rows {
+            let orig = std::mem::take(row);
+            *row = order.iter().map(|&i| orig[i].clone()).collect();
+        }
     }
 
     /// Apply offset/limit pagination to result rows (post-executor).
@@ -259,4 +307,83 @@ pub struct ParquetColumnStats {
     pub max_value: Option<String>,
     /// Total compressed size in bytes.
     pub compressed_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str) -> Column {
+        Column {
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn reorder_columns_moves_well_known_first() {
+        let mut result = QueryResult {
+            columns: vec![
+                col("pid"),
+                col("host"),
+                col("message"),
+                col("timestamp"),
+                col("status"),
+            ],
+            rows: vec![vec![
+                Value::Integer(1),
+                Value::String("web-1".into()),
+                Value::String("ok".into()),
+                Value::String("2026-01-01".into()),
+                Value::Integer(200),
+            ]],
+        };
+
+        result.reorder_columns(WELL_KNOWN_LOG_FIELDS);
+
+        let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["timestamp", "host", "message", "pid", "status"]);
+        // Row data must follow the same permutation.
+        assert_eq!(result.rows[0][0], Value::String("2026-01-01".into()));
+        assert_eq!(result.rows[0][1], Value::String("web-1".into()));
+        assert_eq!(result.rows[0][2], Value::String("ok".into()));
+        assert_eq!(result.rows[0][3], Value::Integer(1));
+        assert_eq!(result.rows[0][4], Value::Integer(200));
+    }
+
+    #[test]
+    fn reorder_columns_skips_missing_fields() {
+        let mut result = QueryResult {
+            columns: vec![col("status"), col("uri")],
+            rows: vec![vec![Value::Integer(200), Value::String("/api".into())]],
+        };
+
+        result.reorder_columns(WELL_KNOWN_LOG_FIELDS);
+
+        let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["status", "uri"]); // unchanged
+    }
+
+    #[test]
+    fn reorder_columns_noop_when_already_ordered() {
+        let mut result = QueryResult {
+            columns: vec![col("timestamp"), col("host"), col("extra")],
+            rows: vec![vec![
+                Value::String("t".into()),
+                Value::String("h".into()),
+                Value::Integer(1),
+            ]],
+        };
+
+        result.reorder_columns(WELL_KNOWN_LOG_FIELDS);
+
+        let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["timestamp", "host", "extra"]);
+    }
+
+    #[test]
+    fn reorder_columns_empty_result() {
+        let mut result = QueryResult::empty();
+        result.reorder_columns(WELL_KNOWN_LOG_FIELDS); // should not panic
+        assert!(result.columns.is_empty());
+    }
 }

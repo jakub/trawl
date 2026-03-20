@@ -48,6 +48,11 @@ pub(crate) struct EmitterState {
     pub(crate) limit: Option<u64>,
     pub(crate) has_aggregation: bool,
     pub(crate) has_projection: bool,
+    /// Persistent flag: set when any stage defines a complete output column set
+    /// (table/fields, stats, top, rare, timechart, pivot). Unlike `has_aggregation`
+    /// and `has_projection`, this is NOT reset on CTE flush — it tracks whether
+    /// the pipeline as a whole produced an explicit schema.
+    pub(crate) had_explicit_columns: bool,
     /// The time filter from the search stage, used by `timechart` auto-bucketing.
     /// Not reset on CTE flush — this is query-wide context.
     pub(crate) time_filter: Option<TrawlDuration>,
@@ -180,6 +185,7 @@ impl EmitterState {
             limit: None,
             has_aggregation: false,
             has_projection: false,
+            had_explicit_columns: false,
             time_filter: None,
             sample: None,
             pivot: None,
@@ -462,5 +468,13 @@ impl EmitterState {
     /// Consume the state and return the accumulated parameters.
     pub(crate) fn into_params(self) -> Vec<SqlValue> {
         self.params
+    }
+
+    /// Whether the result columns should be reordered to put well-known fields first.
+    ///
+    /// Returns `true` when no stage in the pipeline defined a complete output
+    /// column set (table/fields, stats, top, rare, timechart, pivot).
+    pub(crate) fn needs_column_reorder(&self) -> bool {
+        !self.had_explicit_columns
     }
 }

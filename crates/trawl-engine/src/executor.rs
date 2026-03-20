@@ -70,6 +70,9 @@ impl Executor {
         if !emitted.rust_stages.is_empty() {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
         }
+        if emitted.needs_column_reorder {
+            result.reorder_columns(trawl_api::value::WELL_KNOWN_LOG_FIELDS);
+        }
         Ok(result)
     }
 
@@ -112,6 +115,9 @@ impl Executor {
         };
         if !emitted.rust_stages.is_empty() {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
+        }
+        if emitted.needs_column_reorder {
+            result.reorder_columns(trawl_api::value::WELL_KNOWN_LOG_FIELDS);
         }
         Ok(result)
     }

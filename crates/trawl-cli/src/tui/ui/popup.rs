@@ -152,7 +152,13 @@ fn render_save_query(
 }
 
 /// Render the event detail popup (key-value view of a single row).
+///
+/// Groups well-known fields first, then remaining non-null fields alphabetically.
+/// Null fields are hidden to reduce noise.
 fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scroll: usize) {
+    use trawl_api::value::WELL_KNOWN_LOG_FIELDS;
+    use trawl_engine::value::Value;
+
     let area = centered_rect(70, 80, frame.area());
     frame.render_widget(Clear, area);
 
@@ -166,42 +172,76 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         return;
     };
 
+    // Collect non-null fields into (name, value_string) pairs.
+    let total_fields = result.columns.len();
+    let fields: Vec<(&str, String)> = result
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| {
+            let value = row_data.get(i)?;
+            if matches!(value, Value::Null) {
+                return None;
+            }
+            Some((col.name.as_str(), super::results::value_to_string(value)))
+        })
+        .collect();
+    let visible_fields = fields.len();
+
+    // Partition into well-known (in priority order) and others (alphabetical).
+    let mut well_known: Vec<(&str, &str)> = Vec::new();
+    for &wk in WELL_KNOWN_LOG_FIELDS {
+        if let Some((_, val)) = fields.iter().find(|(name, _)| *name == wk) {
+            well_known.push((wk, val.as_str()));
+        }
+    }
+    let mut others: Vec<(&str, &str)> = fields
+        .iter()
+        .filter(|(name, _)| !WELL_KNOWN_LOG_FIELDS.contains(name))
+        .map(|(name, val)| (*name, val.as_str()))
+        .collect();
+    others.sort_by_key(|(name, _)| *name);
+
     let theme = &app.theme;
-    let title = format!(" Event Detail (row {}) ", row_index + 1);
+    let title = format!(
+        " Event Detail (row {}, {visible_fields}/{total_fields} fields) ",
+        row_index + 1
+    );
     let block = Block::default()
         .title(title)
         .title_bottom(" ↑↓: scroll | []: prev/next row | Esc: close ")
         .borders(Borders::ALL)
         .style(Style::default().bg(theme.surface).fg(theme.text_primary));
 
-    // Build key-value lines
+    // Find max name width across all visible fields for alignment.
+    let max_name_len = fields.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+
+    let divider = Line::from(Span::styled(
+        "─".repeat(area.width.saturating_sub(4) as usize),
+        Style::default().fg(theme.border_unfocused),
+    ));
+
+    // Build lines: well-known section → divider → other fields.
     let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.push(Line::from(""));
 
-    // Find max field name width for alignment
-    let max_name_len = result
-        .columns
-        .iter()
-        .map(|c| c.name.len())
-        .max()
-        .unwrap_or(0);
-
-    for (i, col) in result.columns.iter().enumerate() {
-        let value = row_data
-            .get(i)
-            .map(super::results::value_to_string)
-            .unwrap_or_default();
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:>width$}  ", col.name, width = max_name_len),
-                Style::default()
-                    .fg(theme.text_accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(value),
-        ]));
+    if !well_known.is_empty() {
+        lines.push(Line::from(""));
+        for (name, val) in &well_known {
+            lines.push(field_line(name, val, max_name_len, theme));
+        }
     }
+
+    if !others.is_empty() {
+        if well_known.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.push(divider);
+        }
+        for (name, val) in &others {
+            lines.push(field_line(name, val, max_name_len, theme));
+        }
+    }
+
     lines.push(Line::from(""));
 
     let max_scroll = lines.len().saturating_sub(1);
@@ -214,6 +254,19 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         .scroll((clamped_scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
+}
+
+/// Build a single key-value line for the event detail popup.
+fn field_line<'a>(name: &str, value: &str, max_name_len: usize, theme: &Theme) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("{name:>max_name_len$}  "),
+            Style::default()
+                .fg(theme.text_accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(value.to_owned()),
+    ])
 }
 
 /// Render an error message popup.
