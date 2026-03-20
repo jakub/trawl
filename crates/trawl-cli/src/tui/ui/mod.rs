@@ -24,6 +24,12 @@ pub mod tabs;
 
 /// Main render function — dispatches to submodules based on app state.
 pub fn render(app: &mut App, frame: &mut Frame<'_>) {
+    // Fill entire frame with surface background so unpainted cells (spacer rows,
+    // gaps between widgets) use the theme color instead of the terminal default.
+    use ratatui::widgets::Block;
+    let bg = Block::default().style(ratatui::style::Style::default().bg(app.theme.surface));
+    frame.render_widget(bg, frame.area());
+
     match app.main_tab {
         MainTab::Query => render_query_layout(app, frame),
         MainTab::Dashboard => render_dashboard_layout(app, frame),
