@@ -1711,28 +1711,7 @@ impl App {
             // Delegate all other keys to the editor
             _ => {
                 if let Some(Popup::SaveQuery { ref mut editor }) = self.popup {
-                    match key.code {
-                        KeyCode::Char(ch) => editor.insert_char(ch),
-                        KeyCode::Backspace => editor.delete_char_before(),
-                        KeyCode::Delete => editor.delete_char_at(),
-                        KeyCode::Left => {
-                            editor.clear_selection();
-                            editor.move_left();
-                        }
-                        KeyCode::Right => {
-                            editor.clear_selection();
-                            editor.move_right();
-                        }
-                        KeyCode::Home => {
-                            editor.clear_selection();
-                            editor.move_to_line_start();
-                        }
-                        KeyCode::End => {
-                            editor.clear_selection();
-                            editor.move_to_line_end();
-                        }
-                        _ => {}
-                    }
+                    editor.handle_key(key);
                 }
             }
         }
@@ -1779,28 +1758,7 @@ impl App {
             // Delegate all other keys to the editor
             _ => {
                 if let Some(Popup::SetSchedule { ref mut editor, .. }) = self.popup {
-                    match key.code {
-                        KeyCode::Char(ch) => editor.insert_char(ch),
-                        KeyCode::Backspace => editor.delete_char_before(),
-                        KeyCode::Delete => editor.delete_char_at(),
-                        KeyCode::Left => {
-                            editor.clear_selection();
-                            editor.move_left();
-                        }
-                        KeyCode::Right => {
-                            editor.clear_selection();
-                            editor.move_right();
-                        }
-                        KeyCode::Home => {
-                            editor.clear_selection();
-                            editor.move_to_line_start();
-                        }
-                        KeyCode::End => {
-                            editor.clear_selection();
-                            editor.move_to_line_end();
-                        }
-                        _ => {}
-                    }
+                    editor.handle_key(key);
                 }
             }
         }

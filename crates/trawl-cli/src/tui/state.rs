@@ -557,6 +557,46 @@ impl SimpleEditor {
         editor
     }
 
+    /// Handle a key event for simple popup inputs.
+    /// Returns true if the key was consumed.
+    pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        match key.code {
+            crossterm::event::KeyCode::Char(ch) => {
+                self.insert_char(ch);
+                true
+            }
+            crossterm::event::KeyCode::Backspace => {
+                self.delete_char_before();
+                true
+            }
+            crossterm::event::KeyCode::Delete => {
+                self.delete_char_at();
+                true
+            }
+            crossterm::event::KeyCode::Left => {
+                self.clear_selection();
+                self.move_left();
+                true
+            }
+            crossterm::event::KeyCode::Right => {
+                self.clear_selection();
+                self.move_right();
+                true
+            }
+            crossterm::event::KeyCode::Home => {
+                self.clear_selection();
+                self.move_to_line_start();
+                true
+            }
+            crossterm::event::KeyCode::End => {
+                self.clear_selection();
+                self.move_to_line_end();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Convert a char offset to a byte offset within a string.
     ///
     /// Returns `s.len()` when `char_idx` is at or past the end,
