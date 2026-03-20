@@ -49,25 +49,25 @@ fn clipboard_set(text: &str) {
 
 /// Error from an async query execution.
 #[derive(Debug)]
-struct QueryError {
+pub(super) struct QueryError {
     /// Human-readable error message.
-    message: String,
+    pub(super) message: String,
     /// Structured error details with optional span info.
-    details: Vec<trawl_client::ErrorDetail>,
+    pub(super) details: Vec<trawl_client::ErrorDetail>,
 }
 
 /// Result of an async query execution.
 #[derive(Debug)]
-struct QueryResult {
+pub(super) struct QueryResult {
     /// Query execution result.
-    result: Result<QueryResponse, QueryError>,
+    pub(super) result: Result<QueryResponse, QueryError>,
     /// Execution duration.
-    duration: Duration,
+    pub(super) duration: Duration,
 }
 
 /// Result of a mutation operation (save/delete saved query).
 #[derive(Debug)]
-enum MutationResult {
+pub(super) enum MutationResult {
     /// Saved query was created successfully.
     SavedQueryCreated { name: String },
     /// Saved query was deleted successfully.
@@ -247,7 +247,7 @@ impl App {
     }
 
     /// Cancel the currently running query on the active tab (if any).
-    fn cancel_query(&mut self) {
+    pub(super) fn cancel_query(&mut self) {
         let tab = self.active_tab_mut();
         if let Some(handle) = tab.query_task.take() {
             handle.abort();
@@ -427,7 +427,6 @@ impl App {
     }
 
     /// Handle a key event.
-    #[allow(clippy::too_many_lines)] // Key dispatch is inherently large
     pub fn handle_key(&mut self, key: event::KeyEvent) {
         // Popups take priority over everything else.
         if self.popup.is_some() {
@@ -529,7 +528,7 @@ impl App {
     ///
     /// Saves the current Query focus (Editor/Results) on switch-away and
     /// restores it on switch-back, so users don't lose context.
-    fn switch_to_main_tab(&mut self, tab: MainTab) {
+    pub(super) fn switch_to_main_tab(&mut self, tab: MainTab) {
         // Save Query focus before switching away.
         if self.main_tab == MainTab::Query && tab != MainTab::Query {
             self.query_focus = self.focus;

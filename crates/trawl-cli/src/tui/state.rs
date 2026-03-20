@@ -401,13 +401,13 @@ impl ChartView {
 
 /// Status of a tab's current query.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Variants used when query execution is implemented
 pub enum TabStatus {
     /// No query running.
     Idle,
     /// Query is executing.
     Running {
         /// When the query started.
+        #[allow(dead_code)] // Reserved for elapsed-time display in status bar
         start: Instant,
     },
     /// Query completed successfully.
