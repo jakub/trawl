@@ -7,6 +7,7 @@
 //! Each submodule adds methods to `App` via split `impl` blocks.
 
 mod editor;
+mod mouse;
 mod panels;
 mod popup;
 mod results;

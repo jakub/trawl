@@ -17,8 +17,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -29,8 +31,8 @@ use trawl_client::{HistoryResponse, HttpClient, ListSavedResponse, QueryResponse
 
 use self::driver::{DriverCommand, DriverResponse, ExecuteWaiter, query_response_to_data};
 use self::state::{
-    ChartView, DashboardState, Focus, MainTab, PanelState, Popup, ResultsSearch, SchemaBrowser,
-    SimpleEditor, Tab, TabStatus,
+    ChartView, DashboardState, Focus, LayoutAreas, MainTab, PanelState, Popup, ResultsSearch,
+    SchemaBrowser, SimpleEditor, Tab, TabStatus,
 };
 use crate::CliError;
 use crate::config::Config;
@@ -144,6 +146,10 @@ pub struct App {
     pub dashboard: DashboardState,
     /// Active color theme.
     pub theme: theme::Theme,
+    /// Cached layout areas from last render (for mouse hit-testing).
+    pub layout: LayoutAreas,
+    /// Whether mouse capture is enabled (from config).
+    pub mouse_enabled: bool,
 }
 
 impl App {
@@ -180,6 +186,8 @@ impl App {
             server_version: None,
             dashboard: DashboardState::new(),
             theme: theme::dark(),
+            layout: LayoutAreas::default(),
+            mouse_enabled: false,
         }
     }
 
@@ -562,7 +570,16 @@ pub async fn run(
     // Set up terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    if config.ui.enable_mouse {
+        crossterm::execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
+    } else {
+        crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -641,6 +658,7 @@ pub async fn run(
 
     // Create app with schema, history, and saved queries.
     let mut app = App::new(client);
+    app.mouse_enabled = config.ui.enable_mouse;
     app.max_live_events = config.tail.max_events;
     app.timezone = config.ui.timezone.clone();
     app.theme = theme::resolve(&config.ui.theme);
@@ -673,11 +691,20 @@ pub async fn run(
 
     // Restore terminal.
     disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
+    if app.mouse_enabled {
+        crossterm::execute!(
+            terminal.backend_mut(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        )?;
+    } else {
+        crossterm::execute!(
+            terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        )?;
+    }
     terminal.show_cursor()?;
 
     result
@@ -721,6 +748,9 @@ where
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
+                }
+                Event::Mouse(mouse) if app.mouse_enabled => {
+                    app.handle_mouse(mouse);
                 }
                 Event::Paste(text) => {
                     if app.focus == Focus::Editor {

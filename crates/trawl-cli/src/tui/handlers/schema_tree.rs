@@ -69,7 +69,7 @@ impl App {
     ///
     /// Layout: common header + common fields, then per-service rows
     /// (each service + its unique fields when expanded).
-    fn visible_tree_node_count(&self) -> usize {
+    pub(crate) fn visible_tree_node_count(&self) -> usize {
         let Some(schema) = self.panel.schema.as_ref() else {
             return 0;
         };

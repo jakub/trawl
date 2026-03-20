@@ -5,10 +5,10 @@
 //! UI rendering dispatch.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::tui::App;
-use crate::tui::state::{Focus, MainTab};
+use crate::tui::state::{Focus, LayoutAreas, MainTab, Popup};
 
 pub mod common;
 pub mod editor;
@@ -70,6 +70,19 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
         (outer[1], None, outer[2], outer[3])
     };
 
+    // Populate layout areas for mouse hit-testing.
+    app.layout = LayoutAreas {
+        tab_bar: Rect {
+            height: 2,
+            ..frame.area()
+        },
+        editor: Some(editor_area),
+        results: Some(results_area),
+        panel: None,
+        status: status_area,
+        popup: app.popup.as_ref().map(|p| popup_area(p, frame.area())),
+    };
+
     editor::render(app, frame, editor_area);
 
     // Render validation hint bar if there are errors.
@@ -120,6 +133,15 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
         ])
         .split(frame.area());
 
+    app.layout = LayoutAreas {
+        tab_bar: outer[0],
+        editor: None,
+        results: None,
+        panel: Some(outer[1]),
+        status: outer[2],
+        popup: app.popup.as_ref().map(|p| popup_area(p, frame.area())),
+    };
+
     tabs::render(app, frame, outer[0]);
 
     if let Some(ref snapshot) = app.dashboard.cache {
@@ -159,12 +181,36 @@ fn render_panel_layout(app: &mut App, frame: &mut Frame<'_>) {
         ])
         .split(frame.area());
 
+    app.layout = LayoutAreas {
+        tab_bar: outer[0],
+        editor: None,
+        results: None,
+        panel: Some(outer[1]),
+        status: outer[2],
+        popup: app.popup.as_ref().map(|p| popup_area(p, frame.area())),
+    };
+
     tabs::render(app, frame, outer[0]);
     panels::render(app, frame, outer[1]);
     status::render(app, frame, outer[2]);
 
     // Render popup overlay (if any).
     popup::render(app, frame);
+}
+
+/// Compute the popup area for hit-testing based on the active popup type.
+///
+/// Uses the same percentages as each popup's render function so click-outside
+/// detection is accurate.
+fn popup_area(popup: &Popup, frame_area: Rect) -> Rect {
+    use common::centered_rect;
+    match popup {
+        Popup::Help { .. } => centered_rect(60, 70, frame_area),
+        Popup::EventDetail { .. } => centered_rect(70, 80, frame_area),
+        Popup::ConfirmDelete { .. } | Popup::SaveQuery { .. } => centered_rect(60, 35, frame_area),
+        Popup::Error { .. } => centered_rect(60, 30, frame_area),
+        Popup::SetSchedule { .. } => centered_rect(60, 40, frame_area),
+    }
 }
 
 #[cfg(test)]

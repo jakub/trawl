@@ -7,8 +7,29 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
+use ratatui::layout::Rect;
 use trawl_client::{PaginationMeta, QueryResponse};
 use trawl_engine::value::{Column, QueryResult, Value};
+
+/// Cached layout areas from the last render frame, used for mouse hit-testing.
+///
+/// Updated every frame (~100ms) so always fresh after resize.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutAreas {
+    /// Tab bar row at the top.
+    pub tab_bar: Rect,
+    /// Query editor pane (only on Query tab).
+    pub editor: Option<Rect>,
+    /// Results table pane (only on Query tab).
+    pub results: Option<Rect>,
+    /// Full-width panel content (History/Schema/Saved/Dashboard tabs).
+    pub panel: Option<Rect>,
+    /// Status bar at the bottom (reserved for future click handling).
+    #[allow(dead_code)]
+    pub status: Rect,
+    /// Active popup overlay area (if any).
+    pub popup: Option<Rect>,
+}
 
 /// State for vim-style `/` search within results.
 #[derive(Debug, Clone)]
@@ -955,6 +976,18 @@ impl SimpleEditor {
     /// Clear the active selection.
     pub fn clear_selection(&mut self) {
         self.selection_anchor = None;
+    }
+
+    /// Place cursor at the given (row, col) position, clamping to valid bounds.
+    ///
+    /// Used by mouse click to position the cursor without needing to know
+    /// line lengths or line counts externally.
+    pub fn place_cursor(&mut self, row: usize, col: usize) {
+        self.clear_selection();
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let col = col.min(Self::char_count(&self.lines[row]));
+        self.cursor = (row, col);
+        self.desired_col = None;
     }
 
     /// Get the selection range in document order (start, end).
