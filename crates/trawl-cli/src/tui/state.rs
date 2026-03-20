@@ -130,16 +130,15 @@ pub struct ColumnConfig {
 }
 
 impl ColumnConfig {
-    /// Initialize config from result columns: all visible, well-known fields auto-pinned.
+    /// Initialize config from result columns: all visible, none pinned, no overrides.
     pub fn init(columns: &[trawl_engine::value::Column]) -> Self {
-        use trawl_api::value::WELL_KNOWN_LOG_FIELDS;
         Self {
             columns: columns
                 .iter()
-                .map(|col| ColumnEntry {
+                .map(|_| ColumnEntry {
                     width_override: None,
                     hidden: false,
-                    pinned: WELL_KNOWN_LOG_FIELDS.contains(&col.name.as_str()),
+                    pinned: false,
                 })
                 .collect(),
             selected: None,

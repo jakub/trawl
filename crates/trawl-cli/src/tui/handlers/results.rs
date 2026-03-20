@@ -208,7 +208,7 @@ impl App {
     fn handle_column_mode_key(&mut self, key: event::KeyEvent) {
         match (key.modifiers, key.code) {
             // Exit column mode
-            (KeyModifiers::NONE, KeyCode::Esc) => {
+            (KeyModifiers::NONE, KeyCode::Esc | KeyCode::Char('c')) => {
                 if let Some(ref mut config) = self.active_tab_mut().column_config {
                     config.selected = None;
                 }
