@@ -11,26 +11,34 @@ use std::collections::HashSet;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Sparkline, Wrap};
 
 use crate::tui::state::SchemaBrowser;
+use crate::tui::theme::Theme;
 
 /// Determine what is selected in the tree and render the appropriate detail.
-pub fn render_detail_pane(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect) {
+pub fn render_detail_pane(
+    schema: &SchemaBrowser,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+) {
     let selection = resolve_selection(schema);
     match selection {
         Selection::None => {
             let p = Paragraph::new("select a service or field")
-                .style(Style::default().fg(Color::DarkGray));
+                .style(Style::default().fg(theme.text_muted));
             frame.render_widget(p, area);
         }
-        Selection::CommonHeader => render_common_header_detail(schema, frame, area),
-        Selection::CommonField { name } => render_field_detail(schema, name, None, frame, area),
-        Selection::Service { name } => render_service_detail(schema, name, frame, area),
+        Selection::CommonHeader => render_common_header_detail(schema, frame, area, theme),
+        Selection::CommonField { name } => {
+            render_field_detail(schema, name, None, frame, area, theme);
+        }
+        Selection::Service { name } => render_service_detail(schema, name, frame, area, theme),
         Selection::ServiceField { service, field } => {
-            render_field_detail(schema, field, Some(service), frame, area);
+            render_field_detail(schema, field, Some(service), frame, area, theme);
         }
     }
 }
@@ -117,17 +125,22 @@ fn resolve_selection(schema: &SchemaBrowser) -> Selection<'_> {
 }
 
 /// Render overview for the common fields header.
-fn render_common_header_detail(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect) {
+fn render_common_header_detail(
+    schema: &SchemaBrowser,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+) {
     let mut lines = vec![
         Line::from(Span::styled(
             "common fields",
             Style::default()
-                .fg(Color::White)
+                .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "\u{2500}".repeat(area.width.min(35) as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
         Line::from(format!("fields:     {}", schema.common_fields.len())),
         Line::from(format!("services:   {}", schema.services.len())),
@@ -136,10 +149,10 @@ fn render_common_header_detail(schema: &SchemaBrowser, frame: &mut Frame<'_>, ar
 
     for f in &schema.common_fields {
         lines.push(Line::from(vec![
-            Span::styled(&f.name, Style::default().fg(Color::Cyan)),
+            Span::styled(&f.name, Style::default().fg(theme.text_accent)),
             Span::styled(
                 format!("  ({})", f.data_type),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_muted),
             ),
         ]));
     }
@@ -155,6 +168,7 @@ fn render_service_detail(
     service_name: &str,
     frame: &mut Frame<'_>,
     area: Rect,
+    theme: &Theme,
 ) {
     let Some(svc) = schema.services.iter().find(|s| s.name == service_name) else {
         return;
@@ -190,12 +204,12 @@ fn render_service_detail(
         Line::from(Span::styled(
             service_name,
             Style::default()
-                .fg(Color::White)
+                .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "\u{2500}".repeat(area.width.min(35) as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
         Line::from(format!("events:    {events_str}")),
         Line::from(format!(
@@ -221,7 +235,7 @@ fn render_service_detail(
     if !svc.daily_event_counts.is_empty() {
         lines.push(Line::from(Span::styled(
             "daily events:",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )));
     }
 
@@ -241,8 +255,8 @@ fn render_service_detail(
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(Line::from(vec![
-            Span::styled("  common: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(common_list, Style::default().fg(Color::White)),
+            Span::styled("  common: ", Style::default().fg(theme.text_muted)),
+            Span::styled(common_list, Style::default().fg(theme.text_primary)),
         ]));
     }
 
@@ -255,8 +269,8 @@ fn render_service_detail(
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(Line::from(vec![
-            Span::styled("  unique: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(unique_list, Style::default().fg(Color::White)),
+            Span::styled("  unique: ", Style::default().fg(theme.text_muted)),
+            Span::styled(unique_list, Style::default().fg(theme.text_primary)),
         ]));
     }
 
@@ -305,7 +319,7 @@ fn render_service_detail(
         let display_data = resample(&data, target_width);
         let sparkline = Sparkline::default()
             .data(&display_data)
-            .style(Style::default().fg(Color::Cyan));
+            .style(Style::default().fg(theme.text_accent));
         frame.render_widget(sparkline, spark_rect);
 
         // Y-max label in the gutter of the sparkline's top row.
@@ -316,7 +330,7 @@ fn render_service_detail(
         };
         let y_max = Line::from(Span::styled(
             format!("{max_label:>gutter$}", gutter = gutter as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         ));
         frame.render_widget(Paragraph::new(y_max), ymax_rect);
 
@@ -329,7 +343,7 @@ fn render_service_detail(
         };
         let y_min = Line::from(Span::styled(
             format!("{min_label:>gutter$}", gutter = gutter as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         ));
         frame.render_widget(Paragraph::new(y_min), ymin_rect);
 
@@ -343,7 +357,7 @@ fn render_service_detail(
             " ".repeat(date_pad),
             gutter = gutter as usize,
         );
-        let x_axis = Line::from(Span::styled(x_line, Style::default().fg(Color::DarkGray)));
+        let x_axis = Line::from(Span::styled(x_line, Style::default().fg(theme.text_muted)));
         frame.render_widget(Paragraph::new(x_axis), rows[1]);
     }
 }
@@ -355,17 +369,18 @@ fn render_field_detail(
     service: Option<&str>,
     frame: &mut Frame<'_>,
     area: Rect,
+    theme: &Theme,
 ) {
     let mut lines = vec![
         Line::from(Span::styled(
             field_name,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "\u{2500}".repeat(area.width.min(35) as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
     ];
 

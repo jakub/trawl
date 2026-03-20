@@ -6,41 +6,43 @@
 
 use ratatui::Frame;
 use ratatui::layout::Alignment;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::tui::App;
 use crate::tui::state::Popup;
+use crate::tui::theme::Theme;
 
 /// Render the active popup (if any).
 pub fn render(app: &App, frame: &mut Frame<'_>) {
     if let Some(popup) = &app.popup {
+        let theme = &app.theme;
         match popup {
             Popup::Help { scroll } => {
                 crate::tui::ui::help::render(app, frame, *scroll);
             }
             Popup::ConfirmDelete { name, .. } => {
-                render_confirm_delete(frame, name);
+                render_confirm_delete(frame, theme, name);
             }
             Popup::SaveQuery { editor } => {
-                render_save_query(frame, editor);
+                render_save_query(frame, theme, editor);
             }
             Popup::EventDetail { row_index, scroll } => {
                 render_event_detail(app, frame, *row_index, *scroll);
             }
             Popup::Error { message } => {
-                render_error(frame, message);
+                render_error(frame, theme, message);
             }
             Popup::SetSchedule { name, editor, .. } => {
-                render_set_schedule(frame, name, editor);
+                render_set_schedule(frame, theme, name, editor);
             }
         }
     }
 }
 
 /// Render confirmation dialog for deleting a saved query.
-fn render_confirm_delete(frame: &mut Frame<'_>, name: &str) {
+fn render_confirm_delete(frame: &mut Frame<'_>, theme: &Theme, name: &str) {
     let area = centered_rect(60, 35, frame.area());
 
     frame.render_widget(Clear, area);
@@ -48,31 +50,33 @@ fn render_confirm_delete(frame: &mut Frame<'_>, name: &str) {
     let block = Block::default()
         .title(" Confirm Delete ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black).fg(Color::Red));
+        .style(Style::default().bg(theme.surface).fg(theme.status_error));
 
     let text = vec![
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "Delete saved query?",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.status_error)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             name,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.status_warning)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "Press Y or Enter to confirm",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
         Line::from(Span::styled(
             "Any other key to cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
         Line::from(""),
     ];
@@ -86,7 +90,11 @@ fn render_confirm_delete(frame: &mut Frame<'_>, name: &str) {
 }
 
 /// Render text input dialog for saving a query.
-fn render_save_query(frame: &mut Frame<'_>, editor: &crate::tui::state::SimpleEditor) {
+fn render_save_query(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    editor: &crate::tui::state::SimpleEditor,
+) {
     let area = centered_rect(60, 35, frame.area());
     let input = editor.text();
 
@@ -95,31 +103,31 @@ fn render_save_query(frame: &mut Frame<'_>, editor: &crate::tui::state::SimpleEd
     let block = Block::default()
         .title(" Save Query ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black).fg(Color::Cyan));
+        .style(Style::default().bg(theme.surface).fg(theme.text_accent));
 
     let text = vec![
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "Enter a name for this query:",
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text_primary),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("> {input}█"),
+            format!("> {input}\u{2588}"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "Press Enter to save",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
         Line::from(Span::styled(
             "Esc to cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
         Line::from(""),
     ];
@@ -155,12 +163,13 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         return;
     };
 
+    let theme = &app.theme;
     let title = format!(" Event Detail (row {}) ", row_index + 1);
     let block = Block::default()
         .title(title)
         .title_bottom(" ↑↓: scroll | []: prev/next row | Esc: close ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+        .style(Style::default().bg(theme.surface).fg(theme.text_primary));
 
     // Build key-value lines
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -184,7 +193,7 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
             Span::styled(
                 format!("{:>width$}  ", col.name, width = max_name_len),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.text_accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(value),
@@ -205,24 +214,27 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
 }
 
 /// Render an error message popup.
-fn render_error(frame: &mut Frame<'_>, message: &str) {
+fn render_error(frame: &mut Frame<'_>, theme: &Theme, message: &str) {
     let area = centered_rect(60, 30, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
         .title(" Error ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black).fg(Color::Red));
+        .style(Style::default().bg(theme.surface).fg(theme.status_error));
 
     let text = vec![
         Line::from(""),
         Line::from(""),
-        Line::from(Span::styled(message, Style::default().fg(Color::Red))),
+        Line::from(Span::styled(
+            message,
+            Style::default().fg(theme.status_error),
+        )),
         Line::from(""),
         Line::from(""),
         Line::from(Span::styled(
             "Press Esc to dismiss",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
         Line::from(""),
     ];
@@ -238,6 +250,7 @@ fn render_error(frame: &mut Frame<'_>, message: &str) {
 /// Render text input dialog for scheduling a saved query.
 fn render_set_schedule(
     frame: &mut Frame<'_>,
+    theme: &Theme,
     name: &str,
     editor: &crate::tui::state::SimpleEditor,
 ) {
@@ -249,32 +262,32 @@ fn render_set_schedule(
     let block = Block::default()
         .title(" Set Schedule ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black).fg(Color::Cyan));
+        .style(Style::default().bg(theme.surface).fg(theme.text_accent));
 
     let text = vec![
         Line::from(""),
         Line::from(Span::styled(
             name,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.status_warning)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "Interval (e.g. 5m, 1h, 24h):",
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text_primary),
         )),
         Line::from(""),
         Line::from(Span::styled(
             format!("> {input}\u{2588}"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "Enter to schedule  |  Esc to cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
         Line::from(""),
     ];

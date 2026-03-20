@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -15,6 +15,7 @@ use crate::tui::state::{MainTab, TabStatus};
 
 /// Render the tab bar at the top of the screen.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let theme = &app.theme;
     let width = area.width as usize;
     let mut spans = Vec::new();
 
@@ -33,11 +34,11 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
         // For the Query tab, show the status indicator.
         let label_text = if *tab == MainTab::Query {
-            let (indicator, _indicator_color) = match &app.tab.status {
-                TabStatus::Idle => ("", Color::DarkGray),
-                TabStatus::Running { .. } => (" ◉", Color::Yellow),
-                TabStatus::Success { .. } => (" ✓", Color::Green),
-                TabStatus::Error { .. } => (" ✗", Color::Red),
+            let indicator = match &app.tab.status {
+                TabStatus::Idle => "",
+                TabStatus::Running { .. } => " ◉",
+                TabStatus::Success { .. } => " ✓",
+                TabStatus::Error { .. } => " ✗",
             };
             if width >= 75 {
                 format!(" {shortcut} {label}{indicator} ")
@@ -52,12 +53,12 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
         let style = if is_active {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme.tab_active_fg)
+                .bg(theme.tab_active_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(theme.text_muted)
                 .add_modifier(Modifier::DIM)
         };
 
@@ -70,7 +71,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     }
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Black));
+    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.surface));
 
     // Render only on the first row; the rest of the area is a spacer that
     // inherits the terminal's default background.

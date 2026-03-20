@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{
     Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -20,22 +20,25 @@ use ratatui::text::Span;
 
 use crate::tui::App;
 use crate::tui::state::{ChartView, Focus, TabStatus};
+use crate::tui::theme::Theme;
 
 /// Build the results pane frame title from the current tab status.
-fn pane_title(status: &TabStatus) -> Line<'_> {
+fn pane_title(status: &TabStatus, theme: &Theme) -> Line<'static> {
     let (text, color) = match status {
         TabStatus::Idle => return Line::from(" Results "),
-        TabStatus::Running { .. } => (" Running... ", Color::Yellow),
+        TabStatus::Running { .. } => (" Running... ", theme.status_warning),
         TabStatus::Success { duration_ms } => {
             return Line::from(format!(" Results ({duration_ms}ms) "));
         }
-        TabStatus::Error { .. } => (" Error ", Color::Red),
+        TabStatus::Error { .. } => (" Error ", theme.status_error),
     };
     Line::from(Span::styled(text, Style::default().fg(color)))
 }
 
 /// Render the results pane (table/sparkline + optional search bar).
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let theme = &app.theme;
+
     // Split off a search bar row at the bottom if search is active.
     let (results_area, search_area) = if app.results_search.is_some() {
         let chunks = Layout::default()
@@ -73,12 +76,17 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     // Render search bar if active.
     if let (Some(search), Some(bar_area)) = (&app.results_search, search_area) {
-        render_search_bar(frame, search, bar_area);
+        render_search_bar(frame, theme, search, bar_area);
     }
 }
 
 /// Render the search input bar at the bottom of the results pane.
-fn render_search_bar(frame: &mut Frame<'_>, search: &crate::tui::state::ResultsSearch, area: Rect) {
+fn render_search_bar(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    search: &crate::tui::state::ResultsSearch,
+    area: Rect,
+) {
     let match_info = if search.query.is_empty() {
         String::new()
     } else if search.matches.is_empty() {
@@ -90,16 +98,16 @@ fn render_search_bar(frame: &mut Frame<'_>, search: &crate::tui::state::ResultsS
     let cursor = if search.input_active { "█" } else { "" };
 
     let line = Line::from(vec![
-        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::styled("/", Style::default().fg(theme.search_match_active)),
         Span::styled(
             format!("{}{cursor}", search.query),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text_primary),
         ),
-        Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+        Span::styled(match_info, Style::default().fg(theme.text_muted)),
     ]);
 
     let paragraph = Paragraph::new(line)
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(theme.surface))
         .alignment(Alignment::Left);
     frame.render_widget(paragraph, area);
 }
@@ -112,10 +120,11 @@ fn render_table(
     area: Rect,
     response: &trawl_client::QueryResponse,
 ) {
+    let theme = &app.theme;
     let border_style = if app.focus == Focus::Results {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.border_focused)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border_unfocused)
     };
 
     let tab = app.active_tab();
@@ -168,7 +177,7 @@ fn render_table(
     .style(
         Style::default()
             .add_modifier(Modifier::BOLD)
-            .fg(Color::Yellow),
+            .fg(theme.table_header),
     );
 
     // Build search match sets for highlighting.
@@ -201,14 +210,18 @@ fn render_table(
                     let truncated = truncate_with_ellipsis(&text, width as usize);
                     let cell = Cell::from(truncated);
                     if current_match_cell == Some((abs_row, col_idx)) {
-                        // Current match: bright yellow bg
-                        cell.style(Style::default().bg(Color::Yellow).fg(Color::Black))
-                    } else if match_cells.contains(&(abs_row, col_idx)) {
-                        // Other matches: dim yellow bg
+                        // Current match: bright highlight bg
                         cell.style(
                             Style::default()
-                                .bg(Color::DarkGray)
-                                .fg(Color::Yellow)
+                                .bg(theme.search_match_active)
+                                .fg(theme.surface),
+                        )
+                    } else if match_cells.contains(&(abs_row, col_idx)) {
+                        // Other matches: dim highlight bg
+                        cell.style(
+                            Style::default()
+                                .bg(theme.search_match_other)
+                                .fg(theme.search_match_active)
                                 .add_modifier(Modifier::BOLD),
                         )
                     } else {
@@ -218,7 +231,11 @@ fn render_table(
                 .collect();
             let row = Row::new(cells);
             if selected_row == Some(abs_row) {
-                row.style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                row.style(
+                    Style::default()
+                        .bg(theme.surface_highlight)
+                        .fg(theme.text_primary),
+                )
             } else {
                 row
             }
@@ -233,7 +250,7 @@ fn render_table(
         .collect();
 
     let title = match tab.status {
-        TabStatus::Running { .. } | TabStatus::Error { .. } => pane_title(&tab.status),
+        TabStatus::Running { .. } | TabStatus::Error { .. } => pane_title(&tab.status, theme),
         _ => Line::from(format!(
             " Results ({} rows, cols {}-{}/{}{}) ",
             total_rows,
@@ -267,7 +284,7 @@ fn render_table(
     // The 3-char column spacing leaves room for ` │ ` between each pair.
     if visible_cols > 1 {
         let has_h_scrollbar = total_cols > visible_cols;
-        let divider_style = Style::default().fg(Color::DarkGray);
+        let divider_style = Style::default().fg(theme.border_unfocused);
         // Start after left border (1) + horizontal padding (1)
         let inner_x = area.x + 2;
         let y_start = area.y + 1; // skip top border
@@ -335,16 +352,17 @@ fn render_table(
 
 /// Render placeholder when no results are available.
 fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let theme = &app.theme;
     let border_style = if app.focus == Focus::Results {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.border_focused)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border_unfocused)
     };
 
     let tab = app.active_tab();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(pane_title(&tab.status))
+        .title(pane_title(&tab.status, theme))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -352,7 +370,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(block, area);
 
     // Build splash content lines.
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(theme.text_muted);
     let client_version = trawl_core::version::PKG_VERSION;
     let server_version = app.server_version.as_deref().unwrap_or("\u{2014}");
 
@@ -360,7 +378,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::from(Span::styled(
             "trawl",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -395,15 +413,16 @@ fn render_error_display(
     message: &str,
     details: &[trawl_client::ErrorDetail],
 ) {
+    let theme = &app.theme;
     let border_style = if app.focus == Focus::Results {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.border_focused)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border_unfocused)
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(pane_title(&tab.status))
+        .title(pane_title(&tab.status, theme))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -416,7 +435,9 @@ fn render_error_display(
     // Error message header.
     lines.push(Line::from(Span::styled(
         format!("error: {message}"),
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.status_error)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
 
@@ -459,33 +480,36 @@ fn render_error_display(
 
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(before.to_owned(), Style::default().fg(Color::White)),
+                Span::styled(before.to_owned(), Style::default().fg(theme.text_primary)),
                 Span::styled(
                     error_region.to_owned(),
                     Style::default()
-                        .fg(Color::Red)
+                        .fg(theme.status_error)
                         .add_modifier(Modifier::UNDERLINED),
                 ),
-                Span::styled(after.to_owned(), Style::default().fg(Color::White)),
+                Span::styled(after.to_owned(), Style::default().fg(theme.text_primary)),
             ]));
 
             // Caret line.
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::raw(" ".repeat(col_start)),
-                Span::styled("^".repeat(underline_len), Style::default().fg(Color::Red)),
+                Span::styled(
+                    "^".repeat(underline_len),
+                    Style::default().fg(theme.status_error),
+                ),
             ]));
 
             // Detail message.
             lines.push(Line::from(Span::styled(
                 format!("  {}", detail.message),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_muted),
             )));
 
             if let Some(ref label) = detail.label {
                 lines.push(Line::from(Span::styled(
                     format!("  while parsing: {label}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.text_muted),
                 )));
             }
 
@@ -494,7 +518,7 @@ fn render_error_display(
             // No span — just the message.
             lines.push(Line::from(Span::styled(
                 format!("  {}", detail.message),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_muted),
             )));
             lines.push(Line::from(""));
         }
@@ -511,10 +535,11 @@ fn render_sparkline(
     area: Rect,
     result: &trawl_engine::value::QueryResult,
 ) {
+    let theme = &app.theme;
     let border_style = if app.focus == Focus::Results {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.border_focused)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border_unfocused)
     };
 
     let (series, total_series) = extract_series(result);
@@ -563,14 +588,14 @@ fn render_sparkline(
 
         let sparkline = Sparkline::default()
             .data(&display_data)
-            .style(Style::default().fg(Color::Cyan))
+            .style(Style::default().fg(theme.chart_series[0]))
             .max(max_val);
 
         frame.render_widget(sparkline, sparkline_area);
 
         // Render y-axis labels (max at top, 0 at bottom - sparkline is filled area from 0)
         let max_label =
-            Paragraph::new(format!("{max_val:>7}")).style(Style::default().fg(Color::DarkGray));
+            Paragraph::new(format!("{max_val:>7}")).style(Style::default().fg(theme.text_muted));
         frame.render_widget(
             max_label,
             Rect {
@@ -581,7 +606,7 @@ fn render_sparkline(
             },
         );
 
-        let zero_label = Paragraph::new("      0").style(Style::default().fg(Color::DarkGray));
+        let zero_label = Paragraph::new("      0").style(Style::default().fg(theme.text_muted));
         frame.render_widget(
             zero_label,
             Rect {
@@ -601,7 +626,7 @@ fn render_sparkline(
 
             let x_axis_text = format!("{start}{}{end}", " ".repeat(padding));
             let x_axis_label =
-                Paragraph::new(x_axis_text).style(Style::default().fg(Color::DarkGray));
+                Paragraph::new(x_axis_text).style(Style::default().fg(theme.text_muted));
             frame.render_widget(
                 x_axis_label,
                 Rect {
@@ -632,11 +657,12 @@ fn render_sparkline(
 #[allow(clippy::cast_possible_truncation)]
 fn render_series_label(
     frame: &mut Frame<'_>,
+    theme: &Theme,
     area: Rect,
     label: &str,
     min_val: u64,
     max_val: u64,
-    color: Color,
+    series_color: ratatui::style::Color,
 ) {
     let w = area.width as usize;
     let display_label = if label.len() > w {
@@ -648,13 +674,13 @@ fn render_series_label(
     if area.height >= 3 {
         // Max value at top
         frame.render_widget(
-            Paragraph::new(format!("{max_val:>w$}")).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(format!("{max_val:>w$}")).style(Style::default().fg(theme.text_muted)),
             Rect { height: 1, ..area },
         );
 
         // Min value at bottom
         frame.render_widget(
-            Paragraph::new(format!("{min_val:>w$}")).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(format!("{min_val:>w$}")).style(Style::default().fg(theme.text_muted)),
             Rect {
                 y: area.y + area.height - 1,
                 height: 1,
@@ -664,7 +690,7 @@ fn render_series_label(
 
         // Series label vertically centered
         frame.render_widget(
-            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(color)),
+            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(series_color)),
             Rect {
                 y: area.y + area.height / 2,
                 height: 1,
@@ -674,7 +700,7 @@ fn render_series_label(
     } else {
         // Too short for y-axis labels — just show the series name
         frame.render_widget(
-            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(color)),
+            Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(series_color)),
             area,
         );
     }
@@ -683,7 +709,7 @@ fn render_series_label(
 /// Render multiple sparklines stacked vertically for multi-series timechart.
 #[allow(clippy::cast_possible_truncation)]
 fn render_stacked_sparklines(
-    _app: &App,
+    app: &App,
     frame: &mut Frame<'_>,
     area: Rect,
     series: &[(String, Vec<u64>)],
@@ -691,6 +717,7 @@ fn render_stacked_sparklines(
     border_style: Style,
     time_info: Option<(String, String, String)>,
 ) {
+    let theme = &app.theme;
     let title = if let Some((ref start, ref end, ref span)) = time_info {
         format!(" timechart • {start} to {end} • span: {span} ")
     } else {
@@ -733,14 +760,7 @@ fn render_stacked_sparklines(
     };
 
     let label_width: u16 = 20;
-    let colors = [
-        Color::Cyan,
-        Color::Yellow,
-        Color::Magenta,
-        Color::Green,
-        Color::Red,
-        Color::Blue,
-    ];
+    let colors = &theme.chart_series;
 
     let mut y_offset: u16 = 0;
     for (idx, (label, values)) in series.iter().enumerate() {
@@ -781,7 +801,7 @@ fn render_stacked_sparklines(
             width: label_w,
             height: row_height as u16,
         };
-        render_series_label(frame, label_area, label, min_val, max_val, color);
+        render_series_label(frame, theme, label_area, label, min_val, max_val, color);
 
         // Advance y_offset: row height + 1 gap row (except after last series)
         y_offset += row_height as u16;
@@ -798,7 +818,7 @@ fn render_stacked_sparklines(
         let padding = sparkline_width.saturating_sub(start_len + end_len);
 
         let x_axis_text = format!("{start}{}{end}", " ".repeat(padding));
-        let x_axis_label = Paragraph::new(x_axis_text).style(Style::default().fg(Color::DarkGray));
+        let x_axis_label = Paragraph::new(x_axis_text).style(Style::default().fg(theme.text_muted));
         frame.render_widget(
             x_axis_label,
             Rect {

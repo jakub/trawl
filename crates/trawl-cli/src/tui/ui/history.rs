@@ -8,7 +8,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
@@ -17,6 +17,7 @@ use crate::tui::highlight::Highlighter;
 
 /// Render the detail pane for the selected history entry.
 pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let theme = &app.theme;
     let selected = app.panel.history_selected;
     let Some(ref history) = app.history_cache else {
         return;
@@ -25,15 +26,15 @@ pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         return;
     };
 
-    let highlighter = Highlighter::new(app.schema_cache.as_ref());
+    let highlighter = Highlighter::new(app.schema_cache.as_ref(), &app.theme.syntax);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // -- status badge --
     let (status_label, status_color) = match entry.status {
-        trawl_client::QueryStatus::Success => ("success", Color::Green),
-        trawl_client::QueryStatus::Error => ("error", Color::Red),
-        trawl_client::QueryStatus::Timeout => ("timeout", Color::Yellow),
+        trawl_client::QueryStatus::Success => ("success", theme.status_success),
+        trawl_client::QueryStatus::Error => ("error", theme.status_error),
+        trawl_client::QueryStatus::Timeout => ("timeout", theme.status_warning),
     };
     lines.push(Line::from(Span::styled(
         status_label,
@@ -47,30 +48,23 @@ pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let sep_width = area.width.min(35) as usize;
     lines.push(Line::from(Span::styled(
         "\u{2500}".repeat(sep_width),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.text_muted),
     )));
 
     // -- metadata --
+    let label_style = Style::default().fg(theme.text_muted);
+    let value_style = Style::default().fg(theme.text_primary);
     lines.push(Line::from(vec![
-        Span::styled("duration   ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format_duration_ms(entry.duration_ms),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled("duration   ", label_style),
+        Span::styled(format_duration_ms(entry.duration_ms), value_style),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("rows       ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            entry.row_count.to_string(),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled("rows       ", label_style),
+        Span::styled(entry.row_count.to_string(), value_style),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("executed   ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format_full_timestamp(&entry.executed_at),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled("executed   ", label_style),
+        Span::styled(format_full_timestamp(&entry.executed_at), value_style),
     ]));
 
     lines.push(Line::default());

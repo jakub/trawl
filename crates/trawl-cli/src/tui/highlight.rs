@@ -4,10 +4,12 @@
 
 //! Custom DSL syntax highlighting.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use trawl_client::SchemaResponse;
+
+use crate::tui::theme::SyntaxColors;
 
 /// Token type for syntax highlighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,19 +41,21 @@ enum TokenType {
 }
 
 /// Syntax highlighter for DSL queries.
-pub struct Highlighter {
+pub struct Highlighter<'a> {
     /// Known field names from schema (for validation).
     fields: Vec<std::string::String>,
+    /// Syntax colors from the active theme.
+    colors: &'a SyntaxColors,
 }
 
-impl Highlighter {
-    /// Create a new highlighter with schema information.
-    pub fn new(schema: Option<&SchemaResponse>) -> Self {
+impl<'a> Highlighter<'a> {
+    /// Create a new highlighter with schema information and theme colors.
+    pub fn new(schema: Option<&SchemaResponse>, colors: &'a SyntaxColors) -> Self {
         let fields = schema
             .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_default();
 
-        Self { fields }
+        Self { fields, colors }
     }
 
     /// Highlight a single line of DSL query text.
@@ -62,34 +66,34 @@ impl Highlighter {
         // If token[i] is Field and token[i+1] is ":" operator, reclassify as FilterKey.
         Self::fix_filter_keys(&mut tokens);
 
+        let colors = self.colors;
         let spans: Vec<Span<'static>> = tokens
             .into_iter()
             .map(|(token_type, text)| {
                 let style = match token_type {
                     TokenType::Stage | TokenType::Function => Style::default()
-                        .fg(Color::Magenta)
+                        .fg(colors.stage)
                         .add_modifier(Modifier::BOLD),
-                    TokenType::FilterKey => Style::default().fg(Color::Cyan),
-                    TokenType::Operator => Style::default().fg(Color::Yellow),
+                    TokenType::FilterKey => Style::default().fg(colors.filter_key),
+                    TokenType::Operator => Style::default().fg(colors.operator),
                     TokenType::Logical => Style::default()
-                        .fg(Color::Yellow)
+                        .fg(colors.logical)
                         .add_modifier(Modifier::BOLD),
                     TokenType::Field => {
-                        // Green if in schema, white otherwise
                         if self.fields.contains(&text) {
-                            Style::default().fg(Color::Green)
+                            Style::default().fg(colors.field_known)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(colors.field_unknown)
                         }
                     }
-                    TokenType::String => Style::default().fg(Color::LightYellow),
-                    TokenType::Number => Style::default().fg(Color::LightBlue),
-                    TokenType::Regex => Style::default().fg(Color::LightRed),
-                    TokenType::Negated => {
-                        Style::default().fg(Color::Red).add_modifier(Modifier::DIM)
-                    }
+                    TokenType::String => Style::default().fg(colors.string),
+                    TokenType::Number => Style::default().fg(colors.number),
+                    TokenType::Regex => Style::default().fg(colors.regex),
+                    TokenType::Negated => Style::default()
+                        .fg(colors.negated)
+                        .add_modifier(Modifier::DIM),
                     TokenType::Comment => Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(colors.comment)
                         .add_modifier(Modifier::ITALIC),
                     TokenType::Whitespace => Style::default(),
                 };

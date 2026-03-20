@@ -6,14 +6,15 @@
 
 use ratatui::Frame;
 use ratatui::layout::Alignment;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::tui::App;
 
 /// Render the help overlay.
-pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
+pub fn render(app: &App, frame: &mut Frame<'_>, scroll: usize) {
+    let theme = &app.theme;
     let area = centered_rect(60, 70, frame.area());
 
     frame.render_widget(Clear, area);
@@ -21,14 +22,12 @@ pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
     let block = Block::default()
         .title(" Help ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+        .style(Style::default().bg(theme.surface).fg(theme.text_primary));
 
+    let section_style = Style::default().fg(theme.table_header);
     let help_text = vec![
         Line::from(""),
-        Line::from(Span::styled(
-            "Navigation",
-            Style::default().fg(Color::Yellow),
-        )),
+        Line::from(Span::styled("Navigation", section_style)),
         Line::from(""),
         Line::from("  Alt+1           - Query tab"),
         Line::from("  Alt+2           - History tab"),
@@ -37,10 +36,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
         Line::from("  Tab             - accept suggestion / cycle focus"),
         Line::from("  Esc             - close panel / cancel / deselect"),
         Line::from(""),
-        Line::from(Span::styled(
-            "Query Editor",
-            Style::default().fg(Color::Yellow),
-        )),
+        Line::from(Span::styled("Query Editor", section_style)),
         Line::from(""),
         Line::from("  Shift+Enter     - execute query"),
         Line::from("  Ctrl+Enter      - execute query (alt)"),
@@ -57,7 +53,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
         Line::from("  Alt+B / Alt+F   - word movement (readline)"),
         Line::from("  Alt+D           - delete word after cursor"),
         Line::from(""),
-        Line::from(Span::styled("Results", Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled("Results", section_style)),
         Line::from(""),
         Line::from("  ↑/↓             - navigate rows"),
         Line::from("  ←/→             - scroll columns"),
@@ -68,10 +64,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
         Line::from("  PgUp/PgDn       - page up / down"),
         Line::from("  Home/End        - jump to top / bottom"),
         Line::from(""),
-        Line::from(Span::styled(
-            "Schema / History / Saved",
-            Style::default().fg(Color::Yellow),
-        )),
+        Line::from(Span::styled("Schema / History / Saved", section_style)),
         Line::from(""),
         Line::from("  ↑/↓             - navigate items"),
         Line::from("  Enter           - expand / load query"),
@@ -80,7 +73,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
         Line::from("  s               - schedule (Saved tab)"),
         Line::from("  Del             - delete (Saved tab)"),
         Line::from(""),
-        Line::from(Span::styled("Other", Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled("Other", section_style)),
         Line::from(""),
         Line::from("  Ctrl+Q          - quit"),
         Line::from("  F1              - toggle help"),
@@ -90,7 +83,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
         Line::from(""),
         Line::from(Span::styled(
             "Esc to close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_muted),
         )),
     ];
 

@@ -14,19 +14,22 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::tui::App;
 use crate::tui::state::{Focus, MainTab, SchemaBrowser};
+use crate::tui::theme::Theme;
 
 /// Render panel content based on the active `MainTab`.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let theme = &app.theme;
+
     let border_style = if app.focus == Focus::Panel {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.border_focused)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border_unfocused)
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(theme.surface));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -46,14 +49,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     .constraints([Constraint::Length(1), Constraint::Min(1)])
                     .split(cols[0]);
 
-                render_filter_bar(&schema.filter, schema.filter_active, frame, left[0]);
-                render_schema_tree(schema, frame, left[1]);
+                render_filter_bar(&schema.filter, schema.filter_active, theme, frame, left[0]);
+                render_schema_tree(schema, theme, frame, left[1]);
 
                 // Right side: detail pane.
-                super::schema::render_detail_pane(schema, frame, cols[1]);
+                super::schema::render_detail_pane(schema, frame, cols[1], theme);
             } else {
-                let paragraph =
-                    Paragraph::new("loading schema...").style(Style::default().fg(Color::DarkGray));
+                let paragraph = Paragraph::new("loading schema...")
+                    .style(Style::default().fg(theme.text_muted));
                 frame.render_widget(paragraph, inner);
             }
         }
@@ -61,7 +64,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
             if let Some(ref history) = app.history_cache {
                 if history.entries.is_empty() {
                     let paragraph = Paragraph::new("no history yet")
-                        .style(Style::default().fg(Color::DarkGray));
+                        .style(Style::default().fg(theme.text_muted));
                     frame.render_widget(paragraph, inner);
                 } else {
                     // Horizontal split: list (55%) | detail pane (45%).
@@ -70,26 +73,26 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                         .split(inner);
 
-                    render_history_list(app, frame, cols[0]);
+                    render_history_list(app, theme, frame, cols[0]);
                     super::history::render_detail_pane(app, frame, cols[1]);
                 }
             } else {
                 let paragraph = Paragraph::new("loading history...")
-                    .style(Style::default().fg(Color::DarkGray));
+                    .style(Style::default().fg(theme.text_muted));
                 frame.render_widget(paragraph, inner);
             }
         }
-        MainTab::Saved => render_saved_list(app, frame, inner),
+        MainTab::Saved => render_saved_list(app, theme, frame, inner),
         MainTab::Query | MainTab::Dashboard => {} // Use their own layout.
     }
 }
 
 /// Render the filter input bar for schema search.
-fn render_filter_bar(filter: &str, active: bool, frame: &mut Frame<'_>, area: Rect) {
+fn render_filter_bar(filter: &str, active: bool, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let style = if active {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.text_accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.text_muted)
     };
 
     let text = if filter.is_empty() && !active {
@@ -132,7 +135,7 @@ enum TreeNode<'a> {
 }
 
 /// Flatten the schema tree into a linear list for rendering.
-fn flatten_tree(schema: &SchemaBrowser) -> Vec<TreeNode<'_>> {
+fn flatten_tree<'a>(schema: &'a SchemaBrowser, theme: &Theme) -> Vec<TreeNode<'a>> {
     let filter = schema.filter.to_lowercase();
     let common_names: HashSet<&str> = schema
         .common_fields
@@ -194,19 +197,19 @@ fn flatten_tree(schema: &SchemaBrowser) -> Vec<TreeNode<'_>> {
                     let non_null = col.total_count - col.null_count;
                     let pct_100 = (non_null * 100) / col.total_count;
                     if non_null == 0 {
-                        Some(("  0%".to_owned(), Color::Red))
+                        Some(("  0%".to_owned(), theme.status_error))
                     } else if pct_100 == 0 {
                         // Non-zero but rounds to 0% → show "< 1%"
-                        Some(("< 1%".to_owned(), Color::Red))
+                        Some(("< 1%".to_owned(), theme.status_error))
                     } else {
                         #[allow(clippy::cast_possible_truncation)]
                         let pct = pct_100.min(100) as u8;
                         let color = if pct >= 80 {
-                            Color::Green
+                            theme.status_success
                         } else if pct >= 50 {
-                            Color::Yellow
+                            theme.status_warning
                         } else {
-                            Color::Red
+                            theme.status_error
                         };
                         Some((format!("{pct:>3}%"), color))
                     }
@@ -225,10 +228,10 @@ fn flatten_tree(schema: &SchemaBrowser) -> Vec<TreeNode<'_>> {
 }
 
 /// Color for a data type badge.
-fn type_color(data_type: &str) -> Color {
+fn type_color(data_type: &str, theme: &Theme) -> Color {
     let dt = data_type.to_uppercase();
     if dt.starts_with("VARCHAR") || dt.starts_with("TEXT") || dt.starts_with("STRING") {
-        Color::Green
+        theme.status_success
     } else if dt.starts_with("BIGINT")
         || dt.starts_with("INTEGER")
         || dt.starts_with("INT")
@@ -242,20 +245,20 @@ fn type_color(data_type: &str) -> Color {
         || dt.starts_with("USMALLINT")
         || dt.starts_with("UTINYINT")
     {
-        Color::Yellow
+        theme.status_warning
     } else if dt.starts_with("TIMESTAMP") || dt.starts_with("DATE") || dt.starts_with("TIME") {
-        Color::Cyan
+        theme.text_accent
     } else if dt.starts_with("BOOLEAN") || dt.starts_with("BOOL") {
-        Color::Magenta
+        theme.status_info
     } else {
-        Color::DarkGray
+        theme.text_primary
     }
 }
 
 /// Render the schema tree view.
 #[allow(clippy::too_many_lines)]
-fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect) {
-    let nodes = flatten_tree(schema);
+fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let nodes = flatten_tree(schema, theme);
     let selected = schema.selected;
 
     if nodes.is_empty() {
@@ -264,7 +267,7 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
         } else {
             "no matches"
         };
-        let paragraph = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
+        let paragraph = Paragraph::new(msg).style(Style::default().fg(theme.text_muted));
         frame.render_widget(paragraph, area);
         return;
     }
@@ -275,15 +278,15 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
             TreeNode::CommonHeader { field_count } => ListItem::new(Line::from(Span::styled(
                 format!("\u{2605} common ({field_count})"),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             ))),
             TreeNode::CommonField { name, data_type } => {
                 let type_str = abbreviate_type(data_type);
-                let tc = type_color(data_type);
+                let tc = type_color(data_type, theme);
                 ListItem::new(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled((*name).to_string(), Style::default().fg(Color::Cyan)),
+                    Span::styled((*name).to_string(), Style::default().fg(theme.text_accent)),
                     Span::raw(" "),
                     Span::styled(type_str, Style::default().fg(tc)),
                 ]))
@@ -294,7 +297,7 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
                 coverage,
             } => {
                 let type_str = abbreviate_type(data_type);
-                let tc = type_color(data_type);
+                let tc = type_color(data_type, theme);
 
                 // Column layout: "   " + name (padded) + " " + type (4) + " " + coverage (4) + " "
                 let indent = 3usize;
@@ -315,7 +318,7 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
                     Span::raw(" ".repeat(indent)),
                     Span::styled(
                         (*display_name).to_string(),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(theme.text_accent),
                     ),
                     Span::raw(" ".repeat(name_pad + 1)),
                     Span::styled(format!("{type_str:<type_width$}"), Style::default().fg(tc)),
@@ -345,14 +348,14 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
                     name
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{arrow} "), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{arrow} "), Style::default().fg(theme.text_muted)),
                     Span::styled(
                         display_name.to_string(),
                         Style::default()
-                            .fg(Color::White)
+                            .fg(theme.text_primary)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(count_str, Style::default().fg(Color::DarkGray)),
+                    Span::styled(count_str, Style::default().fg(theme.text_muted)),
                 ]))
             }
         })
@@ -360,7 +363,7 @@ fn render_schema_tree(schema: &SchemaBrowser, frame: &mut Frame<'_>, area: Rect)
 
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(theme.surface_highlight)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -417,7 +420,7 @@ fn abbreviate_type(data_type: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Render history entries in the left pane (relative time + truncated query).
-fn render_history_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
+fn render_history_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     // Layout: "{4-char time}  {query…} "
     const TIME_WIDTH: usize = 4;
     const GAP: usize = 2;
@@ -443,9 +446,9 @@ fn render_history_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 format!("{query}  ")
             };
             ListItem::new(Line::from(vec![
-                Span::styled(time_str, Style::default().fg(Color::DarkGray)),
+                Span::styled(time_str, Style::default().fg(theme.text_muted)),
                 Span::raw("  "),
-                Span::styled(display, Style::default().fg(Color::White)),
+                Span::styled(display, Style::default().fg(theme.text_primary)),
             ]))
         })
         .collect();
@@ -453,7 +456,7 @@ fn render_history_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let total = items.len();
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(theme.surface_highlight)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -497,19 +500,19 @@ fn format_relative_time(iso_timestamp: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Render saved queries in the panel.
-fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
+fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let selected = app.panel.saved_selected;
 
     let Some(ref saved) = app.saved_cache else {
         let paragraph =
-            Paragraph::new("loading saved...").style(Style::default().fg(Color::DarkGray));
+            Paragraph::new("loading saved...").style(Style::default().fg(theme.text_muted));
         frame.render_widget(paragraph, area);
         return;
     };
 
     if saved.queries.is_empty() {
         let paragraph =
-            Paragraph::new("no saved queries").style(Style::default().fg(Color::DarkGray));
+            Paragraph::new("no saved queries").style(Style::default().fg(theme.text_muted));
         frame.render_widget(paragraph, area);
         return;
     }
@@ -536,12 +539,12 @@ fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
             if schedule_suffix.is_empty() {
                 ListItem::new(Span::styled(
                     display_name,
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme.text_primary),
                 ))
             } else {
                 ListItem::new(Line::from(vec![
-                    Span::styled(display_name, Style::default().fg(Color::White)),
-                    Span::styled(schedule_suffix, Style::default().fg(Color::DarkGray)),
+                    Span::styled(display_name, Style::default().fg(theme.text_primary)),
+                    Span::styled(schedule_suffix, Style::default().fg(theme.text_muted)),
                 ]))
             }
         })
@@ -550,7 +553,7 @@ fn render_saved_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let total = items.len();
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(theme.surface_highlight)
             .add_modifier(Modifier::BOLD),
     );
 

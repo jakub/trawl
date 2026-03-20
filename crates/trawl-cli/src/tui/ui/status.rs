@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -15,6 +15,7 @@ use crate::tui::state::{Focus, MainTab, TabStatus};
 
 /// Render the status bar.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let theme = &app.theme;
     let width = area.width as usize;
     let tab = app.active_tab();
 
@@ -23,20 +24,21 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     // Left: status (skip on Query tab — shown in results title, and Dashboard — has own indicator)
     if app.main_tab != MainTab::Query && app.main_tab != MainTab::Dashboard {
         let status_span = match &tab.status {
-            TabStatus::Idle => Span::styled("idle", Style::default().fg(Color::Gray)),
+            TabStatus::Idle => Span::styled("idle", Style::default().fg(theme.status_idle)),
             TabStatus::Running { .. } => Span::styled(
                 "running...",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.status_warning)
                     .add_modifier(Modifier::BOLD),
             ),
             TabStatus::Success { duration_ms } => Span::styled(
                 format!("success ({duration_ms}ms)"),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.status_success),
             ),
-            TabStatus::Error { message, .. } => {
-                Span::styled(format!("error: {message}"), Style::default().fg(Color::Red))
-            }
+            TabStatus::Error { message, .. } => Span::styled(
+                format!("error: {message}"),
+                Style::default().fg(theme.status_error),
+            ),
         };
         spans.push(status_span);
     }
@@ -47,7 +49,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         spans.push(Span::styled(
             "[LIVE]",
             Style::default()
-                .fg(Color::Magenta)
+                .fg(theme.status_info)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -72,10 +74,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     // Add padding and hints
     spans.push(Span::raw(" ".repeat(padding_len)));
-    spans.push(Span::styled(hints, Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(hints, Style::default().fg(theme.text_muted)));
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Black));
+    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.surface));
     frame.render_widget(paragraph, area);
 }
 

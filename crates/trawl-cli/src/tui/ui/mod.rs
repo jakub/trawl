@@ -101,8 +101,9 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
 
 /// Render the Dashboard tab: tab bar, dashboard content, status bar.
 fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
-    use ratatui::style::{Color, Style};
+    use ratatui::style::Style;
     use ratatui::widgets::Paragraph;
+    let theme = &app.theme;
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -126,11 +127,12 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
         };
         trawl_dashboard::render_dashboard(snapshot, frame, outer[1], &opts);
     } else if let Some(ref err) = app.dashboard.last_error {
-        let msg = Paragraph::new(format!(" Error: {err}")).style(Style::default().fg(Color::Red));
+        let msg =
+            Paragraph::new(format!(" Error: {err}")).style(Style::default().fg(theme.status_error));
         frame.render_widget(msg, outer[1]);
     } else {
         let msg =
-            Paragraph::new(" Loading dashboard...").style(Style::default().fg(Color::DarkGray));
+            Paragraph::new(" Loading dashboard...").style(Style::default().fg(theme.text_muted));
         frame.render_widget(msg, outer[1]);
     }
 

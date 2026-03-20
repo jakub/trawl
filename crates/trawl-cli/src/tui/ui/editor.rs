@@ -16,27 +16,23 @@ use crate::tui::App;
 use crate::tui::highlight::Highlighter;
 use crate::tui::state::Focus;
 
-/// Selection highlight style.
-const SELECTION_STYLE: Style = Style::new()
-    .bg(Color::DarkGray)
-    .add_modifier(Modifier::empty());
-
-/// Error underline style (red underline, preserves existing fg).
-const ERROR_STYLE: Style = Style::new()
-    .fg(Color::Red)
-    .add_modifier(Modifier::UNDERLINED);
-
-/// Ghost-text autocomplete style (dimmed, dark gray).
-const GHOST_STYLE: Style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM);
-
 /// Render the editor pane.
 pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    let theme = &app.theme;
+
     // Determine border style.
     let border_style = if app.focus == Focus::Editor {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.border_focused)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border_unfocused)
     };
+
+    // Theme-derived style values for helper functions.
+    let selection_bg = theme.surface_highlight;
+    let error_fg = theme.status_error;
+    let ghost_style = Style::new()
+        .fg(theme.text_muted)
+        .add_modifier(Modifier::DIM);
 
     // Add [LIVE] indicator if streaming
     let title = if app.live_mode {
@@ -67,7 +63,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let selection = tab.editor.selection_range();
 
     // Create highlighter with schema information.
-    let highlighter = Highlighter::new(app.schema_cache.as_ref());
+    let highlighter = Highlighter::new(app.schema_cache.as_ref(), &app.theme.syntax);
 
     // Convert validation error byte spans to (row, col_start, col_end) tuples.
     let error_regions = compute_error_regions(&tab.editor.lines, &tab.validation_errors);
@@ -89,7 +85,8 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
             // Apply error overlay (red underline on error spans).
             for &(err_row, err_col_start, err_col_end) in &error_regions {
                 if err_row == abs_row {
-                    styled_line = apply_error_style(styled_line, err_col_start, err_col_end);
+                    styled_line =
+                        apply_error_style(styled_line, err_col_start, err_col_end, error_fg);
                 }
             }
 
@@ -109,14 +106,14 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
                 } else {
                     line_len
                 };
-                return apply_selection_style(styled_line, sel_start, sel_end);
+                return apply_selection_style(styled_line, sel_start, sel_end, selection_bg);
             }
 
             // Splice ghost text at cursor position on the cursor's line.
             if abs_row == cursor_row
                 && let Some(ref ghost) = ghost_text
             {
-                styled_line = splice_ghost_text(styled_line, cursor_col, ghost);
+                styled_line = splice_ghost_text(styled_line, cursor_col, ghost, ghost_style);
             }
 
             styled_line
@@ -151,7 +148,12 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 /// Apply selection background to a highlighted line within the given char column range.
-fn apply_selection_style(line: Line<'static>, sel_start: usize, sel_end: usize) -> Line<'static> {
+fn apply_selection_style(
+    line: Line<'static>,
+    sel_start: usize,
+    sel_end: usize,
+    bg: Color,
+) -> Line<'static> {
     if sel_start >= sel_end {
         return line;
     }
@@ -168,10 +170,7 @@ fn apply_selection_style(line: Line<'static>, sel_start: usize, sel_end: usize) 
             result.push(span);
         } else if col >= sel_start && span_end <= sel_end {
             // Entirely inside selection
-            result.push(Span::styled(
-                span.content,
-                span.style.bg(SELECTION_STYLE.bg.unwrap_or(Color::DarkGray)),
-            ));
+            result.push(Span::styled(span.content, span.style.bg(bg)));
         } else {
             // Partially overlapping — split the span by char offset
             let text = span.content.to_string();
@@ -187,7 +186,7 @@ fn apply_selection_style(line: Line<'static>, sel_start: usize, sel_end: usize) 
             }
             result.push(Span::styled(
                 text[byte_start..byte_end].to_owned(),
-                span.style.bg(SELECTION_STYLE.bg.unwrap_or(Color::DarkGray)),
+                span.style.bg(bg),
             ));
             if byte_end < text.len() {
                 result.push(Span::styled(text[byte_end..].to_owned(), span.style));
@@ -256,7 +255,12 @@ fn compute_error_regions(
 }
 
 /// Apply error styling (red underline) to a line within the given char column range.
-fn apply_error_style(line: Line<'static>, err_start: usize, err_end: usize) -> Line<'static> {
+fn apply_error_style(
+    line: Line<'static>,
+    err_start: usize,
+    err_end: usize,
+    fg: Color,
+) -> Line<'static> {
     if err_start >= err_end {
         return line;
     }
@@ -275,9 +279,7 @@ fn apply_error_style(line: Line<'static>, err_start: usize, err_end: usize) -> L
             // Entirely inside error region
             result.push(Span::styled(
                 span.content,
-                span.style
-                    .fg(ERROR_STYLE.fg.unwrap_or(Color::Red))
-                    .add_modifier(Modifier::UNDERLINED),
+                span.style.fg(fg).add_modifier(Modifier::UNDERLINED),
             ));
         } else {
             // Partially overlapping — split the span
@@ -293,9 +295,7 @@ fn apply_error_style(line: Line<'static>, err_start: usize, err_end: usize) -> L
             }
             result.push(Span::styled(
                 text[byte_start..byte_end].to_owned(),
-                span.style
-                    .fg(ERROR_STYLE.fg.unwrap_or(Color::Red))
-                    .add_modifier(Modifier::UNDERLINED),
+                span.style.fg(fg).add_modifier(Modifier::UNDERLINED),
             ));
             if byte_end < text.len() {
                 result.push(Span::styled(text[byte_end..].to_owned(), span.style));
@@ -313,7 +313,12 @@ fn apply_error_style(line: Line<'static>, err_start: usize, err_end: usize) -> L
 /// Splits the existing spans at the cursor position and inserts a dimmed
 /// ghost text span. The ghost text extends the visual line but doesn't
 /// affect cursor positioning.
-fn splice_ghost_text(line: Line<'static>, cursor_col: usize, ghost: &str) -> Line<'static> {
+fn splice_ghost_text(
+    line: Line<'static>,
+    cursor_col: usize,
+    ghost: &str,
+    ghost_style: Style,
+) -> Line<'static> {
     let mut result: Vec<Span<'static>> = Vec::new();
     let mut col = 0;
     let mut inserted = false;
@@ -331,7 +336,7 @@ fn splice_ghost_text(line: Line<'static>, cursor_col: usize, ghost: &str) -> Lin
             if byte_split > 0 {
                 result.push(Span::styled(text[..byte_split].to_owned(), span.style));
             }
-            result.push(Span::styled(ghost.to_owned(), GHOST_STYLE));
+            result.push(Span::styled(ghost.to_owned(), ghost_style));
             if byte_split < text.len() {
                 result.push(Span::styled(text[byte_split..].to_owned(), span.style));
             }
@@ -345,7 +350,7 @@ fn splice_ghost_text(line: Line<'static>, cursor_col: usize, ghost: &str) -> Lin
 
     // If cursor is past all spans (at the very end of the line), append ghost.
     if !inserted {
-        result.push(Span::styled(ghost.to_owned(), GHOST_STYLE));
+        result.push(Span::styled(ghost.to_owned(), ghost_style));
     }
 
     Line::from(result)
@@ -354,19 +359,22 @@ fn splice_ghost_text(line: Line<'static>, cursor_col: usize, ghost: &str) -> Lin
 /// Render a one-line validation hint bar showing the first error message.
 pub fn render_validation_hint(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let tab = app.active_tab();
+    let theme = &app.theme;
     if let Some(error) = tab.validation_errors.first() {
         let mut spans = vec![
             Span::styled(
                 " ! ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.status_error)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(&error.message, Style::default().fg(Color::DarkGray)),
+            Span::styled(&error.message, Style::default().fg(theme.text_muted)),
         ];
 
         if let Some(ref hint) = error.hint {
             spans.push(Span::styled(
                 format!("  ({hint})"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.status_warning),
             ));
         }
 

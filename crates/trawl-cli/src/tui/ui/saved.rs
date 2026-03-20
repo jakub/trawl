@@ -7,7 +7,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Alignment;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
@@ -15,6 +15,7 @@ use crate::tui::App;
 
 /// Render the saved queries sidebar.
 pub fn render(app: &App, frame: &mut Frame<'_>) {
+    let theme = &app.theme;
     let area = centered_rect(80, 80, frame.area());
 
     frame.render_widget(Clear, area);
@@ -22,7 +23,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     let block = Block::default()
         .title(" Saved Queries (F4) ")
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+        .style(Style::default().bg(theme.surface).fg(theme.text_primary));
 
     if let Some(saved) = &app.saved_cache {
         if saved.queries.is_empty() {
@@ -44,13 +45,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
                     Span::styled(
                         format!("{:25}", query.name),
                         Style::default()
-                            .fg(Color::Green)
+                            .fg(theme.status_success)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" - "),
                     Span::styled(
                         truncate_query(&query.query, 80),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(theme.text_accent),
                     ),
                 ]);
                 ListItem::new(line)
@@ -62,7 +63,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Span::styled(
                 saved.queries.len().to_string(),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.status_success)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" saved queries"),
@@ -72,7 +73,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             .block(block.title_bottom(footer).borders(Borders::ALL))
             .highlight_style(
                 Style::default()
-                    .bg(Color::DarkGray)
+                    .bg(theme.surface_highlight)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("► ");
