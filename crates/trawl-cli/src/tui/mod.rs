@@ -4,6 +4,7 @@
 
 //! TUI application state machine and event loop.
 
+mod autocomplete;
 pub mod driver;
 pub mod highlight;
 pub mod state;
@@ -190,6 +191,67 @@ impl App {
     /// Get the query tab mutably.
     pub fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tab
+    }
+
+    /// Recompute ghost-text autocomplete for the current editor state.
+    fn update_ghost_text(&mut self) {
+        let schema_fields: Vec<autocomplete::SchemaField> = self
+            .schema_cache
+            .as_ref()
+            .map(|s| {
+                s.columns
+                    .iter()
+                    .map(|c| {
+                        let is_numeric = matches!(
+                            c.data_type.to_uppercase().as_str(),
+                            "INTEGER"
+                                | "BIGINT"
+                                | "SMALLINT"
+                                | "TINYINT"
+                                | "HUGEINT"
+                                | "FLOAT"
+                                | "DOUBLE"
+                                | "DECIMAL"
+                                | "UBIGINT"
+                                | "UINTEGER"
+                                | "USMALLINT"
+                                | "UTINYINT"
+                        );
+                        autocomplete::SchemaField {
+                            name: c.name.clone(),
+                            is_numeric,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let tab = &self.tab;
+        // Don't show ghost text when there's an active selection.
+        if tab.editor.selection_anchor.is_some() {
+            self.tab.ghost = None;
+            return;
+        }
+
+        let (row, col) = tab.editor.cursor;
+        let cursor_byte = autocomplete::cursor_to_byte_offset(&tab.editor.lines, row, col);
+        let text = tab.editor.text();
+
+        self.tab.ghost = autocomplete::complete(&text, cursor_byte, &schema_fields);
+    }
+
+    /// Accept the current ghost-text completion.
+    fn accept_ghost_completion(&mut self) {
+        if let Some(ghost) = self.tab.ghost.take() {
+            self.tab.editor.replace_at_cursor(
+                ghost.replace_len,
+                &ghost.insert_text,
+                ghost.cursor_offset,
+            );
+            self.tab.mark_editor_dirty();
+            // Recompute ghost for the new editor state.
+            self.update_ghost_text();
+        }
     }
 
     /// Execute a query in the background.
@@ -552,9 +614,18 @@ impl App {
         );
 
         match (key.modifiers, key.code) {
-            // Switch to results: Tab
+            // Tab: accept ghost completion if active, otherwise switch to results.
             (KeyModifiers::NONE, KeyCode::Tab) => {
+                if self.tab.ghost.is_some() {
+                    self.accept_ghost_completion();
+                    return;
+                }
                 self.focus = Focus::Results;
+            }
+            // Esc: dismiss ghost text and clear selection.
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.tab.ghost = None;
+                self.tab.editor.clear_selection();
             }
             // Execute query: F5
             (KeyModifiers::NONE, KeyCode::F(5)) => {
@@ -764,6 +835,9 @@ impl App {
                 }
             }
         }
+
+        // Recompute ghost text after every editor keypress.
+        self.update_ghost_text();
     }
 
     /// Handle key events when results are focused.

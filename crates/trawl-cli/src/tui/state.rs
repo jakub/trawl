@@ -808,6 +808,37 @@ impl SimpleEditor {
         }
     }
 
+    /// Accept a ghost-text completion: replace `replace_len` chars before
+    /// the cursor with `text`, then position cursor at `cursor_offset`
+    /// within the inserted text (or at the end if `None`).
+    pub fn replace_at_cursor(
+        &mut self,
+        replace_len: usize,
+        text: &str,
+        cursor_offset: Option<usize>,
+    ) {
+        self.save_snapshot();
+        self.selection_anchor = None;
+
+        let (row, col) = self.cursor;
+        let start_col = col.saturating_sub(replace_len);
+
+        // Delete the prefix chars.
+        let byte_start = Self::char_to_byte(&self.lines[row], start_col);
+        let byte_end = Self::char_to_byte(&self.lines[row], col);
+        self.lines[row].drain(byte_start..byte_end);
+
+        // Insert the replacement text.
+        self.lines[row].insert_str(byte_start, text);
+
+        // Position cursor.
+        let insert_char_len = text.chars().count();
+        self.cursor.1 = match cursor_offset {
+            Some(offset) => start_col + offset,
+            None => start_col + insert_char_len,
+        };
+    }
+
     /// Delete from cursor to word boundary left (Ctrl+W).
     pub fn delete_word_before(&mut self) {
         self.maybe_snapshot(EditKind::Other);
@@ -1216,6 +1247,8 @@ pub struct Tab {
     pub validation_dirty: bool,
     /// Timestamp of the last editor modification (for debounce).
     pub last_edit_time: Option<std::time::Instant>,
+    /// Active ghost-text autocomplete suggestion (if any).
+    pub ghost: Option<super::autocomplete::Completion>,
 }
 
 impl Tab {
@@ -1235,6 +1268,7 @@ impl Tab {
             validation_errors: Vec::new(),
             validation_dirty: false,
             last_edit_time: None,
+            ghost: None,
         }
     }
 
@@ -1252,6 +1286,7 @@ impl Tab {
         self.validation_errors.clear();
         self.validation_dirty = false;
         self.last_edit_time = None;
+        self.ghost = None;
         // Abort any running query task.
         if let Some(handle) = self.query_task.take() {
             handle.abort();

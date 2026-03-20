@@ -14,7 +14,7 @@ expression: terminal.backend().to_string()
 "│               │  Alt+2           - History tab               │               │"
 "│               │  Alt+3           - Schema tab                │               │"
 "└───────────────│  Alt+4           - Saved tab                 │───────────────┘"
-"┌ Results ──────│  Tab             - cycle focus / return to Qu│───────────────┐"
+"┌ Results ──────│  Tab             - accept suggestion / cycle │───────────────┐"
 "│               │  Esc             - close panel / cancel / des│               │"
 "│               │                                              │               │"
 "│               │Query Editor                                  │               │"

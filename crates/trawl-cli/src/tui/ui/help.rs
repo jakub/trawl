@@ -34,7 +34,7 @@ pub fn render(_app: &App, frame: &mut Frame<'_>, scroll: usize) {
         Line::from("  Alt+2           - History tab"),
         Line::from("  Alt+3           - Schema tab"),
         Line::from("  Alt+4           - Saved tab"),
-        Line::from("  Tab             - cycle focus / return to Query"),
+        Line::from("  Tab             - accept suggestion / cycle focus"),
         Line::from("  Esc             - close panel / cancel / deselect"),
         Line::from(""),
         Line::from(Span::styled(

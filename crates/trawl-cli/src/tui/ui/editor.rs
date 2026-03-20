@@ -26,6 +26,9 @@ const ERROR_STYLE: Style = Style::new()
     .fg(Color::Red)
     .add_modifier(Modifier::UNDERLINED);
 
+/// Ghost-text autocomplete style (dimmed, dark gray).
+const GHOST_STYLE: Style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+
 /// Render the editor pane.
 pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     // Determine border style.
@@ -69,6 +72,11 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     // Convert validation error byte spans to (row, col_start, col_end) tuples.
     let error_regions = compute_error_regions(&tab.editor.lines, &tab.validation_errors);
 
+    // Ghost text info: cursor position and ghost text (if any).
+    let cursor_row = tab.editor.cursor.0;
+    let cursor_col = tab.editor.cursor.1;
+    let ghost_text = tab.ghost.as_ref().map(|g| g.ghost_text.clone());
+
     // Highlight visible lines and apply error + selection overlays.
     let end_row = (scroll_row + visible_rows).min(tab.editor.lines.len());
     let highlighted_lines: Vec<Line<'static>> = tab.editor.lines[scroll_row..end_row]
@@ -102,6 +110,13 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
                     line_len
                 };
                 return apply_selection_style(styled_line, sel_start, sel_end);
+            }
+
+            // Splice ghost text at cursor position on the cursor's line.
+            if abs_row == cursor_row
+                && let Some(ref ghost) = ghost_text
+            {
+                styled_line = splice_ghost_text(styled_line, cursor_col, ghost);
             }
 
             styled_line
@@ -288,6 +303,49 @@ fn apply_error_style(line: Line<'static>, err_start: usize, err_end: usize) -> L
         }
 
         col = span_end;
+    }
+
+    Line::from(result)
+}
+
+/// Splice a ghost-text span into a line at the given char column.
+///
+/// Splits the existing spans at the cursor position and inserts a dimmed
+/// ghost text span. The ghost text extends the visual line but doesn't
+/// affect cursor positioning.
+fn splice_ghost_text(line: Line<'static>, cursor_col: usize, ghost: &str) -> Line<'static> {
+    let mut result: Vec<Span<'static>> = Vec::new();
+    let mut col = 0;
+    let mut inserted = false;
+
+    for span in line.spans {
+        let span_chars = span.content.chars().count();
+        let span_end = col + span_chars;
+
+        if !inserted && cursor_col >= col && cursor_col <= span_end {
+            // Cursor is inside (or at boundary of) this span — split it.
+            let rel = cursor_col - col;
+            let text = span.content.to_string();
+            let byte_split = char_to_byte(&text, rel);
+
+            if byte_split > 0 {
+                result.push(Span::styled(text[..byte_split].to_owned(), span.style));
+            }
+            result.push(Span::styled(ghost.to_owned(), GHOST_STYLE));
+            if byte_split < text.len() {
+                result.push(Span::styled(text[byte_split..].to_owned(), span.style));
+            }
+            inserted = true;
+        } else {
+            result.push(span);
+        }
+
+        col = span_end;
+    }
+
+    // If cursor is past all spans (at the very end of the line), append ghost.
+    if !inserted {
+        result.push(Span::styled(ghost.to_owned(), GHOST_STYLE));
     }
 
     Line::from(result)
