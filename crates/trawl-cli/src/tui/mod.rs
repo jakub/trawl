@@ -8,6 +8,7 @@ mod autocomplete;
 pub mod driver;
 pub mod highlight;
 pub mod state;
+pub mod theme;
 mod ui;
 
 use std::io;
@@ -145,6 +146,8 @@ pub struct App {
     pub server_version: Option<String>,
     /// Admin dashboard state (permissions, polling, cache).
     pub dashboard: DashboardState,
+    /// Active color theme.
+    pub theme: theme::Theme,
 }
 
 impl App {
@@ -180,6 +183,7 @@ impl App {
             driver_execute_waiter: None,
             server_version: None,
             dashboard: DashboardState::new(),
+            theme: theme::dark(),
         }
     }
 
@@ -2297,6 +2301,7 @@ pub async fn run(
     let mut app = App::new(client);
     app.max_live_events = config.tail.max_events;
     app.timezone = config.ui.timezone.clone();
+    app.theme = theme::resolve(&config.ui.theme);
     app.schema_cache = schema;
     app.history_cache = history;
     app.saved_cache = saved;
