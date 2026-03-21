@@ -12,8 +12,9 @@ use std::collections::HashSet;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph, Wrap};
 
 use crate::tui::state::SchemaBrowser;
 use crate::tui::theme::Theme;
@@ -161,8 +162,8 @@ fn render_common_header_detail(
     frame.render_widget(p, area);
 }
 
-/// Render service overview with sparkline.
-#[allow(clippy::too_many_lines)]
+/// Render service overview with braille chart.
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn render_service_detail(
     schema: &SchemaBrowser,
     service_name: &str,
@@ -274,13 +275,11 @@ fn render_service_detail(
         ]));
     }
 
-    // Split area: text above, sparkline with axis labels below (if data).
+    // Split area: text above, braille chart below (if data).
     if svc.daily_event_counts.is_empty() {
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(p, area);
     } else {
-        // Layout: sparkline (2, y-labels in gutter) + x-axis (1)
-        // y-max in gutter of top row, y-min in gutter of bottom row.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(3)])
@@ -297,68 +296,50 @@ fn render_service_detail(
         let max_label = format_count(max_val);
         let min_label = format_count(min_val);
 
-        // Y-axis labels are right-justified in a small gutter, sparkline fills the rest.
-        let gutter: u16 = 5; // enough for "1.2K " or "12.3K"
+        // Downsample for braille (2x resolution per column)
+        let chart_width = chunks[1].width.saturating_sub(8) as usize; // axis labels
+        let target = chart_width.saturating_mul(2).max(1);
+        let display_data = resample(&data, target);
 
-        let spark_area = chunks[1];
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2), // sparkline (y-max/y-min in gutter)
-                Constraint::Length(1), // x-axis dates
-            ])
-            .split(spark_area);
+        #[allow(clippy::cast_precision_loss)]
+        let points: Vec<(f64, f64)> = display_data
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i as f64, v as f64))
+            .collect();
 
-        // Sparkline: 2 rows tall, offset past gutter.
-        let spark_rect = Rect {
-            x: rows[0].x + gutter + 1,
-            width: rows[0].width.saturating_sub(gutter + 1),
-            ..rows[0]
+        let x_max = (display_data.len().saturating_sub(1)) as f64;
+        let y_min_f = min_val as f64;
+        let y_max_f = if max_val == min_val {
+            max_val as f64 + 1.0
+        } else {
+            max_val as f64
         };
-        let target_width = spark_rect.width as usize;
-        let display_data = resample(&data, target_width);
-        let sparkline = Sparkline::default()
-            .data(&display_data)
+
+        let dataset = Dataset::default()
+            .data(&points)
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
             .style(Style::default().fg(theme.text_accent));
-        frame.render_widget(sparkline, spark_rect);
 
-        // Y-max label in the gutter of the sparkline's top row.
-        let ymax_rect = Rect {
-            width: gutter,
-            height: 1,
-            ..rows[0]
-        };
-        let y_max = Line::from(Span::styled(
-            format!("{max_label:>gutter$}", gutter = gutter as usize),
-            Style::default().fg(theme.text_muted),
-        ));
-        frame.render_widget(Paragraph::new(y_max), ymax_rect);
+        let chart = Chart::new(vec![dataset])
+            .x_axis(
+                Axis::default()
+                    .style(Style::default().fg(theme.text_muted))
+                    .bounds([0.0, x_max.max(1.0)])
+                    .labels(vec![
+                        Span::raw(first_date.clone()),
+                        Span::raw(last_date.clone()),
+                    ]),
+            )
+            .y_axis(
+                Axis::default()
+                    .style(Style::default().fg(theme.text_muted))
+                    .bounds([y_min_f, y_max_f])
+                    .labels(vec![Span::raw(min_label), Span::raw(max_label)]),
+            );
 
-        // Y-min label in the gutter of the sparkline's bottom row.
-        let ymin_rect = Rect {
-            width: gutter,
-            y: rows[0].y + 1,
-            height: 1,
-            ..rows[0]
-        };
-        let y_min = Line::from(Span::styled(
-            format!("{min_label:>gutter$}", gutter = gutter as usize),
-            Style::default().fg(theme.text_muted),
-        ));
-        frame.render_widget(Paragraph::new(y_min), ymin_rect);
-
-        // X-axis dates, indented past gutter.
-        #[allow(clippy::cast_possible_truncation)]
-        let x_width = rows[1].width.saturating_sub(gutter + 1) as usize;
-        let date_pad = x_width.saturating_sub(first_date.len() + last_date.len());
-        let x_line = format!(
-            "{:>gutter$} {first_date}{}{last_date}",
-            "",
-            " ".repeat(date_pad),
-            gutter = gutter as usize,
-        );
-        let x_axis = Line::from(Span::styled(x_line, Style::default().fg(theme.text_muted)));
-        frame.render_widget(Paragraph::new(x_axis), rows[1]);
+        frame.render_widget(chart, chunks[1]);
     }
 }
 
