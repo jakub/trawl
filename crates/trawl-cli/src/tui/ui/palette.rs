@@ -25,7 +25,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
         ref input,
         cursor,
         selected,
-        ref scroll,
+        scroll: _,
         ref items,
         ref filtered,
     }) = app.popup
@@ -93,7 +93,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     // Compute scroll offset based on selected item position.
     // We need to find the line index of the selected item.
     let selected_line_idx = find_selected_line(&display, selected);
-    let scroll_offset = compute_scroll(selected_line_idx, visible_height, *scroll);
+    let scroll_offset = compute_scroll(selected_line_idx, visible_height, display.len());
 
     // Render visible lines, highlighting the selected item.
     let visible_lines: Vec<Line<'_>> = display
@@ -292,16 +292,12 @@ fn find_selected_line(display: &[DisplayLine<'_>], selected: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Compute scroll offset to keep the selected line visible.
-fn compute_scroll(selected_line: usize, visible_height: usize, current_scroll: usize) -> usize {
-    if visible_height == 0 {
+/// Compute scroll offset to keep the selected line centered in the viewport.
+fn compute_scroll(selected_line: usize, visible_height: usize, total_lines: usize) -> usize {
+    if visible_height == 0 || total_lines <= visible_height {
         return 0;
     }
-    if selected_line < current_scroll {
-        selected_line
-    } else if selected_line >= current_scroll + visible_height {
-        selected_line.saturating_sub(visible_height - 1)
-    } else {
-        current_scroll
-    }
+    let half = visible_height / 2;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    selected_line.saturating_sub(half).min(max_scroll)
 }
