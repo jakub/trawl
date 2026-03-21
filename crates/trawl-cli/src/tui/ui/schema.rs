@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
@@ -280,13 +280,11 @@ fn render_service_detail(
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(p, area);
     } else {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
-            .split(area);
+        let [text_area, chart_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
 
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
-        frame.render_widget(p, chunks[0]);
+        frame.render_widget(p, text_area);
 
         let data: Vec<u64> = svc.daily_event_counts.iter().map(|d| d.count).collect();
         let max_val = data.iter().copied().max().unwrap_or(0);
@@ -297,7 +295,7 @@ fn render_service_detail(
         let min_label = format_count(min_val);
 
         // Downsample for braille (2x resolution per column)
-        let chart_width = chunks[1].width.saturating_sub(8) as usize; // axis labels
+        let chart_width = chart_area.width.saturating_sub(8) as usize; // axis labels
         let target = chart_width.saturating_mul(2).max(1);
         let display_data = resample(&data, target);
 
@@ -339,7 +337,7 @@ fn render_service_detail(
                     .labels(vec![Span::raw(min_label), Span::raw(max_label)]),
             );
 
-        frame.render_widget(chart, chunks[1]);
+        frame.render_widget(chart, chart_area);
     }
 }
 

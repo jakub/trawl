@@ -14,9 +14,10 @@
 use std::time::Duration;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Rect};
+use ratatui::macros::{horizontal, line, vertical};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Row, Table};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -66,38 +67,28 @@ pub fn render_dashboard(
 ) {
     let footer_height = u16::from(options.footer_text.is_some());
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),             // header (title + info)
-            Constraint::Min(10),               // body
-            Constraint::Length(footer_height), // footer
-        ])
-        .split(area);
+    let [header, body, footer] = vertical![==2, >=10, ==footer_height].areas(area);
 
-    render_header(snapshot, frame, outer[0]);
-    render_body(snapshot, frame, outer[1]);
+    render_header(snapshot, frame, header);
+    render_body(snapshot, frame, body);
     if let Some(ref text) = options.footer_text {
-        render_footer(text, frame, outer[2]);
+        render_footer(text, frame, footer);
     }
 }
 
 /// Header: title bar + hostname/addr/uptime/health.
 fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
+    let [title_row, info_row] = vertical![==1, ==1].areas(area);
 
     // Title bar
     let title = format!(" trawld v{} ", snapshot.version);
-    let title_line = Line::from(vec![Span::styled(
+    let title_line = line![Span::styled(
         title,
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-    )]);
-    frame.render_widget(Paragraph::new(title_line), rows[0]);
+    )];
+    frame.render_widget(Paragraph::new(title_line), title_row);
 
     // Info line
     let health_style = if snapshot.healthy {
@@ -107,7 +98,7 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
     };
     let health_text = if snapshot.healthy { "OK" } else { "DEGRADED" };
 
-    let info = Line::from(vec![
+    let info = line![
         Span::raw(" host: "),
         Span::styled(&snapshot.hostname, Style::default().fg(Color::White)),
         Span::raw("  addr: "),
@@ -119,8 +110,8 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
         ),
         Span::raw("  health: "),
         Span::styled(health_text, health_style),
-    ]);
-    frame.render_widget(Paragraph::new(info), rows[1]);
+    ];
+    frame.render_widget(Paragraph::new(info), info_row);
 }
 
 /// Body: two-column grid with panels.
@@ -128,46 +119,26 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
 /// Uses `Flex::Start` (the default since ratatui 0.26) for predictable
 /// top-aligned layout. `Flex::SpaceAround` could work for taller terminals.
 fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let vsplit = Layout::default()
-        .direction(Direction::Vertical)
-        .flex(Flex::Start)
-        .constraints([
-            Constraint::Length(5), // executor + hot buffer
-            Constraint::Length(4), // query throughput + ingest
-            Constraint::Length(3), // SSE + scheduler
-            Constraint::Min(4),    // recent + active queries
-        ])
-        .split(area);
+    let [row1_area, row2_area, row3_area, row4_area] =
+        vertical![==5, ==4, ==3, >=4].flex(Flex::Start).areas(area);
 
     // -- row 1: executor pool | hot buffer --
-    let row1 = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(2, 5), Constraint::Ratio(3, 5)])
-        .split(vsplit[0]);
-
-    render_executor_pool(snapshot, frame, row1[0]);
-    render_hot_buffer(snapshot, frame, row1[1]);
+    let [exec_area, hot_area] = horizontal![==2/5, ==3/5].areas(row1_area);
+    render_executor_pool(snapshot, frame, exec_area);
+    render_hot_buffer(snapshot, frame, hot_area);
 
     // -- row 2: query throughput | ingest --
-    let row2 = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(2, 5), Constraint::Ratio(3, 5)])
-        .split(vsplit[1]);
-
-    render_query_throughput(snapshot, frame, row2[0]);
-    render_ingest(snapshot, frame, row2[1]);
+    let [qtp_area, ingest_area] = horizontal![==2/5, ==3/5].areas(row2_area);
+    render_query_throughput(snapshot, frame, qtp_area);
+    render_ingest(snapshot, frame, ingest_area);
 
     // -- row 3: SSE | scheduler --
-    let row3 = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(2, 5), Constraint::Ratio(3, 5)])
-        .split(vsplit[2]);
-
-    render_sse(snapshot, frame, row3[0]);
-    render_scheduler(snapshot, frame, row3[1]);
+    let [sse_area, sched_area] = horizontal![==2/5, ==3/5].areas(row3_area);
+    render_sse(snapshot, frame, sse_area);
+    render_scheduler(snapshot, frame, sched_area);
 
     // -- row 4: recent + active queries --
-    render_queries(snapshot, frame, vsplit[3]);
+    render_queries(snapshot, frame, row4_area);
 }
 
 /// Executor pool panel with gauge.
@@ -182,14 +153,11 @@ fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
         return;
     }
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(inner);
+    let [info_row, gauge_row] = vertical![==1, ==1].areas(inner);
 
     let active = snapshot.pool_active.min(snapshot.pool_capacity);
     let info = format!(" active: {}/{}", active, snapshot.pool_capacity);
-    frame.render_widget(Paragraph::new(info), rows[0]);
+    frame.render_widget(Paragraph::new(info), info_row);
 
     let ratio = if snapshot.pool_capacity > 0 {
         active as f64 / snapshot.pool_capacity as f64
@@ -199,7 +167,7 @@ fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
     let gauge = Gauge::default()
         .ratio(ratio.min(1.0))
         .gauge_style(Style::default().fg(Color::Cyan));
-    frame.render_widget(gauge, rows[1]);
+    frame.render_widget(gauge, gauge_row);
 }
 
 /// Hot buffer fill gauges.
@@ -214,14 +182,7 @@ fn render_hot_buffer(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: 
         return;
     }
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let [event_row, byte_row, batch_row] = vertical![==1, ==1, ==1].areas(inner);
 
     let event_pct = if snapshot.hot_buffer_max_events > 0 {
         (snapshot.hot_buffer_events as f64 / snapshot.hot_buffer_max_events as f64) * 100.0
@@ -234,7 +195,7 @@ fn render_hot_buffer(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: 
         format_number(snapshot.hot_buffer_max_events as u64),
         event_pct,
     );
-    frame.render_widget(Paragraph::new(event_line), rows[0]);
+    frame.render_widget(Paragraph::new(event_line), event_row);
 
     let byte_pct = if snapshot.hot_buffer_max_bytes > 0 {
         (snapshot.hot_buffer_bytes as f64 / snapshot.hot_buffer_max_bytes as f64) * 100.0
@@ -247,10 +208,10 @@ fn render_hot_buffer(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: 
         format_bytes(snapshot.hot_buffer_max_bytes),
         byte_pct,
     );
-    frame.render_widget(Paragraph::new(byte_line), rows[1]);
+    frame.render_widget(Paragraph::new(byte_line), byte_row);
 
     let batch_line = format!(" batches: {}", snapshot.hot_buffer_batches);
-    frame.render_widget(Paragraph::new(batch_line), rows[2]);
+    frame.render_widget(Paragraph::new(batch_line), batch_row);
 }
 
 /// Query throughput panel.
@@ -264,23 +225,20 @@ fn render_query_throughput(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, 
         return;
     }
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(inner);
+    let [total_row, err_row] = vertical![==1, ==1].areas(inner);
 
     let total_line = format!(
         " total: {}  {:.1} q/s",
         format_number(snapshot.total_queries),
         snapshot.query_rate,
     );
-    frame.render_widget(Paragraph::new(total_line), rows[0]);
+    frame.render_widget(Paragraph::new(total_line), total_row);
 
     let err_line = format!(
         " errors: {}  timeouts: {}",
         snapshot.query_errors, snapshot.query_timeouts,
     );
-    frame.render_widget(Paragraph::new(err_line), rows[1]);
+    frame.render_widget(Paragraph::new(err_line), err_row);
 }
 
 /// Ingest throughput panel.
@@ -294,20 +252,17 @@ fn render_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
         return;
     }
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(inner);
+    let [events_row, rejected_row] = vertical![==1, ==1].areas(inner);
 
     let events_line = format!(
         " events: {}  ~{:.0} ev/s",
         format_number(snapshot.ingest_events),
         snapshot.ingest_rate,
     );
-    frame.render_widget(Paragraph::new(events_line), rows[0]);
+    frame.render_widget(Paragraph::new(events_line), events_row);
 
     let rejected_line = format!(" rejected: {}", snapshot.ingest_rejected);
-    frame.render_widget(Paragraph::new(rejected_line), rows[1]);
+    frame.render_widget(Paragraph::new(rejected_line), rejected_row);
 }
 
 /// SSE connections panel.
@@ -354,18 +309,12 @@ fn render_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rec
         0
     };
 
-    let vsplit = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if has_active {
-            vec![Constraint::Min(4), Constraint::Length(active_height)]
-        } else {
-            vec![Constraint::Min(4), Constraint::Length(0)]
-        })
-        .split(area);
+    let active_len = if has_active { active_height } else { 0 };
+    let [recent_area, active_area] = vertical![>=4, ==active_len].areas(area);
 
-    render_recent_queries(snapshot, frame, vsplit[0]);
+    render_recent_queries(snapshot, frame, recent_area);
     if has_active {
-        render_active_queries(snapshot, frame, vsplit[1]);
+        render_active_queries(snapshot, frame, active_area);
     }
 }
 
@@ -478,11 +427,8 @@ fn render_active_queries(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, ar
 
 /// Footer: help text.
 fn render_footer(text: &str, frame: &mut Frame<'_>, area: Rect) {
-    let line = Line::from(vec![Span::styled(
-        text,
-        Style::default().fg(Color::DarkGray),
-    )]);
-    frame.render_widget(Paragraph::new(line), area);
+    let footer = line![Span::styled(text, Style::default().fg(Color::DarkGray),)];
+    frame.render_widget(Paragraph::new(footer), area);
 }
 
 // -- formatting helpers (public for reuse) ------------------------------------

@@ -5,7 +5,8 @@
 //! UI rendering dispatch.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
+use ratatui::macros::vertical;
 
 use crate::tui::App;
 use crate::tui::state::{Focus, LayoutAreas, MainTab, Popup};
@@ -44,30 +45,15 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     // Build layout conditionally to avoid affecting percentage distribution
     // when there is no hint line.
     let (editor_area, hint_area, results_area, status_area) = if has_validation_hint {
-        let outer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),      // Tab bar
-                Constraint::Percentage(40), // Editor
-                Constraint::Length(1),      // Validation hint
-                Constraint::Percentage(55), // Results
-                Constraint::Length(1),      // Status bar
-            ])
-            .split(frame.area());
-        tabs::render(app, frame, outer[0]);
-        (outer[1], Some(outer[2]), outer[3], outer[4])
+        let [tab_bar, editor, hint, results, status] =
+            vertical![==2, ==40%, ==1, ==55%, ==1].areas(frame.area());
+        tabs::render(app, frame, tab_bar);
+        (editor, Some(hint), results, status)
     } else {
-        let outer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),      // Tab bar
-                Constraint::Percentage(40), // Editor
-                Constraint::Percentage(55), // Results
-                Constraint::Length(1),      // Status bar
-            ])
-            .split(frame.area());
-        tabs::render(app, frame, outer[0]);
-        (outer[1], None, outer[2], outer[3])
+        let [tab_bar, editor, results, status] =
+            vertical![==2, ==40%, ==55%, ==1].areas(frame.area());
+        tabs::render(app, frame, tab_bar);
+        (editor, None, results, status)
     };
 
     // Populate layout areas for mouse hit-testing.
@@ -126,26 +112,19 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
     use ratatui::widgets::Paragraph;
     let theme = &app.theme;
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // Tab bar (1 row + 1 spacer)
-            Constraint::Min(1),    // Dashboard content (full height)
-            Constraint::Length(1), // Status bar
-        ])
-        .split(frame.area());
+    let [tab_bar, content, status_area] = vertical![==2, >=1, ==1].areas(frame.area());
 
     app.layout = LayoutAreas {
-        tab_bar: outer[0],
+        tab_bar,
         editor: None,
         results: None,
-        panel: Some(outer[1]),
-        status: outer[2],
+        panel: Some(content),
+        status: status_area,
         popup: app.popup.as_ref().map(|p| popup_area(p, frame.area())),
         column_header_ranges: Vec::new(),
     };
 
-    tabs::render(app, frame, outer[0]);
+    tabs::render(app, frame, tab_bar);
 
     if let Some(ref snapshot) = app.dashboard.cache {
         let footer = app
@@ -156,18 +135,18 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
         let opts = trawl_dashboard::DashboardOptions {
             footer_text: footer,
         };
-        trawl_dashboard::render_dashboard(snapshot, frame, outer[1], &opts);
+        trawl_dashboard::render_dashboard(snapshot, frame, content, &opts);
     } else if let Some(ref err) = app.dashboard.last_error {
         let msg =
             Paragraph::new(format!(" Error: {err}")).style(Style::default().fg(theme.status_error));
-        frame.render_widget(msg, outer[1]);
+        frame.render_widget(msg, content);
     } else {
         let msg =
             Paragraph::new(" Loading dashboard...").style(Style::default().fg(theme.text_muted));
-        frame.render_widget(msg, outer[1]);
+        frame.render_widget(msg, content);
     }
 
-    status::render(app, frame, outer[2]);
+    status::render(app, frame, status_area);
 
     // Render popup overlay (if any).
     popup::render(app, frame);
@@ -175,28 +154,21 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
 
 /// Render a non-Query tab: tab bar, full-width panel content, status bar.
 fn render_panel_layout(app: &mut App, frame: &mut Frame<'_>) {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // Tab bar (1 row + 1 spacer)
-            Constraint::Min(1),    // Panel content (full height)
-            Constraint::Length(1), // Status bar
-        ])
-        .split(frame.area());
+    let [tab_bar, panel, status_area] = vertical![==2, >=1, ==1].areas(frame.area());
 
     app.layout = LayoutAreas {
-        tab_bar: outer[0],
+        tab_bar,
         editor: None,
         results: None,
-        panel: Some(outer[1]),
-        status: outer[2],
+        panel: Some(panel),
+        status: status_area,
         popup: app.popup.as_ref().map(|p| popup_area(p, frame.area())),
         column_header_ranges: Vec::new(),
     };
 
-    tabs::render(app, frame, outer[0]);
-    panels::render(app, frame, outer[1]);
-    status::render(app, frame, outer[2]);
+    tabs::render(app, frame, tab_bar);
+    panels::render(app, frame, panel);
+    status::render(app, frame, status_area);
 
     // Render popup overlay (if any).
     popup::render(app, frame);

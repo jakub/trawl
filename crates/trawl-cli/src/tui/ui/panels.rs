@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -41,22 +41,25 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         MainTab::Schema => {
             if let Some(ref schema) = app.panel.schema {
                 // Horizontal split: tree (55%) | detail pane (45%).
-                let cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                    .split(inner);
+                let [tree_col, detail_col] =
+                    Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                        .areas(inner);
 
                 // Left side: filter bar + tree.
-                let left = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Min(1)])
-                    .split(cols[0]);
+                let [filter_area, tree_area] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(tree_col);
 
-                render_filter_bar(&schema.filter, schema.filter_active, theme, frame, left[0]);
-                render_schema_tree(schema, theme, frame, left[1]);
+                render_filter_bar(
+                    &schema.filter,
+                    schema.filter_active,
+                    theme,
+                    frame,
+                    filter_area,
+                );
+                render_schema_tree(schema, theme, frame, tree_area);
 
                 // Right side: detail pane.
-                super::schema::render_detail_pane(schema, frame, cols[1], theme);
+                super::schema::render_detail_pane(schema, frame, detail_col, theme);
             } else {
                 let paragraph = Paragraph::new("loading schema...")
                     .style(Style::default().fg(theme.text_muted));
@@ -71,13 +74,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     frame.render_widget(paragraph, inner);
                 } else {
                     // Horizontal split: list (55%) | detail pane (45%).
-                    let cols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                        .split(inner);
+                    let [list_col, detail_col] = Layout::horizontal([
+                        Constraint::Percentage(55),
+                        Constraint::Percentage(45),
+                    ])
+                    .areas(inner);
 
-                    render_history_list(app, theme, frame, cols[0]);
-                    super::history::render_detail_pane(app, frame, cols[1]);
+                    render_history_list(app, theme, frame, list_col);
+                    super::history::render_detail_pane(app, frame, detail_col);
                 }
             } else {
                 let paragraph = Paragraph::new("loading history...")

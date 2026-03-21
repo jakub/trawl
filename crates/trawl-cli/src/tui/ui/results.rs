@@ -40,11 +40,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     // Split off a search bar row at the bottom if search is active.
     let (results_area, search_area) = if app.results_search.is_some() {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
-            .split(area);
-        (chunks[0], Some(chunks[1]))
+        let [content, bar] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+        (content, Some(bar))
     } else {
         (area, None)
     };

@@ -4,25 +4,26 @@
 
 //! Shared UI helpers used across multiple rendering modules.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 
 /// Create a centered rect using percentage-based constraints.
 pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
+    let pad_y = (100 - percent_y) / 2;
+    let pad_x = (100 - percent_x) / 2;
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    let [_, mid, _] = Layout::vertical([
+        Constraint::Percentage(pad_y),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage(pad_y),
+    ])
+    .areas(r);
+
+    let [_, center, _] = Layout::horizontal([
+        Constraint::Percentage(pad_x),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage(pad_x),
+    ])
+    .areas(mid);
+
+    center
 }
