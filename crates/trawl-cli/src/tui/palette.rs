@@ -230,10 +230,14 @@ pub fn build_palette_items(
         }
     }
 
-    // History (deduped by query text, most recent first).
+    // History (deduped by query text, most recent 5).
     if let Some(history) = history {
         let mut seen = HashSet::new();
+        let mut count = 0;
         for entry in &history.entries {
+            if count >= 5 {
+                break;
+            }
             if seen.insert(entry.query.as_str()) {
                 items.push(PaletteItem {
                     label: entry.query.clone(),
@@ -242,6 +246,7 @@ pub fn build_palette_items(
                     shortcut: None,
                     action: PaletteAction::LoadQuery(entry.query.clone()),
                 });
+                count += 1;
             }
         }
     }
