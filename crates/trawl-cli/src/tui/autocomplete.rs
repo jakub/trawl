@@ -278,14 +278,21 @@ fn candidates_for(context: &CompletionContext, schema_fields: &[SchemaField]) ->
 }
 
 /// Case-insensitive prefix match. Returns the first alphabetical match.
+///
+/// Returns `None` when the prefix exactly matches a candidate — the user
+/// has already typed a valid name, so suggesting a longer variant (e.g.
+/// "services" when they typed "service") would be confusing.
 fn prefix_match(prefix: &str, candidates: &[Candidate]) -> Option<Candidate> {
     let lower = prefix.to_lowercase();
+
+    // If the prefix is an exact match for any candidate, suppress ghost text.
+    if candidates.iter().any(|c| c.name.to_lowercase() == lower) {
+        return None;
+    }
+
     candidates
         .iter()
-        .find(|c| {
-            let name_lower = c.name.to_lowercase();
-            name_lower.starts_with(&lower) && name_lower != lower
-        })
+        .find(|c| c.name.to_lowercase().starts_with(&lower))
         .cloned()
 }
 
@@ -864,5 +871,40 @@ mod tests {
             is_zero_arg: false,
         }];
         assert!(prefix_match("stats", &candidates).is_none());
+    }
+
+    #[test]
+    fn prefix_match_exact_suppresses_longer_variant() {
+        // "service" exists alongside "services" — typing the exact name
+        // should not suggest the longer variant.
+        let candidates = vec![
+            Candidate {
+                name: "service".to_owned(),
+                is_function: false,
+                is_zero_arg: false,
+            },
+            Candidate {
+                name: "services".to_owned(),
+                is_function: false,
+                is_zero_arg: false,
+            },
+        ];
+        assert!(prefix_match("service", &candidates).is_none());
+    }
+
+    #[test]
+    fn complete_exact_field_no_ghost_with_longer_variant() {
+        // End-to-end: schema has both "service" and "services".
+        let schema = vec![
+            SchemaField {
+                name: "service".to_owned(),
+                is_numeric: false,
+            },
+            SchemaField {
+                name: "services".to_owned(),
+                is_numeric: false,
+            },
+        ];
+        assert!(complete("| stats count() by service", 26, &schema).is_none());
     }
 }
