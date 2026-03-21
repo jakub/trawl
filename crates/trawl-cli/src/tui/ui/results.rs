@@ -537,6 +537,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(label("Command Palette", "Ctrl+P"), dim)),
+        Line::from(Span::styled(label("Tabs", "Alt+<num>"), dim)),
         Line::from(Span::styled(label("Quit", "Ctrl+Q"), dim)),
         Line::from(Span::styled(label("Docs", "https://trawl.sh"), dim)),
         Line::from(""),
@@ -545,7 +546,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     ];
 
     // Vertically center by prepending empty lines.
-    #[allow(clippy::cast_possible_truncation)] // content is always 8 lines
+    #[allow(clippy::cast_possible_truncation)] // content is always 9 lines
     let content_height = content.len() as u16;
     let top_pad = (inner.height.saturating_sub(content_height)) / 2;
     let mut lines: Vec<Line<'_>> = (0..top_pad).map(|_| Line::from("")).collect();
