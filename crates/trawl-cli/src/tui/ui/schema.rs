@@ -281,7 +281,7 @@ fn render_service_detail(
         frame.render_widget(p, area);
     } else {
         let [text_area, chart_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
+            Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).areas(area);
 
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(p, text_area);
