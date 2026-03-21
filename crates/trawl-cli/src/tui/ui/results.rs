@@ -516,7 +516,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let w = inner.width as usize;
     // Center the *colon column* in the pane, then nudge left a bit so the
     // right-side values have room to breathe.
-    let left_pad = (w.saturating_sub(longest_line)) / 2;
+    let left_pad = (w.saturating_sub(longest_line)) / 2 - 1;
     let pad = " ".repeat(left_pad);
 
     let label = |name: &str, val: &str| -> String {
