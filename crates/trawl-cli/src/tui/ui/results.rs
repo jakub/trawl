@@ -5,18 +5,17 @@
 //! Results table pane.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::symbols;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Sparkline, Table,
+    Axis, Bar, BarChart as BarChartWidget, BarGroup, Block, Borders, Cell, Chart, Dataset,
+    GraphType, LegendPosition, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Sparkline, Table,
 };
 use std::collections::{HashMap, HashSet};
 use trawl_engine::value::Value;
-
-use ratatui::layout::{Alignment, Direction, Layout};
-use ratatui::text::Span;
 
 use crate::tui::App;
 use crate::tui::state::{ChartView, ColumnConfig, Focus, TabStatus};
@@ -63,10 +62,16 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         let is_timechart = is_timechart_result(result);
 
         match tab.chart_view {
+            ChartView::LineChart if is_timechart => {
+                render_line_chart(app, frame, results_area, result);
+            }
             ChartView::Sparkline if is_timechart => {
                 render_sparkline(app, frame, results_area, result);
             }
-            ChartView::Table | ChartView::Sparkline => {
+            ChartView::BarChart if is_bar_chartable(result) => {
+                render_bar_chart(app, frame, results_area, result);
+            }
+            _ => {
                 render_table(app, frame, results_area, response);
             }
         }
@@ -654,6 +659,250 @@ fn render_error_display(
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
+}
+
+/// Detect if a result is suitable for bar chart visualization.
+///
+/// Requires at least one string column (label) and one numeric column (value),
+/// and must not be a timechart result (those get line charts).
+pub fn is_bar_chartable(result: &trawl_engine::value::QueryResult) -> bool {
+    if is_timechart_result(result) || result.rows.is_empty() {
+        return false;
+    }
+    let first_row = &result.rows[0];
+    let has_string = first_row.iter().any(|v| matches!(v, Value::String(_)));
+    let has_numeric = first_row
+        .iter()
+        .any(|v| matches!(v, Value::Integer(_) | Value::Float(_)));
+    has_string && has_numeric
+}
+
+/// Render braille line chart for timechart results using `Chart` widget.
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn render_line_chart(
+    app: &App,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    result: &trawl_engine::value::QueryResult,
+) {
+    let theme = &app.theme;
+    let border_style = if app.focus == Focus::Results {
+        Style::default().fg(theme.border_focused)
+    } else {
+        Style::default().fg(theme.border_unfocused)
+    };
+
+    let (series, total_series) = extract_series(result);
+
+    if series.is_empty() {
+        render_placeholder(app, frame, area);
+        return;
+    }
+
+    let time_info = extract_time_metadata(result);
+
+    // Build title
+    let title = if series.len() == 1 {
+        let label = &series[0].0;
+        if let Some((ref start, ref end, ref span)) = time_info {
+            format!(" {label} \u{2022} {start} to {end} \u{2022} span: {span} ")
+        } else {
+            format!(" {label} over time ")
+        }
+    } else if let Some((ref start, ref end, ref span)) = time_info {
+        format!(" timechart \u{2022} {start} to {end} \u{2022} span: {span} ")
+    } else {
+        " timechart by series ".to_owned()
+    };
+
+    let series_info = if series.len() < total_series {
+        format!(
+            " top {} of {} series  \u{2022}  'v' to toggle view ",
+            series.len(),
+            total_series,
+        )
+    } else {
+        format!(" {} series  \u{2022}  'v' to toggle view ", series.len(),)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(series_info)
+        .border_style(border_style);
+
+    // Compute per-series data points and global bounds
+    let colors = &theme.chart_series;
+    let n_points = series.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
+    let x_max = (n_points.saturating_sub(1)) as f64;
+
+    // Downsample series to fit within available width (braille gives 2x resolution)
+    let inner_width = area.width.saturating_sub(12) as usize; // borders + y-axis labels
+    let target = inner_width.saturating_mul(2).max(1);
+
+    let mut all_points: Vec<Vec<(f64, f64)>> = Vec::with_capacity(series.len());
+    let mut y_max: f64 = 0.0;
+
+    for (_, values) in &series {
+        let ds = downsample(values, target);
+        let ds_max = (ds.len().saturating_sub(1)) as f64;
+        let pts: Vec<(f64, f64)> = ds
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let x = if ds_max > 0.0 {
+                    i as f64 / ds_max * x_max
+                } else {
+                    0.0
+                };
+                let y = v as f64;
+                if y > y_max {
+                    y_max = y;
+                }
+                (x, y)
+            })
+            .collect();
+        all_points.push(pts);
+    }
+
+    // Ensure y_max is non-zero for axis rendering
+    if y_max == 0.0 {
+        y_max = 1.0;
+    }
+
+    // Build datasets
+    let datasets: Vec<Dataset<'_>> = series
+        .iter()
+        .zip(all_points.iter())
+        .enumerate()
+        .map(|(idx, ((label, _), pts))| {
+            Dataset::default()
+                .name(label.as_str())
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(colors[idx % colors.len()]))
+                .data(pts)
+        })
+        .collect();
+
+    // Y-axis labels: 0, mid, max
+    let y_mid = y_max / 2.0;
+    let y_labels = vec![
+        Span::raw("0"),
+        Span::raw(format_axis_value(y_mid)),
+        Span::raw(format_axis_value(y_max)),
+    ];
+
+    // X-axis labels: start and end time (or point indices)
+    let x_labels = if let Some((ref start, ref end, _)) = time_info {
+        vec![Span::raw(start.clone()), Span::raw(end.clone())]
+    } else {
+        vec![Span::raw("0"), Span::raw(format!("{n_points}"))]
+    };
+
+    let chart = Chart::new(datasets)
+        .block(block)
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(theme.text_muted))
+                .bounds([0.0, x_max.max(1.0)])
+                .labels(x_labels),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(theme.text_muted))
+                .bounds([0.0, y_max])
+                .labels(y_labels),
+        )
+        .legend_position(Some(LegendPosition::TopRight));
+
+    frame.render_widget(chart, area);
+}
+
+/// Format a numeric value for axis labels (compact representation).
+fn format_axis_value(v: f64) -> String {
+    if v >= 1_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else if v >= 1_000.0 {
+        format!("{:.1}K", v / 1_000.0)
+    } else if (v - v.floor()).abs() < f64::EPSILON {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let i = v as u64;
+        format!("{i}")
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+/// Render horizontal bar chart for aggregation results.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn render_bar_chart(
+    app: &App,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    result: &trawl_engine::value::QueryResult,
+) {
+    let theme = &app.theme;
+    let border_style = if app.focus == Focus::Results {
+        Style::default().fg(theme.border_focused)
+    } else {
+        Style::default().fg(theme.border_unfocused)
+    };
+
+    // Find first string column (label) and first numeric column (value)
+    let first_row = &result.rows[0];
+    let label_col = first_row
+        .iter()
+        .position(|v| matches!(v, Value::String(_)))
+        .unwrap_or(0);
+    let value_col = first_row
+        .iter()
+        .position(|v| matches!(v, Value::Integer(_) | Value::Float(_)))
+        .unwrap_or(1);
+
+    let metric_name = &result.columns[value_col].name;
+    let label_name = &result.columns[label_col].name;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {metric_name} by {label_name} "))
+        .title_bottom(" 'v' to toggle view ")
+        .border_style(border_style);
+
+    let colors = &theme.chart_series;
+    let max_bars = 20.min(result.rows.len());
+
+    let bars: Vec<Bar<'_>> = result
+        .rows
+        .iter()
+        .take(max_bars)
+        .enumerate()
+        .map(|(idx, row)| {
+            let label = value_to_string(&row[label_col]);
+            let value = match &row[value_col] {
+                Value::Integer(i) => (*i).max(0) as u64,
+                Value::Float(f) => f.max(0.0) as u64,
+                _ => 0,
+            };
+            Bar::default()
+                .value(value)
+                .label(Line::from(label))
+                .style(Style::default().fg(colors[idx % colors.len()]))
+        })
+        .collect();
+
+    let group = BarGroup::default().bars(&bars);
+
+    let barchart = BarChartWidget::default()
+        .block(block)
+        .data(group)
+        .direction(Direction::Horizontal)
+        .bar_width(1)
+        .bar_gap(0)
+        .value_style(Style::default().fg(theme.text_primary))
+        .label_style(Style::default().fg(theme.text_muted));
+
+    frame.render_widget(barchart, area);
 }
 
 /// Render sparkline visualization for timechart results.

@@ -560,16 +560,26 @@ pub enum Popup {
 pub enum ChartView {
     /// Tabular view (default).
     Table,
-    /// Sparkline view (compact ascii-art).
+    /// Braille line chart with axes and legend.
+    LineChart,
+    /// Sparkline view (compact block-char).
     Sparkline,
+    /// Horizontal bar chart for aggregation results.
+    BarChart,
 }
 
 impl ChartView {
-    /// Cycle to the next view mode.
-    pub fn next(self) -> Self {
+    /// Cycle to next view appropriate for the result shape.
+    pub fn next_for(self, is_timechart: bool, is_bar_chartable: bool) -> Self {
         match self {
-            Self::Table => Self::Sparkline,
-            Self::Sparkline => Self::Table,
+            // timechart cycle: Table → LineChart → Sparkline → Table
+            Self::Table if is_timechart => Self::LineChart,
+            Self::LineChart => Self::Sparkline,
+            Self::Sparkline if is_timechart => Self::Table,
+            // bar-chartable cycle: Table → BarChart → Table
+            Self::Table if is_bar_chartable => Self::BarChart,
+            // fallback (includes BarChart → Table)
+            _ => Self::Table,
         }
     }
 }

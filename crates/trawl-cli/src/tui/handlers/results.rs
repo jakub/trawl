@@ -178,16 +178,15 @@ impl App {
                 let tab = self.active_tab_mut();
                 tab.horizontal_scroll_offset = tab.horizontal_scroll_offset.saturating_add(1);
             }
-            // Cycle chart view (only for timechart results)
+            // Cycle chart view (timechart → line/sparkline, aggregation → bar chart)
             (KeyModifiers::NONE, KeyCode::Char('v')) => {
-                let is_timechart = self
-                    .active_tab()
-                    .result
-                    .as_ref()
-                    .is_some_and(|r| ui::results::is_timechart_result(&r.result));
-                if is_timechart {
-                    let tab = self.active_tab_mut();
-                    tab.chart_view = tab.chart_view.next();
+                if let Some(ref r) = self.active_tab().result {
+                    let timechart = ui::results::is_timechart_result(&r.result);
+                    let bar_chartable = ui::results::is_bar_chartable(&r.result);
+                    if timechart || bar_chartable {
+                        let tab = self.active_tab_mut();
+                        tab.chart_view = tab.chart_view.next_for(timechart, bar_chartable);
+                    }
                 }
             }
             // Execute query: Ctrl+Enter

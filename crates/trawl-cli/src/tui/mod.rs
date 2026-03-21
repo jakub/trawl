@@ -395,10 +395,10 @@ impl App {
 
             match query_result.result {
                 Ok(response) => {
-                    // Auto-switch to sparkline view for timechart queries.
+                    // Auto-switch to line chart view for timechart queries.
                     let is_timechart = response.result.columns.iter().any(|c| c.name == "_time");
                     if is_timechart && tab.chart_view == ChartView::Table {
-                        tab.chart_view = ChartView::Sparkline;
+                        tab.chart_view = ChartView::LineChart;
                     }
 
                     tab.result = Some(response);
@@ -1168,7 +1168,7 @@ mod tests {
 
         app.poll_query_results();
 
-        assert_eq!(app.tab.chart_view, ChartView::Sparkline);
+        assert_eq!(app.tab.chart_view, ChartView::LineChart);
     }
 
     #[tokio::test]
