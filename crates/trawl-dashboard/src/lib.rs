@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Row, Table};
@@ -124,9 +124,13 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
 }
 
 /// Body: two-column grid with panels.
+///
+/// Uses `Flex::Start` (the default since ratatui 0.26) for predictable
+/// top-aligned layout. `Flex::SpaceAround` could work for taller terminals.
 fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let vsplit = Layout::default()
         .direction(Direction::Vertical)
+        .flex(Flex::Start)
         .constraints([
             Constraint::Length(5), // executor + hot buffer
             Constraint::Length(4), // query throughput + ingest
@@ -138,7 +142,7 @@ fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) 
     // -- row 1: executor pool | hot buffer --
     let row1 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Ratio(2, 5), Constraint::Ratio(3, 5)])
         .split(vsplit[0]);
 
     render_executor_pool(snapshot, frame, row1[0]);
@@ -147,7 +151,7 @@ fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) 
     // -- row 2: query throughput | ingest --
     let row2 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Ratio(2, 5), Constraint::Ratio(3, 5)])
         .split(vsplit[1]);
 
     render_query_throughput(snapshot, frame, row2[0]);
@@ -156,7 +160,7 @@ fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) 
     // -- row 3: SSE | scheduler --
     let row3 = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Ratio(2, 5), Constraint::Ratio(3, 5)])
         .split(vsplit[2]);
 
     render_sse(snapshot, frame, row3[0]);
