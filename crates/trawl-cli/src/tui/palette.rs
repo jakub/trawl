@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 
-use super::state::MainTab;
+use super::state::{MainTab, SchemaBrowser};
 
 /// A single item in the command palette.
 #[derive(Debug, Clone)]
@@ -35,7 +35,7 @@ pub enum PaletteCategory {
     Tab,
     SavedQuery,
     History,
-    SchemaField,
+    Service,
 }
 
 impl PaletteCategory {
@@ -46,7 +46,7 @@ impl PaletteCategory {
             Self::Tab => "Tabs",
             Self::SavedQuery => "Saved Queries",
             Self::History => "History",
-            Self::SchemaField => "Schema Fields",
+            Self::Service => "Services",
         }
     }
 }
@@ -62,6 +62,8 @@ pub enum PaletteAction {
     InsertAtCursor(String),
     /// Execute a built-in action.
     RunAction(ActionKind),
+    /// Drill into a service's columns (appends "service." to palette input).
+    DrillService(String),
 }
 
 /// Built-in actions available from the command palette.
@@ -205,11 +207,13 @@ fn tab_items(is_admin: bool) -> Vec<PaletteItem> {
 /// Build the full palette item catalog from current app state.
 ///
 /// Called once each time the palette is opened (not on every keystroke).
+/// Also called to rebuild items when the palette input changes between
+/// "all categories" mode and "service columns" mode.
 pub fn build_palette_items(
     is_admin: bool,
     saved: Option<&trawl_client::ListSavedResponse>,
     history: Option<&trawl_client::HistoryResponse>,
-    schema: Option<&trawl_client::SchemaResponse>,
+    schema: Option<&SchemaBrowser>,
 ) -> Vec<PaletteItem> {
     let mut items = Vec::with_capacity(64);
 
@@ -251,20 +255,85 @@ pub fn build_palette_items(
         }
     }
 
-    // Schema fields.
+    // Services (one item per service with column count).
     if let Some(schema) = schema {
-        for col in &schema.columns {
+        for svc in &schema.services {
             items.push(PaletteItem {
-                label: col.name.clone(),
-                detail: Some(col.data_type.clone()),
-                category: PaletteCategory::SchemaField,
+                label: svc.name.clone(),
+                detail: Some(format!("{} fields", svc.columns.len())),
+                category: PaletteCategory::Service,
                 shortcut: None,
-                action: PaletteAction::InsertAtCursor(col.name.clone()),
+                action: PaletteAction::DrillService(svc.name.clone()),
             });
         }
     }
 
     items
+}
+
+/// Build palette items for a specific service's columns.
+///
+/// Called when the palette input contains a dot (e.g. "nginx.").
+pub fn build_service_column_items(schema: &SchemaBrowser, service_name: &str) -> Vec<PaletteItem> {
+    let Some(svc) = schema.services.iter().find(|s| s.name == service_name) else {
+        return Vec::new();
+    };
+    svc.columns
+        .iter()
+        .map(|col| PaletteItem {
+            label: col.name.clone(),
+            detail: Some(col.data_type.clone()),
+            category: PaletteCategory::Service,
+            shortcut: None,
+            action: PaletteAction::InsertAtCursor(col.name.clone()),
+        })
+        .collect()
+}
+
+/// Compute ghost text completion suffix for the current palette input.
+///
+/// Returns the remaining characters that would complete the top fuzzy match,
+/// but only when the match is a case-insensitive prefix match (not a fuzzy
+/// mid-string hit).
+pub fn compute_ghost_text(
+    input: &str,
+    items: &[PaletteItem],
+    filtered: &[FilteredItem],
+) -> Option<String> {
+    if input.is_empty() || filtered.is_empty() {
+        return None;
+    }
+
+    // Determine what we're completing: after-dot text matches column names,
+    // pre-dot text matches service names.
+    let (prefix, target_category) = if let Some(dot_pos) = input.find('.') {
+        // Column mode: match text after the dot against column labels.
+        let after_dot = &input[dot_pos + 1..];
+        if after_dot.is_empty() {
+            return None;
+        }
+        (after_dot, None) // category is Service for columns too, match any
+    } else {
+        // Service mode: only ghost-complete service names.
+        (input, Some(PaletteCategory::Service))
+    };
+
+    let prefix_lower = prefix.to_lowercase();
+
+    // Find the top filtered item that is a prefix match.
+    for entry in filtered {
+        let item = &items[entry.item_index];
+        if target_category.is_some_and(|cat| item.category != cat) {
+            continue;
+        }
+        let label_lower = item.label.to_lowercase();
+        if label_lower.starts_with(&prefix_lower) && label_lower.len() > prefix_lower.len() {
+            // Return the suffix preserving the original label's casing.
+            return Some(item.label[prefix.len()..].to_string());
+        }
+    }
+
+    None
 }
 
 /// Filter and score items against user input using fuzzy matching.
@@ -456,5 +525,122 @@ mod tests {
             matched_labels.contains(&&"nginx errors".to_string()),
             "should find saved query by its DSL body"
         );
+    }
+
+    fn test_col(name: &str, data_type: &str) -> trawl_api::ServiceColumnStats {
+        trawl_api::ServiceColumnStats {
+            name: name.into(),
+            data_type: data_type.into(),
+            null_count: 0,
+            total_count: 100,
+            min_value: None,
+            max_value: None,
+            compressed_bytes: 0,
+        }
+    }
+
+    fn test_schema() -> SchemaBrowser {
+        SchemaBrowser::new(vec![
+            trawl_api::ServiceSchema {
+                name: "nginx".into(),
+                columns: vec![
+                    test_col("timestamp", "TIMESTAMP"),
+                    test_col("host", "VARCHAR"),
+                    test_col("status", "BIGINT"),
+                ],
+                earliest_date: None,
+                latest_date: None,
+                file_count: 1,
+                total_bytes: 1024,
+                total_events: 100,
+                daily_event_counts: Vec::new(),
+            },
+            trawl_api::ServiceSchema {
+                name: "trawld".into(),
+                columns: vec![test_col("total_queries", "BIGINT")],
+                earliest_date: None,
+                latest_date: None,
+                file_count: 1,
+                total_bytes: 512,
+                total_events: 50,
+                daily_event_counts: Vec::new(),
+            },
+        ])
+    }
+
+    #[test]
+    fn services_appear_in_palette() {
+        let schema = test_schema();
+        let items = build_palette_items(false, None, None, Some(&schema));
+        let service_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.category == PaletteCategory::Service)
+            .collect();
+        assert_eq!(service_items.len(), 2);
+        assert_eq!(service_items[0].label, "nginx");
+        assert_eq!(service_items[0].detail.as_deref(), Some("3 fields"));
+        assert_eq!(service_items[1].label, "trawld");
+        assert_eq!(service_items[1].detail.as_deref(), Some("1 fields"));
+    }
+
+    #[test]
+    fn service_drill_builds_column_items() {
+        let schema = test_schema();
+        let items = build_service_column_items(&schema, "nginx");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].label, "timestamp");
+        assert_eq!(items[0].detail.as_deref(), Some("TIMESTAMP"));
+        assert!(matches!(items[0].action, PaletteAction::InsertAtCursor(_)));
+    }
+
+    #[test]
+    fn service_drill_unknown_service_returns_empty() {
+        let schema = test_schema();
+        let items = build_service_column_items(&schema, "nonexistent");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn ghost_text_completes_service_name() {
+        let schema = test_schema();
+        let items = build_palette_items(false, None, None, Some(&schema));
+        let filtered = refilter("ngi", &items);
+        let ghost = compute_ghost_text("ngi", &items, &filtered);
+        assert_eq!(ghost.as_deref(), Some("nx"));
+    }
+
+    #[test]
+    fn ghost_text_completes_column_name() {
+        let schema = test_schema();
+        let items = build_service_column_items(&schema, "nginx");
+        let filtered = refilter("sta", &items);
+        let ghost = compute_ghost_text("nginx.sta", &items, &filtered);
+        assert_eq!(ghost.as_deref(), Some("tus"));
+    }
+
+    #[test]
+    fn ghost_text_empty_input_returns_none() {
+        let items = build_palette_items(false, None, None, None);
+        let filtered = refilter("", &items);
+        let ghost = compute_ghost_text("", &items, &filtered);
+        assert!(ghost.is_none());
+    }
+
+    #[test]
+    fn ghost_text_no_match_returns_none() {
+        let items = build_palette_items(false, None, None, None);
+        let filtered = refilter("zzzznothing", &items);
+        let ghost = compute_ghost_text("zzzznothing", &items, &filtered);
+        assert!(ghost.is_none());
+    }
+
+    #[test]
+    fn ghost_text_exact_match_returns_none() {
+        let schema = test_schema();
+        let items = build_palette_items(false, None, None, Some(&schema));
+        let filtered = refilter("nginx", &items);
+        let ghost = compute_ghost_text("nginx", &items, &filtered);
+        // "nginx" fully matches "nginx" — no suffix to complete.
+        assert!(ghost.is_none());
     }
 }

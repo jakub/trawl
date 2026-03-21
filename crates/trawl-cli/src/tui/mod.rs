@@ -438,6 +438,7 @@ impl App {
     }
 
     /// Handle a key event.
+    #[allow(clippy::too_many_lines)]
     pub fn handle_key(&mut self, key: event::KeyEvent) {
         // Popups take priority over everything else.
         if self.popup.is_some() {
@@ -493,7 +494,7 @@ impl App {
                     self.dashboard.is_admin,
                     self.saved_cache.as_ref(),
                     self.history_cache.as_ref(),
-                    self.schema_cache.as_ref(),
+                    self.panel.schema.as_ref(),
                 );
                 let filtered = palette::refilter("", &items);
                 self.popup = Some(Popup::CommandPalette {
@@ -503,6 +504,7 @@ impl App {
                     scroll: 0,
                     items,
                     filtered,
+                    ghost: None,
                 });
                 return;
             }

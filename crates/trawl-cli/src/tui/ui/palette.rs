@@ -28,6 +28,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
         scroll: _,
         ref items,
         ref filtered,
+        ref ghost,
     }) = app.popup
     else {
         return;
@@ -43,7 +44,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
         .title(" Command Palette ")
         .borders(Borders::ALL)
         .title_bottom(
-            Line::from(" ↑↓ navigate | Enter select | Esc close ").alignment(Alignment::Center),
+            Line::from(" ↑↓ navigate | Enter select | Tab complete | Esc close ")
+                .alignment(Alignment::Center),
         )
         .style(Style::default().bg(theme.surface).fg(theme.text_primary));
 
@@ -58,14 +60,18 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     ])
     .split(inner);
 
-    // -- input line --
+    // -- input line with ghost text --
     let input_line = Line::from(vec![
         Span::styled("> ", Style::default().fg(theme.text_accent)),
         Span::raw(input),
+        Span::styled(
+            ghost.as_deref().unwrap_or(""),
+            Style::default().fg(theme.text_muted),
+        ),
     ]);
     frame.render_widget(Paragraph::new(input_line), chunks[0]);
 
-    // Position cursor in the input.
+    // Position cursor in the input (before ghost text).
     #[allow(clippy::cast_possible_truncation)]
     let cursor_x = chunks[0].x + 2 + cursor as u16; // ">" + space + cursor offset
     frame.set_cursor_position((
@@ -87,8 +93,11 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     let list_area = chunks[2];
     let visible_height = list_area.height as usize;
 
+    // Detect column mode: input contains a dot.
+    let column_mode_service = input.find('.').map(|pos| &input[..pos]);
+
     // Build display lines from filtered items.
-    let display = build_display_lines(input, items, filtered, theme);
+    let display = build_display_lines(input, items, filtered, theme, column_mode_service);
 
     // Compute scroll offset based on selected item position.
     // We need to find the line index of the selected item.
@@ -138,18 +147,44 @@ fn build_display_lines<'a>(
     items: &'a [PaletteItem],
     filtered: &[FilteredItem],
     theme: &Theme,
+    column_mode_service: Option<&str>,
 ) -> Vec<DisplayLine<'a>> {
     let mut lines = Vec::new();
     let is_filtered = !input.is_empty();
 
+    // In column mode with no matches, show a "no matching service" or "no columns" message.
     if filtered.is_empty() {
+        let msg = if column_mode_service.is_some() {
+            "  No matching service"
+        } else {
+            "  No matches"
+        };
+        lines.push(DisplayLine {
+            line: Line::from(Span::styled(msg, Style::default().fg(theme.text_muted))),
+            filtered_index: None,
+        });
+        return lines;
+    }
+
+    // Column mode: show a service header, then flat column list.
+    if let Some(service_name) = column_mode_service {
         lines.push(DisplayLine {
             line: Line::from(Span::styled(
-                "  No matches",
-                Style::default().fg(theme.text_muted),
+                format!("  {service_name} — Columns"),
+                Style::default()
+                    .fg(theme.table_header)
+                    .add_modifier(Modifier::BOLD),
             )),
             filtered_index: None,
         });
+
+        for (fi, entry) in filtered.iter().enumerate() {
+            let item = &items[entry.item_index];
+            lines.push(DisplayLine {
+                line: render_item_line(item, &entry.match_positions, theme),
+                filtered_index: Some(fi),
+            });
+        }
         return lines;
     }
 
@@ -260,7 +295,7 @@ fn render_item_line<'a>(item: &'a PaletteItem, match_positions: &[u32], theme: &
             format!("  {shortcut}"),
             Style::default().fg(theme.text_muted),
         ));
-    } else if item.category == PaletteCategory::SchemaField
+    } else if item.category == PaletteCategory::Service
         && let Some(ref detail) = item.detail
     {
         spans.push(Span::styled(

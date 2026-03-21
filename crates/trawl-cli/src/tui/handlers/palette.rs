@@ -7,7 +7,10 @@
 use crossterm::event::{self, KeyCode, KeyModifiers};
 
 use super::super::App;
-use super::super::palette::{ActionKind, PaletteAction, refilter};
+use super::super::palette::{
+    ActionKind, PaletteAction, build_palette_items, build_service_column_items, compute_ghost_text,
+    refilter,
+};
 use super::super::state::{Focus, MainTab, Popup, SimpleEditor};
 use super::super::ui;
 
@@ -36,9 +39,36 @@ impl App {
                         .get(selected)
                         .map(|f| items[f.item_index].action.clone())
                 };
-                self.popup = None;
-                if let Some(action) = action {
-                    self.execute_palette_action(action);
+                if let Some(PaletteAction::DrillService(ref name)) = action {
+                    // Drill into service columns — don't close the palette.
+                    let new_input = format!("{name}.");
+                    self.set_palette_input(&new_input);
+                } else {
+                    self.popup = None;
+                    if let Some(action) = action {
+                        self.execute_palette_action(action);
+                    }
+                }
+            }
+            // Accept ghost text completion.
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                let suffix = {
+                    let Some(Popup::CommandPalette { ref ghost, .. }) = self.popup else {
+                        return;
+                    };
+                    ghost.clone()
+                };
+                if let Some(suffix) = suffix {
+                    if let Some(Popup::CommandPalette {
+                        ref mut input,
+                        ref mut cursor,
+                        ..
+                    }) = self.popup
+                    {
+                        input.push_str(&suffix);
+                        *cursor = input.len();
+                    }
+                    self.refresh_palette_state();
                 }
             }
             // Move selection up.
@@ -64,70 +94,115 @@ impl App {
             }
             // Clear filter text.
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-                if let Some(Popup::CommandPalette {
-                    ref mut input,
-                    ref mut cursor,
-                    ref mut selected,
-                    ref mut scroll,
-                    ref items,
-                    ref mut filtered,
-                }) = self.popup
-                {
-                    input.clear();
-                    *cursor = 0;
-                    *selected = 0;
-                    *scroll = 0;
-                    *filtered = refilter("", items);
-                }
+                self.set_palette_input("");
             }
             // Delete last character.
             (KeyModifiers::NONE, KeyCode::Backspace) => {
-                if let Some(Popup::CommandPalette {
-                    ref mut input,
-                    ref mut cursor,
-                    ref mut selected,
-                    ref mut scroll,
-                    ref items,
-                    ref mut filtered,
-                }) = self.popup
-                    && *cursor > 0
-                {
-                    let byte_pos = input.char_indices().nth(*cursor - 1).map_or(0, |(i, _)| i);
+                let new_input = {
+                    let Some(Popup::CommandPalette {
+                        ref input, cursor, ..
+                    }) = self.popup
+                    else {
+                        return;
+                    };
+                    if cursor == 0 {
+                        return;
+                    }
+                    let byte_pos = input.char_indices().nth(cursor - 1).map_or(0, |(i, _)| i);
                     let next_byte = input
                         .char_indices()
-                        .nth(*cursor)
+                        .nth(cursor)
                         .map_or(input.len(), |(i, _)| i);
-                    input.replace_range(byte_pos..next_byte, "");
-                    *cursor -= 1;
-                    *selected = 0;
-                    *scroll = 0;
-                    *filtered = refilter(input, items);
-                }
+                    let mut new = input.clone();
+                    new.replace_range(byte_pos..next_byte, "");
+                    new
+                };
+                self.set_palette_input(&new_input);
             }
             // Type a character into the filter.
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-                if let Some(Popup::CommandPalette {
-                    ref mut input,
-                    ref mut cursor,
-                    ref mut selected,
-                    ref mut scroll,
-                    ref items,
-                    ref mut filtered,
-                }) = self.popup
-                {
+                let new_input = {
+                    let Some(Popup::CommandPalette {
+                        ref input, cursor, ..
+                    }) = self.popup
+                    else {
+                        return;
+                    };
                     let byte_pos = input
                         .char_indices()
-                        .nth(*cursor)
+                        .nth(cursor)
                         .map_or(input.len(), |(i, _)| i);
-                    input.insert(byte_pos, c);
-                    *cursor += 1;
-                    *selected = 0;
-                    *scroll = 0;
-                    *filtered = refilter(input, items);
-                }
+                    let mut new = input.clone();
+                    new.insert(byte_pos, c);
+                    new
+                };
+                self.set_palette_input(&new_input);
             }
             _ => {}
         }
+    }
+
+    /// Set the palette input text and refresh all derived state.
+    ///
+    /// This is the single entry point for all input mutations — it handles
+    /// dot-aware item rebuilding, refiltering, and ghost text computation.
+    fn set_palette_input(&mut self, new_input: &str) {
+        // Determine if we're in "service columns" mode (input contains a dot).
+        let (items, filter_text) = if let Some(dot_pos) = new_input.find('.') {
+            let service_prefix = &new_input[..dot_pos];
+            let after_dot = &new_input[dot_pos + 1..];
+            if let Some(ref schema) = self.panel.schema {
+                let items = build_service_column_items(schema, service_prefix);
+                (items, after_dot.to_string())
+            } else {
+                (Vec::new(), after_dot.to_string())
+            }
+        } else {
+            // Full catalog mode.
+            let items = build_palette_items(
+                self.dashboard.is_admin,
+                self.saved_cache.as_ref(),
+                self.history_cache.as_ref(),
+                self.panel.schema.as_ref(),
+            );
+            (items, new_input.to_string())
+        };
+
+        let filtered = refilter(&filter_text, &items);
+        let ghost = compute_ghost_text(new_input, &items, &filtered);
+
+        if let Some(Popup::CommandPalette {
+            input: ref mut inp,
+            ref mut cursor,
+            ref mut selected,
+            ref mut scroll,
+            items: ref mut cur_items,
+            filtered: ref mut cur_filtered,
+            ghost: ref mut cur_ghost,
+        }) = self.popup
+        {
+            *inp = new_input.to_string();
+            *cursor = new_input.len();
+            *selected = 0;
+            *scroll = 0;
+            *cur_items = items;
+            *cur_filtered = filtered;
+            *cur_ghost = ghost;
+        }
+    }
+
+    /// Refresh palette items, filter, and ghost text from the current input.
+    ///
+    /// Called after Tab (ghost text acceptance) to recompute derived state
+    /// without changing the input text.
+    fn refresh_palette_state(&mut self) {
+        let input = {
+            let Some(Popup::CommandPalette { ref input, .. }) = self.popup else {
+                return;
+            };
+            input.clone()
+        };
+        self.set_palette_input(&input);
     }
 
     /// Dispatch a palette action — called after the palette closes.
@@ -150,6 +225,10 @@ impl App {
             }
             PaletteAction::RunAction(kind) => {
                 self.execute_palette_builtin(kind);
+            }
+            PaletteAction::DrillService(_) => {
+                // Handled inline in Enter key dispatch (doesn't close palette).
+                // Should not reach here.
             }
         }
     }

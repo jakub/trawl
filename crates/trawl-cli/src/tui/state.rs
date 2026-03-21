@@ -567,6 +567,8 @@ pub enum Popup {
         items: Vec<super::palette::PaletteItem>,
         /// Filtered + scored results (recomputed on input change).
         filtered: Vec<super::palette::FilteredItem>,
+        /// Ghost text completion suffix (shown dimmed after cursor).
+        ghost: Option<String>,
     },
 }
 
