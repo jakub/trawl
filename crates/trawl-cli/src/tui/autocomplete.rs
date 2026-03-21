@@ -90,6 +90,14 @@ pub fn complete(
         return None;
     }
 
+    // Suppress ghost text when cursor is in the middle of an existing word.
+    // Without this, moving the cursor into "me|ssage" would suggest completions
+    // for the "me" prefix and splice ghost text inside the word.
+    let after = &text[cursor_byte..];
+    if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
     let candidates = candidates_for(&context, schema_fields);
     let candidate = prefix_match(prefix, &candidates)?;
     Some(build_completion(&candidate, prefix.len()))
@@ -764,6 +772,20 @@ mod tests {
         assert_eq!(c.ghost_text, "rvice");
         assert_eq!(c.insert_text, "service");
         assert_eq!(c.replace_len, 2);
+    }
+
+    #[test]
+    fn complete_mid_word_suppressed() {
+        // Cursor inside "message" (after "me") — should NOT offer ghost text.
+        let result = complete("| table me", 10, &fields());
+        assert!(result.is_some(), "sanity: 'me' at end of input completes");
+
+        // Same prefix but with word chars after cursor — suppress.
+        let result = complete("| table message", 10, &fields());
+        assert!(
+            result.is_none(),
+            "mid-word cursor should suppress ghost text"
+        );
     }
 
     #[test]
