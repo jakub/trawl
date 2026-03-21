@@ -42,9 +42,17 @@ impl App {
             return;
         }
 
+        // Command palette needs mutable access — handle before immutable borrow.
+        if matches!(self.popup, Some(Popup::CommandPalette { .. })) {
+            self.handle_command_palette_key(key);
+            return;
+        }
+
         if let Some(popup) = &self.popup {
             match popup {
-                Popup::Help { .. } => unreachable!("handled above"),
+                Popup::Help { .. } | Popup::CommandPalette { .. } => {
+                    unreachable!("handled above")
+                }
                 Popup::ConfirmDelete { saved_id, name } => {
                     match (key.modifiers, key.code) {
                         // Confirm deletion: Y or Enter

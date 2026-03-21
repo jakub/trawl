@@ -553,6 +553,21 @@ pub enum Popup {
         /// Vertical scroll offset.
         scroll: usize,
     },
+    /// Command palette (Ctrl+P) — fuzzy searchable action/query/field picker.
+    CommandPalette {
+        /// Filter input text.
+        input: String,
+        /// Cursor position within the input.
+        cursor: usize,
+        /// Index of the selected item in the filtered list.
+        selected: usize,
+        /// Vertical scroll offset in the item list.
+        scroll: usize,
+        /// Full catalog of palette items (built on open).
+        items: Vec<super::palette::PaletteItem>,
+        /// Filtered + scored results (recomputed on input change).
+        filtered: Vec<super::palette::FilteredItem>,
+    },
 }
 
 /// Chart visualization mode for results.

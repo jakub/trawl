@@ -15,6 +15,7 @@ pub mod common;
 pub mod editor;
 pub mod help;
 pub mod history;
+pub mod palette;
 pub mod panels;
 pub mod popup;
 pub mod results;
@@ -187,6 +188,7 @@ fn popup_area(popup: &Popup, frame_area: Rect) -> Rect {
         Popup::Error { .. } => centered_rect(60, 30, frame_area),
         Popup::SetSchedule { .. } => centered_rect(60, 40, frame_area),
         Popup::ColumnPicker { .. } => centered_rect(50, 60, frame_area),
+        Popup::CommandPalette { .. } => centered_rect(65, 75, frame_area),
     }
 }
 

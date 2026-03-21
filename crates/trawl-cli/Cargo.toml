@@ -23,6 +23,7 @@ clap = { workspace = true }
 comfy-table = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
+nucleo-matcher = { workspace = true }
 ratatui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

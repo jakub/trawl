@@ -40,6 +40,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Popup::ColumnPicker { selected, scroll } => {
                 render_column_picker(app, frame, *selected, *scroll);
             }
+            Popup::CommandPalette { .. } => {
+                super::palette::render(app, frame);
+            }
         }
     }
 }

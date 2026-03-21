@@ -9,6 +9,7 @@ pub mod driver;
 mod handlers;
 pub mod highlight;
 mod live;
+pub mod palette;
 pub mod state;
 pub mod theme;
 mod ui;
@@ -484,6 +485,25 @@ impl App {
             // Toggle live tail: F9
             (KeyModifiers::NONE, KeyCode::F(9)) => {
                 self.toggle_live_mode();
+                return;
+            }
+            // Command palette: Ctrl+P
+            (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
+                let items = palette::build_palette_items(
+                    self.dashboard.is_admin,
+                    self.saved_cache.as_ref(),
+                    self.history_cache.as_ref(),
+                    self.schema_cache.as_ref(),
+                );
+                let filtered = palette::refilter("", &items);
+                self.popup = Some(Popup::CommandPalette {
+                    input: String::new(),
+                    cursor: 0,
+                    selected: 0,
+                    scroll: 0,
+                    items,
+                    filtered,
+                });
                 return;
             }
             // Esc: on panel tabs, switch back to Query; on Query, cancel running query

@@ -8,6 +8,7 @@
 
 mod editor;
 mod mouse;
+mod palette;
 mod panels;
 mod popup;
 mod results;
