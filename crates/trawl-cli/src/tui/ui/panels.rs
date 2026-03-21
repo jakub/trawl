@@ -7,10 +7,13 @@
 use std::collections::HashSet;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 
 use crate::tui::App;
 use crate::tui::state::{Focus, MainTab, SchemaBrowser};
@@ -367,12 +370,29 @@ fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'
             .add_modifier(Modifier::BOLD),
     );
 
+    let total = nodes.len();
     #[allow(clippy::cast_possible_truncation)]
     let visible_height = area.height as usize;
-    let offset = compute_center_offset(selected, visible_height, nodes.len());
+    let offset = compute_center_offset(selected, visible_height, total);
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+
+    // Scrollbar when content overflows
+    if total > visible_height {
+        let mut sb_state = ScrollbarState::new(total).position(offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("\u{2191}"))
+            .end_symbol(Some("\u{2193}"));
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut sb_state,
+        );
+    }
 }
 
 /// Compute scroll offset for center-locked scrolling.
@@ -466,6 +486,21 @@ fn render_history_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Re
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+
+    if total > visible_height {
+        let mut sb_state = ScrollbarState::new(total).position(offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("\u{2191}"))
+            .end_symbol(Some("\u{2193}"));
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut sb_state,
+        );
+    }
 }
 
 /// Format an ISO 8601 timestamp as a compact relative time from now.
@@ -563,6 +598,21 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+
+    if total > visible_height {
+        let mut sb_state = ScrollbarState::new(total).position(offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("\u{2191}"))
+            .end_symbol(Some("\u{2193}"));
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut sb_state,
+        );
+    }
 }
 
 #[cfg(test)]
