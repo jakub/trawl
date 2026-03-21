@@ -377,25 +377,29 @@ fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'
     let total = nodes.len();
     #[allow(clippy::cast_possible_truncation)]
     let visible_height = area.height as usize;
+    let needs_scrollbar = total > visible_height;
+
+    // Shrink list area when scrollbar is visible to avoid text overlap.
+    let list_area = if needs_scrollbar {
+        Rect {
+            width: area.width.saturating_sub(2), // 1 gap + 1 scrollbar track
+            ..area
+        }
+    } else {
+        area
+    };
+
     let offset = compute_center_offset(selected, visible_height, total);
     let mut state = ListState::default().with_offset(offset);
     state.select(Some(selected));
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, list_area, &mut state);
 
-    // Scrollbar when content overflows
-    if total > visible_height {
+    if needs_scrollbar {
         let mut sb_state = ScrollbarState::new(total).position(offset);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("\u{2191}"))
             .end_symbol(Some("\u{2193}"));
-        frame.render_stateful_widget(
-            scrollbar,
-            area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut sb_state,
-        );
+        frame.render_stateful_widget(scrollbar, area, &mut sb_state);
     }
 }
 

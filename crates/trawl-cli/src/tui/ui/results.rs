@@ -870,7 +870,9 @@ fn render_bar_chart(
     let colors = &theme.chart_series;
     let max_bars = 20.min(result.rows.len());
 
-    let bars: Vec<Bar<'_>> = result
+    // Pre-compute labels and values so we can pad labels to a uniform width,
+    // ensuring all bars start at the same x position (consistent y-axis).
+    let entries: Vec<(String, u64, usize)> = result
         .rows
         .iter()
         .take(max_bars)
@@ -882,9 +884,34 @@ fn render_bar_chart(
                 Value::Float(f) => f.max(0.0) as u64,
                 _ => 0,
             };
+            (label, value, idx)
+        })
+        .collect();
+
+    // Compute fixed label width: max(name_len) + space + max(value_len) + separator
+    let max_name_len = entries.iter().map(|(l, _, _)| l.len()).max().unwrap_or(0);
+    let max_value_len = entries
+        .iter()
+        .map(|(_, v, _)| format!("{v}").len())
+        .max()
+        .unwrap_or(0);
+
+    let bars: Vec<Bar<'_>> = entries
+        .iter()
+        .map(|(label, value, idx)| {
+            // Pad name to max width, right-align value — creates a uniform "y-axis" edge
+            let value_str = format!("{value}");
+            let name_pad = max_name_len.saturating_sub(label.len());
+            let val_pad = max_value_len.saturating_sub(value_str.len());
+            let padded = format!(
+                "{label}{}{}{value_str} ",
+                " ".repeat(name_pad),
+                " ".repeat(val_pad + 2),
+            );
             Bar::default()
-                .value(value)
-                .label(Line::from(label))
+                .value(*value)
+                .label(Line::from(padded))
+                .text_value(String::new()) // hide value text inside the bar
                 .style(Style::default().fg(colors[idx % colors.len()]))
         })
         .collect();
@@ -897,7 +924,6 @@ fn render_bar_chart(
         .direction(Direction::Horizontal)
         .bar_width(1)
         .bar_gap(0)
-        .value_style(Style::default().fg(theme.text_primary))
         .label_style(Style::default().fg(theme.text_muted));
 
     frame.render_widget(barchart, area);
