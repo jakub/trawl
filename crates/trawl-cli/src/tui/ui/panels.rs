@@ -58,8 +58,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 );
                 render_schema_tree(schema, theme, frame, tree_area);
 
-                // Right side: detail pane.
-                super::schema::render_detail_pane(schema, frame, detail_col, theme);
+                // Right side: detail pane (1-col left padding clears the scrollbar).
+                let detail_inset = Rect {
+                    x: detail_col.x + 1,
+                    width: detail_col.width.saturating_sub(1),
+                    ..detail_col
+                };
+                super::schema::render_detail_pane(schema, frame, detail_inset, theme);
             } else {
                 let paragraph = Paragraph::new("loading schema...")
                     .style(Style::default().fg(theme.text_muted));
