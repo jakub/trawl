@@ -97,7 +97,15 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     let column_mode_service = input.find('.').map(|pos| &input[..pos]);
 
     // Build display lines from filtered items.
-    let display = build_display_lines(input, items, filtered, theme, column_mode_service);
+    let list_width = list_area.width as usize;
+    let display = build_display_lines(
+        input,
+        items,
+        filtered,
+        theme,
+        column_mode_service,
+        list_width,
+    );
 
     // Compute scroll offset based on selected item position.
     // We need to find the line index of the selected item.
@@ -148,6 +156,7 @@ fn build_display_lines<'a>(
     filtered: &[FilteredItem],
     theme: &Theme,
     column_mode_service: Option<&str>,
+    width: usize,
 ) -> Vec<DisplayLine<'a>> {
     let mut lines = Vec::new();
     let is_filtered = !input.is_empty();
@@ -181,7 +190,7 @@ fn build_display_lines<'a>(
         for (fi, entry) in filtered.iter().enumerate() {
             let item = &items[entry.item_index];
             lines.push(DisplayLine {
-                line: render_item_line(item, &entry.match_positions, theme),
+                line: render_item_line(item, &entry.match_positions, theme, width),
                 filtered_index: Some(fi),
             });
         }
@@ -193,7 +202,7 @@ fn build_display_lines<'a>(
         for (fi, entry) in filtered.iter().enumerate() {
             let item = &items[entry.item_index];
             lines.push(DisplayLine {
-                line: render_item_line(item, &entry.match_positions, theme),
+                line: render_item_line(item, &entry.match_positions, theme, width),
                 filtered_index: Some(fi),
             });
             // Detail line for saved/history items.
@@ -238,7 +247,7 @@ fn build_display_lines<'a>(
             }
 
             lines.push(DisplayLine {
-                line: render_item_line(item, &[], theme),
+                line: render_item_line(item, &[], theme, width),
                 filtered_index: Some(fi),
             });
 
@@ -261,13 +270,22 @@ fn build_display_lines<'a>(
 }
 
 /// Render a single palette item as a `Line`.
-fn render_item_line<'a>(item: &'a PaletteItem, match_positions: &[u32], theme: &Theme) -> Line<'a> {
+///
+/// `width` is the available line width — used to right-align shortcuts/hints.
+fn render_item_line<'a>(
+    item: &'a PaletteItem,
+    match_positions: &[u32],
+    theme: &Theme,
+    width: usize,
+) -> Line<'a> {
     let mut spans = Vec::new();
+    let indent = 2; // "  " prefix
 
     // Selection indicator (populated by the caller via styling).
     spans.push(Span::raw("  "));
 
     // Label with match highlighting.
+    let label_len = item.label.chars().count();
     if match_positions.is_empty() {
         spans.push(Span::styled(
             item.label.as_str(),
@@ -290,16 +308,24 @@ fn render_item_line<'a>(item: &'a PaletteItem, match_positions: &[u32], theme: &
     }
 
     // Right-aligned shortcut or detail hint.
-    if let Some(ref shortcut) = item.shortcut {
+    let hint: Option<&str> = item.shortcut.as_deref().or_else(|| {
+        if item.category == PaletteCategory::Service {
+            item.detail.as_deref()
+        } else {
+            None
+        }
+    });
+
+    if let Some(hint_text) = hint {
+        let used = indent + label_len;
+        let hint_len = hint_text.len();
+        // pad = total width - used - hint - 1 trailing space
+        let pad = width.saturating_sub(used + hint_len + 1);
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
         spans.push(Span::styled(
-            format!("  {shortcut}"),
-            Style::default().fg(theme.text_muted),
-        ));
-    } else if item.category == PaletteCategory::Service
-        && let Some(ref detail) = item.detail
-    {
-        spans.push(Span::styled(
-            format!("  {detail}"),
+            hint_text.to_string(),
             Style::default().fg(theme.text_muted),
         ));
     }
