@@ -513,15 +513,16 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("Help: F1 or https://docs.trawl.sh", dim)),
-        Line::from(Span::styled("Quit: Ctrl-Q", dim)),
+        Line::from(Span::styled("Command Palette: Ctrl+P", dim)),
+        Line::from(Span::styled("Quit: Ctrl+Q", dim)),
+        Line::from(Span::styled("Docs: https://trawl.sh", dim)),
         Line::from(""),
         Line::from(Span::styled(format!("Client: {client_version}"), dim)),
         Line::from(Span::styled(format!("Server: {server_version}"), dim)),
     ];
 
     // Vertically center by prepending empty lines.
-    #[allow(clippy::cast_possible_truncation)] // content is always 7 lines
+    #[allow(clippy::cast_possible_truncation)] // content is always 8 lines
     let content_height = content.len() as u16;
     let top_pad = (inner.height.saturating_sub(content_height)) / 2;
     let mut lines: Vec<Line<'_>> = (0..top_pad).map(|_| Line::from("")).collect();
