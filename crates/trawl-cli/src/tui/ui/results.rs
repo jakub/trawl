@@ -514,11 +514,17 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled("Command Palette: Ctrl+P", dim)),
-        Line::from(Span::styled("Quit: Ctrl+Q", dim)),
-        Line::from(Span::styled("Docs: https://trawl.sh", dim)),
+        Line::from(Span::styled("           Quit: Ctrl+Q", dim)),
+        Line::from(Span::styled("           Docs: https://trawl.sh", dim)),
         Line::from(""),
-        Line::from(Span::styled(format!("Client: {client_version}"), dim)),
-        Line::from(Span::styled(format!("Server: {server_version}"), dim)),
+        Line::from(Span::styled(
+            format!("         Client: {client_version}"),
+            dim,
+        )),
+        Line::from(Span::styled(
+            format!("         Server: {server_version}"),
+            dim,
+        )),
     ];
 
     // Vertically center by prepending empty lines.
