@@ -319,8 +319,8 @@ fn render_item_line<'a>(
     if let Some(hint_text) = hint {
         let used = indent + label_len;
         let hint_len = hint_text.len();
-        // pad = total width - used - hint - 1 trailing space
-        let pad = width.saturating_sub(used + hint_len + 1);
+        let trailing_pad = 2; // breathing room before the right edge
+        let pad = width.saturating_sub(used + hint_len + trailing_pad);
         if pad > 0 {
             spans.push(Span::raw(" ".repeat(pad)));
         }
