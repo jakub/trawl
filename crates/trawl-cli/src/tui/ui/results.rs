@@ -505,26 +505,43 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let client_version = trawl_core::version::PKG_VERSION;
     let server_version = app.server_version.as_deref().unwrap_or("\u{2014}");
 
+    // Layout: align all colons at a fixed column, then horizontally center
+    // the block so the colon column sits slightly left of the pane midpoint.
+    // This keeps the visual weight balanced despite varying value lengths.
+    //
+    // Label widths: "Command Palette" = 15 (longest), colon at col 15.
+    // We pad shorter labels so every ":" lands at the same offset.
+    let colon_col: usize = 15; // offset of ":" within each line
+    let longest_line = "Command Palette: https://trawl.sh".len(); // 33 chars
+    let w = inner.width as usize;
+    // Center the *colon column* in the pane, then nudge left a bit so the
+    // right-side values have room to breathe.
+    let left_pad = (w.saturating_sub(longest_line)) / 2;
+    let pad = " ".repeat(left_pad);
+
+    let label = |name: &str, val: &str| -> String {
+        let spacing = colon_col - name.len();
+        format!("{pad}{}{name}: {val}", " ".repeat(spacing))
+    };
+
+    // "trawl" title: center it on the colon column (visually near the middle).
+    let title_pad = left_pad + colon_col.saturating_sub(3); // ~center "trawl" on colon col
+    let title_line = format!("{}{}", " ".repeat(title_pad), "trawl");
+
     let content: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
-            "trawl",
+            title_line,
             Style::default()
                 .fg(theme.text_accent)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("Command Palette: Ctrl+P", dim)),
-        Line::from(Span::styled("           Quit: Ctrl+Q", dim)),
-        Line::from(Span::styled("           Docs: https://trawl.sh", dim)),
+        Line::from(Span::styled(label("Command Palette", "Ctrl+P"), dim)),
+        Line::from(Span::styled(label("Quit", "Ctrl+Q"), dim)),
+        Line::from(Span::styled(label("Docs", "https://trawl.sh"), dim)),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("         Client: {client_version}"),
-            dim,
-        )),
-        Line::from(Span::styled(
-            format!("         Server: {server_version}"),
-            dim,
-        )),
+        Line::from(Span::styled(label("Client", client_version), dim)),
+        Line::from(Span::styled(label("Server", server_version), dim)),
     ];
 
     // Vertically center by prepending empty lines.
@@ -534,7 +551,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut lines: Vec<Line<'_>> = (0..top_pad).map(|_| Line::from("")).collect();
     lines.extend(content);
 
-    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+    let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
 }
 
