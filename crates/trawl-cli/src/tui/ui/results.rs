@@ -11,8 +11,8 @@ use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Axis, Bar, BarChart as BarChartWidget, BarGroup, Block, Borders, Cell, Chart, Dataset,
-    GraphType, LegendPosition, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Sparkline, Table,
+    GraphType, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline,
+    Table,
 };
 use std::collections::{HashMap, HashSet};
 use trawl_engine::value::Value;
@@ -798,23 +798,71 @@ fn render_line_chart(
         vec![Span::raw("0"), Span::raw(format!("{n_points}"))]
     };
 
-    let chart = Chart::new(datasets)
-        .block(block)
-        .x_axis(
-            Axis::default()
-                .style(Style::default().fg(theme.text_muted))
-                .bounds([0.0, x_max.max(1.0)])
-                .labels(x_labels),
-        )
-        .y_axis(
-            Axis::default()
-                .style(Style::default().fg(theme.text_muted))
-                .bounds([0.0, y_max])
-                .labels(y_labels),
-        )
-        .legend_position(Some(LegendPosition::TopRight));
+    // For multi-series charts, render the block separately so the inline
+    // color legend sits inside the border, above the chart.
+    if series.len() > 1 {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-    frame.render_widget(chart, area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+
+        let legend_spans: Vec<Span<'_>> = series
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, (label, _))| {
+                let color = colors[idx % colors.len()];
+                let mut spans = Vec::with_capacity(3);
+                if idx > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled("\u{25A0} ", Style::default().fg(color)));
+                spans.push(Span::styled(
+                    label.as_str().to_owned(),
+                    Style::default().fg(color),
+                ));
+                spans
+            })
+            .collect();
+
+        let legend = Paragraph::new(Line::from(legend_spans)).alignment(Alignment::Center);
+        frame.render_widget(legend, chunks[0]);
+
+        let chart = Chart::new(datasets)
+            .x_axis(
+                Axis::default()
+                    .style(Style::default().fg(theme.text_muted))
+                    .bounds([0.0, x_max.max(1.0)])
+                    .labels(x_labels),
+            )
+            .y_axis(
+                Axis::default()
+                    .style(Style::default().fg(theme.text_muted))
+                    .bounds([0.0, y_max])
+                    .labels(y_labels),
+            )
+            .legend_position(None);
+        frame.render_widget(chart, chunks[1]);
+    } else {
+        let chart = Chart::new(datasets)
+            .block(block)
+            .x_axis(
+                Axis::default()
+                    .style(Style::default().fg(theme.text_muted))
+                    .bounds([0.0, x_max.max(1.0)])
+                    .labels(x_labels),
+            )
+            .y_axis(
+                Axis::default()
+                    .style(Style::default().fg(theme.text_muted))
+                    .bounds([0.0, y_max])
+                    .labels(y_labels),
+            )
+            .legend_position(None);
+        frame.render_widget(chart, area);
+    }
 }
 
 /// Format a numeric value for axis labels (compact representation).

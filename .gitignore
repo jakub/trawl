@@ -34,6 +34,7 @@ docs/node_modules/
 docs/dist/
 docs/.astro/
 
-# fuzz artifacts
+# fuzz artifacts and corpus
 crates/trawl-core/fuzz/target/
 crates/trawl-core/fuzz/artifacts/
+crates/trawl-core/fuzz/corpus/
