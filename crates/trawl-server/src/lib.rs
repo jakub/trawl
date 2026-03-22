@@ -12,6 +12,7 @@ pub mod auth;
 pub mod bus;
 pub mod config;
 pub mod error;
+pub(crate) mod from_saved;
 pub mod handlers;
 pub mod hot_buffer;
 pub mod ingest;

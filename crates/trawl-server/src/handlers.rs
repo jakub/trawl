@@ -92,11 +92,29 @@ pub async fn query(
     let role_str = verified.role.to_string();
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
-    let outcome = state
-        .query
-        .pool
-        .execute(&req.query, timeout, capture_debug, utc_offset_secs)
-        .await;
+
+    // Check for `| from saved` — if present, resolve to parquet source
+    // and execute with the pre-computed source instead of normal glob scan.
+    let outcome = if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query)? {
+        state
+            .query
+            .pool
+            .execute_with_source(
+                &resolved.remaining_dsl,
+                &resolved.source,
+                timeout,
+                capture_debug,
+                utc_offset_secs,
+            )
+            .await
+    } else {
+        state
+            .query
+            .pool
+            .execute(&req.query, timeout, capture_debug, utc_offset_secs)
+            .await
+    };
+
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let duration_secs = start.elapsed().as_secs_f64();
 
@@ -1098,6 +1116,50 @@ fn resolve_key_id(state: &AppState, verified: &VerifiedKey) -> Result<i64, Serve
         .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))
 }
 
+/// Try to resolve a `| from saved` stage from the DSL query.
+///
+/// Returns `Ok(Some(resolved))` if the query starts with `| from saved`,
+/// `Ok(None)` if it's a normal query, or `Err(...)` if resolution fails
+/// (e.g. saved query not found, no successful runs).
+fn try_resolve_from_saved(
+    state: &AppState,
+    verified: &VerifiedKey,
+    dsl: &str,
+) -> Result<Option<crate::from_saved::ResolvedFromSaved>, ServerError> {
+    // Best-effort parse — if it fails, let the normal execution path
+    // handle the parse error with proper diagnostics.
+    let Ok(ast) = trawl_core::parser::parse(dsl) else {
+        return Ok(None);
+    };
+
+    // Only intercept if the first pipe stage is `from saved`.
+    let Some(from_saved) = ast.from_saved_stage() else {
+        return Ok(None);
+    };
+
+    let key_id = resolve_key_id(state, verified)?;
+
+    // Lock both stores for the duration of resolution.
+    let saved_store = state.auth.saved.lock();
+    let schedule_store = state.auth.schedule.lock();
+
+    // The span end of the first pipeline stage tells us where to slice
+    // the remaining DSL.
+    let stage_span_end = ast.pipeline[0].span.end;
+
+    let resolved = crate::from_saved::resolve(
+        from_saved,
+        dsl,
+        stage_span_end,
+        &saved_store,
+        &schedule_store,
+        key_id,
+        state.query.pool.base_dir(),
+    )?;
+
+    Ok(Some(resolved))
+}
+
 /// `PUT /api/v1/saved/{id}/schedule` — create or update a schedule.
 pub async fn set_schedule(
     State(state): State<AppState>,
@@ -1248,6 +1310,8 @@ pub async fn list_report_runs(
 }
 
 /// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.
+///
+/// Prefers parquet result files (via `result_path`) over legacy zstd blobs.
 pub async fn get_report_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -1258,35 +1322,77 @@ pub async fn get_report_run(
     }
 
     let key_id = resolve_key_id(&state, &verified)?;
-    let schedule_store = state.auth.schedule.lock();
 
-    let run = schedule_store
-        .get_run(run_id, key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to get run: {e}")))?
-        .ok_or_else(|| ServerError::NotFound("report run not found or unauthorized".into()))?;
+    // Fetch run metadata and legacy blob under one lock, then release
+    // before any async work (parking_lot guards are not Send).
+    let (run, legacy_blob) = {
+        let schedule_store = state.auth.schedule.lock();
 
-    // Verify the run belongs to the correct saved query.
-    if run.saved_query_id != saved_id {
-        return Err(ServerError::NotFound(
-            "report run not found for this saved query".into(),
-        ));
-    }
+        let run = schedule_store
+            .get_run(run_id, key_id)
+            .map_err(|e| ServerError::Internal(format!("failed to get run: {e}")))?
+            .ok_or_else(|| ServerError::NotFound("report run not found or unauthorized".into()))?;
 
-    // Decompress result blob if present.
-    let result = schedule_store
-        .get_run_result(run_id, key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to get run result: {e}")))?
-        .and_then(|compressed| {
-            let decompressed = zstd::decode_all(compressed.as_slice()).ok()?;
-            serde_json::from_slice::<QueryResult>(&decompressed).ok()
-        });
+        if run.saved_query_id != saved_id {
+            return Err(ServerError::NotFound(
+                "report run not found for this saved query".into(),
+            ));
+        }
 
-    drop(schedule_store);
+        // Pre-fetch legacy blob (cheap if NULL in db).
+        let blob = schedule_store.get_run_result(run_id, key_id).ok().flatten();
+
+        (run, blob)
+    };
+
+    // Try parquet result first, fall back to legacy zstd blob.
+    let result = if let Some(ref result_path) = run.result_path {
+        let base_dir = state.query.pool.base_dir().to_owned();
+        let max_rows = state.query.pool.max_result_rows();
+        let full_path = format!("{}/{}", base_dir.trim_end_matches('/'), result_path);
+        let path = std::path::PathBuf::from(full_path);
+
+        match tokio::task::spawn_blocking(move || {
+            let executor = trawl_engine::executor::Executor::new()?;
+            executor.read_parquet_to_result(&path, max_rows)
+        })
+        .await
+        {
+            Ok(Ok(qr)) => Some(qr),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    event_type = "report_run_parquet_read_failed",
+                    run_id,
+                    error = %e,
+                    "failed to read parquet result, trying legacy blob"
+                );
+                decompress_legacy_blob(legacy_blob)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "report_run_parquet_task_failed",
+                    run_id,
+                    error = %e,
+                    "parquet read task panicked, trying legacy blob"
+                );
+                decompress_legacy_blob(legacy_blob)
+            }
+        }
+    } else {
+        decompress_legacy_blob(legacy_blob)
+    };
 
     Ok(Json(ReportRunResponse {
         summary: report_run_summary(run),
         result,
     }))
+}
+
+/// Decompress a legacy zstd-compressed JSON result blob.
+fn decompress_legacy_blob(blob: Option<Vec<u8>>) -> Option<QueryResult> {
+    let compressed = blob?;
+    let decompressed = zstd::decode_all(compressed.as_slice()).ok()?;
+    serde_json::from_slice::<QueryResult>(&decompressed).ok()
 }
 
 /// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.

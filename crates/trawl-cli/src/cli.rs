@@ -58,6 +58,17 @@ pub async fn run_query(
         return run_parquet_export(query, data, conn.as_ref(), output_path).await;
     }
 
+    // Block `from saved` in embedded mode — it requires server-side
+    // auth database access to resolve saved query names to parquet paths.
+    if data.is_some()
+        && let Ok(ast) = trawl_core::parser::parse(query)
+        && ast.from_saved_stage().is_some()
+    {
+        return Err(CliError::Usage(
+            "\"from saved\" requires a server connection and cannot be used with --data".into(),
+        ));
+    }
+
     let result = if let Some(data) = data {
         match run_embedded_mode(data, query, timezone) {
             Ok(r) => r,

@@ -501,6 +501,140 @@ impl ExecutorPool {
         outcome
     }
 
+    /// Execute a DSL query with a pre-computed source, skipping glob computation.
+    ///
+    /// Used for `| from saved` queries where the source is a `read_parquet()`
+    /// expression pointing at scheduled result files, not the normal data dir.
+    /// The hot buffer is intentionally skipped — saved query results are
+    /// self-contained parquet files.
+    #[allow(clippy::too_many_lines)]
+    pub async fn execute_with_source(
+        &self,
+        dsl: &str,
+        source: &str,
+        timeout: Duration,
+        capture_debug: bool,
+        utc_offset_secs: i32,
+    ) -> ExecuteOutcome {
+        let available = self.semaphore.available_permits();
+        if available == 0 {
+            tracing::warn!(
+                event_type = "pool_pressure",
+                max_concurrent = self.max_concurrent,
+                "executor pool at capacity, query queued"
+            );
+        }
+
+        let wait_start = std::time::Instant::now();
+        let semaphore = Arc::clone(&self.semaphore);
+        let Ok(permit) = semaphore.acquire_owned().await else {
+            return ExecuteOutcome {
+                result: Err(ServerError::Internal("executor pool shut down".into())),
+                debug: None,
+            };
+        };
+
+        let wait_ms = wait_start.elapsed().as_millis();
+        #[allow(clippy::cast_possible_truncation)]
+        let pool_wait_ms = wait_ms as u64;
+        tracing::info!(
+            event_type = "pool_acquired",
+            wait_ms,
+            available = self.semaphore.available_permits(),
+            "semaphore permit acquired (from saved)"
+        );
+
+        let executor = self.take_executor();
+
+        let dsl = dsl.to_owned();
+        let source = source.to_owned();
+        let fallback_glob = Arc::clone(&self.fallback_glob);
+        let max_result_rows = self.max_result_rows;
+
+        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
+
+        let mut task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _ = interrupt_tx.send(executor.interrupt_handle());
+
+            #[cfg(test)]
+            {
+                let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
+                if delay > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+            }
+
+            tracing::debug!(
+                event_type = "query_source",
+                source = %source,
+                "using pre-computed source (from saved)"
+            );
+
+            // No hot buffer — saved query results are self-contained.
+            run_query_blocking(
+                executor,
+                &dsl,
+                &source,
+                None,
+                max_result_rows,
+                utc_offset_secs,
+                capture_debug,
+                &fallback_glob,
+                pool_wait_ms,
+            )
+        });
+
+        let interrupt = interrupt_rx.await.ok();
+
+        let query_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref handle) = interrupt {
+            let h = Arc::clone(handle);
+            self.active_interrupts
+                .lock()
+                .insert(query_id, Box::new(move || h.interrupt()));
+        }
+
+        let outcome = tokio::select! {
+            join_result = &mut task => {
+                match join_result {
+                    Ok((executor, result, debug)) => {
+                        self.return_executor(executor);
+                        ExecuteOutcome { result, debug }
+                    }
+                    Err(e) => ExecuteOutcome {
+                        result: Err(ServerError::Internal(format!("query task panicked: {e}"))),
+                        debug: None,
+                    },
+                }
+            }
+            () = tokio::time::sleep(timeout) => {
+                if let Some(handle) = &interrupt {
+                    handle.interrupt();
+                }
+                let idle = Arc::clone(&self.idle);
+                tokio::spawn(async move {
+                    match task.await {
+                        Ok((executor, _, _)) => {
+                            idle.lock().push(executor);
+                        }
+                        Err(e) => {
+                            tracing::warn!(event_type = "task_panic", error = %e, "timed-out from-saved query task panicked");
+                        }
+                    }
+                });
+                ExecuteOutcome {
+                    result: Err(ServerError::Timeout),
+                    debug: None,
+                }
+            }
+        };
+
+        self.active_interrupts.lock().remove(&query_id);
+
+        outcome
+    }
+
     /// Interrupt all currently executing queries. Called during shutdown
     /// to cancel in-flight `DuckDB` operations before draining connections.
     pub fn cancel_all(&self) {
