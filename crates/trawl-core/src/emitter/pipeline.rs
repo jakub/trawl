@@ -63,6 +63,9 @@ pub(crate) fn process_stage(pipe: &PipeStage, ctx: &mut EmitterState) -> Result<
             Ok(())
         }
         PipeStage::EventStats(es) => process_eventstats(es, ctx),
+        PipeStage::FromSaved(_) => Err(EmitError::UnsupportedOperation {
+            message: "'from saved' must be resolved before SQL emission".to_string(),
+        }),
     }
 }
 

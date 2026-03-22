@@ -9,6 +9,7 @@
 
 /// All recognized pipe stage keywords.
 pub const KNOWN_PIPE_STAGES: &[&str] = &[
+    "from",
     "stats",
     "timechart",
     "where",
@@ -252,6 +253,7 @@ mod tests {
                 "pivot" => "| pivot count() on status".to_string(),
                 "sample" => "| sample 10%".to_string(),
                 "eventstats" => "| eventstats count()".to_string(),
+                "from" => "| from saved daily_errors".to_string(),
                 _ => panic!("unhandled stage '{stage}' in test — add a case"),
             };
             assert!(

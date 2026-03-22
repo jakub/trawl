@@ -124,7 +124,11 @@ fn validate_source_list(source: &str) -> Result<(), super::EmitError> {
 /// - JSON/ndjson file: `*.json` or `*.ndjson` → `read_json(...)`
 /// - Parquet glob: everything else → `read_parquet('...', union_by_name=true)`
 fn build_reader(source: &str) -> Result<String, super::EmitError> {
-    if source.starts_with('[') {
+    if source.starts_with('(') {
+        // Raw SQL subquery — used by `from saved` resolution for run=all
+        // UNION ALL sources with injected synthetic columns.
+        Ok(source.to_string())
+    } else if source.starts_with('[') {
         validate_source_list(source)?;
         Ok(format!("read_parquet({source}, union_by_name=true)"))
     } else {

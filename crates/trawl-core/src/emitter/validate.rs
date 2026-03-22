@@ -20,7 +20,7 @@ use super::functions::validate_function_arity;
 /// so that callers see consistent diagnostics regardless of which layer
 /// catches the problem.
 pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError> {
-    for stage in stages {
+    for (i, stage) in stages.iter().enumerate() {
         match &stage.node {
             PipeStage::Stats(s) => {
                 for agg in &s.aggregations {
@@ -37,6 +37,11 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
             }
             PipeStage::Extract(e) => {
                 validate_extract(e)?;
+            }
+            PipeStage::FromSaved(_) if i > 0 => {
+                return Err(EmitError::UnsupportedOperation {
+                    message: "'from' must be the first pipe stage".to_string(),
+                });
             }
             // other stages have no pre-validation needs
             _ => {}

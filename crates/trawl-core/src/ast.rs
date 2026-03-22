@@ -39,6 +39,26 @@ pub struct Query {
     pub pipeline: Vec<Spanned<PipeStage>>,
 }
 
+impl Query {
+    /// If the first pipeline stage is `from saved`, return a reference to it.
+    #[must_use]
+    pub fn from_saved_stage(&self) -> Option<&FromSavedStage> {
+        self.pipeline.first().and_then(|s| match &s.node {
+            PipeStage::FromSaved(fs) => Some(fs),
+            _ => None,
+        })
+    }
+
+    /// Whether the search stage is empty (no groups, no time filters, no bounds).
+    #[must_use]
+    pub fn has_empty_search(&self) -> bool {
+        self.search.groups.iter().all(Vec::is_empty)
+            && self.search.time_filter.is_none()
+            && self.search.earliest.is_none()
+            && self.search.latest.is_none()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Search stage (everything before the first `|`)
 // ---------------------------------------------------------------------------
@@ -253,6 +273,7 @@ pub enum PipeStage {
     Rename(RenameStage),
     Sample(SampleStage),
     EventStats(EventStatsStage),
+    FromSaved(FromSavedStage),
 }
 
 impl fmt::Display for PipeStage {
@@ -275,6 +296,7 @@ impl fmt::Display for PipeStage {
             Self::Rename(_) => write!(f, "rename"),
             Self::Sample(_) => write!(f, "sample"),
             Self::EventStats(_) => write!(f, "eventstats"),
+            Self::FromSaved(_) => write!(f, "from"),
         }
     }
 }
@@ -432,6 +454,39 @@ pub struct RenameStage {
 pub struct EventStatsStage {
     pub aggregations: Vec<AggExpr>,
     pub group_by: Vec<String>,
+}
+
+/// `from saved daily_ip_rollup [run=latest|all|N]` — load saved query results.
+///
+/// Must be the first pipe stage in a pipeline and cannot be combined
+/// with a search stage. The server resolves the name to parquet files
+/// before query execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromSavedStage {
+    pub name: String,
+    pub run: SavedRunSelector,
+}
+
+/// Which run(s) to load for a `from saved` query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SavedRunSelector {
+    /// Most recent successful run (default).
+    #[default]
+    Latest,
+    /// All historical runs — injects `_run_id` and `_run_time` columns.
+    All,
+    /// A specific run by numeric ID.
+    Specific(i64),
+}
+
+impl fmt::Display for SavedRunSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Latest => write!(f, "latest"),
+            Self::All => write!(f, "all"),
+            Self::Specific(id) => write!(f, "{id}"),
+        }
+    }
 }
 
 /// `sample 10%` or `sample 1000` — statistical sampling.

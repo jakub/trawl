@@ -10,10 +10,10 @@
 use chumsky::prelude::*;
 
 use crate::ast::{
-    AggExpr, DedupStage, DropStage, EventStatsStage, Expr, ExtractMode, ExtractStage, LetStage,
-    LimitStage, PipeStage, PivotStage, RareStage, RenameStage, SampleMode, SampleStage,
-    SortDirection, SortField, SortStage, Spanned, StatsStage, TableStage, TailStage,
-    TimechartStage, TopStage, WhereStage,
+    AggExpr, DedupStage, DropStage, EventStatsStage, Expr, ExtractMode, ExtractStage,
+    FromSavedStage, LetStage, LimitStage, PipeStage, PivotStage, RareStage, RenameStage,
+    SampleMode, SampleStage, SavedRunSelector, SortDirection, SortField, SortStage, Spanned,
+    StatsStage, TableStage, TailStage, TimechartStage, TopStage, WhereStage,
 };
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
@@ -500,10 +500,39 @@ fn eventstats_stage<'src>()
         .labelled("eventstats stage")
 }
 
+/// Parse a `from saved` stage: `from saved <name> [run=latest|all|N]`
+///
+/// Name is a bare identifier or a quoted string. The optional `run=` clause
+/// selects which run(s) to load: `latest` (default), `all`, or a numeric ID.
+fn from_saved_stage<'src>()
+-> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
+    let name = choice((raw_quoted_string(), field_name())).labelled("saved query name");
+
+    let run_selector = keyword("run")
+        .ignore_then(just('='))
+        .ignore_then(choice((
+            keyword("latest").to(SavedRunSelector::Latest),
+            keyword("all").to(SavedRunSelector::All),
+            uint().map(|n| SavedRunSelector::Specific(i64::try_from(n).unwrap_or(i64::MAX))),
+        )))
+        .padded()
+        .or_not()
+        .map(Option::unwrap_or_default);
+
+    keyword("from")
+        .padded()
+        .ignore_then(keyword("saved").padded())
+        .ignore_then(name)
+        .then(run_selector)
+        .map(|(name, run)| PipeStage::FromSaved(FromSavedStage { name, run }))
+        .labelled("from saved stage")
+}
+
 /// Parse a single pipe stage.
 fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     choice((
+        from_saved_stage(),
         stats_stage(),
         eventstats_stage(),
         timechart_stage(),
@@ -544,7 +573,7 @@ pub(crate) fn pipeline<'src>()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BinaryOp, Expr};
+    use crate::ast::{BinaryOp, Expr, SavedRunSelector};
 
     #[test]
     fn test_stats_count_by_host() {
@@ -1102,5 +1131,84 @@ mod tests {
             }
             other => panic!("expected Rename, got {other:?}"),
         }
+    }
+
+    // ── from saved ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_from_saved_bare_name() {
+        let input = "| from saved daily_errors";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::FromSaved(fs) => {
+                assert_eq!(fs.name, "daily_errors");
+                assert_eq!(fs.run, SavedRunSelector::Latest);
+            }
+            other => panic!("expected FromSaved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_saved_quoted_name() {
+        let input = r#"| from saved "hourly-error-count""#;
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].node {
+            PipeStage::FromSaved(fs) => {
+                assert_eq!(fs.name, "hourly-error-count");
+                assert_eq!(fs.run, SavedRunSelector::Latest);
+            }
+            other => panic!("expected FromSaved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_saved_run_latest() {
+        let input = "| from saved my_query run=latest";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::FromSaved(fs) => {
+                assert_eq!(fs.name, "my_query");
+                assert_eq!(fs.run, SavedRunSelector::Latest);
+            }
+            other => panic!("expected FromSaved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_saved_run_all() {
+        let input = "| from saved my_query run=all";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::FromSaved(fs) => {
+                assert_eq!(fs.name, "my_query");
+                assert_eq!(fs.run, SavedRunSelector::All);
+            }
+            other => panic!("expected FromSaved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_saved_run_specific() {
+        let input = "| from saved daily_rollup run=42";
+        let result = pipeline().parse(input).into_result().unwrap();
+        match &result[0].node {
+            PipeStage::FromSaved(fs) => {
+                assert_eq!(fs.name, "daily_rollup");
+                assert_eq!(fs.run, SavedRunSelector::Specific(42));
+            }
+            other => panic!("expected FromSaved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_saved_with_pipeline() {
+        let input = "| from saved daily_rollup | where count > 10 | sort -count";
+        let result = pipeline().parse(input).into_result().unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(matches!(result[0].node, PipeStage::FromSaved(_)));
+        assert!(matches!(result[1].node, PipeStage::Where(_)));
+        assert!(matches!(result[2].node, PipeStage::Sort(_)));
     }
 }

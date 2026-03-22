@@ -150,6 +150,13 @@ pub fn emit_with_hot_source(
 fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuery, EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
 
+    // `from saved` cannot be combined with search-stage filters.
+    if query.from_saved_stage().is_some() && !query.has_empty_search() {
+        return Err(EmitError::UnsupportedOperation {
+            message: "'from saved' cannot be combined with search filters".to_string(),
+        });
+    }
+
     search::emit_search(&query.search, &mut state)?;
 
     let mut rust_stages = Vec::new();

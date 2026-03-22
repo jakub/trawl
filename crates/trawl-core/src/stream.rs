@@ -155,6 +155,10 @@ fn compile_per_event_stage(spanned: &Spanned<PipeStage>) -> Result<CompiledStage
             stage: "eventstats".to_string(),
             reason: "window functions require the full dataset".to_string(),
         }),
+        PipeStage::FromSaved(_) => Err(StreamPlanError::UnsupportedStage {
+            stage: "from".to_string(),
+            reason: "saved query sources are not supported in streaming mode".to_string(),
+        }),
     }
 }
 
@@ -177,6 +181,7 @@ fn stage_name(stage: &PipeStage) -> &'static str {
         PipeStage::Rename(_) => "rename",
         PipeStage::Sample(_) => "sample",
         PipeStage::EventStats(_) => "eventstats",
+        PipeStage::FromSaved(_) => "from",
     }
 }
 
