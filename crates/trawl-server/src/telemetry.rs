@@ -754,6 +754,10 @@ mod tests {
         assert_eq!(batch.events[0]["event_type"], "test_bus");
         assert_eq!(batch.events[0]["user"], "alice");
         assert!(batch.byte_size > 0);
-        assert!(batch.batch_id.starts_with("trawld_telemetry_"));
+        assert!(
+            batch.batch_id.starts_with("trawld_"),
+            "batch_id should use WAL filename stem: {}",
+            batch.batch_id
+        );
     }
 }
