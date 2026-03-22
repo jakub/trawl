@@ -8,6 +8,7 @@
 //! newline-delimited framing (most common) or RFC 6587 octet-counting.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -15,6 +16,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 
 use crate::config::SyslogConfig;
+use crate::state::SyslogStats;
 
 use super::CidrEntry;
 use super::batch::{SyslogEvent, SyslogSender};
@@ -29,6 +31,7 @@ pub async fn run_tcp_listener(
     config: &SyslogConfig,
     sender: SyslogSender,
     cidrs: Arc<[CidrEntry]>,
+    stats: Option<Arc<SyslogStats>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(&config.tcp_addr).await?;
@@ -77,8 +80,12 @@ pub async fn run_tcp_listener(
                 };
 
                 metrics::gauge!(crate::metrics::SYSLOG_TCP_CONNECTIONS).increment(1.0);
+                if let Some(ref s) = stats {
+                    s.tcp_connections.fetch_add(1, Ordering::Relaxed);
+                }
 
                 let conn_sender = sender.clone();
+                let conn_stats = stats.clone();
                 let conn_config_service_map = config.source_service_map.clone();
                 let conn_default_service = config.default_service.clone();
                 let idle_timeout = Duration::from_secs(config.tcp_idle_timeout_secs);
@@ -95,10 +102,14 @@ pub async fn run_tcp_listener(
                         idle_timeout,
                         max_events,
                         send_failure_limit,
+                        conn_stats.as_ref(),
                     )
                     .await;
 
                     metrics::gauge!(crate::metrics::SYSLOG_TCP_CONNECTIONS).decrement(1.0);
+                    if let Some(ref s) = conn_stats {
+                        s.tcp_connections.fetch_sub(1, Ordering::Relaxed);
+                    }
                     drop(permit); // Release the connection permit
                 });
             }
@@ -126,6 +137,7 @@ async fn handle_tcp_connection(
     idle_timeout: Duration,
     max_events: usize,
     send_failure_limit: usize,
+    stats: Option<&Arc<SyslogStats>>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut event_count: usize = 0;
@@ -175,6 +187,9 @@ async fn handle_tcp_connection(
 
         if sender.try_send(event).is_err() {
             metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
+            if let Some(s) = stats {
+                s.dropped.fetch_add(1, Ordering::Relaxed);
+            }
             consecutive_send_failures += 1;
             if consecutive_send_failures >= send_failure_limit {
                 tracing::warn!(
@@ -507,6 +522,7 @@ mod tests {
             Duration::from_millis(50), // very short timeout for test
             100_000,
             100,
+            None,
         )
         .await;
         let elapsed = start.elapsed();
@@ -533,6 +549,7 @@ mod tests {
                 Duration::from_secs(5),
                 3, // max 3 events
                 100,
+                None,
             )
             .await;
         });

@@ -4500,7 +4500,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-admin"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "chrono",
  "clap",
@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-api"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "serde",
  "serde_json",
@@ -4523,7 +4523,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-auth"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "argon2",
  "base64ct",
@@ -4540,7 +4540,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-cli"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "arboard",
  "chrono",
@@ -4570,7 +4570,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-client"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "async-stream",
  "futures",
@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-core"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "aho-corasick",
  "chrono",
@@ -4599,7 +4599,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-dashboard"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "insta",
  "ratatui",
@@ -4609,7 +4609,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-engine"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "chrono",
  "duckdb",
@@ -4625,7 +4625,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-server"
-version = "0.1.11"
+version = "0.1.13"
 dependencies = [
  "async-stream",
  "axum",

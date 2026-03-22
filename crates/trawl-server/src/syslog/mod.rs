@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::SyslogConfig;
 use crate::ingest::pipeline::PipelineWriter;
+use crate::state::SyslogStats;
 
 use self::batch::SyslogBatcher;
 
@@ -33,9 +34,10 @@ use self::batch::SyslogBatcher;
 pub fn spawn_syslog(
     config: &SyslogConfig,
     pipeline: Arc<PipelineWriter>,
+    syslog_stats: Option<Arc<SyslogStats>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Vec<JoinHandle<()>> {
-    let batcher = SyslogBatcher::new(config, pipeline);
+    let batcher = SyslogBatcher::new(config, pipeline, syslog_stats.clone());
     let sender = batcher.sender();
 
     let mut handles = Vec::new();
@@ -54,9 +56,11 @@ pub fn spawn_syslog(
         let udp_sender = sender.clone();
         let udp_shutdown = shutdown_rx.clone();
         let udp_cidrs = cidrs.clone();
+        let udp_stats = syslog_stats.clone();
         handles.push(tokio::spawn(async move {
             if let Err(e) =
-                udp::run_udp_listener(&udp_config, udp_sender, udp_cidrs, udp_shutdown).await
+                udp::run_udp_listener(&udp_config, udp_sender, udp_cidrs, udp_stats, udp_shutdown)
+                    .await
             {
                 tracing::error!(event_type = "syslog_udp_error", error = %e, "UDP syslog listener failed");
             }
@@ -69,9 +73,11 @@ pub fn spawn_syslog(
         let tcp_sender = sender;
         let tcp_shutdown = shutdown_rx;
         let tcp_cidrs = cidrs;
+        let tcp_stats = syslog_stats;
         handles.push(tokio::spawn(async move {
             if let Err(e) =
-                tcp::run_tcp_listener(&tcp_config, tcp_sender, tcp_cidrs, tcp_shutdown).await
+                tcp::run_tcp_listener(&tcp_config, tcp_sender, tcp_cidrs, tcp_stats, tcp_shutdown)
+                    .await
             {
                 tracing::error!(event_type = "syslog_tcp_error", error = %e, "TCP syslog listener failed");
             }

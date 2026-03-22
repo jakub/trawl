@@ -487,6 +487,56 @@ pub struct DashboardSnapshot {
     /// Total rejected events.
     pub ingest_rejected: u64,
 
+    // -- syslog --
+    /// Whether the syslog listener is enabled.
+    #[serde(default)]
+    pub syslog_enabled: bool,
+    /// Total events received via UDP syslog.
+    #[serde(default)]
+    pub syslog_events_udp: u64,
+    /// Total events received via TCP syslog.
+    #[serde(default)]
+    pub syslog_events_tcp: u64,
+    /// EMA-smoothed syslog event rate (events/sec).
+    #[serde(default)]
+    pub syslog_rate: f64,
+    /// Total unparseable syslog messages.
+    #[serde(default)]
+    pub syslog_parse_errors: u64,
+    /// Total syslog events dropped due to backpressure.
+    #[serde(default)]
+    pub syslog_dropped: u64,
+    /// Current active syslog TCP connections.
+    #[serde(default)]
+    pub syslog_tcp_connections: u64,
+
+    // -- WAL --
+    /// Pending WAL file count.
+    #[serde(default)]
+    pub wal_files: u64,
+    /// Total byte size of pending WAL files.
+    #[serde(default)]
+    pub wal_bytes: u64,
+
+    // -- compaction --
+    /// Seconds since last successful compaction (None if never run).
+    #[serde(default)]
+    pub last_compaction_secs: Option<u64>,
+    /// Total successful compaction cycles since startup.
+    #[serde(default)]
+    pub compaction_runs: u64,
+    /// Total failed compaction cycles since startup.
+    #[serde(default)]
+    pub compaction_errors: u64,
+
+    // -- storage --
+    /// Total parquet files on disk.
+    #[serde(default)]
+    pub parquet_files: u64,
+    /// Total byte size of parquet files.
+    #[serde(default)]
+    pub parquet_bytes: u64,
+
     // -- SSE --
     /// Active SSE streaming connections.
     pub sse_active: usize,
@@ -1147,6 +1197,20 @@ mod tests {
             ingest_events: 847_293,
             ingest_rate: 340.0,
             ingest_rejected: 47,
+            syslog_enabled: true,
+            syslog_events_udp: 1_247_829,
+            syslog_events_tcp: 89_341,
+            syslog_rate: 530.0,
+            syslog_parse_errors: 12,
+            syslog_dropped: 3,
+            syslog_tcp_connections: 2,
+            wal_files: 12,
+            wal_bytes: 4_404_019,
+            last_compaction_secs: Some(3),
+            compaction_runs: 1247,
+            compaction_errors: 0,
+            parquet_files: 847,
+            parquet_bytes: 13_312_000_000,
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,
@@ -1175,6 +1239,11 @@ mod tests {
         assert_eq!(rt.hot_buffer_events, 12_847);
         assert_eq!(rt.total_queries, 1247);
         assert!((rt.query_rate - 2.1).abs() < f64::EPSILON);
+        assert!(rt.syslog_enabled);
+        assert_eq!(rt.syslog_events_udp, 1_247_829);
+        assert_eq!(rt.wal_files, 12);
+        assert_eq!(rt.compaction_runs, 1247);
+        assert_eq!(rt.parquet_files, 847);
         assert_eq!(rt.recent_queries.len(), 1);
         assert_eq!(rt.active_queries.len(), 1);
     }

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use std::time::Instant;
@@ -108,6 +108,91 @@ pub struct IngestState {
     pub total_events: Arc<AtomicU64>,
     /// Total events rejected since startup (for monitor dashboard).
     pub total_rejected: Arc<AtomicU64>,
+    /// Syslog ingest counters (None if syslog is disabled).
+    pub syslog_stats: Option<Arc<SyslogStats>>,
+    /// Compaction cycle counters (None if ingest is disabled).
+    pub compaction_stats: Option<Arc<CompactionStats>>,
+}
+
+/// Shared counters for syslog ingest stats (dashboard + monitoring).
+pub struct SyslogStats {
+    /// Total events received via UDP.
+    pub events_udp: AtomicU64,
+    /// Total events received via TCP.
+    pub events_tcp: AtomicU64,
+    /// Total unparseable syslog messages.
+    pub parse_errors: AtomicU64,
+    /// Total events dropped due to channel backpressure.
+    pub dropped: AtomicU64,
+    /// Current active TCP connections (incremented on connect, decremented on close).
+    pub tcp_connections: AtomicU64,
+}
+
+impl Default for SyslogStats {
+    fn default() -> Self {
+        Self {
+            events_udp: AtomicU64::new(0),
+            events_tcp: AtomicU64::new(0),
+            parse_errors: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            tcp_connections: AtomicU64::new(0),
+        }
+    }
+}
+
+impl SyslogStats {
+    /// Combined event count (UDP + TCP).
+    pub fn total_events(&self) -> u64 {
+        self.events_udp.load(Ordering::Relaxed) + self.events_tcp.load(Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Debug for SyslogStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyslogStats")
+            .field("events_udp", &self.events_udp.load(Ordering::Relaxed))
+            .field("events_tcp", &self.events_tcp.load(Ordering::Relaxed))
+            .field("parse_errors", &self.parse_errors.load(Ordering::Relaxed))
+            .field("dropped", &self.dropped.load(Ordering::Relaxed))
+            .field(
+                "tcp_connections",
+                &self.tcp_connections.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+/// Shared counters for compaction cycle tracking (dashboard + monitoring).
+pub struct CompactionStats {
+    /// Unix epoch seconds of last successful compaction (0 = never).
+    pub last_run_epoch_secs: AtomicU64,
+    /// Total successful compaction cycles.
+    pub total_runs: AtomicU64,
+    /// Total failed compaction cycles.
+    pub total_errors: AtomicU64,
+}
+
+impl Default for CompactionStats {
+    fn default() -> Self {
+        Self {
+            last_run_epoch_secs: AtomicU64::new(0),
+            total_runs: AtomicU64::new(0),
+            total_errors: AtomicU64::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for CompactionStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompactionStats")
+            .field(
+                "last_run_epoch_secs",
+                &self.last_run_epoch_secs.load(Ordering::Relaxed),
+            )
+            .field("total_runs", &self.total_runs.load(Ordering::Relaxed))
+            .field("total_errors", &self.total_errors.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 /// HTTP transport config consumed at router/server construction time.
@@ -233,6 +318,16 @@ impl AppState {
                 event_bus,
                 total_events: Arc::new(AtomicU64::new(0)),
                 total_rejected: Arc::new(AtomicU64::new(0)),
+                syslog_stats: if config.syslog.enabled && config.ingest.enabled {
+                    Some(Arc::new(SyslogStats::default()))
+                } else {
+                    None
+                },
+                compaction_stats: if config.ingest.enabled {
+                    Some(Arc::new(CompactionStats::default()))
+                } else {
+                    None
+                },
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),

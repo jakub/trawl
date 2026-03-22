@@ -57,10 +57,16 @@ pub fn spawn_snapshot_collector(
     listen_addr: String,
     sse_max: usize,
     scheduler_enabled: bool,
+    syslog_enabled: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut monitor =
-            state::from_app_state(app_state.clone(), &listen_addr, sse_max, scheduler_enabled);
+        let mut monitor = state::from_app_state(
+            app_state.clone(),
+            &listen_addr,
+            sse_max,
+            scheduler_enabled,
+            syslog_enabled,
+        );
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

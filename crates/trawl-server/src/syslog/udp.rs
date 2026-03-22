@@ -8,11 +8,13 @@
 //! parsed, converted to a trawl event, and sent to the batcher.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
 use crate::config::SyslogConfig;
+use crate::state::SyslogStats;
 
 use super::CidrEntry;
 use super::batch::{SyslogEvent, SyslogSender};
@@ -27,6 +29,7 @@ pub async fn run_udp_listener(
     config: &SyslogConfig,
     sender: SyslogSender,
     cidrs: Arc<[CidrEntry]>,
+    stats: Option<Arc<SyslogStats>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let socket = UdpSocket::bind(&config.udp_addr).await?;
@@ -67,6 +70,9 @@ pub async fn run_udp_listener(
                 let Ok(raw) = std::str::from_utf8(&buf[..len]) else {
                     metrics::counter!(crate::metrics::SYSLOG_PARSE_ERRORS_TOTAL, "transport" => "udp")
                         .increment(1);
+                    if let Some(ref s) = stats {
+                        s.parse_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                     tracing::debug!(
                         event_type = "syslog_parse_error",
                         source = %source_ip,
@@ -92,6 +98,9 @@ pub async fn run_udp_listener(
                 // Non-blocking send — drop if batcher is overwhelmed
                 if sender.try_send(event).is_err() {
                     metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
+                    if let Some(ref s) = stats {
+                        s.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                     tracing::debug!(
                         event_type = "syslog_event_dropped",
                         source = %source_ip,

@@ -10,11 +10,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
 
 use crate::hot_buffer::HotBuffer;
+use crate::state::CompactionStats;
 
 /// Spawn the compaction background loop.
 ///
@@ -29,6 +31,7 @@ pub fn spawn_compaction(
     interval: Duration,
     daily_rollup: bool,
     hot_buffer: Option<Arc<HotBuffer>>,
+    compaction_stats: Option<Arc<CompactionStats>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -45,8 +48,22 @@ pub fn spawn_compaction(
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    if let Err(e) = compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref()).await {
-                        tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
+                    match compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref()).await {
+                        Ok(()) => {
+                            if let Some(ref stats) = compaction_stats {
+                                stats.total_runs.fetch_add(1, Ordering::Relaxed);
+                                let epoch_secs = SystemTime::now()
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_secs());
+                                stats.last_run_epoch_secs.store(epoch_secs, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(ref stats) = compaction_stats {
+                                stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
+                        }
                     }
                 }
                 _ = shutdown_rx.changed() => {

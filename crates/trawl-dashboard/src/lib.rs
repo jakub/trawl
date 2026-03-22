@@ -119,26 +119,37 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
 /// Uses `Flex::Start` (the default since ratatui 0.26) for predictable
 /// top-aligned layout. `Flex::SpaceAround` could work for taller terminals.
 fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let [row1_area, row2_area, row3_area, row4_area] =
-        vertical![==5, ==4, ==3, >=4].flex(Flex::Start).areas(area);
+    let [row1_area, row2_area, row3_area, row4_area, row5_area] =
+        vertical![==5, ==6, ==5, ==3, >=4]
+            .flex(Flex::Start)
+            .areas(area);
 
     // -- row 1: executor pool | hot buffer --
     let [exec_area, hot_area] = horizontal![==2/5, ==3/5].areas(row1_area);
     render_executor_pool(snapshot, frame, exec_area);
     render_hot_buffer(snapshot, frame, hot_area);
 
-    // -- row 2: query throughput | ingest --
-    let [qtp_area, ingest_area] = horizontal![==2/5, ==3/5].areas(row2_area);
-    render_query_throughput(snapshot, frame, qtp_area);
-    render_ingest(snapshot, frame, ingest_area);
+    // -- row 2: HTTP ingest | syslog ingest --
+    if snapshot.syslog_enabled {
+        let [http_area, syslog_area] = horizontal![==2/5, ==3/5].areas(row2_area);
+        render_http_ingest(snapshot, frame, http_area);
+        render_syslog_ingest(snapshot, frame, syslog_area);
+    } else {
+        render_http_ingest(snapshot, frame, row2_area);
+    }
 
-    // -- row 3: SSE | scheduler --
-    let [sse_area, sched_area] = horizontal![==2/5, ==3/5].areas(row3_area);
+    // -- row 3: query throughput | data pipeline --
+    let [qtp_area, pipeline_area] = horizontal![==2/5, ==3/5].areas(row3_area);
+    render_query_throughput(snapshot, frame, qtp_area);
+    render_data_pipeline(snapshot, frame, pipeline_area);
+
+    // -- row 4: SSE | scheduler --
+    let [sse_area, sched_area] = horizontal![==2/5, ==3/5].areas(row4_area);
     render_sse(snapshot, frame, sse_area);
     render_scheduler(snapshot, frame, sched_area);
 
-    // -- row 4: recent + active queries --
-    render_queries(snapshot, frame, row4_area);
+    // -- row 5: recent + active queries --
+    render_queries(snapshot, frame, row5_area);
 }
 
 /// Executor pool panel with gauge.
@@ -204,8 +215,8 @@ fn render_hot_buffer(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: 
     };
     let byte_line = format!(
         " bytes:  {} / {} ({:.1}%)",
-        format_bytes(snapshot.hot_buffer_bytes),
-        format_bytes(snapshot.hot_buffer_max_bytes),
+        format_bytes(snapshot.hot_buffer_bytes as u64),
+        format_bytes(snapshot.hot_buffer_max_bytes as u64),
         byte_pct,
     );
     frame.render_widget(Paragraph::new(byte_line), byte_row);
@@ -241,9 +252,9 @@ fn render_query_throughput(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, 
     frame.render_widget(Paragraph::new(err_line), err_row);
 }
 
-/// Ingest throughput panel.
-fn render_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
-    let block = panel_block(" INGEST ");
+/// HTTP ingest throughput panel.
+fn render_http_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
+    let block = panel_block(" HTTP INGEST ");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -263,6 +274,84 @@ fn render_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
 
     let rejected_line = format!(" rejected: {}", snapshot.ingest_rejected);
     frame.render_widget(Paragraph::new(rejected_line), rejected_row);
+}
+
+/// Syslog ingest throughput panel.
+fn render_syslog_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
+    let block = panel_block(" SYSLOG INGEST ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    let [totals_row, breakdown_row, errors_row] = vertical![==1, ==1, ==1].areas(inner);
+
+    let total = snapshot.syslog_events_udp + snapshot.syslog_events_tcp;
+    let totals_line = format!(
+        " events: {}  ~{:.0} ev/s",
+        format_number(total),
+        snapshot.syslog_rate,
+    );
+    frame.render_widget(Paragraph::new(totals_line), totals_row);
+
+    let breakdown_line = format!(
+        " udp: {}  tcp: {}",
+        format_number(snapshot.syslog_events_udp),
+        format_number(snapshot.syslog_events_tcp),
+    );
+    frame.render_widget(Paragraph::new(breakdown_line), breakdown_row);
+
+    let errors_line = format!(
+        " errors: {}  dropped: {}  tcp conns: {}",
+        snapshot.syslog_parse_errors, snapshot.syslog_dropped, snapshot.syslog_tcp_connections,
+    );
+    frame.render_widget(Paragraph::new(errors_line), errors_row);
+}
+
+/// WAL, compaction, and parquet storage panel.
+fn render_data_pipeline(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
+    let block = panel_block(" DATA PIPELINE ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    let [wal_row, parquet_row] = vertical![==1, ==1].areas(inner);
+
+    let compacted_ago = match snapshot.last_compaction_secs {
+        Some(secs) => format!(
+            "compacted: {} ago",
+            format_duration(std::time::Duration::from_secs(secs))
+        ),
+        None => "compacted: never".to_owned(),
+    };
+    let wal_line = format!(
+        " wal: {} files ({})  {}",
+        snapshot.wal_files,
+        format_bytes(snapshot.wal_bytes),
+        compacted_ago,
+    );
+    frame.render_widget(Paragraph::new(wal_line), wal_row);
+
+    let errors_suffix = if snapshot.compaction_errors > 0 {
+        format!("  errors: {}", snapshot.compaction_errors)
+    } else {
+        String::new()
+    };
+    let parquet_line = format!(
+        " parquet: {} files ({})  runs: {}{}",
+        format_number(snapshot.parquet_files),
+        format_bytes(snapshot.parquet_bytes),
+        format_number(snapshot.compaction_runs),
+        errors_suffix,
+    );
+    frame.render_widget(Paragraph::new(parquet_line), parquet_row);
 }
 
 /// SSE connections panel.
@@ -477,10 +566,10 @@ pub fn format_number(n: u64) -> String {
 
 /// Format bytes as human-readable (e.g. "4.2 MB", "128 KB").
 #[allow(clippy::cast_precision_loss)] // display only — sub-byte precision is meaningless
-pub fn format_bytes(bytes: usize) -> String {
-    const KB: usize = 1024;
-    const MB: usize = 1024 * 1024;
-    const GB: usize = 1024 * 1024 * 1024;
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
 
     if bytes >= GB {
         format!("{:.1} GB", bytes as f64 / GB as f64)
@@ -544,6 +633,20 @@ mod tests {
             ingest_events: 847_293,
             ingest_rate: 340.0,
             ingest_rejected: 47,
+            syslog_enabled: true,
+            syslog_events_udp: 1_247_829,
+            syslog_events_tcp: 89_341,
+            syslog_rate: 530.0,
+            syslog_parse_errors: 12,
+            syslog_dropped: 3,
+            syslog_tcp_connections: 2,
+            wal_files: 12,
+            wal_bytes: 4_404_019, // ~4.2 MB
+            last_compaction_secs: Some(3),
+            compaction_runs: 1247,
+            compaction_errors: 0,
+            parquet_files: 847,
+            parquet_bytes: 13_312_000_000, // ~12.4 GB
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,

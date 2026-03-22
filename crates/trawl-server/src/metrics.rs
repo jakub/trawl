@@ -275,6 +275,23 @@ fn collect_wal_gauges(wal_dir: &Path) {
     cached.last_updated = Some(Instant::now());
 }
 
+// -- public cache accessors (for dashboard monitor) --------------------------
+
+/// Read the cached WAL file stats. Returns `(file_count, total_bytes)`.
+///
+/// Returns `(0, 0)` if the cache has never been populated (no prometheus
+/// scrape or stats-emit has run yet).
+pub fn cached_wal_stats() -> (u64, u64) {
+    let cached = wal_cache().lock().expect("wal cache poisoned");
+    (cached.file_count, cached.total_bytes)
+}
+
+/// Read the cached parquet file stats. Returns `(file_count, total_bytes)`.
+pub fn cached_parquet_stats() -> (u64, u64) {
+    let cached = parquet_cache().lock().expect("parquet cache poisoned");
+    (cached.file_count, cached.total_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

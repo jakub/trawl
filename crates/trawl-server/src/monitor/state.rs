@@ -9,7 +9,7 @@
 //! non-blocking — no subscriptions or channels needed.
 
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot, DashboardSnapshot};
 
@@ -42,10 +42,32 @@ pub struct MonitorSnapshot {
     pub query_errors: u64,
     pub query_timeouts: u64,
 
-    // -- ingest --
+    // -- ingest (HTTP) --
     pub ingest_events: u64,
     pub ingest_rate: f64,
     pub ingest_rejected: u64,
+
+    // -- syslog --
+    pub syslog_enabled: bool,
+    pub syslog_events_udp: u64,
+    pub syslog_events_tcp: u64,
+    pub syslog_rate: f64,
+    pub syslog_parse_errors: u64,
+    pub syslog_dropped: u64,
+    pub syslog_tcp_connections: u64,
+
+    // -- WAL --
+    pub wal_files: u64,
+    pub wal_bytes: u64,
+
+    // -- compaction --
+    pub last_compaction_secs: Option<u64>,
+    pub compaction_runs: u64,
+    pub compaction_errors: u64,
+
+    // -- storage --
+    pub parquet_files: u64,
+    pub parquet_bytes: u64,
 
     // -- SSE --
     pub sse_active: usize,
@@ -83,6 +105,20 @@ impl MonitorSnapshot {
             ingest_events: self.ingest_events,
             ingest_rate: self.ingest_rate,
             ingest_rejected: self.ingest_rejected,
+            syslog_enabled: self.syslog_enabled,
+            syslog_events_udp: self.syslog_events_udp,
+            syslog_events_tcp: self.syslog_events_tcp,
+            syslog_rate: self.syslog_rate,
+            syslog_parse_errors: self.syslog_parse_errors,
+            syslog_dropped: self.syslog_dropped,
+            syslog_tcp_connections: self.syslog_tcp_connections,
+            wal_files: self.wal_files,
+            wal_bytes: self.wal_bytes,
+            last_compaction_secs: self.last_compaction_secs,
+            compaction_runs: self.compaction_runs,
+            compaction_errors: self.compaction_errors,
+            parquet_files: self.parquet_files,
+            parquet_bytes: self.parquet_bytes,
             sse_active: self.sse_active,
             sse_max: self.sse_max,
             scheduler_enabled: self.scheduler_enabled,
@@ -103,9 +139,11 @@ impl MonitorSnapshot {
 pub struct RateTracker {
     last_query_count: u64,
     last_ingest_count: u64,
+    last_syslog_count: u64,
     last_tick: Instant,
     pub query_rate: f64,
     pub ingest_rate: f64,
+    pub syslog_rate: f64,
 }
 
 /// EMA smoothing factor (0..1). Lower = smoother but slower to respond.
@@ -116,9 +154,11 @@ impl Default for RateTracker {
         Self {
             last_query_count: 0,
             last_ingest_count: 0,
+            last_syslog_count: 0,
             last_tick: Instant::now(),
             query_rate: 0.0,
             ingest_rate: 0.0,
+            syslog_rate: 0.0,
         }
     }
 }
@@ -126,18 +166,22 @@ impl Default for RateTracker {
 impl RateTracker {
     /// Update rates from current counter values. Call once per tick.
     #[allow(clippy::cast_precision_loss)] // dashboard display — u64→f64 precision loss is fine
-    pub fn update(&mut self, total_queries: u64, total_ingest: u64) {
+    pub fn update(&mut self, total_queries: u64, total_ingest: u64, total_syslog: u64) {
         let elapsed = self.last_tick.elapsed().as_secs_f64();
         if elapsed > 0.0 {
             let query_delta = total_queries.saturating_sub(self.last_query_count);
             let ingest_delta = total_ingest.saturating_sub(self.last_ingest_count);
+            let syslog_delta = total_syslog.saturating_sub(self.last_syslog_count);
             let instant_query = query_delta as f64 / elapsed;
             let instant_ingest = ingest_delta as f64 / elapsed;
+            let instant_syslog = syslog_delta as f64 / elapsed;
             self.query_rate += RATE_SMOOTHING * (instant_query - self.query_rate);
             self.ingest_rate += RATE_SMOOTHING * (instant_ingest - self.ingest_rate);
+            self.syslog_rate += RATE_SMOOTHING * (instant_syslog - self.syslog_rate);
         }
         self.last_query_count = total_queries;
         self.last_ingest_count = total_ingest;
+        self.last_syslog_count = total_syslog;
         self.last_tick = Instant::now();
     }
 }
@@ -150,6 +194,7 @@ pub struct MonitorState {
     listen_addr: String,
     sse_max: usize,
     scheduler_enabled: bool,
+    syslog_enabled: bool,
     pub rate_tracker: RateTracker,
     /// Health check runs on a slower cadence (every N ticks).
     health_counter: u32,
@@ -166,6 +211,7 @@ impl MonitorState {
         listen_addr: String,
         sse_max: usize,
         scheduler_enabled: bool,
+        syslog_enabled: bool,
     ) -> Self {
         let hostname =
             hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().into_owned());
@@ -176,6 +222,7 @@ impl MonitorState {
             listen_addr,
             sse_max,
             scheduler_enabled,
+            syslog_enabled,
             rate_tracker: RateTracker::default(),
             health_counter: 0,
             last_healthy: true,
@@ -185,6 +232,7 @@ impl MonitorState {
     }
 
     /// Collect a snapshot of all dashboard fields. Cheap reads only.
+    #[allow(clippy::too_many_lines)]
     pub fn snapshot(&mut self) -> MonitorSnapshot {
         let pool = &self.state.query.pool;
         let tracker = &self.state.query.tracker;
@@ -211,7 +259,23 @@ impl MonitorState {
         let ingest_events = self.state.ingest.total_events.load(Ordering::Relaxed);
         let ingest_rejected = self.state.ingest.total_rejected.load(Ordering::Relaxed);
 
-        self.rate_tracker.update(total_queries, ingest_events);
+        // Syslog stats (zeros when syslog is disabled).
+        let (syslog_udp, syslog_tcp, syslog_parse, syslog_drop, syslog_conns) =
+            if let Some(ref stats) = self.state.ingest.syslog_stats {
+                (
+                    stats.events_udp.load(Ordering::Relaxed),
+                    stats.events_tcp.load(Ordering::Relaxed),
+                    stats.parse_errors.load(Ordering::Relaxed),
+                    stats.dropped.load(Ordering::Relaxed),
+                    stats.tcp_connections.load(Ordering::Relaxed),
+                )
+            } else {
+                (0, 0, 0, 0, 0)
+            };
+        let syslog_total = syslog_udp + syslog_tcp;
+
+        self.rate_tracker
+            .update(total_queries, ingest_events, syslog_total);
 
         // Count errors and timeouts from recent history.
         let recent = tracker.recent();
@@ -248,6 +312,31 @@ impl MonitorState {
             self.last_healthy = pool.available_permits() > 0;
         }
 
+        // Compaction stats (None/zeros when ingest is disabled).
+        let (last_compaction_secs, compaction_runs, compaction_errors) =
+            if let Some(ref stats) = self.state.ingest.compaction_stats {
+                let epoch_secs = stats.last_run_epoch_secs.load(Ordering::Relaxed);
+                let last_secs = if epoch_secs == 0 {
+                    None
+                } else {
+                    let now_epoch = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    Some(now_epoch.saturating_sub(epoch_secs))
+                };
+                (
+                    last_secs,
+                    stats.total_runs.load(Ordering::Relaxed),
+                    stats.total_errors.load(Ordering::Relaxed),
+                )
+            } else {
+                (None, 0, 0)
+            };
+
+        // WAL and parquet stats from cached gauge values.
+        let (wal_files, wal_bytes) = crate::metrics::cached_wal_stats();
+        let (parquet_files, parquet_bytes) = crate::metrics::cached_parquet_stats();
+
         MonitorSnapshot {
             hostname: self.hostname.clone(),
             listen_addr: self.listen_addr.clone(),
@@ -268,6 +357,20 @@ impl MonitorState {
             ingest_events,
             ingest_rate: self.rate_tracker.ingest_rate,
             ingest_rejected,
+            syslog_enabled: self.syslog_enabled,
+            syslog_events_udp: syslog_udp,
+            syslog_events_tcp: syslog_tcp,
+            syslog_rate: self.rate_tracker.syslog_rate,
+            syslog_parse_errors: syslog_parse,
+            syslog_dropped: syslog_drop,
+            syslog_tcp_connections: syslog_conns,
+            wal_files,
+            wal_bytes,
+            last_compaction_secs,
+            compaction_runs,
+            compaction_errors,
+            parquet_files,
+            parquet_bytes,
             sse_active,
             sse_max: self.sse_max,
             scheduler_enabled: self.scheduler_enabled,
@@ -286,6 +389,13 @@ pub fn from_app_state(
     listen_addr: &str,
     sse_max: usize,
     scheduler_enabled: bool,
+    syslog_enabled: bool,
 ) -> MonitorState {
-    MonitorState::new(state, listen_addr.to_owned(), sse_max, scheduler_enabled)
+    MonitorState::new(
+        state,
+        listen_addr.to_owned(),
+        sse_max,
+        scheduler_enabled,
+        syslog_enabled,
+    )
 }

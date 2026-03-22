@@ -8,6 +8,7 @@
 //! WAL pipeline in batches, matching the pattern used by HTTP ingest.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use indexmap::IndexMap;
 use serde_json::Map;
@@ -15,6 +16,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::SyslogConfig;
 use crate::ingest::pipeline::{PipelineWriter, ServiceBatch};
+use crate::state::SyslogStats;
 
 /// A single syslog event ready for batching.
 #[derive(Debug)]
@@ -38,10 +40,15 @@ pub struct SyslogBatcher {
     pipeline: Arc<PipelineWriter>,
     batch_interval_ms: u64,
     batch_max_events: usize,
+    stats: Option<Arc<SyslogStats>>,
 }
 
 impl SyslogBatcher {
-    pub fn new(config: &SyslogConfig, pipeline: Arc<PipelineWriter>) -> Self {
+    pub fn new(
+        config: &SyslogConfig,
+        pipeline: Arc<PipelineWriter>,
+        stats: Option<Arc<SyslogStats>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         Self {
             rx,
@@ -49,6 +56,7 @@ impl SyslogBatcher {
             pipeline,
             batch_interval_ms: config.batch_interval_ms,
             batch_max_events: config.batch_max_events,
+            stats,
         }
     }
 
@@ -171,6 +179,16 @@ impl SyslogBatcher {
                 .increment(tcp_count);
         }
 
+        // Update dashboard atomics.
+        if let Some(ref stats) = self.stats {
+            if udp_count > 0 {
+                stats.events_udp.fetch_add(udp_count, Ordering::Relaxed);
+            }
+            if tcp_count > 0 {
+                stats.events_tcp.fetch_add(tcp_count, Ordering::Relaxed);
+            }
+        }
+
         tracing::debug!(
             event_type = "syslog_batch_flushed",
             services,
@@ -204,7 +222,7 @@ mod tests {
             ..SyslogConfig::default()
         };
 
-        let batcher = SyslogBatcher::new(&config, pipeline);
+        let batcher = SyslogBatcher::new(&config, pipeline, None);
         (batcher, tmp)
     }
 

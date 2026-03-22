@@ -123,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handles = trawl_server::syslog::spawn_syslog(
             &config.syslog,
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
+            state.ingest.syslog_stats.clone(),
             shutdown_rx,
         );
         tracing::info!(
@@ -209,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.server.http_addr.clone(),
         config.server.max_sse_connections,
         config.scheduler.enabled,
+        config.syslog.enabled && config.ingest.enabled,
     );
 
     if monitor_active {
@@ -321,6 +323,7 @@ fn spawn_ingest_pipeline(
         interval,
         config.ingest.daily_rollup,
         state.query.hot_buffer.clone(),
+        state.ingest.compaction_stats.clone(),
         shutdown_rx,
     );
 
