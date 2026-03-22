@@ -191,6 +191,10 @@ fn walk_dir_recursive(
         let entry = entry?;
         let ft = entry.file_type()?;
         if ft.is_dir() {
+            // Skip `scheduled/` — contains saved query result parquet, not ingested logs.
+            if entry.file_name() == "scheduled" {
+                continue;
+            }
             walk_dir_recursive(&entry.path(), results)?;
         } else if ft.is_file() {
             let path = entry.path();

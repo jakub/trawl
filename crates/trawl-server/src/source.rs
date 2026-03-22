@@ -73,8 +73,9 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
     let base = base_dir.trim_end_matches('/');
 
     let Some(duration) = time_filter else {
-        // No time filter — use recursive glob, possibly service-narrowed.
-        return format!("{base}/**/{file_pattern}");
+        // No time filter — enumerate date-formatted directories to avoid
+        // scanning `scheduled/` (or other non-date subdirs) accidentally.
+        return date_scoped_fallback(base, &file_pattern);
     };
 
     let total_secs = duration
@@ -131,7 +132,7 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
     }
 
     if globs.is_empty() {
-        return format!("{base}/**/{file_pattern}");
+        return date_scoped_fallback(base, &file_pattern);
     }
 
     // Filter out globs whose parent directory doesn't exist on disk.
@@ -151,12 +152,59 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
         .collect();
 
     if globs.is_empty() {
-        // All glob dirs were nonexistent — fall back to recursive glob.
+        // All glob dirs were nonexistent — fall back to date-scoped glob.
         // The SQL time filter still provides correctness.
-        return format!("{base}/**/{file_pattern}");
+        return date_scoped_fallback(base, &file_pattern);
     }
 
     format!("[{}]", globs.join(", "))
+}
+
+/// Build a date-scoped glob for queries without a time filter.
+///
+/// Enumerates directories matching `YYYY-MM-DD` in the base dir and builds
+/// a `DuckDB` list of globs for each. This naturally excludes non-date subdirs
+/// like `scheduled/` from being scanned.
+///
+/// Falls back to `{base}/**/{file_pattern}` only if the base dir is empty
+/// or can't be read (cold start / new install).
+fn date_scoped_fallback(base: &str, file_pattern: &str) -> String {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return format!("{base}/**/{file_pattern}");
+    };
+
+    let mut globs = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        // Match YYYY-MM-DD (exactly 10 chars, digits and dashes in right places).
+        if is_date_dir_name(name_str) && entry.path().is_dir() {
+            globs.push(format!("'{base}/{name_str}/**/{file_pattern}'"));
+        }
+    }
+
+    if globs.is_empty() {
+        return format!("{base}/**/{file_pattern}");
+    }
+
+    // Sort for deterministic ordering.
+    globs.sort();
+    format!("[{}]", globs.join(", "))
+}
+
+/// Check if a directory name looks like `YYYY-MM-DD`.
+fn is_date_dir_name(name: &str) -> bool {
+    if name.len() != 10 {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 /// Check if a date directory has day-level parquet files (consolidated).
