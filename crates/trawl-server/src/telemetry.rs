@@ -176,46 +176,50 @@ impl WalLayerInner {
         // the byte buffer and must stay in sync.
         let maps = std::mem::take(&mut *self.event_maps.lock());
 
-        if let Err(e) = writer.write("trawld", &data) {
-            // MUST NOT use tracing here — infinite recursion.
-            eprintln!("[trawl-telemetry] WAL write failed: {e}");
-            self.dropped_bytes
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-        } else if !maps.is_empty() {
-            // Insert into hot buffer synchronously (query freshness),
-            // then publish to event bus for SSE streaming.
-            use crate::bus::{EventBus, IngestBatch};
-            let batch = Arc::new(IngestBatch {
-                batch_id: format!(
-                    "trawld_telemetry_{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                )
-                .into(),
-                service: "trawld".into(),
-                events: maps,
-                byte_size: data.len(),
-            });
-            if let Some(buf) = self.hot_buffer.get() {
-                buf.insert(Arc::clone(&batch));
+        match writer.write("trawld", &data) {
+            Err(e) => {
+                // MUST NOT use tracing here — infinite recursion.
+                eprintln!("[trawl-telemetry] WAL write failed: {e}");
+                self.dropped_bytes
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
             }
-            if let Some(bus) = self.bus.get() {
-                let _ = bus.publish(batch);
-            }
+            Ok(wal_path) if !maps.is_empty() => {
+                // Insert into hot buffer synchronously (query freshness),
+                // then publish to event bus for SSE streaming.
+                // batch_id MUST match the WAL filename stem so compaction
+                // can drain the hot buffer after writing parquet.
+                use crate::bus::{EventBus, IngestBatch};
+                let batch_id: Arc<str> = wal_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("trawld_unknown")
+                    .into();
+                let batch = Arc::new(IngestBatch {
+                    batch_id,
+                    service: "trawld".into(),
+                    events: maps,
+                    byte_size: data.len(),
+                });
+                if let Some(buf) = self.hot_buffer.get() {
+                    buf.insert(Arc::clone(&batch));
+                }
+                if let Some(bus) = self.bus.get() {
+                    let _ = bus.publish(batch);
+                }
 
-            // Report any previously dropped bytes. Safe from recursion:
-            // on_event only buffers, the tracing event will be picked up
-            // on the NEXT flush cycle.
-            let prev = self.dropped_bytes.swap(0, Ordering::Relaxed);
-            if prev > 0 {
-                tracing::warn!(
-                    event_type = "telemetry_dropped",
-                    dropped_bytes = prev,
-                    "telemetry events were lost due to WAL write failure"
-                );
+                // Report any previously dropped bytes. Safe from recursion:
+                // on_event only buffers, the tracing event will be picked up
+                // on the NEXT flush cycle.
+                let prev = self.dropped_bytes.swap(0, Ordering::Relaxed);
+                if prev > 0 {
+                    tracing::warn!(
+                        event_type = "telemetry_dropped",
+                        dropped_bytes = prev,
+                        "telemetry events were lost due to WAL write failure"
+                    );
+                }
             }
+            Ok(_) => {}
         }
     }
 }
