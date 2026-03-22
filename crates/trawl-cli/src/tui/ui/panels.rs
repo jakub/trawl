@@ -16,7 +16,7 @@ use ratatui::widgets::{
 };
 
 use crate::tui::App;
-use crate::tui::state::{Focus, MainTab, SchemaBrowser};
+use crate::tui::state::{Focus, MainTab, SavedFocus, SchemaBrowser};
 use crate::tui::theme::Theme;
 
 /// Render panel content based on the active `MainTab`.
@@ -94,7 +94,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 frame.render_widget(paragraph, inner);
             }
         }
-        MainTab::Saved => render_saved_list(app, theme, frame, inner),
+        MainTab::Saved => render_saved_panel(app, theme, frame, inner),
         MainTab::Query | MainTab::Dashboard => {} // Use their own layout.
     }
 }
@@ -547,10 +547,9 @@ fn format_relative_time(iso_timestamp: &str) -> String {
 // Saved queries list
 // ---------------------------------------------------------------------------
 
-/// Render saved queries in the panel.
-fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
-    let selected = app.panel.saved_selected;
-
+/// Render the saved tab as a two-pane layout: list (left) + detail/runs (right).
+#[allow(clippy::too_many_lines)]
+fn render_saved_panel(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let Some(ref saved) = app.saved_cache else {
         let paragraph =
             Paragraph::new("loading saved...").style(Style::default().fg(theme.text_muted));
@@ -565,45 +564,77 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
         return;
     }
 
+    // Two-pane horizontal split: list (45%) | detail (55%).
+    let [list_col, detail_col] =
+        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
+
+    render_saved_list(app, theme, frame, list_col);
+    render_saved_detail(app, theme, frame, detail_col);
+}
+
+/// Render the left-pane saved query list.
+fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let selected = app.panel.saved_selected;
+    let is_focused = app.panel.saved_focus == SavedFocus::List;
+
+    let Some(ref saved) = app.saved_cache else {
+        return;
+    };
+
     #[allow(clippy::cast_possible_truncation)]
     let max_width = area.width as usize;
     let items: Vec<ListItem<'_>> = saved
         .queries
         .iter()
         .map(|entry| {
-            // Show schedule indicator if the query has one.
-            let schedule_suffix = entry
-                .schedule
-                .as_ref()
-                .map(|s| format!(" [{}]", s.interval))
-                .unwrap_or_default();
-            let name_budget = max_width.saturating_sub(schedule_suffix.len());
+            // Show schedule indicator and last run status if the query has a schedule.
+            let mut suffixes = Vec::new();
+            if let Some(ref sched) = entry.schedule {
+                suffixes.push(Span::styled(
+                    format!(" [{}]", sched.interval),
+                    Style::default().fg(theme.text_accent),
+                ));
+                // Show last run status icon
+                if let Some(ref last_run) = sched.last_run {
+                    let (icon, color) = match last_run.status.as_str() {
+                        "success" => (" \u{2713}", theme.status_success),
+                        "error" => (" \u{2717}", theme.status_error),
+                        "running" => (" \u{25cf}", theme.status_warning),
+                        _ => (" ?", theme.text_muted),
+                    };
+                    suffixes.push(Span::styled(icon, Style::default().fg(color)));
+                }
+            }
+
+            // Compute suffix width for name budget.
+            let suffix_width: usize = suffixes.iter().map(Span::width).sum();
+            let name_budget = max_width.saturating_sub(suffix_width);
             let display_name = if entry.name.len() > name_budget {
                 format!("{}…", &entry.name[..name_budget.saturating_sub(1)])
             } else {
                 entry.name.clone()
             };
 
-            if schedule_suffix.is_empty() {
-                ListItem::new(Span::styled(
-                    display_name,
-                    Style::default().fg(theme.text_primary),
-                ))
-            } else {
-                ListItem::new(Line::from(vec![
-                    Span::styled(display_name, Style::default().fg(theme.text_primary)),
-                    Span::styled(schedule_suffix, Style::default().fg(theme.text_muted)),
-                ]))
-            }
+            let mut spans = vec![Span::styled(
+                display_name,
+                Style::default().fg(theme.text_primary),
+            )];
+            spans.extend(suffixes);
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
     let total = items.len();
-    let list = List::new(items).highlight_style(
+    let highlight = if is_focused {
         Style::default()
             .bg(theme.surface_highlight)
-            .add_modifier(Modifier::BOLD),
-    );
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.text_accent)
+            .add_modifier(Modifier::BOLD)
+    };
+    let list = List::new(items).highlight_style(highlight);
 
     #[allow(clippy::cast_possible_truncation)]
     let visible_height = area.height as usize;
@@ -625,6 +656,343 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
             }),
             &mut sb_state,
         );
+    }
+}
+
+/// Render the right-pane detail view for the selected saved query.
+#[allow(clippy::too_many_lines)]
+fn render_saved_detail(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    // Inset 1 col from the left to visually separate from the list pane.
+    let area = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+
+    match app.panel.saved_focus {
+        SavedFocus::List => {
+            // Show a hint when no detail pane is active.
+            let hint = Paragraph::new("Enter/\u{2192} to view run history")
+                .style(Style::default().fg(theme.text_muted));
+            frame.render_widget(hint, area);
+        }
+        SavedFocus::Detail => {
+            render_saved_detail_inner(app, theme, frame, area);
+        }
+        SavedFocus::RunResults => {
+            render_saved_run_results(app, theme, frame, area);
+        }
+    }
+}
+
+/// Render the detail view: query info header + run history sub-list.
+#[allow(clippy::too_many_lines)]
+fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let selected_idx = app.panel.saved_selected;
+    let Some(ref saved) = app.saved_cache else {
+        return;
+    };
+    let Some(entry) = saved.queries.get(selected_idx) else {
+        return;
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // -- name --
+    lines.push(Line::from(Span::styled(
+        entry.name.clone(),
+        Style::default()
+            .fg(theme.text_primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    // -- separator --
+    #[allow(clippy::cast_possible_truncation)]
+    let sep_width = area.width.min(40) as usize;
+    lines.push(Line::from(Span::styled(
+        "\u{2500}".repeat(sep_width),
+        Style::default().fg(theme.text_muted),
+    )));
+
+    // -- query DSL --
+    let label_style = Style::default().fg(theme.text_muted);
+    let value_style = Style::default().fg(theme.text_primary);
+    lines.push(Line::from(vec![
+        Span::styled("query  ", label_style),
+        Span::styled(entry.query.replace('\n', " "), value_style),
+    ]));
+
+    // -- schedule info --
+    if let Some(ref sched) = entry.schedule {
+        let enabled_str = if sched.enabled { "enabled" } else { "paused" };
+        lines.push(Line::from(vec![
+            Span::styled("sched  ", label_style),
+            Span::styled(
+                format!("every {} ({})", sched.interval, enabled_str),
+                value_style,
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("runs   ", label_style),
+            Span::styled(sched.total_runs.to_string(), value_style),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("sched  ", label_style),
+            Span::styled("none", Style::default().fg(theme.text_muted)),
+        ]));
+    }
+
+    lines.push(Line::default());
+
+    // -- runs sub-list header --
+    let Some(ref detail) = app.panel.saved_detail else {
+        lines.push(Line::from(Span::styled(
+            "loading runs...",
+            Style::default().fg(theme.text_muted),
+        )));
+        let p = Paragraph::new(lines);
+        frame.render_widget(p, area);
+        return;
+    };
+
+    if detail.loading {
+        lines.push(Line::from(Span::styled(
+            "loading runs...",
+            Style::default().fg(theme.text_muted),
+        )));
+        let p = Paragraph::new(lines);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    if detail.runs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no runs yet",
+            Style::default().fg(theme.text_muted),
+        )));
+        let p = Paragraph::new(lines);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let header_lines = lines.len();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "runs ({} total)  \u{2191}\u{2193} navigate  Enter view  q query",
+            detail.total_runs
+        ),
+        Style::default().fg(theme.text_muted),
+    )));
+
+    // Render the header as a paragraph, then the run list below it.
+    let header_height = header_lines + 1; // +1 for the runs header
+    #[allow(clippy::cast_possible_truncation)]
+    let header_h = (header_height as u16).min(area.height);
+    let [header_area, list_area] =
+        Layout::vertical([Constraint::Length(header_h), Constraint::Min(1)]).areas(area);
+
+    let header_p = Paragraph::new(lines);
+    frame.render_widget(header_p, header_area);
+
+    // Render run items as a List widget.
+    let run_items: Vec<ListItem<'_>> = detail
+        .runs
+        .iter()
+        .map(|run| {
+            let (icon, icon_color) = match run.status.as_str() {
+                "success" => ("\u{2713}", theme.status_success),
+                "error" => ("\u{2717}", theme.status_error),
+                "running" => ("\u{25cf}", theme.status_warning),
+                "timeout" => ("\u{25cb}", theme.status_warning),
+                _ => ("?", theme.text_muted),
+            };
+
+            let time_str = format_relative_time(&run.started_at);
+            let rows_str = run
+                .row_count
+                .map(|r| format!(" {r} rows"))
+                .unwrap_or_default();
+            let dur_str = run
+                .duration_ms
+                .map(|d| format!(" {d}ms"))
+                .unwrap_or_default();
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+                Span::styled(
+                    format!("#{:<5}", run.id),
+                    Style::default().fg(theme.text_accent),
+                ),
+                Span::styled(time_str, Style::default().fg(theme.text_muted)),
+                Span::styled(dur_str, Style::default().fg(theme.text_primary)),
+                Span::styled(rows_str, Style::default().fg(theme.text_muted)),
+            ]))
+        })
+        .collect();
+
+    let run_total = run_items.len();
+    let run_list = List::new(run_items).highlight_style(
+        Style::default()
+            .bg(theme.surface_highlight)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    #[allow(clippy::cast_possible_truncation)]
+    let visible_height = list_area.height as usize;
+    let offset = compute_center_offset(detail.run_selected, visible_height, run_total);
+    let mut state = ListState::default().with_offset(offset);
+    state.select(Some(detail.run_selected));
+    frame.render_stateful_widget(run_list, list_area, &mut state);
+
+    if run_total > visible_height {
+        let mut sb_state = ScrollbarState::new(run_total).position(offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("\u{2191}"))
+            .end_symbol(Some("\u{2193}"));
+        frame.render_stateful_widget(
+            scrollbar,
+            list_area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut sb_state,
+        );
+    }
+}
+
+/// Render run results in a simple table view.
+#[allow(clippy::too_many_lines)]
+fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let Some(ref detail) = app.panel.saved_detail else {
+        return;
+    };
+    let Some(ref result) = detail.result else {
+        let p = Paragraph::new("loading result...").style(Style::default().fg(theme.text_muted));
+        frame.render_widget(p, area);
+        return;
+    };
+
+    // Get the run summary for the title.
+    let run_info = detail.runs.get(detail.run_selected);
+    let title_str = if let Some(run) = run_info {
+        let time_str = format_relative_time(&run.started_at);
+        format!(
+            "Run #{} ({}, {} rows)  Esc back  q query",
+            run.id,
+            time_str.trim(),
+            result.rows.len()
+        )
+    } else {
+        format!("{} rows", result.rows.len())
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // -- title --
+    lines.push(Line::from(Span::styled(
+        title_str,
+        Style::default()
+            .fg(theme.text_primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    // -- column headers --
+    let col_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+    // Compute column widths: max of header width and first few data rows.
+    let col_widths: Vec<usize> = col_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let mut w = name.len();
+            for row in result.rows.iter().take(100) {
+                if let Some(val) = row.get(i) {
+                    w = w.max(format_value(val).len());
+                }
+            }
+            w.min(30) // cap at 30 chars
+        })
+        .collect();
+
+    let header_spans: Vec<Span<'static>> = col_names
+        .iter()
+        .zip(&col_widths)
+        .map(|(name, &width)| {
+            Span::styled(
+                format!("{name:<width$}  "),
+                Style::default()
+                    .fg(theme.text_accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect();
+    lines.push(Line::from(header_spans));
+
+    // -- separator --
+    #[allow(clippy::cast_possible_truncation)]
+    let sep_width = area.width as usize;
+    lines.push(Line::from(Span::styled(
+        "\u{2500}".repeat(sep_width),
+        Style::default().fg(theme.text_muted),
+    )));
+
+    // -- data rows (windowed by scroll offset) --
+    #[allow(clippy::cast_possible_truncation)]
+    let visible_rows = (area.height as usize).saturating_sub(lines.len() + 1); // reserve for footer
+    let scroll = detail.result_scroll;
+    let total_rows = result.rows.len();
+    let start = scroll.min(total_rows);
+    let end = (start + visible_rows).min(total_rows);
+
+    for row in &result.rows[start..end] {
+        let row_spans: Vec<Span<'static>> = row
+            .iter()
+            .zip(&col_widths)
+            .map(|(val, &width)| {
+                let display = format_value(val);
+                let truncated = if display.len() > width {
+                    format!("{}…", &display[..width.saturating_sub(1)])
+                } else {
+                    display
+                };
+                Span::styled(
+                    format!("{truncated:<width$}  "),
+                    Style::default().fg(theme.text_primary),
+                )
+            })
+            .collect();
+        lines.push(Line::from(row_spans));
+    }
+
+    // -- scroll indicator --
+    if total_rows > visible_rows {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "rows {}-{} of {} (\u{2191}\u{2193} scroll)",
+                start + 1,
+                end,
+                total_rows,
+            ),
+            Style::default().fg(theme.text_muted),
+        )));
+    }
+
+    let p = Paragraph::new(lines);
+    frame.render_widget(p, area);
+}
+
+/// Format a `Value` for display in the run results table.
+fn format_value(val: &trawl_api::value::Value) -> String {
+    match val {
+        trawl_api::value::Value::Null => "NULL".to_owned(),
+        trawl_api::value::Value::Boolean(b) => b.to_string(),
+        trawl_api::value::Value::Integer(i) => i.to_string(),
+        trawl_api::value::Value::Float(f) => format!("{f:.2}"),
+        trawl_api::value::Value::String(s) => s.clone(),
+        trawl_api::value::Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(format_value).collect();
+            format!("[{}]", inner.join(", "))
+        }
     }
 }
 

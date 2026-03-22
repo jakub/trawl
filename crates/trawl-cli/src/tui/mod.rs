@@ -85,6 +85,16 @@ pub(super) enum MutationResult {
     ScheduleSet { saved_query_id: i64 },
     /// Dashboard snapshot received from server (Err on failure — preserves cached data).
     DashboardUpdate(Result<Box<trawl_client::DashboardSnapshot>, String>),
+    /// Report runs loaded for a saved query.
+    RunsLoaded {
+        saved_id: i64,
+        runs: Vec<trawl_client::ReportRunSummary>,
+        total: usize,
+    },
+    /// A specific run's result data loaded.
+    RunResultLoaded {
+        result: trawl_api::value::QueryResult,
+    },
     /// Mutation failed.
     Error { message: String },
 }
@@ -292,6 +302,54 @@ impl App {
         });
     }
 
+    /// Fetch report runs for a saved query (async, results arrive via mutation channel).
+    fn fetch_runs(&self, saved_id: i64) {
+        let client = self.client.clone();
+        let mutation_tx = self.mutation_tx.clone();
+        tokio::spawn(async move {
+            let result = match client.list_report_runs(saved_id, Some(50), None).await {
+                Ok(resp) => MutationResult::RunsLoaded {
+                    saved_id,
+                    runs: resp.runs,
+                    total: resp.total,
+                },
+                Err(e) => {
+                    tracing::error!("failed to fetch runs for saved query {saved_id}: {e}");
+                    MutationResult::Error {
+                        message: format!("Failed to fetch runs: {e}"),
+                    }
+                }
+            };
+            let _ = mutation_tx.send(result);
+        });
+    }
+
+    /// Fetch a specific run's result data (async, results arrive via mutation channel).
+    fn fetch_run_result(&self, saved_id: i64, run_id: i64) {
+        let client = self.client.clone();
+        let mutation_tx = self.mutation_tx.clone();
+        tokio::spawn(async move {
+            let result = match client.get_report_run(saved_id, run_id).await {
+                Ok(resp) => {
+                    if let Some(qr) = resp.result {
+                        MutationResult::RunResultLoaded { result: qr }
+                    } else {
+                        MutationResult::Error {
+                            message: "Run has no result data".to_owned(),
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("failed to fetch run result: {e}");
+                    MutationResult::Error {
+                        message: format!("Failed to fetch run result: {e}"),
+                    }
+                }
+            };
+            let _ = mutation_tx.send(result);
+        });
+    }
+
     /// Poll for mutation results and refresh caches.
     pub fn poll_mutations(&mut self) {
         while let Ok(mutation_result) = self.mutation_rx.try_recv() {
@@ -347,6 +405,32 @@ impl App {
                         }
                     }
                     self.dashboard.clear_inflight();
+                }
+                MutationResult::RunsLoaded {
+                    saved_id,
+                    runs,
+                    total,
+                } => {
+                    tracing::debug!("loaded {} runs for saved query {saved_id}", runs.len());
+                    self.panel.saved_detail = Some(state::SavedDetailState {
+                        saved_id,
+                        runs,
+                        total_runs: total,
+                        run_selected: 0,
+                        run_scroll: 0,
+                        result: None,
+                        result_scroll: 0,
+                        loading: false,
+                    });
+                    self.panel.saved_focus = state::SavedFocus::Detail;
+                }
+                MutationResult::RunResultLoaded { result } => {
+                    tracing::debug!("loaded run result data");
+                    if let Some(ref mut detail) = self.panel.saved_detail {
+                        detail.result = Some(result);
+                        detail.result_scroll = 0;
+                    }
+                    self.panel.saved_focus = state::SavedFocus::RunResults;
                 }
                 MutationResult::Error { message } => {
                     tracing::error!("mutation error: {message}");
@@ -519,6 +603,27 @@ impl App {
                         schema.filter.clear();
                     }
                     return;
+                }
+                // Saved tab: navigate focus back before leaving the tab
+                if self.main_tab == MainTab::Saved {
+                    match self.panel.saved_focus {
+                        state::SavedFocus::RunResults => {
+                            // Back to detail view, clear loaded result
+                            if let Some(ref mut detail) = self.panel.saved_detail {
+                                detail.result = None;
+                                detail.result_scroll = 0;
+                            }
+                            self.panel.saved_focus = state::SavedFocus::Detail;
+                            return;
+                        }
+                        state::SavedFocus::Detail => {
+                            // Back to list, clear detail state
+                            self.panel.saved_detail = None;
+                            self.panel.saved_focus = state::SavedFocus::List;
+                            return;
+                        }
+                        state::SavedFocus::List => {} // fall through to switch to Query
+                    }
                 }
                 self.switch_to_main_tab(MainTab::Query);
                 return;

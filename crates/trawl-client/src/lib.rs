@@ -18,8 +18,9 @@ pub use types::{
     ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,
     DashboardSnapshot, DeleteSavedResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse,
     ErrorSpan, ExportFormat, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
-    HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse, ListSavedResponse,
-    PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, SavedQueryResponse,
+    HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse,
+    ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
+    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
     SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent, UpdateSavedRequest,
     ValidationResponse, WhoAmIResponse,
 };

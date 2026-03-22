@@ -484,6 +484,40 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
     common
 }
 
+/// Focus state for the Saved tab's two-pane layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SavedFocus {
+    /// Left pane: saved query list.
+    #[default]
+    List,
+    /// Right pane: detail view with run history sub-list.
+    Detail,
+    /// Right pane: run results table (replaces detail on Enter).
+    RunResults,
+}
+
+/// State for the saved tab detail pane (right side).
+#[derive(Debug, Clone)]
+pub struct SavedDetailState {
+    /// ID of the saved query whose runs are loaded.
+    pub saved_id: i64,
+    /// Report runs for the selected saved query.
+    pub runs: Vec<trawl_api::ReportRunSummary>,
+    /// Total runs on the server (for display).
+    pub total_runs: usize,
+    /// Currently selected run in the list.
+    pub run_selected: usize,
+    /// Scroll offset for the run list (used by rendering).
+    #[allow(dead_code)] // Consumed by render code via `compute_center_offset`
+    pub run_scroll: usize,
+    /// Loaded result data for viewing a specific run.
+    pub result: Option<trawl_api::value::QueryResult>,
+    /// Scroll offset for result rows.
+    pub result_scroll: usize,
+    /// Whether runs are currently being fetched.
+    pub loading: bool,
+}
+
 /// Panel state for non-Query tabs (schema, history, saved).
 #[derive(Debug, Clone)]
 pub struct PanelState {
@@ -493,6 +527,10 @@ pub struct PanelState {
     pub history_selected: usize,
     /// Selected index in the saved queries list.
     pub saved_selected: usize,
+    /// Focus state for the saved tab two-pane layout.
+    pub saved_focus: SavedFocus,
+    /// Detail pane state for the selected saved query (runs + result).
+    pub saved_detail: Option<SavedDetailState>,
 }
 
 impl PanelState {
@@ -501,6 +539,8 @@ impl PanelState {
             schema: None,
             history_selected: 0,
             saved_selected: 0,
+            saved_focus: SavedFocus::default(),
+            saved_detail: None,
         }
     }
 }
