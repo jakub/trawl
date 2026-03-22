@@ -22,7 +22,7 @@ expression: terminal.backend().to_string()
 "│               │  Shift+Enter     - execute query             │               │"
 "│               │  Ctrl+Enter      - execute query (alt)       │               │"
 "│               └──────────────────────────────────────────────┘               │"
-"│                              Client: 0.1.11                                  │"
+"│                              Client: 0.1.12                                  │"
 "│                              Server: —                                       │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 " [editor]                    Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear"
