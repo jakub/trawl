@@ -120,8 +120,8 @@ impl IntoResponse for ServerError {
                     format!("result exceeded {n} row limit"),
                 ),
             ),
-            // Database errors are server-side — don't leak details.
-            Self::Engine(EngineError::Database(_)) => (
+            // Database/IO errors are server-side — don't leak details.
+            Self::Engine(EngineError::Database(_) | EngineError::Io(_)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),
             ),

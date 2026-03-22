@@ -441,6 +441,124 @@ impl Executor {
         cleanup(&self.conn);
         Ok(())
     }
+
+    /// Write an in-memory [`QueryResult`] to a Parquet file.
+    ///
+    /// Serializes the result as temp ndjson, then uses `DuckDB` `COPY TO`
+    /// for efficient columnar conversion with Snappy compression.
+    /// Returns the number of rows written.
+    pub fn write_query_result_to_parquet(
+        &self,
+        result: &QueryResult,
+        path: &Path,
+    ) -> Result<usize, EngineError> {
+        if result.rows.is_empty() {
+            return Ok(0);
+        }
+
+        let path_str = path.to_str().ok_or_else(|| {
+            EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+                message: "output path is not valid UTF-8".into(),
+            })
+        })?;
+
+        // Write result as temp ndjson.
+        let tmp_json = format!("{path_str}.ndjson.tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_json)?;
+            for row in &result.rows {
+                let mut map = serde_json::Map::with_capacity(result.columns.len());
+                for (col, val) in result.columns.iter().zip(row.iter()) {
+                    map.insert(col.name.clone(), value_to_json(val));
+                }
+                serde_json::to_writer(&mut file, &map).map_err(|e| {
+                    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+                        message: format!("failed to serialize result row: {e}"),
+                    })
+                })?;
+                file.write_all(b"\n")?;
+            }
+            file.flush()?;
+        }
+
+        // Use DuckDB to convert ndjson → parquet.
+        let safe_json = tmp_json.replace('\'', "''");
+        let safe_path = path_str.replace('\'', "''");
+        let copy_sql = format!(
+            "COPY (SELECT * FROM read_json('{safe_json}', format='newline_delimited', \
+             records=true, auto_detect=true, field_appearance_threshold=0)) \
+             TO '{safe_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+        );
+
+        let copy_result = self.conn.execute_batch(&copy_sql);
+
+        // Always clean up the temp ndjson file.
+        let _ = std::fs::remove_file(&tmp_json);
+
+        copy_result?;
+        Ok(result.rows.len())
+    }
+
+    /// Read a Parquet file into a [`QueryResult`].
+    ///
+    /// Used by the API's `get_report_run` endpoint to serve historical
+    /// scheduled query results.
+    pub fn read_parquet_to_result(
+        &self,
+        path: &Path,
+        max_rows: usize,
+    ) -> Result<QueryResult, EngineError> {
+        let path_str = path.to_str().ok_or_else(|| {
+            EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+                message: "parquet path is not valid UTF-8".into(),
+            })
+        })?;
+
+        let safe_path = path_str.replace('\'', "''");
+        let sql = format!(
+            "SELECT * FROM read_parquet('{safe_path}', union_by_name=true) LIMIT {max_rows}"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut result_rows = stmt.query([])?;
+
+        let stmt_ref =
+            result_rows
+                .as_ref()
+                .ok_or(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    "statement unavailable after query execution".into(),
+                )))?;
+        let col_count = stmt_ref.column_count();
+        let columns: Vec<Column> = stmt_ref
+            .column_names()
+            .into_iter()
+            .map(|name| Column { name })
+            .collect();
+
+        let mut rows = Vec::new();
+        while let Some(row) = result_rows.next()? {
+            let mut cells = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                cells.push(extract_value(row, i, 0));
+            }
+            rows.push(cells);
+        }
+
+        Ok(QueryResult { columns, rows })
+    }
+}
+
+/// Convert a [`Value`] to a [`serde_json::Value`] for ndjson serialization.
+fn value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Integer(n) => serde_json::json!(n),
+        Value::Float(f) => serde_json::json!(f),
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
+    }
 }
 
 /// `DuckDB` error substring for "no matching files" — verified against `DuckDB` 1.4.x.

@@ -24,6 +24,10 @@ pub enum EngineError {
     /// Query produced more rows than the configured limit.
     #[error("result too large: query returned more than {0} rows")]
     ResultTooLarge(usize),
+
+    /// Filesystem I/O error (e.g. writing temp files for parquet export).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 fn format_parse_errors(errors: &[ParseError]) -> String {
