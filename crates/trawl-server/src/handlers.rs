@@ -1082,6 +1082,7 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
         duration_ms: run.duration_ms,
         row_count: run.row_count,
         error_message: run.error_message,
+        result_path: run.result_path,
     }
 }
 

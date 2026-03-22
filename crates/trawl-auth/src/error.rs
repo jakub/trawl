@@ -74,4 +74,11 @@ pub enum AuthError {
         /// The saved query that already has a schedule.
         saved_query_id: i64,
     },
+
+    /// Saved query name contains invalid characters.
+    #[error("invalid saved query name '{name}': must match [a-zA-Z0-9_-]+")]
+    InvalidName {
+        /// The rejected name.
+        name: String,
+    },
 }

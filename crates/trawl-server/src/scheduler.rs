@@ -100,14 +100,28 @@ async fn scheduler_loop(
         if retention_counter >= retention_interval {
             retention_counter = 0;
             let store = schedule_store.lock();
-            if let Err(e) =
-                store.delete_old_runs(config.report_retention_days, config.max_runs_per_schedule)
+            match store.delete_old_runs(config.report_retention_days, config.max_runs_per_schedule)
             {
-                tracing::warn!(
-                    event_type = "scheduler_retention_error",
-                    error = %e,
-                    "failed to clean up old report runs"
-                );
+                Ok((_count, paths)) => {
+                    // Clean up parquet files from disk for deleted runs.
+                    for path in paths {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            tracing::warn!(
+                                event_type = "scheduler_retention_file_error",
+                                path = %path,
+                                error = %e,
+                                "failed to delete parquet file for expired run"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event_type = "scheduler_retention_error",
+                        error = %e,
+                        "failed to clean up old report runs"
+                    );
+                }
             }
         }
     }
@@ -253,6 +267,7 @@ async fn execute_scheduled_query(
                 Some(row_count),
                 None,
                 result_data.as_deref(),
+                None,
             ) {
                 tracing::error!(
                     event_type = "scheduler_error",
@@ -278,9 +293,15 @@ async fn execute_scheduled_query(
                 ("error", format!("{e}"))
             };
 
-            if let Err(e2) =
-                store.finish_run(run_id, status, duration_ms, None, Some(&error_msg), None)
-            {
+            if let Err(e2) = store.finish_run(
+                run_id,
+                status,
+                duration_ms,
+                None,
+                Some(&error_msg),
+                None,
+                None,
+            ) {
                 tracing::error!(
                     event_type = "scheduler_error",
                     run_id,

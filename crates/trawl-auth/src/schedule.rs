@@ -44,6 +44,8 @@ pub struct ReportRun {
     pub duration_ms: Option<u64>,
     pub row_count: Option<usize>,
     pub error_message: Option<String>,
+    /// Filesystem path to the parquet result file (relative to data dir).
+    pub result_path: Option<String>,
 }
 
 /// Parse a duration string (same syntax as the DSL `last:` filter) into seconds.
@@ -117,6 +119,7 @@ fn row_to_report_run(row: &rusqlite::Row<'_>) -> Result<ReportRun, rusqlite::Err
         duration_ms: row.get(7)?,
         row_count: row.get(8)?,
         error_message: row.get(9)?,
+        result_path: row.get(10)?,
     })
 }
 
@@ -196,6 +199,21 @@ impl ScheduleStore {
             CREATE INDEX IF NOT EXISTS idx_report_runs_schedule
                 ON report_runs (schedule_id, started_at DESC);",
         )?;
+        self.migrate_result_path()?;
+        Ok(())
+    }
+
+    /// Add `result_path` column to `report_runs` if it doesn't exist.
+    fn migrate_result_path(&self) -> Result<(), AuthError> {
+        let has_column: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('report_runs') WHERE name = 'result_path'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_column {
+            self.conn
+                .execute_batch("ALTER TABLE report_runs ADD COLUMN result_path TEXT")?;
+        }
         Ok(())
     }
 
@@ -428,7 +446,7 @@ impl ScheduleStore {
         Ok(Some(id))
     }
 
-    /// Finish a run with status, timing, and optional compressed result blob.
+    /// Finish a run with status, timing, and optional result path or blob.
     #[allow(clippy::too_many_arguments)]
     pub fn finish_run(
         &self,
@@ -438,14 +456,15 @@ impl ScheduleStore {
         row_count: Option<usize>,
         error_message: Option<&str>,
         result_data: Option<&[u8]>,
+        result_path: Option<&str>,
     ) -> Result<(), AuthError> {
         let now = Utc::now().to_rfc3339();
 
         self.conn.execute(
             "UPDATE report_runs
              SET status = ?1, finished_at = ?2, duration_ms = ?3, row_count = ?4,
-                 error_message = ?5, result_data = ?6
-             WHERE id = ?7",
+                 error_message = ?5, result_data = ?6, result_path = ?7
+             WHERE id = ?8",
             params![
                 status,
                 &now,
@@ -453,6 +472,7 @@ impl ScheduleStore {
                 row_count.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 error_message,
                 result_data,
+                result_path,
                 run_id,
             ],
         )?;
@@ -478,7 +498,7 @@ impl ScheduleStore {
     ) -> Result<Vec<ReportRun>, AuthError> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, r.schedule_id, r.saved_query_id, r.query, r.status,
-                    r.started_at, r.finished_at, r.duration_ms, r.row_count, r.error_message
+                    r.started_at, r.finished_at, r.duration_ms, r.row_count, r.error_message, r.result_path
              FROM report_runs r
              JOIN schedules s ON s.id = r.schedule_id
              WHERE r.saved_query_id = ?1 AND s.key_id = ?2
@@ -505,7 +525,7 @@ impl ScheduleStore {
     pub fn get_run(&self, run_id: i64, key_id: i64) -> Result<Option<ReportRun>, AuthError> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, r.schedule_id, r.saved_query_id, r.query, r.status,
-                    r.started_at, r.finished_at, r.duration_ms, r.row_count, r.error_message
+                    r.started_at, r.finished_at, r.duration_ms, r.row_count, r.error_message, r.result_path
              FROM report_runs r
              JOIN schedules s ON s.id = r.schedule_id
              WHERE r.id = ?1 AND s.key_id = ?2",
@@ -550,7 +570,7 @@ impl ScheduleStore {
     pub fn latest_run(&self, schedule_id: i64) -> Result<Option<ReportRun>, AuthError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, schedule_id, saved_query_id, query, status,
-                    started_at, finished_at, duration_ms, row_count, error_message
+                    started_at, finished_at, duration_ms, row_count, error_message, result_path
              FROM report_runs
              WHERE schedule_id = ?1
              ORDER BY started_at DESC
@@ -562,6 +582,44 @@ impl ScheduleStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Get the most recent successful run for a saved query (for `run=latest` resolution).
+    pub fn latest_successful_run(
+        &self,
+        saved_query_id: i64,
+    ) -> Result<Option<ReportRun>, AuthError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schedule_id, saved_query_id, query, status,
+                    started_at, finished_at, duration_ms, row_count, error_message, result_path
+             FROM report_runs
+             WHERE saved_query_id = ?1 AND status = 'success' AND result_path IS NOT NULL
+             ORDER BY started_at DESC
+             LIMIT 1",
+        )?;
+
+        match stmt.query_row(params![saved_query_id], row_to_report_run) {
+            Ok(run) => Ok(Some(run)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List all successful runs with parquet results for a saved query (for `run=all`).
+    pub fn list_successful_runs(&self, saved_query_id: i64) -> Result<Vec<ReportRun>, AuthError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schedule_id, saved_query_id, query, status,
+                    started_at, finished_at, duration_ms, row_count, error_message, result_path
+             FROM report_runs
+             WHERE saved_query_id = ?1 AND status = 'success' AND result_path IS NOT NULL
+             ORDER BY started_at ASC",
+        )?;
+
+        let runs = stmt
+            .query_map(params![saved_query_id], row_to_report_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(runs)
     }
 
     /// Mark any runs with status `running` as `error` (crash recovery on startup).
@@ -587,16 +645,57 @@ impl ScheduleStore {
 
     /// Delete old runs for retention. Keeps at most `max_per_schedule` runs per schedule,
     /// and deletes any runs older than `max_age_days`.
+    ///
+    /// Returns `(count_deleted, result_paths)` — the caller is responsible for
+    /// deleting the corresponding parquet files from disk.
     pub fn delete_old_runs(
         &self,
         max_age_days: u64,
         max_per_schedule: u64,
-    ) -> Result<usize, AuthError> {
+    ) -> Result<(usize, Vec<String>), AuthError> {
         let cutoff =
             Utc::now() - chrono::Duration::days(i64::try_from(max_age_days).unwrap_or(365));
         let cutoff_str = cutoff.to_rfc3339();
 
-        // Delete runs older than max_age_days.
+        // Collect result_path values of runs that will be deleted, so the
+        // caller can clean up parquet files from disk.
+        let mut paths = Vec::new();
+
+        // Paths from age-expired runs.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT result_path FROM report_runs WHERE started_at < ?1 AND result_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![&cutoff_str], |row| row.get::<_, String>(0))?;
+            for path in rows {
+                paths.push(path?);
+            }
+        }
+
+        // Paths from excess runs per schedule.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT result_path FROM report_runs
+                 WHERE result_path IS NOT NULL AND id NOT IN (
+                     SELECT id FROM (
+                         SELECT id, ROW_NUMBER() OVER (
+                             PARTITION BY schedule_id ORDER BY started_at DESC
+                         ) AS rn
+                         FROM report_runs
+                     )
+                     WHERE rn <= ?1
+                 )",
+            )?;
+            let rows = stmt.query_map(
+                params![i64::try_from(max_per_schedule).unwrap_or(i64::MAX)],
+                |row| row.get::<_, String>(0),
+            )?;
+            for path in rows {
+                paths.push(path?);
+            }
+        }
+
+        // Delete age-expired runs.
         let age_deleted = self.conn.execute(
             "DELETE FROM report_runs WHERE started_at < ?1",
             params![&cutoff_str],
@@ -623,11 +722,12 @@ impl ScheduleStore {
                 event_type = "old_runs_deleted",
                 age_deleted,
                 excess_deleted,
+                parquet_paths = paths.len(),
                 "Deleted old report runs"
             );
         }
 
-        Ok(total)
+        Ok((total, paths))
     }
 
     /// Count total runs for a saved query (for pagination).
@@ -832,7 +932,7 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .finish_run(run_id, "success", 100, Some(5), None, None)
+            .finish_run(run_id, "success", 100, Some(5), None, None, None)
             .unwrap();
 
         // Delete the saved query — should cascade to schedule and runs.
@@ -876,6 +976,7 @@ mod tests {
                 Some(42),
                 None,
                 Some(b"compressed-data"),
+                None,
             )
             .unwrap();
 
@@ -904,7 +1005,7 @@ mod tests {
 
         // After finishing, should be able to start again.
         store
-            .finish_run(run_id.unwrap(), "success", 100, None, None, None)
+            .finish_run(run_id.unwrap(), "success", 100, None, None, None, None)
             .unwrap();
         let third = store.start_run(schedule.id, sq_id, "q").unwrap();
         assert!(third.is_some());
@@ -920,7 +1021,15 @@ mod tests {
             let run_id = store.start_run(schedule.id, sq_id, "q").unwrap().unwrap();
             #[allow(clippy::cast_possible_truncation)]
             store
-                .finish_run(run_id, "success", (i as u64) * 100, Some(i), None, None)
+                .finish_run(
+                    run_id,
+                    "success",
+                    (i as u64) * 100,
+                    Some(i),
+                    None,
+                    None,
+                    None,
+                )
                 .unwrap();
         }
 
@@ -939,7 +1048,7 @@ mod tests {
 
         let run_id = store.start_run(schedule.id, sq_id, "q").unwrap().unwrap();
         store
-            .finish_run(run_id, "success", 100, None, None, None)
+            .finish_run(run_id, "success", 100, None, None, None, None)
             .unwrap();
 
         // User 2 should see no runs.
@@ -978,7 +1087,7 @@ mod tests {
 
         let run_id = store.start_run(schedule.id, sq_id, "q").unwrap().unwrap();
         store
-            .finish_run(run_id, "success", 100, None, None, None)
+            .finish_run(run_id, "success", 100, None, None, None, None)
             .unwrap();
 
         assert_eq!(store.count_runs(schedule.id).unwrap(), 1);
@@ -994,12 +1103,12 @@ mod tests {
 
         let run_id = store.start_run(schedule.id, sq_id, "q1").unwrap().unwrap();
         store
-            .finish_run(run_id, "success", 100, None, None, None)
+            .finish_run(run_id, "success", 100, None, None, None, None)
             .unwrap();
 
         let run_id = store.start_run(schedule.id, sq_id, "q2").unwrap().unwrap();
         store
-            .finish_run(run_id, "error", 50, None, Some("boom"), None)
+            .finish_run(run_id, "error", 50, None, Some("boom"), None, None)
             .unwrap();
 
         let latest = store.latest_run(schedule.id).unwrap().unwrap();
@@ -1034,7 +1143,7 @@ mod tests {
 
         let run_id = store.start_run(schedule.id, sq_id, "q").unwrap().unwrap();
         store
-            .finish_run(run_id, "success", 100, None, None, None)
+            .finish_run(run_id, "success", 100, None, None, None, None)
             .unwrap();
 
         assert_eq!(store.count_runs_for_saved_query(sq_id, 1).unwrap(), 1);

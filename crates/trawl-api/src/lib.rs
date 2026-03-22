@@ -770,6 +770,9 @@ pub struct ReportRunSummary {
     /// Error message (if status is "error").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Filesystem path to the parquet result file (relative to data dir).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<String>,
 }
 
 /// Paginated list of report runs.

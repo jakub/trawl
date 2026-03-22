@@ -15,6 +15,20 @@ use rusqlite::params;
 
 use crate::error::AuthError;
 
+/// Validate that a saved query name matches `[a-zA-Z0-9_-]+`.
+fn validate_name(name: &str) -> Result<(), AuthError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(AuthError::InvalidName {
+            name: name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Map a row from the `saved_queries` table to a [`SavedQuery`].
 ///
 /// Expects columns in order: id, `key_id`, name, query, `created_at`, `updated_at`.
@@ -105,10 +119,27 @@ impl SavedQueryStore {
         Ok(queries)
     }
 
+    /// Look up a saved query by name for a specific user.
+    pub fn get_by_name(&self, key_id: i64, name: &str) -> Result<Option<SavedQuery>, AuthError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, key_id, name, query, created_at, updated_at
+             FROM saved_queries
+             WHERE key_id = ?1 AND name = ?2",
+        )?;
+
+        match stmt.query_row(params![key_id, name], row_to_saved_query) {
+            Ok(sq) => Ok(Some(sq)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Create a new saved query.
     ///
-    /// Returns `Conflict` if a query with the same name already exists for this user.
+    /// Returns `InvalidName` if the name contains characters outside `[a-zA-Z0-9_-]`.
+    /// Returns `DuplicateName` if a query with the same name already exists for this user.
     pub fn create(&self, key_id: i64, name: &str, query: &str) -> Result<SavedQuery, AuthError> {
+        validate_name(name)?;
         let now = Utc::now().to_rfc3339();
 
         match self.conn.execute(
@@ -233,15 +264,15 @@ mod tests {
         let key_id = 1;
 
         let saved = store
-            .create(key_id, "nginx errors", "service=nginx level=error")
+            .create(key_id, "nginx_errors", "service=nginx level=error")
             .unwrap();
 
-        assert_eq!(saved.name, "nginx errors");
+        assert_eq!(saved.name, "nginx_errors");
         assert_eq!(saved.query, "service=nginx level=error");
 
         let list = store.list(key_id).unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "nginx errors");
+        assert_eq!(list[0].name, "nginx_errors");
     }
 
     #[test]
@@ -319,32 +350,32 @@ mod tests {
     fn user_isolation() {
         let store = test_store();
 
-        store.create(1, "user1 query", "query 1").unwrap();
-        store.create(2, "user2 query", "query 2").unwrap();
-        store.create(1, "user1 another", "query 3").unwrap();
+        store.create(1, "user1_query", "query 1").unwrap();
+        store.create(2, "user2_query", "query 2").unwrap();
+        store.create(1, "user1_another", "query 3").unwrap();
 
         let user1 = store.list(1).unwrap();
         assert_eq!(user1.len(), 2);
-        assert_eq!(user1[0].name, "user1 another");
-        assert_eq!(user1[1].name, "user1 query");
+        assert_eq!(user1[0].name, "user1_another");
+        assert_eq!(user1[1].name, "user1_query");
 
         let user2 = store.list(2).unwrap();
         assert_eq!(user2.len(), 1);
-        assert_eq!(user2[0].name, "user2 query");
+        assert_eq!(user2[0].name, "user2_query");
     }
 
     #[test]
     fn list_sorted_by_name() {
         let store = test_store();
 
-        store.create(1, "z last", "query").unwrap();
-        store.create(1, "a first", "query").unwrap();
-        store.create(1, "m middle", "query").unwrap();
+        store.create(1, "z_last", "query").unwrap();
+        store.create(1, "a_first", "query").unwrap();
+        store.create(1, "m_middle", "query").unwrap();
 
         let list = store.list(1).unwrap();
-        assert_eq!(list[0].name, "a first");
-        assert_eq!(list[1].name, "m middle");
-        assert_eq!(list[2].name, "z last");
+        assert_eq!(list[0].name, "a_first");
+        assert_eq!(list[1].name, "m_middle");
+        assert_eq!(list[2].name, "z_last");
     }
 
     #[test]
@@ -352,5 +383,55 @@ mod tests {
         let store = test_store();
         let list = store.list(999).unwrap();
         assert_eq!(list.len(), 0);
+    }
+
+    #[test]
+    fn name_validation_rejects_spaces() {
+        let store = test_store();
+        let result = store.create(1, "has spaces", "query");
+        assert!(matches!(result, Err(AuthError::InvalidName { .. })));
+    }
+
+    #[test]
+    fn name_validation_rejects_special_chars() {
+        let store = test_store();
+        assert!(matches!(
+            store.create(1, "foo/bar", "q"),
+            Err(AuthError::InvalidName { .. })
+        ));
+        assert!(matches!(
+            store.create(1, "foo.bar", "q"),
+            Err(AuthError::InvalidName { .. })
+        ));
+        assert!(matches!(
+            store.create(1, "", "q"),
+            Err(AuthError::InvalidName { .. })
+        ));
+    }
+
+    #[test]
+    fn name_validation_accepts_valid_names() {
+        let store = test_store();
+        store.create(1, "daily_ip_rollup", "q").unwrap();
+        store.create(1, "hourly-error-count", "q").unwrap();
+        store.create(1, "Auth2", "q").unwrap();
+        store.create(1, "a", "q").unwrap();
+    }
+
+    #[test]
+    fn get_by_name() {
+        let store = test_store();
+        let key_id = 1;
+
+        assert!(store.get_by_name(key_id, "missing").unwrap().is_none());
+
+        store.create(key_id, "my_query", "level=error").unwrap();
+
+        let found = store.get_by_name(key_id, "my_query").unwrap().unwrap();
+        assert_eq!(found.name, "my_query");
+        assert_eq!(found.query, "level=error");
+
+        // Other user can't see it.
+        assert!(store.get_by_name(2, "my_query").unwrap().is_none());
     }
 }
