@@ -224,10 +224,20 @@ fn poll_and_execute(
         let store = Arc::clone(schedule_store);
         let pool = pool.clone();
         let query = saved_query.query.clone();
+        let query_name = saved_query.name.clone();
         let max_rows = config.report_max_rows;
 
         tokio::spawn(async move {
-            execute_scheduled_query(store, pool, run_id, &query, max_rows, timeout_secs).await;
+            execute_scheduled_query(
+                store,
+                pool,
+                run_id,
+                &query,
+                &query_name,
+                max_rows,
+                timeout_secs,
+            )
+            .await;
         });
     }
 }
@@ -237,6 +247,7 @@ async fn execute_scheduled_query(
     pool: ExecutorPool,
     run_id: i64,
     query: &str,
+    query_name: &str,
     _max_rows: usize,
     timeout_secs: u64,
 ) {
@@ -255,10 +266,9 @@ async fn execute_scheduled_query(
         Ok(query_result) => {
             let row_count = query_result.rows.len();
 
-            // Compress result as zstd JSON.
-            let result_data = serde_json::to_vec(&query_result)
-                .ok()
-                .and_then(|json| zstd::encode_all(json.as_slice(), 3).ok());
+            // Write result as parquet file.
+            let (result_path, result_data) =
+                write_result_parquet(&pool, run_id, query_name, &query_result);
 
             if let Err(e) = store.finish_run(
                 run_id,
@@ -267,7 +277,7 @@ async fn execute_scheduled_query(
                 Some(row_count),
                 None,
                 result_data.as_deref(),
-                None,
+                result_path.as_deref(),
             ) {
                 tracing::error!(
                     event_type = "scheduler_error",
@@ -282,6 +292,7 @@ async fn execute_scheduled_query(
                 run_id,
                 duration_ms,
                 row_count,
+                result_path = result_path.as_deref().unwrap_or("(blob)"),
                 "scheduled query completed"
             );
         }
@@ -320,4 +331,84 @@ async fn execute_scheduled_query(
             );
         }
     }
+}
+
+/// Write a `QueryResult` to a parquet file under `{data_dir}/scheduled/{name}/`.
+///
+/// Returns `(Some(relative_path), None)` on success, or `(None, Some(blob))`
+/// as a zstd-JSON fallback if parquet writing fails.
+fn write_result_parquet(
+    pool: &ExecutorPool,
+    run_id: i64,
+    query_name: &str,
+    result: &trawl_api::value::QueryResult,
+) -> (Option<String>, Option<Vec<u8>>) {
+    if result.rows.is_empty() {
+        return (None, None);
+    }
+
+    let base = pool.base_dir().trim_end_matches('/');
+    let relative = format!("scheduled/{query_name}/run_{run_id}.parquet");
+    let full_path = format!("{base}/{relative}");
+    let temp_path = format!("{full_path}.tmp");
+
+    // Ensure the parent directory exists.
+    if let Err(e) = std::fs::create_dir_all(format!("{base}/scheduled/{query_name}")) {
+        tracing::warn!(
+            event_type = "scheduler_parquet_error",
+            run_id,
+            error = %e,
+            "failed to create scheduled result directory, falling back to blob"
+        );
+        return zstd_fallback(result);
+    }
+
+    // Create a temporary executor for the parquet write.
+    let executor = match trawl_engine::executor::Executor::new() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                event_type = "scheduler_parquet_error",
+                run_id,
+                error = %e,
+                "failed to create executor for parquet write, falling back to blob"
+            );
+            return zstd_fallback(result);
+        }
+    };
+
+    // Write to temp file, then atomic rename.
+    let temp = std::path::Path::new(&temp_path);
+    let final_path = std::path::Path::new(&full_path);
+    if let Err(e) = executor.write_query_result_to_parquet(result, temp) {
+        tracing::warn!(
+            event_type = "scheduler_parquet_error",
+            run_id,
+            error = %e,
+            "failed to write parquet result, falling back to blob"
+        );
+        let _ = std::fs::remove_file(temp);
+        return zstd_fallback(result);
+    }
+
+    if let Err(e) = std::fs::rename(temp, final_path) {
+        tracing::warn!(
+            event_type = "scheduler_parquet_error",
+            run_id,
+            error = %e,
+            "failed to rename parquet temp file, falling back to blob"
+        );
+        let _ = std::fs::remove_file(temp);
+        return zstd_fallback(result);
+    }
+
+    (Some(relative), None)
+}
+
+/// Compress a `QueryResult` as a zstd JSON blob (fallback when parquet write fails).
+fn zstd_fallback(result: &trawl_api::value::QueryResult) -> (Option<String>, Option<Vec<u8>>) {
+    let blob = serde_json::to_vec(result)
+        .ok()
+        .and_then(|json| zstd::encode_all(json.as_slice(), 3).ok());
+    (None, blob)
 }
