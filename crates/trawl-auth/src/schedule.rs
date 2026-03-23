@@ -8,6 +8,7 @@
 //! their results. Shares the auth database file with [`KeyStore`] and
 //! [`SavedQueryStore`] via separate connection (safe with WAL mode).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::Utc;
@@ -324,6 +325,23 @@ impl ScheduleStore {
                 },
                 e => e.into(),
             })
+    }
+
+    /// Collect all non-null `result_path` values for runs belonging to a saved query.
+    ///
+    /// Call this *before* deleting a schedule or saved query so the caller can
+    /// clean up the corresponding parquet files from disk.
+    pub fn collect_run_paths(&self, saved_query_id: i64) -> Result<Vec<String>, AuthError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT result_path FROM report_runs
+             WHERE saved_query_id = ?1 AND result_path IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![saved_query_id], |row| row.get::<_, String>(0))?;
+        let mut paths = Vec::new();
+        for path in rows {
+            paths.push(path?);
+        }
+        Ok(paths)
     }
 
     /// Delete a schedule by its saved query id. Returns `NotFound` if not owned by `key_id`.
@@ -658,8 +676,9 @@ impl ScheduleStore {
         let cutoff_str = cutoff.to_rfc3339();
 
         // Collect result_path values of runs that will be deleted, so the
-        // caller can clean up parquet files from disk.
-        let mut paths = Vec::new();
+        // caller can clean up parquet files from disk. Use a set to avoid
+        // duplicates (a run can match both age and excess criteria).
+        let mut paths = HashSet::new();
 
         // Paths from age-expired runs.
         {
@@ -668,7 +687,7 @@ impl ScheduleStore {
             )?;
             let rows = stmt.query_map(params![&cutoff_str], |row| row.get::<_, String>(0))?;
             for path in rows {
-                paths.push(path?);
+                paths.insert(path?);
             }
         }
 
@@ -691,7 +710,7 @@ impl ScheduleStore {
                 |row| row.get::<_, String>(0),
             )?;
             for path in rows {
-                paths.push(path?);
+                paths.insert(path?);
             }
         }
 
@@ -727,7 +746,7 @@ impl ScheduleStore {
             );
         }
 
-        Ok((total, paths))
+        Ok((total, paths.into_iter().collect()))
     }
 
     /// Count total runs for a saved query (for pagination).

@@ -104,11 +104,15 @@ async fn scheduler_loop(
             {
                 Ok((_count, paths)) => {
                     // Clean up parquet files from disk for deleted runs.
+                    // Paths from the DB are relative (e.g. "scheduled/foo/run_1.parquet"),
+                    // so we must prepend the data directory.
+                    let base = pool.base_dir().trim_end_matches('/');
                     for path in paths {
-                        if let Err(e) = std::fs::remove_file(&path) {
+                        let full = format!("{base}/{path}");
+                        if let Err(e) = std::fs::remove_file(&full) {
                             tracing::warn!(
                                 event_type = "scheduler_retention_file_error",
-                                path = %path,
+                                path = %full,
                                 error = %e,
                                 "failed to delete parquet file for expired run"
                             );

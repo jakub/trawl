@@ -333,6 +333,11 @@ impl App {
                 Ok(resp) => {
                     if let Some(qr) = resp.result {
                         MutationResult::RunResultLoaded { result: qr }
+                    } else if resp.summary.row_count == Some(0) {
+                        // Successful run with 0 rows — show empty result, not an error.
+                        MutationResult::RunResultLoaded {
+                            result: trawl_api::value::QueryResult::empty(),
+                        }
                     } else {
                         MutationResult::Error {
                             message: "Run has no result data".to_owned(),

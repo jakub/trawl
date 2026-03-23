@@ -1036,6 +1036,14 @@ pub async fn delete_saved(
         .get_key_id_by_prefix(&verified.prefix)
         .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
 
+    // Collect parquet file paths before deletion (FK CASCADE will wipe run rows).
+    let run_paths = state
+        .auth
+        .schedule
+        .lock()
+        .collect_run_paths(id)
+        .unwrap_or_default();
+
     state
         .auth
         .saved
@@ -1047,6 +1055,8 @@ pub async fn delete_saved(
             }
             e => ServerError::Internal(format!("failed to delete saved query: {e}")),
         })?;
+
+    cleanup_run_parquet_files(&state, &run_paths);
 
     Ok(Json(DeleteSavedResponse { deleted: true }))
 }
@@ -1114,6 +1124,25 @@ fn resolve_key_id(state: &AppState, verified: &VerifiedKey) -> Result<i64, Serve
         .lock()
         .get_key_id_by_prefix(&verified.prefix)
         .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))
+}
+
+/// Remove parquet files for deleted report runs (best-effort, logs warnings on failure).
+fn cleanup_run_parquet_files(state: &AppState, relative_paths: &[String]) {
+    if relative_paths.is_empty() {
+        return;
+    }
+    let base = state.query.pool.base_dir().trim_end_matches('/');
+    for path in relative_paths {
+        let full = format!("{base}/{path}");
+        if let Err(e) = std::fs::remove_file(&full) {
+            tracing::warn!(
+                event_type = "cleanup_parquet_file_error",
+                path = %full,
+                error = %e,
+                "failed to delete parquet file for deleted run"
+            );
+        }
+    }
 }
 
 /// Try to resolve a `| from saved` stage from the DSL query.
@@ -1251,17 +1280,24 @@ pub async fn delete_schedule(
 
     let key_id = resolve_key_id(&state, &verified)?;
 
-    state
-        .auth
-        .schedule
-        .lock()
-        .delete_schedule(saved_id, key_id)
-        .map_err(|e| match e {
-            trawl_auth::AuthError::NotFound { .. } => {
-                ServerError::NotFound("schedule not found or unauthorized".into())
-            }
-            e => ServerError::Internal(format!("failed to delete schedule: {e}")),
-        })?;
+    // Collect parquet file paths before deletion (FK CASCADE will wipe the rows).
+    let run_paths = {
+        let schedule_store = state.auth.schedule.lock();
+        let paths = schedule_store
+            .collect_run_paths(saved_id)
+            .unwrap_or_default();
+        schedule_store
+            .delete_schedule(saved_id, key_id)
+            .map_err(|e| match e {
+                trawl_auth::AuthError::NotFound { .. } => {
+                    ServerError::NotFound("schedule not found or unauthorized".into())
+                }
+                e => ServerError::Internal(format!("failed to delete schedule: {e}")),
+            })?;
+        paths
+    };
+
+    cleanup_run_parquet_files(&state, &run_paths);
 
     Ok(Json(DeleteScheduleResponse { deleted: true }))
 }

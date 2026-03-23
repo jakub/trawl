@@ -40,7 +40,7 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
             }
             PipeStage::FromSaved(_) if i > 0 => {
                 return Err(EmitError::UnsupportedOperation {
-                    message: "'from' must be the first pipe stage".to_string(),
+                    message: "'from saved' must be the first pipe stage".to_string(),
                 });
             }
             // other stages have no pre-validation needs
