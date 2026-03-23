@@ -35,11 +35,10 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             arch: arm64
-            cross: false
-            os: macos-latest
+            cross: true
+            os: ubuntu-latest
     steps:
       - name: Free disk space
-        if: runner.os == 'Linux'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
@@ -48,20 +47,11 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Set version from tag (Linux)
-        if: runner.os == 'Linux'
+      - name: Set version from tag
         run: |
           version="${RELEASE_TAG#v}"
           echo "Setting workspace version to ${version}"
           sed -i "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
-          grep '^version' Cargo.toml
-
-      - name: Set version from tag (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          version="${RELEASE_TAG#v}"
-          echo "Setting workspace version to ${version}"
-          sed -i '' "1,/^version = \".*\"/s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
           grep '^version' Cargo.toml
 
       - uses: dtolnay/rust-toolchain@stable
@@ -76,8 +66,8 @@ jobs:
         if: matrix.cross
         uses: mlugg/setup-zig@v2
 
-      - name: Install cross-arch dpkg libs (cross-compile)
-        if: matrix.cross
+      - name: Install cross-arch dpkg libs (Linux cross-compile)
+        if: matrix.cross && contains(matrix.target, 'linux')
         run: |
           sudo dpkg --add-architecture arm64
           # Pin existing sources to amd64 — noble runners use DEB822 .sources
@@ -100,7 +90,6 @@ jobs:
           sudo apt-get install -y libc6-arm64-cross dpkg-dev
 
       - uses: taiki-e/install-action@v2
-        if: runner.os == 'Linux'
         with:
           tool: cargo-zigbuild,cargo-deb
 
@@ -108,12 +97,18 @@ jobs:
         if: "!matrix.cross"
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (cross)
-        if: matrix.cross
+      - name: Build (Linux cross)
+        if: matrix.cross && contains(matrix.target, 'linux')
         run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
 
+      - name: Build (macOS cross)
+        if: matrix.cross && contains(matrix.target, 'apple')
+        run: cargo zigbuild --release --target ${{ matrix.target }} --no-default-features
+        env:
+          DUCKDB_DOWNLOAD_LIB: "1"
+
       - name: Build .deb packages
-        if: runner.os == 'Linux'
+        if: contains(matrix.target, 'linux')
         run: |
           cargo deb -p trawl-server --no-build --no-strip --target ${{ matrix.target }}
           cargo deb -p trawl-cli --no-build --no-strip --target ${{ matrix.target }}
@@ -136,7 +131,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload .deb packages
-        if: runner.os == 'Linux'
+        if: contains(matrix.target, 'linux')
         uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.target }}
