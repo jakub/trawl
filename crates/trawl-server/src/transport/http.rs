@@ -165,7 +165,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             })
             .on_response(
                 |response: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
-                    tracing::info!(
+                    tracing::debug!(
                         event_type = "http_response",
                         status = response.status().as_u16(),
                         latency_ms = latency.as_millis(),
