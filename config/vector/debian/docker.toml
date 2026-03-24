@@ -46,7 +46,25 @@ if compose_svc != "" {
   }
 } else if container != "" {
   # strip leading / from container name (docker API includes it)
-  .service = replace(container, r'^/', "")
+  clean = replace(container, r'^/', "")
+  # strip swarm task suffix: name.{node/replica}.{task_id} → name
+  # matches the .{25-char-alphanumeric}.{25-char-alphanumeric} tail
+  swarm_match, err = parse_regex(clean, r'^(?P<base>.+)\.[a-z0-9]{25}\.[a-z0-9]{25}$')
+  if err == null {
+    # base may be {stack}_{service}.{replica} or {stack}_{service}
+    base = swarm_match.base
+    # strip trailing .{digit} replica number if present
+    base = replace(base, r'\.\d+$', "")
+    # extract service from {stack}_{service}
+    base_parts = split(base, "_", limit: 2)
+    if length(base_parts) > 1 {
+      .service = base_parts[1]
+    } else {
+      .service = base
+    }
+  } else {
+    .service = clean
+  }
 } else if image != "" {
   # strip tag and registry prefix: registry.io/org/name:tag → name
   parts = split(image, ":")
@@ -66,7 +84,16 @@ if compose_project != "" {
   swarm_parts_host = split(swarm_svc, "_", limit: 2)
   .host = swarm_parts_host[0]
 } else if container != "" {
-  .host = replace(container, r'^/', "")
+  clean_host = replace(container, r'^/', "")
+  # for swarm containers, use stack name as host
+  host_swarm_match, err = parse_regex(clean_host, r'^(?P<base>.+)\.[a-z0-9]{25}\.[a-z0-9]{25}$')
+  if err == null {
+    host_base = replace(host_swarm_match.base, r'\.\d+$', "")
+    host_parts = split(host_base, "_", limit: 2)
+    .host = host_parts[0]
+  } else {
+    .host = clean_host
+  }
 }
 
 # --- log level ---
