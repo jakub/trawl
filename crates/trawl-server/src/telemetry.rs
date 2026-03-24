@@ -361,7 +361,10 @@ where
         );
         record.insert("service".into(), json!("trawld"));
         record.insert("host".into(), json!(&self.inner.host));
-        record.insert("level".into(), json!(metadata.level().as_str()));
+        record.insert(
+            "level".into(),
+            json!(metadata.level().as_str().to_ascii_lowercase()),
+        );
         record.insert("target".into(), json!(metadata.target()));
         record.insert("event_type".into(), json!(event_type));
         record.insert("message".into(), json!(message));
