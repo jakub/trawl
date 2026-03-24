@@ -1,0 +1,115 @@
+# trawl drop-in: unifi device syslog normalization
+#
+# receives syslog from unifi network devices (APs, switches, gateways) and
+# rewrites the APP-NAME from the raw MAC+model+firmware format to a clean
+# service name. e.g.:
+#   f492bfa1554cU6-Lite-6.7.4915634 → unifi-u6-lite
+#   7483c2091c1dUSW-Flex-7.4.116850 → unifi-usw-flex
+#
+# deployment:
+#   1. deploy this config to the host running vector
+#   2. point unifi controller syslog target at this host:1514
+#   3. optionally disable trawld's built-in syslog listener if all devices
+#      are routed through vector
+#
+# the gateway (UDM/USG) can also be routed here. set a static service name
+# for the gateway IP using the remap below, or use trawld's source_service_map.
+
+# =============================================================================
+# SOURCE
+# =============================================================================
+
+[sources.unifi_syslog]
+type = "syslog"
+address = "0.0.0.0:1514"
+mode = "udp"
+
+# uncomment to also accept TCP connections from devices
+# [sources.unifi_syslog_tcp]
+# type = "syslog"
+# address = "0.0.0.0:1514"
+# mode = "tcp"
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+
+[transforms.trawl_unifi]
+type = "remap"
+inputs = ["unifi_syslog"]
+source = '''
+# --- service name: rewrite unifi APP-NAME format ---
+# unifi devices send APP-NAME as {12-hex-MAC}{Model}-{Firmware}, e.g.:
+#   f492bfa1554cU6-Lite-6.7.4915634
+#   7483c2091c1dUSW-Flex-7.4.116850
+#   9c05d6d77564U7-Pro-8.5.1818674
+#
+# we extract the model portion, lowercase it, and prefix with "unifi-".
+
+appname = to_string(.appname) ?? ""
+service = "unknown"
+
+if appname != "" {
+  # check for unifi format: 12 hex chars followed by a device model
+  mac_match, err = parse_regex(appname, r'^(?i)[0-9a-f]{12}(?P<rest>.+)$')
+  if err == null {
+    rest = mac_match.rest
+
+    # strip firmware version: find last segment matching digits.digits...
+    # e.g. "U6-Lite-6.7.4915634" → "U6-Lite", "USW-Flex-7.4.116850" → "USW-Flex"
+    model_match, err = parse_regex(rest, r'^(?P<model>.+?)-\d+\.\d+')
+    if err == null {
+      service = "unifi-" + downcase(model_match.model)
+    } else {
+      # no firmware version found — use the whole rest as model
+      service = "unifi-" + downcase(rest)
+    }
+  } else {
+    # not unifi format — use appname directly (e.g. "sshd", "kernel")
+    service = appname
+  }
+}
+
+.service = service
+
+# --- host: prefer syslog hostname, fall back to source IP ---
+if !exists(.hostname) || to_string(.hostname) ?? "" == "" {
+  .host = to_string(.source_ip) ?? "unknown"
+} else {
+  .host = to_string(.hostname) ?? "unknown"
+}
+
+# --- gateway override (optional) ---
+# uncomment and set your gateway IP to give it a stable service name:
+# if to_string(.source_ip) ?? "" == "10.0.0.1" {
+#   .service = "unifi-gateway"
+# }
+
+# --- log level: map syslog severity ---
+severity = to_string(.severity) ?? "informational"
+sev = downcase(severity)
+if sev == "emergency" || sev == "alert" || sev == "critical" || sev == "error" {
+  .level = "error"
+} else if sev == "warning" {
+  .level = "warn"
+} else if sev == "debug" {
+  .level = "debug"
+} else {
+  .level = "info"
+}
+
+# --- preserve syslog metadata ---
+.syslog_facility = to_string(.facility) ?? null
+.syslog_source_ip = to_string(.source_ip) ?? null
+
+# clean up syslog-internal fields
+del(.appname)
+del(.facility)
+del(.severity)
+del(.source_ip)
+del(.source_type)
+del(.hostname)
+del(.procid)
+del(.msgid)
+del(.version)
+'''
