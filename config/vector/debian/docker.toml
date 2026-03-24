@@ -37,13 +37,8 @@ image = to_string(.image) ?? ""
 if compose_svc != "" {
   .service = compose_svc
 } else if swarm_svc != "" {
-  # swarm format: {stack}_{service} — extract the service portion
-  swarm_parts = split(swarm_svc, "_", limit: 2)
-  if length(swarm_parts) > 1 {
-    .service = swarm_parts[1]
-  } else {
-    .service = swarm_svc
-  }
+  # swarm format: {stack}_{service} — normalize to hyphenated name
+  .service = replace(swarm_svc, "_", "-")
 } else if container != "" {
   # strip leading / from container name (docker API includes it)
   clean = replace(container, r'^/', "")
@@ -55,13 +50,8 @@ if compose_svc != "" {
     base = swarm_match.base
     # strip trailing .{digit} replica number if present
     base = replace(base, r'\.\d+$', "")
-    # extract service from {stack}_{service}
-    base_parts = split(base, "_", limit: 2)
-    if length(base_parts) > 1 {
-      .service = base_parts[1]
-    } else {
-      .service = base
-    }
+    # normalize {stack}_{service} to hyphenated name
+    .service = replace(base, "_", "-")
   } else {
     .service = clean
   }
