@@ -83,7 +83,7 @@ exclude = [
 # maps systemd journal fields to trawl's expected schema. includes UFW firewall
 # log enhancement: kernel messages containing [UFW are parsed for src/dst/proto.
 
-[transforms.trawl_journal]
+[transforms.trawl_journal_enriched]
 type = "remap"
 inputs = ["journald"]
 source = '''
@@ -181,6 +181,30 @@ del(._UID)
 del(.PRIORITY)
 del(.SYSLOG_IDENTIFIER)
 del(.source_type)
+'''
+
+# -- noise filter: drop high-volume low-signal journald events ----------------
+# serial-getty crash loops on VMs without a real serial console generate ~4.3M
+# events per 15 days. docker container lifecycle causes veth/bridge churn in
+# networkd-dispatcher, NetworkManager, and systemd-networkd.
+
+[transforms.trawl_journal]
+type = "filter"
+inputs = ["trawl_journal_enriched"]
+condition = '''
+svc = to_string(.service) ?? ""
+msg = to_string(.message) ?? ""
+
+# drop serial-getty crash loop (the service itself + init reporting restarts)
+if svc == "serial-getty-ttyS0" { return false }
+if svc == "init" && contains(msg, "serial-getty") { return false }
+
+# drop docker network churn from networkd/NM/systemd-networkd
+if svc == "networkd-dispatcher" || svc == "NetworkManager" || svc == "systemd-networkd" {
+  if match(msg, r'(?i)veth|docker[0-9]|br-[0-9a-f]') { return false }
+}
+
+true
 '''
 
 # -- varlog catch-all → trawl schema -----------------------------------------
