@@ -3,6 +3,10 @@
 # collects from all containers via the docker socket. automatically captures
 # portainer, watchtower, and any other containerized service.
 #
+# service name priority: compose service label > swarm service label >
+# container name > image name. swarm labels avoid the cardinality explosion
+# from task IDs in container names (e.g. uptime-kuma_uptime-kuma.1.abc123).
+#
 # retries socket connection if docker is not installed or not running —
 # safe to deploy on non-docker hosts.
 #
@@ -24,13 +28,22 @@ type = "remap"
 inputs = ["docker"]
 source = '''
 # --- service name: best available identifier ---
-# priority: compose service label > container name > image name (stripped of tag)
+# priority: compose label > swarm label > container name > image name
 compose_svc = to_string(.label."com.docker.compose.service") ?? ""
+swarm_svc = to_string(.label."com.docker.swarm.service.name") ?? ""
 container = to_string(.container_name) ?? ""
 image = to_string(.image) ?? ""
 
 if compose_svc != "" {
   .service = compose_svc
+} else if swarm_svc != "" {
+  # swarm format: {stack}_{service} — extract the service portion
+  swarm_parts = split(swarm_svc, "_", limit: 2)
+  if length(swarm_parts) > 1 {
+    .service = swarm_parts[1]
+  } else {
+    .service = swarm_svc
+  }
 } else if container != "" {
   # strip leading / from container name (docker API includes it)
   .service = replace(container, r'^/', "")
@@ -44,10 +57,14 @@ if compose_svc != "" {
   .service = "docker"
 }
 
-# --- host: compose project or container name ---
+# --- host: compose project, swarm stack, or container name ---
 compose_project = to_string(.label."com.docker.compose.project") ?? ""
 if compose_project != "" {
   .host = compose_project
+} else if swarm_svc != "" {
+  # swarm: use stack name (part before _) as host for grouping
+  swarm_parts_host = split(swarm_svc, "_", limit: 2)
+  .host = swarm_parts_host[0]
 } else if container != "" {
   .host = replace(container, r'^/', "")
 }
