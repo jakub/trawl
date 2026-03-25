@@ -71,6 +71,7 @@ pub enum PaletteAction {
 pub enum ActionKind {
     ExecuteQuery,
     SaveQuery,
+    FormatQuery,
     ClearEditor,
     ToggleLiveMode,
     ToggleHelp,
@@ -107,6 +108,13 @@ fn action_items() -> Vec<PaletteItem> {
             category: PaletteCategory::Action,
             shortcut: Some("Ctrl+S".into()),
             action: PaletteAction::RunAction(ActionKind::SaveQuery),
+        },
+        PaletteItem {
+            label: "Format Query".into(),
+            detail: None,
+            category: PaletteCategory::Action,
+            shortcut: Some("Ctrl+F".into()),
+            action: PaletteAction::RunAction(ActionKind::FormatQuery),
         },
         PaletteItem {
             label: "Clear Editor".into(),
@@ -427,8 +435,8 @@ mod tests {
     #[test]
     fn action_items_always_present() {
         let items = build_palette_items(false, None, None, None);
-        // Actions (9) + tabs (4, no dashboard) = 13
-        assert_eq!(items.len(), 13);
+        // Actions (10) + tabs (4, no dashboard) = 14
+        assert_eq!(items.len(), 14);
         assert!(
             items.iter().all(
                 |i| i.category == PaletteCategory::Action || i.category == PaletteCategory::Tab
@@ -439,7 +447,7 @@ mod tests {
     #[test]
     fn admin_gets_dashboard_tab() {
         let items = build_palette_items(true, None, None, None);
-        assert_eq!(items.len(), 14); // 9 actions + 5 tabs
+        assert_eq!(items.len(), 15); // 10 actions + 5 tabs
         assert!(items.iter().any(|i| i.label == "Go to Dashboard"));
     }
 

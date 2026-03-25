@@ -250,6 +250,9 @@ impl App {
                     });
                 }
             }
+            ActionKind::FormatQuery => {
+                self.format_editor_query();
+            }
             ActionKind::ClearEditor => {
                 self.tab.clear();
             }

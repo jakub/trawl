@@ -219,6 +219,10 @@ impl App {
             self.stop_live_stream();
         }
 
+        // Auto-format the editor before executing (best-effort, no-op on
+        // parse failure). Uses the same reformat path as Ctrl+F.
+        self.format_editor_query();
+
         let tab = self.active_tab_mut();
         let query = tab.editor.text().trim().to_owned();
 
@@ -263,6 +267,26 @@ impl App {
 
         // Store handle for cancellation.
         self.active_tab_mut().query_task = Some(handle);
+    }
+
+    /// Format the editor query in-place using the canonical DSL formatter.
+    ///
+    /// No-op if the editor is empty or the query fails to parse.
+    /// Saves an undo snapshot so `Ctrl+Z` reverts the format.
+    pub(super) fn format_editor_query(&mut self) {
+        let tab = self.active_tab_mut();
+        let text = tab.editor.text();
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Some(formatted) = trawl_core::format::reformat(&text)
+            && formatted != text
+        {
+            tab.editor.save_snapshot();
+            tab.editor.clear();
+            tab.editor.insert_text(&formatted);
+            tab.mark_editor_dirty();
+        }
     }
 
     /// Cancel the currently running query on the active tab (if any).

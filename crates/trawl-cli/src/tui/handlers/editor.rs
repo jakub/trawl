@@ -116,6 +116,10 @@ impl App {
                 self.active_tab_mut().clear();
                 self.active_tab_mut().mark_editor_dirty();
             }
+            // Format query: Ctrl+F
+            (KeyModifiers::CONTROL, KeyCode::Char('f')) => {
+                self.format_editor_query();
+            }
             // Readline: Ctrl+A → line start
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
                 let editor = &mut self.active_tab_mut().editor;
