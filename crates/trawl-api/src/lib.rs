@@ -343,6 +343,9 @@ pub struct ValidationResponse {
     pub valid: bool,
     /// Validation error details with optional span info (empty if valid).
     pub errors: Vec<ErrorDetail>,
+    /// Canonically formatted query (present only when valid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formatted: Option<String>,
 }
 
 // -- queries (active/recent) -------------------------------------------------

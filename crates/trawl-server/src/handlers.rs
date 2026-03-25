@@ -631,24 +631,38 @@ pub async fn validate_query(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let result = trawl_core::parser::parse(&req.query).and_then(|ast| {
-        trawl_core::emitter::validate_pipeline(&ast.pipeline)
-            .map_err(|e| e.to_parse_errors(req.query.len()))
-    });
+    let ast = match trawl_core::parser::parse(&req.query) {
+        Ok(ast) => ast,
+        Err(errors) => {
+            return Ok(Json(ValidationResponse {
+                valid: false,
+                errors: errors
+                    .iter()
+                    .map(crate::error::parse_error_to_detail)
+                    .collect(),
+                formatted: None,
+            }));
+        }
+    };
 
-    match result {
-        Ok(()) => Ok(Json(ValidationResponse {
-            valid: true,
-            errors: vec![],
-        })),
-        Err(errors) => Ok(Json(ValidationResponse {
+    if let Err(e) = trawl_core::emitter::validate_pipeline(&ast.pipeline) {
+        return Ok(Json(ValidationResponse {
             valid: false,
-            errors: errors
+            errors: e
+                .to_parse_errors(req.query.len())
                 .iter()
                 .map(crate::error::parse_error_to_detail)
                 .collect(),
-        })),
+            formatted: None,
+        }));
     }
+
+    let formatted = trawl_core::format::format_query(&ast);
+    Ok(Json(ValidationResponse {
+        valid: true,
+        errors: vec![],
+        formatted: Some(formatted),
+    }))
 }
 
 /// `GET /api/v1/stats` — server statistics and metrics (admin only).
