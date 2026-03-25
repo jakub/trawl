@@ -353,15 +353,25 @@ impl fmt::Display for SortDirection {
 }
 
 /// `limit 20` — cap the number of results.
+///
+/// Also parsed from `head 20` (SPL alias). The `keyword` field preserves
+/// which form the user wrote so the formatter can round-trip it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LimitStage {
     pub count: u64,
+    /// Original keyword: `"limit"` or `"head"`.
+    pub keyword: &'static str,
 }
 
 /// `table status, avg_duration` — select output columns.
+///
+/// Also parsed from `fields` (SPL alias). The `keyword` field preserves
+/// which form the user wrote so the formatter can round-trip it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableStage {
     pub fields: Vec<String>,
+    /// Original keyword: `"table"` or `"fields"`.
+    pub keyword: &'static str,
 }
 
 /// `top 10 host` — frequency analysis (most common values).
@@ -390,9 +400,14 @@ pub struct DropStage {
 ///
 /// Supports comma-separated multi-assignment:
 /// `let a = lower(service), b = length(service)`
+///
+/// Also parsed from `eval` (SPL alias). The `keyword` field preserves
+/// which form the user wrote so the formatter can round-trip it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LetStage {
     pub assignments: Vec<(String, Spanned<Expr>)>,
+    /// Original keyword: `"let"` or `"eval"`.
+    pub keyword: &'static str,
 }
 
 /// The mode of extraction for `extract`.
@@ -405,11 +420,16 @@ pub enum ExtractMode {
 }
 
 /// `extract "(?P<ip>\\d+)" from message` — regex-based field extraction.
+///
+/// Also parsed from `rex` (SPL alias). The `keyword` field preserves
+/// which form the user wrote so the formatter can round-trip it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractStage {
     pub mode: ExtractMode,
     /// Source field for extraction. `None` defaults to `message`.
     pub source_field: Option<String>,
+    /// Original keyword: `"extract"` or `"rex"`.
+    pub keyword: &'static str,
 }
 
 /// `dedup host, service` — deduplicate rows by field(s), keeping most recent.

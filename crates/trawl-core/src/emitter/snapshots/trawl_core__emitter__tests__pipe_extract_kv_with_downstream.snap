@@ -6,6 +6,6 @@ SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 ---
 rust_stages: 3
-  Extract(ExtractStage { mode: KeyValue { separator: '=' }, source_field: None })
+  Extract(ExtractStage { mode: KeyValue { separator: '=' }, source_field: None, keyword: "extract" })
   Where(WhereStage { condition: Spanned { node: Binary { lhs: Spanned { node: FieldRef("status"), span: 23..29 }, op: Gt, rhs: Spanned { node: Literal(Int(200)), span: 32..35 } }, span: 23..35 } })
   Stats(StatsStage { aggregations: [AggExpr { function: "count", args: [], alias: None }], group_by: ["method"] })

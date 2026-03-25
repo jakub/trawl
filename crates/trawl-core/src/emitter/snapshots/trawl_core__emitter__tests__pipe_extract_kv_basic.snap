@@ -6,4 +6,4 @@ SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 ---
 rust_stages: 1
-  Extract(ExtractStage { mode: KeyValue { separator: '=' }, source_field: None })
+  Extract(ExtractStage { mode: KeyValue { separator: '=' }, source_field: None, keyword: "extract" })

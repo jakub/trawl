@@ -1275,6 +1275,7 @@ mod tests {
     fn table_retains_specified_fields() {
         let mut stage = compile_table(&TableStage {
             fields: vec!["host".into(), "service".into()],
+            keyword: "table",
         });
         let mut ev = event(
             &json!({"host": "web-1", "service": "nginx", "message": "hello", "level": "info"}),
@@ -1294,6 +1295,7 @@ mod tests {
                 "target".into(),
                 "message".into(),
             ],
+            keyword: "table",
         });
         // The compiled stage preserves user-specified field order.
         let CompiledStage::Table { ref fields } = stage else {
@@ -1310,6 +1312,7 @@ mod tests {
     fn table_maps_field_names() {
         let mut stage = compile_table(&TableStage {
             fields: vec!["_time".into(), "host".into()],
+            keyword: "table",
         });
         let mut ev = event(&json!({"timestamp": "2026-01-01", "host": "web-1", "message": "hi"}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
@@ -1385,7 +1388,10 @@ mod tests {
 
     #[test]
     fn limit_allows_n_events() {
-        let mut stage = compile_limit(&LimitStage { count: 3 });
+        let mut stage = compile_limit(&LimitStage {
+            count: 3,
+            keyword: "limit",
+        });
         let mut ev = event(&json!({"i": 1}));
 
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
@@ -1396,7 +1402,10 @@ mod tests {
 
     #[test]
     fn limit_zero_is_done_immediately() {
-        let mut stage = compile_limit(&LimitStage { count: 0 });
+        let mut stage = compile_limit(&LimitStage {
+            count: 0,
+            keyword: "limit",
+        });
         let mut ev = event(&json!({"i": 1}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Done);
     }
@@ -1451,7 +1460,10 @@ mod tests {
                 rhs: Box::new(span(Expr::Literal(LiteralValue::Int(1000)))),
             }),
         )];
-        let mut stage = compile_let(&LetStage { assignments });
+        let mut stage = compile_let(&LetStage {
+            assignments,
+            keyword: "let",
+        });
         let mut ev = event(&json!({"duration": 2}));
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("duration_ms").unwrap(), 2000);
@@ -1466,7 +1478,10 @@ mod tests {
                 args: vec![span(Expr::FieldRef("service".into()))],
             }),
         )];
-        let mut stage = compile_let(&LetStage { assignments });
+        let mut stage = compile_let(&LetStage {
+            assignments,
+            keyword: "let",
+        });
         let mut ev = event(&json!({"service": "nginx"}));
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("svc").unwrap(), "NGINX");
@@ -1479,6 +1494,7 @@ mod tests {
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::Regex(r"(?P<ip>\d+\.\d+\.\d+\.\d+)".into()),
             source_field: Some("message".into()),
+            keyword: "extract",
         })
         .unwrap();
         let mut ev = event(&json!({"message": "connection from 192.168.1.100 accepted"}));
@@ -1491,6 +1507,7 @@ mod tests {
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::Regex(r"(?P<ip>\d+\.\d+\.\d+\.\d+)".into()),
             source_field: Some("message".into()),
+            keyword: "extract",
         })
         .unwrap();
         let mut ev = event(&json!({"message": "no ip here"}));
@@ -1504,6 +1521,7 @@ mod tests {
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::Regex(r"(?P<method>[A-Z]+) (?P<path>/[^ ]+)".into()),
             source_field: None,
+            keyword: "extract",
         })
         .unwrap();
         let mut ev = event(&json!({"message": "GET /api/v1/users HTTP/1.1"}));
@@ -1517,6 +1535,7 @@ mod tests {
         let err = compile_extract(&ExtractStage {
             mode: ExtractMode::Regex(r"(?P<bad>[".into()),
             source_field: None,
+            keyword: "extract",
         })
         .unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidRegex(_)));
@@ -1529,6 +1548,7 @@ mod tests {
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::KeyValue { separator: '=' },
             source_field: Some("message".into()),
+            keyword: "extract",
         })
         .unwrap();
         let mut ev = event(&json!({"message": "user=alice status=200 path=/api"}));
@@ -1543,6 +1563,7 @@ mod tests {
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::KeyValue { separator: '=' },
             source_field: Some("message".into()),
+            keyword: "extract",
         })
         .unwrap();
         let mut ev = event(&json!({"message": r#"user="alice smith" action=login"#}));
@@ -1556,6 +1577,7 @@ mod tests {
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::KeyValue { separator: ':' },
             source_field: Some("message".into()),
+            keyword: "extract",
         })
         .unwrap();
         let mut ev = event(&json!({"message": "user:alice status:200"}));
@@ -1569,6 +1591,7 @@ mod tests {
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::KeyValue { separator: '=' },
             source_field: Some("message".into()),
+            keyword: "extract",
         })
         .unwrap();
         let mut ev =
@@ -1689,6 +1712,7 @@ mod tests {
         let pipeline = vec![
             span(PipeStage::Table(TableStage {
                 fields: vec!["host".into(), "service".into()],
+                keyword: "table",
             })),
             span(PipeStage::Rename(RenameStage {
                 renames: vec![("service".into(), "svc".into())],
@@ -1719,7 +1743,10 @@ mod tests {
                     rhs: Box::new(span(Expr::Literal(LiteralValue::Int(400)))),
                 }),
             })),
-            span(PipeStage::Limit(LimitStage { count: 2 })),
+            span(PipeStage::Limit(LimitStage {
+                count: 2,
+                keyword: "limit",
+            })),
         ];
         let plan = compile_stream_plan(&pipeline).unwrap();
         let StreamPlan::PassThrough(mut stages) = plan else {
@@ -1793,6 +1820,7 @@ mod tests {
         let pipeline = vec![
             span(PipeStage::Table(TableStage {
                 fields: vec!["host".into(), "duration".into()],
+                keyword: "table",
             })),
             span(PipeStage::Stats(StatsStage {
                 aggregations: vec![AggExpr {
@@ -1802,7 +1830,10 @@ mod tests {
                 }],
                 group_by: vec!["host".into()],
             })),
-            span(PipeStage::Limit(LimitStage { count: 10 })),
+            span(PipeStage::Limit(LimitStage {
+                count: 10,
+                keyword: "limit",
+            })),
         ];
         let plan = compile_stream_plan(&pipeline).unwrap();
         let StreamPlan::Aggregate {

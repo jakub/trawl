@@ -303,6 +303,7 @@ mod tests {
         let stages = vec![span(PipeStage::Extract(ExtractStage {
             mode: ExtractMode::KeyValue { separator: '=' },
             source_field: None, // defaults to "message"
+            keyword: "extract",
         }))];
 
         let out = apply_rust_stages(result, &stages).unwrap();
@@ -336,6 +337,7 @@ mod tests {
             span(PipeStage::Extract(ExtractStage {
                 mode: ExtractMode::KeyValue { separator: '=' },
                 source_field: None,
+                keyword: "extract",
             })),
             span(PipeStage::Where(WhereStage {
                 condition: span(Expr::Binary {
@@ -370,6 +372,7 @@ mod tests {
             span(PipeStage::Extract(ExtractStage {
                 mode: ExtractMode::KeyValue { separator: '=' },
                 source_field: None,
+                keyword: "extract",
             })),
             span(PipeStage::Stats(StatsStage {
                 aggregations: vec![AggExpr {
@@ -409,6 +412,7 @@ mod tests {
             span(PipeStage::Extract(ExtractStage {
                 mode: ExtractMode::KeyValue { separator: '=' },
                 source_field: None,
+                keyword: "extract",
             })),
             span(PipeStage::Sort(SortStage {
                 fields: vec![SortField {
@@ -443,6 +447,7 @@ mod tests {
         let stages = vec![span(PipeStage::Extract(ExtractStage {
             mode: ExtractMode::KeyValue { separator: ':' },
             source_field: None,
+            keyword: "extract",
         }))];
 
         let out = apply_rust_stages(result, &stages).unwrap();
@@ -469,6 +474,7 @@ mod tests {
         let stages = vec![span(PipeStage::Extract(ExtractStage {
             mode: ExtractMode::KeyValue { separator: '=' },
             source_field: None,
+            keyword: "extract",
         }))];
 
         let out = apply_rust_stages(result, &stages).unwrap();
@@ -497,6 +503,7 @@ mod tests {
         let stages = vec![span(PipeStage::Extract(ExtractStage {
             mode: ExtractMode::KeyValue { separator: '=' },
             source_field: None,
+            keyword: "extract",
         }))];
         let out = apply_rust_stages(result, &stages).unwrap();
         assert!(out.is_empty());

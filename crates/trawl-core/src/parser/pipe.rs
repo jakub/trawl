@@ -116,7 +116,12 @@ fn limit_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
     keyword("limit")
         .padded()
         .ignore_then(uint())
-        .map(|count| PipeStage::Limit(LimitStage { count }))
+        .map(|count| {
+            PipeStage::Limit(LimitStage {
+                count,
+                keyword: "limit",
+            })
+        })
         .labelled("limit stage")
 }
 
@@ -126,7 +131,12 @@ fn head_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
     keyword("head")
         .padded()
         .ignore_then(uint())
-        .map(|count| PipeStage::Limit(LimitStage { count }))
+        .map(|count| {
+            PipeStage::Limit(LimitStage {
+                count,
+                keyword: "head",
+            })
+        })
         .labelled("head stage")
 }
 
@@ -151,7 +161,12 @@ fn table_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
-        .map(|fields| PipeStage::Table(TableStage { fields }))
+        .map(|fields| {
+            PipeStage::Table(TableStage {
+                fields,
+                keyword: "table",
+            })
+        })
         .labelled("table stage")
 }
 
@@ -166,7 +181,12 @@ fn fields_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
-        .map(|fields| PipeStage::Table(TableStage { fields }))
+        .map(|fields| {
+            PipeStage::Table(TableStage {
+                fields,
+                keyword: "fields",
+            })
+        })
         .labelled("fields stage")
 }
 
@@ -246,7 +266,12 @@ fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserEx
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
-        .map(|assignments| PipeStage::Let(LetStage { assignments }))
+        .map(|assignments| {
+            PipeStage::Let(LetStage {
+                assignments,
+                keyword: "let",
+            })
+        })
         .labelled("let stage")
 }
 
@@ -261,7 +286,12 @@ fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
-        .map(|assignments| PipeStage::Let(LetStage { assignments }))
+        .map(|assignments| {
+            PipeStage::Let(LetStage {
+                assignments,
+                keyword: "eval",
+            })
+        })
         .labelled("eval stage")
 }
 
@@ -287,7 +317,7 @@ fn extract_like_stage<'src>(
         .padded()
         .ignore_then(sep_clause)
         .then(from_clause.clone())
-        .map(|(sep_str, source_field)| {
+        .map(move |(sep_str, source_field)| {
             let separator = sep_str
                 .and_then(|s| {
                     let mut chars = s.chars();
@@ -302,6 +332,7 @@ fn extract_like_stage<'src>(
             PipeStage::Extract(ExtractStage {
                 mode: ExtractMode::KeyValue { separator },
                 source_field,
+                keyword: kw,
             })
         });
 
@@ -309,10 +340,11 @@ fn extract_like_stage<'src>(
         .padded()
         .ignore_then(raw_quoted_string())
         .then(from_clause)
-        .map(|(pattern, source_field)| {
+        .map(move |(pattern, source_field)| {
             PipeStage::Extract(ExtractStage {
                 mode: ExtractMode::Regex(pattern),
                 source_field,
+                keyword: kw,
             })
         });
 
