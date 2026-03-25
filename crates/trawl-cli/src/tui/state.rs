@@ -666,6 +666,173 @@ pub enum TabStatus {
     },
 }
 
+/// Number of spaces prepended to continuation (wrapped) visual lines.
+const CONTINUATION_INDENT: usize = 2;
+
+/// Soft-wrap map: maps logical lines to visual (wrapped) lines.
+///
+/// The first visual line of each logical line gets the full viewport width.
+/// Continuation visual lines are indented by `CONTINUATION_INDENT` chars
+/// and get `width - CONTINUATION_INDENT` chars of content.
+#[derive(Debug, Clone)]
+pub struct WrapMap {
+    /// For each logical line: char offsets where visual line breaks occur.
+    /// Always starts with 0. E.g. `[0, 40, 78]` means 3 visual lines.
+    line_breaks: Vec<Vec<usize>>,
+    /// Viewport width used for this computation.
+    viewport_width: usize,
+}
+
+impl WrapMap {
+    /// Compute wrap breaks for all lines at a given viewport width.
+    pub fn new(lines: &[String], width: usize) -> Self {
+        let line_breaks = lines
+            .iter()
+            .map(|l| Self::compute_breaks(l, width))
+            .collect();
+        Self {
+            line_breaks,
+            viewport_width: width,
+        }
+    }
+
+    /// Recompute the wrap map (on resize or edit).
+    pub fn rebuild(&mut self, lines: &[String], width: usize) {
+        self.viewport_width = width;
+        self.line_breaks = lines
+            .iter()
+            .map(|l| Self::compute_breaks(l, width))
+            .collect();
+    }
+
+    /// Compute break offsets for a single line.
+    ///
+    /// First visual line gets `width` chars. Each continuation gets
+    /// `width - CONTINUATION_INDENT` chars (minimum 1 to guarantee progress).
+    fn compute_breaks(line: &str, width: usize) -> Vec<usize> {
+        let mut breaks = vec![0usize];
+        if width == 0 {
+            return breaks;
+        }
+
+        let char_count = line.chars().count();
+        if char_count <= width {
+            return breaks;
+        }
+
+        // First visual line: chars 0..width
+        let mut offset = width;
+        breaks.push(offset);
+
+        // Continuation lines get narrower columns
+        let cont_width = width.saturating_sub(CONTINUATION_INDENT).max(1);
+        while offset + cont_width < char_count {
+            offset += cont_width;
+            breaks.push(offset);
+        }
+
+        breaks
+    }
+
+    /// Map logical (row, col) to visual (vrow, vcol).
+    ///
+    /// `vcol` includes the continuation indent offset for wrapped lines.
+    pub fn logical_to_visual(&self, row: usize, col: usize) -> (usize, usize) {
+        // Sum visual lines from all preceding logical lines.
+        let mut vrow: usize = 0;
+        for r in 0..row.min(self.line_breaks.len()) {
+            vrow += self.line_breaks[r].len();
+        }
+
+        let breaks = self
+            .line_breaks
+            .get(row)
+            .map_or(&[0usize][..], |v| v.as_slice());
+
+        // Find which visual sub-line the col falls in.
+        let mut seg = 0;
+        for (i, &brk) in breaks.iter().enumerate().skip(1) {
+            if col >= brk {
+                seg = i;
+            } else {
+                break;
+            }
+        }
+
+        vrow += seg;
+        let local_col = col - breaks[seg];
+        let vcol = if seg == 0 {
+            local_col
+        } else {
+            CONTINUATION_INDENT + local_col
+        };
+
+        (vrow, vcol)
+    }
+
+    /// Map visual (vrow, vcol) back to logical (row, col).
+    pub fn visual_to_logical(&self, vrow: usize, vcol: usize) -> (usize, usize) {
+        let mut remaining = vrow;
+
+        for (row, breaks) in self.line_breaks.iter().enumerate() {
+            let num_visual = breaks.len();
+            if remaining < num_visual {
+                // We're in this logical line, segment `remaining`.
+                let seg = remaining;
+                let base = breaks[seg];
+                let local_col = if seg == 0 {
+                    vcol
+                } else {
+                    vcol.saturating_sub(CONTINUATION_INDENT)
+                };
+
+                // Clamp to the extent of this visual segment.
+                let seg_end = if seg + 1 < breaks.len() {
+                    breaks[seg + 1]
+                } else {
+                    usize::MAX // will be clamped by caller
+                };
+                let col = base + local_col;
+                return (row, col.min(seg_end));
+            }
+            remaining -= num_visual;
+        }
+
+        // Past the end — return last line, last col.
+        let last_row = self.line_breaks.len().saturating_sub(1);
+        (last_row, 0)
+    }
+
+    /// Total visual lines across all logical lines.
+    pub fn total_visual_lines(&self) -> usize {
+        self.line_breaks.iter().map(Vec::len).sum()
+    }
+
+    /// How many visual lines a single logical line occupies.
+    #[allow(dead_code)] // Public API for future use (e.g. line numbers)
+    pub fn visual_lines_for(&self, logical_row: usize) -> usize {
+        self.line_breaks.get(logical_row).map_or(1, Vec::len)
+    }
+
+    /// Get the break offsets for a logical line.
+    pub fn breaks_for(&self, logical_row: usize) -> &[usize] {
+        self.line_breaks
+            .get(logical_row)
+            .map_or(&[0], |v| v.as_slice())
+    }
+
+    /// The continuation indent size.
+    pub fn continuation_indent() -> usize {
+        CONTINUATION_INDENT
+    }
+
+    /// Current viewport width.
+    #[allow(dead_code)] // Public API for future use (e.g. dynamic resize detection)
+    pub fn viewport_width(&self) -> usize {
+        self.viewport_width
+    }
+}
+
 /// A snapshot of editor state for undo/redo.
 #[derive(Debug, Clone)]
 struct EditorSnapshot {
@@ -749,15 +916,15 @@ impl UndoStack {
 pub struct SimpleEditor {
     /// Lines of text.
     pub lines: Vec<String>,
-    /// Cursor position (row, column).
+    /// Cursor position (row, column) in logical coordinates.
     pub cursor: (usize, usize),
     /// Desired column for vertical movement (sticky column).
-    /// Set on horizontal movement, used by `move_up()`/`move_down()` to
-    /// maintain column position across lines of varying length.
+    /// When wrapping is active, this is in *visual* column coordinates.
     desired_col: Option<usize>,
-    /// Vertical scroll offset (first visible line).
+    /// Vertical scroll offset. When wrapping is active, this is in
+    /// *visual line* units (not logical line units).
     pub scroll_row: usize,
-    /// Horizontal scroll offset (first visible column).
+    /// Horizontal scroll offset. Always 0 when wrapping is active.
     pub scroll_col: usize,
     /// Selection anchor position. If `Some`, marks start of selection;
     /// cursor is the other end.
@@ -768,6 +935,8 @@ pub struct SimpleEditor {
     last_edit_kind: Option<EditKind>,
     /// Single-line mode: disables newline insertion.
     pub single_line: bool,
+    /// Soft-wrap map. `None` for single-line editors or before first render.
+    pub wrap_map: Option<WrapMap>,
 }
 
 impl Default for SimpleEditor {
@@ -789,6 +958,7 @@ impl SimpleEditor {
             undo_stack: UndoStack::new(200),
             last_edit_kind: None,
             single_line: false,
+            wrap_map: None,
         }
     }
 
@@ -797,6 +967,32 @@ impl SimpleEditor {
         let mut editor = Self::new();
         editor.single_line = true;
         editor
+    }
+
+    /// Rebuild the wrap map for the current lines at the given viewport width.
+    ///
+    /// Skipped for single-line editors. Call this from the render path
+    /// whenever the viewport width is known.
+    pub fn update_wrap_map(&mut self, width: usize) {
+        if self.single_line {
+            return;
+        }
+        if let Some(ref mut wm) = self.wrap_map {
+            wm.rebuild(&self.lines, width);
+        } else {
+            self.wrap_map = Some(WrapMap::new(&self.lines, width));
+        }
+    }
+
+    /// Cursor position in visual coordinates (accounting for wrapping).
+    ///
+    /// Falls back to logical coordinates when no wrap map is available.
+    pub fn visual_cursor(&self) -> (usize, usize) {
+        if let Some(ref wm) = self.wrap_map {
+            wm.logical_to_visual(self.cursor.0, self.cursor.1)
+        } else {
+            self.cursor
+        }
     }
 
     /// Handle a key event for simple popup inputs.
@@ -929,9 +1125,21 @@ impl SimpleEditor {
         }
     }
 
-    /// Move cursor up (uses sticky column).
+    /// Move cursor up one visual line (wrap-aware, uses sticky column).
     pub fn move_up(&mut self) {
-        if self.cursor.0 > 0 {
+        if let Some(ref wm) = self.wrap_map {
+            let (vrow, vcol) = wm.logical_to_visual(self.cursor.0, self.cursor.1);
+            let target_vcol = self.desired_col.unwrap_or(vcol);
+            if self.desired_col.is_none() {
+                self.desired_col = Some(target_vcol);
+            }
+            if vrow == 0 {
+                return;
+            }
+            let (new_row, new_col) = wm.visual_to_logical(vrow - 1, target_vcol);
+            let line_chars = Self::char_count(&self.lines[new_row]);
+            self.cursor = (new_row, new_col.min(line_chars));
+        } else if self.cursor.0 > 0 {
             let target_col = self.desired_col.unwrap_or(self.cursor.1);
             self.cursor.0 -= 1;
             let line_chars = Self::char_count(&self.lines[self.cursor.0]);
@@ -942,9 +1150,22 @@ impl SimpleEditor {
         }
     }
 
-    /// Move cursor down (uses sticky column).
+    /// Move cursor down one visual line (wrap-aware, uses sticky column).
     pub fn move_down(&mut self) {
-        if self.cursor.0 < self.lines.len() - 1 {
+        if let Some(ref wm) = self.wrap_map {
+            let (vrow, vcol) = wm.logical_to_visual(self.cursor.0, self.cursor.1);
+            let target_vcol = self.desired_col.unwrap_or(vcol);
+            if self.desired_col.is_none() {
+                self.desired_col = Some(target_vcol);
+            }
+            let total = wm.total_visual_lines();
+            if vrow + 1 >= total {
+                return;
+            }
+            let (new_row, new_col) = wm.visual_to_logical(vrow + 1, target_vcol);
+            let line_chars = Self::char_count(&self.lines[new_row]);
+            self.cursor = (new_row, new_col.min(line_chars));
+        } else if self.cursor.0 < self.lines.len() - 1 {
             let target_col = self.desired_col.unwrap_or(self.cursor.1);
             self.cursor.0 += 1;
             let line_chars = Self::char_count(&self.lines[self.cursor.0]);
@@ -1276,25 +1497,40 @@ impl SimpleEditor {
 
     /// Adjust scroll offsets to keep cursor in viewport.
     ///
+    /// When a wrap map is present, scrolling is in visual-line units and
+    /// horizontal scrolling is disabled (wrapping handles it).
     /// Call after every cursor movement or content change.
     pub fn ensure_cursor_visible(&mut self, visible_rows: usize, visible_cols: usize) {
-        let (row, col) = self.cursor;
-
-        // Vertical scrolling
-        if visible_rows > 0 {
-            if row < self.scroll_row {
-                self.scroll_row = row;
-            } else if row >= self.scroll_row + visible_rows {
-                self.scroll_row = row - visible_rows + 1;
+        if let Some(ref wm) = self.wrap_map {
+            // Wrap-aware: scroll in visual line units, no horizontal scroll.
+            self.scroll_col = 0;
+            let (vrow, _vcol) = wm.logical_to_visual(self.cursor.0, self.cursor.1);
+            if visible_rows > 0 {
+                if vrow < self.scroll_row {
+                    self.scroll_row = vrow;
+                } else if vrow >= self.scroll_row + visible_rows {
+                    self.scroll_row = vrow - visible_rows + 1;
+                }
             }
-        }
+        } else {
+            let (row, col) = self.cursor;
 
-        // Horizontal scrolling
-        if visible_cols > 0 {
-            if col < self.scroll_col {
-                self.scroll_col = col;
-            } else if col >= self.scroll_col + visible_cols {
-                self.scroll_col = col - visible_cols + 1;
+            // Vertical scrolling (logical lines)
+            if visible_rows > 0 {
+                if row < self.scroll_row {
+                    self.scroll_row = row;
+                } else if row >= self.scroll_row + visible_rows {
+                    self.scroll_row = row - visible_rows + 1;
+                }
+            }
+
+            // Horizontal scrolling
+            if visible_cols > 0 {
+                if col < self.scroll_col {
+                    self.scroll_col = col;
+                } else if col >= self.scroll_col + visible_cols {
+                    self.scroll_col = col - visible_cols + 1;
+                }
             }
         }
     }
@@ -2464,5 +2700,156 @@ mod tests {
         let names: Vec<&str> = common.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"common_f")); // 5/5 = 100% > 80%
         assert!(!names.contains(&"rare_f")); // 3/5 = 60% < 80%
+    }
+
+    // --- WrapMap tests ---
+
+    #[test]
+    fn wrap_map_short_line_no_breaks() {
+        let lines = vec!["hello".to_owned()];
+        let wm = WrapMap::new(&lines, 40);
+        assert_eq!(wm.total_visual_lines(), 1);
+        assert_eq!(wm.breaks_for(0), &[0]);
+    }
+
+    #[test]
+    fn wrap_map_exact_width_no_break() {
+        // A line exactly `width` chars should NOT wrap.
+        let lines = vec!["a".repeat(40)];
+        let wm = WrapMap::new(&lines, 40);
+        assert_eq!(wm.total_visual_lines(), 1);
+    }
+
+    #[test]
+    fn wrap_map_one_char_over_wraps() {
+        // 41 chars at width 40 → 2 visual lines.
+        let lines = vec!["a".repeat(41)];
+        let wm = WrapMap::new(&lines, 40);
+        assert_eq!(wm.total_visual_lines(), 2);
+        assert_eq!(wm.breaks_for(0), &[0, 40]);
+    }
+
+    #[test]
+    fn wrap_map_multiple_wraps() {
+        // width=10, continuation_indent=2, so cont lines hold 8 chars.
+        // 30 chars: first 10, then 8, 8, 4 → 4 visual lines.
+        let lines = vec!["a".repeat(30)];
+        let wm = WrapMap::new(&lines, 10);
+        assert_eq!(wm.total_visual_lines(), 4);
+        assert_eq!(wm.breaks_for(0), &[0, 10, 18, 26]);
+    }
+
+    #[test]
+    fn wrap_map_logical_to_visual_first_line() {
+        let lines = vec!["a".repeat(30)];
+        let wm = WrapMap::new(&lines, 10);
+
+        // Col 0 → vrow 0, vcol 0
+        assert_eq!(wm.logical_to_visual(0, 0), (0, 0));
+        // Col 5 → vrow 0, vcol 5
+        assert_eq!(wm.logical_to_visual(0, 5), (0, 5));
+        // Col 10 → vrow 1, vcol CONTINUATION_INDENT + 0 = 2
+        assert_eq!(wm.logical_to_visual(0, 10), (1, 2));
+        // Col 15 → vrow 1, vcol 2 + 5 = 7
+        assert_eq!(wm.logical_to_visual(0, 15), (1, 7));
+        // Col 18 → vrow 2, vcol 2 + 0 = 2
+        assert_eq!(wm.logical_to_visual(0, 18), (2, 2));
+    }
+
+    #[test]
+    fn wrap_map_visual_to_logical_round_trip() {
+        let lines = vec!["a".repeat(30)];
+        let wm = WrapMap::new(&lines, 10);
+
+        // Check a few positions round-trip through both mappings.
+        for col in [0, 5, 10, 15, 18, 25, 29] {
+            let (vrow, vcol) = wm.logical_to_visual(0, col);
+            let (row, col_back) = wm.visual_to_logical(vrow, vcol);
+            assert_eq!(row, 0);
+            assert_eq!(col_back, col, "round-trip failed for col={col}");
+        }
+    }
+
+    #[test]
+    fn wrap_map_multi_logical_lines() {
+        let lines = vec![
+            "a".repeat(15), // wraps at width 10: 2 visual lines
+            "b".repeat(5),  // fits: 1 visual line
+        ];
+        let wm = WrapMap::new(&lines, 10);
+        assert_eq!(wm.total_visual_lines(), 3);
+
+        // Second logical line starts at visual row 2.
+        assert_eq!(wm.logical_to_visual(1, 0), (2, 0));
+        assert_eq!(wm.logical_to_visual(1, 3), (2, 3));
+    }
+
+    #[test]
+    fn wrap_map_visual_to_logical_second_line() {
+        let lines = vec![
+            "a".repeat(15), // 2 visual lines (width 10)
+            "b".repeat(5),  // 1 visual line
+        ];
+        let wm = WrapMap::new(&lines, 10);
+
+        // vrow 2 → logical line 1
+        let (row, col) = wm.visual_to_logical(2, 3);
+        assert_eq!(row, 1);
+        assert_eq!(col, 3);
+    }
+
+    #[test]
+    fn wrap_map_zero_width_no_panic() {
+        let lines = vec!["hello".to_owned()];
+        let wm = WrapMap::new(&lines, 0);
+        assert_eq!(wm.total_visual_lines(), 1);
+    }
+
+    #[test]
+    fn wrap_map_empty_lines() {
+        let lines = vec![String::new(), String::new()];
+        let wm = WrapMap::new(&lines, 40);
+        assert_eq!(wm.total_visual_lines(), 2);
+    }
+
+    #[test]
+    fn editor_wrap_move_up_within_same_logical_line() {
+        // A long line that wraps. Moving up from continuation → first visual line.
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["a".repeat(30)];
+        editor.update_wrap_map(10);
+        // Place cursor at col 15 (visual line 1).
+        editor.cursor = (0, 15);
+        editor.move_up();
+        // Should move to visual line 0, maintaining visual column.
+        // vcol for col 15 = 2 + 5 = 7. Target vrow 0, vcol 7 → logical col 7.
+        assert_eq!(editor.cursor, (0, 7));
+    }
+
+    #[test]
+    fn editor_wrap_move_down_within_same_logical_line() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["a".repeat(30)];
+        editor.update_wrap_map(10);
+        // Place cursor at col 5 (visual line 0, vcol 5).
+        editor.cursor = (0, 5);
+        editor.move_down();
+        // Should move to visual line 1. Target vcol 5 → logical col 10 + (5 - 2) = 13.
+        assert_eq!(editor.cursor, (0, 13));
+    }
+
+    #[test]
+    fn editor_wrap_ensure_cursor_visible_scrolls_visual() {
+        let mut editor = SimpleEditor::new();
+        editor.lines = vec!["a".repeat(100)]; // many visual lines at width 10
+        editor.update_wrap_map(10);
+        // Place cursor at end.
+        editor.cursor = (0, 99);
+        editor.ensure_cursor_visible(5, 10);
+        // scroll_row should be in visual line units, scroll_col always 0.
+        assert_eq!(editor.scroll_col, 0);
+        let (vrow, _) = editor.visual_cursor();
+        assert!(editor.scroll_row <= vrow);
+        assert!(editor.scroll_row + 5 > vrow);
     }
 }

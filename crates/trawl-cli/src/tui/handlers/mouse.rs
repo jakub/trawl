@@ -8,7 +8,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use super::super::App;
-use super::super::state::{Focus, MainTab, Popup, TabStatus};
+use super::super::state::{Focus, MainTab, Popup, TabStatus, WrapMap};
 
 impl App {
     /// Top-level mouse event dispatch.
@@ -134,18 +134,27 @@ impl App {
     }
 
     /// Place editor cursor at the clicked position.
+    ///
+    /// When wrapping is active, the click coordinates are in visual space
+    /// and must be mapped back to logical (row, col) via the wrap map.
     fn handle_editor_click(&mut self, col: u16, row: u16, area: Rect) {
         let tab = self.active_tab_mut();
         let scroll_row = tab.editor.scroll_row;
-        let scroll_col = tab.editor.scroll_col;
 
         // Reverse the cursor math from ui/mod.rs render_query_layout:
-        //   x = area.x + col_offset + 2  (border + padding)
-        //   y = area.y + row_offset + 1  (border)
-        let target_row = (row.saturating_sub(area.y).saturating_sub(1) as usize) + scroll_row;
-        let target_col = (col.saturating_sub(area.x).saturating_sub(2) as usize) + scroll_col;
+        //   x = area.x + vcol + 2  (border + padding)
+        //   y = area.y + (vrow - scroll_row) + 1  (border)
+        let target_vrow = (row.saturating_sub(area.y).saturating_sub(1) as usize) + scroll_row;
+        let target_vcol = col.saturating_sub(area.x).saturating_sub(2) as usize;
 
-        tab.editor.place_cursor(target_row, target_col);
+        if let Some(ref wm) = tab.editor.wrap_map {
+            let (logical_row, logical_col) = wm.visual_to_logical(target_vrow, target_vcol);
+            tab.editor.place_cursor(logical_row, logical_col);
+        } else {
+            let scroll_col = tab.editor.scroll_col;
+            tab.editor
+                .place_cursor(target_vrow, target_vcol + scroll_col);
+        }
     }
 
     /// Select a result row at the clicked position, or enter column mode on header click.
@@ -276,7 +285,12 @@ impl App {
             && contains(editor_area, col, row)
         {
             let tab = self.active_tab_mut();
-            let max_scroll = tab.editor.lines.len().saturating_sub(1);
+            let max_scroll = tab
+                .editor
+                .wrap_map
+                .as_ref()
+                .map_or(tab.editor.lines.len(), WrapMap::total_visual_lines)
+                .saturating_sub(1);
             tab.editor.scroll_row = apply_scroll_delta(tab.editor.scroll_row, delta, max_scroll);
             return;
         }

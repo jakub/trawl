@@ -92,17 +92,17 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     popup::render(app, frame);
 
     // Set cursor position based on focus (adjusted for scroll offset).
+    // When wrapping is active, use visual coordinates from the wrap map.
     if app.focus == Focus::Editor && app.popup.is_none() {
         let tab = app.active_tab();
-        let (row, col) = tab.editor.cursor;
+        let (vrow, vcol) = tab.editor.visual_cursor();
         let scroll_row = tab.editor.scroll_row;
-        let scroll_col = tab.editor.scroll_col;
         // +2 for x: border (1) + horizontal padding (1)
         // +1 for y: border (1) only
         #[allow(clippy::cast_possible_truncation)] // Terminal coordinates are always < u16::MAX
-        let x = editor_area.x + col.saturating_sub(scroll_col) as u16 + 2;
+        let x = editor_area.x + vcol as u16 + 2;
         #[allow(clippy::cast_possible_truncation)]
-        let y = editor_area.y + row.saturating_sub(scroll_row) as u16 + 1;
+        let y = editor_area.y + vrow.saturating_sub(scroll_row) as u16 + 1;
         frame.set_cursor_position((x, y));
     }
 }

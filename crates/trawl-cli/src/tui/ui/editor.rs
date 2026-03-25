@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Query editor pane.
+//! Query editor pane with soft word wrapping.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -14,9 +14,10 @@ use ratatui::widgets::{
 
 use crate::tui::App;
 use crate::tui::highlight::Highlighter;
-use crate::tui::state::Focus;
+use crate::tui::state::{Focus, WrapMap};
 
 /// Render the editor pane.
+#[allow(clippy::too_many_lines)] // Editor rendering is inherently complex
 pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
 
@@ -33,8 +34,11 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let ghost_style = Style::new()
         .fg(theme.text_muted)
         .add_modifier(Modifier::DIM);
+    let indent_style = Style::new()
+        .fg(theme.text_muted)
+        .add_modifier(Modifier::DIM);
 
-    // Add [LIVE] indicator if streaming
+    // Add [LIVE] indicator if streaming.
     let title = if app.live_mode {
         " Query Editor [LIVE] "
     } else {
@@ -53,13 +57,15 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let visible_rows = area.height.saturating_sub(2) as usize;
     let visible_cols = area.width.saturating_sub(4) as usize; // 2 border + 2 padding
 
-    // Ensure cursor is visible within viewport.
+    // Update the wrap map with the current viewport width.
     let tab = app.active_tab_mut();
+    tab.editor.update_wrap_map(visible_cols);
+
+    // Ensure cursor is visible within viewport (wrap-aware).
     tab.editor.ensure_cursor_visible(visible_rows, visible_cols);
 
     let tab = app.active_tab();
-    let scroll_row = tab.editor.scroll_row;
-    let scroll_col = tab.editor.scroll_col;
+    let scroll_row = tab.editor.scroll_row; // in visual-line units when wrapping
     let selection = tab.editor.selection_range();
 
     // Create highlighter with schema information.
@@ -73,64 +79,55 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let cursor_col = tab.editor.cursor.1;
     let ghost_text = tab.ghost.as_ref().map(|g| g.ghost_text.clone());
 
-    // Highlight visible lines and apply error + selection overlays.
-    let end_row = (scroll_row + visible_rows).min(tab.editor.lines.len());
-    let highlighted_lines: Vec<Line<'static>> = tab.editor.lines[scroll_row..end_row]
-        .iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let abs_row = scroll_row + i;
-            let mut styled_line = highlighter.highlight_line(line);
+    // Build visual lines from logical lines using the wrap map.
+    let visual_lines: Vec<Line<'static>> = if let Some(ref wm) = tab.editor.wrap_map {
+        build_wrapped_lines(
+            &tab.editor.lines,
+            wm,
+            scroll_row,
+            visible_rows,
+            &highlighter,
+            &error_regions,
+            selection,
+            cursor_row,
+            cursor_col,
+            ghost_text.as_deref(),
+            ghost_style,
+            selection_bg,
+            error_fg,
+            indent_style,
+        )
+    } else {
+        // Fallback: no wrap map (shouldn't happen for multi-line editors,
+        // but handles the edge case gracefully).
+        build_unwrapped_lines(
+            &tab.editor.lines,
+            scroll_row,
+            visible_rows,
+            &highlighter,
+            &error_regions,
+            selection,
+            cursor_row,
+            cursor_col,
+            ghost_text.as_deref(),
+            ghost_style,
+            selection_bg,
+            error_fg,
+        )
+    };
 
-            // Apply error overlay (red underline on error spans).
-            for &(err_row, err_col_start, err_col_end) in &error_regions {
-                if err_row == abs_row {
-                    styled_line =
-                        apply_error_style(styled_line, err_col_start, err_col_end, error_fg);
-                }
-            }
-
-            if let Some(((sel_start_row, sel_start_col), (sel_end_row, sel_end_col))) = selection
-                && abs_row >= sel_start_row
-                && abs_row <= sel_end_row
-            {
-                // This line is (partially) selected
-                let line_len = line.chars().count();
-                let sel_start = if abs_row == sel_start_row {
-                    sel_start_col
-                } else {
-                    0
-                };
-                let sel_end = if abs_row == sel_end_row {
-                    sel_end_col
-                } else {
-                    line_len
-                };
-                return apply_selection_style(styled_line, sel_start, sel_end, selection_bg);
-            }
-
-            // Splice ghost text at cursor position on the cursor's line.
-            if abs_row == cursor_row
-                && let Some(ref ghost) = ghost_text
-            {
-                styled_line = splice_ghost_text(styled_line, cursor_col, ghost, ghost_style);
-            }
-
-            styled_line
-        })
-        .collect();
-
-    #[allow(clippy::cast_possible_truncation)] // scroll_col bounded by terminal width
-    let paragraph = Paragraph::new(highlighted_lines)
-        .block(block)
-        .scroll((0, scroll_col as u16));
-
+    let paragraph = Paragraph::new(visual_lines).block(block);
     frame.render_widget(paragraph, area);
 
-    // Render vertical scrollbar when content exceeds visible area
-    let total_lines = tab.editor.lines.len();
-    if total_lines > visible_rows {
-        let mut scrollbar_state = ScrollbarState::new(total_lines).position(scroll_row);
+    // Render vertical scrollbar when content exceeds visible area.
+    let total_visual = tab
+        .editor
+        .wrap_map
+        .as_ref()
+        .map_or(tab.editor.lines.len(), WrapMap::total_visual_lines);
+
+    if total_visual > visible_rows {
+        let mut scrollbar_state = ScrollbarState::new(total_visual).position(scroll_row);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
@@ -145,6 +142,254 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
             &mut scrollbar_state,
         );
     }
+}
+
+/// Build visual lines with wrapping applied.
+///
+/// Iterates logical lines, highlights each, applies overlays, then splits
+/// at wrap break points. Only returns the visual lines visible in the
+/// current scroll window.
+#[allow(clippy::too_many_arguments)]
+fn build_wrapped_lines(
+    lines: &[String],
+    wm: &WrapMap,
+    scroll_row: usize,
+    visible_rows: usize,
+    highlighter: &Highlighter<'_>,
+    error_regions: &[(usize, usize, usize)],
+    selection: Option<((usize, usize), (usize, usize))>,
+    cursor_row: usize,
+    cursor_col: usize,
+    ghost_text: Option<&str>,
+    ghost_style: Style,
+    selection_bg: Color,
+    error_fg: Color,
+    indent_style: Style,
+) -> Vec<Line<'static>> {
+    let end_vrow = scroll_row + visible_rows;
+    let mut result = Vec::with_capacity(visible_rows);
+    let mut vrow_offset = 0; // running visual row counter
+
+    for (logical_row, line) in lines.iter().enumerate() {
+        let breaks = wm.breaks_for(logical_row);
+        let num_visual = breaks.len();
+        let vrow_start = vrow_offset;
+        let vrow_end = vrow_offset + num_visual;
+
+        // Skip logical lines entirely above or below the viewport.
+        if vrow_end <= scroll_row || vrow_start >= end_vrow {
+            vrow_offset = vrow_end;
+            continue;
+        }
+
+        // Highlight the full logical line.
+        let mut styled_line = highlighter.highlight_line(line);
+
+        // Apply error overlay.
+        for &(err_row, err_col_start, err_col_end) in error_regions {
+            if err_row == logical_row {
+                styled_line = apply_error_style(styled_line, err_col_start, err_col_end, error_fg);
+            }
+        }
+
+        // Apply selection overlay.
+        if let Some(((sel_start_row, sel_start_col), (sel_end_row, sel_end_col))) = selection
+            && logical_row >= sel_start_row
+            && logical_row <= sel_end_row
+        {
+            let line_len = line.chars().count();
+            let sel_start = if logical_row == sel_start_row {
+                sel_start_col
+            } else {
+                0
+            };
+            let sel_end = if logical_row == sel_end_row {
+                sel_end_col
+            } else {
+                line_len
+            };
+            styled_line = apply_selection_style(styled_line, sel_start, sel_end, selection_bg);
+        } else if logical_row == cursor_row
+            && let Some(ghost) = ghost_text
+        {
+            // Ghost text (only when no selection active on this line).
+            styled_line = splice_ghost_text(styled_line, cursor_col, ghost, ghost_style);
+        }
+
+        // Split the styled line at wrap breaks.
+        let visual_lines = split_line_at_wraps(
+            styled_line,
+            breaks,
+            WrapMap::continuation_indent(),
+            indent_style,
+        );
+
+        for (seg_idx, vline) in visual_lines.into_iter().enumerate() {
+            let abs_vrow = vrow_start + seg_idx;
+            if abs_vrow >= scroll_row && abs_vrow < end_vrow {
+                result.push(vline);
+            }
+            if result.len() >= visible_rows {
+                return result;
+            }
+        }
+
+        vrow_offset = vrow_end;
+    }
+
+    result
+}
+
+/// Fallback: build visual lines without wrapping (original behavior).
+#[allow(clippy::too_many_arguments)]
+fn build_unwrapped_lines(
+    lines: &[String],
+    scroll_row: usize,
+    visible_rows: usize,
+    highlighter: &Highlighter<'_>,
+    error_regions: &[(usize, usize, usize)],
+    selection: Option<((usize, usize), (usize, usize))>,
+    cursor_row: usize,
+    cursor_col: usize,
+    ghost_text: Option<&str>,
+    ghost_style: Style,
+    selection_bg: Color,
+    error_fg: Color,
+) -> Vec<Line<'static>> {
+    let end_row = (scroll_row + visible_rows).min(lines.len());
+    lines[scroll_row..end_row]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let abs_row = scroll_row + i;
+            let mut styled_line = highlighter.highlight_line(line);
+
+            for &(err_row, err_col_start, err_col_end) in error_regions {
+                if err_row == abs_row {
+                    styled_line =
+                        apply_error_style(styled_line, err_col_start, err_col_end, error_fg);
+                }
+            }
+
+            if let Some(((sel_start_row, sel_start_col), (sel_end_row, sel_end_col))) = selection
+                && abs_row >= sel_start_row
+                && abs_row <= sel_end_row
+            {
+                let line_len = line.chars().count();
+                let sel_start = if abs_row == sel_start_row {
+                    sel_start_col
+                } else {
+                    0
+                };
+                let sel_end = if abs_row == sel_end_row {
+                    sel_end_col
+                } else {
+                    line_len
+                };
+                return apply_selection_style(styled_line, sel_start, sel_end, selection_bg);
+            }
+
+            if abs_row == cursor_row
+                && let Some(ghost) = ghost_text
+            {
+                styled_line = splice_ghost_text(styled_line, cursor_col, ghost, ghost_style);
+            }
+
+            styled_line
+        })
+        .collect()
+}
+
+/// Split a highlighted line into multiple visual lines at wrap break offsets.
+///
+/// `breaks` is a slice of char offsets (always starting with 0).
+/// The first visual line renders as-is. Continuation lines get `indent`
+/// spaces prepended in `indent_style`.
+fn split_line_at_wraps(
+    line: Line<'static>,
+    breaks: &[usize],
+    indent: usize,
+    indent_style: Style,
+) -> Vec<Line<'static>> {
+    // Single visual line (no wrapping needed).
+    if breaks.len() <= 1 {
+        return vec![line];
+    }
+
+    // Collect all spans into a flat (char_offset, style, text) stream
+    // so we can split them at arbitrary char boundaries.
+    let mut visual_lines = Vec::with_capacity(breaks.len());
+    let spans = line.spans;
+
+    // For each segment between consecutive breaks, extract the relevant spans.
+    for (seg_idx, window) in breaks.windows(2).enumerate() {
+        let seg_start = window[0];
+        let seg_end = window[1];
+        let mut seg_spans = extract_span_range(&spans, seg_start, seg_end);
+        if seg_idx > 0 {
+            let indent_span = Span::styled(" ".repeat(indent), indent_style);
+            seg_spans.insert(0, indent_span);
+        }
+        visual_lines.push(Line::from(seg_spans));
+    }
+
+    // Last segment: from last break to end of line.
+    let last_break = *breaks.last().unwrap_or(&0);
+    let mut last_spans = extract_span_range(&spans, last_break, usize::MAX);
+    if breaks.len() > 1 {
+        let indent_span = Span::styled(" ".repeat(indent), indent_style);
+        last_spans.insert(0, indent_span);
+    }
+    visual_lines.push(Line::from(last_spans));
+
+    visual_lines
+}
+
+/// Extract spans covering the char range `[range_start, range_end)` from a span list.
+///
+/// Splits spans that straddle the range boundaries. Returns owned spans.
+fn extract_span_range(
+    spans: &[Span<'static>],
+    range_start: usize,
+    range_end: usize,
+) -> Vec<Span<'static>> {
+    let mut result = Vec::new();
+    let mut col = 0usize;
+
+    for span in spans {
+        let span_chars = span.content.chars().count();
+        let span_end = col + span_chars;
+
+        if span_end <= range_start || col >= range_end {
+            // Entirely outside range — skip.
+            col = span_end;
+            continue;
+        }
+
+        // Compute overlap in char offsets relative to this span.
+        let rel_start = range_start.saturating_sub(col);
+        let rel_end = range_end.saturating_sub(col).min(span_chars);
+
+        if rel_start == 0 && rel_end >= span_chars {
+            // Entire span is within range.
+            result.push(span.clone());
+        } else {
+            // Partial span — slice by char offsets.
+            let text = span.content.as_ref();
+            let byte_start = char_to_byte(text, rel_start);
+            let byte_end = char_to_byte(text, rel_end);
+            if byte_start < byte_end {
+                result.push(Span::styled(
+                    text[byte_start..byte_end].to_owned(),
+                    span.style,
+                ));
+            }
+        }
+
+        col = span_end;
+    }
+
+    result
 }
 
 /// Apply selection background to a highlighted line within the given char column range.
