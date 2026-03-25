@@ -17,6 +17,9 @@ pub mod parser;
 /// SQL emitter — transforms AST into DuckDB-compatible SQL.
 pub mod emitter;
 
+/// DSL query formatter — canonical pretty-printing of parsed queries.
+pub mod format;
+
 /// In-memory expression evaluator for streaming pipeline stages.
 pub mod eval;
 
