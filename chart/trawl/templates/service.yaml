@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "trawl.fullname" . }}
+  labels:
+    {{- include "trawl.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: https
+      port: {{ .Values.service.port }}
+      targetPort: https
+      protocol: TCP
+    {{- if .Values.service.syslog.enabled }}
+    - name: syslog-udp
+      port: {{ .Values.service.syslog.udpPort }}
+      targetPort: syslog-udp
+      protocol: UDP
+    - name: syslog-tcp
+      port: {{ .Values.service.syslog.tcpPort }}
+      targetPort: syslog-tcp
+      protocol: TCP
+    {{- end }}
+  selector:
+    {{- include "trawl.selectorLabels" . | nindent 4 }}

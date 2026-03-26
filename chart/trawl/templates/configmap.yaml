@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "trawl.fullname" . }}
+  labels:
+    {{- include "trawl.labels" . | nindent 4 }}
+data:
+  trawld.toml: |
+    {{- if .Values.config.raw }}
+    {{ .Values.config.raw | nindent 4 }}
+    {{- else }}
+    [server]
+    http_addr = {{ .Values.config.server.httpAddr | quote }}
+    timeout_secs = {{ .Values.config.server.timeoutSecs | int }}
+    {{- if .Values.config.server.maxConcurrentQueries }}
+    max_concurrent_queries = {{ .Values.config.server.maxConcurrentQueries }}
+    {{- end }}
+    max_result_rows = {{ .Values.config.server.maxResultRows | int }}
+    max_export_rows = {{ .Values.config.server.maxExportRows | int }}
+    max_request_body_bytes = {{ .Values.config.server.maxRequestBodyBytes | quote }}
+    max_concurrent_requests = {{ .Values.config.server.maxConcurrentRequests | int }}
+    shutdown_drain_secs = {{ .Values.config.server.shutdownDrainSecs | int }}
+    max_sse_connections = {{ .Values.config.server.maxSseConnections | int }}
+    schema_cache_ttl_secs = {{ .Values.config.server.schemaCacheTtlSecs | int }}
+    max_query_history = {{ .Values.config.server.maxQueryHistory | int }}
+    {{- if .Values.config.server.corsAllowedOrigins }}
+    cors_allowed_origins = [{{ range $i, $o := .Values.config.server.corsAllowedOrigins }}{{ if $i }}, {{ end }}{{ $o | quote }}{{ end }}]
+    {{- end }}
+    {{- if eq .Values.tls.mode "secret" }}
+    tls_cert_path = "/etc/trawl/tls/tls.crt"
+    tls_key_path = "/etc/trawl/tls/tls.key"
+    tls_reload_interval_secs = 300
+    {{- else if eq .Values.tls.mode "certManager" }}
+    tls_cert_path = "/etc/trawl/tls/tls.crt"
+    tls_key_path = "/etc/trawl/tls/tls.key"
+    tls_reload_interval_secs = 300
+    {{- end }}
+
+    [server.rate_limit]
+    admin = {{ .Values.config.server.rateLimit.admin | int }}
+    analyst = {{ .Values.config.server.rateLimit.analyst | int }}
+    reader = {{ .Values.config.server.rateLimit.reader | int }}
+    ingest = {{ .Values.config.server.rateLimit.ingest | int }}
+
+    [data]
+    path = {{ .Values.config.data.path | quote }}
+
+    [auth]
+    db_path = {{ .Values.config.auth.dbPath | quote }}
+    audit_interval_secs = {{ .Values.config.auth.auditIntervalSecs | int }}
+    auth_cache_ttl_secs = {{ .Values.config.auth.authCacheTtlSecs | int }}
+
+    [ingest]
+    enabled = {{ .Values.config.ingest.enabled }}
+    max_body_bytes = {{ .Values.config.ingest.maxBodyBytes | quote }}
+    {{- if .Values.config.ingest.walDir }}
+    wal_dir = {{ .Values.config.ingest.walDir | quote }}
+    {{- end }}
+    compaction_interval_secs = {{ .Values.config.ingest.compactionIntervalSecs | int }}
+    internal_telemetry = {{ .Values.config.ingest.internalTelemetry }}
+    daily_rollup = {{ .Values.config.ingest.dailyRollup }}
+    event_bus_capacity = {{ .Values.config.ingest.eventBusCapacity | int }}
+    hot_buffer_max_events = {{ .Values.config.ingest.hotBufferMaxEvents | int }}
+    hot_buffer_max_bytes = {{ .Values.config.ingest.hotBufferMaxBytes | quote }}
+    stats_interval_secs = {{ .Values.config.ingest.statsIntervalSecs | int }}
+    telemetry_flush_interval_secs = {{ .Values.config.ingest.telemetryFlushIntervalSecs | int }}
+
+    [retention]
+    max_age_days = {{ .Values.config.retention.maxAgeDays | int }}
+    min_free_disk_bytes = {{ .Values.config.retention.minFreeDiskBytes | quote }}
+    retention_interval_secs = {{ .Values.config.retention.retentionIntervalSecs | int }}
+
+    [syslog]
+    enabled = {{ .Values.config.syslog.enabled }}
+    {{- if .Values.config.syslog.enabled }}
+    udp_addr = {{ .Values.config.syslog.udpAddr | quote }}
+    tcp_addr = {{ .Values.config.syslog.tcpAddr | quote }}
+    {{- end }}
+
+    [scheduler]
+    enabled = {{ .Values.config.scheduler.enabled }}
+    poll_interval_secs = {{ .Values.config.scheduler.pollIntervalSecs | int }}
+    report_max_rows = {{ .Values.config.scheduler.reportMaxRows | int }}
+    max_runs_per_schedule = {{ .Values.config.scheduler.maxRunsPerSchedule | int }}
+    report_retention_days = {{ .Values.config.scheduler.reportRetentionDays | int }}
+    {{- end }}

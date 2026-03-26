@@ -1,0 +1,158 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "trawl.fullname" . }}
+  labels:
+    {{- include "trawl.labels" . | nindent 4 }}
+spec:
+  # Single-node only — multiple replicas would corrupt the SQLite auth database.
+  replicas: 1
+  serviceName: {{ include "trawl.fullname" . }}
+  selector:
+    matchLabels:
+      {{- include "trawl.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "trawl.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "trawl.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.config.server.shutdownDrainSecs }}
+      {{- if .Values.initAuth.enabled }}
+      initContainers:
+        - name: init-auth
+          image: {{ include "trawl.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              if [ -f /var/lib/trawl/auth.db ]; then
+                echo "auth.db already exists, skipping bootstrap"
+                exit 0
+              fi
+              echo "=== bootstrapping auth database ==="
+              echo ""
+              echo "--- admin token ---"
+              trawl-admin --db /var/lib/trawl/auth.db keys create \
+                --role admin --name {{ .Values.initAuth.keyName | quote }}
+              echo ""
+              {{- if .Values.initAuth.createIngestKey }}
+              echo "--- ingest token ---"
+              trawl-admin --db /var/lib/trawl/auth.db keys create \
+                --role ingest --name {{ .Values.initAuth.ingestKeyName | quote }}
+              echo ""
+              {{- end }}
+              echo "=== retrieve tokens with: kubectl logs {{ include "trawl.fullname" . }}-0 -c init-auth ==="
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/trawl
+      {{- end }}
+      containers:
+        - name: trawld
+          image: {{ include "trawl.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/trawl/trawld.toml", "--no-monitor"]
+          ports:
+            - name: https
+              containerPort: 5514
+              protocol: TCP
+            {{- if .Values.config.syslog.enabled }}
+            - name: syslog-udp
+              containerPort: 1514
+              protocol: UDP
+            - name: syslog-tcp
+              containerPort: 1514
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: https
+              scheme: HTTPS
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: https
+              scheme: HTTPS
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/trawl
+            - name: config
+              mountPath: /etc/trawl/trawld.toml
+              subPath: trawld.toml
+              readOnly: true
+            {{- if ne .Values.tls.mode "auto" }}
+            - name: tls
+              mountPath: /etc/trawl/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "trawl.fullname" . }}
+        {{- if eq .Values.tls.mode "secret" }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- else if eq .Values.tls.mode "certManager" }}
+        - name: tls
+          secret:
+            secretName: {{ include "trawl.fullname" . }}-tls
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "trawl.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

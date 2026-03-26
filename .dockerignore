@@ -1,0 +1,14 @@
+target/
+.git/
+.github/
+docs/
+config/
+*.md
+!chart/trawl/README.md
+.gitignore
+.cargo/
+.claude/
+bacon.toml
+lefthook.yml
+deny.toml
+rustfmt.toml

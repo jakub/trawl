@@ -1,0 +1,190 @@
+# trawl helm chart values
+#
+# trawl is single-node only — replicas are hardcoded to 1.
+# multiple replicas would corrupt the SQLite auth database.
+
+image:
+  repository: ghcr.io/jakub/trawl
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Kubernetes Service
+service:
+  type: ClusterIP
+  port: 5514
+  # Optional annotations (e.g. for cloud load balancers).
+  annotations: {}
+  # Native syslog listener ports (requires config.syslog.enabled).
+  syslog:
+    enabled: false
+    udpPort: 1514
+    tcpPort: 1514
+
+# -- Ingress (disabled by default)
+# trawld speaks HTTPS natively — the ingress must use backend-protocol HTTPS.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # Example for nginx-ingress:
+  #   nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+  hosts:
+    - host: trawl.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: trawl-tls
+  #    hosts:
+  #      - trawl.local
+
+# -- Persistent storage
+# Single PVC for parquet data, WAL, auth database, and auto-generated TLS certs.
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 50Gi
+  accessModes:
+    - ReadWriteOnce
+
+# -- trawld configuration
+# Either use the structured values below (templated into trawld.toml),
+# or set config.raw to provide your own TOML verbatim.
+config:
+  # Set to a complete trawld.toml string to bypass structured templating.
+  raw: ""
+
+  server:
+    httpAddr: "0.0.0.0:5514"
+    timeoutSecs: 30
+    # Defaults to CPU count when empty.
+    maxConcurrentQueries: ""
+    maxResultRows: 100000
+    maxExportRows: 1000000
+    maxRequestBodyBytes: "128K"
+    maxConcurrentRequests: 256
+    shutdownDrainSecs: 30
+    maxSseConnections: 32
+    corsAllowedOrigins: []
+    schemaCacheTtlSecs: 60
+    maxQueryHistory: 1000
+    # Per-role rate limits (requests/minute). 0 = disabled.
+    rateLimit:
+      admin: 100
+      analyst: 60
+      reader: 30
+      ingest: 1000
+
+  data:
+    path: "/var/lib/trawl/data"
+
+  auth:
+    dbPath: "/var/lib/trawl/auth.db"
+    auditIntervalSecs: 30
+    authCacheTtlSecs: 300
+
+  ingest:
+    enabled: true
+    maxBodyBytes: "16M"
+    # Defaults to {data.path}/wal when empty.
+    walDir: ""
+    compactionIntervalSecs: 10
+    internalTelemetry: true
+    dailyRollup: true
+    eventBusCapacity: 4096
+    hotBufferMaxEvents: 100000
+    hotBufferMaxBytes: "100M"
+    statsIntervalSecs: 60
+    telemetryFlushIntervalSecs: 1
+
+  retention:
+    maxAgeDays: 90
+    minFreeDiskBytes: "1G"
+    retentionIntervalSecs: 3600
+
+  syslog:
+    enabled: false
+    udpAddr: "0.0.0.0:1514"
+    tcpAddr: "0.0.0.0:1514"
+
+  scheduler:
+    enabled: true
+    pollIntervalSecs: 10
+    reportMaxRows: 10000
+    maxRunsPerSchedule: 100
+    reportRetentionDays: 30
+
+# -- TLS configuration
+# "auto"        — trawld generates a self-signed cert (default, zero-config)
+# "secret"      — mount an existing Kubernetes TLS Secret
+# "certManager" — create a cert-manager Certificate resource
+tls:
+  mode: auto
+  # For mode=secret: name of the existing TLS Secret.
+  secretName: ""
+  # For mode=certManager:
+  certManager:
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+
+# -- Auth bootstrap
+# On first install, an init container creates the SQLite auth database
+# and generates an initial admin API key. Retrieve the token with:
+#   kubectl logs <pod> -c init-auth
+initAuth:
+  enabled: true
+  keyName: "helm-bootstrap"
+  # Also create an ingest-role key for immediate log ingestion.
+  createIngestKey: true
+  ingestKeyName: "helm-ingest"
+
+# -- Container resources
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    # No CPU limit — DuckDB benefits from burst capacity.
+    memory: 2Gi
+
+# -- Log level
+logLevel: "trawl_server=info"
+
+# -- Prometheus ServiceMonitor (requires prometheus-operator CRDs)
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  # Install into a specific namespace (e.g. monitoring). Empty = release namespace.
+  namespace: ""
+
+# -- Pod configuration
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -263,3 +264,78 @@ jobs:
           git add -A
           git commit -m "apt: update repository for ${RELEASE_TAG}"
           git push origin gh-pages
+
+  docker:
+    name: container image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*-unknown-linux-gnu
+          merge-multiple: true
+
+      - name: Extract binaries by arch
+        run: |
+          for arch in amd64 arm64; do
+            case $arch in
+              amd64) target="x86_64-unknown-linux-gnu" ;;
+              arm64) target="aarch64-unknown-linux-gnu" ;;
+            esac
+            mkdir -p "docker-ctx/${arch}"
+            tar xzf dist/trawl-*-${target}.tar.gz
+            cp trawl-*-${target}/trawld "docker-ctx/${arch}/"
+            cp trawl-*-${target}/trawl-admin "docker-ctx/${arch}/"
+            chmod +x "docker-ctx/${arch}/trawld" "docker-ctx/${arch}/trawl-admin"
+          done
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  helm-package:
+    name: helm chart
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to GHCR for Helm
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username ${{ github.actor }} --password-stdin
+
+      - name: Package and push chart
+        env:
+          VERSION: ${{ env.RELEASE_TAG }}
+        run: |
+          version="${VERSION#v}"
+          helm package chart/trawl --version "${version}" --app-version "${version}"
+          helm push trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
