@@ -280,6 +280,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         .as_ref()
         .map(|w| w.dir().to_path_buf());
     let _ = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "linux")]
         metrics_process::Collector::default().collect();
         crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob, wal_dir.as_deref());
     })

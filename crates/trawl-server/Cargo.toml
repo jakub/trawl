@@ -29,7 +29,6 @@ governor = { workspace = true }
 indexmap = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-metrics-process = { workspace = true }
 hyper = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
@@ -58,6 +57,9 @@ hostname = { workspace = true }
 ratatui = { workspace = true }
 x509-parser = { workspace = true }
 zstd = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+metrics-process = { workspace = true }
 
 [features]
 default = ["bundled"]

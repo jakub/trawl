@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
         .expect("failed to install prometheus recorder");
+    #[cfg(target_os = "linux")]
     metrics_process::Collector::default().describe();
     trawl_server::metrics::describe_metrics();
 
