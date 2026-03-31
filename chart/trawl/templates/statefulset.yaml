@@ -80,8 +80,13 @@ spec:
               protocol: TCP
             {{- end }}
           env:
+            - name: HOME
+              value: /var/lib/trawl
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           startupProbe:
             httpGet:
               path: /api/v1/health

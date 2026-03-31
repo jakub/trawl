@@ -191,6 +191,13 @@ resources:
     # No CPU limit — DuckDB benefits from burst capacity.
     memory: 2Gi
 
+# -- Extra environment variables for the trawld container.
+# Example:
+#   extraEnv:
+#     - name: RUST_BACKTRACE
+#       value: "1"
+extraEnv: []
+
 # -- Log level
 logLevel: "trawl_server=info"
 
