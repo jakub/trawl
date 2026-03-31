@@ -1,29 +1,29 @@
 Package: trawl-cli
-Version: 0.1.15-1
+Version: 0.1.16-1
 Architecture: arm64
 Maintainer: Jakub Burgis <mail@jakub.me>
-Installed-Size: 40232
+Installed-Size: 40234
 Depends: libc6:arm64 (>= 2.39)
-Filename: pool/trawl-cli_0.1.15-1_arm64.deb
-Size: 8955096
-MD5sum: ed5102c90d1527c7bc64238073cebeab
-SHA1: 2e0dc00e298a0a1a08cb8ccbbabe79a20712cfe1
-SHA256: 81d3adb77dc0a8a7284c83396009eed85fefb7d649256b265583332e131fdaa2
+Filename: pool/trawl-cli_0.1.16-1_arm64.deb
+Size: 8956944
+MD5sum: dbdfdc2de9abe6b6b47622ea7bbaa2b6
+SHA1: 3a30b8b617b22b3e5f416d8bdc2205807554c1b5
+SHA256: b8ef79fb58ef43504f1bc1e59cfe8e7e1c513e23fc4a47c00010925d26614d71
 Section: utils
 Priority: optional
 Description: CLI tool for querying logs via trawl
 
 Package: trawl-server
-Version: 0.1.15-1
+Version: 0.1.16-1
 Architecture: arm64
 Maintainer: Jakub Burgis <mail@jakub.me>
-Installed-Size: 46273
+Installed-Size: 46275
 Depends: libc6:arm64 (>= 2.39)
-Filename: pool/trawl-server_0.1.15-1_arm64.deb
-Size: 10845772
-MD5sum: d3f1c9311736b8dcd1e2f80994faa25d
-SHA1: 20d21412bb62a34bca391b34cc955d5bd87aba75
-SHA256: 36db5f61bd318606007f488c6a871c7017a6930fbb78b42aadfa470407bfdd0f
+Filename: pool/trawl-server_0.1.16-1_arm64.deb
+Size: 10848756
+MD5sum: f7601ea586f6b005e30bb101f196b188
+SHA1: 60f42dfdac3fd3fac9ddff20e29f0bc3123ff38a
+SHA256: b2154d20d39361e4eb3851ff6b4c6a62ab1a275c320b6edc9bbe525933f2b840
 Section: net
 Priority: optional
 Description: The trawld daemon — HTTP, Unix socket, and TCP+TLS listeners
