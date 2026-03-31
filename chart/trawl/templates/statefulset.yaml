@@ -61,6 +61,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/trawl
+            - name: tmp
+              mountPath: /tmp
       {{- end }}
       containers:
         - name: trawld
@@ -113,6 +115,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/trawl
+            - name: tmp
+              mountPath: /tmp
             - name: config
               mountPath: /etc/trawl/trawld.toml
               subPath: trawld.toml
@@ -123,6 +127,9 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
         - name: config
           configMap:
             name: {{ include "trawl.fullname" . }}
