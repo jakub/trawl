@@ -587,10 +587,16 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     // ── endpoint URL construction ───────────────────────────────────────
 
     #[test]
     fn endpoint_no_trailing_slash() {
+        init();
         let client = HttpClient::with_client("https://localhost:8443", "tok", Client::new());
         assert_eq!(
             client.endpoint("/api/v1/query"),
@@ -600,6 +606,7 @@ mod tests {
 
     #[test]
     fn endpoint_strips_trailing_slash() {
+        init();
         let client = HttpClient::with_client("https://localhost:8443/", "tok", Client::new());
         assert_eq!(
             client.endpoint("/api/v1/query"),
@@ -609,6 +616,7 @@ mod tests {
 
     #[test]
     fn endpoint_strips_multiple_trailing_slashes() {
+        init();
         let client = HttpClient::with_client("https://localhost:8443///", "tok", Client::new());
         assert_eq!(
             client.endpoint("/api/v1/query"),
@@ -620,6 +628,7 @@ mod tests {
 
     #[test]
     fn debug_redacts_token() {
+        init();
         let client = HttpClient::with_client(
             "https://localhost:8443",
             "flt_XXXXXXXX_secrettoken123456789012345",
