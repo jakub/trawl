@@ -23,7 +23,7 @@ tempfile = { workspace = true }
 
 [features]
 default = ["bundled"]
-bundled = ["duckdb/bundled"]
+bundled = ["duckdb/bundled", "duckdb/json"]
 
 [lints]
 workspace = true
