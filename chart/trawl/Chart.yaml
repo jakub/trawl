@@ -3,7 +3,7 @@ name: trawl
 description: Self-hosted log collection, storage, and search for homelabs and small-to-medium infra
 type: application
 version: 0.1.0
-appVersion: "0.1.15"
+appVersion: "0.1.16"
 home: https://github.com/jakub/trawl
 sources:
   - https://github.com/jakub/trawl
