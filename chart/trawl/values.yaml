@@ -43,6 +43,17 @@ ingress:
   #    hosts:
   #      - trawl.local
 
+# -- Gateway API HTTPRoute (alternative to Ingress)
+# trawld speaks HTTPS natively — configure BackendTLSPolicy if your
+# gateway controller needs to trust the backend certificate.
+httpRoute:
+  enabled: false
+  parentRef:
+    name: ""
+    namespace: ""
+    sectionName: websecure
+  hostnames: []
+
 # -- Persistent storage
 # Single PVC for parquet data, WAL, auth database, and auto-generated TLS certs.
 persistence:
@@ -70,6 +81,9 @@ config:
     maxConcurrentRequests: 256
     shutdownDrainSecs: 30
     maxSseConnections: 32
+    # How often to check for rotated TLS certs (seconds). Default: 300.
+    # Lower values improve cert-manager rotation responsiveness.
+    tlsReloadIntervalSecs: 300
     corsAllowedOrigins: []
     schemaCacheTtlSecs: 60
     maxQueryHistory: 1000
@@ -110,7 +124,25 @@ config:
   syslog:
     enabled: false
     udpAddr: "0.0.0.0:1514"
+    udpEnabled: true
     tcpAddr: "0.0.0.0:1514"
+    tcpEnabled: true
+    maxTcpConnections: 256
+    batchIntervalMs: 500
+    batchMaxEvents: 1000
+    defaultService: "syslog"
+    tcpIdleTimeoutSecs: 60
+    maxEventsPerConnection: 100000
+    consecutiveSendFailuresLimit: 100
+    allowCidrs: []
+    # allowCidrs:
+    #   - "192.168.0.0/16"
+    #   - "10.0.0.0/8"
+    sourceServiceMap: {}
+    # sourceServiceMap:
+    #   "10.0.0.1": "unifi-gateway"
+    #   "10.0.0.2": "unifi-ap"
+    channelCapacity: 10000
 
   scheduler:
     enabled: true
@@ -143,6 +175,12 @@ initAuth:
   # Also create an ingest-role key for immediate log ingestion.
   createIngestKey: true
   ingestKeyName: "helm-ingest"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
 
 # -- Container resources
 resources:

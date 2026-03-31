@@ -29,11 +29,11 @@ data:
     {{- if eq .Values.tls.mode "secret" }}
     tls_cert_path = "/etc/trawl/tls/tls.crt"
     tls_key_path = "/etc/trawl/tls/tls.key"
-    tls_reload_interval_secs = 300
+    tls_reload_interval_secs = {{ .Values.config.server.tlsReloadIntervalSecs | int }}
     {{- else if eq .Values.tls.mode "certManager" }}
     tls_cert_path = "/etc/trawl/tls/tls.crt"
     tls_key_path = "/etc/trawl/tls/tls.key"
-    tls_reload_interval_secs = 300
+    tls_reload_interval_secs = {{ .Values.config.server.tlsReloadIntervalSecs | int }}
     {{- end }}
 
     [server.rate_limit]
@@ -74,7 +74,27 @@ data:
     enabled = {{ .Values.config.syslog.enabled }}
     {{- if .Values.config.syslog.enabled }}
     udp_addr = {{ .Values.config.syslog.udpAddr | quote }}
+    udp_enabled = {{ .Values.config.syslog.udpEnabled }}
     tcp_addr = {{ .Values.config.syslog.tcpAddr | quote }}
+    tcp_enabled = {{ .Values.config.syslog.tcpEnabled }}
+    max_tcp_connections = {{ .Values.config.syslog.maxTcpConnections | int }}
+    batch_interval_ms = {{ .Values.config.syslog.batchIntervalMs | int }}
+    batch_max_events = {{ .Values.config.syslog.batchMaxEvents | int }}
+    default_service = {{ .Values.config.syslog.defaultService | quote }}
+    tcp_idle_timeout_secs = {{ .Values.config.syslog.tcpIdleTimeoutSecs | int }}
+    max_events_per_connection = {{ .Values.config.syslog.maxEventsPerConnection | int }}
+    consecutive_send_failures_limit = {{ .Values.config.syslog.consecutiveSendFailuresLimit | int }}
+    channel_capacity = {{ .Values.config.syslog.channelCapacity | int }}
+    {{- if .Values.config.syslog.allowCidrs }}
+    allow_cidrs = [{{ range $i, $cidr := .Values.config.syslog.allowCidrs }}{{ if $i }}, {{ end }}{{ $cidr | quote }}{{ end }}]
+    {{- end }}
+    {{- if .Values.config.syslog.sourceServiceMap }}
+
+    [syslog.source_service_map]
+    {{- range $ip, $service := .Values.config.syslog.sourceServiceMap }}
+    {{ $ip | quote }} = {{ $service | quote }}
+    {{- end }}
+    {{- end }}
     {{- end }}
 
     [scheduler]

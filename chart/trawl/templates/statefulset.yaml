@@ -56,6 +56,8 @@ spec:
               echo "=== retrieve tokens with: kubectl logs {{ include "trawl.fullname" . }}-0 -c init-auth ==="
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.initAuth.resources | nindent 12 }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/trawl

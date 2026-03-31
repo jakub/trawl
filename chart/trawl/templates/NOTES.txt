@@ -1,0 +1,31 @@
+trawl has been installed.
+
+{{- if .Values.initAuth.enabled }}
+
+Retrieve bootstrap API tokens (first install only):
+
+  kubectl logs {{ include "trawl.fullname" . }}-0 -c init-auth -n {{ .Release.Namespace }}
+{{- end }}
+
+Health check:
+
+  kubectl exec -n {{ .Release.Namespace }} {{ include "trawl.fullname" . }}-0 -- \
+    wget -qO- --no-check-certificate https://localhost:5514/api/v1/health
+
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+
+Web access:  https://{{ .host }}
+{{- end }}
+{{- else if .Values.httpRoute.enabled }}
+{{- range .Values.httpRoute.hostnames }}
+
+Web access:  https://{{ . }}
+{{- end }}
+{{- else }}
+
+Direct access (port-forward):
+
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 5514:{{ .Values.service.port }}
+  curl -k https://localhost:5514/api/v1/health
+{{- end }}
