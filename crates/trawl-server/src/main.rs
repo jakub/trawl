@@ -38,6 +38,10 @@ struct Cli {
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install ring crypto provider");
+
     let cli = Cli::parse();
     let config_path = resolve_path(&cli.config);
     let config = Config::from_file(&config_path)?;

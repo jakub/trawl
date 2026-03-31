@@ -81,6 +81,10 @@ impl HttpClient {
         token: impl Into<String>,
         accept_invalid_certs: bool,
     ) -> Result<Self, ClientError> {
+        // Ensure ring is available as the rustls crypto provider.
+        // Idempotent — returns Err if already installed, which we ignore.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Self::DEFAULT_TIMEOUT);
