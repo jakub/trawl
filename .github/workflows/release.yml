@@ -19,9 +19,9 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  build:
+  build-linux:
     name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -29,15 +29,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
             cross: false
-            os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             cross: true
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            arch: arm64
-            cross: true
-            os: ubuntu-latest
     steps:
       - name: Free disk space
         run: |
@@ -67,20 +61,16 @@ jobs:
         if: matrix.cross
         uses: mlugg/setup-zig@v2
 
-      - name: Install cross-arch dpkg libs (Linux cross-compile)
-        if: matrix.cross && contains(matrix.target, 'linux')
+      - name: Install cross-arch dpkg libs
+        if: matrix.cross
         run: |
           sudo dpkg --add-architecture arm64
-          # Pin existing sources to amd64 — noble runners use DEB822 .sources
-          # files, so patch both formats. Without this, apt tries to fetch
-          # arm64 from mirrors that only carry amd64 and gets 404s.
           for f in /etc/apt/sources.list.d/*.sources; do
             [ -f "$f" ] && sudo sed -i '/^Architectures:/!s/^Types: deb/Architectures: amd64\nTypes: deb/' "$f"
           done
           for f in /etc/apt/sources.list.d/*.list; do
             [ -f "$f" ] && sudo sed -i '/\[arch=/!s/^deb /deb [arch=amd64] /' "$f"
           done
-          # Add arm64 from ports.ubuntu.com (the only mirror that carries it)
           codename="$(lsb_release -cs)"
           printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s %s\n' \
             "$codename"          "main universe" \
@@ -98,18 +88,11 @@ jobs:
         if: "!matrix.cross"
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (Linux cross)
-        if: matrix.cross && contains(matrix.target, 'linux')
+      - name: Build (cross)
+        if: matrix.cross
         run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
 
-      - name: Build (macOS cross)
-        if: matrix.cross && contains(matrix.target, 'apple')
-        run: cargo zigbuild --release --target ${{ matrix.target }} -p trawl-cli --no-default-features
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
-
       - name: Build .deb packages
-        if: contains(matrix.target, 'linux')
         run: |
           cargo deb -p trawl-server --no-build --no-strip --target ${{ matrix.target }}
           cargo deb -p trawl-cli --no-build --no-strip --target ${{ matrix.target }}
@@ -120,11 +103,8 @@ jobs:
           staging="trawl-${tag}-${{ matrix.target }}"
           mkdir -p "${staging}"
           cp "target/${{ matrix.target }}/release/trawl" "${staging}/"
-          # trawld and trawl-admin are linux-only (not built for macOS)
-          if [ -f "target/${{ matrix.target }}/release/trawld" ]; then
-            cp "target/${{ matrix.target }}/release/trawld" "${staging}/"
-            cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
-          fi
+          cp "target/${{ matrix.target }}/release/trawld" "${staging}/"
+          cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
           tar czf "${staging}.tar.gz" "${staging}"
 
       - name: Upload tarball
@@ -135,16 +115,69 @@ jobs:
           if-no-files-found: error
 
       - name: Upload .deb packages
-        if: contains(matrix.target, 'linux')
         uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.target }}
           path: target/${{ matrix.target }}/debian/*.deb
           if-no-files-found: error
 
+  build-macos:
+    name: build (aarch64-apple-darwin)
+    runs-on: ubuntu-latest
+    # macOS cross-compile is best-effort — don't block release artifacts
+    continue-on-error: true
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set version from tag
+        run: |
+          version="${RELEASE_TAG#v}"
+          sed -i "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-aarch64-apple-darwin
+
+      - uses: mlugg/setup-zig@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build CLI for macOS
+        run: cargo zigbuild --release --target aarch64-apple-darwin -p trawl-cli --no-default-features
+        env:
+          DUCKDB_DOWNLOAD_LIB: "1"
+
+      - name: Create tarball
+        run: |
+          tag="${RELEASE_TAG}"
+          staging="trawl-${tag}-aarch64-apple-darwin"
+          mkdir -p "${staging}"
+          cp "target/aarch64-apple-darwin/release/trawl" "${staging}/"
+          tar czf "${staging}.tar.gz" "${staging}"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-aarch64-apple-darwin
+          path: trawl-*.tar.gz
+          if-no-files-found: error
+
   release:
     name: github release
-    needs: build
+    needs: build-linux
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -167,7 +200,7 @@ jobs:
 
   publish-apt:
     name: publish APT repository
-    needs: [build, release]
+    needs: [build-linux, release]
     runs-on: ubuntu-latest
     concurrency:
       group: gh-pages-deploy
@@ -203,8 +236,6 @@ jobs:
       - name: Import GPG key
         run: |
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import || true
-          # Verify the key was actually imported (gpg exits 2 on armor
-          # header warnings from github secrets newline mangling)
           gpg --list-secret-keys --keyid-format long | grep -q '^sec' \
             || { echo "::error::GPG secret key not found after import"; exit 1; }
         env:
@@ -215,16 +246,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Collect .deb files into pool
           mkdir -p apt/pool
           find incoming -name '*.deb' -exec cp {} apt/pool/ \;
           ls -la apt/pool/
 
-          # All apt operations run from inside apt/ so that
-          # dpkg-scanpackages produces Filename: pool/... (not apt/pool/...)
           cd apt
 
-          # Generate per-arch Packages indices
           for arch in amd64 arm64; do
             dir="dists/stable/main/binary-${arch}"
             mkdir -p "${dir}"
@@ -232,7 +259,6 @@ jobs:
             gzip -9c "${dir}/Packages" > "${dir}/Packages.gz"
           done
 
-          # Generate Release file
           cd dists/stable
           cat > Release <<'RELEASE'
           Origin: Trawl
@@ -242,21 +268,16 @@ jobs:
           Architectures: amd64 arm64
           Components: main
           RELEASE
-          # Add dynamic date field
           echo "Date: $(date -Ru)" >> Release
-          # Strip leading whitespace from heredoc
           sed -i 's/^[[:space:]]*//' Release
-          # Add hashes
           apt-ftparchive release . >> Release
 
-          # Sign
           gpg_key="$(gpg --list-secret-keys --keyid-format long 2>/dev/null \
             | grep '^sec' | head -1 | awk '{print $2}' | cut -d/ -f2)"
           gpg --batch --yes --default-key "${gpg_key}" --detach-sign --armor -o Release.gpg Release
           gpg --batch --yes --default-key "${gpg_key}" --clearsign -o InRelease Release
           cd "$GITHUB_WORKSPACE"
 
-          # Export public key
           gpg --batch --yes --armor --export "${gpg_key}" > gpg.key
 
       - name: Clean up incoming artifacts
@@ -270,7 +291,7 @@ jobs:
 
   docker:
     name: container image
-    needs: build
+    needs: build-linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
