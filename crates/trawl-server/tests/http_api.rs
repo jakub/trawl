@@ -162,6 +162,7 @@ async fn wait_for_ready(addr: &str) {
 
 /// Set up a test server with custom rate limiting for rate limit tests.
 async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let data_glob = ensure_fixtures();
     let auth_db = tmp.path().join("auth.db");
@@ -241,6 +242,7 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
 async fn setup() -> TestServer {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let data_glob = ensure_fixtures();
     let auth_db = tmp.path().join("auth.db");
