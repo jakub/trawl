@@ -40,14 +40,24 @@ use crate::config::Config;
 
 /// Get text from the system clipboard. Returns `None` if clipboard is unavailable.
 fn clipboard_get() -> Option<String> {
-    arboard::Clipboard::new().ok()?.get_text().ok()
+    #[cfg(feature = "clipboard")]
+    {
+        arboard::Clipboard::new().ok()?.get_text().ok()
+    }
+    #[cfg(not(feature = "clipboard"))]
+    {
+        None
+    }
 }
 
 /// Set text on the system clipboard. Silently fails if clipboard is unavailable.
 fn clipboard_set(text: &str) {
+    #[cfg(feature = "clipboard")]
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(text.to_owned());
     }
+    #[cfg(not(feature = "clipboard"))]
+    let _ = text;
 }
 
 /// Error from an async query execution.

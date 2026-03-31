@@ -17,7 +17,7 @@ trawl-client = { workspace = true }
 trawl-core = { workspace = true }
 trawl-dashboard = { workspace = true }
 trawl-engine = { workspace = true }
-arboard = { workspace = true }
+arboard = { workspace = true, optional = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
@@ -37,8 +37,9 @@ tracing-subscriber = { workspace = true }
 unicode-width = { workspace = true }
 
 [features]
-default = ["bundled"]
+default = ["bundled", "clipboard"]
 bundled = ["trawl-engine/bundled"]
+clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 insta = { workspace = true }

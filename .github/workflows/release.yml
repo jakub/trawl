@@ -104,7 +104,7 @@ jobs:
 
       - name: Build (macOS cross)
         if: matrix.cross && contains(matrix.target, 'apple')
-        run: cargo zigbuild --release --target ${{ matrix.target }} --no-default-features
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p trawl-cli --no-default-features
         env:
           DUCKDB_DOWNLOAD_LIB: "1"
 
@@ -120,8 +120,11 @@ jobs:
           staging="trawl-${tag}-${{ matrix.target }}"
           mkdir -p "${staging}"
           cp "target/${{ matrix.target }}/release/trawl" "${staging}/"
-          cp "target/${{ matrix.target }}/release/trawld" "${staging}/"
-          cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
+          # trawld and trawl-admin are linux-only (not built for macOS)
+          if [ -f "target/${{ matrix.target }}/release/trawld" ]; then
+            cp "target/${{ matrix.target }}/release/trawld" "${staging}/"
+            cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
+          fi
           tar czf "${staging}.tar.gz" "${staging}"
 
       - name: Upload tarball
