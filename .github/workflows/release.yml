@@ -57,8 +57,7 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Install zig (cross-compile)
-        if: matrix.cross
+      - name: Install zig
         uses: mlugg/setup-zig@v2
 
       - name: Install cross-arch dpkg libs
@@ -84,12 +83,7 @@ jobs:
         with:
           tool: cargo-zigbuild,cargo-deb
 
-      - name: Build (native)
-        if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
+      - name: Build
         run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
 
       - name: Build .deb packages
