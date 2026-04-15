@@ -18,10 +18,10 @@ use tokio::sync::watch;
 use crate::hot_buffer::HotBuffer;
 use crate::state::CompactionStats;
 
-/// Maximum WAL files to process in a single `read_json` call during
-/// compaction. Large backlogs (100k+ files) would OOM an in-memory
-/// `DuckDB` instance, so we chunk and merge incrementally.
-const MAX_WAL_FILES_PER_CHUNK: usize = 10_000;
+/// Default compaction chunk size, used when config is not threaded
+/// through (e.g. in direct `compact_once` calls from tests).
+#[cfg(test)]
+const DEFAULT_CHUNK_SIZE: usize = 500;
 
 /// Spawn the compaction background loop.
 ///
@@ -30,11 +30,14 @@ const MAX_WAL_FILES_PER_CHUNK: usize = 10_000;
 /// parquet to `data_dir/{date}/{hour}/{service}.parquet`.
 ///
 /// Stops when `shutdown_rx` receives a signal.
+#[allow(clippy::too_many_arguments)] // internal API, config struct is overkill here
 pub fn spawn_compaction(
     wal_dir: PathBuf,
     data_dir: PathBuf,
     interval: Duration,
     daily_rollup: bool,
+    chunk_size: usize,
+    memory_limit: String,
     hot_buffer: Option<Arc<HotBuffer>>,
     compaction_stats: Option<Arc<CompactionStats>>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -47,13 +50,15 @@ pub fn spawn_compaction(
             data_dir = %data_dir.display(),
             interval_secs = interval.as_secs(),
             daily_rollup,
+            chunk_size,
+            memory_limit = %memory_limit,
             "compaction task started"
         );
 
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    match compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref()).await {
+                    match compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit).await {
                         Ok(()) => {
                             if let Some(ref stats) = compaction_stats {
                                 stats.total_runs.fetch_add(1, Ordering::Relaxed);
@@ -90,6 +95,8 @@ pub async fn compact_once(
     min_age: Duration,
     daily_rollup: bool,
     hot_buffer: Option<&Arc<HotBuffer>>,
+    chunk_size: usize,
+    memory_limit: &str,
 ) -> Result<(), String> {
     // Remove orphaned .parquet.tmp files from interrupted compaction runs.
     cleanup_stale_tmp_files(data_dir, min_age * 2);
@@ -113,7 +120,8 @@ pub async fn compact_once(
             // the canonical file if it exists), drains the hot buffer, and
             // cleans up consumed WAL files. If a chunk fails, remaining
             // chunks are skipped and retried on the next tick.
-            let chunks: Vec<&[PathBuf]> = wal_files.chunks(MAX_WAL_FILES_PER_CHUNK).collect();
+            let safe_chunk_size = chunk_size.max(1);
+            let chunks: Vec<&[PathBuf]> = wal_files.chunks(safe_chunk_size).collect();
             let total_chunks = chunks.len();
 
             for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
@@ -136,7 +144,7 @@ pub async fn compact_once(
                     .filter_map(|f| f.file_stem()?.to_str())
                     .collect();
 
-                match compact_service_batch(chunk, data_dir, service).await {
+                match compact_service_batch(chunk, data_dir, service, memory_limit).await {
                     Ok(()) => {
                         // Remove fully compacted batches from the hot buffer.
                         if let Some(buf) = &hot_buffer {
@@ -175,7 +183,7 @@ pub async fn compact_once(
     // After WAL compaction, consolidate older days' hourly files into
     // per-service daily files. This dramatically reduces file count for
     // long lookback queries.
-    if daily_rollup && let Err(e) = rollup_once(data_dir).await {
+    if daily_rollup && let Err(e) = rollup_once(data_dir, memory_limit).await {
         tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
     }
 
@@ -187,7 +195,7 @@ pub async fn compact_once(
 /// For each date-directory older than today, collects all
 /// `{hour}/{service}.parquet` files, merges them (sorted by timestamp)
 /// into `{date}/{service}.parquet`, then removes the hourly sources.
-async fn rollup_once(data_dir: &Path) -> Result<(), String> {
+async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<(), String> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     let date_dirs =
@@ -243,9 +251,12 @@ async fn rollup_once(data_dir: &Path) -> Result<(), String> {
             let svc = service.clone();
             let files = files.clone();
 
-            match tokio::task::spawn_blocking(move || rollup_day_blocking(&day_dir, &svc, &files))
-                .await
-                .map_err(|e| format!("rollup task panicked: {e}"))?
+            let mem_limit = memory_limit.to_owned();
+            match tokio::task::spawn_blocking(move || {
+                rollup_day_blocking(&day_dir, &svc, &files, &mem_limit)
+            })
+            .await
+            .map_err(|e| format!("rollup task panicked: {e}"))?
             {
                 Ok(()) => {}
                 Err(e) => {
@@ -442,6 +453,7 @@ fn rollup_day_blocking(
     day_dir: &Path,
     service: &str,
     hourly_files: &[PathBuf],
+    memory_limit: &str,
 ) -> Result<(), String> {
     let rollup_start = std::time::Instant::now();
     let conn =
@@ -454,6 +466,13 @@ fn rollup_day_blocking(
         day_dir.to_string_lossy().replace('\'', "''")
     ))
     .map_err(|e| format!("SET temp_directory failed: {e}"))?;
+
+    // Cap memory and threads — same rationale as compact_service_blocking.
+    conn.execute_batch(&format!(
+        "SET memory_limit='{}'; SET threads=2",
+        memory_limit.replace('\'', "''")
+    ))
+    .map_err(|e| format!("SET memory_limit/threads failed: {e}"))?;
 
     // Build file list for read_parquet.
     let mut file_list_parts = Vec::with_capacity(hourly_files.len() + 1);
@@ -526,14 +545,18 @@ async fn compact_service_batch(
     wal_files: &[PathBuf],
     data_dir: &Path,
     service: &str,
+    memory_limit: &str,
 ) -> Result<(), String> {
     let wal_files = wal_files.to_vec();
     let data_dir = data_dir.to_path_buf();
     let service = service.to_owned();
+    let memory_limit = memory_limit.to_owned();
 
-    tokio::task::spawn_blocking(move || compact_service_blocking(&wal_files, &data_dir, &service))
-        .await
-        .map_err(|e| format!("compaction task panicked: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        compact_service_blocking(&wal_files, &data_dir, &service, &memory_limit)
+    })
+    .await
+    .map_err(|e| format!("compaction task panicked: {e}"))?
 }
 
 /// Count rows in a `DuckDB` table. Used to capture row counts before
@@ -601,6 +624,148 @@ fn read_wal_to_table(
     }
 }
 
+/// Column name and type from `DuckDB` `DESCRIBE`.
+struct ColInfo {
+    name: String,
+    dtype: String,
+}
+
+/// Run `DESCRIBE <query>` and return the column names and types.
+fn describe_source(conn: &duckdb::Connection, query: &str) -> Result<Vec<ColInfo>, String> {
+    let mut stmt = conn
+        .prepare(&format!("DESCRIBE {query}"))
+        .map_err(|e| format!("DESCRIBE failed: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ColInfo {
+                name: row.get::<_, String>(0)?,
+                dtype: row.get::<_, String>(1)?,
+            })
+        })
+        .map_err(|e| format!("DESCRIBE query failed: {e}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("DESCRIBE row read failed: {e}"))
+}
+
+/// Escape a `DuckDB` identifier: wrap in double-quotes, doubling any
+/// embedded double-quotes. Column names come from ingested JSON keys
+/// (user-controlled), so this prevents SQL injection in the fallback path.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Build a SELECT list that casts conflicting columns to `VARCHAR`.
+///
+/// Non-conflicting columns pass through quoted (`"col"`); conflicting
+/// ones become `CAST("col" AS VARCHAR) AS "col"`.
+fn build_cast_select(schema: &[ColInfo], conflicts: &[String]) -> String {
+    schema
+        .iter()
+        .map(|col| {
+            let quoted = quote_ident(&col.name);
+            if conflicts.contains(&col.name) {
+                format!("CAST({quoted} AS VARCHAR) AS {quoted}")
+            } else {
+                quoted
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Return true if the error looks like a type/cast mismatch from
+/// `DuckDB` — the kind that `UNION ALL BY NAME` raises when column
+/// types are incompatible (e.g. JSON vs VARCHAR).
+fn is_type_mismatch_error(e: &duckdb::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("Conversion")
+        || msg.contains("Type")
+        || msg.contains("Cast")
+        || msg.contains("type mismatch")
+}
+
+/// Merge `wal_batch` with an existing parquet file via `UNION ALL BY NAME`.
+///
+/// Fast path: direct union. If that fails with a type mismatch (e.g.
+/// JSON vs VARCHAR for the same column), falls back to `DESCRIBE`-ing
+/// both sides, finding the conflicting columns, and casting them to
+/// `VARCHAR` before retrying.
+fn merge_with_existing(
+    conn: &duckdb::Connection,
+    canonical_path: &Path,
+    service: &str,
+) -> Result<(), String> {
+    let pq_path = canonical_path.display();
+
+    // Fast path: direct union.
+    let result = conn.execute_batch(&format!(
+        "CREATE TABLE merged AS \
+         SELECT * FROM read_parquet('{pq_path}') \
+         UNION ALL BY NAME \
+         SELECT * FROM wal_batch",
+    ));
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if is_type_mismatch_error(&e) => {
+            tracing::warn!(
+                event_type = "compaction_fallback",
+                compact_service = %service,
+                error = %e,
+                "type mismatch during merge, falling back to explicit casts"
+            );
+
+            // Get schemas for both sides.
+            let pq_schema =
+                describe_source(conn, &format!("SELECT * FROM read_parquet('{pq_path}')"))?;
+            let wb_schema = describe_source(conn, "SELECT * FROM wal_batch")?;
+
+            // Build a lookup of wal_batch column types.
+            let wb_types: HashMap<&str, &str> = wb_schema
+                .iter()
+                .map(|c| (c.name.as_str(), c.dtype.as_str()))
+                .collect();
+
+            // Find columns present in both with different types.
+            let conflicts: Vec<String> = pq_schema
+                .iter()
+                .filter(|col| {
+                    wb_types
+                        .get(col.name.as_str())
+                        .is_some_and(|wb_type| *wb_type != col.dtype)
+                })
+                .map(|col| col.name.clone())
+                .collect();
+
+            if conflicts.is_empty() {
+                // Not actually a type conflict — re-raise original error.
+                return Err(format!("merge read_parquet failed: {e}"));
+            }
+
+            tracing::info!(
+                event_type = "compaction_fallback",
+                compact_service = %service,
+                conflicting_columns = ?conflicts,
+                "casting conflicting columns to VARCHAR"
+            );
+
+            let pq_select = build_cast_select(&pq_schema, &conflicts);
+            let wb_select = build_cast_select(&wb_schema, &conflicts);
+
+            conn.execute_batch(&format!(
+                "CREATE TABLE merged AS \
+                 SELECT {pq_select} FROM read_parquet('{pq_path}') \
+                 UNION ALL BY NAME \
+                 SELECT {wb_select} FROM wal_batch",
+            ))
+            .map_err(|e| format!("merge (type fallback) failed: {e}"))
+        }
+        Err(e) => Err(format!("merge read_parquet failed: {e}")),
+    }
+}
+
 /// Blocking compaction: open `DuckDB`, read ndjson, write parquet.
 ///
 /// Uses a canonical filename (`{service}.parquet`) per service per
@@ -611,6 +776,7 @@ fn compact_service_blocking(
     wal_files: &[PathBuf],
     data_dir: &Path,
     service: &str,
+    memory_limit: &str,
 ) -> Result<(), String> {
     let compact_start = std::time::Instant::now();
     let conn =
@@ -623,6 +789,15 @@ fn compact_service_blocking(
         data_dir.to_string_lossy().replace('\'', "''")
     ))
     .map_err(|e| format!("SET temp_directory failed: {e}"))?;
+
+    // Cap memory usage so DuckDB spills to disk earlier rather than
+    // consuming 80% of container RAM. Limit threads to reduce peak
+    // memory — compaction is a background task where latency is fine.
+    conn.execute_batch(&format!(
+        "SET memory_limit='{}'; SET threads=2",
+        memory_limit.replace('\'', "''")
+    ))
+    .map_err(|e| format!("SET memory_limit/threads failed: {e}"))?;
 
     read_wal_to_table(&conn, wal_files, service)?;
 
@@ -646,14 +821,8 @@ fn compact_service_blocking(
         // Merge: union existing parquet rows with new WAL batch.
         // BY NAME handles heterogeneous schemas (different events have
         // different fields) — missing columns become NULL in parquet.
-        conn.execute_batch(&format!(
-            "CREATE TABLE merged AS \
-             SELECT * FROM read_parquet('{}') \
-             UNION ALL BY NAME \
-             SELECT * FROM wal_batch",
-            canonical_path.display(),
-        ))
-        .map_err(|e| format!("merge read_parquet failed: {e}"))?;
+        // Falls back to explicit casts if column types conflict.
+        merge_with_existing(&conn, &canonical_path, service)?;
 
         conn.execute_batch(&format!(
             "COPY merged TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
@@ -887,7 +1056,7 @@ mod tests {
         let record = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"hello"}"#;
         let wal_files = vec![write_wal_file(&wal_dir, "nginx", &[record])];
 
-        compact_service_blocking(&wal_files, &data_dir, "nginx").unwrap();
+        compact_service_blocking(&wal_files, &data_dir, "nginx", "2GB").unwrap();
 
         // Should create {date}/{hour}/nginx.parquet (canonical name).
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
@@ -913,12 +1082,12 @@ mod tests {
         // First compaction: write initial data.
         let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"first"}"#;
         let files1 = vec![write_wal_file(&wal_dir, "nginx", &[r1])];
-        compact_service_blocking(&files1, &data_dir, "nginx").unwrap();
+        compact_service_blocking(&files1, &data_dir, "nginx", "2GB").unwrap();
 
         // Second compaction: merge new data into existing file.
         let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"nginx","message":"second"}"#;
         let files2 = vec![write_wal_file(&wal_dir, "nginx", &[r2])];
-        compact_service_blocking(&files2, &data_dir, "nginx").unwrap();
+        compact_service_blocking(&files2, &data_dir, "nginx", "2GB").unwrap();
 
         // Still only one parquet file.
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
@@ -954,7 +1123,7 @@ mod tests {
         let f1 = write_wal_file(&wal_dir, "test", &[r1]);
         let f2 = write_wal_file(&wal_dir, "test", &[r2]);
 
-        compact_service_blocking(&[f1, f2], &data_dir, "test").unwrap();
+        compact_service_blocking(&[f1, f2], &data_dir, "test", "2GB").unwrap();
 
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet_files.len(), 1);
@@ -994,7 +1163,7 @@ mod tests {
         let f1 = write_wal_file(&wal_dir, "test", &[r1]);
         let f2 = write_wal_file(&wal_dir, "test", &[r2]);
 
-        compact_service_blocking(&[f1, f2], &data_dir, "test").unwrap();
+        compact_service_blocking(&[f1, f2], &data_dir, "test", "2GB").unwrap();
 
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet_files.len(), 1);
@@ -1032,7 +1201,7 @@ mod tests {
         let f1 = write_wal_file(&wal_dir, "flux-op", &[r1]);
         let f2 = write_wal_file(&wal_dir, "flux-op", &[r2]);
 
-        compact_service_blocking(&[f1, f2], &data_dir, "flux-op").unwrap();
+        compact_service_blocking(&[f1, f2], &data_dir, "flux-op", "2GB").unwrap();
 
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet_files.len(), 1);
@@ -1073,10 +1242,10 @@ mod tests {
         let f3 = write_wal_file(&wal_dir, "test", &[r3]);
 
         // Chunk 1: first two files.
-        compact_service_blocking(&[f1, f2], &data_dir, "test").unwrap();
+        compact_service_blocking(&[f1, f2], &data_dir, "test", "2GB").unwrap();
 
         // Chunk 2: third file merges into existing parquet.
-        compact_service_blocking(&[f3], &data_dir, "test").unwrap();
+        compact_service_blocking(&[f3], &data_dir, "test", "2GB").unwrap();
 
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet_files.len(), 1, "should still be one canonical file");
@@ -1095,6 +1264,65 @@ mod tests {
         assert_eq!(
             count, 3,
             "all three rows should be present after incremental merge"
+        );
+    }
+
+    #[test]
+    fn compact_merges_despite_type_conflict() {
+        // Simulates the k8s containerID scenario: first compaction writes
+        // a parquet file where `container_id` is a JSON object, second
+        // compaction has WAL data where `container_id` is a plain string.
+        // The merge should succeed by falling back to VARCHAR casts.
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // First batch: container_id is a JSON object.
+        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"kubelet","message":"start","container_id":{"id":"abc123","runtime":"containerd"}}"#;
+        let f1 = write_wal_file(&wal_dir, "kubelet", &[r1]);
+        compact_service_blocking(&[f1], &data_dir, "kubelet", "2GB").unwrap();
+
+        // Second batch: container_id is a plain string.
+        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"kubelet","message":"running","container_id":"def456"}"#;
+        let f2 = write_wal_file(&wal_dir, "kubelet", &[r2]);
+
+        // This would previously fail with a type mismatch error.
+        compact_service_blocking(&[f2], &data_dir, "kubelet", "2GB").unwrap();
+
+        let parquet_files = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet_files.len(), 1);
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet_files[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "both rows should be present despite type conflict on container_id"
+        );
+
+        // Verify the conflicting column was cast to VARCHAR.
+        let col_type: String = conn
+            .query_row(
+                &format!(
+                    "SELECT typeof(container_id) FROM read_parquet('{}') LIMIT 1",
+                    parquet_files[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            col_type, "VARCHAR",
+            "conflicting column should be cast to VARCHAR"
         );
     }
 
@@ -1208,7 +1436,7 @@ mod tests {
         let f2 = write_hourly_parquet(&data_dir, date, "02", "nginx", &[r2, r3]);
 
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "nginx", &[f1.clone(), f2.clone()]).unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f1.clone(), f2.clone()], "2GB").unwrap();
 
         // Day-level file should exist.
         let daily = day_dir.join("nginx.parquet");
@@ -1243,14 +1471,14 @@ mod tests {
         let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "nginx", &[f1]).unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f1], "2GB").unwrap();
 
         // Late-arriving data creates a new hourly file.
         let r2 = r#"{"timestamp":"2026-01-15T03:00:00Z","service":"nginx","msg":"late"}"#;
         let f2 = write_hourly_parquet(&data_dir, date, "03", "nginx", &[r2]);
 
         // Second rollup: should merge existing daily + new hourly.
-        rollup_day_blocking(&day_dir, "nginx", &[f2]).unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f2], "2GB").unwrap();
 
         let daily = day_dir.join("nginx.parquet");
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1280,7 +1508,7 @@ mod tests {
         let f2 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r2]);
 
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "nginx", &[f1, f2]).unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f1, f2], "2GB").unwrap();
 
         // Verify rows are sorted by timestamp (ascending).
         let daily = day_dir.join("nginx.parquet");
@@ -1344,9 +1572,17 @@ mod tests {
         write_hourly_parquet(&data_dir, &yesterday, "01", "nginx", &[&r1]);
 
         // WAL dir is empty — compact_once should still run rollup.
-        compact_once(&wal_dir, &data_dir, Duration::from_secs(1), true, None)
-            .await
-            .unwrap();
+        compact_once(
+            &wal_dir,
+            &data_dir,
+            Duration::from_secs(1),
+            true,
+            None,
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+        )
+        .await
+        .unwrap();
 
         // Day-level file should exist from rollup.
         let daily = data_dir.join(&yesterday).join("nginx.parquet");
@@ -1368,7 +1604,7 @@ mod tests {
         let day_dir = data_dir.join(date);
         let marker = day_dir.join(".rollup-nginx");
 
-        rollup_day_blocking(&day_dir, "nginx", &[f1]).unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f1], "2GB").unwrap();
 
         // Marker should be cleaned up after successful rollup.
         assert!(!marker.exists(), "marker should be removed after rollup");

@@ -327,6 +327,8 @@ fn spawn_ingest_pipeline(
         data_dir,
         interval,
         config.ingest.daily_rollup,
+        config.ingest.compaction_chunk_size,
+        config.ingest.compaction_memory_limit.clone(),
         state.query.hot_buffer.clone(),
         state.ingest.compaction_stats.clone(),
         shutdown_rx,

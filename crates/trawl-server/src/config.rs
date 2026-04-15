@@ -249,6 +249,17 @@ pub struct IngestConfig {
     /// but increase I/O.
     #[serde(default = "default_telemetry_flush_interval_secs")]
     pub telemetry_flush_interval_secs: u64,
+
+    /// Maximum WAL files per compaction chunk. Larger backlogs are split
+    /// into chunks of this size and merged incrementally. Default: 500.
+    #[serde(default = "default_compaction_chunk_size")]
+    pub compaction_chunk_size: usize,
+
+    /// `DuckDB` memory limit for compaction connections. Forces spill-to-disk
+    /// earlier rather than letting `DuckDB` use 80% of container RAM.
+    /// Accepts `DuckDB` memory strings like `"2GB"`, `"512MB"`. Default: `"2GB"`.
+    #[serde(default = "default_compaction_memory_limit")]
+    pub compaction_memory_limit: String,
 }
 
 impl Default for IngestConfig {
@@ -265,6 +276,8 @@ impl Default for IngestConfig {
             hot_buffer_max_bytes: default_hot_buffer_max_bytes(),
             stats_interval_secs: DEFAULT_STATS_INTERVAL_SECS,
             telemetry_flush_interval_secs: DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS,
+            compaction_chunk_size: DEFAULT_COMPACTION_CHUNK_SIZE,
+            compaction_memory_limit: DEFAULT_COMPACTION_MEMORY_LIMIT.to_string(),
         }
     }
 }
@@ -651,6 +664,10 @@ pub const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 10;
 pub const DEFAULT_INTERNAL_TELEMETRY: bool = true;
 /// Default daily rollup (enabled).
 pub const DEFAULT_DAILY_ROLLUP: bool = true;
+/// Default compaction chunk size (WAL files per `read_json` call).
+pub const DEFAULT_COMPACTION_CHUNK_SIZE: usize = 500;
+/// Default `DuckDB` memory limit for compaction connections.
+pub const DEFAULT_COMPACTION_MEMORY_LIMIT: &str = "2GB";
 /// Default retention max age (days).
 pub const DEFAULT_RETENTION_MAX_AGE_DAYS: u64 = 90;
 /// Default retention minimum free disk space (bytes). 1 GiB.
@@ -688,6 +705,14 @@ fn default_internal_telemetry() -> bool {
 
 fn default_daily_rollup() -> bool {
     DEFAULT_DAILY_ROLLUP
+}
+
+fn default_compaction_chunk_size() -> usize {
+    DEFAULT_COMPACTION_CHUNK_SIZE
+}
+
+fn default_compaction_memory_limit() -> String {
+    DEFAULT_COMPACTION_MEMORY_LIMIT.to_string()
 }
 
 fn default_event_bus_capacity() -> usize {

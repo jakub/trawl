@@ -108,6 +108,8 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         Duration::ZERO, // no min age — compact immediately
         false,          // no daily rollup
         Some(&hot_buffer),
+        500,
+        "2GB",
     )
     .await
     .expect("compaction should succeed");
@@ -189,6 +191,8 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         Duration::ZERO,
         false,
         Some(&hot_buffer),
+        500,
+        "2GB",
     )
     .await
     .expect("compaction 1 should succeed");
@@ -247,6 +251,8 @@ async fn query_works_without_hot_buffer() {
         Duration::ZERO,
         false,
         None,
+        500,
+        "2GB",
     )
     .await
     .expect("compaction without hot buffer should succeed");
