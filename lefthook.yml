@@ -7,3 +7,11 @@ pre-commit:
     clippy:
       glob: "*.rs"
       run: source "$HOME/.cargo/env" && cargo clippy --workspace --all-targets -- -D warnings
+
+pre-push:
+  parallel: true
+  commands:
+    test:
+      run: source "$HOME/.cargo/env" && cargo nextest run --workspace
+    test-no-defaults:
+      run: source "$HOME/.cargo/env" && cargo nextest run --workspace --no-default-features
