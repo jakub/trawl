@@ -18,6 +18,11 @@ use tokio::sync::watch;
 use crate::hot_buffer::HotBuffer;
 use crate::state::CompactionStats;
 
+/// Maximum WAL files to process in a single `read_json` call during
+/// compaction. Large backlogs (100k+ files) would OOM an in-memory
+/// `DuckDB` instance, so we chunk and merge incrementally.
+const MAX_WAL_FILES_PER_CHUNK: usize = 10_000;
+
 /// Spawn the compaction background loop.
 ///
 /// Runs every `interval` seconds, scanning `wal_dir` for `.ndjson` files
@@ -103,41 +108,65 @@ pub async fn compact_once(
                 "compacting service batch"
             );
 
-            // Events remain visible in the hot buffer until drain. Brief
-            // duplicates (events in both parquet and hot snapshot) are
-            // acceptable — invisible events are not.
-            let batch_ids: Vec<&str> = wal_files
-                .iter()
-                .filter_map(|f| f.file_stem()?.to_str())
-                .collect();
+            // Process WAL files in chunks to avoid OOM on large backlogs.
+            // Each chunk independently compacts to parquet (merging with
+            // the canonical file if it exists), drains the hot buffer, and
+            // cleans up consumed WAL files. If a chunk fails, remaining
+            // chunks are skipped and retried on the next tick.
+            let chunks: Vec<&[PathBuf]> = wal_files.chunks(MAX_WAL_FILES_PER_CHUNK).collect();
+            let total_chunks = chunks.len();
 
-            match compact_service_batch(wal_files, data_dir, service).await {
-                Ok(()) => {
-                    // Remove fully compacted batches from the hot buffer.
-                    if let Some(buf) = &hot_buffer {
-                        buf.drain(&batch_ids);
-                    }
+            for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+                if total_chunks > 1 {
+                    tracing::debug!(
+                        event_type = "compaction_chunk",
+                        compact_service = %service,
+                        chunk = chunk_idx + 1,
+                        total_chunks,
+                        chunk_files = chunk.len(),
+                        "processing compaction chunk"
+                    );
+                }
 
-                    // Clean up consumed WAL files.
-                    for f in wal_files {
-                        if let Err(e) = std::fs::remove_file(f) {
-                            tracing::warn!(
-                                event_type = "compaction_error",
-                                file = %f.display(),
-                                error = %e,
-                                "failed to delete consumed WAL file"
-                            );
+                // Events remain visible in the hot buffer until drain. Brief
+                // duplicates (events in both parquet and hot snapshot) are
+                // acceptable — invisible events are not.
+                let batch_ids: Vec<&str> = chunk
+                    .iter()
+                    .filter_map(|f| f.file_stem()?.to_str())
+                    .collect();
+
+                match compact_service_batch(chunk, data_dir, service).await {
+                    Ok(()) => {
+                        // Remove fully compacted batches from the hot buffer.
+                        if let Some(buf) = &hot_buffer {
+                            buf.drain(&batch_ids);
+                        }
+
+                        // Clean up consumed WAL files.
+                        for f in chunk {
+                            if let Err(e) = std::fs::remove_file(f) {
+                                tracing::warn!(
+                                    event_type = "compaction_error",
+                                    file = %f.display(),
+                                    error = %e,
+                                    "failed to delete consumed WAL file"
+                                );
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    // Leave WAL files for retry on next tick.
-                    tracing::error!(
-                        event_type = "compaction_error",
-                        compact_service = %service,
-                        error = %e,
-                        "compaction failed, will retry next tick"
-                    );
+                    Err(e) => {
+                        // Leave remaining WAL files for retry on next tick.
+                        tracing::error!(
+                            event_type = "compaction_error",
+                            compact_service = %service,
+                            chunk = chunk_idx + 1,
+                            total_chunks,
+                            error = %e,
+                            "compaction chunk failed, will retry next tick"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -519,6 +548,59 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
     .map_err(|e| format!("count_rows failed: {e}"))
 }
 
+/// Read WAL ndjson files into a `DuckDB` temp table called `wal_batch`.
+///
+/// Tries auto-detection first (`maximum_depth=2`). If `DuckDB` hits a
+/// "Duplicate name" error (nested JSON keys that collide when flattened),
+/// falls back to an explicit column list with `json` typed as opaque JSON.
+fn read_wal_to_table(
+    conn: &duckdb::Connection,
+    wal_files: &[PathBuf],
+    service: &str,
+) -> Result<(), String> {
+    let file_list_sql = wal_files
+        .iter()
+        .map(|p| format!("'{}'", p.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Primary path: auto-detect with union_by_name to handle heterogeneous schemas.
+    let result = conn.execute_batch(&format!(
+        "CREATE TABLE wal_batch AS \
+         SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
+         FROM read_json([{file_list_sql}], format='newline_delimited', \
+         records=true, auto_detect=true, union_by_name=true, \
+         field_appearance_threshold=0, maximum_depth=2)"
+    ));
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains("Duplicate name") => {
+            tracing::warn!(
+                event_type = "compaction_fallback",
+                compact_service = %service,
+                error = %e,
+                "falling back to explicit columns to avoid duplicate key collision"
+            );
+            // Explicit columns: the stable vector envelope, with `json` as
+            // opaque JSON to prevent struct flattening that causes collisions.
+            conn.execute_batch(&format!(
+                "CREATE TABLE wal_batch AS \
+                 SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
+                 FROM read_json([{file_list_sql}], format='newline_delimited', \
+                 records=true, union_by_name=true, columns={{\
+                 host: 'VARCHAR', json: 'JSON', \
+                 k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
+                 k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR', \
+                 level: 'VARCHAR', message: 'VARCHAR', \
+                 service: 'VARCHAR', timestamp: 'VARCHAR'}})"
+            ))
+            .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
+        }
+        Err(e) => Err(format!("read_json failed: {e}")),
+    }
+}
+
 /// Blocking compaction: open `DuckDB`, read ndjson, write parquet.
 ///
 /// Uses a canonical filename (`{service}.parquet`) per service per
@@ -542,28 +624,7 @@ fn compact_service_blocking(
     ))
     .map_err(|e| format!("SET temp_directory failed: {e}"))?;
 
-    // Build file list for read_json.
-    let file_list_sql = wal_files
-        .iter()
-        .map(|p| format!("'{}'", p.to_string_lossy()))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // Read all WAL files into a temp table, casting timestamp to native TIMESTAMP
-    // so parquet row group statistics enable predicate pushdown for time filters.
-    //
-    // Parameters match the query-time reader (emitter/state.rs):
-    //   - union_by_name: merge heterogeneous schemas across files (missing → NULL)
-    //   - field_appearance_threshold=0: include all fields regardless of frequency
-    //   - maximum_depth=2: prevent deep nesting from creating duplicate column names
-    conn.execute_batch(&format!(
-        "CREATE TABLE wal_batch AS \
-         SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
-         FROM read_json([{file_list_sql}], format='newline_delimited', \
-         records=true, auto_detect=true, union_by_name=true, \
-         field_appearance_threshold=0, maximum_depth=2)"
-    ))
-    .map_err(|e| format!("read_json failed: {e}"))?;
+    read_wal_to_table(&conn, wal_files, service)?;
 
     // Determine output directory from current time.
     let now = chrono::Utc::now();
@@ -952,6 +1013,88 @@ mod tests {
         assert_eq!(
             count, 2,
             "nested JSON records should compact without duplicate key errors"
+        );
+    }
+
+    #[test]
+    fn compact_handles_duplicate_key_across_nesting_levels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Simulates flux-operator: `k8s_namespace` at top level, `namespace`
+        // inside the `json` sub-object. With unlimited depth, DuckDB would
+        // flatten `json.namespace` and collide with the top-level key.
+        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"flux-op","message":"reconcile","k8s_namespace":"flux-system","json":{"controller":"fluxinstance","level":"info","msg":"Reconciliation finished","name":"flux","namespace":"flux-system"}}"#;
+        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"flux-op","message":"sync","k8s_namespace":"flux-system","json":{"controller":"kustomization","level":"info","msg":"Applied revision","namespace":"default"}}"#;
+
+        let f1 = write_wal_file(&wal_dir, "flux-op", &[r1]);
+        let f2 = write_wal_file(&wal_dir, "flux-op", &[r2]);
+
+        compact_service_blocking(&[f1, f2], &data_dir, "flux-op").unwrap();
+
+        let parquet_files = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet_files.len(), 1);
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet_files[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "duplicate nested key names should not cause compaction failure"
+        );
+    }
+
+    #[test]
+    fn compact_chunked_merges_incrementally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Create 3 WAL files. Compact them in two calls to simulate chunking:
+        // first call processes 2 files, second call processes 1 file and
+        // merges with the existing parquet from the first call.
+        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"test","message":"one"}"#;
+        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"test","message":"two"}"#;
+        let r3 = r#"{"timestamp":"2026-01-01T00:00:02Z","service":"test","message":"three"}"#;
+
+        let f1 = write_wal_file(&wal_dir, "test", &[r1]);
+        let f2 = write_wal_file(&wal_dir, "test", &[r2]);
+        let f3 = write_wal_file(&wal_dir, "test", &[r3]);
+
+        // Chunk 1: first two files.
+        compact_service_blocking(&[f1, f2], &data_dir, "test").unwrap();
+
+        // Chunk 2: third file merges into existing parquet.
+        compact_service_blocking(&[f3], &data_dir, "test").unwrap();
+
+        let parquet_files = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet_files.len(), 1, "should still be one canonical file");
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet_files[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "all three rows should be present after incremental merge"
         );
     }
 
