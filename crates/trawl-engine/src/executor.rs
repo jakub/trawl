@@ -26,8 +26,17 @@ pub struct Executor {
 
 impl Executor {
     /// Create a new executor with an in-memory `DuckDB` connection.
+    ///
+    /// Sets `temp_directory` to the system temp dir so `DuckDB` can spill
+    /// to disk even when the process working directory is read-only (e.g.
+    /// container overlay filesystems).
     pub fn new() -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
+        let tmp = std::env::temp_dir();
+        conn.execute_batch(&format!(
+            "SET temp_directory='{}'",
+            tmp.to_string_lossy().replace('\'', "''")
+        ))?;
         Ok(Self { conn })
     }
 

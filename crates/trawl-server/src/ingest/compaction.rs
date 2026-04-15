@@ -418,6 +418,14 @@ fn rollup_day_blocking(
     let conn =
         duckdb::Connection::open_in_memory().map_err(|e| format!("DuckDB open failed: {e}"))?;
 
+    // Point DuckDB temp directory at the PVC so spill-to-disk works on
+    // read-only container overlay filesystems.
+    conn.execute_batch(&format!(
+        "SET temp_directory='{}'",
+        day_dir.to_string_lossy().replace('\'', "''")
+    ))
+    .map_err(|e| format!("SET temp_directory failed: {e}"))?;
+
     // Build file list for read_parquet.
     let mut file_list_parts = Vec::with_capacity(hourly_files.len() + 1);
     for f in hourly_files {
@@ -526,7 +534,15 @@ fn compact_service_blocking(
     let conn =
         duckdb::Connection::open_in_memory().map_err(|e| format!("DuckDB open failed: {e}"))?;
 
-    // Build file list for read_json_auto.
+    // Point DuckDB temp directory at the PVC so spill-to-disk works on
+    // read-only container overlay filesystems.
+    conn.execute_batch(&format!(
+        "SET temp_directory='{}'",
+        data_dir.to_string_lossy().replace('\'', "''")
+    ))
+    .map_err(|e| format!("SET temp_directory failed: {e}"))?;
+
+    // Build file list for read_json.
     let file_list_sql = wal_files
         .iter()
         .map(|p| format!("'{}'", p.to_string_lossy()))
@@ -535,12 +551,19 @@ fn compact_service_blocking(
 
     // Read all WAL files into a temp table, casting timestamp to native TIMESTAMP
     // so parquet row group statistics enable predicate pushdown for time filters.
+    //
+    // Parameters match the query-time reader (emitter/state.rs):
+    //   - union_by_name: merge heterogeneous schemas across files (missing → NULL)
+    //   - field_appearance_threshold=0: include all fields regardless of frequency
+    //   - maximum_depth=2: prevent deep nesting from creating duplicate column names
     conn.execute_batch(&format!(
         "CREATE TABLE wal_batch AS \
          SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
-         FROM read_json_auto([{file_list_sql}])"
+         FROM read_json([{file_list_sql}], format='newline_delimited', \
+         records=true, auto_detect=true, union_by_name=true, \
+         field_appearance_threshold=0, maximum_depth=2)"
     ))
-    .map_err(|e| format!("read_json_auto failed: {e}"))?;
+    .map_err(|e| format!("read_json failed: {e}"))?;
 
     // Determine output directory from current time.
     let now = chrono::Utc::now();
@@ -856,6 +879,83 @@ mod tests {
     }
 
     #[test]
+    fn compact_handles_heterogeneous_schemas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Two records with different key sets — simulates the real scenario
+        // where services emit log lines with varying JSON shapes.
+        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"test","message":"base record"}"#;
+        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"test","message":"extra","extra_field":"surprise","error":"oh no"}"#;
+
+        let f1 = write_wal_file(&wal_dir, "test", &[r1]);
+        let f2 = write_wal_file(&wal_dir, "test", &[r2]);
+
+        compact_service_blocking(&[f1, f2], &data_dir, "test").unwrap();
+
+        let parquet_files = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet_files.len(), 1);
+
+        // Verify both rows are present in the output.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet_files[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "both records should be present despite different schemas"
+        );
+    }
+
+    #[test]
+    fn compact_handles_nested_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Simulates the real data shape: outer envelope + nested json object
+        // with varying subkeys. The `json` object has different keys across
+        // records, and `k8s_namespace` at the top level coexists with
+        // `namespace` inside the nested object.
+        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"test","message":"startup","k8s_namespace":"default","json":{"level":"info","msg":"starting","namespace":"kube-system","build":{"version":"1.0","commit":"abc123"}}}"#;
+        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"test","message":"runtime","k8s_namespace":"default","json":{"level":"warn","msg":"something happened"}}"#;
+
+        let f1 = write_wal_file(&wal_dir, "test", &[r1]);
+        let f2 = write_wal_file(&wal_dir, "test", &[r2]);
+
+        compact_service_blocking(&[f1, f2], &data_dir, "test").unwrap();
+
+        let parquet_files = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet_files.len(), 1);
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet_files[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "nested JSON records should compact without duplicate key errors"
+        );
+    }
+
+    #[test]
     fn cleanup_removes_stale_tmp_files() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
@@ -937,7 +1037,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         conn.execute_batch(&format!(
-            "COPY (SELECT * FROM read_json_auto([{file_list}])) \
+            "COPY (SELECT * FROM read_json([{file_list}], format='newline_delimited', \
+             records=true, auto_detect=true, union_by_name=true, \
+             field_appearance_threshold=0, maximum_depth=2)) \
              TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
             out.to_string_lossy(),
         ))
