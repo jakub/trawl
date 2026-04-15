@@ -22,7 +22,7 @@ expression: terminal.backend().to_string()
 "│                                Quit: Ctrl+Q                                  │"
 "│                                Docs: https://trawl.sh                        │"
 "│                                                                              │"
-"│                              Client: 0.1.20                                  │"
+"│                              Client: 0.1.21                                  │"
 "│                              Server: —                                       │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 " [editor]                    Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear"
