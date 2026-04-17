@@ -17,5 +17,7 @@ pub fn build(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { (StatusCode::OK, "ok") }))
         .route("/login", post(auth::login))
+        .route("/logout", post(auth::logout))
+        .route("/me", get(auth::me))
         .with_state(state)
 }
