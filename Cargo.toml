@@ -20,6 +20,7 @@ trawl-server = { path = "crates/trawl-server" }
 trawl-api = { path = "crates/trawl-api" }
 trawl-client = { path = "crates/trawl-client" }
 trawl-dashboard = { path = "crates/trawl-dashboard" }
+trawl-web = { path = "crates/trawl-web" }
 
 # external deps
 aho-corasick = "1"

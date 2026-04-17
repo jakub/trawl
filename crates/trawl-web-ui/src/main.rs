@@ -1,0 +1,37 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! `trawl-web-ui`: Leptos SPA entry point.
+//!
+//! Only meaningfully compiles for `wasm32-unknown-unknown`. On native targets
+//! the binary is a stub so `cargo check --workspace` stays green.
+
+#[cfg(target_arch = "wasm32")]
+mod app {
+    use leptos::prelude::*;
+
+    #[component]
+    pub fn App() -> impl IntoView {
+        view! {
+            <main class="shell">
+                <h1>"trawl"</h1>
+                <p>"web UI scaffold — nothing here yet."</p>
+            </main>
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    console_error_panic_hook::set_once();
+    leptos::mount::mount_to_body(app::App);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn main() {
+    eprintln!(
+        "trawl-web-ui is a wasm-only crate — build with `trunk build` or \
+         `cargo check -p trawl-web-ui --target wasm32-unknown-unknown`"
+    );
+}

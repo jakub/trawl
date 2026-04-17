@@ -1,0 +1,22 @@
+[package]
+name = "trawl-web-ui"
+description = "Leptos SPA for the trawl web UI (wasm32 target)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "trawl-web-ui"
+path = "src/main.rs"
+
+# Deps are target-gated so `cargo check --workspace` passes on native while
+# the real app only compiles for wasm32.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+leptos_router = { version = "0.8" }
+console_error_panic_hook = "0.1"
+
+[lints]
+workspace = true
