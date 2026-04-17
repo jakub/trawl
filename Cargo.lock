@@ -818,7 +818,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -4572,6 +4574,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5688,14 +5701,20 @@ dependencies = [
 name = "trawl-web-ui"
 version = "0.1.21"
 dependencies = [
+ "chrono",
  "console_error_panic_hook",
  "gloo-net 0.7.0",
+ "js-sys",
  "leptos",
  "leptos_meta",
  "leptos_router",
  "serde",
+ "serde-wasm-bindgen",
  "serde_json",
  "thiserror 2.0.18",
+ "trawl-api",
+ "trawl-core",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
 ]

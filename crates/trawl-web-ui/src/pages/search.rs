@@ -11,6 +11,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
+use crate::components::editor::DslEditor;
 
 #[component]
 pub fn Search() -> impl IntoView {
@@ -55,9 +56,18 @@ pub fn Search() -> impl IntoView {
                 <button class="btn-link" on:click=on_logout>"logout"</button>
             </header>
             <main class="main">
-                <p>
-                    "search scaffold — editor, results, live-tail land in the next commits."
-                </p>
+                {move || {
+                    let _ = me.get();
+                    let query = RwSignal::new(String::from(
+                        "service=nginx level=error last=1h | stats count() by host"
+                    ));
+                    let on_submit = Callback::new(move |()| {
+                        web_sys::console::log_1(&format!("run: {}", query.get()).into());
+                    });
+                    view! {
+                        <DslEditor query=query on_submit=on_submit/>
+                    }
+                }}
             </main>
         </div>
     }

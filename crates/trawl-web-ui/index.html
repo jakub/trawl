@@ -6,6 +6,11 @@
     <title>trawl</title>
     <link data-trunk rel="rust" data-bin="trawl-web-ui" data-wasm-opt="s"/>
     <link data-trunk rel="css" href="styles/main.css"/>
+    <!-- Vendored JS bundles copied into dist/vendor/ so wasm-bindgen's
+         `module = "/vendor/codemirror.js"` path resolves at runtime. -->
+    <link data-trunk rel="copy-file" href="vendor/codemirror.js" data-target-path="vendor"/>
+    <link data-trunk rel="copy-file" href="vendor/uplot.js" data-target-path="vendor"/>
+    <link data-trunk rel="copy-file" href="vendor/uplot.css" data-target-path="vendor"/>
 </head>
 <body>
 </body>

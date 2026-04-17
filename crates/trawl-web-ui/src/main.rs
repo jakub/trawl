@@ -11,6 +11,12 @@ mod api;
 mod app;
 
 #[cfg(target_arch = "wasm32")]
+mod components;
+
+#[cfg(target_arch = "wasm32")]
+mod interop;
+
+#[cfg(target_arch = "wasm32")]
 mod pages;
 
 #[cfg(target_arch = "wasm32")]
