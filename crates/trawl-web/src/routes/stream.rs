@@ -115,7 +115,7 @@ mod tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/login")
+            .uri("/api/auth/login")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"api_key":"flt_token"}"#))
             .unwrap();
