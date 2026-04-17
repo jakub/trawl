@@ -1,0 +1,146 @@
+@import url("tokens.css");
+
+/* ---------- reset ------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font: var(--type-base)/var(--leading-normal) var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; }
+
+/* ---------- login page ------------------------------------------- */
+.login-shell {
+  display: grid;
+  place-items: center;
+  height: 100%;
+}
+
+.login-card {
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-6);
+  width: 360px;
+}
+
+.login-card h1 {
+  margin: 0 0 var(--space-5) 0;
+  font-size: var(--type-xxl);
+  color: var(--color-accent);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.login-card .subtitle {
+  margin: calc(var(--space-5) * -1) 0 var(--space-5) 0;
+  color: var(--color-fg-muted);
+  font-size: var(--type-sm);
+}
+
+.field {
+  display: block;
+  margin-bottom: var(--space-4);
+}
+
+.field label {
+  display: block;
+  font-size: var(--type-xs);
+  color: var(--color-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: var(--space-2);
+}
+
+.field input[type="password"],
+.field input[type="text"] {
+  width: 100%;
+  padding: var(--space-3);
+  background: var(--color-bg-sunken);
+  color: var(--color-fg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: var(--type-base);
+}
+
+.field input:focus {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-color: var(--color-accent);
+}
+
+.btn {
+  display: inline-block;
+  padding: var(--space-3) var(--space-5);
+  background: var(--color-accent);
+  color: #000;
+  border: none;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn:hover { filter: brightness(1.1); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-full { width: 100%; }
+
+.error {
+  background: rgba(255, 85, 85, 0.08);
+  border: 1px solid var(--color-danger);
+  color: var(--color-danger);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-4);
+  font-size: var(--type-sm);
+}
+
+/* ---------- app shell (search page) ------------------------------ */
+.shell {
+  display: grid;
+  grid-template-rows: var(--nav-height) 1fr;
+  height: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: 0 var(--space-4);
+  background: var(--color-bg-raised);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.topbar h1 {
+  font-size: var(--type-base);
+  font-weight: 600;
+  color: var(--color-accent);
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  margin: 0;
+}
+
+.topbar .spacer { flex: 1; }
+
+.topbar .user {
+  color: var(--color-fg-muted);
+  font-size: var(--type-sm);
+  font-family: var(--font-mono);
+}
+
+.topbar .btn-link {
+  background: none;
+  border: none;
+  color: var(--color-fg-muted);
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+}
+.topbar .btn-link:hover { color: var(--color-fg); }
+
+.main {
+  padding: var(--space-5);
+  overflow: auto;
+}

@@ -1,0 +1,95 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Typed helpers for calling the trawl-web proxy from the browser.
+//!
+//! All calls are same-origin (`/me`, `/login`, `/logout`, `/api/v1/...`)
+//! and rely on the httpOnly session cookie being attached automatically
+//! by the browser. Never touches `Authorization` — that's the proxy's job.
+
+use gloo_net::http::Request;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("network: {0}")]
+    Network(String),
+
+    #[error("unauthorized")]
+    Unauthorized,
+
+    #[error("server returned {0}")]
+    Status(u16),
+
+    #[error("decode: {0}")]
+    Decode(String),
+}
+
+impl From<gloo_net::Error> for ApiError {
+    fn from(e: gloo_net::Error) -> Self {
+        Self::Network(e.to_string())
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct LoginRequest<'a> {
+    pub api_key: &'a str,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // fields consumed by later commits (search page, admin gating)
+pub struct LoginResponse {
+    pub name: String,
+    pub role: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // `exp` is for client-side expiry countdowns in a later commit
+pub struct MeResponse {
+    pub name: String,
+    pub role: String,
+    pub exp: i64,
+}
+
+/// POST /login with the given API key. Returns identity on success,
+/// [`ApiError::Unauthorized`] on bad key.
+pub async fn login(api_key: &str) -> Result<LoginResponse, ApiError> {
+    let body = LoginRequest { api_key };
+    let resp = Request::post("/login")
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+
+    match resp.status() {
+        200 => resp
+            .json::<LoginResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /me — read current session identity.
+pub async fn me() -> Result<MeResponse, ApiError> {
+    let resp = Request::get("/me").send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<MeResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// POST /logout — clears the session cookie.
+pub async fn logout() -> Result<(), ApiError> {
+    let resp = Request::post("/logout").send().await?;
+    match resp.status() {
+        204 | 200 => Ok(()),
+        s => Err(ApiError::Status(s)),
+    }
+}
