@@ -21,9 +21,13 @@ pub fn build(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(|| async { (StatusCode::OK, "ok") }))
-        .route("/login", post(auth::login))
-        .route("/logout", post(auth::logout))
-        .route("/me", get(auth::me))
+        // Auth endpoints live under /api/auth/ so the SPA owns the
+        // top-level /login, /logout paths as client-side routes without
+        // colliding with POST-only HTTP handlers (which would 405 on GET
+        // navigation and break deep-links to the login page).
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/me", get(auth::me))
         // SSE first — must outrank the generic forwarder (both are under /api/v1).
         .route("/api/v1/stream", get(stream::forward))
         // Block /ingest before it can match the generic forwarder.

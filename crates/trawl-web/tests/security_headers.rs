@@ -75,7 +75,7 @@ async fn unauthorized_responses_still_carry_security_headers() {
     // so error responses don't become a weak link.
     let req = Request::builder()
         .method("GET")
-        .uri("/me")
+        .uri("/api/auth/me")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();

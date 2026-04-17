@@ -56,7 +56,7 @@ pub struct MeResponse {
 /// [`ApiError::Unauthorized`] on bad key.
 pub async fn login(api_key: &str) -> Result<LoginResponse, ApiError> {
     let body = LoginRequest { api_key };
-    let resp = Request::post("/login")
+    let resp = Request::post("/api/auth/login")
         .header("content-type", "application/json")
         .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
         .send()
@@ -74,7 +74,7 @@ pub async fn login(api_key: &str) -> Result<LoginResponse, ApiError> {
 
 /// GET /me — read current session identity.
 pub async fn me() -> Result<MeResponse, ApiError> {
-    let resp = Request::get("/me").send().await?;
+    let resp = Request::get("/api/auth/me").send().await?;
     match resp.status() {
         200 => resp
             .json::<MeResponse>()
@@ -87,7 +87,7 @@ pub async fn me() -> Result<MeResponse, ApiError> {
 
 /// POST /logout — clears the session cookie.
 pub async fn logout() -> Result<(), ApiError> {
-    let resp = Request::post("/logout").send().await?;
+    let resp = Request::post("/api/auth/logout").send().await?;
     match resp.status() {
         204 | 200 => Ok(()),
         s => Err(ApiError::Status(s)),

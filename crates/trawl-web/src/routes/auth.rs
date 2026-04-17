@@ -205,7 +205,7 @@ mod tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/login")
+            .uri("/api/auth/login")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"api_key":"flt_goodtoken"}"#))
             .unwrap();
@@ -241,7 +241,7 @@ mod tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/login")
+            .uri("/api/auth/login")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"api_key":"flt_badtoken"}"#))
             .unwrap();
@@ -259,7 +259,7 @@ mod tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/login")
+            .uri("/api/auth/login")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"api_key":""}"#))
             .unwrap();
@@ -291,7 +291,7 @@ mod tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/login")
+            .uri("/api/auth/login")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"api_key":"flt_prod"}"#))
             .unwrap();
@@ -328,7 +328,7 @@ mod tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/login")
+            .uri("/api/auth/login")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"api_key":"flt_token"}"#))
             .unwrap();
@@ -350,7 +350,7 @@ mod tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/me")
+            .uri("/api/auth/me")
             .header("cookie", &cookie)
             .body(Body::empty())
             .unwrap();
@@ -372,7 +372,7 @@ mod tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/me")
+            .uri("/api/auth/me")
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -390,7 +390,7 @@ mod tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/me")
+            .uri("/api/auth/me")
             .header("cookie", &tampered)
             .body(Body::empty())
             .unwrap();
@@ -404,7 +404,7 @@ mod tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/logout")
+            .uri("/api/auth/logout")
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
