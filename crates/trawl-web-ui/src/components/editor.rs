@@ -144,6 +144,42 @@ fn f64_to_usize(f: f64) -> usize {
     }
 }
 
+/// Bundle of everything that must outlive the editor mount.
+///
+/// `EditorHandle` owns the `CodeMirror` view; dropping it calls `destroy`
+/// on the JS side. The four closures are installed into that JS view as
+/// callbacks, so they need to stay alive at least as long as the view.
+/// Keeping them in one struct ensures they all drop together on
+/// component cleanup — in the right order (view first, then closures).
+///
+/// This replaces an earlier `Closure::forget()`-everywhere design that
+/// leaked the closures permanently and made re-mounting the component
+/// (which can happen if a parent re-renders) pile up unreferenceable
+/// JS functions in the GC roots.
+struct EditorLifecycle {
+    handle: EditorHandle,
+    // The `dyn Fn` types differ per closure, so we can't store a Vec.
+    // Ordering matters for drop: the destructor runs handle FIRST,
+    // which triggers CodeMirror's internal teardown (it stops firing
+    // callbacks). Only then are the closures dropped, which in turn
+    // releases their JS-side backing functions safely.
+    _on_change: Closure<dyn Fn(String)>,
+    _on_submit: Closure<dyn Fn()>,
+    _lint: Closure<dyn Fn(String) -> JsValue>,
+    _complete: Closure<dyn Fn(JsValue) -> JsValue>,
+}
+
+impl Drop for EditorLifecycle {
+    fn drop(&mut self) {
+        // Explicit `destroy()` before the closures are released by the
+        // compiler-inserted field drops. CodeMirror's destroy() removes
+        // the view from the DOM and tears down internal event listeners
+        // that reference our callbacks; running it first guarantees no
+        // callback fires on a dangling closure.
+        self.handle.destroy();
+    }
+}
+
 /// Leptos component that mounts a `CodeMirror` editor into a div. The doc
 /// text is pushed into `query` on every change; `on_submit` fires when
 /// the user hits ⌘⏎ / ctrl+⏎.
@@ -153,7 +189,13 @@ pub fn DslEditor(
     #[prop(into)] on_submit: Callback<()>,
 ) -> impl IntoView {
     let node_ref = NodeRef::<leptos::html::Div>::new();
-    let handle: StoredValue<Option<EditorHandle>> = StoredValue::new(None);
+    // `StoredValue::new_local`, not `::new`: `Closure<dyn Fn...>` is
+    // neither `Send` nor `Sync`, so the default `SyncStorage` rejects
+    // it. `LocalStorage` is the single-threaded (i.e. wasm-appropriate)
+    // variant. CSR apps always run on the main JS thread — `Local`
+    // semantics are a perfect fit.
+    let lifecycle: StoredValue<Option<EditorLifecycle>, leptos::prelude::LocalStorage> =
+        StoredValue::new_local(None);
 
     Effect::new(move |_| {
         let Some(element) = node_ref.get() else {
@@ -161,10 +203,6 @@ pub fn DslEditor(
         };
         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
 
-        // Closures have to outlive the handle; we leak them intentionally
-        // for the lifetime of the component (editor lives until navigated
-        // away from). A more pedantic solution would store them in
-        // StoredValue and invoke destroy() on effect cleanup.
         let on_change_cb = Closure::<dyn Fn(String)>::new(move |doc: String| {
             query.set(doc);
         });
@@ -203,6 +241,9 @@ pub fn DslEditor(
         });
 
         // Build the opts object by reflection — matches TS `EditorOpts` shape.
+        // `as_ref().unchecked_ref()` reads the closure's JS function
+        // *without* consuming it; the closure is then moved into
+        // `EditorLifecycle` below to keep it alive.
         let opts = js_sys::Object::new();
         let _ = js_sys::Reflect::set(
             &opts,
@@ -225,22 +266,24 @@ pub fn DslEditor(
             complete_cb.as_ref().unchecked_ref(),
         );
 
-        // Intentionally leak the closures for the component lifetime.
-        on_change_cb.forget();
-        on_submit_cb.forget();
-        lint_cb.forget();
-        complete_cb.forget();
-
         let initial = query.get_untracked();
-        let h = create_editor(&html_el, &initial, opts.into());
-        handle.set_value(Some(h));
+        let handle = create_editor(&html_el, &initial, opts.into());
+
+        lifecycle.set_value(Some(EditorLifecycle {
+            handle,
+            _on_change: on_change_cb,
+            _on_submit: on_submit_cb,
+            _lint: lint_cb,
+            _complete: complete_cb,
+        }));
     });
 
     on_cleanup(move || {
-        handle.update_value(|h| {
-            if let Some(h) = h.take() {
-                h.destroy();
-            }
+        // Dropping the `EditorLifecycle` runs its `Drop` impl (which
+        // calls `destroy()`) and then drops the four closures in field
+        // order. No `.forget()` anywhere — closures are freed cleanly.
+        lifecycle.update_value(|v| {
+            let _ = v.take();
         });
     });
 
