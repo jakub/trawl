@@ -29,6 +29,12 @@ crates/trawl-server/tests/fixtures/
 # vector log data
 data/
 
+# trawl-web-ui trunk build output
+crates/trawl-web-ui/dist/
+
+# runtime-generated TLS certs (trawld self-signed)
+tls/
+
 # docs site
 docs/node_modules/
 docs/dist/
