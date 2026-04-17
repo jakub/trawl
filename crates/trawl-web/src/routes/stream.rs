@@ -11,11 +11,15 @@
 //! browser's `EventSource` handles framing on its end; reconnection
 //! after a drop is automatic and rides the same session cookie.
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
+use futures::StreamExt;
 use serde::Deserialize;
+use tokio::time::{Instant, sleep_until};
 
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Session;
@@ -60,6 +64,16 @@ pub async fn forward(
         .map(str::to_owned);
     let byte_stream = upstream_resp.bytes_stream();
 
+    // Cap the stream at `session.exp`. Without this, a browser that opens
+    // `/api/v1/stream` moments before expiry would keep receiving events
+    // indefinitely after the cookie becomes unusable for any other
+    // request — the extractor checks expiry once at handler entry, but
+    // `Body::from_stream` otherwise has no deadline. Dropping the
+    // upstream stream also cleanly closes the TCP connection via
+    // reqwest's drop handling.
+    let deadline = Instant::now() + remaining_ttl(session.exp(), chrono::Utc::now().timestamp());
+    let capped_stream = byte_stream.take_until(sleep_until(deadline));
+
     // For non-2xx, preserve the upstream Content-Type (typically
     // application/json for structured error bodies) so the browser
     // sees a real error response rather than a truncated SSE stream.
@@ -77,8 +91,21 @@ pub async fn forward(
         // this too but we re-set it to be resilient to misconfigured
         // intermediate proxies when trawl-web is fronted by another one.
         .header("X-Accel-Buffering", "no")
-        .body(Body::from_stream(byte_stream))
+        .body(Body::from_stream(capped_stream))
         .map_err(|e| ProxyError::Internal(format!("SSE response build: {e}")))
+}
+
+/// Compute the `Duration` between now and the session's expiry.
+///
+/// The session extractor rejects expired sessions before we get here, so
+/// `exp > now` in practice. This function nonetheless clamps to zero for
+/// the edge case where clock skew or a race lets an about-to-expire
+/// session slip through — returning `Duration::ZERO` makes the stream
+/// close immediately via `take_until`, which is the right failure mode.
+#[must_use]
+pub fn remaining_ttl(exp_secs: i64, now_secs: i64) -> Duration {
+    let remaining = exp_secs.saturating_sub(now_secs).max(0);
+    Duration::from_secs(u64::try_from(remaining).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -300,5 +327,87 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn remaining_ttl_positive_when_exp_in_future() {
+        assert_eq!(remaining_ttl(1100, 1000), Duration::from_secs(100));
+        assert_eq!(remaining_ttl(1001, 1000), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn remaining_ttl_zero_when_exp_at_or_past_now() {
+        // Defensive clamp — the extractor rejects expired sessions so
+        // reaching here with exp <= now is a sign of clock skew or a
+        // race. take_until(Duration::ZERO) ends the stream immediately,
+        // which is the correct failure mode.
+        assert_eq!(remaining_ttl(1000, 1000), Duration::ZERO);
+        assert_eq!(remaining_ttl(999, 1000), Duration::ZERO);
+        assert_eq!(remaining_ttl(-1_000_000, 1000), Duration::ZERO);
+    }
+
+    #[test]
+    fn remaining_ttl_handles_max_exp() {
+        // Far-future session (100 years) must not overflow.
+        let far_future = 1_000 + 3_153_600_000; // ~100y in seconds
+        assert_eq!(
+            remaining_ttl(far_future, 1000),
+            Duration::from_secs(3_153_600_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_deadline_cuts_long_running_body() {
+        // End-to-end smoke: session with exp ~1s in the future, upstream
+        // returns a body that would otherwise stream indefinitely. The
+        // response body must EOF before ~2s elapse.
+        use crate::session::{SessionPayload, encrypt};
+        use zeroize::Zeroizing;
+
+        let upstream = MockServer::start().await;
+        // Upstream body can be short; the point is that take_until fires
+        // regardless of whether the body is still arriving.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("event: data\ndata: first\n\n")
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state.clone());
+
+        // Hand-craft a session cookie with exp = now + 1 so we skip the
+        // login round-trip and get a deterministic short TTL.
+        let now = chrono::Utc::now().timestamp();
+        let payload = SessionPayload {
+            token: Zeroizing::new("flt_test".to_string()),
+            name: "test".into(),
+            role: "admin".into(),
+            exp: now + 1,
+        };
+        let cookie_value = encrypt(state.cookie_key(), &payload).unwrap();
+        let cookie = format!("trawl_session={cookie_value}");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=*")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Fully drain the body — with the cap, this must terminate cleanly.
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "stream should close at session.exp (~1s), took {elapsed:?}"
+        );
     }
 }
