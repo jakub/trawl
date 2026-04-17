@@ -117,3 +117,40 @@ jobs:
             crates/trawl-web-ui/vendor/codemirror.js \
             crates/trawl-web-ui/vendor/uplot.js \
             crates/trawl-web-ui/vendor/uplot.css
+
+  trunk-build:
+    name: web UI release build (trunk)
+    runs-on: k8s-big
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: trunk-build
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
+        with:
+          tool: trunk
+      - name: Build SPA
+        working-directory: crates/trawl-web-ui
+        run: trunk build --release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trawl-web-ui-dist
+          path: crates/trawl-web-ui/dist/
+          retention-days: 7
+
+  trawl-web-tests:
+    name: trawl-web tests
+    runs-on: k8s-big
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: trawl-web-tests
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
+        with:
+          tool: nextest
+      - run: cargo nextest run -p trawl-web
