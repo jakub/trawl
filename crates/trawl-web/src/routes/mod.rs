@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod proxy;
+pub mod stream;
 
 use axum::Router;
 use axum::http::StatusCode;
@@ -20,6 +21,8 @@ pub fn build(state: AppState) -> Router {
         .route("/login", post(auth::login))
         .route("/logout", post(auth::logout))
         .route("/me", get(auth::me))
+        // SSE first — must outrank the generic forwarder (both are under /api/v1).
+        .route("/api/v1/stream", get(stream::forward))
         // Block /ingest before it can match the generic forwarder.
         .route("/api/v1/ingest", any(proxy::block_ingest))
         .route("/api/v1/{*path}", any(proxy::forward))
