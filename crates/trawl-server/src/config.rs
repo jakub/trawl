@@ -22,6 +22,8 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub syslog: SyslogConfig,
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
 /// HTTPS listener settings.
@@ -772,6 +774,37 @@ pub struct AuthConfig {
     /// this duration. Set to 0 to disable caching. Default: 300 (5 min).
     #[serde(default = "default_auth_cache_ttl_secs")]
     pub auth_cache_ttl_secs: u64,
+}
+
+/// Browser-facing session proxy (`trawl-web`) settings.
+///
+/// Consumed by the `trawl-web` binary, which translates cookie-based browser
+/// sessions into bearer-token requests against trawld. Every field is
+/// optional so the proxy can supply its own defaults without coupling trawld
+/// to the proxy's operational choices. Existing config.toml files without a
+/// `[web]` section continue to parse cleanly.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WebConfig {
+    /// Bind address for the proxy HTTP listener. Default: "127.0.0.1:8090".
+    pub bind_addr: Option<String>,
+
+    /// How the proxy reaches trawld. If unset, derived from `[server]`.
+    pub upstream_url: Option<String>,
+
+    /// Path to a file containing the 32-byte AEAD key for cookie encryption.
+    /// Either this or `cookie_secret_env` must be set in production.
+    pub cookie_secret_path: Option<PathBuf>,
+
+    /// Environment variable name holding a base64-encoded 32-byte AEAD key.
+    /// Alternative to `cookie_secret_path`.
+    pub cookie_secret_env: Option<String>,
+
+    /// Session TTL in seconds. Default: 86400 (24h).
+    pub session_ttl_secs: Option<u64>,
+
+    /// Drop `Secure` on session cookies. Dev-only; MUST stay `false` in prod.
+    #[serde(default)]
+    pub allow_insecure_cookies: bool,
 }
 
 fn default_audit_interval_secs() -> u64 {
@@ -1642,5 +1675,53 @@ stats_interval_secs = 0
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ingest.stats_interval_secs, 0);
+    }
+
+    #[test]
+    fn web_section_optional_preserves_backcompat() {
+        // Existing trawld deployments have no [web] section — must still parse.
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.web.bind_addr.is_none());
+        assert!(config.web.upstream_url.is_none());
+        assert!(config.web.cookie_secret_path.is_none());
+        assert!(config.web.cookie_secret_env.is_none());
+        assert!(config.web.session_ttl_secs.is_none());
+        assert!(!config.web.allow_insecure_cookies);
+    }
+
+    #[test]
+    fn web_section_populated() {
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/auth.db"
+[web]
+bind_addr = "0.0.0.0:8090"
+upstream_url = "https://localhost:5514"
+cookie_secret_path = "/etc/trawl/web.key"
+session_ttl_secs = 3600
+allow_insecure_cookies = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.web.bind_addr.as_deref(), Some("0.0.0.0:8090"));
+        assert_eq!(
+            config.web.upstream_url.as_deref(),
+            Some("https://localhost:5514")
+        );
+        assert_eq!(
+            config.web.cookie_secret_path.as_deref(),
+            Some(std::path::Path::new("/etc/trawl/web.key"))
+        );
+        assert_eq!(config.web.session_ttl_secs, Some(3600));
+        assert!(config.web.allow_insecure_cookies);
     }
 }
