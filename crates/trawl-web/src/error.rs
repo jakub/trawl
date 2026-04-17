@@ -68,7 +68,21 @@ impl IntoResponse for ProxyError {
             }
         };
 
-        tracing::debug!(error = %self, "proxy error");
+        // Severity per variant — blanket `debug!` used to hide network
+        // and upstream errors at the default `info` log level, which
+        // made prod outages invisible until someone turned debug
+        // logging on.
+        match &self {
+            Self::Unauthorized | Self::ExpiredSession { .. } | Self::BadRequest(_) => {
+                tracing::debug!(error = %self, "proxy error (expected)");
+            }
+            Self::Upstream(_) | Self::Network(_) => {
+                tracing::warn!(error = %self, "proxy upstream error");
+            }
+            Self::Session(_) | Self::Internal(_) => {
+                tracing::error!(error = %self, "proxy internal error");
+            }
+        }
 
         // For the expired-session path, attach Set-Cookie: Max-Age=0 so
         // the browser stops sending the dead cookie on every subsequent
