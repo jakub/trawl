@@ -126,7 +126,12 @@ fn copy_response_headers(src: &reqwest::header::HeaderMap, dst: &mut HeaderMap) 
             HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            dst.insert(h_name, h_value);
+            // `append`, not `insert`: HTTP allows repeated headers
+            // (notably `Set-Cookie`), and `reqwest::HeaderMap`'s
+            // iterator yields each entry separately. `insert`
+            // clobbers; `append` preserves all of them so the browser
+            // sees every `Set-Cookie` trawld emitted.
+            dst.append(h_name, h_value);
         }
     }
 }
@@ -277,6 +282,53 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn forward_preserves_multiple_set_cookie_headers() {
+        // Regression: `copy_response_headers` previously used `insert`,
+        // which clobbers prior entries for the same header name. When
+        // trawld emits multiple `Set-Cookie` headers (or any header
+        // allowed to repeat), only the last survived. Now we `append`.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/saved"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("set-cookie", "one=1; Path=/")
+                    .append_header("set-cookie", "two=2; Path=/")
+                    .set_body_string("[]"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/saved")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let set_cookies: Vec<_> = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            set_cookies.len(),
+            2,
+            "both upstream Set-Cookie headers must reach the browser, got {set_cookies:?}"
+        );
+        assert!(set_cookies.iter().any(|c| c.starts_with("one=1")));
+        assert!(set_cookies.iter().any(|c| c.starts_with("two=2")));
     }
 
     #[test]
