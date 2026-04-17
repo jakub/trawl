@@ -4,6 +4,10 @@
 
 //! `trawl-web-ui`: Leptos SPA entry point.
 
+// offset helpers are pure str manipulation — keep them available on both
+// targets so their tests run under plain `cargo test`.
+mod offset;
+
 #[cfg(target_arch = "wasm32")]
 mod api;
 

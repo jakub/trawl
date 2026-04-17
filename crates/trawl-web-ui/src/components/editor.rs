@@ -19,6 +19,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 use crate::interop::codemirror::{EditorHandle, create_editor};
+use crate::offset::{utf8_to_utf16, utf16_to_utf8};
 
 /// JS-side `Diagnostic` shape expected by the codemirror bundle.
 #[derive(Serialize)]
@@ -47,6 +48,11 @@ struct CompletionResult {
 }
 
 /// Emits `CodeMirror` diagnostics for every parse error from trawl-core.
+///
+/// `doc` is the current document text. Parser spans are UTF-8 byte
+/// offsets; `CodeMirror` expects UTF-16 code-unit offsets — we translate
+/// so squiggles line up under the correct characters for non-ASCII
+/// input.
 fn lint_document(doc: &str) -> Vec<Diagnostic> {
     match trawl_core::parser::parse(doc) {
         Ok(_) => Vec::new(),
@@ -58,8 +64,8 @@ fn lint_document(doc: &str) -> Vec<Diagnostic> {
                     None => e.message,
                 };
                 Diagnostic {
-                    from: e.span.start,
-                    to: e.span.end,
+                    from: utf8_to_utf16(doc, e.span.start),
+                    to: utf8_to_utf16(doc, e.span.end),
                     severity: "error",
                     message,
                 }
@@ -71,16 +77,20 @@ fn lint_document(doc: &str) -> Vec<Diagnostic> {
 /// Autocomplete: offers pipe stages if the cursor is after `|` or at SOL;
 /// otherwise offers function names. Good-enough v1 heuristic — full
 /// context-aware completion is a later commit.
-fn complete_at(doc: &str, pos: usize) -> Option<CompletionResult> {
-    let prefix = &doc[..pos];
-    let last_word_start = prefix
+///
+/// `pos_utf16` is the cursor position in UTF-16 code units (as `CodeMirror`
+/// reports). We translate to a UTF-8 byte offset before slicing.
+fn complete_at(doc: &str, pos_utf16: usize) -> Option<CompletionResult> {
+    let pos_utf8 = utf16_to_utf8(doc, pos_utf16);
+    let prefix = &doc[..pos_utf8];
+    let last_word_start_utf8 = prefix
         .char_indices()
         .rev()
         .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
         .last()
-        .map_or(pos, |(i, _)| i);
+        .map_or(pos_utf8, |(i, _)| i);
 
-    let word = &prefix[last_word_start..];
+    let word = &prefix[last_word_start_utf8..];
     if word.is_empty() {
         return None;
     }
@@ -115,8 +125,9 @@ fn complete_at(doc: &str, pos: usize) -> Option<CompletionResult> {
         return None;
     }
 
+    // `CompletionResult::from` must be in UTF-16 code units.
     Some(CompletionResult {
-        from: last_word_start,
+        from: utf8_to_utf16(doc, last_word_start_utf8),
         options,
         filter: false,
     })
