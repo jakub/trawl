@@ -10,10 +10,8 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 
 use crate::error::ProxyError;
-use crate::session::{self, SessionPayload};
+use crate::session::{self, SESSION_COOKIE, SessionPayload};
 use crate::state::AppState;
-
-const SESSION_COOKIE: &str = "trawl_session";
 
 /// A decrypted, non-expired session, injected into handlers.
 ///

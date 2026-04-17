@@ -25,6 +25,11 @@ use chacha20poly1305::{
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+/// Cookie name used for the encrypted session. Lives here so every
+/// module that reads, writes, or clears the cookie agrees on the
+/// wire-level identifier.
+pub const SESSION_COOKIE: &str = "trawl_session";
+
 /// Length of the symmetric AEAD key in bytes (XChaCha20-Poly1305).
 pub const KEY_LEN: usize = 32;
 
