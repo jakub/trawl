@@ -12,10 +12,13 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::{any, get, post};
 
+use crate::middleware::security_headers;
 use crate::state::AppState;
 
 /// Compose the proxy's top-level `Router` from its sub-modules.
 pub fn build(state: AppState) -> Router {
+    let (csp, hsts, xcto, refp, xfo) = security_headers::layers();
+
     Router::new()
         .route("/healthz", get(|| async { (StatusCode::OK, "ok") }))
         .route("/login", post(auth::login))
@@ -26,5 +29,10 @@ pub fn build(state: AppState) -> Router {
         // Block /ingest before it can match the generic forwarder.
         .route("/api/v1/ingest", any(proxy::block_ingest))
         .route("/api/v1/{*path}", any(proxy::forward))
+        .layer(csp)
+        .layer(hsts)
+        .layer(xcto)
+        .layer(refp)
+        .layer(xfo)
         .with_state(state)
 }
