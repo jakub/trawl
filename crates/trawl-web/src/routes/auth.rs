@@ -182,7 +182,7 @@ mod tests {
             allow_insecure_cookies: true,
             ..WebConfig::default()
         };
-        let cfg = ResolvedConfig::from_parsed(&web).unwrap();
+        let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
         AppState::from_config(cfg).unwrap()
     }
 
@@ -285,7 +285,8 @@ mod tests {
             allow_insecure_cookies: false,
             ..WebConfig::default()
         };
-        let state = AppState::from_config(ResolvedConfig::from_parsed(&web).unwrap()).unwrap();
+        let state =
+            AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap();
         let app = routes::build(state);
 
         let req = Request::builder()

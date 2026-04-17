@@ -18,7 +18,7 @@ fn test_state() -> AppState {
         allow_insecure_cookies: true,
         ..WebConfig::default()
     };
-    AppState::from_config(ResolvedConfig::from_parsed(&web).unwrap()).unwrap()
+    AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap()
 }
 
 #[tokio::test]

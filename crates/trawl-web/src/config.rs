@@ -11,15 +11,18 @@
 
 use std::path::{Path, PathBuf};
 
-use trawl_server::config::{Config, WebConfig};
+use trawl_server::config::{Config, ServerConfig, WebConfig};
 
 use crate::session::{KEY_LEN, SessionKey};
 
 /// Default bind address for the proxy HTTP listener.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
 
-/// Default upstream URL. Matches the `dev` profile's trawld.
-pub const DEFAULT_UPSTREAM_URL: &str = "https://127.0.0.1:5514";
+/// Fallback upstream URL used only if the loaded config exposes no
+/// `[server].http_addr` AND `[web].upstream_url` is also unset — i.e.
+/// nearly never. Matches the homelab/dev convention documented in
+/// CLAUDE.md.
+pub const FALLBACK_UPSTREAM_URL: &str = "https://127.0.0.1:5514";
 
 /// Default session TTL in seconds (24h).
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
@@ -85,25 +88,31 @@ impl ResolvedConfig {
             path: path.to_owned(),
             source: e,
         })?;
-        Self::from_parsed(&config.web)
+        Self::from_parsed(&config.web, Some(&config.server))
     }
 
-    /// Resolve from an already-parsed `WebConfig`. Useful in tests.
+    /// Resolve from an already-parsed `WebConfig`. `server` is used only
+    /// to derive the default upstream URL when `web.upstream_url` is
+    /// absent — pass `None` in tests that don't need that resolution.
     ///
     /// # Errors
     /// Returns `ConfigError::NoKey` if neither `cookie_secret_path` nor
     /// `cookie_secret_env` is set (cookies would not survive restart).
-    pub fn from_parsed(web: &WebConfig) -> Result<Self, ConfigError> {
+    pub fn from_parsed(
+        web: &WebConfig,
+        server: Option<&ServerConfig>,
+    ) -> Result<Self, ConfigError> {
         let cookie_key = load_key(web)?;
+        let upstream_url = web
+            .upstream_url
+            .clone()
+            .unwrap_or_else(|| default_upstream_from_server(server));
         Ok(Self {
             bind_addr: web
                 .bind_addr
                 .clone()
                 .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned()),
-            upstream_url: web
-                .upstream_url
-                .clone()
-                .unwrap_or_else(|| DEFAULT_UPSTREAM_URL.to_owned()),
+            upstream_url,
             session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
             allow_insecure_cookies: web.allow_insecure_cookies,
             insecure_upstream_tls: std::env::var(ENV_INSECURE_UPSTREAM)
@@ -111,6 +120,55 @@ impl ResolvedConfig {
             cookie_key,
         })
     }
+}
+
+/// Build the default upstream URL from the trawld `[server].http_addr`.
+///
+/// Trawld always speaks HTTPS (it auto-generates a self-signed cert if
+/// none is configured), so we always produce an `https://` URL.
+/// Wildcard bind addresses (`0.0.0.0`, `::`, `[::]`) are rewritten to
+/// loopback — the proxy reaches trawld on the same host, never across
+/// the wire. IPv6 literals are wrapped in brackets per RFC 3986.
+fn default_upstream_from_server(server: Option<&ServerConfig>) -> String {
+    let Some(srv) = server else {
+        return FALLBACK_UPSTREAM_URL.to_owned();
+    };
+
+    let addr = srv.http_addr.trim();
+    let (host, port_suffix) = split_addr(addr);
+    let is_ipv6 = host.contains(':');
+    let host = match host {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    // RFC 3986 requires IPv6 literals in URLs to be bracketed.
+    if is_ipv6 && host != "127.0.0.1" {
+        format!("https://[{host}]{port_suffix}")
+    } else {
+        format!("https://{host}{port_suffix}")
+    }
+}
+
+/// Split "host:port" / "[ipv6]:port" / bare host into
+/// (host-without-brackets, ":port" or "").
+/// Does not validate; malformed input passes through unchanged so an
+/// operator with an oddly-formatted addr gets an explanatory reqwest
+/// error rather than a silent URL-building mistake.
+fn split_addr(addr: &str) -> (&str, &str) {
+    // IPv6 literal in brackets, e.g. "[::1]:5514". Strip the brackets
+    // for the host component; the caller re-adds them when building the
+    // URL.
+    if let Some(rest) = addr.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let host = &rest[..end];
+        let port = &rest[end + 1..];
+        return (host, port);
+    }
+    // IPv4 or hostname with optional :port.
+    addr.rsplit_once(':').map_or((addr, ""), |(host, port)| {
+        (host, &addr[host.len()..host.len() + 1 + port.len()])
+    })
 }
 
 fn load_key(web: &WebConfig) -> Result<SessionKey, ConfigError> {
@@ -147,9 +205,9 @@ mod tests {
     fn defaults_applied_when_web_section_empty() {
         let web = WebConfig::default();
         // Will generate ephemeral key (prints a warning) — that's fine in tests.
-        let resolved = ResolvedConfig::from_parsed(&web).unwrap();
+        let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
         assert_eq!(resolved.bind_addr, DEFAULT_BIND_ADDR);
-        assert_eq!(resolved.upstream_url, DEFAULT_UPSTREAM_URL);
+        assert_eq!(resolved.upstream_url, FALLBACK_UPSTREAM_URL);
         assert_eq!(resolved.session_ttl_secs, DEFAULT_SESSION_TTL_SECS);
         assert!(!resolved.allow_insecure_cookies);
     }
@@ -163,11 +221,88 @@ mod tests {
             allow_insecure_cookies: true,
             ..WebConfig::default()
         };
-        let resolved = ResolvedConfig::from_parsed(&web).unwrap();
+        let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
         assert_eq!(resolved.bind_addr, "0.0.0.0:9091");
         assert_eq!(resolved.upstream_url, "https://trawld:5514");
         assert_eq!(resolved.session_ttl_secs, 3600);
         assert!(resolved.allow_insecure_cookies);
+    }
+
+    #[test]
+    fn upstream_url_derived_from_server_http_addr() {
+        let web = WebConfig::default();
+        let srv = ServerConfig {
+            http_addr: "127.0.0.1:8080".into(),
+            ..dummy_server()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, Some(&srv)).unwrap();
+        assert_eq!(resolved.upstream_url, "https://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn upstream_url_rewrites_wildcard_bind() {
+        let web = WebConfig::default();
+        let srv = ServerConfig {
+            http_addr: "0.0.0.0:5514".into(),
+            ..dummy_server()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, Some(&srv)).unwrap();
+        assert_eq!(resolved.upstream_url, "https://127.0.0.1:5514");
+    }
+
+    #[test]
+    fn upstream_url_handles_ipv6_bracketed() {
+        let web = WebConfig::default();
+        let srv = ServerConfig {
+            http_addr: "[::1]:5514".into(),
+            ..dummy_server()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, Some(&srv)).unwrap();
+        // RFC 3986 requires brackets around IPv6 in URLs.
+        assert_eq!(resolved.upstream_url, "https://[::1]:5514");
+    }
+
+    #[test]
+    fn upstream_url_rewrites_ipv6_wildcard() {
+        let web = WebConfig::default();
+        let srv = ServerConfig {
+            http_addr: "[::]:5514".into(),
+            ..dummy_server()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, Some(&srv)).unwrap();
+        // `::` wildcard maps to loopback IPv4 — same-host reach, no need
+        // for IPv6 at all.
+        assert_eq!(resolved.upstream_url, "https://127.0.0.1:5514");
+    }
+
+    #[test]
+    fn explicit_web_upstream_url_wins_over_server() {
+        let web = WebConfig {
+            upstream_url: Some("https://trawld.internal:9000".into()),
+            ..WebConfig::default()
+        };
+        let srv = ServerConfig {
+            http_addr: "127.0.0.1:8080".into(),
+            ..dummy_server()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, Some(&srv)).unwrap();
+        assert_eq!(resolved.upstream_url, "https://trawld.internal:9000");
+    }
+
+    #[test]
+    fn upstream_url_falls_back_when_server_missing() {
+        let web = WebConfig::default();
+        let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
+        assert_eq!(resolved.upstream_url, FALLBACK_UPSTREAM_URL);
+    }
+
+    /// Build a minimally populated `ServerConfig` for tests. Most fields
+    /// aren't exercised by the upstream-URL derivation but the struct
+    /// doesn't implement `Default` — see trawl-server's config module.
+    fn dummy_server() -> ServerConfig {
+        // `toml::from_str` with only mandatory fields gives us a fully
+        // defaulted ServerConfig (serde defaults fill everything else).
+        toml::from_str::<ServerConfig>("http_addr = \"127.0.0.1:8080\"").unwrap()
     }
 
     #[test]
@@ -180,7 +315,7 @@ mod tests {
             cookie_secret_path: Some(key_path),
             ..WebConfig::default()
         };
-        let resolved = ResolvedConfig::from_parsed(&web).unwrap();
+        let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
         let _ = resolved.cookie_key; // successfully loaded
     }
 }
