@@ -5,10 +5,11 @@
 //! Handler modules, composed into the final `axum::Router` in `build()`.
 
 pub mod auth;
+pub mod proxy;
 
 use axum::Router;
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 
 use crate::state::AppState;
 
@@ -19,5 +20,8 @@ pub fn build(state: AppState) -> Router {
         .route("/login", post(auth::login))
         .route("/logout", post(auth::logout))
         .route("/me", get(auth::me))
+        // Block /ingest before it can match the generic forwarder.
+        .route("/api/v1/ingest", any(proxy::block_ingest))
+        .route("/api/v1/{*path}", any(proxy::forward))
         .with_state(state)
 }
