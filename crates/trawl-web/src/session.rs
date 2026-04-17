@@ -30,6 +30,32 @@ use zeroize::Zeroizing;
 /// wire-level identifier.
 pub const SESSION_COOKIE: &str = "trawl_session";
 
+/// Build a `Set-Cookie` header value for a live session cookie.
+///
+/// Delegates to the `cookie` crate for attribute serialization rather
+/// than hand-rolling a format string — belt-and-suspenders against
+/// future bugs where a value character (e.g. `;` or `\r`) could inject
+/// spurious directives into the header. Session values today are
+/// base64url-safe, so this is purely defensive; code-review flagged it
+/// as a cosmetic concern worth closing.
+#[must_use]
+pub fn build_session_cookie_header(
+    name: &'static str,
+    value: String,
+    max_age_secs: u64,
+    secure: bool,
+) -> String {
+    cookie::Cookie::build((name, value))
+        .http_only(true)
+        .same_site(cookie::SameSite::Strict)
+        .path("/")
+        .max_age(cookie::time::Duration::seconds(
+            i64::try_from(max_age_secs).unwrap_or(i64::MAX),
+        ))
+        .secure(secure)
+        .to_string()
+}
+
 /// Build a `Set-Cookie` header value that clears the named cookie.
 ///
 /// Attributes match what the login handler sets on creation
@@ -39,12 +65,14 @@ pub const SESSION_COOKIE: &str = "trawl_session";
 /// original cookie — dev deployments with `allow_insecure_cookies =
 /// true` set it to `false` to accept the cookie on plain HTTP.
 #[must_use]
-pub fn build_clear_cookie_header(name: &str, secure: bool) -> String {
-    let mut s = format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
-    if secure {
-        s.push_str("; Secure");
-    }
-    s
+pub fn build_clear_cookie_header(name: &'static str, secure: bool) -> String {
+    cookie::Cookie::build((name, ""))
+        .http_only(true)
+        .same_site(cookie::SameSite::Strict)
+        .path("/")
+        .max_age(cookie::time::Duration::ZERO)
+        .secure(secure)
+        .to_string()
 }
 
 /// Length of the symmetric AEAD key in bytes (XChaCha20-Poly1305).
