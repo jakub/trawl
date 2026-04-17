@@ -30,6 +30,23 @@ use zeroize::Zeroizing;
 /// wire-level identifier.
 pub const SESSION_COOKIE: &str = "trawl_session";
 
+/// Build a `Set-Cookie` header value that clears the named cookie.
+///
+/// Attributes match what the login handler sets on creation
+/// (`HttpOnly`, `SameSite=Strict`, `Path=/`, optional `Secure`),
+/// so browsers will accept the clear directive. `Max-Age=0` signals
+/// immediate deletion. The optional `Secure` attribute mirrors the
+/// original cookie — dev deployments with `allow_insecure_cookies =
+/// true` set it to `false` to accept the cookie on plain HTTP.
+#[must_use]
+pub fn build_clear_cookie_header(name: &str, secure: bool) -> String {
+    let mut s = format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    if secure {
+        s.push_str("; Secure");
+    }
+    s
+}
+
 /// Length of the symmetric AEAD key in bytes (XChaCha20-Poly1305).
 pub const KEY_LEN: usize = 32;
 

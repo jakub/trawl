@@ -59,7 +59,13 @@ impl FromRequestParts<AppState> for Session {
 
         let now = chrono::Utc::now().timestamp();
         if session::is_expired(&payload, now) {
-            return Err(ProxyError::Unauthorized);
+            // Expired is distinct from missing/tampered: the browser
+            // IS presenting a cookie, it just can't be redeemed. Tell
+            // it to drop the cookie so subsequent requests don't keep
+            // sending a token we'll always reject.
+            return Err(ProxyError::ExpiredSession {
+                secure_cookie: !state.allow_insecure_cookies(),
+            });
         }
 
         Ok(Session(payload))

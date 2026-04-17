@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Session;
-use crate::session::{self, SESSION_COOKIE, SessionPayload};
+use crate::session::{self, SESSION_COOKIE, SessionPayload, build_clear_cookie_header};
 use crate::state::AppState;
 
 /// Request body for `POST /login`.
@@ -118,14 +118,6 @@ async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyErro
 fn build_cookie_header(name: &str, value: &str, max_age_secs: u64, secure: bool) -> String {
     let mut s =
         format!("{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_secs}");
-    if secure {
-        s.push_str("; Secure");
-    }
-    s
-}
-
-fn build_clear_cookie_header(name: &str, secure: bool) -> String {
-    let mut s = format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
     if secure {
         s.push_str("; Secure");
     }
