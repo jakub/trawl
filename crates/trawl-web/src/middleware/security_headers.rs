@@ -19,8 +19,14 @@ pub type HeaderLayer = SetResponseHeaderLayer<HeaderValue>;
 /// Content Security Policy string applied to every response.
 ///
 /// - `default-src 'self'`: only same-origin resources by default
-/// - `script-src 'self' 'wasm-unsafe-eval'`: load scripts from same origin;
-///   `wasm-unsafe-eval` is mandatory for `WebAssembly.instantiate`
+/// - `script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'`: load scripts
+///   from same origin; `wasm-unsafe-eval` is mandatory for
+///   `WebAssembly.instantiate`; `unsafe-inline` is required because
+///   Trunk bootstraps the wasm via an injected `<script type="module">`
+///   block, and so does the codemirror/uplot `<link data-trunk>` glue
+///   when it ends up inline. A future hardening pass can switch to a
+///   nonce-per-response scheme (Trunk supports `data-integrity`), but
+///   for v1 behind same-origin auth the trade-off is acceptable.
 /// - `style-src 'self' 'unsafe-inline'`: inline style attributes are used
 ///   by some component patterns (codemirror does this); kept permissive
 ///   because the alternative is shipping style nonces
@@ -29,7 +35,7 @@ pub type HeaderLayer = SetResponseHeaderLayer<HeaderValue>;
 /// - `frame-ancestors 'none'`: disallow embedding in iframes (belt and
 ///   suspenders with `X-Frame-Options: DENY`)
 pub const CSP: &str = "default-src 'self'; \
-    script-src 'self' 'wasm-unsafe-eval'; \
+    script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; \
     style-src 'self' 'unsafe-inline'; \
     connect-src 'self'; \
     img-src 'self' data:; \
