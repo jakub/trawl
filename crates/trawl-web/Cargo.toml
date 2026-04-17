@@ -32,12 +32,7 @@ tower-http = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 trawl-api = { workspace = true }
-# The workspace dep explicitly sets `default-features = false` so consumers
-# like trawl-web that only need the `config` module don't transitively pull
-# in bundled DuckDB (trawl-server's default `bundled` feature gates that).
-# The trawl-server binary itself builds with its own default features via
-# `cargo build -p trawl-server` — only cross-crate deps are affected.
-trawl-server = { workspace = true }
+trawl-config = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

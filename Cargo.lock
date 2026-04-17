@@ -5599,6 +5599,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "trawl-config"
+version = "0.1.21"
+dependencies = [
+ "chrono",
+ "serde",
+ "shellexpand",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "trawl-core"
 version = "0.1.21"
 dependencies = [
@@ -5684,6 +5695,7 @@ dependencies = [
  "trawl-api",
  "trawl-auth",
  "trawl-client",
+ "trawl-config",
  "trawl-core",
  "trawl-dashboard",
  "trawl-engine",
@@ -5717,7 +5729,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trawl-api",
- "trawl-server",
+ "trawl-config",
  "wiremock",
  "zeroize",
 ]

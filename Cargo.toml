@@ -16,9 +16,10 @@ publish = false
 trawl-core = { path = "crates/trawl-core" }
 trawl-engine = { path = "crates/trawl-engine", default-features = false }
 trawl-auth = { path = "crates/trawl-auth" }
-trawl-server = { path = "crates/trawl-server", default-features = false }
+trawl-server = { path = "crates/trawl-server" }
 trawl-api = { path = "crates/trawl-api" }
 trawl-client = { path = "crates/trawl-client" }
+trawl-config = { path = "crates/trawl-config" }
 trawl-dashboard = { path = "crates/trawl-dashboard" }
 trawl-web = { path = "crates/trawl-web" }
 

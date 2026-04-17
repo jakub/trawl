@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use trawl_server::config::{Config, ServerConfig, WebConfig};
+use trawl_config::{Config, ServerConfig, WebConfig};
 
 use crate::session::{KEY_LEN, SessionKey};
 
