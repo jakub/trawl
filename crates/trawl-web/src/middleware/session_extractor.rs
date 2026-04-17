@@ -28,6 +28,16 @@ impl Session {
     pub fn token(&self) -> &str {
         self.0.token.as_str()
     }
+
+    /// Absolute unix-second expiry timestamp of the session.
+    ///
+    /// Used by the SSE handler to cap stream duration at expiry time —
+    /// preventing a request opened just before expiry from keeping its
+    /// stream alive indefinitely.
+    #[must_use]
+    pub fn exp(&self) -> i64 {
+        self.0.exp
+    }
 }
 
 impl FromRequestParts<AppState> for Session {
