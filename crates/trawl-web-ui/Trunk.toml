@@ -1,3 +1,36 @@
+# DEV WORKFLOW
+# ============
+#
+# Two dev modes are supported; pick based on whether you want SPA hot
+# reload or a "behaves exactly like production" setup.
+#
+# Mode A — trunk serve with proxy (SPA hot reload):
+#   trunk serve
+#
+#   Trunk serves compiled wasm at :8080 and proxies ALL other requests
+#   (including /api/*, /login, /logout, /me) to the trawl-web backend at
+#   :8090. Editing .rs files in trawl-web-ui triggers a rebuild and live
+#   browser refresh. Requires trawl-web + trawld running separately.
+#
+#   Caveat: trunk 0.21's proxy doesn't support exact-path routing, so
+#   every request (including /index.html) is forwarded. The whole SPA
+#   moves through :8090 → :8080. Same-origin from the browser's view;
+#   SameSite=Strict cookies work.
+#
+# Mode B — single-origin via TRAWL_WEB_SPA_DIR (prod-like):
+#   cd crates/trawl-web-ui && trunk build
+#   TRAWL_WEB_SPA_DIR=$(pwd)/crates/trawl-web-ui/dist \
+#     cargo run -p trawl-web
+#
+#   trawl-web itself serves dist/ as a static-file fallback and handles
+#   /api/* and /login etc. in the same process. One port, one origin.
+#   NO hot reload — rebuild + restart on every change. Use this to
+#   verify production-style CSP, cookie Secure flags, etc.
+#
+# The final release deploy uses neither mode — commit 15 of the v1 plan
+# wires rust-embed to bake dist/ into the binary at compile time. This
+# file stays as the dev affordance.
+
 [build]
 target = "index.html"
 dist = "dist"

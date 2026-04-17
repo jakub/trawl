@@ -79,3 +79,21 @@ export function createEditor(
     },
   };
 }
+
+// Compile-time shape assertion — mirrors the `#[wasm_bindgen(module=...)]`
+// extern block in `crates/trawl-web-ui/src/interop/codemirror.rs`. If the
+// exported signature ever drifts (rename, added/removed parameter, return
+// type change), TypeScript rejects this file before `build.sh` finishes,
+// making the vendor-drift CI job fail loudly instead of shipping a runtime
+// `TypeError` to the browser.
+//
+// The runtime-side drift check (committed bundle byte diff) catches content
+// changes but NOT API changes — `createEditor` could be renamed and the
+// content check would just pass the new content. This static typecheck
+// covers that gap.
+const _apiShape: (
+  parent: HTMLElement,
+  initial: string,
+  opts: EditorOpts,
+) => EditorHandle = createEditor;
+void _apiShape;
