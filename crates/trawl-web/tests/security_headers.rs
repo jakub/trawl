@@ -8,7 +8,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
-use trawl_server::config::WebConfig;
+use trawl_config::WebConfig;
 use trawl_web::config::ResolvedConfig;
 use trawl_web::routes;
 use trawl_web::state::AppState;

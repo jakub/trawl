@@ -144,7 +144,7 @@ mod tests {
     use axum::http::Request;
     use serde_json::json;
     use tower::ServiceExt;
-    use trawl_server::config::WebConfig;
+    use trawl_config::WebConfig;
     use wiremock::matchers::{bearer_token, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
