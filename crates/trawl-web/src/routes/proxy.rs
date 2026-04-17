@@ -152,7 +152,7 @@ mod tests {
             allow_insecure_cookies: true,
             ..WebConfig::default()
         };
-        let cfg = ResolvedConfig::from_parsed(&web).unwrap();
+        let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
         AppState::from_config(cfg).unwrap()
     }
 

@@ -89,7 +89,7 @@ mod tests {
             allow_insecure_cookies: true,
             ..WebConfig::default()
         };
-        AppState::from_config(ResolvedConfig::from_parsed(&web).unwrap()).unwrap()
+        AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap()
     }
 
     async fn login_cookie(app: axum::Router, upstream: &MockServer) -> String {
