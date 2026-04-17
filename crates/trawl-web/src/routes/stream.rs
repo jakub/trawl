@@ -45,21 +45,33 @@ pub async fn forward(
         .await
         .map_err(ProxyError::Network)?;
 
-    if !upstream_resp.status().is_success() {
-        return Err(ProxyError::Upstream(
-            StatusCode::from_u16(upstream_resp.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY),
-        ));
-    }
-
-    // Pass through the upstream's chunked body as an axum streaming body.
-    // No parsing, no buffering, no keep-alive injection — trawld already
-    // emits SSE keep-alive pings.
+    // Mirror the upstream status verbatim. The previous implementation
+    // routed non-2xx through `ProxyError::Upstream`, whose `IntoResponse`
+    // collapses everything that isn't 401/403 into 502 — so trawld's
+    // 400 (invalid DSL) or 429 (stream-concurrency limit) would surface
+    // as a vague "upstream error" to the browser. The generic
+    // `proxy::forward` gets this right; we match its behavior here.
+    let status =
+        StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let upstream_ct = upstream_resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let byte_stream = upstream_resp.bytes_stream();
 
+    // For non-2xx, preserve the upstream Content-Type (typically
+    // application/json for structured error bodies) so the browser
+    // sees a real error response rather than a truncated SSE stream.
+    let content_type = if status.is_success() {
+        "text/event-stream".to_string()
+    } else {
+        upstream_ct.unwrap_or_else(|| "application/json".to_string())
+    };
+
     Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
         // Disable proxy buffering (e.g. nginx) upstream of us. Trawld sets
         // this too but we re-set it to be resilient to misconfigured
@@ -201,5 +213,92 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_upstream_400_for_bad_query() {
+        // Invalid DSL is a user error, not a proxy error — we must
+        // preserve trawld's 400 so the client can render the real message.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"error": "invalid DSL"})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=junk")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Content-Type from upstream is preserved (not forced to
+        // text/event-stream), so the browser gets a parseable error body.
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), br#"{"error":"invalid DSL"}"#);
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_upstream_429_for_rate_limit() {
+        // Stream concurrency limit is an actionable 429 that the UI
+        // should render with backoff messaging — not a generic 502.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=*")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_500_is_not_masked_as_502() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=*")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
