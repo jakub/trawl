@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::ProxyError;
+use crate::middleware::session_extractor::Session;
 use crate::session::{self, SessionPayload};
 use crate::state::AppState;
 
@@ -123,6 +124,42 @@ fn build_cookie_header(name: &str, value: &str, max_age_secs: u64, secure: bool)
         s.push_str("; Secure");
     }
     s
+}
+
+fn build_clear_cookie_header(name: &str, secure: bool) -> String {
+    let mut s = format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    if secure {
+        s.push_str("; Secure");
+    }
+    s
+}
+
+/// Response body for `GET /me`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeResponse {
+    pub name: String,
+    pub role: String,
+    pub exp: i64,
+}
+
+pub async fn me(session: Session) -> Json<MeResponse> {
+    Json(MeResponse {
+        name: session.0.name.clone(),
+        role: session.0.role.clone(),
+        exp: session.0.exp,
+    })
+}
+
+pub async fn logout(State(state): State<AppState>) -> Result<Response, ProxyError> {
+    let header_value = build_clear_cookie_header(SESSION_COOKIE, !state.allow_insecure_cookies());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        header_value
+            .parse()
+            .map_err(|e: header::InvalidHeaderValue| ProxyError::Internal(e.to_string()))?,
+    );
+    Ok((StatusCode::NO_CONTENT, headers).into_response())
 }
 
 #[cfg(test)]
@@ -267,5 +304,118 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(set_cookie.contains("Secure"));
+    }
+
+    /// Returns just the `name=value` pair from a Set-Cookie header, ready
+    /// to send back as a Cookie request header.
+    fn cookie_pair(set_cookie: &str) -> String {
+        set_cookie.split(';').next().unwrap().trim().to_string()
+    }
+
+    async fn login_and_get_cookie() -> (axum::Router, String) {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/whoami"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "alice", "role": "analyst", "permissions": []
+            })))
+            .mount(&upstream)
+            .await;
+
+        let state = test_state(upstream.uri());
+        let app = routes::build(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"api_key":"flt_token"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        (app, cookie_pair(&set_cookie))
+    }
+
+    #[tokio::test]
+    async fn me_returns_identity_from_cookie() {
+        let (app, cookie) = login_and_get_cookie().await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/me")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: MeResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.name, "alice");
+        assert_eq!(body.role, "analyst");
+    }
+
+    #[tokio::test]
+    async fn me_rejects_missing_cookie() {
+        let state = test_state("http://unused".into());
+        let app = routes::build(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/me")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn me_rejects_tampered_cookie() {
+        let (app, cookie) = login_and_get_cookie().await;
+        // Flip a byte in the cookie value (not the name).
+        let (name, value) = cookie.split_once('=').unwrap();
+        let mut bytes = value.as_bytes().to_vec();
+        bytes[5] ^= 0x01;
+        let tampered = format!("{name}={}", String::from_utf8_lossy(&bytes));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/me")
+            .header("cookie", &tampered)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_clears_cookie() {
+        let (app, _cookie) = login_and_get_cookie().await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.starts_with("trawl_session=;"));
+        assert!(set_cookie.contains("Max-Age=0"));
     }
 }
