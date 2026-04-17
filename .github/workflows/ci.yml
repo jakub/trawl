@@ -99,3 +99,21 @@ jobs:
         with:
           shared-key: wasm-check
       - run: cargo check -p trawl-web-ui --target wasm32-unknown-unknown
+
+  vendor-drift:
+    name: web UI vendor bundle drift
+    runs-on: k8s-small
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: '22'
+      - name: Rebuild vendor bundles
+        working-directory: crates/trawl-web-ui/vendor
+        run: bash build.sh
+      - name: Fail if committed bundles drifted
+        run: |
+          git diff --exit-code \
+            crates/trawl-web-ui/vendor/codemirror.js \
+            crates/trawl-web-ui/vendor/uplot.js \
+            crates/trawl-web-ui/vendor/uplot.css

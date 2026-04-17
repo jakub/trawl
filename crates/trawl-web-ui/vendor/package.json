@@ -1,0 +1,21 @@
+{
+  "name": "trawl-web-ui-vendor",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Vendored JS bundles (CodeMirror 6 + uPlot) consumed by the Leptos SPA via wasm-bindgen. Committed output lives alongside sources; CI gates drift.",
+  "scripts": {
+    "build": "bash build.sh"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "6.20.1",
+    "@codemirror/commands": "6.10.3",
+    "@codemirror/language": "6.12.3",
+    "@codemirror/lint": "6.9.5",
+    "@codemirror/state": "6.6.0",
+    "@codemirror/view": "6.41.0",
+    "uplot": "1.6.32"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.0"
+  }
+}
