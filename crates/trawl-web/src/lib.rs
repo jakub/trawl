@@ -7,5 +7,8 @@
 //! Exists alongside the binary so integration tests can exercise the proxy's
 //! handlers, middleware, and session logic without spawning a real server.
 
-/// Session cookie encryption, decryption, and key management.
+pub mod config;
+pub mod error;
+pub mod routes;
 pub mod session;
+pub mod state;
