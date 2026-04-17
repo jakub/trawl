@@ -84,6 +84,7 @@ tempfile = "3"
 time = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-width = "0.2"
+wiremock = "0.6"
 x509-parser = "0.18"
 zeroize = { version = "1", features = ["derive"] }
 syslog_loose = "0.23"
