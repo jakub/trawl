@@ -58,6 +58,9 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
+    #[error("env var {name} is referenced by config but not set in the environment")]
+    EnvMissing { name: String },
+
     #[error("env var {name} is set but not valid UTF-8")]
     EnvUtf8 { name: String },
 
@@ -172,10 +175,38 @@ fn split_addr(addr: &str) -> (&str, &str) {
 }
 
 fn load_key(web: &WebConfig) -> Result<SessionKey, ConfigError> {
+    // Both sources set → env wins silently by policy. That's a config
+    // shape that's easy to set accidentally (e.g. env var from a
+    // secrets provider unexpectedly overlaps with a path configured
+    // in the TOML), so emit a loud warning with both identifiers.
+    // Documented precedence in the field-level rustdoc on WebConfig.
+    if web.cookie_secret_env.is_some() && web.cookie_secret_path.is_some() {
+        tracing::warn!(
+            event_type = "session_key_ambiguous",
+            cookie_secret_env = ?web.cookie_secret_env,
+            cookie_secret_path = ?web.cookie_secret_path,
+            "both cookie_secret_env and cookie_secret_path are set; env takes precedence"
+        );
+    }
+
     if let Some(ref env_name) = web.cookie_secret_env {
-        let raw = std::env::var(env_name).map_err(|_| ConfigError::EnvUtf8 {
-            name: env_name.clone(),
-        })?;
+        // Distinguish "var unset" from "var set but not UTF-8": the
+        // former is a config mistake (wrong name, forgotten export),
+        // the latter is an encoding issue. Mapping both to a single
+        // "not valid UTF-8" error sent operators down the wrong path.
+        let raw = match std::env::var(env_name) {
+            Ok(v) => v,
+            Err(std::env::VarError::NotPresent) => {
+                return Err(ConfigError::EnvMissing {
+                    name: env_name.clone(),
+                });
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::EnvUtf8 {
+                    name: env_name.clone(),
+                });
+            }
+        };
         return SessionKey::from_base64(&raw).map_err(|_| ConfigError::EnvKey {
             name: env_name.clone(),
         });

@@ -118,6 +118,26 @@ mod tests {
     }
 
     #[test]
+    fn every_utf16_offset_yields_char_boundary() {
+        // Regression guard: slicing `&s[..utf16_to_utf8(s, pos)]` must
+        // never panic mid-codepoint for ANY utf-16 offset, including
+        // ones that fall between surrogate halves of astral chars.
+        // `is_char_boundary` is the stdlib invariant we rely on.
+        for s in ["x🌊y", "naïve", "🌊🌊", "", "simple ascii", "a\u{1F600}b"] {
+            for utf16 in 0..=s.encode_utf16().count() + 5 {
+                let utf8 = utf16_to_utf8(s, utf16);
+                assert!(
+                    s.is_char_boundary(utf8),
+                    "utf16_to_utf8({s:?}, {utf16}) = {utf8} is NOT a char boundary",
+                );
+                // And slicing must not panic, which is the actual
+                // property we care about in `complete_at`.
+                let _ = &s[..utf8];
+            }
+        }
+    }
+
+    #[test]
     fn empty_string_returns_zero() {
         assert_eq!(utf16_to_utf8("", 0), 0);
         assert_eq!(utf16_to_utf8("", 5), 0);
