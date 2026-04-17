@@ -18,6 +18,19 @@ pub fn Search() -> impl IntoView {
     let me = RwSignal::new(None::<api::MeResponse>);
     let redirect_to_login = RwSignal::new(false);
 
+    // Hoisted out of the view closure so they persist across reactive
+    // re-renders. Previously these were constructed *inside* the
+    // `move ||` block below — which made them reactive dependents of
+    // `me.get()`, so when `/me` resolved (None → Some), leptos tore
+    // down the old signal + editor and mounted fresh ones, discarding
+    // any query text the user had typed during the in-flight fetch.
+    let query = RwSignal::new(String::from(
+        "service=nginx level=error last=1h | stats count() by host",
+    ));
+    let on_submit = Callback::new(move |()| {
+        web_sys::console::log_1(&format!("run: {}", query.get()).into());
+    });
+
     // On mount: fetch /me. On 401, redirect to /login.
     Effect::new(move |_| {
         spawn_local(async move {
@@ -56,18 +69,14 @@ pub fn Search() -> impl IntoView {
                 <button class="btn-link" on:click=on_logout>"logout"</button>
             </header>
             <main class="main">
-                {move || {
-                    let _ = me.get();
-                    let query = RwSignal::new(String::from(
-                        "service=nginx level=error last=1h | stats count() by host"
-                    ));
-                    let on_submit = Callback::new(move |()| {
-                        web_sys::console::log_1(&format!("run: {}", query.get()).into());
-                    });
-                    view! {
-                        <DslEditor query=query on_submit=on_submit/>
-                    }
-                }}
+                // `<Show>` only renders children once `me` is `Some`, so the
+                // editor doesn't mount during the brief 401 window — AND,
+                // critically, doesn't remount when `me` transitions. The
+                // hoisted `query` signal is captured by reference, so
+                // whatever the user types survives auth resolution.
+                <Show when=move || me.get().is_some() fallback=|| ()>
+                    <DslEditor query=query on_submit=on_submit/>
+                </Show>
             </main>
         </div>
     }
