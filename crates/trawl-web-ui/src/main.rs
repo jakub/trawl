@@ -3,24 +3,15 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `trawl-web-ui`: Leptos SPA entry point.
-//!
-//! Only meaningfully compiles for `wasm32-unknown-unknown`. On native targets
-//! the binary is a stub so `cargo check --workspace` stays green.
 
 #[cfg(target_arch = "wasm32")]
-mod app {
-    use leptos::prelude::*;
+mod api;
 
-    #[component]
-    pub fn App() -> impl IntoView {
-        view! {
-            <main class="shell">
-                <h1>"trawl"</h1>
-                <p>"web UI scaffold — nothing here yet."</p>
-            </main>
-        }
-    }
-}
+#[cfg(target_arch = "wasm32")]
+mod app;
+
+#[cfg(target_arch = "wasm32")]
+mod pages;
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
