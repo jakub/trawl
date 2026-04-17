@@ -20,7 +20,9 @@ use zeroize::Zeroizing;
 
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Session;
-use crate::session::{self, SESSION_COOKIE, SessionPayload, build_clear_cookie_header};
+use crate::session::{
+    self, SESSION_COOKIE, SessionPayload, build_clear_cookie_header, build_session_cookie_header,
+};
 use crate::state::AppState;
 
 /// Request body for `POST /login`.
@@ -58,9 +60,9 @@ pub async fn login(
     };
 
     let cookie_value = session::encrypt(state.cookie_key(), &payload)?;
-    let cookie_header = build_cookie_header(
+    let cookie_header = build_session_cookie_header(
         SESSION_COOKIE,
-        &cookie_value,
+        cookie_value,
         state.session_ttl_secs(),
         !state.allow_insecure_cookies(),
     );
@@ -113,15 +115,6 @@ async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyErro
             StatusCode::from_u16(s.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
         )),
     }
-}
-
-fn build_cookie_header(name: &str, value: &str, max_age_secs: u64, secure: bool) -> String {
-    let mut s =
-        format!("{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_secs}");
-    if secure {
-        s.push_str("; Secure");
-    }
-    s
 }
 
 /// Response body for `GET /me`.
