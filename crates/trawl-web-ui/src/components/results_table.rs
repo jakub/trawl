@@ -9,7 +9,7 @@ use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
 
 use crate::api::{ApiError, PAGE_SIZE};
-use crate::state::query::go_to;
+use crate::state::query::{Mode, go_to};
 
 #[component]
 pub fn ResultsTable(
@@ -59,12 +59,22 @@ fn ResultsTableBody(
 
     let on_prev = move |_| {
         if can_prev {
-            go_to(&executed_q.get_untracked(), cur_page - 1, true);
+            go_to(
+                &executed_q.get_untracked(),
+                cur_page - 1,
+                Mode::Snapshot,
+                true,
+            );
         }
     };
     let on_next = move |_| {
         if can_next {
-            go_to(&executed_q.get_untracked(), cur_page + 1, true);
+            go_to(
+                &executed_q.get_untracked(),
+                cur_page + 1,
+                Mode::Snapshot,
+                true,
+            );
         }
     };
 

@@ -57,6 +57,26 @@ impl Query {
             && self.search.earliest.is_none()
             && self.search.latest.is_none()
     }
+
+    /// Whether any pipeline stage emits aggregated rows (stats, timechart,
+    /// top, rare, pivot).
+    ///
+    /// Consumers use this to distinguish "raw event stream" queries from
+    /// "shaped result snapshot" queries — e.g. the live-tail UI renders
+    /// aggregating queries as charts and raw-event queries as tables.
+    #[must_use]
+    pub fn has_aggregation(&self) -> bool {
+        self.pipeline.iter().any(|s| {
+            matches!(
+                s.node,
+                PipeStage::Stats(_)
+                    | PipeStage::Timechart(_)
+                    | PipeStage::Top(_)
+                    | PipeStage::Rare(_)
+                    | PipeStage::Pivot(_)
+            )
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

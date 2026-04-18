@@ -6,6 +6,8 @@
  */
 @import "components/results_table.css";
 @import "components/facet_sidebar.css";
+@import "components/chart.css";
+@import "components/live_badge.css";
 
 :root {
   /* Typography */
