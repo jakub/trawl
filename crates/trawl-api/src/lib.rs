@@ -13,6 +13,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod display;
 pub mod value;
 
 use crate::value::{QueryResult, SchemaColumn};

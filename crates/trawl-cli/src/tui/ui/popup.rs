@@ -186,7 +186,10 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
             if matches!(value, Value::Null) {
                 return None;
             }
-            Some((col.name.as_str(), super::results::value_to_string(value)))
+            Some((
+                col.name.as_str(),
+                trawl_api::display::value_to_string(value),
+            ))
         })
         .collect();
     let visible_fields = fields.len();

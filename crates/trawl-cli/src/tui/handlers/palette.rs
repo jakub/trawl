@@ -267,7 +267,7 @@ impl App {
             }
             ActionKind::CycleChartView => {
                 if let Some(ref r) = self.tab.result {
-                    let timechart = ui::results::is_timechart_result(&r.result);
+                    let timechart = trawl_api::display::is_timechart_result(&r.result);
                     let bar_chartable = ui::results::is_bar_chartable(&r.result);
                     if timechart || bar_chartable {
                         self.tab.chart_view =
