@@ -7,15 +7,16 @@
 # Mode A — trunk serve with proxy (SPA hot reload):
 #   trunk serve
 #
-#   Trunk serves compiled wasm at :8080 and proxies ALL other requests
-#   (including /api/*, /login, /logout, /me) to the trawl-web backend at
-#   :8090. Editing .rs files in trawl-web-ui triggers a rebuild and live
-#   browser refresh. Requires trawl-web + trawld running separately.
+#   Trunk serves compiled wasm + index.html at :8080 and proxies only
+#   /api/* to the trawl-web backend at :8090. SPA routes (/login,
+#   /search, etc.) are served by trunk's index.html fallback so the
+#   wasm router can interpret them. Editing .rs files in trawl-web-ui
+#   triggers a rebuild and live browser refresh. Requires trawl-web +
+#   trawld running separately.
 #
-#   Caveat: trunk 0.21's proxy doesn't support exact-path routing, so
-#   every request (including /index.html) is forwarded. The whole SPA
-#   moves through :8090 → :8080. Same-origin from the browser's view;
-#   SameSite=Strict cookies work.
+#   Cookies set by trawl-web on /api/auth/login are scoped to the
+#   :8080 origin (the browser's view of the host), so subsequent
+#   /api/* fetches carry them automatically. SameSite=Strict works.
 #
 # Mode B — single-origin via TRAWL_WEB_SPA_DIR (prod-like):
 #   cd crates/trawl-web-ui && trunk build
@@ -27,9 +28,9 @@
 #   NO hot reload — rebuild + restart on every change. Use this to
 #   verify production-style CSP, cookie Secure flags, etc.
 #
-# The final release deploy uses neither mode — commit 15 of the v1 plan
-# wires rust-embed to bake dist/ into the binary at compile time. This
-# file stays as the dev affordance.
+# The release deploy uses neither mode — `cargo xtask build-web
+# --release` bakes dist/ into trawl-web via rust-embed. This file
+# stays as the dev affordance.
 
 [build]
 target = "index.html"
@@ -39,6 +40,12 @@ dist = "dist"
 addresses = ["127.0.0.1"]
 port = 8080
 
+# Trunk 0.21.14 panics on root-mounted proxies (axum no longer allows
+# `nest_service` at "/"). Both the legacy `proxy_backend = "..."` +
+# `proxy_rewrite = "/"` form and `[[proxy]] rewrite = "/"` hit the same
+# panic. So we proxy *only* `/api/` — the only paths that need to reach
+# trawl-web at :8090. Client-side SPA routes (`/login`, `/search`,
+# etc.) are handled by trunk's index.html fallback and never hit the
+# backend, so the SPA's own router gets to interpret them.
 [[proxy]]
-rewrite = "/"
-backend = "http://127.0.0.1:8090/"
+backend = "http://127.0.0.1:8090/api/"
