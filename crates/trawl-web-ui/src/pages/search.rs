@@ -2,16 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `/search` — hero screen (editor, results, live-tail).
-//!
-//! This commit only wires the chrome — the editor, results table, facets,
-//! and live-tail come in subsequent commits.
+//! `/search` — hero screen (editor, results).
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
 use crate::components::editor::DslEditor;
+use crate::components::results_table::ResultsTable;
+use crate::state::query::{go_to, url_signals};
+use crate::state::search_session::rows_resource;
 
 #[component]
 pub fn Search() -> impl IntoView {
@@ -24,11 +24,31 @@ pub fn Search() -> impl IntoView {
     // `me.get()`, so when `/me` resolved (None → Some), leptos tore
     // down the old signal + editor and mounted fresh ones, discarding
     // any query text the user had typed during the in-flight fetch.
-    let query = RwSignal::new(String::from(
-        "service=nginx level=error last=1h | stats count() by host",
-    ));
+    let query_text = RwSignal::new(String::new());
+
+    // URL-driven signals: the executed query + page come from `?q=` and
+    // `?page=` on every navigation (including back/forward).
+    let (executed_q, page) = url_signals();
+
+    // Keep the editor buffer in sync with the URL on first load and on
+    // back/forward — but only when the editor hasn't diverged from the
+    // last-executed query (i.e. the user isn't mid-typing). The equality
+    // check prevents clobbering in-progress edits while still rehydrating
+    // from a pasted/shared URL.
+    Effect::new(move |_| {
+        let url_q = executed_q.get();
+        let buf = query_text.get_untracked();
+        if buf.is_empty() || buf == url_q {
+            query_text.set(url_q);
+        }
+    });
+
+    let rows = rows_resource(executed_q, page);
+
     let on_submit = Callback::new(move |()| {
-        web_sys::console::log_1(&format!("run: {}", query.get()).into());
+        // Submit resets to page 0; push to URL — the effect above wires
+        // the resource refetch off (executed_q, page).
+        go_to(&query_text.get_untracked(), 0, false);
     });
 
     // On mount: fetch /me. On 401, redirect to /login.
@@ -69,13 +89,15 @@ pub fn Search() -> impl IntoView {
                 <button class="btn-link" on:click=on_logout>"logout"</button>
             </header>
             <main class="main">
-                // `<Show>` only renders children once `me` is `Some`, so the
-                // editor doesn't mount during the brief 401 window — AND,
-                // critically, doesn't remount when `me` transitions. The
-                // hoisted `query` signal is captured by reference, so
-                // whatever the user types survives auth resolution.
                 <Show when=move || me.get().is_some() fallback=|| ()>
-                    <DslEditor query=query on_submit=on_submit/>
+                    <div class="search-col">
+                        <DslEditor query=query_text on_submit=on_submit/>
+                        <ResultsTable
+                            executed_q=Signal::derive(move || executed_q.get())
+                            page=Signal::derive(move || page.get())
+                            rows=rows
+                        />
+                    </div>
                 </Show>
             </main>
         </div>

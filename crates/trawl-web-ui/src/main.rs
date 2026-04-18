@@ -24,6 +24,9 @@ mod interop;
 mod pages;
 
 #[cfg(target_arch = "wasm32")]
+mod state;
+
+#[cfg(target_arch = "wasm32")]
 fn main() {
     console_error_panic_hook::set_once();
     leptos::mount::mount_to_body(app::App);

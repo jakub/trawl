@@ -10,8 +10,12 @@
 
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
+use trawl_api::{QueryRequest, QueryResponse};
 
-#[derive(Debug, thiserror::Error)]
+/// Rows per page for the snapshot results table.
+pub const PAGE_SIZE: usize = 50;
+
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ApiError {
     #[error("network: {0}")]
     Network(String),
@@ -90,6 +94,30 @@ pub async fn logout() -> Result<(), ApiError> {
     let resp = Request::post("/api/auth/logout").send().await?;
     match resp.status() {
         204 | 200 => Ok(()),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// POST /api/v1/query — execute a DSL query with fixed [`PAGE_SIZE`] paging.
+pub async fn query(q: &str, page: usize) -> Result<QueryResponse, ApiError> {
+    let body = QueryRequest {
+        query: q.to_owned(),
+        limit: Some(PAGE_SIZE),
+        offset: Some(page * PAGE_SIZE),
+        timezone: None,
+    };
+    let resp = Request::post("/api/v1/query")
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+
+    match resp.status() {
+        200 => resp
+            .json::<QueryResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
         s => Err(ApiError::Status(s)),
     }
 }

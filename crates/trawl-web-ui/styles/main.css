@@ -4,6 +4,8 @@
  * "Terminal amber" colorway mirroring the TUI. Data-dense by default:
  * 13px base, monospace for data, sans for chrome.
  */
+@import "components/results_table.css";
+
 :root {
   /* Typography */
   --font-sans: "Inter", "SF Pro Text", system-ui, -apple-system, sans-serif;
@@ -205,5 +207,15 @@ button { font: inherit; }
 
 .main {
   padding: var(--space-5);
-  overflow: auto;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* Search page: editor above, results below. */
+.search-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  height: 100%;
+  min-height: 0;
 }

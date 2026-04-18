@@ -1,0 +1,117 @@
+/*
+ * Results table — snapshot query rendering.
+ *
+ * Dense, monospace, zebra-striped for scanability. Horizontal scroll
+ * inside the wrap so column overflow doesn't break the page layout.
+ */
+.results {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.results-loading,
+.results-empty,
+.results-error {
+  padding: var(--space-4);
+  color: var(--color-fg-muted);
+  font-size: var(--type-sm);
+  font-family: var(--font-mono);
+}
+
+.results-error {
+  color: var(--color-danger);
+  background: rgba(255, 85, 85, 0.06);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+}
+
+.results-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-raised);
+}
+
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--type-sm);
+}
+
+.results-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--color-bg-sunken);
+  color: var(--color-fg-muted);
+  text-transform: uppercase;
+  font-size: var(--type-xs);
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.results-table tbody td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.results-table tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.results-table tbody tr:hover {
+  background: var(--color-accent-bg);
+}
+
+.results-empty-cell {
+  text-align: center;
+  color: var(--color-fg-subtle);
+  font-style: italic;
+}
+
+.results-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) 0 0 0;
+  font-size: var(--type-xs);
+  color: var(--color-fg-muted);
+}
+
+.results-summary {
+  font-family: var(--font-mono);
+}
+
+.results-pager {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.btn-sm {
+  padding: var(--space-1) var(--space-3);
+  background: var(--color-bg-raised);
+  color: var(--color-fg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: var(--type-xs);
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+.btn-sm:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+.btn-sm:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
