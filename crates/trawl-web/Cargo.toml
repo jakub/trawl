@@ -19,7 +19,9 @@ chrono = { workspace = true }
 clap = { workspace = true }
 cookie = { workspace = true }
 futures = { workspace = true }
+mime_guess = { workspace = true }
 rand = { workspace = true }
+rust-embed = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }

@@ -7,6 +7,7 @@
 //! Exists alongside the binary so integration tests can exercise the proxy's
 //! handlers, middleware, and session logic without spawning a real server.
 
+pub mod assets;
 pub mod config;
 pub mod error;
 pub mod middleware;
