@@ -4,8 +4,12 @@
 
 //! `trawl-web`: browser-facing session proxy binary.
 //!
-//! Reads the same `~/.config/trawl/config.toml` as trawld, looking at its
-//! `[web]` section for proxy-specific settings.
+//! Reads the same `~/.trawl/trawld.toml` as trawld (matching trawld's
+//! `--config` default), looking at its `[web]` section for
+//! proxy-specific settings. The CLI config at
+//! `~/.config/trawl/config.toml` has a different schema (with
+//! `[server].url`, `[server].token`, and `[profiles.*]`) and is NOT
+//! a valid input here.
 
 use std::path::PathBuf;
 
@@ -15,12 +19,16 @@ use trawl_web::config::ResolvedConfig;
 use trawl_web::routes;
 use trawl_web::state::AppState;
 
+/// Default config path — kept in sync with `trawl-server`'s default so a
+/// single `trawld.toml` configures both daemons.
+const DEFAULT_CONFIG_PATH: &str = "~/.trawl/trawld.toml";
+
 #[derive(Parser, Debug)]
 #[command(name = "trawl-web", about = "trawl browser-facing session proxy")]
 struct Cli {
-    /// Config file path. Defaults to `~/.config/trawl/config.toml`.
-    #[arg(short, long, env = "TRAWL_CONFIG")]
-    config: Option<PathBuf>,
+    /// Config file path. Same schema as trawld; reads the `[web]` block.
+    #[arg(short, long, env = "TRAWL_CONFIG", default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
 }
 
 #[tokio::main]
@@ -32,10 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or_else(|| {
-        let expanded = shellexpand::tilde("~/.config/trawl/config.toml").into_owned();
-        PathBuf::from(expanded)
-    });
+    // clap doesn't expand ~ for us; do it here so `--config ~/foo.toml`
+    // and the default both resolve.
+    let config_path = PathBuf::from(shellexpand::tilde(&cli.config.to_string_lossy()).into_owned());
 
     let resolved = ResolvedConfig::load(&config_path)?;
     tracing::info!(
