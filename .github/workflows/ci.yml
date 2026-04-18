@@ -154,3 +154,21 @@ jobs:
         with:
           tool: nextest
       - run: cargo nextest run -p trawl-web
+
+  trawl-web-release:
+    name: trawl-web release build (SPA embedded)
+    runs-on: k8s-big
+    needs: trunk-build
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: trawl-web-release
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4
+        with:
+          name: trawl-web-ui-dist
+          path: crates/trawl-web-ui/dist
+      - name: Verify SPA was baked in
+        run: test -f crates/trawl-web-ui/dist/index.html
+      - run: cargo build --release -p trawl-web

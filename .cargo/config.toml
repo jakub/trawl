@@ -4,3 +4,8 @@
 # Completely ignored when `bundled` is active — the duckdb-sys build.rs
 # never checks this env var in the bundled code path.
 DUCKDB_DOWNLOAD_LIB = "1"
+
+# `cargo xtask <cmd>` → workspace task runner. The double-dash separates
+# cargo args from subcommand args so flags like `--release` reach xtask.
+[alias]
+xtask = "run --package xtask --quiet --"

@@ -51,6 +51,26 @@ crates/
 - the binary name is `trawl`, NOT `trawl-cli` — the crate is `trawl-cli` but the binary is `trawl`
 - the server binary is `target/debug/trawld` (crate `trawl-server`)
 - admin binary is `target/debug/trawl-admin` (crate `trawl-admin`)
+- web proxy binary is `target/debug/trawl-web` (crate `trawl-web`) — serves the SPA + translates cookie sessions to bearer tokens
+- web UI crate is `trawl-web-ui` — leptos 0.8 CSR SPA, built via `trunk build`
+
+### web UI deploy
+
+the web UI ships as a single binary: `trawl-web` with the SPA baked in
+via `rust-embed`. the canonical build is:
+
+```sh
+cargo xtask build-web --release
+# produces target/release/trawl-web with dist/ embedded
+```
+
+the xtask runs `trunk build --release` inside `crates/trawl-web-ui/`
+then `cargo build --release -p trawl-web` so rust-embed picks up the
+fresh SPA. `cargo xtask` is aliased in `.cargo/config.toml`.
+
+for local iteration there are two faster flows:
+- **trunk serve** (SPA hot reload): `cd crates/trawl-web-ui && trunk serve` — proxies `/api/*` to a separately-run `trawl-web` on :8090. full docs in `Trunk.toml`.
+- **env override**: `TRAWL_WEB_SPA_DIR=$(pwd)/crates/trawl-web-ui/dist cargo run -p trawl-web` — `trawl-web` serves a pre-built `dist/` from disk instead of its embedded copy. lets you rebuild the SPA without recompiling the binary.
 
 ### environments
 
