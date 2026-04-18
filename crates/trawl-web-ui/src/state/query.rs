@@ -63,18 +63,28 @@ pub fn build_search_url(query: &str, page: usize, mode: Mode) -> String {
     url
 }
 
-/// Navigate to a new `(q, page, mode)` tuple, replacing the current URL entry
-/// when `replace` is true (e.g. pagination — user shouldn't need to hit back
-/// 20 times to undo page clicks).
-pub fn go_to(query: &str, page: usize, mode: Mode, replace: bool) {
+/// Capture a `Navigator` closure that pushes new `(q, page, mode)` tuples
+/// onto the router's history.
+///
+/// MUST be called from a component body during initial setup — `use_navigate`
+/// internally panics if called outside a `<Router>` context, which includes
+/// any deferred callback (`CodeMirror` keydown, `EventSource` onmessage,
+/// `gloo-timers::Timeout`, etc.). Capture once at component-setup time, then
+/// pass the returned closure to whatever callbacks need to navigate.
+///
+/// `replace = true` is appropriate for pagination clicks (user shouldn't
+/// have to hit back 20 times to undo); `false` for explicit submits.
+pub fn navigator() -> impl Fn(&str, usize, Mode, bool) + Clone + 'static {
     let nav = use_navigate();
-    nav(
-        &build_search_url(query, page, mode),
-        NavigateOptions {
-            replace,
-            ..Default::default()
-        },
-    );
+    move |query, page, mode, replace| {
+        nav(
+            &build_search_url(query, page, mode),
+            NavigateOptions {
+                replace,
+                ..Default::default()
+            },
+        );
+    }
 }
 
 /// Parse page number from URL query string, defaulting to 0 on missing/invalid.

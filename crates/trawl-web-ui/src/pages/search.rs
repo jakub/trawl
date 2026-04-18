@@ -14,7 +14,7 @@ use crate::components::editor::DslEditor;
 use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::live_badge::LiveBadge;
 use crate::components::results_table::ResultsTable;
-use crate::state::query::{Mode, build_search_url, go_to, url_signals};
+use crate::state::query::{Mode, navigator, url_signals};
 use crate::state::search_session::rows_resource;
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
@@ -44,11 +44,28 @@ pub fn Search() -> impl IntoView {
 
     let rows = rows_resource(executed_q, page);
 
-    let on_submit = Callback::new(move |()| {
-        // Submit preserves current mode — live stays live, snapshot
-        // stays snapshot. Reset page to 0 for snapshot.
-        go_to(&query_text.get_untracked(), 0, mode.get_untracked(), false);
-    });
+    // Capture the router navigator ONCE here, during component setup —
+    // `use_navigate()` panics outside the `<Router>` reactive context,
+    // and our callbacks (CodeMirror submit, button clicks, EventSource
+    // handlers) all run after that context is gone. Cloned per-callback
+    // since we hand it to multiple closures below.
+    let goto = navigator();
+
+    let on_submit = {
+        let goto = goto.clone();
+        Callback::new(move |()| {
+            // Submit preserves current mode — live stays live, snapshot
+            // stays snapshot. Reset page to 0 for snapshot.
+            goto(&query_text.get_untracked(), 0, mode.get_untracked(), false);
+        })
+    };
+
+    let on_paginate = {
+        let goto = goto.clone();
+        Callback::new(move |new_page: usize| {
+            goto(&executed_q.get_untracked(), new_page, Mode::Snapshot, true);
+        })
+    };
 
     // --- live-tail state ----------------------------------------------
     let ring = RwSignal::new(RingBuffer::default());
@@ -116,20 +133,19 @@ pub fn Search() -> impl IntoView {
         });
     };
 
-    // Toggle live-tail mode. In snapshot→live, we also decide whether
-    // the query is "chart-shaped" (has aggregation) so the UI can pick
-    // the right renderer; that's a simple parse call.
-    let toggle_live = move |_| {
-        let q = query_text.get_untracked();
-        let new_mode = match mode.get_untracked() {
-            Mode::Snapshot => Mode::Live,
-            Mode::Live => Mode::Snapshot,
-        };
-        let nav = leptos_router::hooks::use_navigate();
-        nav(
-            &build_search_url(&q, 0, new_mode),
-            leptos_router::NavigateOptions::default(),
-        );
+    // Toggle live-tail mode. Uses the captured navigator from setup;
+    // calling `use_navigate()` here would panic since this runs from
+    // a click event outside the reactive setup scope.
+    let toggle_live = {
+        let goto = goto.clone();
+        move |_| {
+            let q = query_text.get_untracked();
+            let new_mode = match mode.get_untracked() {
+                Mode::Snapshot => Mode::Live,
+                Mode::Live => Mode::Snapshot,
+            };
+            goto(&q, 0, new_mode, false);
+        }
     };
 
     // Whether the live stream is aggregation-shaped (→ chart) vs
@@ -176,9 +192,9 @@ pub fn Search() -> impl IntoView {
                             {move || match mode.get() {
                                 Mode::Snapshot => view! {
                                     <ResultsTable
-                                        executed_q=Signal::derive(move || executed_q.get())
                                         page=Signal::derive(move || page.get())
                                         rows=rows
+                                        on_paginate=on_paginate
                                     />
                                 }.into_any(),
                                 Mode::Live if is_chart_query.get() => view! {
