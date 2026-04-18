@@ -923,9 +923,7 @@ impl Default for RateLimitConfig {
 
 /// Portable CPU count without pulling in the `num_cpus` crate.
 fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(FALLBACK_CPU_COUNT)
+    std::thread::available_parallelism().map_or(FALLBACK_CPU_COUNT, std::num::NonZero::get)
 }
 
 /// Expand a leading `~/` to `$HOME/`.
