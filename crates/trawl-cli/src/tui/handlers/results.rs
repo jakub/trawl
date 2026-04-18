@@ -165,7 +165,7 @@ impl App {
             // Cycle chart view (timechart → line/sparkline, aggregation → bar chart)
             (KeyModifiers::NONE, KeyCode::Char('v')) => {
                 if let Some(ref r) = self.active_tab().result {
-                    let timechart = ui::results::is_timechart_result(&r.result);
+                    let timechart = trawl_api::display::is_timechart_result(&r.result);
                     let bar_chartable = ui::results::is_bar_chartable(&r.result);
                     if timechart || bar_chartable {
                         let tab = self.active_tab_mut();
