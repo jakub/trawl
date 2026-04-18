@@ -1,0 +1,71 @@
+/*
+ * Facet sidebar — field → top values + counts (display only).
+ */
+.facets {
+  width: var(--sidebar-width);
+  overflow-y: auto;
+  border-right: 1px solid var(--color-border);
+  padding: var(--space-3) var(--space-4) var(--space-4) 0;
+}
+
+.facets-hint {
+  color: var(--color-fg-subtle);
+  font-size: var(--type-xs);
+  font-style: italic;
+  padding: var(--space-2);
+  margin: 0;
+}
+
+.facet-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.facet-group {
+  margin-bottom: var(--space-3);
+}
+
+.facet-group summary {
+  cursor: pointer;
+  font-size: var(--type-xs);
+  color: var(--color-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: var(--space-1) var(--space-2);
+  border-left: 2px solid transparent;
+}
+.facet-group summary:hover {
+  color: var(--color-accent);
+  border-left-color: var(--color-accent);
+}
+.facet-group[open] summary {
+  color: var(--color-fg);
+}
+
+.facet-values {
+  list-style: none;
+  padding: var(--space-1) 0 0 var(--space-2);
+  margin: 0;
+}
+
+.facet-value {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  padding: 2px var(--space-2);
+  color: var(--color-fg);
+  line-height: 1.5;
+}
+.facet-value .v {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 140px;
+}
+.facet-value .c {
+  color: var(--color-fg-subtle);
+  font-variant-numeric: tabular-nums;
+}

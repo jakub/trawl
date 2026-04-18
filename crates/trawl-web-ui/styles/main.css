@@ -5,6 +5,7 @@
  * 13px base, monospace for data, sans for chrome.
  */
 @import "components/results_table.css";
+@import "components/facet_sidebar.css";
 
 :root {
   /* Typography */
@@ -211,7 +212,15 @@ button { font: inherit; }
   min-height: 0;
 }
 
-/* Search page: editor above, results below. */
+/* Search page: sidebar on the left, editor + results stacked on the right. */
+.search-layout {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-4);
+  height: 100%;
+  min-height: 0;
+}
+
 .search-col {
   display: flex;
   flex-direction: column;
