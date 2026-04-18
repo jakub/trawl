@@ -9,20 +9,21 @@ use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
 
 use crate::api::{ApiError, PAGE_SIZE};
-use crate::state::query::{Mode, go_to};
 
 #[component]
 pub fn ResultsTable(
-    #[prop(into)] executed_q: Signal<String>,
     #[prop(into)] page: Signal<usize>,
     rows: LocalResource<Result<QueryResponse, ApiError>>,
+    /// Called with the new page index when prev/next is clicked. Parent
+    /// captures a router navigator and translates to URL navigation.
+    on_paginate: Callback<usize>,
 ) -> impl IntoView {
     view! {
         <div class="results">
             {move || match rows.get() {
                 None => view! { <div class="results-loading">"loading…"</div> }.into_any(),
                 Some(Ok(resp)) => view! {
-                    <ResultsTableBody resp=resp executed_q=executed_q page=page/>
+                    <ResultsTableBody resp=resp page=page on_paginate=on_paginate/>
                 }.into_any(),
                 Some(Err(err)) => view! {
                     <div class="results-error">
@@ -37,8 +38,8 @@ pub fn ResultsTable(
 #[component]
 fn ResultsTableBody(
     resp: QueryResponse,
-    executed_q: Signal<String>,
     page: Signal<usize>,
+    on_paginate: Callback<usize>,
 ) -> impl IntoView {
     let columns: Vec<String> = resp.result.columns.iter().map(|c| c.name.clone()).collect();
     let rows_data = resp.result.rows.clone();
@@ -59,22 +60,12 @@ fn ResultsTableBody(
 
     let on_prev = move |_| {
         if can_prev {
-            go_to(
-                &executed_q.get_untracked(),
-                cur_page - 1,
-                Mode::Snapshot,
-                true,
-            );
+            on_paginate.run(cur_page - 1);
         }
     };
     let on_next = move |_| {
         if can_next {
-            go_to(
-                &executed_q.get_untracked(),
-                cur_page + 1,
-                Mode::Snapshot,
-                true,
-            );
+            on_paginate.run(cur_page + 1);
         }
     };
 
