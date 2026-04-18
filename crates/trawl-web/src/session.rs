@@ -17,7 +17,7 @@
 use std::fs;
 use std::path::Path;
 
-use base64ct::{Base64UrlUnpadded, Encoding};
+use base64ct::{Base64, Base64Unpadded, Base64Url, Base64UrlUnpadded, Encoding};
 use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
     aead::{Aead, OsRng, rand_core::RngCore},
@@ -130,14 +130,25 @@ impl SessionKey {
         Self::from_bytes(bytes)
     }
 
-    /// Load a key from a base64 (url-safe, unpadded) string.
+    /// Load a key from a base64 string. Accepts all four common variants
+    /// (standard or url-safe alphabet, with or without `=` padding) so
+    /// keys produced by `openssl rand -base64`, `python3 -m base64`,
+    /// and the trawl-admin generator all work as drop-ins.
     ///
     /// # Errors
-    /// Returns `KeyDecode` if the string isn't valid base64, or `KeyLength`
-    /// if the decoded byte count isn't exactly [`KEY_LEN`].
+    /// Returns `KeyDecode` if the string isn't valid base64 in any of
+    /// the four flavors, or `KeyLength` if the decoded byte count isn't
+    /// exactly [`KEY_LEN`].
     pub fn from_base64(s: &str) -> Result<Self, SessionError> {
-        let decoded =
-            Base64UrlUnpadded::decode_vec(s.trim()).map_err(|_| SessionError::KeyDecode)?;
+        let trimmed = s.trim();
+        // Try url-safe first (the historical canonical form), fall back
+        // through the other three. All four decoders are constant-time
+        // and reject non-alphabet bytes, so the cascade is safe.
+        let decoded = Base64UrlUnpadded::decode_vec(trimmed)
+            .or_else(|_| Base64Url::decode_vec(trimmed))
+            .or_else(|_| Base64Unpadded::decode_vec(trimmed))
+            .or_else(|_| Base64::decode_vec(trimmed))
+            .map_err(|_| SessionError::KeyDecode)?;
         let bytes: [u8; KEY_LEN] = decoded
             .try_into()
             .map_err(|v: Vec<u8>| SessionError::KeyLength(v.len()))?;
@@ -406,5 +417,28 @@ mod tests {
         let cookie = encrypt(&original, &sample_payload()).unwrap();
         let decoded = decrypt(&loaded, &cookie).unwrap();
         assert_eq!(decoded.name, "alice");
+    }
+
+    #[test]
+    fn key_from_base64_accepts_all_four_flavors() {
+        // Same 32-byte key encoded in each of the four base64 variants
+        // we accept (url-safe and standard, padded and unpadded).
+        let original = SessionKey::generate();
+        let bytes = original.0.as_ref();
+
+        for encoded in [
+            Base64UrlUnpadded::encode_string(bytes),
+            Base64Url::encode_string(bytes),
+            Base64Unpadded::encode_string(bytes),
+            Base64::encode_string(bytes),
+        ] {
+            let loaded = SessionKey::from_base64(&encoded)
+                .unwrap_or_else(|e| panic!("decode failed for {encoded:?}: {e:?}"));
+            // Round-trip a payload through the loaded key to prove the
+            // bytes are bit-identical.
+            let cookie = encrypt(&original, &sample_payload()).unwrap();
+            let decoded = decrypt(&loaded, &cookie).unwrap();
+            assert_eq!(decoded.name, "alice");
+        }
     }
 }
