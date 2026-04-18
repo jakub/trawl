@@ -173,7 +173,7 @@ pub fn Search() -> impl IntoView {
                 <div class="spacer"></div>
                 <LiveBadge
                     active=Signal::derive(move || mode.get() == Mode::Live)
-                    lagged=Signal::derive(move || lagged.get())
+                    lagged=lagged
                 />
                 <button class="btn-link" on:click=toggle_live>
                     {move || if mode.get() == Mode::Live { "stop live" } else { "live tail" }}
@@ -192,13 +192,13 @@ pub fn Search() -> impl IntoView {
                             {move || match mode.get() {
                                 Mode::Snapshot => view! {
                                     <ResultsTable
-                                        page=Signal::derive(move || page.get())
+                                        page=page
                                         rows=rows
                                         on_paginate=on_paginate
                                     />
                                 }.into_any(),
                                 Mode::Live if is_chart_query.get() => view! {
-                                    <Chart snapshot=Signal::derive(move || live_snapshot.get())/>
+                                    <Chart snapshot=live_snapshot/>
                                 }.into_any(),
                                 Mode::Live => view! {
                                     <LiveRawTable result=ring_result/>
