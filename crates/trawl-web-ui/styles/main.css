@@ -3,12 +3,13 @@
  *
  * "Terminal amber" colorway mirroring the TUI. Data-dense by default:
  * 13px base, monospace for data, sans for chrome.
+ *
+ * Component styles are inlined below — Trunk doesn't resolve `@import`
+ * (it just hashes and copies linked files), and the browser's own
+ * resolver would 404 against the SPA fallback. Keeping everything in
+ * one file is simpler than wiring per-component <link> tags through
+ * index.html.
  */
-@import "components/results_table.css";
-@import "components/facet_sidebar.css";
-@import "components/chart.css";
-@import "components/live_badge.css";
-
 :root {
   /* Typography */
   --font-sans: "Inter", "SF Pro Text", system-ui, -apple-system, sans-serif;
@@ -229,4 +230,226 @@ button { font: inherit; }
   gap: var(--space-4);
   height: 100%;
   min-height: 0;
+}
+
+/* ---------- results table (snapshot + live raw) ------------------ */
+.results {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.results-loading,
+.results-empty,
+.results-error {
+  padding: var(--space-4);
+  color: var(--color-fg-muted);
+  font-size: var(--type-sm);
+  font-family: var(--font-mono);
+}
+
+.results-error {
+  color: var(--color-danger);
+  background: rgba(255, 85, 85, 0.06);
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+}
+
+.results-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-raised);
+}
+
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--type-sm);
+}
+
+.results-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--color-bg-sunken);
+  color: var(--color-fg-muted);
+  text-transform: uppercase;
+  font-size: var(--type-xs);
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.results-table tbody td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.results-table tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.results-table tbody tr:hover {
+  background: var(--color-accent-bg);
+}
+
+.results-empty-cell {
+  text-align: center;
+  color: var(--color-fg-subtle);
+  font-style: italic;
+}
+
+.results-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) 0 0 0;
+  font-size: var(--type-xs);
+  color: var(--color-fg-muted);
+}
+
+.results-summary {
+  font-family: var(--font-mono);
+}
+
+.results-pager {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.btn-sm {
+  padding: var(--space-1) var(--space-3);
+  background: var(--color-bg-raised);
+  color: var(--color-fg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: var(--type-xs);
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+.btn-sm:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+.btn-sm:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---------- facet sidebar ---------------------------------------- */
+.facets {
+  width: var(--sidebar-width);
+  overflow-y: auto;
+  border-right: 1px solid var(--color-border);
+  padding: var(--space-3) var(--space-4) var(--space-4) 0;
+}
+
+.facets-hint {
+  color: var(--color-fg-subtle);
+  font-size: var(--type-xs);
+  font-style: italic;
+  padding: var(--space-2);
+  margin: 0;
+}
+
+.facet-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.facet-group {
+  margin-bottom: var(--space-3);
+}
+
+.facet-group summary {
+  cursor: pointer;
+  font-size: var(--type-xs);
+  color: var(--color-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: var(--space-1) var(--space-2);
+  border-left: 2px solid transparent;
+}
+.facet-group summary:hover {
+  color: var(--color-accent);
+  border-left-color: var(--color-accent);
+}
+.facet-group[open] summary {
+  color: var(--color-fg);
+}
+
+.facet-values {
+  list-style: none;
+  padding: var(--space-1) 0 0 var(--space-2);
+  margin: 0;
+}
+
+.facet-value {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  padding: 2px var(--space-2);
+  color: var(--color-fg);
+  line-height: 1.5;
+}
+.facet-value .v {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 140px;
+}
+.facet-value .c {
+  color: var(--color-fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- chart (uPlot host) ----------------------------------- */
+.chart {
+  width: 100%;
+  min-height: 320px;
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2);
+  overflow: hidden;
+}
+
+/* ---------- live-tail status pill -------------------------------- */
+.live-badge {
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  letter-spacing: 0.06em;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+}
+
+.live-badge.live {
+  color: var(--color-success);
+  background: rgba(85, 204, 119, 0.1);
+  border: 1px solid var(--color-success);
+}
+
+.live-badge.lagged {
+  color: var(--color-warning);
+  background: rgba(255, 165, 0, 0.1);
+  border: 1px solid var(--color-warning);
+  animation: live-badge-pulse 0.5s ease-out;
+}
+
+@keyframes live-badge-pulse {
+  from { transform: scale(1.1); }
+  to   { transform: scale(1); }
 }
