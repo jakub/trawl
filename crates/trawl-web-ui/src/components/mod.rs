@@ -3,4 +3,5 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 pub mod editor;
+pub mod facet_sidebar;
 pub mod results_table;

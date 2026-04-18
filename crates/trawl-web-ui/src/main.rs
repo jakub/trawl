@@ -4,8 +4,9 @@
 
 //! `trawl-web-ui`: Leptos SPA entry point.
 
-// offset helpers are pure str manipulation — keep them available on both
-// targets so their tests run under plain `cargo test`.
+// Pure modules that don't touch Leptos/web-sys — keep them ungated so
+// their tests run under plain `cargo test` on native.
+mod facets;
 mod offset;
 
 #[cfg(target_arch = "wasm32")]

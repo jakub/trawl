@@ -9,6 +9,7 @@ use leptos::task::spawn_local;
 
 use crate::api;
 use crate::components::editor::DslEditor;
+use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::results_table::ResultsTable;
 use crate::state::query::{go_to, url_signals};
 use crate::state::search_session::rows_resource;
@@ -90,13 +91,16 @@ pub fn Search() -> impl IntoView {
             </header>
             <main class="main">
                 <Show when=move || me.get().is_some() fallback=|| ()>
-                    <div class="search-col">
-                        <DslEditor query=query_text on_submit=on_submit/>
-                        <ResultsTable
-                            executed_q=Signal::derive(move || executed_q.get())
-                            page=Signal::derive(move || page.get())
-                            rows=rows
-                        />
+                    <div class="search-layout">
+                        <FacetSidebar rows=rows/>
+                        <div class="search-col">
+                            <DslEditor query=query_text on_submit=on_submit/>
+                            <ResultsTable
+                                executed_q=Signal::derive(move || executed_q.get())
+                                page=Signal::derive(move || page.get())
+                                rows=rows
+                            />
+                        </div>
                     </div>
                 </Show>
             </main>
