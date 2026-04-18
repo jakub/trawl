@@ -36,7 +36,9 @@ target = "index.html"
 dist = "dist"
 
 [serve]
-address = "127.0.0.1"
+addresses = ["127.0.0.1"]
 port = 8080
-proxy_backend = "http://127.0.0.1:8090"
-proxy_rewrite = "/"
+
+[[proxy]]
+rewrite = "/"
+backend = "http://127.0.0.1:8090/"
