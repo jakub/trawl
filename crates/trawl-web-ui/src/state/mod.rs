@@ -10,3 +10,4 @@
 
 pub mod query;
 pub mod search_session;
+pub mod stream_session;
