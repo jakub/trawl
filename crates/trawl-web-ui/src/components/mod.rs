@@ -4,8 +4,14 @@
 
 pub mod chart;
 pub mod editor;
+pub mod editor_wrap;
 pub mod facet_sidebar;
+pub mod histogram;
 pub mod live_badge;
+pub mod meta_strip;
 pub mod rail;
 pub mod results_table;
+pub mod status_bar;
+pub mod tabs;
+pub mod toast;
 pub mod topbar;

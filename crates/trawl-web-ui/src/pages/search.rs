@@ -2,7 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `/search` — hero screen (editor, results, live-tail).
+//! `/search` — hero screen.
+//!
+//! Layout (top to bottom inside `.search-col`):
+//! editor wrap (header + `DslEditor` + date range + run button)
+//! → meta strip (count · duration · save/export)
+//! → tabs (Events / Visualization)
+//! → tab body (Events: histogram + results table | Visualization: chart)
+//! Status bar pinned at the bottom of the shell.
+//!
+//! Live-tail still works via `?mode=live`; the live state feeds the
+//! status bar's HAULING / LAGGED indicators and renders into either
+//! the chart or a streaming table.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -10,10 +21,15 @@ use trawl_api::value::QueryResult;
 
 use crate::api;
 use crate::components::chart::Chart;
-use crate::components::editor::DslEditor;
+use crate::components::editor_wrap::EditorWrap;
 use crate::components::facet_sidebar::FacetSidebar;
+use crate::components::histogram::Histogram;
+use crate::components::meta_strip::MetaStrip;
 use crate::components::rail::Rail;
 use crate::components::results_table::ResultsTable;
+use crate::components::status_bar::{StatusBar, StatusKind};
+use crate::components::tabs::{ResultsTab, Tabs};
+use crate::components::toast::{ToastBus, Toasts};
 use crate::components::topbar::TopBar;
 use crate::state::app_mode;
 use crate::state::query::{Mode, navigator, url_signals};
@@ -57,8 +73,6 @@ pub fn Search() -> impl IntoView {
     let on_submit = {
         let goto = goto.clone();
         Callback::new(move |()| {
-            // Submit preserves current mode — live stays live, snapshot
-            // stays snapshot. Reset page to 0 for snapshot.
             goto(&query_text.get_untracked(), 0, mode.get_untracked(), false);
         })
     };
@@ -77,18 +91,10 @@ pub fn Search() -> impl IntoView {
     let stream_handle: StoredValue<Option<StreamLifecycle>, LocalStorage> =
         StoredValue::new_local(None);
 
-    // Start/stop the SSE stream based on (mode, executed_q). Each change
-    // tears down the previous handle (which close()s the EventSource
-    // via Drop) before opening a new one.
     Effect::new(move |_| {
         let current_mode = mode.get();
         let q = executed_q.get();
-        // Drop any existing stream first.
-        stream_handle.update_value(|slot| {
-            *slot = None;
-        });
-        // Reset transient state on every start/stop so stale events from
-        // a previous query don't bleed into the next session.
+        stream_handle.update_value(|slot| *slot = None);
         ring.set(RingBuffer::default());
         live_snapshot.set(None);
         lagged.set(None);
@@ -103,9 +109,7 @@ pub fn Search() -> impl IntoView {
             lagged,
         };
         if let Some(handle) = start_stream(&q, signals) {
-            stream_handle.update_value(|slot| {
-                *slot = Some(handle);
-            });
+            stream_handle.update_value(|slot| *slot = Some(handle));
         }
     });
 
@@ -127,18 +131,17 @@ pub fn Search() -> impl IntoView {
         }
     });
 
-    // Top-bar mode tabs (Search/Intel/Jobs/Settings). Wired from the
-    // ?app= URL param. Search-only for now; placeholder pages land in
-    // commit 5.
     let current_app = app_mode::from_url();
-    // Left-rail section per mode. Search has Search/History/Schema —
-    // History/Schema are placeholders until the corresponding APIs
-    // get UIs of their own.
     let current_section = section::from_url(current_app);
+    let bus = ToastBus::new();
 
-    // Whether the live stream is aggregation-shaped (→ chart) vs
-    // raw-event-shaped (→ scrolling table). Derived from a parse of
-    // the executed query. Falls back to raw on parse error.
+    // Visual-only range pill (commit 4 scope: doesn't inject `last=X`
+    // into the query yet — that comes when the date-range custom
+    // popover lands).
+    let range = RwSignal::new("15m");
+    // Active results tab.
+    let active_tab = RwSignal::new(ResultsTab::Events);
+
     let is_chart_query = Memo::new(move |_| {
         let q = executed_q.get();
         if q.trim().is_empty() {
@@ -147,20 +150,46 @@ pub fn Search() -> impl IntoView {
         trawl_core::parser::parse(&q).is_ok_and(|ast| ast.has_aggregation())
     });
 
-    // Materialize the raw-event ring into a QueryResult for the live
-    // table. `Signal::derive` (not `Memo`) because QueryResult doesn't
-    // impl PartialEq — ring_to_result is cheap enough to recompute on
-    // render, and the containing signal reads only fire when the ring
-    // itself changes.
     let ring_result = Signal::derive(move || ring_to_result(&ring.read()));
+
+    // "Loading" is derived from the resource state: a non-empty
+    // executed query that hasn't produced a result yet means a query
+    // is in flight. LocalResource doesn't expose `.loading()` like
+    // server-side `Resource` does — the `.get()` value is `None`
+    // while the future is pending, but it's also `None` before the
+    // first trigger. We additionally require executed_q to be
+    // non-empty so the initial blank state doesn't show as Hauling.
+    let loading =
+        Signal::derive(move || !executed_q.get().trim().is_empty() && rows.get().is_none());
+
+    // Status bar inputs.
+    let status = Signal::derive(move || match (mode.get(), loading.get()) {
+        (Mode::Live, _) => StatusKind::Live,
+        (_, true) => StatusKind::Hauling,
+        _ => StatusKind::Connected,
+    });
+    let last_count = Signal::derive(move || {
+        rows.get()
+            .and_then(Result::ok)
+            .map(|r| r.pagination.returned)
+    });
+    let truncated =
+        Signal::derive(move || rows.get().and_then(Result::ok).is_some_and(|r| r.truncated));
+
+    // Toast handle for the editor toolbar's stubbed actions
+    // (save/share/format/syntax) — keeps EditorWrap free of bus details
+    // while still routing through the central toast host.
+    let on_toast: Callback<(&'static str, &'static str)> =
+        Callback::new(move |t| bus.info_tuple(t));
+    let running = loading;
 
     view! {
         <div class="shell">
             <TopBar mode=current_app me=Signal::derive(move || me.get())/>
             <div class="body">
                 <Rail mode=current_app section=Signal::derive(move || current_section.get())/>
-                <main class="main">
-                    <Show when=move || me.get().is_some() fallback=|| ()>
+                <Show when=move || me.get().is_some() fallback=|| view! { <main class="main"></main> }>
+                    <main class="main">
                         <Show
                             when=move || current_section.get() == "search"
                             fallback=move || view! { <SectionPlaceholder section=current_section/> }
@@ -168,28 +197,50 @@ pub fn Search() -> impl IntoView {
                             <div class="search-layout">
                                 <FacetSidebar rows=rows/>
                                 <div class="search-col">
-                                    <DslEditor query=query_text on_submit=on_submit/>
-                                    {move || match mode.get() {
-                                        Mode::Snapshot => view! {
-                                            <ResultsTable
-                                                page=page
-                                                rows=rows
-                                                on_paginate=on_paginate
-                                            />
+                                    <EditorWrap
+                                        query=query_text
+                                        on_submit=on_submit
+                                        range=range
+                                        running=running
+                                        on_toast=on_toast
+                                    />
+                                    <MetaStrip count=last_count truncated=truncated bus=bus/>
+                                    <Tabs active=active_tab count=last_count/>
+                                    {move || match (active_tab.get(), mode.get()) {
+                                        (ResultsTab::Events, Mode::Snapshot) => view! {
+                                            <>
+                                                <Histogram rows=rows/>
+                                                <ResultsTable
+                                                    page=page
+                                                    rows=rows
+                                                    on_paginate=on_paginate
+                                                    bus=bus
+                                                />
+                                            </>
                                         }.into_any(),
-                                        Mode::Live if is_chart_query.get() => view! {
+                                        (ResultsTab::Events, Mode::Live) if is_chart_query.get() => view! {
                                             <Chart snapshot=live_snapshot/>
                                         }.into_any(),
-                                        Mode::Live => view! {
+                                        (ResultsTab::Events, Mode::Live) => view! {
                                             <LiveRawTable result=ring_result/>
+                                        }.into_any(),
+                                        (ResultsTab::Visualization, _) => view! {
+                                            <Chart snapshot=live_snapshot/>
                                         }.into_any(),
                                     }}
                                 </div>
                             </div>
                         </Show>
-                    </Show>
-                </main>
+                    </main>
+                </Show>
             </div>
+            <StatusBar
+                status=status
+                count=last_count
+                range=Signal::derive(move || range.get())
+                lagged=Signal::derive(move || lagged.get())
+            />
+            <Toasts bus=bus/>
         </div>
     }
 }
