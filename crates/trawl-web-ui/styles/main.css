@@ -883,6 +883,432 @@ textarea:focus-visible,
 }
 
 /* ─────────────────────────────────────────────────────────────────
+ *  Editor wrap (header + DslEditor + date range + run button)
+ * ─────────────────────────────────────────────────────────────── */
+.editor-wrap {
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px 8px;
+  flex-shrink: 0;
+}
+.editor-hd {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.editor-hd .anch { color: var(--amber); }
+.editor-hd .title { color: var(--ink-2); font-weight: 500; }
+.editor-hd .dim { color: var(--ink-4); }
+.editor-hd .sp { flex: 1; }
+.editor-hd .tool {
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.editor-hd .tool:hover { background: var(--panel-2); color: var(--ink-2); }
+
+.editor-row { display: flex; gap: 10px; align-items: stretch; }
+
+.editor-right {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+  min-width: 300px;
+}
+
+/* Date range — quick buttons. Custom popover deferred. */
+.daterange { display: flex; align-items: stretch; height: 28px; }
+.daterange .quick {
+  display: flex;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  flex: 1;
+}
+.daterange .quick .q {
+  flex: 1;
+  padding: 0 9px;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  border-right: 1px solid var(--line);
+  user-select: none;
+}
+.daterange .quick .q:last-child { border-right: 0; }
+.daterange .quick .q:hover { color: var(--ink); background: var(--panel-3); }
+.daterange .quick .q.on {
+  background: var(--amber);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* Run button — confident amber. */
+.run {
+  height: 32px;
+  padding: 0 18px;
+  background: var(--amber);
+  color: #fff;
+  border: 1px solid var(--amber-2);
+  border-radius: 3px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 0 rgba(0,0,0,.06);
+  transition: all 120ms;
+}
+.run:hover { background: var(--amber-2); box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 0 0 3px var(--amber-glow); }
+.run:active { transform: translateY(1px); }
+.run.running, .run:disabled {
+  background: var(--panel-2);
+  color: var(--ink-2);
+  border-color: var(--line);
+  cursor: wait;
+}
+.run .kbd-inline {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: .6;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Meta strip — under the editor
+ * ─────────────────────────────────────────────────────────────── */
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 14px;
+  height: 30px;
+  flex-shrink: 0;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.meta .num { color: var(--amber); font-weight: 600; }
+.meta .strong { color: var(--ink); font-weight: 500; }
+.meta .sp { flex: 1; }
+.meta .action {
+  cursor: pointer;
+  color: var(--ink-3);
+  padding: 1px 4px;
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.meta .action:hover { color: var(--ink); background: var(--panel-2); }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Tabs (Events / Visualization)
+ * ─────────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 0 12px;
+  flex-shrink: 0;
+}
+.tabs .t {
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-ui);
+}
+.tabs .t:hover { color: var(--ink-2); }
+.tabs .t.active { color: var(--ink); border-bottom-color: var(--amber); font-weight: 500; }
+.tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: 11px; }
+.tabs .sp { flex: 1; }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Histogram — 78px strip on Events
+ * ─────────────────────────────────────────────────────────────── */
+.histo {
+  height: 78px;
+  padding: 8px 14px 6px 40px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  position: relative;
+  flex-shrink: 0;
+}
+.histo .histo-hint {
+  align-self: center;
+  width: 100%;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.histo .bars {
+  display: flex;
+  gap: 2px;
+  align-items: flex-end;
+  flex: 1;
+  height: 100%;
+}
+.histo .bar {
+  flex: 1;
+  display: flex;
+  flex-direction: column-reverse;
+  min-width: 0;
+  position: relative;
+  cursor: pointer;
+  height: 100%;
+}
+.histo .bar .ok {
+  background: var(--ink-3);
+  opacity: .32;
+  transition: opacity 120ms;
+}
+.histo .bar .err {
+  background: var(--amber);
+  box-shadow: 0 0 3px var(--amber-glow);
+}
+.histo .bar:hover .ok { opacity: .55; }
+.histo .bar:hover::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--amber-wash);
+  pointer-events: none;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Results table v2 (sortable + expandable rows + level pills)
+ * ─────────────────────────────────────────────────────────────── */
+.results {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--panel);
+  position: relative;
+}
+.results .results-table-wrap {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  flex: none;
+  height: auto;
+  overflow: visible;
+}
+.results-table .exp-col {
+  width: 1.6em;
+  text-align: center;
+  color: var(--ink-3);
+}
+.results-table thead th {
+  cursor: pointer;
+  user-select: none;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.results-table thead th .sort {
+  opacity: .3;
+  margin-left: 6px;
+  font-size: 9px;
+}
+.results-table thead th.sorted { color: var(--ink); }
+.results-table thead th.sorted .sort { opacity: 1; color: var(--amber); }
+.results-table tbody tr.expanded td { background: var(--amber-wash); }
+.results-table tbody tr.expanded td.exp-col { color: var(--amber); }
+
+/* Level pills inside the table cell. */
+.lvl {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+.lvl-info  { color: var(--ink-3); }
+.lvl-warn  { color: var(--yellow); background: var(--yellow-wash); }
+.lvl-error { color: var(--red); background: var(--red-wash); }
+.lvl-debug { color: var(--ink-4); }
+
+/* Expanded row detail panel. */
+.results-table .detail {
+  background: var(--bg) !important;
+  padding: 10px 14px !important;
+  white-space: normal !important;
+}
+.results-table .detail .dg {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 2px 10px;
+  font-size: 11px;
+}
+.results-table .detail .dg .k {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.results-table .detail .dg .v {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.results-table .detail .dg .v .tag {
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 0 6px;
+  cursor: pointer;
+  color: var(--ink-2);
+  font-size: 11px;
+}
+.results-table .detail .dg .v .tag:hover {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: var(--amber-wash);
+}
+
+/* Pager footer. */
+.results-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  font-size: 11px;
+  color: var(--ink-3);
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Status bar (26px footer)
+ * ─────────────────────────────────────────────────────────────── */
+.statusbar {
+  height: var(--statusbar-h);
+  flex-shrink: 0;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  gap: 14px;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.statusbar .grp {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px;
+}
+.statusbar .grp.clickable { cursor: pointer; border-radius: 2px; }
+.statusbar .grp.clickable:hover { background: var(--panel-2); color: var(--ink-2); }
+.statusbar .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 5px color-mix(in oklab, var(--green) 60%, transparent);
+}
+.statusbar .dot.live {
+  background: var(--amber);
+  box-shadow: 0 0 5px var(--amber);
+  animation: blink 1.4s ease-in-out infinite;
+}
+.statusbar .dot.err {
+  background: var(--red);
+  box-shadow: 0 0 5px var(--red);
+}
+.statusbar .grp.lagged .strong { color: var(--yellow); }
+.statusbar .sp { flex: 1; }
+.statusbar .strong { color: var(--ink-2); }
+.statusbar .amber { color: var(--amber); }
+
+/* Status-bar layout — make the topbar+body+statusbar three-row grid. */
+.shell {
+  grid-template-rows: var(--topbar-h) 1fr var(--statusbar-h);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Toasts (bottom-right stack)
+ * ─────────────────────────────────────────────────────────────── */
+.toasts {
+  position: fixed;
+  bottom: calc(var(--statusbar-h) + 14px);
+  right: 16px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  min-width: 280px;
+  max-width: 380px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--amber);
+  border-radius: 3px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  box-shadow: var(--shadow-3);
+  animation: toastIn 180ms cubic-bezier(.2,.8,.2,1);
+  font-size: 12px;
+}
+.toast.success { border-left-color: var(--green); }
+.toast.error   { border-left-color: var(--red); }
+.toast.info    { border-left-color: var(--blue); }
+.toast .body { flex: 1; }
+.toast .title {
+  font-weight: 600;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  margin-bottom: 2px;
+}
+.toast .detail { color: var(--ink-2); font-size: 11px; line-height: 1.4; }
+.toast .x {
+  color: var(--ink-3);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  font-family: var(--font-mono);
+}
+.toast .x:hover { color: var(--ink); background: var(--panel-2); }
+
+/* ─────────────────────────────────────────────────────────────────
  *  Common utility bits
  * ─────────────────────────────────────────────────────────────── */
 .mono { font-family: var(--font-mono); }
