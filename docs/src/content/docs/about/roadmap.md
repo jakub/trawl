@@ -51,11 +51,8 @@ The scheduled reports infrastructure is a natural foundation — the next step i
 ### S3/MinIO cold storage
 DuckDB's `httpfs` extension makes this relatively cheap. Daily rollup parquets upload to S3 or a MinIO instance, extending retention from "however much disk you have" to effectively infinite.
 
-### Timestamp-sorted compaction
-Daily rollups already sort by timestamp, but hourly compaction writes events in ingest order. Sorting row groups by timestamp during hourly compaction enables parquet min/max pruning for `last=Xh` and range queries — a cheap win for the most common query shape.
-
-### Parquet bloom filter sidecars
-DuckDB can read parquet bloom filters natively. Emitting them on high-cardinality exact-match fields (`host`, `trace_id`, `level`) during compaction prunes file lists for point lookups without maintaining a separate inverted index. Closes much of the gap with Splunk's tsidx on exact-match queries while staying within the open-parquet thesis.
+### Column-level bloom filter targeting
+Hourly compaction and rollup now write parquet bloom filters with a pinned false-positive ratio of 0.01, but DuckDB 1.4 only emits them on columns that get dictionary-encoded. High-cardinality fields like `trace_id` miss out. A future improvement is forcing dictionary encoding (via `DICTIONARY_SIZE_LIMIT` tuning, or upstream DuckDB support for per-column bloom filter targeting) so exact-match lookups on `trace_id`, `request_id`, and similar fields can prune row groups without a separate inverted index.
 
 ### Config reload on SIGHUP
 TLS certs already hot-reload, but the rest of the config requires a restart.
