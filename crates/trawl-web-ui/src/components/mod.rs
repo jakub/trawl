@@ -6,5 +6,6 @@ pub mod chart;
 pub mod editor;
 pub mod facet_sidebar;
 pub mod live_badge;
+pub mod rail;
 pub mod results_table;
 pub mod topbar;

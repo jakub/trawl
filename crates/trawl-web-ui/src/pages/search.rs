@@ -12,11 +12,13 @@ use crate::api;
 use crate::components::chart::Chart;
 use crate::components::editor::DslEditor;
 use crate::components::facet_sidebar::FacetSidebar;
+use crate::components::rail::Rail;
 use crate::components::results_table::ResultsTable;
 use crate::components::topbar::TopBar;
 use crate::state::app_mode;
 use crate::state::query::{Mode, navigator, url_signals};
 use crate::state::search_session::rows_resource;
+use crate::state::section;
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
 };
@@ -129,6 +131,10 @@ pub fn Search() -> impl IntoView {
     // ?app= URL param. Search-only for now; placeholder pages land in
     // commit 5.
     let current_app = app_mode::from_url();
+    // Left-rail section per mode. Search has Search/History/Schema —
+    // History/Schema are placeholders until the corresponding APIs
+    // get UIs of their own.
+    let current_section = section::from_url(current_app);
 
     // Whether the live stream is aggregation-shaped (→ chart) vs
     // raw-event-shaped (→ scrolling table). Derived from a parse of
@@ -151,31 +157,55 @@ pub fn Search() -> impl IntoView {
     view! {
         <div class="shell">
             <TopBar mode=current_app me=Signal::derive(move || me.get())/>
-            <main class="main">
-                <Show when=move || me.get().is_some() fallback=|| ()>
-                    <div class="search-layout">
-                        <FacetSidebar rows=rows/>
-                        <div class="search-col">
-                            <DslEditor query=query_text on_submit=on_submit/>
-                            {move || match mode.get() {
-                                Mode::Snapshot => view! {
-                                    <ResultsTable
-                                        page=page
-                                        rows=rows
-                                        on_paginate=on_paginate
-                                    />
-                                }.into_any(),
-                                Mode::Live if is_chart_query.get() => view! {
-                                    <Chart snapshot=live_snapshot/>
-                                }.into_any(),
-                                Mode::Live => view! {
-                                    <LiveRawTable result=ring_result/>
-                                }.into_any(),
-                            }}
-                        </div>
-                    </div>
-                </Show>
-            </main>
+            <div class="body">
+                <Rail mode=current_app section=Signal::derive(move || current_section.get())/>
+                <main class="main">
+                    <Show when=move || me.get().is_some() fallback=|| ()>
+                        <Show
+                            when=move || current_section.get() == "search"
+                            fallback=move || view! { <SectionPlaceholder section=current_section/> }
+                        >
+                            <div class="search-layout">
+                                <FacetSidebar rows=rows/>
+                                <div class="search-col">
+                                    <DslEditor query=query_text on_submit=on_submit/>
+                                    {move || match mode.get() {
+                                        Mode::Snapshot => view! {
+                                            <ResultsTable
+                                                page=page
+                                                rows=rows
+                                                on_paginate=on_paginate
+                                            />
+                                        }.into_any(),
+                                        Mode::Live if is_chart_query.get() => view! {
+                                            <Chart snapshot=live_snapshot/>
+                                        }.into_any(),
+                                        Mode::Live => view! {
+                                            <LiveRawTable result=ring_result/>
+                                        }.into_any(),
+                                    }}
+                                </div>
+                            </div>
+                        </Show>
+                    </Show>
+                </main>
+            </div>
+        </div>
+    }
+}
+
+/// Placeholder body for non-search rail sections (History, Schema)
+/// until each gets its own page. Renders inside the shell so the
+/// topbar + rail stay visible.
+#[component]
+fn SectionPlaceholder(section: Memo<String>) -> impl IntoView {
+    view! {
+        <div class="placeholder">
+            <div class="placeholder-card">
+                <div class="placeholder-eyebrow">{move || section.get()}</div>
+                <h2>"Coming soon"</h2>
+                <p>"This section is part of the v1 design but isn't backed by a UI yet."</p>
+            </div>
         </div>
     }
 }
