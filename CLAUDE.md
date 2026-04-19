@@ -164,10 +164,19 @@ the trawl server exposes a REST API. all routes under `/api/v1` except `/health`
 
 ## docs
 
-- `docs/legacy/legacy_overview.md` — original project overview and architecture thesis
-- `docs/legacy/legacy_initial_plan.md` — original 15-phase implementation plan
-- `docs/architecture-review.md` — comparative analysis vs splunk/datadog, data flow diagram, scaling roadmap
-- `docs/1.0-readiness.md` — current feature inventory and gaps for a 1.0 release
+the docs site lives under `docs/` (astro starlight). key pages:
+
+- `docs/src/content/docs/architecture/overview.md` — design principles, components, comparison to splunk/datadog
+- `docs/src/content/docs/architecture/data-flow.md` — ingestion pipeline, compaction, storage layout, query execution
+- `docs/src/content/docs/about/roadmap.md` — what's shipped, what's next, what's out of scope
+- `docs/src/content/docs/reference/{cli,dsl,api,configuration}.md` — user-facing reference
+- `docs/src/content/docs/getting-started/{index,first-query,vector-integration}.md` — onboarding
+
+repo-root docs:
+
+- `README.md` — project overview
+- `CHANGELOG.md` — release history
+- `TUI_ROADMAP.md` — opinionated UX review for the TUI
 
 ## DSL quick reference
 
