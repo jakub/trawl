@@ -9,9 +9,16 @@ use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 
 use crate::pages::{login::Login, search::Search};
+use crate::state::theme;
 
 #[component]
 pub fn App() -> impl IntoView {
+    // Wire UI prefs (theme/density/rowstyle) to <html data-*> + localStorage
+    // before any route mounts. provide_context lets descendants pick up
+    // the signals without prop-drilling.
+    let prefs = theme::install();
+    provide_context(prefs);
+
     view! {
         <Router>
             <Routes fallback=|| view! { <NotFound/> }>

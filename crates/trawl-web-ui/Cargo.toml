@@ -46,6 +46,7 @@ web-sys = { version = "0.3", features = [
     "HtmlElement",
     "Location",
     "MessageEvent",
+    "Storage",
     "Window",
 ] }
 

@@ -27,16 +27,21 @@ pub type HeaderLayer = SetResponseHeaderLayer<HeaderValue>;
 ///   when it ends up inline. A future hardening pass can switch to a
 ///   nonce-per-response scheme (Trunk supports `data-integrity`), but
 ///   for v1 behind same-origin auth the trade-off is acceptable.
-/// - `style-src 'self' 'unsafe-inline'`: inline style attributes are used
-///   by some component patterns (codemirror does this); kept permissive
-///   because the alternative is shipping style nonces
+/// - `style-src 'self' 'unsafe-inline' fonts.googleapis.com`: inline
+///   style attributes are used by some component patterns (codemirror
+///   does this); fonts.googleapis.com is the Google Fonts CSS host
+///   (Inter + `JetBrains` Mono per the design system). Self-hosting the
+///   font CSS is a follow-up; for v1 the third-party load is the
+///   simpler path.
+/// - `font-src 'self' fonts.gstatic.com`: woff2 host for Google Fonts
 /// - `connect-src 'self'`: fetch/XHR/SSE only to same origin
 /// - `img-src 'self' data:`: allow data URLs for inline SVGs
 /// - `frame-ancestors 'none'`: disallow embedding in iframes (belt and
 ///   suspenders with `X-Frame-Options: DENY`)
 pub const CSP: &str = "default-src 'self'; \
     script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; \
-    style-src 'self' 'unsafe-inline'; \
+    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+    font-src 'self' https://fonts.gstatic.com; \
     connect-src 'self'; \
     img-src 'self' data:; \
     frame-ancestors 'none'";
