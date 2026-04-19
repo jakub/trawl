@@ -493,7 +493,8 @@ fn rollup_day_blocking(
         "COPY (\
              SELECT * FROM read_parquet([{file_list_sql}], union_by_name=true) \
              ORDER BY \"timestamp\"\
-         ) TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+         ) TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY, \
+             BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
         tmp_path.to_string_lossy(),
     ))
     .map_err(|e| format!("rollup COPY failed: {e}"))?;
@@ -820,8 +821,15 @@ fn compact_service_blocking(
         // Falls back to explicit casts if column types conflict.
         merge_with_existing(&conn, &canonical_path, service)?;
 
+        // ORDER BY timestamp so row-group min/max stats enable range
+        // pruning for `last=Xh` queries — the dominant query shape.
+        // BLOOM_FILTER_FALSE_POSITIVE_RATIO pins the bloom filter FP
+        // target (DuckDB auto-writes bloom filters on any column it
+        // dictionary-encodes; this locks in a known FP rate).
         conn.execute_batch(&format!(
-            "COPY merged TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+            "COPY (SELECT * FROM merged ORDER BY \"timestamp\") TO '{}' \
+             (FORMAT PARQUET, COMPRESSION SNAPPY, \
+              BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
             tmp_path.display(),
         ))
         .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
@@ -833,7 +841,9 @@ fn compact_service_blocking(
     } else {
         // Fresh write: no existing file to merge with.
         conn.execute_batch(&format!(
-            "COPY wal_batch TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+            "COPY (SELECT * FROM wal_batch ORDER BY \"timestamp\") TO '{}' \
+             (FORMAT PARQUET, COMPRESSION SNAPPY, \
+              BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
             tmp_path.display(),
         ))
         .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
@@ -1100,6 +1110,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2, "merged file should contain 2 rows");
+    }
+
+    #[test]
+    fn compact_sorts_rows_by_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Ingest out-of-order timestamps in both the fresh-write and
+        // merge paths to verify both sort.
+        let late = r#"{"timestamp":"2026-01-01T00:00:10Z","service":"nginx","msg":"late"}"#;
+        let early = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"nginx","msg":"early"}"#;
+        compact_service_blocking(
+            &[write_wal_file(&wal_dir, "nginx", &[late, early])],
+            &data_dir,
+            "nginx",
+            "2GB",
+        )
+        .unwrap();
+
+        // Second batch merges into the existing file; include a timestamp
+        // that should sort between the two above.
+        let middle = r#"{"timestamp":"2026-01-01T00:00:05Z","service":"nginx","msg":"middle"}"#;
+        compact_service_blocking(
+            &[write_wal_file(&wal_dir, "nginx", &[middle])],
+            &data_dir,
+            "nginx",
+            "2GB",
+        )
+        .unwrap();
+
+        let parquet_files = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet_files.len(), 1);
+
+        // Read rows in file order (no ORDER BY in the query) — they should
+        // already be timestamp-ascending because of sort-on-compaction.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT msg FROM read_parquet('{}')",
+                parquet_files[0].display()
+            ))
+            .unwrap();
+        let msgs: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            msgs,
+            vec!["early", "middle", "late"],
+            "hourly parquet should be timestamp-sorted"
+        );
     }
 
     #[test]
