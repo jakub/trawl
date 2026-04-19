@@ -31,7 +31,9 @@ use crate::components::status_bar::{StatusBar, StatusKind};
 use crate::components::tabs::{ResultsTab, Tabs};
 use crate::components::toast::{ToastBus, Toasts};
 use crate::components::topbar::TopBar;
+use crate::pages::placeholder::ModePlaceholder;
 use crate::state::app_mode;
+use crate::state::app_mode::AppMode;
 use crate::state::query::{Mode, navigator, url_signals};
 use crate::state::search_session::rows_resource;
 use crate::state::section;
@@ -190,46 +192,58 @@ pub fn Search() -> impl IntoView {
                 <Rail mode=current_app section=Signal::derive(move || current_section.get())/>
                 <Show when=move || me.get().is_some() fallback=|| view! { <main class="main"></main> }>
                     <main class="main">
+                        // Top-level dispatch: only AppMode::Search renders
+                        // the working search workspace; the rest get a
+                        // placeholder card. Section dispatch within Search
+                        // (History/Schema → SectionPlaceholder) is nested
+                        // beneath this branch.
                         <Show
-                            when=move || current_section.get() == "search"
-                            fallback=move || view! { <SectionPlaceholder section=current_section/> }
+                            when=move || current_app.get() == AppMode::Search
+                            fallback=move || view! {
+                                <ModePlaceholder mode=Signal::derive(move || current_app.get())/>
+                            }
                         >
-                            <div class="search-layout">
-                                <FacetSidebar rows=rows/>
-                                <div class="search-col">
-                                    <EditorWrap
-                                        query=query_text
-                                        on_submit=on_submit
-                                        range=range
-                                        running=running
-                                        on_toast=on_toast
-                                    />
-                                    <MetaStrip count=last_count truncated=truncated bus=bus/>
-                                    <Tabs active=active_tab count=last_count/>
-                                    {move || match (active_tab.get(), mode.get()) {
-                                        (ResultsTab::Events, Mode::Snapshot) => view! {
-                                            <>
-                                                <Histogram rows=rows/>
-                                                <ResultsTable
-                                                    page=page
-                                                    rows=rows
-                                                    on_paginate=on_paginate
-                                                    bus=bus
-                                                />
-                                            </>
-                                        }.into_any(),
-                                        (ResultsTab::Events, Mode::Live) if is_chart_query.get() => view! {
-                                            <Chart snapshot=live_snapshot/>
-                                        }.into_any(),
-                                        (ResultsTab::Events, Mode::Live) => view! {
-                                            <LiveRawTable result=ring_result/>
-                                        }.into_any(),
-                                        (ResultsTab::Visualization, _) => view! {
-                                            <Chart snapshot=live_snapshot/>
-                                        }.into_any(),
-                                    }}
+                            <Show
+                                when=move || current_section.get() == "search"
+                                fallback=move || view! { <SectionPlaceholder section=current_section/> }
+                            >
+                                <div class="search-layout">
+                                    <FacetSidebar rows=rows/>
+                                    <div class="search-col">
+                                        <EditorWrap
+                                            query=query_text
+                                            on_submit=on_submit
+                                            range=range
+                                            running=running
+                                            on_toast=on_toast
+                                        />
+                                        <MetaStrip count=last_count truncated=truncated bus=bus/>
+                                        <Tabs active=active_tab count=last_count/>
+                                        {move || match (active_tab.get(), mode.get()) {
+                                            (ResultsTab::Events, Mode::Snapshot) => view! {
+                                                <>
+                                                    <Histogram rows=rows/>
+                                                    <ResultsTable
+                                                        page=page
+                                                        rows=rows
+                                                        on_paginate=on_paginate
+                                                        bus=bus
+                                                    />
+                                                </>
+                                            }.into_any(),
+                                            (ResultsTab::Events, Mode::Live) if is_chart_query.get() => view! {
+                                                <Chart snapshot=live_snapshot/>
+                                            }.into_any(),
+                                            (ResultsTab::Events, Mode::Live) => view! {
+                                                <LiveRawTable result=ring_result/>
+                                            }.into_any(),
+                                            (ResultsTab::Visualization, _) => view! {
+                                                <Chart snapshot=live_snapshot/>
+                                            }.into_any(),
+                                        }}
+                                    </div>
                                 </div>
-                            </div>
+                            </Show>
                         </Show>
                     </main>
                 </Show>
