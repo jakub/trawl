@@ -12,8 +12,9 @@ use crate::api;
 use crate::components::chart::Chart;
 use crate::components::editor::DslEditor;
 use crate::components::facet_sidebar::FacetSidebar;
-use crate::components::live_badge::LiveBadge;
 use crate::components::results_table::ResultsTable;
+use crate::components::topbar::TopBar;
+use crate::state::app_mode;
 use crate::state::query::{Mode, navigator, url_signals};
 use crate::state::search_session::rows_resource;
 use crate::state::stream_session::{
@@ -124,29 +125,10 @@ pub fn Search() -> impl IntoView {
         }
     });
 
-    let on_logout = move |_| {
-        spawn_local(async move {
-            let _ = api::logout().await;
-            if let Some(win) = web_sys::window() {
-                let _ = win.location().set_href("/login");
-            }
-        });
-    };
-
-    // Toggle live-tail mode. Uses the captured navigator from setup;
-    // calling `use_navigate()` here would panic since this runs from
-    // a click event outside the reactive setup scope.
-    let toggle_live = {
-        let goto = goto.clone();
-        move |_| {
-            let q = query_text.get_untracked();
-            let new_mode = match mode.get_untracked() {
-                Mode::Snapshot => Mode::Live,
-                Mode::Live => Mode::Snapshot,
-            };
-            goto(&q, 0, new_mode, false);
-        }
-    };
+    // Top-bar mode tabs (Search/Intel/Jobs/Settings). Wired from the
+    // ?app= URL param. Search-only for now; placeholder pages land in
+    // commit 5.
+    let current_app = app_mode::from_url();
 
     // Whether the live stream is aggregation-shaped (→ chart) vs
     // raw-event-shaped (→ scrolling table). Derived from a parse of
@@ -168,21 +150,7 @@ pub fn Search() -> impl IntoView {
 
     view! {
         <div class="shell">
-            <header class="topbar">
-                <h1>"trawl"</h1>
-                <div class="spacer"></div>
-                <LiveBadge
-                    active=Signal::derive(move || mode.get() == Mode::Live)
-                    lagged=lagged
-                />
-                <button class="btn-link" on:click=toggle_live>
-                    {move || if mode.get() == Mode::Live { "stop live" } else { "live tail" }}
-                </button>
-                <span class="user">
-                    {move || me.get().map(|m| format!("{} · {}", m.name, m.role))}
-                </span>
-                <button class="btn-link" on:click=on_logout>"logout"</button>
-            </header>
+            <TopBar mode=current_app me=Signal::derive(move || me.get())/>
             <main class="main">
                 <Show when=move || me.get().is_some() fallback=|| ()>
                     <div class="search-layout">

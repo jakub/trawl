@@ -9,6 +9,12 @@
 //! clear is scheduled by `state::stream_session` — this component just
 //! reads the signals.
 
+// Module-level allow: the design replaces the standalone topbar badge
+// with a HAULING indicator inside the status bar (commit 4). Until
+// then this component sits unused — keeping the implementation around
+// rather than deleting and rewriting from scratch.
+#![allow(dead_code)]
+
 use leptos::prelude::*;
 
 #[component]

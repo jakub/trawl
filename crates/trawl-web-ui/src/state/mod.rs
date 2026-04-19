@@ -8,6 +8,7 @@
 //! executed-query state. The editor's in-progress text lives in a separate
 //! signal so typing doesn't spam the URL or trigger refetches.
 
+pub mod app_mode;
 pub mod query;
 pub mod search_session;
 pub mod stream_session;
