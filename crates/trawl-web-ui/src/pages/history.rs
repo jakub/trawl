@@ -8,7 +8,7 @@
 //! Pulls from `GET /api/v1/history` (paginated) and lets the user:
 //! - filter rows client-side by substring on the query text
 //! - click a row to reload the query into the search editor
-//! - "save as net" via a modal dialog → `POST /api/v1/saved`
+//! - "Save as Net" via a modal dialog → `POST /api/v1/saved`
 //!
 //! URL params: `hpage=N` drives pagination (separate from the search
 //! page's `?page=` so switching sections leaves a clean history URL).
@@ -214,7 +214,7 @@ pub fn HistoryPage(bus: ToastBus) -> impl IntoView {
                                                 e.stop_propagation();
                                                 on_save_as_net(q_for_save.clone());
                                             }
-                                        >"save as net"</span>
+                                        >"Save as Net"</span>
                                     </div>
                                 </div>
                             }
