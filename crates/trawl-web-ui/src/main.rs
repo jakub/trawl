@@ -16,6 +16,9 @@ mod time_fmt;
 mod api;
 
 #[cfg(target_arch = "wasm32")]
+mod clipboard;
+
+#[cfg(target_arch = "wasm32")]
 mod app;
 
 #[cfg(target_arch = "wasm32")]

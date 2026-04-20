@@ -193,6 +193,11 @@ impl Drop for EditorLifecycle {
 pub fn DslEditor(
     #[prop(into)] query: RwSignal<String>,
     #[prop(into)] on_submit: Callback<()>,
+    /// Counter signal for external format requests. Parent sets `query`
+    /// to the formatted text and then increments this; the Effect pushes
+    /// the new value into CodeMirror via `set_doc`.
+    #[prop(optional, into)]
+    format_trigger: Option<RwSignal<u64>>,
 ) -> impl IntoView {
     let node_ref = NodeRef::<leptos::html::Div>::new();
     // `StoredValue::new_local`, not `::new`: `Closure<dyn Fn...>` is
@@ -283,6 +288,21 @@ pub fn DslEditor(
             _complete: complete_cb,
         }));
     });
+
+    if let Some(fmt) = format_trigger {
+        Effect::new(move |_| {
+            let v = fmt.get();
+            if v == 0 {
+                return;
+            }
+            let text = query.get_untracked();
+            lifecycle.with_value(|slot| {
+                if let Some(lc) = slot.as_ref() {
+                    lc.handle.set_doc(&text);
+                }
+            });
+        });
+    }
 
     on_cleanup(move || {
         // Dropping the `EditorLifecycle` runs its `Drop` impl (which

@@ -10,17 +10,16 @@
 //! Find similar action buttons. Detail-row tag clicks add filters
 //! through a parent-supplied callback.
 
+use crate::api::{ApiError, PAGE_SIZE};
+use crate::clipboard::write_clipboard;
+use crate::components::toast::{ToastBus, ToastKind};
+use crate::state::query::{Filter, FilterOp};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::cmp::Ordering;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
 use trawl_api::value::Value;
-use wasm_bindgen_futures::JsFuture;
-
-use crate::api::{ApiError, PAGE_SIZE};
-use crate::components::toast::{ToastBus, ToastKind};
-use crate::state::query::{Filter, FilterOp};
 
 #[component]
 pub fn ResultsTable(
@@ -470,16 +469,6 @@ fn build_similar_query(row: &[Value], columns: &[String]) -> Option<String> {
 
 fn escape_dq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-async fn write_clipboard(text: &str) -> Result<(), String> {
-    let window = leptos::web_sys::window().ok_or_else(|| "no window".to_string())?;
-    let clipboard = window.navigator().clipboard();
-    let promise = clipboard.write_text(text);
-    JsFuture::from(promise)
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("{e:?}"))
 }
 
 fn level_class(s: &str) -> &'static str {
