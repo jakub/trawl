@@ -23,7 +23,7 @@ use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{Mode, RangeSpec, navigator};
-use crate::time_fmt::time_ago;
+use crate::time_fmt::{format_duration, time_ago};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -271,18 +271,6 @@ fn format_with_commas(n: u64) -> String {
         out.push(*b as char);
     }
     out
-}
-
-/// Compact duration: `"0.482s"` for >=10ms, `"3ms"` for sub-10ms. Matches
-/// the mockup's `"0.612s"` style without going overboard. Avoids floats
-/// so there's no precision-loss lint to dance around.
-fn format_duration(ms: u64) -> String {
-    if ms < 10 {
-        return format!("{ms}ms");
-    }
-    let s = ms / 1000;
-    let frac = ms % 1000;
-    format!("{s}.{frac:03}s")
 }
 
 #[component]

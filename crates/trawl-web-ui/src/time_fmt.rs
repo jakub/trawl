@@ -60,6 +60,17 @@ pub fn time_ago(iso: &str, now_ms: i64) -> String {
     format!("{} {}", month_abbrev(d.month()), d.day())
 }
 
+/// Compact duration: `"0.482s"` for >=10ms, `"3ms"` for sub-10ms.
+#[must_use]
+pub fn format_duration(ms: u64) -> String {
+    if ms < 10 {
+        return format!("{ms}ms");
+    }
+    let s = ms / 1000;
+    let frac = ms % 1000;
+    format!("{s}.{frac:03}s")
+}
+
 fn month_abbrev(m: u32) -> &'static str {
     match m {
         1 => "Jan",

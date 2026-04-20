@@ -11,8 +11,10 @@
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
 use trawl_api::{
-    CreateSavedRequest, HealthResponse, HistoryResponse, QueryRequest, QueryResponse,
-    SavedQueryResponse, ServiceSchemaResponse,
+    CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, HealthResponse,
+    HistoryResponse, ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueryRequest,
+    QueryResponse, ReportRunResponse, SavedQueryResponse, ScheduleResponse, ServiceSchemaResponse,
+    SetScheduleRequest, UpdateSavedRequest,
 };
 
 /// Rows per page for the snapshot results table.
@@ -181,6 +183,142 @@ pub async fn query(q: &str, page: usize) -> Result<QueryResponse, ApiError> {
     match resp.status() {
         200 => resp
             .json::<QueryResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /api/v1/saved — list all saved queries ("nets") for the session.
+pub async fn list_saved() -> Result<ListSavedResponse, ApiError> {
+    let resp = Request::get("/api/v1/saved").send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<ListSavedResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// PUT /api/v1/saved/{id} — update a saved query's DSL.
+pub async fn update_saved(id: i64, query: &str) -> Result<SavedQueryResponse, ApiError> {
+    let body = UpdateSavedRequest {
+        query: query.to_owned(),
+    };
+    let resp = Request::put(&format!("/api/v1/saved/{id}"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+    match resp.status() {
+        200 => resp
+            .json::<SavedQueryResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// DELETE /api/v1/saved/{id} — delete a saved query.
+pub async fn delete_saved(id: i64) -> Result<DeleteSavedResponse, ApiError> {
+    let resp = Request::delete(&format!("/api/v1/saved/{id}"))
+        .send()
+        .await?;
+    match resp.status() {
+        200 => resp
+            .json::<DeleteSavedResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// PUT /api/v1/saved/{id}/schedule — create or update a schedule.
+pub async fn set_schedule(
+    saved_id: i64,
+    interval: &str,
+    max_runs: Option<u64>,
+    enabled: bool,
+) -> Result<ScheduleResponse, ApiError> {
+    let body = SetScheduleRequest {
+        interval: interval.to_owned(),
+        max_runs,
+        enabled,
+    };
+    let resp = Request::put(&format!("/api/v1/saved/{saved_id}/schedule"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+    match resp.status() {
+        200 => resp
+            .json::<ScheduleResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// DELETE /api/v1/saved/{id}/schedule — remove a schedule.
+pub async fn delete_schedule(saved_id: i64) -> Result<DeleteScheduleResponse, ApiError> {
+    let resp = Request::delete(&format!("/api/v1/saved/{saved_id}/schedule"))
+        .send()
+        .await?;
+    match resp.status() {
+        200 => resp
+            .json::<DeleteScheduleResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /api/v1/saved/{id}/runs — paginated runs for a saved query.
+pub async fn list_runs(
+    saved_id: i64,
+    limit: usize,
+    offset: usize,
+) -> Result<ListReportRunsResponse, ApiError> {
+    let url = format!("/api/v1/saved/{saved_id}/runs?limit={limit}&offset={offset}");
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<ListReportRunsResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /api/v1/saved/{id}/runs/{run_id} — single run with result data.
+pub async fn get_run(saved_id: i64, run_id: i64) -> Result<ReportRunResponse, ApiError> {
+    let url = format!("/api/v1/saved/{saved_id}/runs/{run_id}");
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<ReportRunResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /api/v1/runs — paginated runs across all saved queries.
+pub async fn list_all_runs(limit: usize, offset: usize) -> Result<ListAllRunsResponse, ApiError> {
+    let url = format!("/api/v1/runs?limit={limit}&offset={offset}");
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<ListAllRunsResponse>()
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
