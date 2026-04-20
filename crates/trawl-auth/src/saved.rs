@@ -178,22 +178,52 @@ impl SavedQueryStore {
         }
     }
 
-    /// Update an existing saved query.
+    /// Update an existing saved query (DSL and optionally name).
     ///
     /// Returns `NotFound` if the query doesn't exist or doesn't belong to the user.
-    pub fn update(&self, id: i64, key_id: i64, query: &str) -> Result<SavedQuery, AuthError> {
+    /// Returns `InvalidName` if the new name contains invalid characters.
+    /// Returns `DuplicateName` if the new name conflicts with another query.
+    pub fn update(
+        &self,
+        id: i64,
+        key_id: i64,
+        query: &str,
+        name: Option<&str>,
+    ) -> Result<SavedQuery, AuthError> {
+        if let Some(n) = name {
+            validate_name(n)?;
+        }
+
         let now = Utc::now().to_rfc3339();
 
-        let updated = self.conn.execute(
-            "UPDATE saved_queries SET query = ?1, updated_at = ?2 WHERE id = ?3 AND key_id = ?4",
-            params![query, &now, id, key_id],
-        )?;
+        let updated = if let Some(n) = name {
+            self.conn.execute(
+                "UPDATE saved_queries SET query = ?1, name = ?2, updated_at = ?3 WHERE id = ?4 AND key_id = ?5",
+                params![query, n, &now, id, key_id],
+            )
+        } else {
+            self.conn.execute(
+                "UPDATE saved_queries SET query = ?1, updated_at = ?2 WHERE id = ?3 AND key_id = ?4",
+                params![query, &now, id, key_id],
+            )
+        };
 
-        if updated == 0 {
-            return Err(AuthError::NotFound {
-                id,
-                resource: "saved query".into(),
-            });
+        match updated {
+            Ok(0) => {
+                return Err(AuthError::NotFound {
+                    id,
+                    resource: "saved query".into(),
+                });
+            }
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(AuthError::DuplicateName {
+                    name: name.unwrap_or_default().to_owned(),
+                });
+            }
+            Err(e) => return Err(e.into()),
         }
 
         tracing::info!(
@@ -293,7 +323,9 @@ mod tests {
 
         let created = store.create(key_id, "test", "original query").unwrap();
 
-        let updated = store.update(created.id, key_id, "updated query").unwrap();
+        let updated = store
+            .update(created.id, key_id, "updated query", None)
+            .unwrap();
 
         assert_eq!(updated.query, "updated query");
         assert_eq!(updated.name, "test");
@@ -301,9 +333,24 @@ mod tests {
     }
 
     #[test]
+    fn update_query_with_rename() {
+        let store = test_store();
+        let key_id = 1;
+
+        let created = store.create(key_id, "old-name", "query").unwrap();
+
+        let updated = store
+            .update(created.id, key_id, "query", Some("new-name"))
+            .unwrap();
+
+        assert_eq!(updated.name, "new-name");
+        assert_eq!(updated.query, "query");
+    }
+
+    #[test]
     fn update_nonexistent_returns_error() {
         let store = test_store();
-        let result = store.update(999, 1, "query");
+        let result = store.update(999, 1, "query", None);
         assert!(matches!(result, Err(AuthError::NotFound { .. })));
     }
 
@@ -313,7 +360,7 @@ mod tests {
         let created = store.create(1, "test", "query").unwrap();
 
         // Try to update with a different key_id.
-        let result = store.update(created.id, 2, "updated");
+        let result = store.update(created.id, 2, "updated", None);
         assert!(matches!(result, Err(AuthError::NotFound { .. })));
     }
 
