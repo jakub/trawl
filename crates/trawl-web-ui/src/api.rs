@@ -10,7 +10,10 @@
 
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
-use trawl_api::{QueryRequest, QueryResponse};
+use trawl_api::{
+    CreateSavedRequest, HealthResponse, HistoryResponse, QueryRequest, QueryResponse,
+    SavedQueryResponse, ServiceSchemaResponse,
+};
 
 /// Rows per page for the snapshot results table.
 pub const PAGE_SIZE: usize = 50;
@@ -94,6 +97,69 @@ pub async fn logout() -> Result<(), ApiError> {
     let resp = Request::post("/api/auth/logout").send().await?;
     match resp.status() {
         204 | 200 => Ok(()),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /api/v1/health — unauthenticated health/version probe from trawld.
+pub async fn health() -> Result<HealthResponse, ApiError> {
+    let resp = Request::get("/api/v1/health").send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<HealthResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /api/v1/history — paginated query history for the current session.
+pub async fn history(limit: usize, offset: usize) -> Result<HistoryResponse, ApiError> {
+    let url = format!("/api/v1/history?limit={limit}&offset={offset}");
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<HistoryResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// POST /api/v1/saved — create a named saved query ("net").
+pub async fn create_saved(name: &str, query: &str) -> Result<SavedQueryResponse, ApiError> {
+    let body = CreateSavedRequest {
+        name: name.to_owned(),
+        query: query.to_owned(),
+    };
+    let resp = Request::post("/api/v1/saved")
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+    match resp.status() {
+        200 | 201 => resp
+            .json::<SavedQueryResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /api/v1/schema/services — rich per-service metadata (columns,
+/// stats, daily event counts). Cached server-side; see
+/// `schema_refresh.rs`. Used by the Schema page to render per-service
+/// cards and their drawer inspectors.
+pub async fn schema_services() -> Result<ServiceSchemaResponse, ApiError> {
+    let resp = Request::get("/api/v1/schema/services").send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<ServiceSchemaResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
         s => Err(ApiError::Status(s)),
     }
 }
