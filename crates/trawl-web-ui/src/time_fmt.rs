@@ -209,4 +209,26 @@ mod tests {
         assert!(parse_timestamp("not a date").is_none());
         assert!(parse_timestamp("").is_none());
     }
+
+    #[test]
+    fn time_until_future() {
+        let now = now();
+        assert_eq!(time_until(now + 30_000, now), "in <1m");
+        assert_eq!(time_until(now + 5 * 60_000, now), "in 5m");
+        assert_eq!(time_until(now + 90 * 60_000, now), "in 1h");
+        assert_eq!(time_until(now + 25 * 3_600_000, now), "in 1d");
+    }
+
+    #[test]
+    fn time_until_past_is_overdue() {
+        let now = now();
+        assert_eq!(time_until(now - 1_000, now), "overdue");
+        assert_eq!(time_until(now - 3_600_000, now), "overdue");
+    }
+
+    #[test]
+    fn time_until_exact_now_is_overdue() {
+        let now = now();
+        assert_eq!(time_until(now, now), "overdue");
+    }
 }

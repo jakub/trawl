@@ -822,9 +822,9 @@ impl ScheduleStore {
     pub fn runs_stats(&self, key_id: i64) -> Result<(u64, u64, u64, u64, Option<u64>), AuthError> {
         let row = self.conn.query_row(
             "SELECT COUNT(*),
-                    SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN r.status = 'error' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN r.status = 'timeout' THEN 1 ELSE 0 END),
+                    COALESCE(SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN r.status = 'error' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN r.status = 'timeout' THEN 1 ELSE 0 END), 0),
                     AVG(CASE WHEN r.duration_ms IS NOT NULL THEN r.duration_ms END)
              FROM report_runs r
              JOIN schedules s ON s.id = r.schedule_id
@@ -1313,5 +1313,81 @@ mod tests {
 
         assert_eq!(store.count_all_runs(1).unwrap(), 1);
         assert_eq!(store.count_all_runs(2).unwrap(), 1);
+    }
+
+    #[test]
+    fn runs_stats_empty() {
+        let store = test_store();
+        let (total, success, error, timeout, avg) = store.runs_stats(1).unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(success, 0);
+        assert_eq!(error, 0);
+        assert_eq!(timeout, 0);
+        assert_eq!(avg, None);
+    }
+
+    #[test]
+    fn runs_stats_counts_by_status() {
+        let store = test_store();
+        let sq_id = insert_saved_query(&store, 1, "stats-test");
+        let sched = store.create_schedule(sq_id, 1, 300, None).unwrap();
+
+        // 2 successes, 1 error, 1 timeout
+        let r1 = store.start_run(sched.id, sq_id, "q").unwrap().unwrap();
+        store
+            .finish_run(r1, "success", 100, Some(10), None, None, None)
+            .unwrap();
+
+        let r2 = store.start_run(sched.id, sq_id, "q").unwrap().unwrap();
+        store
+            .finish_run(r2, "success", 200, Some(20), None, None, None)
+            .unwrap();
+
+        let r3 = store.start_run(sched.id, sq_id, "q").unwrap().unwrap();
+        store
+            .finish_run(r3, "error", 50, None, Some("boom"), None, None)
+            .unwrap();
+
+        let r4 = store.start_run(sched.id, sq_id, "q").unwrap().unwrap();
+        store
+            .finish_run(r4, "timeout", 300, None, Some("timed out"), None, None)
+            .unwrap();
+
+        let (total, success, error, timeout, avg) = store.runs_stats(1).unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(success, 2);
+        assert_eq!(error, 1);
+        assert_eq!(timeout, 1);
+        // avg of 100, 200, 50, 300 = 162.5 → 162 truncated
+        assert_eq!(avg, Some(162));
+    }
+
+    #[test]
+    fn runs_stats_user_isolation() {
+        let store = test_store();
+        let sq1 = insert_saved_query(&store, 1, "user1-stats");
+        let sq2 = insert_saved_query(&store, 2, "user2-stats");
+        let sched1 = store.create_schedule(sq1, 1, 300, None).unwrap();
+        let sched2 = store.create_schedule(sq2, 2, 300, None).unwrap();
+
+        let r1 = store.start_run(sched1.id, sq1, "q").unwrap().unwrap();
+        store
+            .finish_run(r1, "success", 100, None, None, None, None)
+            .unwrap();
+
+        let r2 = store.start_run(sched2.id, sq2, "q").unwrap().unwrap();
+        store
+            .finish_run(r2, "error", 200, None, Some("err"), None, None)
+            .unwrap();
+
+        let (total, success, error, _, _) = store.runs_stats(1).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(success, 1);
+        assert_eq!(error, 0);
+
+        let (total, success, error, _, _) = store.runs_stats(2).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(success, 0);
+        assert_eq!(error, 1);
     }
 }
