@@ -22,6 +22,7 @@ pub struct RailItem {
 /// Icons we currently render in the rail. Kept as an enum so the SVG
 /// path stays in one place rather than scattered across templates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum RailIcon {
     Search,
     Clock,
