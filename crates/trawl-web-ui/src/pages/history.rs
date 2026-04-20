@@ -137,11 +137,11 @@ pub fn HistoryPage(bus: ToastBus) -> impl IntoView {
 
             <div class="tbl">
                 <div class="tbl-hd">
-                    <div style="flex:0 0 120px">"When"</div>
+                    <div style="flex:0 0 72px">"When"</div>
                     <div style="flex:3; min-width:0">"Query"</div>
-                    <div style="flex:0 0 100px; text-align:right">"Events"</div>
-                    <div style="flex:0 0 80px; text-align:right">"Duration"</div>
-                    <div style="flex:0 0 120px; text-align:right"></div>
+                    <div style="flex:0 0 60px; text-align:right">"Events"</div>
+                    <div style="flex:0 0 60px; text-align:right">"Duration"</div>
+                    <div style="flex:0 0 72px; text-align:right"></div>
                 </div>
                 <div class="tbl-body">
                 {move || match resource.get() {
@@ -195,19 +195,19 @@ pub fn HistoryPage(bus: ToastBus) -> impl IntoView {
                                     class="tbl-row"
                                     on:click=move |_| on_rerun(q_for_row.clone())
                                 >
-                                    <div style="flex:0 0 120px; color:var(--ink-3)" class="mono">
+                                    <div style="flex:0 0 72px; color:var(--ink-3)" class="mono">
                                         {when}
                                     </div>
                                     <div style="flex:3; min-width:0" class="mono path">
                                         {h.query.clone()}
                                     </div>
-                                    <div style="flex:0 0 100px; text-align:right" class="mono">
+                                    <div style="flex:0 0 60px; text-align:right" class="mono">
                                         {events}
                                     </div>
-                                    <div style="flex:0 0 80px; text-align:right" class="mono">
+                                    <div style="flex:0 0 60px; text-align:right" class="mono">
                                         {duration}
                                     </div>
-                                    <div style="flex:0 0 120px; text-align:right">
+                                    <div style="flex:0 0 72px; text-align:right">
                                         <span
                                             class="link"
                                             on:click=move |e: web_sys::MouseEvent| {
