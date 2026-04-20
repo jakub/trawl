@@ -12,8 +12,8 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::web_sys;
+use trawl_api::SavedQueryResponse;
 use trawl_api::value::QueryResult;
-use trawl_api::{ReportRunSummary, SavedQueryResponse};
 use wasm_bindgen::JsCast;
 
 use crate::api;
@@ -68,7 +68,7 @@ pub fn NetDrawer(
 
     let on_run_click = {
         let q = query_for_run;
-        let cb = on_search.clone();
+        let cb = on_search;
         move |_| cb.run(q.clone())
     };
 
@@ -119,15 +119,15 @@ pub fn NetDrawer(
                             view! {
                                 <RunsPane
                                     net_id=net_for_runs.id
-                                    bus=bus.clone()
-                                    on_search=on_search.clone()
+                                    bus=bus
+                                    on_search=on_search
                                 />
                             }.into_any()
                         } else {
                             view! {
                                 <QuerySchedulePane
                                     net=net_for_query.clone()
-                                    bus=bus.clone()
+                                    bus=bus
                                     on_refresh=on_refresh
                                 />
                             }.into_any()
@@ -158,11 +158,9 @@ fn QuerySchedulePane(
     let original_query = net.query.clone();
 
     let do_save_query = {
-        let bus = bus.clone();
         move || {
             saving_query.set(true);
             let q = query_buf.get_untracked();
-            let bus = bus.clone();
             spawn_local(async move {
                 match api::update_saved(net_id, &q).await {
                     Ok(_) => {
@@ -192,19 +190,17 @@ fn QuerySchedulePane(
             .and_then(|s| s.max_runs)
             .map_or_else(String::new, |n| n.to_string()),
     );
-    let enabled_buf = RwSignal::new(net.schedule.as_ref().map_or(true, |s| s.enabled));
+    let enabled_buf = RwSignal::new(net.schedule.as_ref().is_none_or(|s| s.enabled));
     let saving_schedule = RwSignal::new(false);
     let show_schedule_form = RwSignal::new(has_schedule);
 
     let do_save_schedule = {
-        let bus = bus.clone();
         move || {
             saving_schedule.set(true);
             let interval = interval_buf.get_untracked();
             let max_runs_str = max_runs_buf.get_untracked();
             let max_runs = max_runs_str.trim().parse::<u64>().ok();
             let enabled = enabled_buf.get_untracked();
-            let bus = bus.clone();
             spawn_local(async move {
                 match api::set_schedule(net_id, &interval, max_runs, enabled).await {
                     Ok(_) => {
@@ -221,9 +217,7 @@ fn QuerySchedulePane(
     };
 
     let do_delete_schedule = {
-        let bus = bus.clone();
         move || {
-            let bus = bus.clone();
             spawn_local(async move {
                 match api::delete_schedule(net_id).await {
                     Ok(_) => {
@@ -267,14 +261,14 @@ fn QuerySchedulePane(
                         <button
                             class="btn-pri btn-xs"
                             prop:disabled=move || saving_query.get()
-                            on:click={
-                                let save = do_save_query.clone();
-                                move |_| save()
-                            }
+                            on:click=move |_| do_save_query()
                         >{move || if saving_query.get() { "Saving…" } else { "Save" }}</button>
-                        <button class="btn-sec btn-xs" on:click=move |_| {
-                            editing.set(false);
-                            query_buf.set(original_query.clone());
+                        <button class="btn-sec btn-xs" on:click={
+                            let reset_q = original_query.clone();
+                            move |_| {
+                                editing.set(false);
+                                query_buf.set(reset_q.clone());
+                            }
                         }>"Cancel"</button>
                     </div>
                 </Show>
@@ -293,7 +287,7 @@ fn QuerySchedulePane(
                             class="btn-sec btn-xs"
                             style="margin-top:8px"
                             on:click=move |_| show_schedule_form.set(true)
-                        >"+ Add schedule"</button>
+                        >"+ Add Schedule"</button>
                     }
                 >
                     <div style="display:flex; flex-direction:column; gap:10px">
@@ -360,19 +354,15 @@ fn QuerySchedulePane(
                             <button
                                 class="btn-pri btn-xs"
                                 prop:disabled=move || saving_schedule.get()
-                                on:click={
-                                    let save = do_save_schedule.clone();
-                                    move |_| save()
-                                }
-                            >{move || if saving_schedule.get() { "Saving…" } else { "Save schedule" }}</button>
+                                on:click=move |_| do_save_schedule()
+                            >{move || if saving_schedule.get() { "Saving…" } else { "Save Schedule" }}</button>
                             {has_schedule.then(|| {
-                                let del = do_delete_schedule.clone();
                                 view! {
                                     <button
                                         class="btn-sec btn-xs"
                                         style="color:var(--red)"
-                                        on:click=move |_| del()
-                                    >"Remove schedule"</button>
+                                        on:click=move |_| do_delete_schedule()
+                                    >"Remove Schedule"</button>
                                 }
                             })}
                         </div>
@@ -398,6 +388,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
         async move { api::list_runs(net_id, RUNS_PAGE_SIZE, offset).await }
     });
 
+    #[allow(clippy::cast_possible_truncation)]
     let now_ms = move || js_sys::Date::now() as i64;
 
     view! {
@@ -461,8 +452,8 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                     <RunResultPreview
                                         net_id=net_id
                                         run_id=run_id
-                                        bus=bus.clone()
-                                        on_search=on_search.clone()
+                                        bus=bus
+                                        on_search=on_search
                                     />
                                 </Show>
                             }
@@ -509,6 +500,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
 // ---------------------------------------------------------------------------
 
 #[component]
+#[allow(unused_variables)]
 fn RunResultPreview(
     net_id: i64,
     run_id: i64,
@@ -532,7 +524,6 @@ fn RunResultPreview(
                         }.into_any(),
                         Some(qr) => {
                             let query = resp.summary.query.clone();
-                            let on_search = on_search.clone();
                             view! {
                                 <ResultPreviewTable result=qr/>
                                 <button
@@ -556,7 +547,7 @@ fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
         .rows
         .iter()
         .take(RESULT_PREVIEW_ROWS)
-        .map(|row| row.iter().map(|v| v.to_string()).collect())
+        .map(|row| row.iter().map(ToString::to_string).collect())
         .collect();
     let total_rows = result.rows.len();
     let truncated = total_rows > RESULT_PREVIEW_ROWS;
@@ -565,7 +556,7 @@ fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
         <table>
             <thead>
                 <tr>
-                    {cols.iter().map(|c| view! { <th>{c.clone()}</th> }).collect_view()}
+                    {cols.iter().map(|c| view! { <th>{c.name.clone()}</th> }).collect_view()}
                 </tr>
             </thead>
             <tbody>

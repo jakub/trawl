@@ -115,7 +115,7 @@ pub fn EditorWrap(
                             view! { <span>"Hauling…"</span> }.into_any()
                         } else {
                             view! {
-                                <span>"Run search"</span>
+                                <span>"Haul"</span>
                                 <span class="kbd-inline">"⌘⏎"</span>
                             }.into_any()
                         }}
@@ -281,7 +281,7 @@ fn DateRangePopover(
                 Tab::RealTime => view! {
                     <div class="rt-hint">
                         <p>"Real-time mode streams events as they arrive."</p>
-                        <p class="dim">"Use the "<code>"?mode=live"</code>" URL to enable live-tail — the popover toggle lands in a follow-up."</p>
+                        <p class="dim">"Append "<code>"?mode=live"</code>" to the URL to start streaming."</p>
                     </div>
                 }.into_any(),
             }}

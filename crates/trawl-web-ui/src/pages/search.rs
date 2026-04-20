@@ -25,6 +25,7 @@ use trawl_api::value::QueryResult;
 use crate::api;
 use crate::components::chart::Chart;
 use crate::components::editor_wrap::EditorWrap;
+use crate::components::export_modal::ExportModal;
 use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
 use crate::components::meta_strip::MetaStrip;
@@ -295,6 +296,8 @@ pub fn Search() -> impl IntoView {
 
     let show_save_modal = RwSignal::new(false);
     let on_save = Callback::new(move |()| show_save_modal.set(true));
+    let show_export_modal = RwSignal::new(false);
+    let on_export = Callback::new(move |()| show_export_modal.set(true));
     let running = loading;
 
     // Signal wrappers so child components get `Signal<T>` props rather
@@ -350,6 +353,7 @@ pub fn Search() -> impl IntoView {
                                             truncated=truncated
                                             filters=filters_sig
                                             on_remove=on_remove_filter
+                                            on_export=on_export
                                             bus=bus
                                         />
                                         <Tabs active=active_tab count=last_count/>
@@ -398,6 +402,13 @@ pub fn Search() -> impl IntoView {
                     on_close=Callback::new(move |_| show_save_modal.set(false))
                 />
             </Show>
+            <Show when=move || show_export_modal.get()>
+                <ExportModal
+                    query=effective_q.get_untracked()
+                    bus=bus
+                    on_close=Callback::new(move |_| show_export_modal.set(false))
+                />
+            </Show>
         </div>
     }
 }
@@ -412,7 +423,7 @@ fn SectionPlaceholder(section: Memo<String>) -> impl IntoView {
             <div class="placeholder-card">
                 <div class="placeholder-eyebrow">{move || section.get()}</div>
                 <h2>"Coming soon"</h2>
-                <p>"This section is part of the v1 design but isn't backed by a UI yet."</p>
+                <p>"This section is on the way — check back shortly."</p>
             </div>
         </div>
     }

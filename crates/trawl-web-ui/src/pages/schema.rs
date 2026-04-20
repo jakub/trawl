@@ -115,7 +115,7 @@ pub fn SchemaPage(bus: ToastBus) -> impl IntoView {
         bus.push(
             ToastKind::Info,
             "New extractor",
-            Some("Field extractor authoring is coming soon.".into()),
+            Some("Field extractor authoring is landing soon.".into()),
         );
     };
 

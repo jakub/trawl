@@ -92,9 +92,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
     };
 
     let on_delete = {
-        let bus = bus.clone();
         move |id: i64, name: String| {
-            let bus = bus.clone();
             spawn_local(async move {
                 match api::delete_saved(id).await {
                     Ok(_) => {
@@ -120,6 +118,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
         }
     };
 
+    #[allow(clippy::cast_possible_truncation)]
     let now_ms = move || js_sys::Date::now() as i64;
 
     view! {
@@ -139,7 +138,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                         />
                     </div>
                     <button class="btn-pri" on:click=move |_| show_create_modal.set(true)>
-                        "+ New net"
+                        "+ New Net"
                     </button>
                 </div>
             </div>
@@ -188,14 +187,12 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                                     }.into_any();
                                 }
                                 let count = visible.len();
-                                let on_open = on_open.clone();
                                 let rows = visible.into_iter().map(|net| {
                                     let id = net.id;
                                     let name = net.name.clone();
                                     let query_text = net.query.clone();
                                     let name_for_delete = net.name.clone();
                                     let query_for_run = net.query.clone();
-                                    let on_delete = on_delete.clone();
                                     let on_run_now = on_run_now.clone();
 
                                     let sched_badge = match &net.schedule {
@@ -273,11 +270,10 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                                                             class="item danger"
                                                             on:click={
                                                                 let name = name_for_delete.clone();
-                                                                let del = on_delete.clone();
                                                                 move |e: web_sys::MouseEvent| {
                                                                     e.stop_propagation();
                                                                     actions_open.set(None);
-                                                                    del(id, name.clone());
+                                                                    on_delete(id, name.clone());
                                                                 }
                                                             }
                                                         >"Delete"</div>
@@ -308,10 +304,10 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                     <NetDrawer
                         net=net
                         tab=tab_sig
-                        bus=bus.clone()
+                        bus=bus
                         on_close=on_close
                         on_tab_change=on_tab_change
-                        on_search=on_search.clone()
+                        on_search=on_search
                         on_refresh=on_refresh
                     />
                 })
@@ -320,8 +316,8 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
             // Create modal
             <Show when=move || show_create_modal.get()>
                 <SaveAsNetModal
-                    query=Signal::derive(|| String::new())
-                    bus=bus.clone()
+                    query=String::new()
+                    bus=bus
                     on_close=Callback::new(move |saved: bool| {
                         show_create_modal.set(false);
                         if saved { refresh.update(|n| *n += 1); }

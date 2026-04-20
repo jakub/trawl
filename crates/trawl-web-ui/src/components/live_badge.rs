@@ -28,12 +28,12 @@ pub fn LiveBadge(
         } else if let Some(n) = lagged.get() {
             view! {
                 <span class="live-badge lagged">
-                    {format!("⚠ LAGGED: {n} missed")}
+                    {format!("⚠ Lagged: {n} missed")}
                 </span>
             }.into_any()
         } else {
             view! {
-                <span class="live-badge live">"● LIVE"</span>
+                <span class="live-badge live">"● Live"</span>
             }.into_any()
         }}
     }
