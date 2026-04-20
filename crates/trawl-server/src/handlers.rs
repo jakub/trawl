@@ -16,11 +16,12 @@ use std::borrow::Cow;
 use std::convert::Infallible;
 use trawl_api::{
     CancelResponse, CreateSavedRequest, DashboardSnapshot, DeleteSavedResponse,
-    DeleteScheduleResponse, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
-    HistoryEntryResponse, HistoryResponse, ListReportRunsResponse, ListSavedResponse,
-    PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse,
-    ReportRunSummary, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
-    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    DeleteScheduleResponse, ExportRequest, FieldValuesResponse, GlobalRunSummary, HealthResponse,
+    HealthStatus, HistoryEntryResponse, HistoryResponse, ListAllRunsResponse,
+    ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
+    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
+    ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse,
+    UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
 use trawl_auth::keys::VerifiedKey;
 use trawl_auth::roles::Permission;
@@ -1356,6 +1357,42 @@ pub async fn list_report_runs(
 
     Ok(Json(ListReportRunsResponse {
         runs: runs.into_iter().map(report_run_summary).collect(),
+        total,
+    }))
+}
+
+/// `GET /api/v1/runs` — list report runs across all saved queries for the user.
+pub async fn list_all_runs(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<ListRunsParams>,
+) -> Result<Json<ListAllRunsResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SavedQuery) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = resolve_key_id(&state, &verified)?;
+    let schedule_store = state.auth.schedule.lock();
+
+    let runs = schedule_store
+        .list_all_runs(key_id, params.limit, params.offset)
+        .map_err(|e| ServerError::Internal(format!("failed to list all runs: {e}")))?;
+
+    let total = schedule_store
+        .count_all_runs(key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to count all runs: {e}")))?;
+
+    drop(schedule_store);
+
+    Ok(Json(ListAllRunsResponse {
+        runs: runs
+            .into_iter()
+            .map(|(run, net_name)| GlobalRunSummary {
+                net_id: run.saved_query_id,
+                net_name,
+                run: report_run_summary(run),
+            })
+            .collect(),
         total,
     }))
 }
