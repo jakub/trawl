@@ -36,7 +36,9 @@ use crate::components::tabs::{ResultsTab, Tabs};
 use crate::components::toast::{ToastBus, Toasts};
 use crate::components::topbar::TopBar;
 use crate::pages::history::HistoryPage;
+use crate::pages::nets::NetsPage;
 use crate::pages::placeholder::ModePlaceholder;
+use crate::pages::runs::RunsPage;
 use crate::pages::schema::SchemaPage;
 use crate::state::app_mode;
 use crate::state::app_mode::AppMode;
@@ -309,8 +311,13 @@ pub fn Search() -> impl IntoView {
                     <main class="main">
                         <Show
                             when=move || current_app.get() == AppMode::Search
-                            fallback=move || view! {
-                                <ModePlaceholder mode=Signal::derive(move || current_app.get())/>
+                            fallback=move || match current_app.get() {
+                                AppMode::Jobs => match current_section.get().as_str() {
+                                    "nets" => view! { <NetsPage bus=bus/> }.into_any(),
+                                    "runs" => view! { <RunsPage bus=bus/> }.into_any(),
+                                    _ => view! { <ModePlaceholder mode=Signal::derive(move || current_app.get())/> }.into_any(),
+                                },
+                                _ => view! { <ModePlaceholder mode=Signal::derive(move || current_app.get())/> }.into_any(),
                             }
                         >
                             <Show
