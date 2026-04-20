@@ -6,9 +6,9 @@
 //!
 //! Header (Filters · count · clear all) + filter input + per-field
 //! collapsible groups with proportional value bars and hover-only
-//! include/exclude actions. Display-only in v1: clicking a value
-//! shows the include/exclude affordance but does nothing yet
-//! (server-side filter wiring is a follow-up).
+//! include/exclude actions. Clicking `+` / `⊘` on a value adds an
+//! include / exclude `Filter` to the shared filters signal; the parent
+//! owns state and re-runs the query via URL navigation.
 
 use std::collections::HashMap;
 
@@ -17,9 +17,20 @@ use trawl_api::QueryResponse;
 
 use crate::api::ApiError;
 use crate::facets::compute_facets;
+use crate::state::query::{Filter, FilterOp};
 
 #[component]
-pub fn FacetSidebar(rows: LocalResource<Result<QueryResponse, ApiError>>) -> impl IntoView {
+#[allow(clippy::too_many_lines)] // facet markup tree is one cohesive view
+pub fn FacetSidebar(
+    rows: LocalResource<Result<QueryResponse, ApiError>>,
+    /// Current filters — read to paint selected/excluded value rows.
+    #[prop(into)]
+    filters: Signal<Vec<Filter>>,
+    /// Called when the user clicks `+` or `⊘` on a facet value.
+    on_add: Callback<Filter>,
+    /// Called when the user clicks "clear all" in the header.
+    on_clear: Callback<()>,
+) -> impl IntoView {
     // Per-field collapse state — closed groups stash here. New fields
     // start expanded.
     let collapsed: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
@@ -32,6 +43,12 @@ pub fn FacetSidebar(rows: LocalResource<Result<QueryResponse, ApiError>>) -> imp
         <aside class="facets">
             <div class="phead">
                 <div class="ttl">"Filters"</div>
+                <Show when=move || !filters.get().is_empty()>
+                    <div
+                        class="clear"
+                        on:click=move |_| on_clear.run(())
+                    >"clear all"</div>
+                </Show>
             </div>
             <div class="fsearch">
                 <FsearchIcon/>
@@ -46,11 +63,10 @@ pub fn FacetSidebar(rows: LocalResource<Result<QueryResponse, ApiError>>) -> imp
                 Some(Ok(resp)) => {
                     let facets = compute_facets(&resp.result);
                     if facets.is_empty() {
-                        return view! {
-                            <p class="facets-hint">"no facetable fields on this page"</p>
-                        }.into_any();
+                        return ().into_any();
                     }
                     let q = needle.get().to_lowercase();
+                    let active = filters.get();
                     facets.into_iter().map(|(field, values)| {
                         let max = values.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
                         let total = values.len();
@@ -71,6 +87,7 @@ pub fn FacetSidebar(rows: LocalResource<Result<QueryResponse, ApiError>>) -> imp
                         let is_collapsed = collapsed.get().get(&field).copied().unwrap_or(false);
                         let field_for_toggle = field.clone();
                         let field_for_more = field.clone();
+                        let active = active.clone();
                         view! {
                             <div class="g" class:collapsed=move || is_collapsed>
                                 <div
@@ -88,8 +105,17 @@ pub fn FacetSidebar(rows: LocalResource<Result<QueryResponse, ApiError>>) -> imp
                                     {visible.into_iter().map(|(v, c)| {
                                         let pct = (f64::from(c) / f64::from(max)) * 100.0;
                                         let title = v.clone();
+                                        let state = match_filter_state(&active, &field, &v);
+                                        let field_for_inc = field.clone();
+                                        let field_for_exc = field.clone();
+                                        let value_for_inc = v.clone();
+                                        let value_for_exc = v.clone();
                                         view! {
-                                            <div class="v">
+                                            <div
+                                                class="v"
+                                                class:selected=move || state == FilterState::Included
+                                                class:excluded=move || state == FilterState::Excluded
+                                            >
                                                 <div
                                                     class="bar"
                                                     style=format!("width: {pct:.1}%")
@@ -97,8 +123,30 @@ pub fn FacetSidebar(rows: LocalResource<Result<QueryResponse, ApiError>>) -> imp
                                                 <span class="n" title=title>{v}</span>
                                                 <span class="c">{c}</span>
                                                 <span class="act">
-                                                    <span class="op" title="Include — coming soon">"+"</span>
-                                                    <span class="op" title="Exclude — coming soon">"⊘"</span>
+                                                    <span
+                                                        class="op"
+                                                        title="Include"
+                                                        on:click=move |e| {
+                                                            e.stop_propagation();
+                                                            on_add.run(Filter {
+                                                                field: field_for_inc.clone(),
+                                                                value: value_for_inc.clone(),
+                                                                op: FilterOp::Include,
+                                                            });
+                                                        }
+                                                    >"+"</span>
+                                                    <span
+                                                        class="op"
+                                                        title="Exclude"
+                                                        on:click=move |e| {
+                                                            e.stop_propagation();
+                                                            on_add.run(Filter {
+                                                                field: field_for_exc.clone(),
+                                                                value: value_for_exc.clone(),
+                                                                op: FilterOp::Exclude,
+                                                            });
+                                                        }
+                                                    >"⊘"</span>
                                                 </span>
                                             </div>
                                         }
@@ -121,6 +169,25 @@ pub fn FacetSidebar(rows: LocalResource<Result<QueryResponse, ApiError>>) -> imp
             }}
         </aside>
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterState {
+    None,
+    Included,
+    Excluded,
+}
+
+fn match_filter_state(active: &[Filter], field: &str, value: &str) -> FilterState {
+    for f in active {
+        if f.field == field && f.value == value {
+            return match f.op {
+                FilterOp::Include => FilterState::Included,
+                FilterOp::Exclude => FilterState::Excluded,
+            };
+        }
+    }
+    FilterState::None
 }
 
 #[component]

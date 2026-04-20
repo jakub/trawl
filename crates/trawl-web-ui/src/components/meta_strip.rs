@@ -7,6 +7,7 @@
 use leptos::prelude::*;
 
 use crate::components::toast::{ToastBus, ToastKind};
+use crate::state::query::{Filter, FilterOp};
 
 #[component]
 pub fn MetaStrip(
@@ -16,6 +17,12 @@ pub fn MetaStrip(
     /// Whether the result has been truncated server-side.
     #[prop(into)]
     truncated: Signal<bool>,
+    /// Active filters — rendered as chips. Each chip has an `×` that
+    /// calls `on_remove` with its index.
+    #[prop(into)]
+    filters: Signal<Vec<Filter>>,
+    /// Called with the index of a filter to remove.
+    on_remove: Callback<usize>,
     bus: ToastBus,
 ) -> impl IntoView {
     view! {
@@ -34,6 +41,27 @@ pub fn MetaStrip(
                     "scanned ".to_string() + &dash() + " / " + &dash()
                 }}
             </span>
+            {move || filters.get().into_iter().enumerate().map(|(i, f)| {
+                let is_excl = f.op == FilterOp::Exclude;
+                let label = format!(
+                    "{}{} = {}",
+                    if is_excl { "⊘ " } else { "◆ " },
+                    f.field,
+                    f.value,
+                );
+                view! {
+                    <span class="chip" class:excl=move || is_excl>
+                        <span>{label}</span>
+                        <span
+                            class="x"
+                            on:click=move |e| {
+                                e.stop_propagation();
+                                on_remove.run(i);
+                            }
+                        >"×"</span>
+                    </span>
+                }
+            }).collect::<Vec<_>>()}
             <span class="sp"></span>
             <span
                 class="action"
