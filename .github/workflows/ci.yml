@@ -13,6 +13,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Self-hosted cache server (falcondev-oss/github-actions-cache-server)
+  # running in the same k8s cluster as the ARC runners. The runner worker
+  # blacklists these keys from $GITHUB_ENV writes, so they must be set at
+  # workflow level. On cache-server downtime the build runs cold (cache
+  # miss, not failure).
+  ACTIONS_CACHE_URL: http://cache-server.arc-runners.svc.cluster.local:3000
+  ACTIONS_RESULTS_URL: http://cache-server.arc-runners.svc.cluster.local:3000
+  ACTIONS_RUNTIME_URL: http://cache-server.arc-runners.svc.cluster.local:3000
+  ACTIONS_CACHE_SERVICE_V2: "true"
 
 jobs:
   fmt:
