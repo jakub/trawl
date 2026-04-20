@@ -1030,10 +1030,10 @@ textarea:focus-visible,
  *  Meta strip — under the editor
  * ─────────────────────────────────────────────────────────────── */
 .meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 14px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  gap: 0 14px;
   padding: 6px 14px;
   min-height: 30px;
   flex-shrink: 0;
@@ -1043,8 +1043,10 @@ textarea:focus-visible,
   font-size: 12px;
   color: var(--ink-2);
 }
+.meta-count { display: flex; align-items: center; gap: 8px; padding: 2px 0; white-space: nowrap; }
+.meta-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0; }
+.meta-actions { display: flex; align-items: center; gap: 8px; padding: 2px 0; justify-self: end; }
 .meta .num { color: var(--amber); font-weight: 600; }
-.meta .strong { color: var(--ink); font-weight: 500; }
 .meta .action {
   cursor: pointer;
   color: var(--ink-3);
@@ -1055,7 +1057,6 @@ textarea:focus-visible,
   gap: 4px;
 }
 .meta .action:hover { color: var(--ink); background: var(--panel-2); }
-.meta .action.first { margin-left: auto; }
 
 /* Filter chips — one per active Filter; render between scanned-bytes
  * and the save/export action links. */
