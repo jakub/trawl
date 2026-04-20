@@ -39,9 +39,7 @@ pub enum RailIcon {
 
 #[must_use]
 pub fn items_for(mode: AppMode) -> &'static [RailItem] {
-    use RailIcon::{
-        Alert, Chart, Check, Clock, Database, Grid, Link, News, Search as SearchIcon, User, Zap,
-    };
+    use RailIcon::{Alert, Chart, Clock, Database, Grid, Link, News, Search as SearchIcon, User};
     match mode {
         AppMode::Search => &[
             RailItem {
@@ -79,19 +77,14 @@ pub fn items_for(mode: AppMode) -> &'static [RailItem] {
         ],
         AppMode::Jobs => &[
             RailItem {
-                id: "scheduled",
-                label: "Scheduled",
-                icon: Clock,
+                id: "nets",
+                label: "Nets",
+                icon: Database,
             },
             RailItem {
-                id: "running",
-                label: "Running",
-                icon: Zap,
-            },
-            RailItem {
-                id: "completed",
-                label: "Completed",
-                icon: Check,
+                id: "runs",
+                label: "Runs",
+                icon: Chart,
             },
         ],
         AppMode::Settings => &[
