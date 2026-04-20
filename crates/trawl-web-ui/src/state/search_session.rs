@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Snapshot query resource: re-fetches on `(executed_q, page)` tuple change.
+//! Snapshot query resource: re-fetches on `(effective_q, page)` tuple change.
 
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
@@ -10,7 +10,12 @@ use trawl_api::QueryResponse;
 use crate::api::{self, ApiError};
 
 /// Build a Leptos `LocalResource` that runs `api::query(q, page)` whenever
-/// the executed-query or page signals change.
+/// the effective-query or page signals change.
+///
+/// Callers should feed an "effective" query (base DSL + filters + range
+/// merged via `state::query::effective_query`), not the user's raw editor
+/// buffer. The resource doesn't care where the string came from — it just
+/// re-fires on value changes.
 ///
 /// Empty `q` short-circuits to an `Ok(empty result)` without a network
 /// round-trip so the first page load doesn't fire a POST with `?q=`.
@@ -18,11 +23,11 @@ use crate::api::{self, ApiError};
 /// Uses `LocalResource` (CSR-only, no Serialize/Deserialize bounds on the
 /// result type) because this crate doesn't do SSR hydration.
 pub fn rows_resource(
-    executed_q: Memo<String>,
+    effective_q: Memo<String>,
     page: Memo<usize>,
 ) -> LocalResource<Result<QueryResponse, ApiError>> {
     LocalResource::new(move || {
-        let q = executed_q.get();
+        let q = effective_q.get();
         let p = page.get();
         async move {
             if q.trim().is_empty() {
