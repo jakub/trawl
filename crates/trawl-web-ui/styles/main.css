@@ -1671,7 +1671,7 @@ textarea:focus-visible,
   border-bottom: 1px solid var(--line);
 }
 .tbl-row {
-  display: flex; padding: 6px 14px; gap: 12px; align-items: center;
+  display: flex; padding: 6px 10px; gap: 12px; align-items: center;
   border-bottom: 1px solid var(--line-2);
   font-size: 12.5px; cursor: pointer;
   transition: background 80ms;
