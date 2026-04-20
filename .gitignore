@@ -45,3 +45,4 @@ docs/.astro/
 crates/trawl-core/fuzz/target/
 crates/trawl-core/fuzz/artifacts/
 crates/trawl-core/fuzz/corpus/
+web_ui_mockups/
