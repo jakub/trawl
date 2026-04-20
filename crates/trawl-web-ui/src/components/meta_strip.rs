@@ -27,53 +27,57 @@ pub fn MetaStrip(
 ) -> impl IntoView {
     view! {
         <div class="meta">
-            <span>
+            <div class="meta-count">
                 <span class="num">
                     {move || count.get().map_or_else(|| "—".to_string(), |c| c.to_string())}
                 </span>
                 " events"
-            </span>
-            <Show when=move || truncated.get()>
-                <span class="divider">"·"</span>
-                <span class="dim">"truncated"</span>
-            </Show>
-            {move || filters.get().into_iter().enumerate().map(|(i, f)| {
-                let is_excl = f.op == FilterOp::Exclude;
-                let label = format!(
-                    "{}{} = {}",
-                    if is_excl { "⊘ " } else { "◆ " },
-                    f.field,
-                    f.value,
-                );
-                view! {
-                    <span class="chip" class:excl=move || is_excl>
-                        <span>{label}</span>
-                        <span
-                            class="x"
-                            on:click=move |e| {
-                                e.stop_propagation();
-                                on_remove.run(i);
-                            }
-                        >"×"</span>
-                    </span>
-                }
-            }).collect::<Vec<_>>()}
-            <span
-                class="action first"
-                on:click=move |_| bus.push(
-                    ToastKind::Info,
-                    "Save",
-                    Some("Saving nets is coming soon.".into()),
-                )
-            >"save"</span>
-            <span
-                class="action"
-                on:click=move |_| bus.push(
-                    ToastKind::Info,
-                    "Export",
-                    Some("CSV/JSON export is coming soon.".into()),
-                )
-            >"export"</span>
+                <Show when=move || truncated.get()>
+                    <span class="divider">"·"</span>
+                    <span class="dim">"truncated"</span>
+                </Show>
+            </div>
+            <div class="meta-chips">
+                {move || filters.get().into_iter().enumerate().map(|(i, f)| {
+                    let is_excl = f.op == FilterOp::Exclude;
+                    let label = format!(
+                        "{}{} = {}",
+                        if is_excl { "⊘ " } else { "◆ " },
+                        f.field,
+                        f.value,
+                    );
+                    view! {
+                        <span class="chip" class:excl=move || is_excl>
+                            <span>{label}</span>
+                            <span
+                                class="x"
+                                on:click=move |e| {
+                                    e.stop_propagation();
+                                    on_remove.run(i);
+                                }
+                            >"×"</span>
+                        </span>
+                    }
+                }).collect::<Vec<_>>()}
+            </div>
+            <div class="meta-actions">
+                <span
+                    class="action"
+                    on:click=move |_| bus.push(
+                        ToastKind::Info,
+                        "Save",
+                        Some("Saving nets is coming soon.".into()),
+                    )
+                >"save"</span>
+                <span
+                    class="action"
+                    on:click=move |_| bus.push(
+                        ToastKind::Info,
+                        "Export",
+                        Some("CSV/JSON export is coming soon.".into()),
+                    )
+                >"export"</span>
+            </div>
         </div>
     }
 }
