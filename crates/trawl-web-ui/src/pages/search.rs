@@ -6,14 +6,17 @@
 //!
 //! Layout (top to bottom inside `.search-col`):
 //! editor wrap (header + `DslEditor` + date range + run button)
-//! → meta strip (count · duration · save/export)
+//! → meta strip (count · duration · chips · save/export)
 //! → tabs (Events / Visualization)
 //! → tab body (Events: histogram + results table | Visualization: chart)
 //! Status bar pinned at the bottom of the shell.
 //!
-//! Live-tail still works via `?mode=live`; the live state feeds the
-//! status bar's HAULING / LAGGED indicators and renders into either
-//! the chart or a streaming table.
+//! State split:
+//! - `query_text` — in-progress editor buffer (not URL-synced).
+//! - `executed_q` / `filters` / `range` — URL-driven memos (canonical).
+//! - `effective_q` — derived from the triple; what actually hits the
+//!   server. Filter chips in the meta strip and the date-range popover
+//!   mutate state by navigating; URL drives memos drives resource.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -31,10 +34,14 @@ use crate::components::status_bar::{StatusBar, StatusKind};
 use crate::components::tabs::{ResultsTab, Tabs};
 use crate::components::toast::{ToastBus, Toasts};
 use crate::components::topbar::TopBar;
+use crate::pages::history::HistoryPage;
 use crate::pages::placeholder::ModePlaceholder;
+use crate::pages::schema::SchemaPage;
 use crate::state::app_mode;
 use crate::state::app_mode::AppMode;
-use crate::state::query::{Mode, navigator, url_signals};
+use crate::state::query::{
+    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, url_signals,
+};
 use crate::state::search_session::rows_resource;
 use crate::state::section;
 use crate::state::stream_session::{
@@ -50,8 +57,13 @@ pub fn Search() -> impl IntoView {
     // In-progress editor buffer — never touches the URL.
     let query_text = RwSignal::new(String::new());
 
-    // URL-driven: the executed query, page, and mode.
-    let (executed_q, page, mode) = url_signals();
+    let UrlSignals {
+        executed_q,
+        page,
+        mode,
+        filters,
+        range,
+    } = url_signals();
 
     // Keep editor in sync with URL on first load and back/forward —
     // but don't clobber in-progress edits.
@@ -63,7 +75,16 @@ pub fn Search() -> impl IntoView {
         }
     });
 
-    let rows = rows_resource(executed_q, page);
+    // Effective query = base + filters + range clauses. This is what
+    // the rows resource is keyed on, NOT the raw editor buffer.
+    let effective_q = Memo::new(move |_| {
+        let base = executed_q.get();
+        let fs = filters.get();
+        let r = range.get();
+        effective_query(&base, &fs, &r)
+    });
+
+    let rows = rows_resource(effective_q, page);
 
     // Capture the router navigator ONCE here, during component setup —
     // `use_navigate()` panics outside the `<Router>` reactive context,
@@ -75,14 +96,113 @@ pub fn Search() -> impl IntoView {
     let on_submit = {
         let goto = goto.clone();
         Callback::new(move |()| {
-            goto(&query_text.get_untracked(), 0, mode.get_untracked(), false);
+            goto(
+                &query_text.get_untracked(),
+                0,
+                mode.get_untracked(),
+                &filters.get_untracked(),
+                &range.get_untracked(),
+                false,
+            );
         })
     };
 
     let on_paginate = {
         let goto = goto.clone();
         Callback::new(move |new_page: usize| {
-            goto(&executed_q.get_untracked(), new_page, Mode::Snapshot, true);
+            goto(
+                &executed_q.get_untracked(),
+                new_page,
+                Mode::Snapshot,
+                &filters.get_untracked(),
+                &range.get_untracked(),
+                true,
+            );
+        })
+    };
+
+    // Filter mutation — appends (dedup'd) to the current set and
+    // navigates. Page resets to 0 since the result set changed.
+    let on_add_filter = {
+        let goto = goto.clone();
+        Callback::new(move |f: Filter| {
+            let mut current = filters.get_untracked();
+            if current.iter().any(|existing| existing == &f) {
+                return;
+            }
+            current.push(f);
+            goto(
+                &executed_q.get_untracked(),
+                0,
+                mode.get_untracked(),
+                &current,
+                &range.get_untracked(),
+                false,
+            );
+        })
+    };
+
+    let on_remove_filter = {
+        let goto = goto.clone();
+        Callback::new(move |idx: usize| {
+            let mut current = filters.get_untracked();
+            if idx >= current.len() {
+                return;
+            }
+            current.remove(idx);
+            goto(
+                &executed_q.get_untracked(),
+                0,
+                mode.get_untracked(),
+                &current,
+                &range.get_untracked(),
+                false,
+            );
+        })
+    };
+
+    let on_clear_filters = {
+        let goto = goto.clone();
+        Callback::new(move |()| {
+            if filters.get_untracked().is_empty() {
+                return;
+            }
+            goto(
+                &executed_q.get_untracked(),
+                0,
+                mode.get_untracked(),
+                &[],
+                &range.get_untracked(),
+                false,
+            );
+        })
+    };
+
+    let on_range_change = {
+        let goto = goto.clone();
+        Callback::new(move |new_range: RangeSpec| {
+            if range.get_untracked() == new_range {
+                return;
+            }
+            goto(
+                &executed_q.get_untracked(),
+                0,
+                mode.get_untracked(),
+                &filters.get_untracked(),
+                &new_range,
+                false,
+            );
+        })
+    };
+
+    // Free-form navigation used by detail-row "Show context" / "Find
+    // similar" buttons — resets filters and range to defaults so the
+    // new query runs cleanly.
+    let on_navigate_q = {
+        let goto = goto.clone();
+        Callback::new(move |new_q: String| {
+            query_text.set(new_q.clone());
+            goto(&new_q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
         })
     };
 
@@ -95,7 +215,7 @@ pub fn Search() -> impl IntoView {
 
     Effect::new(move |_| {
         let current_mode = mode.get();
-        let q = executed_q.get();
+        let q = effective_q.get();
         stream_handle.update_value(|slot| *slot = None);
         ring.set(RingBuffer::default());
         live_snapshot.set(None);
@@ -137,15 +257,11 @@ pub fn Search() -> impl IntoView {
     let current_section = section::from_url(current_app);
     let bus = ToastBus::new();
 
-    // Visual-only range pill (commit 4 scope: doesn't inject `last=X`
-    // into the query yet — that comes when the date-range custom
-    // popover lands).
-    let range = RwSignal::new("15m");
     // Active results tab.
     let active_tab = RwSignal::new(ResultsTab::Events);
 
     let is_chart_query = Memo::new(move |_| {
-        let q = executed_q.get();
+        let q = effective_q.get();
         if q.trim().is_empty() {
             return false;
         }
@@ -155,14 +271,10 @@ pub fn Search() -> impl IntoView {
     let ring_result = Signal::derive(move || ring_to_result(&ring.read()));
 
     // "Loading" is derived from the resource state: a non-empty
-    // executed query that hasn't produced a result yet means a query
-    // is in flight. LocalResource doesn't expose `.loading()` like
-    // server-side `Resource` does — the `.get()` value is `None`
-    // while the future is pending, but it's also `None` before the
-    // first trigger. We additionally require executed_q to be
-    // non-empty so the initial blank state doesn't show as Hauling.
+    // effective query that hasn't produced a result yet means a query
+    // is in flight.
     let loading =
-        Signal::derive(move || !executed_q.get().trim().is_empty() && rows.get().is_none());
+        Signal::derive(move || !effective_q.get().trim().is_empty() && rows.get().is_none());
 
     // Status bar inputs.
     let status = Signal::derive(move || match (mode.get(), loading.get()) {
@@ -185,6 +297,11 @@ pub fn Search() -> impl IntoView {
         Callback::new(move |t| bus.info_tuple(t));
     let running = loading;
 
+    // Signal wrappers so child components get `Signal<T>` props rather
+    // than memos directly.
+    let filters_sig = Signal::derive(move || filters.get());
+    let range_sig = Signal::derive(move || range.get());
+
     view! {
         <div class="shell">
             <TopBar mode=current_app me=Signal::derive(move || me.get())/>
@@ -192,11 +309,6 @@ pub fn Search() -> impl IntoView {
                 <Rail mode=current_app section=Signal::derive(move || current_section.get())/>
                 <Show when=move || me.get().is_some() fallback=|| view! { <main class="main"></main> }>
                     <main class="main">
-                        // Top-level dispatch: only AppMode::Search renders
-                        // the working search workspace; the rest get a
-                        // placeholder card. Section dispatch within Search
-                        // (History/Schema → SectionPlaceholder) is nested
-                        // beneath this branch.
                         <Show
                             when=move || current_app.get() == AppMode::Search
                             fallback=move || view! {
@@ -205,28 +317,46 @@ pub fn Search() -> impl IntoView {
                         >
                             <Show
                                 when=move || current_section.get() == "search"
-                                fallback=move || view! { <SectionPlaceholder section=current_section/> }
+                                fallback=move || match current_section.get().as_str() {
+                                    "history" => view! { <HistoryPage bus=bus/> }.into_any(),
+                                    "schema" => view! { <SchemaPage bus=bus/> }.into_any(),
+                                    _ => view! { <SectionPlaceholder section=current_section/> }.into_any(),
+                                }
                             >
                                 <div class="search-layout">
-                                    <FacetSidebar rows=rows/>
+                                    <FacetSidebar
+                                        rows=rows
+                                        filters=filters_sig
+                                        on_add=on_add_filter
+                                        on_clear=on_clear_filters
+                                    />
                                     <div class="search-col">
                                         <EditorWrap
                                             query=query_text
                                             on_submit=on_submit
-                                            range=range
+                                            range=range_sig
+                                            on_range_change=on_range_change
                                             running=running
                                             on_toast=on_toast
                                         />
-                                        <MetaStrip count=last_count truncated=truncated bus=bus/>
+                                        <MetaStrip
+                                            count=last_count
+                                            truncated=truncated
+                                            filters=filters_sig
+                                            on_remove=on_remove_filter
+                                            bus=bus
+                                        />
                                         <Tabs active=active_tab count=last_count/>
                                         {move || match (active_tab.get(), mode.get()) {
                                             (ResultsTab::Events, Mode::Snapshot) => view! {
                                                 <>
-                                                    <Histogram rows=rows/>
+                                                    <Histogram rows=rows range=range_sig/>
                                                     <ResultsTable
                                                         page=page
                                                         rows=rows
                                                         on_paginate=on_paginate
+                                                        on_add_filter=on_add_filter
+                                                        on_navigate=on_navigate_q
                                                         bus=bus
                                                     />
                                                 </>
@@ -251,7 +381,7 @@ pub fn Search() -> impl IntoView {
             <StatusBar
                 status=status
                 count=last_count
-                range=Signal::derive(move || range.get())
+                range=range_sig
                 lagged=Signal::derive(move || lagged.get())
             />
             <Toasts bus=bus/>
