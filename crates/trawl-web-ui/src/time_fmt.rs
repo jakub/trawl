@@ -71,6 +71,20 @@ pub fn format_duration(ms: u64) -> String {
     format!("{s}.{frac:03}s")
 }
 
+/// Parse a timestamp string into `DateTime<Utc>`.
+///
+/// Tries RFC 3339 first, then `DuckDB`'s space-separated format.
+/// `DuckDB` timestamps carry no timezone; we assume UTC.
+#[must_use]
+pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
 fn month_abbrev(m: u32) -> &'static str {
     match m {
         1 => "Jan",
@@ -137,5 +151,36 @@ mod tests {
     #[test]
     fn malformed_input_passthrough() {
         assert_eq!(time_ago("not a date", now()), "not a date");
+    }
+
+    #[test]
+    fn parse_timestamp_rfc3339() {
+        let dt = parse_timestamp("2026-04-18T12:00:00Z").unwrap();
+        assert_eq!(dt, Utc.with_ymd_and_hms(2026, 4, 18, 12, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_timestamp_rfc3339_with_offset() {
+        let dt = parse_timestamp("2026-04-18T14:00:00+02:00").unwrap();
+        assert_eq!(dt, Utc.with_ymd_and_hms(2026, 4, 18, 12, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_timestamp_duckdb_no_frac() {
+        let dt = parse_timestamp("2026-04-18 12:00:00").unwrap();
+        assert_eq!(dt, Utc.with_ymd_and_hms(2026, 4, 18, 12, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_timestamp_duckdb_with_frac() {
+        let dt = parse_timestamp("2026-04-18 12:00:00.123456").unwrap();
+        assert_eq!(dt.timestamp(), 1_776_513_600);
+        assert_eq!(dt.timestamp_subsec_micros(), 123_456);
+    }
+
+    #[test]
+    fn parse_timestamp_garbage_returns_none() {
+        assert!(parse_timestamp("not a date").is_none());
+        assert!(parse_timestamp("").is_none());
     }
 }
