@@ -127,8 +127,9 @@ pub fn SaveAsNetModal(
                 </div>
 
                 <div class="m-body">
-                    <div class="preview" title=query.clone()>
-                        <span class="lb">"QUERY"</span>{query.clone()}
+                    <div class="m-field">
+                        <label>"Query"</label>
+                        <div class="preview" title=query.clone()>{query.clone()}</div>
                     </div>
 
                     <div class="m-field">

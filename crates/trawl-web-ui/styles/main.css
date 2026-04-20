@@ -1730,16 +1730,12 @@ textarea:focus-visible,
 }
 .modal .m-hd .x:hover { color: var(--ink); background: var(--panel-2); }
 
-.modal .m-body { padding: 14px 16px 4px; display: flex; flex-direction: column; gap: 12px; }
+.modal .m-body { padding: 14px 16px 14px; display: flex; flex-direction: column; gap: 12px; }
 .modal .m-body .preview {
   background: var(--panel-2); border: 1px solid var(--line);
   border-radius: 3px; padding: 8px 10px;
   font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-2);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.modal .m-body .preview .lb {
-  font-family: var(--font-ui); font-size: 10px; text-transform: uppercase;
-  letter-spacing: .08em; color: var(--ink-3); margin-right: 8px; font-weight: 600;
+  white-space: pre-wrap; word-break: break-all;
 }
 .modal .m-field { display: flex; flex-direction: column; gap: 4px; }
 .modal .m-field label {
