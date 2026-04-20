@@ -432,7 +432,7 @@ fn find_col(columns: &[String], names: &[&str]) -> Option<usize> {
     None
 }
 
-/// Build a `@timestamp >= "<t-30s>" @timestamp <= "<t+30s>"` window around
+/// Build a `@timestamp>="<t-30s>" @timestamp<="<t+30s>"` window around
 /// this row's timestamp, narrowed to the same host when available.
 fn build_context_query(row: &[Value], columns: &[String]) -> Option<String> {
     let ti = find_col(columns, &["_time", "time", "timestamp", "@timestamp"])?;
@@ -449,7 +449,7 @@ fn build_context_query(row: &[Value], columns: &[String]) -> Option<String> {
         .unwrap_or_default();
 
     Some(format!(
-        "{host_clause}@timestamp >= \"{}\" @timestamp <= \"{}\"",
+        "{host_clause}@timestamp>=\"{}\" @timestamp<=\"{}\"",
         from.to_rfc3339(),
         to.to_rfc3339()
     ))
