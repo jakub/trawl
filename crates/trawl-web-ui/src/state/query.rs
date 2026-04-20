@@ -94,7 +94,8 @@ fn encode_filters(filters: &[Filter]) -> String {
         .map(|f| {
             let val = js_sys::encode_uri_component(&f.value)
                 .as_string()
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .replace(',', "%2C");
             format!("{}{}={}", f.op.prefix(), f.field, val)
         })
         .collect();

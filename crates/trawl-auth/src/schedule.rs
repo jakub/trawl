@@ -56,13 +56,15 @@ pub struct ReportRun {
 pub fn parse_interval(s: &str) -> Result<u64, AuthError> {
     let s = s.trim();
     if s.is_empty() {
-        return Err(AuthError::IntervalTooShort { secs: 0 });
+        return Err(AuthError::InvalidInterval {
+            input: s.to_string(),
+        });
     }
 
     let (digits, unit) = s.split_at(s.len() - 1);
-    let value: u64 = digits
-        .parse()
-        .map_err(|_| AuthError::IntervalTooShort { secs: 0 })?;
+    let value: u64 = digits.parse().map_err(|_| AuthError::InvalidInterval {
+        input: s.to_string(),
+    })?;
 
     let secs = match unit {
         "s" => value,
@@ -70,7 +72,11 @@ pub fn parse_interval(s: &str) -> Result<u64, AuthError> {
         "h" => value * 3600,
         "d" => value * 86400,
         "w" => value * 604_800,
-        _ => return Err(AuthError::IntervalTooShort { secs: 0 }),
+        _ => {
+            return Err(AuthError::InvalidInterval {
+                input: s.to_string(),
+            });
+        }
     };
 
     if secs < MIN_INTERVAL_SECS {

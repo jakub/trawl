@@ -1458,20 +1458,25 @@ pub async fn trigger_run(
         .find(|q| q.id == saved_id)
         .ok_or_else(|| ServerError::NotFound("saved query not found".into()))?;
 
-    // Require a schedule (runs are stored under schedule history).
-    let schedule = state
-        .auth
-        .schedule
-        .lock()
-        .get_schedule_for_saved_query(saved_id, key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to get schedule: {e}")))?
-        .ok_or_else(|| {
-            ServerError::BadRequest("attach a schedule before triggering a run".into())
-        })?;
-
-    // Atomically start a run (prevents concurrent execution).
+    // Single lock scope: look up schedule, check max_runs, start run atomically.
     let run_id = {
         let store = state.auth.schedule.lock();
+        let schedule = store
+            .get_schedule_for_saved_query(saved_id, key_id)
+            .map_err(|e| ServerError::Internal(format!("failed to get schedule: {e}")))?
+            .ok_or_else(|| {
+                ServerError::BadRequest("attach a schedule before triggering a run".into())
+            })?;
+
+        if let Some(max) = schedule.max_runs {
+            let count = store.count_runs(schedule.id).unwrap_or(0);
+            if count >= max {
+                return Err(ServerError::BadRequest(
+                    "max runs reached for this net".into(),
+                ));
+            }
+        }
+
         store
             .start_run(schedule.id, saved_id, &saved.query)
             .map_err(|e| ServerError::Internal(format!("failed to start run: {e}")))?

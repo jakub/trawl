@@ -69,14 +69,9 @@ pub fn Search() -> impl IntoView {
         range,
     } = url_signals();
 
-    // Keep editor in sync with URL on first load and back/forward —
-    // but don't clobber in-progress edits.
+    // Keep editor in sync with URL on first load and back/forward.
     Effect::new(move |_| {
-        let url_q = executed_q.get();
-        let buf = query_text.get_untracked();
-        if buf.is_empty() || buf == url_q {
-            query_text.set(url_q);
-        }
+        query_text.set(executed_q.get());
     });
 
     // Effective query = base + filters + range clauses. This is what
@@ -216,6 +211,11 @@ pub fn Search() -> impl IntoView {
     let lagged = RwSignal::new(None::<u64>);
     let stream_handle: StoredValue<Option<StreamLifecycle>, LocalStorage> =
         StoredValue::new_local(None);
+    on_cleanup(move || {
+        stream_handle.update_value(|slot| {
+            *slot = None;
+        });
+    });
 
     Effect::new(move |_| {
         let current_mode = mode.get();
@@ -272,7 +272,7 @@ pub fn Search() -> impl IntoView {
         trawl_core::parser::parse(&q).is_ok_and(|ast| ast.has_aggregation())
     });
 
-    let ring_result = Signal::derive(move || ring_to_result(&ring.read()));
+    let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
     // "Loading" is derived from the resource state: a non-empty
     // effective query that hasn't produced a result yet means a query
