@@ -58,9 +58,8 @@ pub fn MetaStrip(
                     </span>
                 }
             }).collect::<Vec<_>>()}
-            <span class="sp"></span>
             <span
-                class="action"
+                class="action first"
                 on:click=move |_| bus.push(
                     ToastKind::Info,
                     "Save",
