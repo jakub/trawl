@@ -806,6 +806,27 @@ pub struct DeleteScheduleResponse {
     pub deleted: bool,
 }
 
+/// A report run enriched with the owning saved query's name and ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalRunSummary {
+    /// Saved query ("net") ID.
+    pub net_id: i64,
+    /// Saved query name.
+    pub net_name: String,
+    /// Run details.
+    #[serde(flatten)]
+    pub run: ReportRunSummary,
+}
+
+/// Paginated list of runs across all saved queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAllRunsResponse {
+    /// Runs (most recent first).
+    pub runs: Vec<GlobalRunSummary>,
+    /// Total number of runs for this user.
+    pub total: usize,
+}
+
 // -- ingest ------------------------------------------------------------------
 
 /// A per-event error from the ingest endpoint.

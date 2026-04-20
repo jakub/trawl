@@ -765,6 +765,58 @@ impl ScheduleStore {
         )?;
         Ok(count)
     }
+
+    /// List runs across ALL saved queries for a user, paginated.
+    /// Returns `(ReportRun, net_name)` pairs, most recent first.
+    pub fn list_all_runs(
+        &self,
+        key_id: i64,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(ReportRun, String)>, AuthError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.schedule_id, r.saved_query_id, r.query, r.status,
+                    r.started_at, r.finished_at, r.duration_ms, r.row_count,
+                    r.error_message, r.result_path,
+                    sq.name
+             FROM report_runs r
+             JOIN schedules s ON s.id = r.schedule_id
+             JOIN saved_queries sq ON sq.id = r.saved_query_id
+             WHERE s.key_id = ?1
+             ORDER BY r.started_at DESC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+
+        let rows = stmt
+            .query_map(
+                params![
+                    key_id,
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                    i64::try_from(offset).unwrap_or(0),
+                ],
+                |row| {
+                    let run = row_to_report_run(row)?;
+                    let net_name: String = row.get(11)?;
+                    Ok((run, net_name))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    /// Count all runs across all saved queries for a user.
+    pub fn count_all_runs(&self, key_id: i64) -> Result<usize, AuthError> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM report_runs r
+             JOIN schedules s ON s.id = r.schedule_id
+             WHERE s.key_id = ?1",
+            params![key_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -1168,5 +1220,71 @@ mod tests {
         assert_eq!(store.count_runs_for_saved_query(sq_id, 1).unwrap(), 1);
         // Wrong user sees 0.
         assert_eq!(store.count_runs_for_saved_query(sq_id, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn list_all_runs_paginated() {
+        let store = test_store();
+        let sq1 = insert_saved_query(&store, 1, "alpha");
+        let sq2 = insert_saved_query(&store, 1, "beta");
+        let sched1 = store.create_schedule(sq1, 1, 300, None).unwrap();
+        let sched2 = store.create_schedule(sq2, 1, 300, None).unwrap();
+
+        for _ in 0..3 {
+            let rid = store.start_run(sched1.id, sq1, "q1").unwrap().unwrap();
+            store
+                .finish_run(rid, "success", 50, None, None, None, None)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let rid = store.start_run(sched2.id, sq2, "q2").unwrap().unwrap();
+            store
+                .finish_run(rid, "success", 80, None, None, None, None)
+                .unwrap();
+        }
+
+        let all = store.list_all_runs(1, 100, 0).unwrap();
+        assert_eq!(all.len(), 5);
+
+        let page = store.list_all_runs(1, 2, 0).unwrap();
+        assert_eq!(page.len(), 2);
+
+        let page2 = store.list_all_runs(1, 2, 2).unwrap();
+        assert_eq!(page2.len(), 2);
+
+        assert_eq!(store.count_all_runs(1).unwrap(), 5);
+
+        let names: Vec<&str> = all.iter().map(|(_, name)| name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+    }
+
+    #[test]
+    fn list_all_runs_user_isolation() {
+        let store = test_store();
+        let sq1 = insert_saved_query(&store, 1, "user1-net");
+        let sq2 = insert_saved_query(&store, 2, "user2-net");
+        let sched1 = store.create_schedule(sq1, 1, 300, None).unwrap();
+        let sched2 = store.create_schedule(sq2, 2, 300, None).unwrap();
+
+        let rid = store.start_run(sched1.id, sq1, "q1").unwrap().unwrap();
+        store
+            .finish_run(rid, "success", 50, None, None, None, None)
+            .unwrap();
+        let rid = store.start_run(sched2.id, sq2, "q2").unwrap().unwrap();
+        store
+            .finish_run(rid, "success", 80, None, None, None, None)
+            .unwrap();
+
+        let user1_runs = store.list_all_runs(1, 100, 0).unwrap();
+        assert_eq!(user1_runs.len(), 1);
+        assert_eq!(user1_runs[0].1, "user1-net");
+
+        let user2_runs = store.list_all_runs(2, 100, 0).unwrap();
+        assert_eq!(user2_runs.len(), 1);
+        assert_eq!(user2_runs[0].1, "user2-net");
+
+        assert_eq!(store.count_all_runs(1).unwrap(), 1);
+        assert_eq!(store.count_all_runs(2).unwrap(), 1);
     }
 }

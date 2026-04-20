@@ -81,6 +81,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
                 .get(handlers::get_schedule)
                 .delete(handlers::delete_schedule),
         )
+        .route("/runs", get(handlers::list_all_runs))
         .route("/saved/{id}/runs", get(handlers::list_report_runs))
         .route("/saved/{id}/runs/{run_id}", get(handlers::get_report_run))
         .route("/export", post(handlers::export))
