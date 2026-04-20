@@ -817,6 +817,33 @@ impl ScheduleStore {
         )?;
         Ok(count)
     }
+
+    /// Aggregate stats across all runs for a user.
+    pub fn runs_stats(&self, key_id: i64) -> Result<(u64, u64, u64, u64, Option<u64>), AuthError> {
+        let row = self.conn.query_row(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN r.status = 'error' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN r.status = 'timeout' THEN 1 ELSE 0 END),
+                    AVG(CASE WHEN r.duration_ms IS NOT NULL THEN r.duration_ms END)
+             FROM report_runs r
+             JOIN schedules s ON s.id = r.schedule_id
+             WHERE s.key_id = ?1",
+            params![key_id],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                ))
+            },
+        )?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let avg_ms = row.4.map(|v| v.max(0.0) as u64);
+        Ok((row.0, row.1, row.2, row.3, avg_ms))
+    }
 }
 
 #[cfg(test)]

@@ -245,7 +245,7 @@ fn poll_and_execute(
     }
 }
 
-async fn execute_scheduled_query(
+pub(crate) async fn execute_scheduled_query(
     schedule_store: Arc<Mutex<ScheduleStore>>,
     pool: ExecutorPool,
     run_id: i64,

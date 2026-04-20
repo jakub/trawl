@@ -19,9 +19,9 @@ use trawl_api::{
     DeleteScheduleResponse, ExportRequest, FieldValuesResponse, GlobalRunSummary, HealthResponse,
     HealthStatus, HistoryEntryResponse, HistoryResponse, ListAllRunsResponse,
     ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
-    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
-    ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse,
-    UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, RunsStatsResponse,
+    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest,
+    StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
 use trawl_auth::keys::VerifiedKey;
 use trawl_auth::roles::Permission;
@@ -31,10 +31,13 @@ use trawl_engine::value::{QueryResult, Value};
 
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
+
 use crate::bus::{EventBus, EventSubscriber as _};
 use crate::error::ServerError;
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
+use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues, CachedSchema};
 
 // -- handlers ----------------------------------------------------------------
@@ -1024,10 +1027,16 @@ pub async fn update_saved(
         .auth
         .saved
         .lock()
-        .update(id, key_id, &req.query)
+        .update(id, key_id, &req.query, req.name.as_deref())
         .map_err(|e| match e {
             trawl_auth::AuthError::NotFound { .. } => {
                 ServerError::NotFound("saved query not found or unauthorized".into())
+            }
+            trawl_auth::AuthError::InvalidName { .. } => {
+                ServerError::BadRequest("invalid name: must match [a-zA-Z0-9_-]+".into())
+            }
+            trawl_auth::AuthError::DuplicateName { name } => {
+                ServerError::BadRequest(format!("name '{name}' is already taken"))
             }
             e => ServerError::Internal(format!("failed to update saved query: {e}")),
         })?;
@@ -1395,6 +1404,115 @@ pub async fn list_all_runs(
             .collect(),
         total,
     }))
+}
+
+/// `GET /api/v1/runs/stats` — aggregate run statistics for the authenticated user.
+pub async fn runs_stats(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<RunsStatsResponse>, ServerError> {
+    if !verified.role.has_permission(Permission::SavedQuery) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = resolve_key_id(&state, &verified)?;
+    let schedule_store = state.auth.schedule.lock();
+
+    let (total_runs, success_count, error_count, timeout_count, avg_duration_ms) = schedule_store
+        .runs_stats(key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to get runs stats: {e}")))?;
+
+    Ok(Json(RunsStatsResponse {
+        total_runs,
+        success_count,
+        error_count,
+        timeout_count,
+        avg_duration_ms,
+    }))
+}
+
+/// `POST /api/v1/saved/{id}/run` — trigger an immediate report run for a saved query.
+///
+/// Bypasses the scheduler interval check. Requires a schedule to be attached
+/// (the run is stored under that schedule's history). Returns the run summary
+/// immediately with status "running" — execution continues in the background.
+pub async fn trigger_run(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Path(saved_id): Path<i64>,
+) -> Result<Json<ReportRunSummary>, ServerError> {
+    if !verified.role.has_permission(Permission::SavedQuery) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let key_id = resolve_key_id(&state, &verified)?;
+
+    // Look up the saved query.
+    let saved = state
+        .auth
+        .saved
+        .lock()
+        .list(key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to list saved queries: {e}")))?
+        .into_iter()
+        .find(|q| q.id == saved_id)
+        .ok_or_else(|| ServerError::NotFound("saved query not found".into()))?;
+
+    // Require a schedule (runs are stored under schedule history).
+    let schedule = state
+        .auth
+        .schedule
+        .lock()
+        .get_schedule_for_saved_query(saved_id, key_id)
+        .map_err(|e| ServerError::Internal(format!("failed to get schedule: {e}")))?
+        .ok_or_else(|| {
+            ServerError::BadRequest("attach a schedule before triggering a run".into())
+        })?;
+
+    // Atomically start a run (prevents concurrent execution).
+    let run_id = {
+        let store = state.auth.schedule.lock();
+        store
+            .start_run(schedule.id, saved_id, &saved.query)
+            .map_err(|e| ServerError::Internal(format!("failed to start run: {e}")))?
+            .ok_or_else(|| {
+                ServerError::BadRequest("a run is already in progress for this net".into())
+            })?
+    };
+
+    // Return the summary immediately, execute in background.
+    let summary = ReportRunSummary {
+        id: run_id,
+        query: saved.query.clone(),
+        status: "running".to_string(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        finished_at: None,
+        duration_ms: None,
+        row_count: None,
+        error_message: None,
+        result_path: None,
+    };
+
+    let schedule_store = Arc::clone(&state.auth.schedule);
+    let pool = state.query.pool.clone();
+    let query = saved.query;
+    let query_name = saved.name;
+    let timeout_secs = state.query.timeout_secs;
+
+    tokio::spawn(async move {
+        execute_scheduled_query(
+            schedule_store,
+            pool,
+            run_id,
+            &query,
+            &query_name,
+            0,
+            timeout_secs,
+        )
+        .await;
+    });
+
+    Ok(Json(summary))
 }
 
 /// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.

@@ -231,6 +231,9 @@ pub struct CreateSavedRequest {
 pub struct UpdateSavedRequest {
     /// The new trawl DSL query string.
     pub query: String,
+    /// Optional new name (must match `[a-zA-Z0-9_-]+`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Request body for exporting query results (`POST /api/v1/export`).
@@ -825,6 +828,22 @@ pub struct ListAllRunsResponse {
     pub runs: Vec<GlobalRunSummary>,
     /// Total number of runs for this user.
     pub total: usize,
+}
+
+/// Aggregate statistics across all report runs for a user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunsStatsResponse {
+    /// Total number of runs (all statuses).
+    pub total_runs: u64,
+    /// Number of successful runs.
+    pub success_count: u64,
+    /// Number of failed runs.
+    pub error_count: u64,
+    /// Number of timed-out runs.
+    pub timeout_count: u64,
+    /// Average execution duration in milliseconds (None if no completed runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_duration_ms: Option<u64>,
 }
 
 // -- ingest ------------------------------------------------------------------
