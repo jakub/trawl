@@ -31,6 +31,7 @@ pub fn RunsPage(bus: ToastBus) -> impl IntoView {
     });
 
     let nets_for_stats = LocalResource::new(|| async move { api::list_saved().await });
+    let stats = LocalResource::new(|| async move { api::runs_stats().await });
 
     let nav = use_navigate();
 
@@ -81,30 +82,17 @@ pub fn RunsPage(bus: ToastBus) -> impl IntoView {
                                 .count()
                         });
 
-                    let (success_rate, avg_dur) = runs.get()
+                    let (success_rate, avg_dur) = stats.get()
                         .and_then(Result::ok)
-                        .map_or(("—".to_string(), "—".to_string()), |resp| {
-                            if resp.runs.is_empty() {
-                                return ("—".to_string(), "—".to_string());
-                            }
-                            let total = resp.runs.len();
-                            let successes = resp.runs.iter()
-                                .filter(|r| r.run.status == "success")
-                                .count();
-                            #[allow(clippy::manual_checked_ops)]
+                        .map_or(("—".to_string(), "—".to_string()), |s| {
+                            let total = s.total_runs;
                             let rate = if total > 0 {
-                                format!("{}%", successes * 100 / total)
+                                format!("{}%", s.success_count * 100 / total)
                             } else {
                                 "—".to_string()
                             };
-                            let durations: Vec<u64> = resp.runs.iter()
-                                .filter_map(|r| r.run.duration_ms)
-                                .collect();
-                            let avg = if durations.is_empty() {
-                                "—".to_string()
-                            } else {
-                                format_duration(durations.iter().sum::<u64>() / durations.len() as u64)
-                            };
+                            let avg = s.avg_duration_ms
+                                .map_or_else(|| "—".to_string(), format_duration);
                             (rate, avg)
                         });
 

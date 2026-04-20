@@ -16,11 +16,19 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::SavedQueryResponse;
 
 use crate::api;
+use crate::components::confirm_modal::ConfirmModal;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{Mode, RangeSpec, navigator};
-use crate::time_fmt::time_ago;
+use crate::time_fmt::{time_ago, time_until};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetSort {
+    Name,
+    LastRun,
+    Created,
+}
 
 #[component]
 #[allow(clippy::too_many_lines)]
@@ -37,9 +45,11 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
     let tab_sig: Signal<String> = Signal::derive(move || tab_param.get());
 
     let filter = RwSignal::new(String::new());
+    let sort = RwSignal::new(NetSort::Name);
     let refresh = RwSignal::new(0u64);
     let show_create_modal = RwSignal::new(false);
     let actions_open: RwSignal<Option<i64>> = RwSignal::new(None);
+    let confirm_delete: RwSignal<Option<(i64, String)>> = RwSignal::new(None);
 
     let nets = LocalResource::new(move || {
         let _ = refresh.get();
@@ -91,7 +101,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
         })
     };
 
-    let on_delete = {
+    let do_delete = {
         move |id: i64, name: String| {
             spawn_local(async move {
                 match api::delete_saved(id).await {
@@ -111,15 +121,53 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
         }
     };
 
-    let on_run_now = {
+    let on_run_in_search = {
         let goto = goto_search.clone();
         move |q: String| {
             goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
         }
     };
 
+    let on_trigger_run = {
+        move |id: i64, name: String| {
+            spawn_local(async move {
+                match api::trigger_run(id).await {
+                    Ok(_) => {
+                        bus.push(
+                            ToastKind::Success,
+                            "Run triggered",
+                            Some(format!("'{name}' is executing.")),
+                        );
+                        refresh.update(|n| *n += 1);
+                    }
+                    Err(e) => {
+                        bus.push(ToastKind::Error, "Trigger failed", Some(e.to_string()));
+                    }
+                }
+            });
+        }
+    };
+
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = move || js_sys::Date::now() as i64;
+
+    let sort_nets = move |nets: &mut [&SavedQueryResponse]| match sort.get() {
+        NetSort::Name => nets.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        NetSort::LastRun => nets.sort_by(|a, b| {
+            let a_ts = a
+                .schedule
+                .as_ref()
+                .and_then(|s| s.last_run.as_ref())
+                .map_or("", |r| r.started_at.as_str());
+            let b_ts = b
+                .schedule
+                .as_ref()
+                .and_then(|s| s.last_run.as_ref())
+                .map_or("", |r| r.started_at.as_str());
+            b_ts.cmp(a_ts)
+        }),
+        NetSort::Created => nets.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+    };
 
     view! {
         <div class="page">
@@ -137,6 +185,21 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                             on:input=move |e| filter.set(event_target_value(&e))
                         />
                     </div>
+                    <select
+                        class="sort-select"
+                        on:change=move |e| {
+                            let v = event_target_value(&e);
+                            sort.set(match v.as_str() {
+                                "last_run" => NetSort::LastRun,
+                                "created" => NetSort::Created,
+                                _ => NetSort::Name,
+                            });
+                        }
+                    >
+                        <option value="name" selected=move || sort.get() == NetSort::Name>"Sort: Name"</option>
+                        <option value="last_run" selected=move || sort.get() == NetSort::LastRun>"Sort: Last Run"</option>
+                        <option value="created" selected=move || sort.get() == NetSort::Created>"Sort: Created"</option>
+                    </select>
                     <button class="btn-pri" on:click=move |_| show_create_modal.set(true)>
                         "+ New Net"
                     </button>
@@ -148,7 +211,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                     <div style="flex:2">"Name"</div>
                     <div style="flex:3">"Query"</div>
                     <div style="flex:0 0 80px">"Schedule"</div>
-                    <div style="flex:0 0 100px">"Last Run"</div>
+                    <div style="flex:0 0 140px">"Last Run"</div>
                     <div style="flex:0 0 40px"></div>
                 </div>
                 <div class="tbl-body">
@@ -168,7 +231,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                             }
                             Some(Ok(resp)) => {
                                 let needle = filter.get().to_lowercase();
-                                let visible: Vec<&SavedQueryResponse> = resp.queries.iter()
+                                let mut visible: Vec<&SavedQueryResponse> = resp.queries.iter()
                                     .filter(|q| {
                                         if needle.is_empty() { return true; }
                                         q.name.to_lowercase().contains(&needle)
@@ -186,14 +249,17 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                                         </div>
                                     }.into_any();
                                 }
+                                sort_nets(&mut visible);
                                 let count = visible.len();
                                 let rows = visible.into_iter().map(|net| {
                                     let id = net.id;
                                     let name = net.name.clone();
                                     let query_text = net.query.clone();
                                     let name_for_delete = net.name.clone();
+                                    let name_for_trigger = net.name.clone();
                                     let query_for_run = net.query.clone();
-                                    let on_run_now = on_run_now.clone();
+                                    let on_run_in_search = on_run_in_search.clone();
+                                    let on_trigger_run = on_trigger_run.clone();
 
                                     let sched_badge = match &net.schedule {
                                         Some(s) if s.enabled => {
@@ -211,22 +277,48 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                                         }.into_any(),
                                     };
 
-                                    let last_run_view = match net.schedule.as_ref().and_then(|s| s.last_run.as_ref()) {
-                                        Some(run) => {
-                                            let when = time_ago(&run.started_at, now);
-                                            let dot_class = match run.status.as_str() {
-                                                "success" => "status-dot success",
-                                                "error" | "timeout" => "status-dot error",
-                                                "running" => "status-dot running",
-                                                _ => "status-dot",
-                                            };
-                                            view! {
-                                                <span>
-                                                    <span class=dot_class></span>
-                                                    " "
-                                                    <span class="mono" style="color:var(--ink-2)">{when}</span>
-                                                </span>
-                                            }.into_any()
+                                    let last_run_view = match net.schedule.as_ref() {
+                                        Some(sched) => {
+                                            match sched.last_run.as_ref() {
+                                                Some(run) => {
+                                                    let when = time_ago(&run.started_at, now);
+                                                    let dot_class = match run.status.as_str() {
+                                                        "success" => "status-dot success",
+                                                        "error" | "timeout" => "status-dot error",
+                                                        "running" => "status-dot running",
+                                                        _ => "status-dot",
+                                                    };
+                                                    // Compute next run countdown
+                                                    let next_run_label = if sched.enabled {
+                                                        let started_ms = js_sys::Date::parse(&run.started_at) as i64;
+                                                        let next_ms = started_ms + (sched.interval_secs as i64 * 1000);
+                                                        Some(time_until(next_ms, now))
+                                                    } else {
+                                                        None
+                                                    };
+                                                    view! {
+                                                        <span>
+                                                            <span class=dot_class></span>
+                                                            " "
+                                                            <span class="mono" style="color:var(--ink-2)">{when}</span>
+                                                            {next_run_label.map(|label| view! {
+                                                                <span class="next-run" style="margin-left:6px; font-size:10px; color:var(--ink-3)">{label}</span>
+                                                            })}
+                                                        </span>
+                                                    }.into_any()
+                                                }
+                                                None => {
+                                                    if sched.enabled {
+                                                        view! {
+                                                            <span class="mono" style="color:var(--ink-3); font-size:10px">"pending…"</span>
+                                                        }.into_any()
+                                                    } else {
+                                                        view! {
+                                                            <span style="color:var(--ink-3)">"—"</span>
+                                                        }.into_any()
+                                                    }
+                                                }
+                                            }
                                         }
                                         None => view! {
                                             <span style="color:var(--ink-3)">"—"</span>
@@ -241,7 +333,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                                             <div style="flex:2" class="mono">{name.clone()}</div>
                                             <div style="flex:3; min-width:0" class="mono path">{query_text}</div>
                                             <div style="flex:0 0 80px">{sched_badge}</div>
-                                            <div style="flex:0 0 100px">{last_run_view}</div>
+                                            <div style="flex:0 0 140px">{last_run_view}</div>
                                             <div style="flex:0 0 40px; position:relative">
                                                 <button
                                                     class="btn-icon"
@@ -258,14 +350,26 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                                                             class="item"
                                                             on:click={
                                                                 let q = query_for_run.clone();
-                                                                let run = on_run_now.clone();
+                                                                let run = on_run_in_search.clone();
                                                                 move |e: web_sys::MouseEvent| {
                                                                     e.stop_propagation();
                                                                     actions_open.set(None);
                                                                     run(q.clone());
                                                                 }
                                                             }
-                                                        >"▶ Run now"</div>
+                                                        >"▶ Open in search"</div>
+                                                        <div
+                                                            class="item"
+                                                            on:click={
+                                                                let name = name_for_trigger.clone();
+                                                                let trigger = on_trigger_run.clone();
+                                                                move |e: web_sys::MouseEvent| {
+                                                                    e.stop_propagation();
+                                                                    actions_open.set(None);
+                                                                    trigger(id, name.clone());
+                                                                }
+                                                            }
+                                                        >"⏱ Trigger run"</div>
                                                         <div
                                                             class="item danger"
                                                             on:click={
@@ -273,7 +377,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                                                                 move |e: web_sys::MouseEvent| {
                                                                     e.stop_propagation();
                                                                     actions_open.set(None);
-                                                                    on_delete(id, name.clone());
+                                                                    confirm_delete.set(Some((id, name.clone())));
                                                                 }
                                                             }
                                                         >"Delete"</div>
@@ -323,6 +427,30 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                         if saved { refresh.update(|n| *n += 1); }
                     })
                 />
+            </Show>
+
+            // Delete confirmation modal
+            <Show when=move || confirm_delete.get().is_some()>
+                {move || {
+                    let (del_id, del_name) = confirm_delete.get().unwrap();
+                    let msg = format!("Permanently delete '{del_name}' and all its run history?");
+                    let do_delete = do_delete.clone();
+                    view! {
+                        <ConfirmModal
+                            title="Delete net"
+                            message=msg
+                            confirm_label="Delete"
+                            danger=true
+                            on_confirm=Callback::new(move |()| {
+                                confirm_delete.set(None);
+                                do_delete(del_id, del_name.clone());
+                            })
+                            on_cancel=Callback::new(move |()| {
+                                confirm_delete.set(None);
+                            })
+                        />
+                    }
+                }}
             </Show>
         </div>
     }

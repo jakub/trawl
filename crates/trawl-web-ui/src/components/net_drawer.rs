@@ -17,6 +17,7 @@ use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
 use crate::api;
+use crate::components::sparkline::Sparkline;
 use crate::components::toast::{ToastBus, ToastKind};
 use crate::time_fmt::{format_duration, time_ago};
 
@@ -38,8 +39,40 @@ pub fn NetDrawer(
 ) -> impl IntoView {
     let net_for_query = net.clone();
     let net_for_runs = net.clone();
-    let name_for_hd = net.name.clone();
     let query_for_run = net.query.clone();
+    let net_id_for_trigger = net.id;
+    let name_for_trigger = net.name.clone();
+
+    // -- inline rename --
+    let editing_name = RwSignal::new(false);
+    let name_buf = RwSignal::new(net.name.clone());
+    let original_name = net.name.clone();
+
+    let do_rename = {
+        let net_id = net.id;
+        let original_query = net.query.clone();
+        move || {
+            let new_name = name_buf.get_untracked().trim().to_string();
+            if new_name.is_empty() || new_name == original_name {
+                editing_name.set(false);
+                name_buf.set(original_name.clone());
+                return;
+            }
+            let q = original_query.clone();
+            spawn_local(async move {
+                match api::update_saved_full(net_id, &q, Some(&new_name)).await {
+                    Ok(_) => {
+                        bus.push(ToastKind::Success, "Renamed", None);
+                        editing_name.set(false);
+                        on_refresh.run(());
+                    }
+                    Err(e) => {
+                        bus.push(ToastKind::Error, "Rename failed", Some(e.to_string()));
+                    }
+                }
+            });
+        }
+    };
 
     let close = move || on_close.run(());
     let close_key = close;
@@ -49,7 +82,12 @@ pub fn NetDrawer(
     let on_keydown = move |e: web_sys::KeyboardEvent| {
         if e.key() == "Escape" {
             e.prevent_default();
-            close_key();
+            if editing_name.get_untracked() {
+                editing_name.set(false);
+                name_buf.set(original_name.clone());
+            } else {
+                close_key();
+            }
         }
     };
 
@@ -72,6 +110,26 @@ pub fn NetDrawer(
         move |_| cb.run(q.clone())
     };
 
+    let on_trigger_click = move |_| {
+        let name = name_for_trigger.clone();
+        let id = net_id_for_trigger;
+        spawn_local(async move {
+            match api::trigger_run(id).await {
+                Ok(_) => {
+                    bus.push(
+                        ToastKind::Success,
+                        "Run triggered",
+                        Some(format!("'{name}' is executing.")),
+                    );
+                    on_refresh.run(());
+                }
+                Err(e) => {
+                    bus.push(ToastKind::Error, "Trigger failed", Some(e.to_string()));
+                }
+            }
+        });
+    };
+
     view! {
         <div
             class="sd-scrim"
@@ -89,11 +147,46 @@ pub fn NetDrawer(
             <aside class="sd-drawer" role="dialog" aria-modal="true">
                 <div class="sd-hd">
                     <div class="sd-ttl">
-                        <span class="name">{name_for_hd}</span>
+                        <Show
+                            when=move || editing_name.get()
+                            fallback={
+                                let name = net.name.clone();
+                                move || view! {
+                                    <span
+                                        class="name"
+                                        title="Click to rename"
+                                        style="cursor:pointer"
+                                        on:click=move |_| editing_name.set(true)
+                                    >{name.clone()}</span>
+                                }
+                            }
+                        >
+                            {
+                                let do_rename = do_rename.clone();
+                                let do_rename_blur = do_rename.clone();
+                                view! {
+                                    <input
+                                        class="name-edit"
+                                        prop:value=move || name_buf.get()
+                                        on:input=move |e| name_buf.set(event_target_value(&e))
+                                        on:blur=move |_| do_rename_blur()
+                                        on:keydown=move |e: web_sys::KeyboardEvent| {
+                                            if e.key() == "Enter" {
+                                                e.prevent_default();
+                                                do_rename();
+                                            }
+                                        }
+                                    />
+                                }
+                            }
+                        </Show>
                     </div>
                     <div class="sd-actions">
-                        <button class="btn-sec" on:click=on_run_click>
-                            "▶ Run"
+                        <button class="btn-sec" on:click=on_run_click title="Open query in search">
+                            "▶ Search"
+                        </button>
+                        <button class="btn-sec" on:click=on_trigger_click title="Trigger a scheduled run now">
+                            "⏱ Run"
                         </button>
                         <span class="sd-x" title="Close (Esc)" on:click=move |_| close_x()>
                             <CloseIcon/>
@@ -393,6 +486,29 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
 
     view! {
         <div>
+            // Row count sparkline (trend over recent runs)
+            {move || {
+                let data = runs.get()
+                    .and_then(Result::ok)
+                    .map(|resp| {
+                        resp.runs.iter()
+                            .rev()
+                            .map(|r| r.row_count.unwrap_or(0) as u64)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if data.len() >= 2 {
+                    view! {
+                        <div style="padding:8px 12px; display:flex; align-items:center; gap:8px">
+                            <span style="font-size:11px; color:var(--ink-3)">"Row count trend"</span>
+                            <Sparkline data=data color="var(--blue)".to_string() w=180 h=28/>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! { <div></div> }.into_any()
+                }
+            }}
+
             {move || {
                 let now = now_ms();
                 match runs.get() {
