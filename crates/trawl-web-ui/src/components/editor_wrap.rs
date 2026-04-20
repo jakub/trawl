@@ -10,9 +10,12 @@
 //! callback.
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use leptos::web_sys;
 
+use crate::clipboard::write_clipboard;
 use crate::components::editor::DslEditor;
+use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{QUICK_RANGES, RangeSpec};
 
 #[component]
@@ -32,43 +35,74 @@ pub fn EditorWrap(
     /// True while a query is in flight; flips Run → Hauling…
     #[prop(into)]
     running: Signal<bool>,
-    /// Toast push for the visual-only tools (save/share/format/syntax).
-    #[prop(into)]
-    on_toast: Callback<(&'static str, &'static str)>,
+    /// Bubbles "save" click to the parent so it can open the save modal.
+    on_save: Callback<()>,
+    /// Toast bus for share/format feedback.
+    bus: ToastBus,
 ) -> impl IntoView {
     let on_run = on_submit;
-    let toast_save = on_toast;
-    let toast_share = on_toast;
-    let toast_format = on_toast;
-    let toast_syntax = on_toast;
+    let format_trigger = RwSignal::new(0_u64);
+
+    let do_share = move |_| {
+        let Some(win) = web_sys::window() else { return };
+        let Ok(href) = win.location().href() else {
+            return;
+        };
+        spawn_local(async move {
+            match write_clipboard(&href).await {
+                Ok(()) => bus.push(
+                    ToastKind::Success,
+                    "Copied",
+                    Some("Search URL copied to clipboard.".into()),
+                ),
+                Err(e) => bus.push(ToastKind::Error, "Copy failed", Some(e)),
+            }
+        });
+    };
+
+    let do_format = move |_| {
+        let text = query.get_untracked();
+        if text.trim().is_empty() {
+            return;
+        }
+        match trawl_core::format::reformat(&text) {
+            None => bus.push(
+                ToastKind::Error,
+                "Can't format",
+                Some("Query has parse errors.".into()),
+            ),
+            Some(formatted) if formatted == text => {
+                bus.push(ToastKind::Info, "Format", Some("Already formatted.".into()));
+            }
+            Some(formatted) => {
+                query.set(formatted);
+                format_trigger.update(|v| *v += 1);
+                bus.push(ToastKind::Success, "Formatted", None);
+            }
+        }
+    };
 
     view! {
         <div class="editor-wrap">
             <div class="editor-hd">
                 <span class="anch">"❯"</span>
                 <span class="title">"Query"</span>
-                <span class="dim">"·"</span>
-                <span class="dim">"pipe DSL"</span>
                 <span class="sp"></span>
                 <span
                     class="tool"
-                    on:click=move |_| toast_save.run(("Save", "Saving nets is coming soon."))
+                    on:click=move |_| on_save.run(())
                 >"save"</span>
                 <span
                     class="tool"
-                    on:click=move |_| toast_share.run(("Share", "Sharing search URLs is coming soon."))
+                    on:click=do_share
                 >"share"</span>
                 <span
                     class="tool"
-                    on:click=move |_| toast_format.run(("Format", "Auto-format is coming soon."))
+                    on:click=do_format
                 >"format"</span>
-                <span
-                    class="tool"
-                    on:click=move |_| toast_syntax.run(("Syntax", "Syntax help is coming soon."))
-                >"syntax"</span>
             </div>
             <div class="editor-row">
-                <DslEditor query=query on_submit=on_submit/>
+                <DslEditor query=query on_submit=on_submit format_trigger=format_trigger/>
                 <div class="editor-right">
                     <DateRange value=range on_change=on_range_change/>
                     <button

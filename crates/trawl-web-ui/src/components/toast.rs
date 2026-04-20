@@ -65,12 +65,6 @@ impl ToastBus {
         });
     }
 
-    /// Convenience for the (title, detail) tuple shape passed through
-    /// the editor toolbar's `on_toast` callback.
-    pub fn info_tuple(self, t: (&'static str, &'static str)) {
-        self.push(ToastKind::Info, t.0, Some(t.1.to_owned()));
-    }
-
     fn dismiss(self, id: u64) {
         self.items.update(|v| v.retain(|t| t.id != id));
     }

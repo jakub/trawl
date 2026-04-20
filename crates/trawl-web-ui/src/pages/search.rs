@@ -30,6 +30,7 @@ use crate::components::histogram::Histogram;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::rail::Rail;
 use crate::components::results_table::ResultsTable;
+use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::status_bar::{StatusBar, StatusKind};
 use crate::components::tabs::{ResultsTab, Tabs};
 use crate::components::toast::{ToastBus, Toasts};
@@ -290,11 +291,8 @@ pub fn Search() -> impl IntoView {
     let truncated =
         Signal::derive(move || rows.get().and_then(Result::ok).is_some_and(|r| r.truncated));
 
-    // Toast handle for the editor toolbar's stubbed actions
-    // (save/share/format/syntax) — keeps EditorWrap free of bus details
-    // while still routing through the central toast host.
-    let on_toast: Callback<(&'static str, &'static str)> =
-        Callback::new(move |t| bus.info_tuple(t));
+    let show_save_modal = RwSignal::new(false);
+    let on_save = Callback::new(move |()| show_save_modal.set(true));
     let running = loading;
 
     // Signal wrappers so child components get `Signal<T>` props rather
@@ -337,7 +335,8 @@ pub fn Search() -> impl IntoView {
                                             range=range_sig
                                             on_range_change=on_range_change
                                             running=running
-                                            on_toast=on_toast
+                                            on_save=on_save
+                                            bus=bus
                                         />
                                         <MetaStrip
                                             count=last_count
@@ -385,6 +384,13 @@ pub fn Search() -> impl IntoView {
                 lagged=Signal::derive(move || lagged.get())
             />
             <Toasts bus=bus/>
+            <Show when=move || show_save_modal.get()>
+                <SaveAsNetModal
+                    query=effective_q.get_untracked()
+                    bus=bus
+                    on_close=Callback::new(move |_| show_save_modal.set(false))
+                />
+            </Show>
         </div>
     }
 }
