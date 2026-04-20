@@ -241,8 +241,10 @@ textarea:focus-visible,
   font-size: 12px;
   cursor: pointer;
   box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 0 rgba(0,0,0,.06);
+  transition: scale 150ms ease-out;
 }
 .btn:hover { background: var(--amber-2); }
+.btn:active:not(:disabled) { scale: 0.96; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-full { width: 100%; }
 
@@ -369,6 +371,15 @@ textarea:focus-visible,
   cursor: pointer;
   position: relative;
   transition: color 120ms, background 120ms;
+}
+.topbar .iconbtn::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 40px;
+  height: 40px;
+  transform: translate(-50%, -50%);
 }
 .topbar .iconbtn:hover { color: var(--ink); background: var(--panel-2); }
 
@@ -504,6 +515,7 @@ textarea:focus-visible,
   font-weight: 600;
   letter-spacing: -.4px;
   color: var(--ink);
+  text-wrap: balance;
 }
 
 .placeholder-card p {
@@ -511,6 +523,7 @@ textarea:focus-visible,
   color: var(--ink-2);
   font-size: 13px;
   line-height: 1.55;
+  text-wrap: pretty;
 }
 
 .placeholder-eyebrow {
@@ -607,6 +620,7 @@ textarea:focus-visible,
 
 .results-summary {
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 .results-pager {
@@ -1010,10 +1024,10 @@ textarea:focus-visible,
   justify-content: center;
   gap: 8px;
   box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 0 rgba(0,0,0,.06);
-  transition: all 120ms;
+  transition: background 120ms, box-shadow 120ms, scale 150ms ease-out;
 }
 .run:hover { background: var(--amber-2); box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 0 0 3px var(--amber-glow); }
-.run:active { transform: translateY(1px); }
+.run:active { scale: 0.96; }
 .run.running, .run:disabled {
   background: var(--panel-2);
   color: var(--ink-2);
@@ -1344,6 +1358,7 @@ textarea:focus-visible,
   font-family: var(--font-ui);
   font-size: 11.5px;
   color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
 }
 .statusbar .grp {
   display: flex;
@@ -1620,8 +1635,10 @@ textarea:focus-visible,
   border: 1px solid var(--amber-2);
   border-radius: 2px;
   cursor: pointer;
+  transition: scale 150ms ease-out;
 }
 .btn-pri:hover { background: var(--amber-2); }
+.btn-pri:active:not(:disabled) { scale: 0.96; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Full-page chrome (history, schema, settings etc.)
@@ -1642,9 +1659,9 @@ textarea:focus-visible,
   border-bottom: 1px solid var(--line);
 }
 .page-hd.compact { padding-bottom: 8px; border-bottom: 0; }
-.page h1 { margin: 0; font-family: var(--font-ui); font-size: 22px; font-weight: 600; letter-spacing: -.4px; color: var(--ink); }
+.page h1 { margin: 0; font-family: var(--font-ui); font-size: 22px; font-weight: 600; letter-spacing: -.4px; color: var(--ink); text-wrap: balance; }
 .page h2.subhd { font-family: var(--font-ui); font-size: 14px; font-weight: 600; color: var(--ink-2); margin: 0 0 8px; }
-.page p.sub { margin: 4px 0 0; font-size: 13px; color: var(--ink-3); }
+.page p.sub { margin: 4px 0 0; font-size: 13px; color: var(--ink-3); text-wrap: pretty; }
 .page-hd .actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 
 .inp-wrap {
@@ -1775,6 +1792,34 @@ textarea:focus-visible,
 }
 .modal .m-ft .btn-pri:disabled { opacity: .5; cursor: not-allowed; }
 
+/* Export format selector — segmented pill row inside the modal. */
+.export-formats {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.export-formats .fmt-btn {
+  flex: 1;
+  padding: 6px 0;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-3);
+  background: var(--panel-2);
+  border: none;
+  border-right: 1px solid var(--line);
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.export-formats .fmt-btn:last-child { border-right: none; }
+.export-formats .fmt-btn:hover { color: var(--ink-2); }
+.export-formats .fmt-btn.active {
+  background: var(--amber-wash);
+  color: var(--amber);
+  font-weight: 600;
+}
+
 /* History-specific: footer with paginator (mirror of .results-footer). */
 .tbl-foot {
   display: flex; justify-content: space-between; align-items: center;
@@ -1820,16 +1865,15 @@ textarea:focus-visible,
   position: relative;
   display: flex; flex-direction: column; gap: 10px;
   padding: 12px 14px 8px;
-  background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
-  cursor: pointer; transition: border-color 120ms, box-shadow 120ms, transform 120ms;
+  background: var(--panel); border: none; border-radius: 4px;
+  box-shadow: 0 0 0 1px var(--line), 0 1px 2px rgba(0,0,0,.04);
+  cursor: pointer; transition: box-shadow 120ms, scale 150ms ease-out;
 }
 .sc-card:hover {
-  border-color: color-mix(in oklab, var(--amber) 50%, var(--line));
-  box-shadow: 0 1px 0 var(--amber-wash), 0 4px 12px -8px rgba(0,0,0,.18);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--amber) 50%, var(--line)), 0 4px 12px -8px rgba(0,0,0,.18);
 }
 .sc-card.compact { padding: 10px 12px 6px; gap: 8px; }
 .sc-card.active {
-  border-color: var(--amber);
   box-shadow: 0 0 0 1px var(--amber), 0 6px 18px -10px rgba(0,0,0,.25);
 }
 
@@ -1848,7 +1892,7 @@ textarea:focus-visible,
   font-family: var(--font-ui); font-size: 10px; font-weight: 600;
   text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
 }
-.sc-stats .v { font-size: 13px; color: var(--ink); font-weight: 500; letter-spacing: -.2px; }
+.sc-stats .v { font-size: 13px; color: var(--ink); font-weight: 500; letter-spacing: -.2px; font-variant-numeric: tabular-nums; }
 .sc-card.compact .sc-stats { padding: 0; gap: 2px 10px; }
 .sc-card.compact .sc-stats .v { font-size: 12px; }
 
@@ -1898,7 +1942,7 @@ textarea:focus-visible,
   color: var(--ink-2); background: var(--panel-2);
   border: 1px solid var(--line); border-radius: 3px;
   padding: 3px 8px; cursor: pointer;
-  transition: all 100ms;
+  transition: color 100ms, border-color 100ms, background 100ms;
 }
 .sc-quickact .qa:hover { color: var(--amber-2); border-color: var(--amber); background: var(--amber-wash); }
 .sc-card.compact .sc-quickact { margin: 4px -12px -6px; padding: 4px 10px; }
@@ -2184,6 +2228,7 @@ textarea:focus-visible,
 .stat-card .value {
   font-size: 24px; font-weight: 600; color: var(--ink);
   margin-top: 4px; font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 .run-preview {
