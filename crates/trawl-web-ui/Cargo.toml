@@ -41,18 +41,22 @@ trawl-core = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
     "Clipboard",
     "CloseEvent",
     "Document",
     "Element",
     "EventSource",
     "EventTarget",
+    "HtmlAnchorElement",
     "HtmlElement",
     "Location",
     "MessageEvent",
     "MouseEvent",
     "Navigator",
     "Storage",
+    "Url",
     "Window",
 ] }
 

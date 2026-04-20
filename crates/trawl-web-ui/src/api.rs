@@ -11,10 +11,10 @@
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
 use trawl_api::{
-    CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, HealthResponse,
-    HistoryResponse, ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueryRequest,
-    QueryResponse, ReportRunResponse, SavedQueryResponse, ScheduleResponse, ServiceSchemaResponse,
-    SetScheduleRequest, UpdateSavedRequest,
+    CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, ExportFormat, ExportRequest,
+    HealthResponse, HistoryResponse, ListAllRunsResponse, ListReportRunsResponse,
+    ListSavedResponse, QueryRequest, QueryResponse, ReportRunResponse, SavedQueryResponse,
+    ScheduleResponse, ServiceSchemaResponse, SetScheduleRequest, UpdateSavedRequest,
 };
 
 /// Rows per page for the snapshot results table.
@@ -298,7 +298,7 @@ pub async fn list_runs(
     }
 }
 
-/// GET /api/v1/saved/{id}/runs/{run_id} — single run with result data.
+/// GET `/api/v1/saved/{id}/runs/{run_id}` — single run with result data.
 pub async fn get_run(saved_id: i64, run_id: i64) -> Result<ReportRunResponse, ApiError> {
     let url = format!("/api/v1/saved/{saved_id}/runs/{run_id}");
     let resp = Request::get(&url).send().await?;
@@ -324,4 +324,57 @@ pub async fn list_all_runs(limit: usize, offset: usize) -> Result<ListAllRunsRes
         401 => Err(ApiError::Unauthorized),
         s => Err(ApiError::Status(s)),
     }
+}
+
+/// POST /api/v1/export?format={fmt} — export query results as binary.
+///
+/// Returns raw bytes and a suggested filename from `Content-Disposition`.
+pub async fn export(
+    query: &str,
+    format: &ExportFormat,
+    limit: Option<usize>,
+) -> Result<(Vec<u8>, String), ApiError> {
+    let body = ExportRequest {
+        query: query.to_owned(),
+        limit,
+    };
+    let url = format!("/api/v1/export?format={format}");
+    let resp = Request::post(&url)
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+
+    match resp.status() {
+        200 => {
+            let filename = parse_content_disposition(
+                resp.headers().get("content-disposition").as_deref(),
+                format,
+            );
+            let bytes = resp
+                .binary()
+                .await
+                .map_err(|e| ApiError::Decode(e.to_string()))?;
+            Ok((bytes, filename))
+        }
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+fn parse_content_disposition(header: Option<&str>, format: &ExportFormat) -> String {
+    if let Some(val) = header
+        && let Some(start) = val.find("filename=\"")
+    {
+        let rest = &val[start + 10..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].to_string();
+        }
+    }
+    match format {
+        ExportFormat::Csv => "export.csv",
+        ExportFormat::Json => "export.ndjson",
+        ExportFormat::Parquet => "export.parquet",
+    }
+    .to_string()
 }

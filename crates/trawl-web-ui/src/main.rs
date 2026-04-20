@@ -19,6 +19,9 @@ mod api;
 mod clipboard;
 
 #[cfg(target_arch = "wasm32")]
+mod download;
+
+#[cfg(target_arch = "wasm32")]
 mod app;
 
 #[cfg(target_arch = "wasm32")]

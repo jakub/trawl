@@ -5,6 +5,7 @@
 pub mod chart;
 pub mod editor;
 pub mod editor_wrap;
+pub mod export_modal;
 pub mod facet_sidebar;
 pub mod histogram;
 pub mod live_badge;

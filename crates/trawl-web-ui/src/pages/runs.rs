@@ -48,6 +48,7 @@ pub fn RunsPage(bus: ToastBus) -> impl IntoView {
         }
     };
 
+    #[allow(clippy::cast_possible_truncation)]
     let now_ms = move || js_sys::Date::now() as i64;
 
     view! {
@@ -73,7 +74,7 @@ pub fn RunsPage(bus: ToastBus) -> impl IntoView {
             <div class="stats-row">
                 {move || {
                     let active_nets = nets_for_stats.get()
-                        .and_then(|r| r.ok())
+                        .and_then(Result::ok)
                         .map_or(0, |resp| {
                             resp.queries.iter()
                                 .filter(|q| q.schedule.as_ref().is_some_and(|s| s.enabled))
@@ -81,7 +82,7 @@ pub fn RunsPage(bus: ToastBus) -> impl IntoView {
                         });
 
                     let (success_rate, avg_dur) = runs.get()
-                        .and_then(|r| r.ok())
+                        .and_then(Result::ok)
                         .map_or(("—".to_string(), "—".to_string()), |resp| {
                             if resp.runs.is_empty() {
                                 return ("—".to_string(), "—".to_string());
@@ -90,6 +91,7 @@ pub fn RunsPage(bus: ToastBus) -> impl IntoView {
                             let successes = resp.runs.iter()
                                 .filter(|r| r.run.status == "success")
                                 .count();
+                            #[allow(clippy::manual_checked_ops)]
                             let rate = if total > 0 {
                                 format!("{}%", successes * 100 / total)
                             } else {
