@@ -78,4 +78,9 @@ jobs:
     runs-on: k8s-small
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2
+      # Binary install instead of EmbarkStudios/cargo-deny-action because
+      # that action is Docker-based and k8s-small is unprivileged (no dind).
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-deny
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
