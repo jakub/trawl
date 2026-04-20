@@ -9,6 +9,7 @@ pub mod facet_sidebar;
 pub mod histogram;
 pub mod live_badge;
 pub mod meta_strip;
+pub mod net_drawer;
 pub mod rail;
 pub mod results_table;
 pub mod save_as_net_modal;
