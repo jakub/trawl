@@ -85,7 +85,7 @@ pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 /// - filter clauses and the range clause prepend to the first search stage.
 /// - if the base query already carries `last=X`, the range's `last=` is
 ///   suppressed (user intent wins). Absolute ranges always inject
-///   `@timestamp >= "..." @timestamp <= "..."` regardless.
+///   `@timestamp>="..." @timestamp<="..."` regardless.
 /// - pipeline-only base (`| stats ...`) gets a synthetic `*` search stage
 ///   preceding the filter + range clauses.
 #[must_use]
@@ -207,17 +207,17 @@ fn format_filter(f: &Filter) -> String {
 }
 
 fn format_absolute_range(from: &str, to: &str) -> String {
-    // @timestamp >= "<from>" @timestamp <= "<to>" — DSL parses these as
+    // @timestamp>="<from>" @timestamp<="<to>" — DSL parses these as
     // implicit-AND comparison clauses in the search stage.
     let mut out = String::new();
     if !from.is_empty() {
-        write!(&mut out, "@timestamp >= \"{from}\"").ok();
+        write!(&mut out, "@timestamp>=\"{from}\"").ok();
     }
     if !to.is_empty() && to != "now" {
         if !out.is_empty() {
             out.push(' ');
         }
-        write!(&mut out, "@timestamp <= \"{to}\"").ok();
+        write!(&mut out, "@timestamp<=\"{to}\"").ok();
     }
     out
 }
@@ -316,7 +316,7 @@ mod tests {
         );
         assert_eq!(
             q,
-            "@timestamp >= \"2026-04-18T00:00:00Z\" @timestamp <= \"2026-04-18T23:59:59Z\" *"
+            "@timestamp>=\"2026-04-18T00:00:00Z\" @timestamp<=\"2026-04-18T23:59:59Z\" *"
         );
     }
 
@@ -330,7 +330,7 @@ mod tests {
                 to: "now".into(),
             },
         );
-        assert_eq!(q, "@timestamp >= \"2026-04-18T00:00:00Z\" *");
+        assert_eq!(q, "@timestamp>=\"2026-04-18T00:00:00Z\" *");
     }
 
     #[test]
@@ -343,7 +343,7 @@ mod tests {
                 to: "now".into(),
             },
         );
-        assert_eq!(q, "@timestamp >= \"2026-04-18T00:00:00Z\" last=1h");
+        assert_eq!(q, "@timestamp>=\"2026-04-18T00:00:00Z\" last=1h");
     }
 
     #[test]
