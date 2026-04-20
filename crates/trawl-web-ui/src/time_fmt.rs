@@ -85,6 +85,32 @@ pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
+/// Format a countdown to a future timestamp.
+///
+/// Returns `"in Nm"`, `"in Nh"`, or `"overdue"` if the target is in the past.
+/// Used for next-run countdown in the Jobs section.
+#[must_use]
+pub fn time_until(target_ms: i64, now_ms: i64) -> String {
+    let remaining = target_ms - now_ms;
+    if remaining <= 0 {
+        return "overdue".to_string();
+    }
+
+    let secs = remaining / 1_000;
+    let mins = secs / 60;
+    let hours = mins / 60;
+
+    if mins < 1 {
+        "in <1m".to_string()
+    } else if mins < 60 {
+        format!("in {mins}m")
+    } else if hours < 24 {
+        format!("in {hours}h")
+    } else {
+        format!("in {}d", hours / 24)
+    }
+}
+
 fn month_abbrev(m: u32) -> &'static str {
     match m {
         1 => "Jan",

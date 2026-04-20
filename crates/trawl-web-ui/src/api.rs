@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use trawl_api::{
     CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, ExportFormat, ExportRequest,
     HealthResponse, HistoryResponse, ListAllRunsResponse, ListReportRunsResponse,
-    ListSavedResponse, QueryRequest, QueryResponse, ReportRunResponse, SavedQueryResponse,
-    ScheduleResponse, ServiceSchemaResponse, SetScheduleRequest, UpdateSavedRequest,
+    ListSavedResponse, QueryRequest, QueryResponse, ReportRunResponse, ReportRunSummary,
+    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, ServiceSchemaResponse,
+    SetScheduleRequest, UpdateSavedRequest,
 };
 
 /// Rows per page for the snapshot results table.
@@ -357,6 +358,59 @@ pub async fn export(
                 .map_err(|e| ApiError::Decode(e.to_string()))?;
             Ok((bytes, filename))
         }
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// PUT /api/v1/saved/{id} — update a saved query's DSL and optionally its name.
+pub async fn update_saved_full(
+    id: i64,
+    query: &str,
+    name: Option<&str>,
+) -> Result<SavedQueryResponse, ApiError> {
+    let body = UpdateSavedRequest {
+        query: query.to_owned(),
+        name: name.map(str::to_owned),
+    };
+    let resp = Request::put(&format!("/api/v1/saved/{id}"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+    match resp.status() {
+        200 => resp
+            .json::<SavedQueryResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// POST /api/v1/saved/{id}/run — trigger an immediate report run.
+pub async fn trigger_run(saved_id: i64) -> Result<ReportRunSummary, ApiError> {
+    let resp = Request::post(&format!("/api/v1/saved/{saved_id}/run"))
+        .send()
+        .await?;
+    match resp.status() {
+        200 => resp
+            .json::<ReportRunSummary>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET /api/v1/runs/stats — aggregate run statistics.
+pub async fn runs_stats() -> Result<RunsStatsResponse, ApiError> {
+    let resp = Request::get("/api/v1/runs/stats").send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<RunsStatsResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
         s => Err(ApiError::Status(s)),
     }
