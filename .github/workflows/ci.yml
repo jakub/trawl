@@ -80,6 +80,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Binary install instead of EmbarkStudios/cargo-deny-action because
       # that action is Docker-based and k8s-small is unprivileged (no dind).
+      # cargo-deny shells out to `cargo metadata`, so we need a toolchain.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-deny
         with:
           tool: cargo-deny
