@@ -977,3 +977,169 @@ async fn reader_can_query_and_view_history() {
     // Reader can view history.
     reader.history(Some(10), None).await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Runs stats endpoint
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn runs_stats_empty() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let stats = client.runs_stats().await.unwrap();
+    assert_eq!(stats.total_runs, 0);
+    assert_eq!(stats.success_count, 0);
+    assert_eq!(stats.error_count, 0);
+    assert_eq!(stats.timeout_count, 0);
+    assert_eq!(stats.avg_duration_ms, None);
+}
+
+#[tokio::test]
+async fn runs_stats_rejects_reader() {
+    let server = setup().await;
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    assert_401(reader.runs_stats().await);
+}
+
+// ---------------------------------------------------------------------------
+// Trigger run endpoint
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn trigger_run_requires_schedule() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // Create a net without a schedule.
+    let saved = client
+        .create_saved("trigger-test", "* | head 5")
+        .await
+        .unwrap();
+
+    // Triggering should fail with 400 (no schedule attached).
+    let err = client
+        .trigger_run(saved.id)
+        .await
+        .expect_err("expected error");
+    match err {
+        trawl_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 400);
+        }
+        other => panic!("expected 400, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn trigger_run_starts_execution() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // Create net + attach schedule.
+    let saved = client
+        .create_saved("trigger-exec", "* | head 3")
+        .await
+        .unwrap();
+    client
+        .set_schedule(saved.id, "1h", None, true)
+        .await
+        .unwrap();
+
+    // Trigger the run.
+    let summary = client.trigger_run(saved.id).await.unwrap();
+    assert_eq!(summary.status, "running");
+    assert_eq!(summary.query, "* | head 3");
+
+    // Wait briefly for execution to complete (test fixtures are tiny).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify the run completed.
+    let runs = client
+        .list_report_runs(saved.id, Some(10), None)
+        .await
+        .unwrap();
+    assert_eq!(runs.runs.len(), 1);
+    assert_eq!(runs.runs[0].status, "success");
+
+    // Stats should reflect the completed run.
+    let stats = client.runs_stats().await.unwrap();
+    assert_eq!(stats.total_runs, 1);
+    assert_eq!(stats.success_count, 1);
+    assert!(stats.avg_duration_ms.is_some());
+}
+
+#[tokio::test]
+async fn trigger_run_rejects_reader() {
+    let server = setup().await;
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+
+    assert_401(reader.trigger_run(1).await);
+}
+
+// ---------------------------------------------------------------------------
+// Rename net (update with name)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rename_saved_query() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client.create_saved("old-name", "* | head 1").await.unwrap();
+
+    // Rename it.
+    let updated = client
+        .update_saved_with_name(saved.id, "* | head 1", Some("new-name"))
+        .await
+        .unwrap();
+    assert_eq!(updated.name, "new-name");
+    assert_eq!(updated.query, "* | head 1");
+
+    // Verify via list.
+    let list = client.list_saved().await.unwrap();
+    assert!(list.queries.iter().any(|q| q.name == "new-name"));
+    assert!(!list.queries.iter().any(|q| q.name == "old-name"));
+}
+
+#[tokio::test]
+async fn rename_to_duplicate_fails() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    client
+        .create_saved("taken-name", "* | head 1")
+        .await
+        .unwrap();
+    let other = client
+        .create_saved("other-name", "* | head 2")
+        .await
+        .unwrap();
+
+    // Try to rename `other` to the taken name.
+    let err = client
+        .update_saved_with_name(other.id, "* | head 2", Some("taken-name"))
+        .await
+        .expect_err("expected conflict");
+    match err {
+        trawl_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 400);
+        }
+        other => panic!("expected 400, got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// List all runs endpoint
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_all_runs_paginated() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // Empty initially.
+    let resp = client.list_all_runs(Some(10), None).await.unwrap();
+    assert_eq!(resp.total, 0);
+    assert!(resp.runs.is_empty());
+}

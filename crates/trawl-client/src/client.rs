@@ -13,10 +13,10 @@ use zeroize::Zeroizing;
 use crate::error::ClientError;
 use crate::types::{
     CancelResponse, DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse,
-    FieldValuesResponse, HealthResponse, HistoryResponse, IngestResponse, ListReportRunsResponse,
-    ListSavedResponse, QueriesResponse, QueryResponse, ReportRunResponse, SavedQueryResponse,
-    ScheduleResponse, SchemaResponse, ServiceSchemaResponse, StatsResponse, ValidationResponse,
-    WhoAmIResponse,
+    FieldValuesResponse, HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse,
+    ListReportRunsResponse, ListSavedResponse, QueriesResponse, QueryResponse, ReportRunResponse,
+    ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse,
+    ServiceSchemaResponse, StatsResponse, ValidationResponse, WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
@@ -234,7 +234,20 @@ impl HttpClient {
         query: &str,
     ) -> Result<SavedQueryResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{id}"));
-        let body = UpdateSavedRequestRef { query };
+        let body = UpdateSavedRequestRef { query, name: None };
+        let req = self.client.put(&url).json(&body);
+        self.send_authenticated(req).await
+    }
+
+    /// Update a saved query's DSL and optionally rename it.
+    pub async fn update_saved_with_name(
+        &self,
+        id: i64,
+        query: &str,
+        name: Option<&str>,
+    ) -> Result<SavedQueryResponse, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{id}"));
+        let body = UpdateSavedRequestRef { query, name };
         let req = self.client.put(&url).json(&body);
         self.send_authenticated(req).await
     }
@@ -306,6 +319,37 @@ impl HttpClient {
         run_id: i64,
     ) -> Result<ReportRunResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/runs/{run_id}"));
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Trigger an immediate report run for a saved query.
+    pub async fn trigger_run(&self, saved_id: i64) -> Result<ReportRunSummary, ClientError> {
+        let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/run"));
+        let req = self.client.post(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// List all runs across all saved queries with pagination.
+    pub async fn list_all_runs(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ListAllRunsResponse, ClientError> {
+        let url = self.endpoint("/api/v1/runs");
+        let mut req = self.client.get(&url);
+        if let Some(l) = limit {
+            req = req.query(&[("limit", l.to_string())]);
+        }
+        if let Some(o) = offset {
+            req = req.query(&[("offset", o.to_string())]);
+        }
+        self.send_authenticated(req).await
+    }
+
+    /// Get aggregate run statistics.
+    pub async fn runs_stats(&self) -> Result<RunsStatsResponse, ClientError> {
+        let url = self.endpoint("/api/v1/runs/stats");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
     }

@@ -26,6 +26,8 @@ pub(crate) struct CreateSavedRequestRef<'a> {
 #[derive(Serialize)]
 pub(crate) struct UpdateSavedRequestRef<'a> {
     pub query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -72,10 +74,10 @@ pub use trawl_api::{
     ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,
     DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, ErrorCode, ErrorDetail,
     ErrorEnvelope, ErrorResponse, ErrorSpan, ExportFormat, ExportRequest, FieldValuesResponse,
-    HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse, IngestEventError,
-    IngestResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse,
-    QueryRequest, QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary,
-    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, ServiceColumnStats,
-    ServiceSchema, ServiceSchemaResponse, SetScheduleRequest, StatsResponse, UpdateSavedRequest,
-    ValidationResponse, WhoAmIResponse,
+    GlobalRunSummary, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
+    IngestEventError, IngestResponse, ListAllRunsResponse, ListReportRunsResponse,
+    ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus,
+    ReportRunResponse, ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    SchemaColumnResponse, SchemaResponse, ServiceColumnStats, ServiceSchema, ServiceSchemaResponse,
+    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
