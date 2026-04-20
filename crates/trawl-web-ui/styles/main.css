@@ -1045,7 +1045,6 @@ textarea:focus-visible,
 }
 .meta .num { color: var(--amber); font-weight: 600; }
 .meta .strong { color: var(--ink); font-weight: 500; }
-.meta .sp { flex: 1; }
 .meta .action {
   cursor: pointer;
   color: var(--ink-3);
@@ -1056,6 +1055,7 @@ textarea:focus-visible,
   gap: 4px;
 }
 .meta .action:hover { color: var(--ink); background: var(--panel-2); }
+.meta .action.first { margin-left: auto; }
 
 /* Filter chips — one per active Filter; render between scanned-bytes
  * and the save/export action links. */
