@@ -837,8 +837,7 @@ pub async fn run(
     app.server_version = server_version;
     let is_admin = whoami_result
         .as_ref()
-        .map(|w| w.permissions.iter().any(|p| p == "server_manage"))
-        .unwrap_or(false);
+        .is_ok_and(|w| w.permissions.iter().any(|p| p == "server_manage"));
     app.dashboard.is_admin = is_admin;
     if is_admin {
         tracing::info!("admin privileges detected — Dashboard tab enabled");
@@ -920,14 +919,12 @@ where
                 Event::Mouse(mouse) if app.mouse_enabled => {
                     app.handle_mouse(mouse);
                 }
-                Event::Paste(text) => {
-                    if app.focus == Focus::Editor {
-                        let tab = app.active_tab_mut();
-                        tab.editor.save_snapshot();
-                        tab.editor.delete_selection();
-                        tab.editor.insert_text(&text);
-                        tab.mark_editor_dirty();
-                    }
+                Event::Paste(text) if app.focus == Focus::Editor => {
+                    let tab = app.active_tab_mut();
+                    tab.editor.save_snapshot();
+                    tab.editor.delete_selection();
+                    tab.editor.insert_text(&text);
+                    tab.mark_editor_dirty();
                 }
                 _ => {}
             }

@@ -43,10 +43,8 @@ impl App {
                 self.focus = Focus::Editor;
             }
             // Open search with `/`
-            (KeyModifiers::NONE, KeyCode::Char('/')) => {
-                if self.active_tab().result.is_some() {
-                    self.results_search = Some(ResultsSearch::new());
-                }
+            (KeyModifiers::NONE, KeyCode::Char('/')) if self.active_tab().result.is_some() => {
+                self.results_search = Some(ResultsSearch::new());
             }
             // Next match: n
             (KeyModifiers::NONE, KeyCode::Char('n')) => {
@@ -72,85 +70,71 @@ impl App {
                 }
             }
             // Open column picker: H (Shift+h)
-            (KeyModifiers::SHIFT, KeyCode::Char('H')) => {
-                if self.active_tab().column_config.is_some() {
-                    self.popup = Some(Popup::ColumnPicker {
-                        selected: 0,
-                        scroll: 0,
-                    });
-                }
+            (KeyModifiers::SHIFT, KeyCode::Char('H'))
+                if self.active_tab().column_config.is_some() =>
+            {
+                self.popup = Some(Popup::ColumnPicker {
+                    selected: 0,
+                    scroll: 0,
+                });
             }
             // Row selection: Up
-            (KeyModifiers::NONE, KeyCode::Up) => {
-                if row_count > 0 {
-                    let tab = self.active_tab_mut();
-                    tab.selected_row = Some(match tab.selected_row {
-                        Some(r) => r.saturating_sub(1),
-                        None => 0,
-                    });
-                    self.ensure_selected_row_visible();
-                }
+            (KeyModifiers::NONE, KeyCode::Up) if row_count > 0 => {
+                let tab = self.active_tab_mut();
+                tab.selected_row = Some(match tab.selected_row {
+                    Some(r) => r.saturating_sub(1),
+                    None => 0,
+                });
+                self.ensure_selected_row_visible();
             }
             // Row selection: Down
-            (KeyModifiers::NONE, KeyCode::Down) => {
-                if row_count > 0 {
-                    let tab = self.active_tab_mut();
-                    let max_row = row_count.saturating_sub(1);
-                    tab.selected_row = Some(match tab.selected_row {
-                        Some(r) => (r + 1).min(max_row),
-                        None => 0,
-                    });
-                    self.ensure_selected_row_visible();
-                }
+            (KeyModifiers::NONE, KeyCode::Down) if row_count > 0 => {
+                let tab = self.active_tab_mut();
+                let max_row = row_count.saturating_sub(1);
+                tab.selected_row = Some(match tab.selected_row {
+                    Some(r) => (r + 1).min(max_row),
+                    None => 0,
+                });
+                self.ensure_selected_row_visible();
             }
             // Page up: move selection by one page
-            (KeyModifiers::NONE, KeyCode::PageUp) => {
-                if row_count > 0 {
-                    let tab = self.active_tab_mut();
-                    let page = tab.last_visible_rows;
-                    tab.selected_row = Some(match tab.selected_row {
-                        Some(r) => r.saturating_sub(page),
-                        None => 0,
-                    });
-                    self.ensure_selected_row_visible();
-                }
+            (KeyModifiers::NONE, KeyCode::PageUp) if row_count > 0 => {
+                let tab = self.active_tab_mut();
+                let page = tab.last_visible_rows;
+                tab.selected_row = Some(match tab.selected_row {
+                    Some(r) => r.saturating_sub(page),
+                    None => 0,
+                });
+                self.ensure_selected_row_visible();
             }
             // Page down: move selection by one page
-            (KeyModifiers::NONE, KeyCode::PageDown) => {
-                if row_count > 0 {
-                    let tab = self.active_tab_mut();
-                    let page = tab.last_visible_rows;
-                    let max_row = row_count.saturating_sub(1);
-                    tab.selected_row = Some(match tab.selected_row {
-                        Some(r) => (r + page).min(max_row),
-                        None => 0,
-                    });
-                    self.ensure_selected_row_visible();
-                }
+            (KeyModifiers::NONE, KeyCode::PageDown) if row_count > 0 => {
+                let tab = self.active_tab_mut();
+                let page = tab.last_visible_rows;
+                let max_row = row_count.saturating_sub(1);
+                tab.selected_row = Some(match tab.selected_row {
+                    Some(r) => (r + page).min(max_row),
+                    None => 0,
+                });
+                self.ensure_selected_row_visible();
             }
             // Home: jump to first row
-            (KeyModifiers::NONE, KeyCode::Home) => {
-                if row_count > 0 {
-                    self.active_tab_mut().selected_row = Some(0);
-                    self.ensure_selected_row_visible();
-                }
+            (KeyModifiers::NONE, KeyCode::Home) if row_count > 0 => {
+                self.active_tab_mut().selected_row = Some(0);
+                self.ensure_selected_row_visible();
             }
             // End: jump to last row
-            (KeyModifiers::NONE, KeyCode::End) => {
-                if row_count > 0 {
-                    self.active_tab_mut().selected_row = Some(row_count.saturating_sub(1));
-                    self.ensure_selected_row_visible();
-                }
+            (KeyModifiers::NONE, KeyCode::End) if row_count > 0 => {
+                self.active_tab_mut().selected_row = Some(row_count.saturating_sub(1));
+                self.ensure_selected_row_visible();
             }
             // Enter: open detail view for selected row
-            (KeyModifiers::NONE, KeyCode::Enter) => {
-                if self.active_tab().selected_row.is_some() {
-                    let row_index = self.active_tab().selected_row.unwrap();
-                    self.popup = Some(Popup::EventDetail {
-                        row_index,
-                        scroll: 0,
-                    });
-                }
+            (KeyModifiers::NONE, KeyCode::Enter) if self.active_tab().selected_row.is_some() => {
+                let row_index = self.active_tab().selected_row.unwrap();
+                self.popup = Some(Popup::EventDetail {
+                    row_index,
+                    scroll: 0,
+                });
             }
             // Esc: close search → deselect row (cancel handled globally)
             (KeyModifiers::NONE, KeyCode::Esc) => {
@@ -255,13 +239,13 @@ impl App {
                 }
             }
             // Open column picker
-            (KeyModifiers::SHIFT, KeyCode::Char('H')) => {
-                if self.active_tab().column_config.is_some() {
-                    self.popup = Some(Popup::ColumnPicker {
-                        selected: 0,
-                        scroll: 0,
-                    });
-                }
+            (KeyModifiers::SHIFT, KeyCode::Char('H'))
+                if self.active_tab().column_config.is_some() =>
+            {
+                self.popup = Some(Popup::ColumnPicker {
+                    selected: 0,
+                    scroll: 0,
+                });
             }
             _ => {}
         }

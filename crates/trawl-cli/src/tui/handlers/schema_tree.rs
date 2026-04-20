@@ -42,18 +42,14 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Up) => {
                 schema.selected = schema.selected.saturating_sub(1);
             }
-            (KeyModifiers::NONE, KeyCode::Down) => {
-                if node_count > 0 {
-                    schema.selected = (schema.selected + 1).min(node_count - 1);
-                }
+            (KeyModifiers::NONE, KeyCode::Down) if node_count > 0 => {
+                schema.selected = (schema.selected + 1).min(node_count - 1);
             }
             (KeyModifiers::NONE, KeyCode::PageUp) => {
                 schema.selected = schema.selected.saturating_sub(10);
             }
-            (KeyModifiers::NONE, KeyCode::PageDown) => {
-                if node_count > 0 {
-                    schema.selected = (schema.selected + 10).min(node_count - 1);
-                }
+            (KeyModifiers::NONE, KeyCode::PageDown) if node_count > 0 => {
+                schema.selected = (schema.selected + 10).min(node_count - 1);
             }
             (KeyModifiers::NONE, KeyCode::Home) => {
                 schema.selected = 0;
