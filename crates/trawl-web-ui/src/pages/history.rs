@@ -143,6 +143,7 @@ pub fn HistoryPage(bus: ToastBus) -> impl IntoView {
                     <div style="flex:0 0 80px; text-align:right">"Duration"</div>
                     <div style="flex:0 0 120px; text-align:right"></div>
                 </div>
+                <div class="tbl-body">
                 {move || match resource.get() {
                     None => view! {
                         <div class="tbl-row" style="cursor:default">
@@ -220,6 +221,7 @@ pub fn HistoryPage(bus: ToastBus) -> impl IntoView {
                         }).collect::<Vec<_>>().into_any()
                     }
                 }}
+                </div>
 
                 {move || {
                     let Some(Ok(resp)) = resource.get() else {
