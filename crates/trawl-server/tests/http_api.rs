@@ -49,6 +49,13 @@ fn ensure_fixtures() -> String {
         .join("parquet");
     let nginx_path = dir.join("nginx.parquet");
 
+    // Remove stale scheduled-run results from prior test invocations —
+    // the `**/*.parquet` glob would otherwise include them as log data.
+    let scheduled_dir = dir.join("scheduled");
+    if scheduled_dir.exists() {
+        let _ = std::fs::remove_dir_all(&scheduled_dir);
+    }
+
     if !nginx_path.exists() {
         std::fs::create_dir_all(&dir).unwrap();
         let suffix = format!("_{}", std::process::id());
