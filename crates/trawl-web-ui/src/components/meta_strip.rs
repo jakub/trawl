@@ -33,14 +33,10 @@ pub fn MetaStrip(
                 </span>
                 " events"
             </span>
-            <span class="divider">"·"</span>
-            <span>
-                {move || if truncated.get() {
-                    "truncated server-side".to_string()
-                } else {
-                    "scanned ".to_string() + &dash() + " / " + &dash()
-                }}
-            </span>
+            <Show when=move || truncated.get()>
+                <span class="divider">"·"</span>
+                <span class="dim">"truncated"</span>
+            </Show>
             {move || filters.get().into_iter().enumerate().map(|(i, f)| {
                 let is_excl = f.op == FilterOp::Exclude;
                 let label = format!(
@@ -81,8 +77,4 @@ pub fn MetaStrip(
             >"export"</span>
         </div>
     }
-}
-
-fn dash() -> String {
-    "—".into()
 }
