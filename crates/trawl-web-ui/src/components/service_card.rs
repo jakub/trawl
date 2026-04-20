@@ -129,7 +129,7 @@ pub fn ServiceCard(
             </div>
 
             <div class="sc-quickact">
-                <span class="hint">"CLICK TO INSPECT"</span>
+                <span class="hint">"click to inspect"</span>
                 <span class="sp"></span>
                 <span
                     class="qa"

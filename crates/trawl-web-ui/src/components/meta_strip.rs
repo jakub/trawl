@@ -23,6 +23,8 @@ pub fn MetaStrip(
     filters: Signal<Vec<Filter>>,
     /// Called with the index of a filter to remove.
     on_remove: Callback<usize>,
+    /// Called when the user clicks the export action.
+    on_export: Callback<()>,
     bus: ToastBus,
 ) -> impl IntoView {
     view! {
@@ -66,17 +68,13 @@ pub fn MetaStrip(
                     on:click=move |_| bus.push(
                         ToastKind::Info,
                         "Save",
-                        Some("Saving nets is coming soon.".into()),
+                        Some("Net saving is landing soon — use the history page for now.".into()),
                     )
-                >"save"</span>
+                >"Save"</span>
                 <span
                     class="action"
-                    on:click=move |_| bus.push(
-                        ToastKind::Info,
-                        "Export",
-                        Some("CSV/JSON export is coming soon.".into()),
-                    )
-                >"export"</span>
+                    on:click=move |_| on_export.run(())
+                >"Export"</span>
             </div>
         </div>
     }

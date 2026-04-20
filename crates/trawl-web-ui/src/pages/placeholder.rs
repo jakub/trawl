@@ -28,9 +28,9 @@ pub fn ModePlaceholder(#[prop(into)] mode: Signal<AppMode>) -> impl IntoView {
 fn mode_headline(mode: AppMode) -> &'static str {
     match mode {
         AppMode::Search => "Search",
-        AppMode::Intel => "Intel · Coming soon",
-        AppMode::Jobs => "Jobs · Coming soon",
-        AppMode::Settings => "Settings · Coming soon",
+        AppMode::Intel => "Intel — coming soon",
+        AppMode::Jobs => "Jobs — coming soon",
+        AppMode::Settings => "Settings — coming soon",
     }
 }
 
@@ -38,16 +38,13 @@ fn mode_blurb(mode: AppMode) -> &'static str {
     match mode {
         AppMode::Search => "Type a query and press ⌘⏎ to haul.",
         AppMode::Intel => {
-            "CTI / TIP integration. Will surface news, IoCs and threat \
-             feeds from external sources alongside your event store."
+            "Threat intel feeds, IoCs, and external enrichment \
+             — surfaced alongside your event store."
         }
         AppMode::Jobs => {
-            "Saved searches and scheduled runs. Backed by /api/v1/saved \
-             on the server — UI in flight."
+            "Saved nets and scheduled runs — manage everything \
+             from one place."
         }
-        AppMode::Settings => {
-            "Sources, schema, retention, users & API tokens, system \
-             health. Backed by existing /api/v1 endpoints — UI in flight."
-        }
+        AppMode::Settings => "Sources, schema, retention, users, and API tokens.",
     }
 }

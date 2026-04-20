@@ -82,9 +82,9 @@ pub fn StatusBar(
                 .unwrap_or_else(|| "?".to_string());
             format!("Connected ({host} v{v})")
         }
-        StatusKind::Hauling => "HAULING".to_string(),
-        StatusKind::Live => "LIVE".to_string(),
-        StatusKind::Error => "ERROR".to_string(),
+        StatusKind::Hauling => "Hauling".to_string(),
+        StatusKind::Live => "Live".to_string(),
+        StatusKind::Error => "Error".to_string(),
     };
 
     view! {
@@ -97,7 +97,7 @@ pub fn StatusBar(
                 <>
                     <span class="divider">"·"</span>
                     <div class="grp lagged">
-                        <span class="strong">{format!("LAGGED {n}")}</span>
+                        <span class="strong">{format!("Lagged {n}")}</span>
                     </div>
                 </>
             })}

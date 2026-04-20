@@ -67,14 +67,14 @@ pub fn HistoryPage(bus: ToastBus) -> impl IntoView {
         bus.push(
             ToastKind::Info,
             "Export",
-            Some("Exporting history is coming soon.".into()),
+            Some("History export is landing soon.".into()),
         );
     };
     let on_clear = move |_| {
         bus.push(
             ToastKind::Info,
-            "Clear history",
-            Some("Clearing history server-side is coming soon.".into()),
+            "Clear History",
+            Some("Server-side history clearing is landing soon.".into()),
         );
     };
 
@@ -131,7 +131,7 @@ pub fn HistoryPage(bus: ToastBus) -> impl IntoView {
                         />
                     </div>
                     <button class="btn-sec" on:click=on_export>"Export"</button>
-                    <button class="btn-sec danger" on:click=on_clear>"Clear history"</button>
+                    <button class="btn-sec danger" on:click=on_clear>"Clear History"</button>
                 </div>
             </div>
 

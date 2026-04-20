@@ -158,7 +158,7 @@ pub fn SaveAsNetModal(
                         disabled=move || name.get().trim().is_empty() || submitting.get()
                         on:click=move |_| do_save_click()
                     >
-                        {move || if submitting.get() { "Saving…" } else { "Save net" }}
+                        {move || if submitting.get() { "Saving…" } else { "Save Net" }}
                     </button>
                 </div>
             </div>

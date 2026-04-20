@@ -129,7 +129,7 @@ pub fn TopBar(
                         </div>
                         <div class="sep"></div>
                         <div class="item danger" on:click=on_logout>
-                            <span>"Sign out"</span>
+                            <span>"Sign Out"</span>
                         </div>
                     </div>
                 </Show>

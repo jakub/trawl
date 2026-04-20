@@ -70,7 +70,7 @@ pub fn Login() -> impl IntoView {
                     class="btn btn-full"
                     disabled=move || submitting.get()
                 >
-                    {move || if submitting.get() { "signing in…" } else { "sign in" }}
+                    {move || if submitting.get() { "Signing In…" } else { "Sign In" }}
                 </button>
             </form>
         </div>
