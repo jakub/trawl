@@ -61,6 +61,13 @@ pub enum AuthError {
         resource: String,
     },
 
+    /// The interval string is not a valid format (e.g. "5x", empty, non-numeric).
+    #[error("invalid interval format: {input:?}")]
+    InvalidInterval {
+        /// The raw input string.
+        input: String,
+    },
+
     /// Schedule interval is below the minimum (60 seconds).
     #[error("schedule interval {secs}s is below minimum of 60s")]
     IntervalTooShort {

@@ -119,19 +119,24 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
             .collect();
         (vec![(metric_name.clone(), values)], 1)
     } else {
-        let Some(first_row) = result.rows.first() else {
+        if result.rows.is_empty() {
             return (vec![], 0);
-        };
+        }
 
         let string_cols: Vec<usize> = other_cols
             .iter()
             .copied()
-            .filter(|&i| matches!(first_row.get(i), Some(Value::String(_))))
+            .filter(|&i| {
+                result
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row.get(i), Some(Value::String(_))))
+            })
             .collect();
         let numeric_cols: Vec<usize> = other_cols
             .iter()
             .copied()
-            .filter(|&i| !matches!(first_row.get(i), Some(Value::String(_))))
+            .filter(|&i| !string_cols.contains(&i))
             .collect();
 
         if string_cols.len() == 1 && numeric_cols.len() == 1 {

@@ -535,14 +535,8 @@ textarea:focus-visible,
 }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Results table (snapshot + live raw) — provisional rewire
+ *  Results table — base styles (augmented by v2 block below)
  * ─────────────────────────────────────────────────────────────── */
-.results {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  flex: 1;
-}
 
 .results-loading,
 .results-empty,
@@ -607,15 +601,6 @@ textarea:focus-visible,
   text-align: center;
   color: var(--ink-3);
   font-style: italic;
-}
-
-.results-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 0 0 0;
-  font-size: 11px;
-  color: var(--ink-3);
 }
 
 .results-summary {
@@ -2204,7 +2189,7 @@ textarea:focus-visible,
 }
 .status-dot.success { background: var(--green); }
 .status-dot.error { background: var(--red); }
-.status-dot.running { background: var(--amber); animation: pulse 1.5s infinite; }
+.status-dot.running { background: var(--amber); animation: dot-pulse 1.6s ease-in-out infinite; }
 .status-dot.timeout { background: var(--yellow, var(--amber)); }
 
 .sched-badge {

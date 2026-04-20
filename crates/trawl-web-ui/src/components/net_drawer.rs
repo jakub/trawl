@@ -51,11 +51,12 @@ pub fn NetDrawer(
     let do_rename = {
         let net_id = net.id;
         let original_query = net.query.clone();
+        let orig = original_name.clone();
         move || {
             let new_name = name_buf.get_untracked().trim().to_string();
-            if new_name.is_empty() || new_name == original_name {
+            if new_name.is_empty() || new_name == orig {
                 editing_name.set(false);
-                name_buf.set(original_name.clone());
+                name_buf.set(orig.clone());
                 return;
             }
             let q = original_query.clone();
@@ -431,7 +432,7 @@ fn QuerySchedulePane(
                                     type="checkbox"
                                     prop:checked=move || enabled_buf.get()
                                     on:change=move |e| {
-                                        let el = e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap();
+                                        let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
                                         enabled_buf.set(el.checked());
                                     }
                                 />

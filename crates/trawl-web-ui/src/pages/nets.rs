@@ -432,7 +432,9 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
             // Delete confirmation modal
             <Show when=move || confirm_delete.get().is_some()>
                 {move || {
-                    let (del_id, del_name) = confirm_delete.get().unwrap();
+                    let Some((del_id, del_name)) = confirm_delete.get() else {
+                        return view! { }.into_any();
+                    };
                     let msg = format!("Permanently delete '{del_name}' and all its run history?");
                     let do_delete = do_delete.clone();
                     view! {
@@ -449,7 +451,7 @@ pub fn NetsPage(bus: ToastBus) -> impl IntoView {
                                 confirm_delete.set(None);
                             })
                         />
-                    }
+                    }.into_any()
                 }}
             </Show>
         </div>

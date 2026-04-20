@@ -208,6 +208,7 @@ pub async fn list_saved() -> Result<ListSavedResponse, ApiError> {
 pub async fn update_saved(id: i64, query: &str) -> Result<SavedQueryResponse, ApiError> {
     let body = UpdateSavedRequest {
         query: query.to_owned(),
+        name: None,
     };
     let resp = Request::put(&format!("/api/v1/saved/{id}"))
         .header("content-type", "application/json")

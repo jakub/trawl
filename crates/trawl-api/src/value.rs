@@ -173,13 +173,13 @@ impl fmt::Display for Value {
 pub const WELL_KNOWN_LOG_FIELDS: &[&str] = &["timestamp", "host", "service", "level", "message"];
 
 /// Column metadata from a query result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
 }
 
 /// The complete result of a query execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<Value>>,

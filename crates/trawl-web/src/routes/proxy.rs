@@ -119,6 +119,7 @@ fn copy_response_headers(src: &reqwest::header::HeaderMap, dst: &mut HeaderMap) 
         if HOP_BY_HOP
             .iter()
             .any(|h| name.as_str().eq_ignore_ascii_case(h))
+            || name.as_str().eq_ignore_ascii_case("set-cookie")
         {
             continue;
         }
@@ -126,11 +127,6 @@ fn copy_response_headers(src: &reqwest::header::HeaderMap, dst: &mut HeaderMap) 
             HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            // `append`, not `insert`: HTTP allows repeated headers
-            // (notably `Set-Cookie`), and `reqwest::HeaderMap`'s
-            // iterator yields each entry separately. `insert`
-            // clobbers; `append` preserves all of them so the browser
-            // sees every `Set-Cookie` trawld emitted.
             dst.append(h_name, h_value);
         }
     }
@@ -285,11 +281,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_preserves_multiple_set_cookie_headers() {
-        // Regression: `copy_response_headers` previously used `insert`,
-        // which clobbers prior entries for the same header name. When
-        // trawld emits multiple `Set-Cookie` headers (or any header
-        // allowed to repeat), only the last survived. Now we `append`.
+    async fn forward_strips_upstream_set_cookie_headers() {
+        // trawld is a backend API — it must not set cookies in the
+        // browser context. The proxy strips all Set-Cookie headers
+        // from upstream responses to prevent cookie shadowing.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -316,19 +311,11 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let set_cookies: Vec<_> = resp
-            .headers()
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .map(|v| v.to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            set_cookies.len(),
-            2,
-            "both upstream Set-Cookie headers must reach the browser, got {set_cookies:?}"
+        let set_cookies: Vec<_> = resp.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert!(
+            set_cookies.is_empty(),
+            "upstream Set-Cookie headers must be stripped, got {set_cookies:?}"
         );
-        assert!(set_cookies.iter().any(|c| c.starts_with("one=1")));
-        assert!(set_cookies.iter().any(|c| c.starts_with("two=2")));
     }
 
     #[test]
