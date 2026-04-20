@@ -659,13 +659,9 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Val
         // list values from aggregations like LIST(DISTINCT col)
         ValueRef::List(..) => row
             .get::<_, duckdb::types::Value>(idx)
-            .map(convert_duckdb_value)
-            .unwrap_or(Value::Null),
+            .map_or(Value::Null, convert_duckdb_value),
         // everything else: try string extraction, fall back to null
-        _ => row
-            .get::<_, String>(idx)
-            .map(Value::String)
-            .unwrap_or(Value::Null),
+        _ => row.get::<_, String>(idx).map_or(Value::Null, Value::String),
     }
 }
 

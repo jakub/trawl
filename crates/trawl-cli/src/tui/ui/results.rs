@@ -745,7 +745,7 @@ fn render_line_chart(
             total_series,
         )
     } else {
-        format!(" {} series  \u{2022}  'v' to toggle view ", series.len(),)
+        format!(" {} series  \u{2022}  'v' to toggle view ", series.len())
     };
 
     let block = Block::default()
@@ -1040,7 +1040,7 @@ fn render_sparkline(
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .title_bottom(format!(" {} points  •  'v' to toggle view ", values.len(),))
+            .title_bottom(format!(" {} points  •  'v' to toggle view ", values.len()))
             .border_style(border_style)
             .padding(Padding::horizontal(1));
 

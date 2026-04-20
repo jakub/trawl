@@ -332,9 +332,7 @@ fn collect_service_files(hour_dirs: &[PathBuf]) -> HashMap<String, Vec<PathBuf>>
 
 /// Check if a directory is empty.
 fn is_dir_empty(path: &Path) -> bool {
-    std::fs::read_dir(path)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(false)
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Path for the rollup marker file that tracks in-progress merges.
@@ -522,9 +520,7 @@ fn rollup_day_blocking(
     // Remove marker — rollup fully complete.
     delete_rollup_marker(day_dir, service);
 
-    let output_bytes = std::fs::metadata(&canonical_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let output_bytes = std::fs::metadata(&canonical_path).map_or(0, |m| m.len());
 
     let duration_ms = rollup_start.elapsed().as_millis();
     tracing::info!(
@@ -854,9 +850,7 @@ fn compact_service_blocking(
     std::fs::rename(&tmp_path, &canonical_path)
         .map_err(|e| format!("atomic rename failed: {e}"))?;
 
-    let output_bytes = std::fs::metadata(&canonical_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let output_bytes = std::fs::metadata(&canonical_path).map_or(0, |m| m.len());
 
     let duration_ms = compact_start.elapsed().as_millis();
     tracing::info!(

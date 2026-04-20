@@ -190,26 +190,22 @@ impl App {
                             });
                         }
                         // Navigate to prev row
-                        (KeyModifiers::NONE, KeyCode::Char('[')) => {
-                            if row_index > 0 {
-                                let new_idx = row_index - 1;
-                                self.active_tab_mut().selected_row = Some(new_idx);
-                                self.popup = Some(Popup::EventDetail {
-                                    row_index: new_idx,
-                                    scroll: 0,
-                                });
-                            }
+                        (KeyModifiers::NONE, KeyCode::Char('[')) if row_index > 0 => {
+                            let new_idx = row_index - 1;
+                            self.active_tab_mut().selected_row = Some(new_idx);
+                            self.popup = Some(Popup::EventDetail {
+                                row_index: new_idx,
+                                scroll: 0,
+                            });
                         }
                         // Navigate to next row
-                        (KeyModifiers::NONE, KeyCode::Char(']')) => {
-                            if row_index + 1 < row_count {
-                                let new_idx = row_index + 1;
-                                self.active_tab_mut().selected_row = Some(new_idx);
-                                self.popup = Some(Popup::EventDetail {
-                                    row_index: new_idx,
-                                    scroll: 0,
-                                });
-                            }
+                        (KeyModifiers::NONE, KeyCode::Char(']')) if row_index + 1 < row_count => {
+                            let new_idx = row_index + 1;
+                            self.active_tab_mut().selected_row = Some(new_idx);
+                            self.popup = Some(Popup::EventDetail {
+                                row_index: new_idx,
+                                scroll: 0,
+                            });
                         }
                         _ => {}
                     }

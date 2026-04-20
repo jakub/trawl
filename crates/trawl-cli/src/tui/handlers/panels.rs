@@ -22,11 +22,8 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Up) => {
                 self.panel.history_selected = self.panel.history_selected.saturating_sub(1);
             }
-            (KeyModifiers::NONE, KeyCode::Down) => {
-                if item_count > 0 {
-                    self.panel.history_selected =
-                        (self.panel.history_selected + 1).min(item_count - 1);
-                }
+            (KeyModifiers::NONE, KeyCode::Down) if item_count > 0 => {
+                self.panel.history_selected = (self.panel.history_selected + 1).min(item_count - 1);
             }
             // Enter: load selected query into editor, switch to Query tab
             (KeyModifiers::NONE, KeyCode::Enter) => {
@@ -73,10 +70,8 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Up) => {
                 self.panel.saved_selected = self.panel.saved_selected.saturating_sub(1);
             }
-            (KeyModifiers::NONE, KeyCode::Down) => {
-                if item_count > 0 {
-                    self.panel.saved_selected = (self.panel.saved_selected + 1).min(item_count - 1);
-                }
+            (KeyModifiers::NONE, KeyCode::Down) if item_count > 0 => {
+                self.panel.saved_selected = (self.panel.saved_selected + 1).min(item_count - 1);
             }
             // Right / Enter: open detail pane with run history
             (KeyModifiers::NONE, KeyCode::Enter | KeyCode::Right) => {

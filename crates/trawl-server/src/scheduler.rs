@@ -168,8 +168,7 @@ fn poll_and_execute(
             match store.latest_run(schedule.id) {
                 Ok(Some(last)) => {
                     let last_started = chrono::DateTime::parse_from_rfc3339(&last.started_at)
-                        .map(|dt| dt.timestamp())
-                        .unwrap_or(0);
+                        .map_or(0, |dt| dt.timestamp());
                     let now = chrono::Utc::now().timestamp();
                     let elapsed = (now - last_started).unsigned_abs();
                     elapsed >= schedule.interval_secs
