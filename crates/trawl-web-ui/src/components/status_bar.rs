@@ -11,7 +11,10 @@
 //! re-projects to `<html data-theme>`.
 
 use leptos::prelude::*;
+use leptos::web_sys;
 
+use crate::api;
+use crate::state::query::RangeSpec;
 use crate::state::theme::{Theme, UiPrefs};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,9 +37,9 @@ pub fn StatusBar(
     /// Last-search row count (`None` if nothing has run yet).
     #[prop(into)]
     count: Signal<Option<usize>>,
-    /// Currently selected range label (e.g. "15m").
+    /// Currently selected range spec.
     #[prop(into)]
-    range: Signal<&'static str>,
+    range: Signal<RangeSpec>,
     /// Currently lagged events count, if the live stream emitted a
     /// back-pressure notification.
     #[prop(into)]
@@ -63,11 +66,25 @@ pub fn StatusBar(
         StatusKind::Error => "dot err",
     };
 
+    // Host the browser is talking to — shown in the connected-state label
+    // next to the server version from /api/v1/health.
+    let host = web_sys::window()
+        .and_then(|w| w.location().host().ok())
+        .unwrap_or_default();
+    let server = LocalResource::new(api::health);
+
     let status_label = move || match status.get() {
-        StatusKind::Connected => "CONNECTED",
-        StatusKind::Hauling => "HAULING",
-        StatusKind::Live => "LIVE",
-        StatusKind::Error => "ERROR",
+        StatusKind::Connected => {
+            let v = server
+                .get()
+                .and_then(Result::ok)
+                .and_then(|h| h.version)
+                .unwrap_or_else(|| "?".to_string());
+            format!("Connected ({host} v{v})")
+        }
+        StatusKind::Hauling => "HAULING".to_string(),
+        StatusKind::Live => "LIVE".to_string(),
+        StatusKind::Error => "ERROR".to_string(),
     };
 
     view! {
@@ -102,7 +119,7 @@ pub fn StatusBar(
             <div class="sp"></div>
             <div class="grp">
                 <span>"range "</span>
-                <span class="amber">{move || range.get()}</span>
+                <span class="amber">{move || range.get().label()}</span>
             </div>
             <span class="divider">"·"</span>
             <div class="grp clickable" on:click=toggle_theme title="Switch theme">

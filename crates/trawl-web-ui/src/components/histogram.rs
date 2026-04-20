@@ -9,6 +9,10 @@
 //! come from any `_time` / `time` / `timestamp` column when present;
 //! "is error" is `level == "error"` when a `level` column is present.
 //! Anything missing → render the "no histogram on this page" hint.
+//!
+//! Y/X axis labels are rendered alongside the bars (`0` / `max/2` /
+//! `max` on the left; time anchors on the bottom derived from the
+//! current `RangeSpec`). Per-bar tooltips appear on hover.
 
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
@@ -16,11 +20,17 @@ use trawl_api::value::Value;
 
 use crate::api::ApiError;
 use crate::histogram::{Bucket, bucketize};
+use crate::state::query::RangeSpec;
 
 const N_BUCKETS: usize = 48;
 
 #[component]
-pub fn Histogram(rows: LocalResource<Result<QueryResponse, ApiError>>) -> impl IntoView {
+pub fn Histogram(
+    rows: LocalResource<Result<QueryResponse, ApiError>>,
+    /// Current time window — drives the x-axis anchor labels.
+    #[prop(into)]
+    range: Signal<RangeSpec>,
+) -> impl IntoView {
     view! {
         <div class="histo">
             {move || match rows.get() {
@@ -38,7 +48,15 @@ pub fn Histogram(rows: LocalResource<Result<QueryResponse, ApiError>>) -> impl I
                         }.into_any();
                     }
                     let max = buckets.iter().map(|b| b.ok + b.err).max().unwrap_or(1).max(1);
+                    let half = max / 2;
+                    let bucket_count = buckets.len();
+                    let (x_start, x_mid, x_end) = x_axis_labels(&range.get(), bucket_count);
                     view! {
+                        <div class="yax">
+                            <span>{max}</span>
+                            <span>{half}</span>
+                            <span>"0"</span>
+                        </div>
                         <div class="bars">
                             {buckets.into_iter().enumerate().map(|(i, b)| {
                                 let total = b.ok + b.err;
@@ -49,12 +67,18 @@ pub fn Histogram(rows: LocalResource<Result<QueryResponse, ApiError>>) -> impl I
                                     if b.err > 0 { format!(" · {} errors", b.err) } else { String::new() }
                                 );
                                 view! {
-                                    <div class="bar" title=tip>
+                                    <div class="bar">
+                                        <div class="tip">{tip}</div>
                                         <div class="ok" style=format!("height:{ok_h:.1}%")></div>
                                         <div class="err" style=format!("height:{err_h:.1}%")></div>
                                     </div>
                                 }
                             }).collect::<Vec<_>>()}
+                        </div>
+                        <div class="xax">
+                            <span>{x_start}</span>
+                            <span>{x_mid}</span>
+                            <span>{x_end}</span>
                         </div>
                     }.into_any()
                 }
@@ -122,4 +146,34 @@ fn value_as_str(v: &Value) -> Option<&str> {
 
 fn pct(n: u32, max: u32) -> f64 {
     (f64::from(n) / f64::from(max)) * 100.0
+}
+
+/// Three x-axis labels derived from the current range: left ("-Xm"),
+/// middle (halfway), right ("now"). For absolute ranges, the bounds
+/// are rendered compactly.
+fn x_axis_labels(range: &RangeSpec, buckets: usize) -> (String, String, String) {
+    match range {
+        RangeSpec::Quick(q) => {
+            let label = format!("-{q}");
+            let mid = format!("{}", buckets / 2);
+            (label, mid, "now".to_string())
+        }
+        RangeSpec::Absolute { from, to } => {
+            (compact_ts(from), format!("{}", buckets / 2), compact_ts(to))
+        }
+    }
+}
+
+fn compact_ts(s: &str) -> String {
+    // Trim RFC3339 timezone suffixes and microseconds for compactness.
+    // "2026-04-18T13:32:17Z" → "13:32"; "now" passes through.
+    if s == "now" {
+        return s.to_string();
+    }
+    if let Some(rest) = s.split_once('T').map(|(_, r)| r)
+        && rest.len() >= 5
+    {
+        return rest.chars().take(5).collect();
+    }
+    s.chars().take(10).collect()
 }

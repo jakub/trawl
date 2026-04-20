@@ -6,17 +6,21 @@
 //!
 //! Restyled for the v0.14 design: 10px uppercase column headers with
 //! a right-aligned sort affordance, expandable rows that reveal a
-//! `_time` / field tag detail panel, level pills, and click-to-filter
-//! tags inside the detail panel (currently stubbed → toast).
+//! `_time` / field tag detail panel with Copy _raw / Show context /
+//! Find similar action buttons. Detail-row tag clicks add filters
+//! through a parent-supplied callback.
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use std::cmp::Ordering;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
 use trawl_api::value::Value;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::components::toast::{ToastBus, ToastKind};
+use crate::state::query::{Filter, FilterOp};
 
 #[component]
 pub fn ResultsTable(
@@ -25,6 +29,12 @@ pub fn ResultsTable(
     /// Called with the new page index when prev/next is clicked. Parent
     /// captures a router navigator and translates to URL navigation.
     on_paginate: Callback<usize>,
+    /// Called when a detail-row field tag is clicked — adds an include
+    /// filter for that `field = value`.
+    on_add_filter: Callback<Filter>,
+    /// Navigate to a fresh search with the given DSL query and default
+    /// filters/range. Used by "Show context" and "Find similar".
+    on_navigate: Callback<String>,
     bus: ToastBus,
 ) -> impl IntoView {
     view! {
@@ -36,6 +46,8 @@ pub fn ResultsTable(
                         resp=resp
                         page=page
                         on_paginate=on_paginate
+                        on_add_filter=on_add_filter
+                        on_navigate=on_navigate
                         bus=bus
                     />
                 }.into_any(),
@@ -60,6 +72,8 @@ fn ResultsTableBody(
     resp: QueryResponse,
     page: Signal<usize>,
     on_paginate: Callback<usize>,
+    on_add_filter: Callback<Filter>,
+    on_navigate: Callback<String>,
     bus: ToastBus,
 ) -> impl IntoView {
     let columns: Vec<String> = resp.result.columns.iter().map(|c| c.name.clone()).collect();
@@ -129,7 +143,15 @@ fn ResultsTableBody(
                     <tbody>
                         {if has_rows {
                             let sorted_indices = SortedIndices::new(&rows_data, sort);
-                            sorted_indices.render(rows_data.clone(), cols_for_view, level_idx, expanded, bus)
+                            sorted_indices.render(
+                                rows_data.clone(),
+                                cols_for_view,
+                                level_idx,
+                                expanded,
+                                on_add_filter,
+                                on_navigate,
+                                bus,
+                            )
                         } else {
                             let cols_len = columns.len() + 1;
                             vec![view! {
@@ -185,13 +207,15 @@ impl SortedIndices {
         Self { indices }
     }
 
-    #[allow(clippy::needless_pass_by_value)] // owned vecs are cloned per row anyway
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn render(
         &self,
         rows: Vec<Vec<Value>>,
         columns: Vec<String>,
         level_idx: Option<usize>,
         expanded: RwSignal<Option<usize>>,
+        on_add_filter: Callback<Filter>,
+        on_navigate: Callback<String>,
         bus: ToastBus,
     ) -> Vec<leptos::prelude::AnyView> {
         let indices = self.indices.get();
@@ -207,6 +231,8 @@ impl SortedIndices {
                         columns=cols
                         level_idx=level_idx
                         expanded=expanded
+                        on_add_filter=on_add_filter
+                        on_navigate=on_navigate
                         bus=bus
                     />
                 }
@@ -223,6 +249,8 @@ fn RowFragment(
     columns: Vec<String>,
     level_idx: Option<usize>,
     expanded: RwSignal<Option<usize>>,
+    on_add_filter: Callback<Filter>,
+    on_navigate: Callback<String>,
     bus: ToastBus,
 ) -> impl IntoView {
     let cells_row = row.clone();
@@ -242,6 +270,8 @@ fn RowFragment(
 
     let columns_for_detail = columns.clone();
     let row_for_detail = row.clone();
+    let columns_for_actions = columns.clone();
+    let row_for_actions = row.clone();
 
     view! {
         <>
@@ -263,30 +293,193 @@ fn RowFragment(
                             {columns_for_detail.iter().zip(row_for_detail.iter()).map(|(name, v)| {
                                 let key = name.clone();
                                 let value_text = value_to_string(v);
-                                let key_for_toast = name.clone();
-                                let val_for_toast = value_text.clone();
+                                let field_for_click = name.clone();
+                                let value_for_click = value_text.clone();
                                 view! {
                                     <span class="k">{key}</span>
                                     <span class="v">
                                         <span
                                             class="tag"
-                                            on:click=move |_| bus.push(
-                                                ToastKind::Info,
-                                                "Click-to-filter",
-                                                Some(format!(
-                                                    "{key_for_toast} = {val_for_toast} — coming soon"
-                                                )),
-                                            )
+                                            on:click=move |e| {
+                                                e.stop_propagation();
+                                                on_add_filter.run(Filter {
+                                                    field: field_for_click.clone(),
+                                                    value: value_for_click.clone(),
+                                                    op: FilterOp::Include,
+                                                });
+                                            }
                                         >{value_text}</span>
                                     </span>
                                 }
                             }).collect::<Vec<_>>()}
+                        </div>
+                        <div class="actions">
+                            <CopyRawButton
+                                row=row_for_actions.clone()
+                                columns=columns_for_actions.clone()
+                                bus=bus
+                            />
+                            <ShowContextButton
+                                row=row_for_actions.clone()
+                                columns=columns_for_actions.clone()
+                                on_navigate=on_navigate
+                                bus=bus
+                            />
+                            <FindSimilarButton
+                                row=row_for_actions.clone()
+                                columns=columns_for_actions.clone()
+                                on_navigate=on_navigate
+                                bus=bus
+                            />
                         </div>
                     </td>
                 </tr>
             </Show>
         </>
     }
+}
+
+#[component]
+fn CopyRawButton(row: Vec<Value>, columns: Vec<String>, bus: ToastBus) -> impl IntoView {
+    let on_click = move |e: leptos::web_sys::MouseEvent| {
+        e.stop_propagation();
+        let text = raw_or_synthesized(&row, &columns);
+        let bus_ok = bus;
+        let bus_err = bus;
+        spawn_local(async move {
+            match write_clipboard(&text).await {
+                Ok(()) => bus_ok.push(
+                    ToastKind::Success,
+                    "Copied",
+                    Some("Raw event copied to clipboard.".into()),
+                ),
+                Err(msg) => bus_err.push(ToastKind::Error, "Copy failed", Some(msg)),
+            }
+        });
+    };
+    view! {
+        <button class="btn-sec" on:click=on_click>"Copy _raw"</button>
+    }
+}
+
+#[component]
+fn ShowContextButton(
+    row: Vec<Value>,
+    columns: Vec<String>,
+    on_navigate: Callback<String>,
+    bus: ToastBus,
+) -> impl IntoView {
+    let on_click = move |e: leptos::web_sys::MouseEvent| {
+        e.stop_propagation();
+        match build_context_query(&row, &columns) {
+            Some(q) => on_navigate.run(q),
+            None => bus.push(
+                ToastKind::Info,
+                "Show context",
+                Some("Need a timestamp column to build a context window.".into()),
+            ),
+        }
+    };
+    view! {
+        <button class="btn-sec" on:click=on_click>"Show context"</button>
+    }
+}
+
+#[component]
+fn FindSimilarButton(
+    row: Vec<Value>,
+    columns: Vec<String>,
+    on_navigate: Callback<String>,
+    bus: ToastBus,
+) -> impl IntoView {
+    let on_click = move |e: leptos::web_sys::MouseEvent| {
+        e.stop_propagation();
+        match build_similar_query(&row, &columns) {
+            Some(q) => on_navigate.run(q),
+            None => bus.push(
+                ToastKind::Info,
+                "Find similar",
+                Some("Need a message column to find similar events.".into()),
+            ),
+        }
+    };
+    view! {
+        <button class="btn-sec" on:click=on_click>"Find similar"</button>
+    }
+}
+
+fn raw_or_synthesized(row: &[Value], columns: &[String]) -> String {
+    if let Some(idx) = columns.iter().position(|c| c == "_raw" || c == "raw")
+        && let Some(v) = row.get(idx)
+    {
+        return value_to_string(v);
+    }
+    // Fallback: join "key=value" pairs so the user still gets something
+    // copy-pastable.
+    columns
+        .iter()
+        .zip(row.iter())
+        .map(|(k, v)| format!("{k}={}", value_to_string(v)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn find_col(columns: &[String], names: &[&str]) -> Option<usize> {
+    for name in names {
+        if let Some(i) = columns.iter().position(|c| c == name) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Build a `@timestamp >= "<t-30s>" @timestamp <= "<t+30s>"` window around
+/// this row's timestamp, narrowed to the same host when available.
+fn build_context_query(row: &[Value], columns: &[String]) -> Option<String> {
+    let ti = find_col(columns, &["_time", "time", "timestamp", "@timestamp"])?;
+    let ts_raw = value_to_string(row.get(ti)?);
+    let ts = chrono::DateTime::parse_from_rfc3339(&ts_raw).ok()?;
+    let from = ts - chrono::Duration::seconds(30);
+    let to = ts + chrono::Duration::seconds(30);
+
+    let host_clause = find_col(columns, &["host", "hostname"])
+        .and_then(|hi| row.get(hi))
+        .map(value_to_string)
+        .filter(|s| !s.is_empty())
+        .map(|h| format!("host=\"{}\" ", escape_dq(&h)))
+        .unwrap_or_default();
+
+    Some(format!(
+        "{host_clause}@timestamp >= \"{}\" @timestamp <= \"{}\"",
+        from.to_rfc3339(),
+        to.to_rfc3339()
+    ))
+}
+
+/// Build a phrase-match query on the first ~60 chars of the row's message.
+fn build_similar_query(row: &[Value], columns: &[String]) -> Option<String> {
+    let mi = find_col(columns, &["message", "msg"])?;
+    let msg = value_to_string(row.get(mi)?);
+    let trimmed = msg.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let take: String = trimmed.chars().take(60).collect();
+    Some(format!("\"{}\"", escape_dq(&take)))
+}
+
+fn escape_dq(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+async fn write_clipboard(text: &str) -> Result<(), String> {
+    let window = leptos::web_sys::window().ok_or_else(|| "no window".to_string())?;
+    let clipboard = window.navigator().clipboard();
+    let promise = clipboard.write_text(text);
+    JsFuture::from(promise)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
 fn level_class(s: &str) -> &'static str {
