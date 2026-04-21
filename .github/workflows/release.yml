@@ -85,8 +85,12 @@ jobs:
         working-directory: crates/trawl-web-ui
         run: trunk build --release
 
+      # `cargo build --release` alone honors workspace default-members,
+      # which excludes trawl-web. `--workspace --exclude trawl-web-ui`
+      # builds every crate (including trawl-web) except the wasm32-only
+      # SPA crate — which was already built by the preceding trunk step.
       - name: Build
-        run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
+        run: cargo zigbuild --release --workspace --exclude trawl-web-ui --target ${{ matrix.target }}.2.31
 
       - name: Build .deb packages
         run: |
