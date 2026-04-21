@@ -24,6 +24,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Value types (`Value`, `QueryResult`, `SchemaColumn`) moved from trawl-engine to trawl-api
 - DuckDB error message strings extracted into named constants
 
+## [0.2.0] - 2026-04-20
+
+### Added
+- `trawl-web` (browser session proxy + embedded leptos SPA) now ships by default in both distribution channels
+- Debian: `trawl-server` .deb installs the `trawl-web` binary, a sandboxed `trawl-web.service` systemd unit, and `/etc/default/trawl-web`; `postinst` generates a persistent 32-byte session cookie key at `/var/lib/trawl/web.cookie`
+- Helm chart: `trawl-web` runs as a sidecar container in the trawld StatefulSet pod (`web.enabled: true` by default) with a chart-managed cookie Secret that survives upgrades via `lookup`
+- New `[web]` block in `trawld.toml` (`bind_addr`, `cookie_secret_path`, `session_ttl_secs`, `allow_insecure_cookies`) — shared config for trawld and trawl-web
+- Release workflow now builds the SPA with `trunk` + `wasm-bindgen-cli` before `cargo zigbuild` and includes `trawl-web` in release tarballs, .deb packages, and the container image
+
+### Changed
+- Helm ingress now targets the trawl-web sidecar by default (`ingress.backend: web`, plain HTTP/8090) instead of trawld's raw HTTPS API. Set `ingress.backend: trawld` to restore the previous behavior for bearer-token API clients
+- Container image exposes port 8090 (web UI) alongside 5514 and 1514
+- API clients (CLI, `trawl-client`, vector log shippers) continue to talk to trawld on 5514 directly — the proxy only accepts cookie-authed traffic and blocks `/api/v1/ingest`
+
 ## [0.1.8] - 2026-03-08
 
 ### Added
