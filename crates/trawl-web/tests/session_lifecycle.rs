@@ -139,8 +139,12 @@ async fn tampered_cookie_does_not_send_set_cookie() {
     };
     let mut value = encrypt(state.cookie_key(), &payload).unwrap();
     // Flip a byte near the middle — lands inside ciphertext → AEAD reject.
+    // Pick a replacement that is *guaranteed different* from the original;
+    // naively replacing with 'A' is a ~1/64 no-op when the byte already is 'A'.
     let mid = value.len() / 2;
-    value.replace_range(mid..=mid, "A");
+    let orig = value.as_bytes()[mid];
+    let replacement = if orig == b'A' { 'B' } else { 'A' };
+    value.replace_range(mid..=mid, &replacement.to_string());
     let cookie = format!("trawl_session={value}");
 
     let req = Request::builder()
