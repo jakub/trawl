@@ -4,6 +4,22 @@ set -e
 if [ "$1" = "configure" ]; then
   # create trawl system user/group from sysusers.d config
   systemd-sysusers trawl.conf 2>/dev/null || true
+
+  # Bootstrap the trawl-web session cookie key (32 random bytes).
+  # Idempotent: only generated on first install; preserved across upgrades
+  # so existing browser sessions survive. Stored on the trawl-owned state
+  # directory so trawl-web.service can read it with its sandboxed uid.
+  if [ ! -s /var/lib/trawl/web.cookie ]; then
+    if id trawl >/dev/null 2>&1; then
+      install -d -o trawl -g trawl -m 0750 /var/lib/trawl
+      tmp="$(mktemp /var/lib/trawl/web.cookie.XXXXXX)"
+      chmod 0400 "$tmp"
+      chown trawl:trawl "$tmp"
+      # `head -c` writes the first 32 bytes of /dev/urandom without printing.
+      head -c 32 /dev/urandom > "$tmp"
+      mv "$tmp" /var/lib/trawl/web.cookie
+    fi
+  fi
 fi
 
 #DEBHELPER#

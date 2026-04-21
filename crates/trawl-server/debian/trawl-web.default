@@ -1,0 +1,9 @@
+# Environment overrides for trawl-web (session proxy)
+# Uncomment and modify as needed.
+
+# RUST_LOG=trawl_web=info
+
+# Skip TLS verification of the upstream trawld self-signed cert.
+# Safe ONLY when trawl-web and trawld live on the same host talking loopback.
+# Do NOT set this in deployments where upstream traffic leaves the box.
+# TRAWL_WEB_INSECURE_UPSTREAM=1

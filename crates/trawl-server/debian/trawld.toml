@@ -114,3 +114,34 @@ db_path = "/var/lib/trawl/auth.db"
 
 # How often the retention task runs (seconds).
 # retention_interval_secs = 3600
+
+[web]
+# Browser-facing session proxy (trawl-web). Shared config with trawld.
+#
+# The proxy serves the web UI SPA and translates cookie-authenticated
+# browser requests into bearer-token requests to trawld. Runs as a
+# separate systemd unit (trawl-web.service).
+
+# Address to bind the proxy's HTTP listener.
+# Default is loopback only — put a TLS-terminating reverse proxy
+# (nginx/caddy/traefik) in front for external access.
+# bind_addr = "127.0.0.1:8090"
+
+# Upstream trawld URL. Derived from [server].http_addr by default
+# (wildcard binds are rewritten to loopback for same-host reach).
+# upstream_url = "https://127.0.0.1:5514"
+
+# Path to the 32-byte AEAD cookie-encryption key. The Debian postinst
+# script generates one from /dev/urandom on first install.
+cookie_secret_path = "/var/lib/trawl/web.cookie"
+
+# Alternative: read the base64-encoded key from an environment
+# variable. Takes precedence over cookie_secret_path.
+# cookie_secret_env = "TRAWL_WEB_COOKIE_SECRET"
+
+# Session lifetime in seconds (default: 24h).
+# session_ttl_secs = 86400
+
+# Drop the Secure flag on session cookies. Set true ONLY when the
+# proxy sits behind a TLS-terminating reverse proxy that strips it.
+# allow_insecure_cookies = false

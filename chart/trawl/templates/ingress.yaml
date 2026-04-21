@@ -1,16 +1,26 @@
 {{- if .Values.ingress.enabled -}}
+{{- $backend := .Values.ingress.backend | default "web" -}}
+{{- /*
+  Ingress target port:
+   - "web"    → trawl-web sidecar on plain HTTP (port name: web).
+                Cookie sessions; /api/v1/ingest is blocked by the proxy.
+   - "trawld" → raw HTTPS API (port name: https).
+                Users MUST set nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+                (or their controller's equivalent) via ingress.annotations.
+*/ -}}
+{{- if and (eq $backend "web") (not .Values.web.enabled) -}}
+{{-   fail "ingress.backend=web requires web.enabled=true; set ingress.backend to \"trawld\" or enable the web sidecar" -}}
+{{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ include "trawl.fullname" . }}
   labels:
     {{- include "trawl.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
   annotations:
-    # trawld speaks HTTPS natively — the ingress must proxy to an HTTPS backend.
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-    {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
-    {{- end }}
+  {{- end }}
 spec:
   {{- if .Values.ingress.className }}
   ingressClassName: {{ .Values.ingress.className }}
@@ -31,7 +41,7 @@ spec:
               service:
                 name: {{ include "trawl.fullname" $ }}
                 port:
-                  name: https
+                  name: {{ if eq $backend "web" }}web{{ else }}https{{ end }}
           {{- end }}
     {{- end }}
 {{- end }}

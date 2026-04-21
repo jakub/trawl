@@ -126,6 +126,57 @@ spec:
               mountPath: /etc/trawl/tls
               readOnly: true
             {{- end }}
+        {{- if .Values.web.enabled }}
+        - name: trawl-web
+          image: {{ include "trawl.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["trawl-web"]
+          args: ["--config", "/etc/trawl/trawld.toml"]
+          ports:
+            - name: web
+              containerPort: 8090
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /var/lib/trawl
+            # trawld serves HTTPS with a self-signed cert by default;
+            # loopback-within-pod is the only traffic path, so TLS
+            # verification buys us nothing here.
+            - name: TRAWL_WEB_INSECURE_UPSTREAM
+              value: "1"
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            {{- with .Values.web.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: web
+              scheme: HTTP
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: web
+              scheme: HTTP
+            periodSeconds: 10
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /etc/trawl/trawld.toml
+              subPath: trawld.toml
+              readOnly: true
+            - name: web-cookie
+              mountPath: /etc/trawl/web.cookie
+              subPath: cookie.key
+              readOnly: true
+        {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -141,6 +192,15 @@ spec:
         - name: tls
           secret:
             secretName: {{ include "trawl.fullname" . }}-tls
+        {{- end }}
+        {{- if .Values.web.enabled }}
+        - name: web-cookie
+          secret:
+            secretName: {{ if .Values.web.cookieSecret.existingSecret }}{{ .Values.web.cookieSecret.existingSecret }}{{ else }}{{ printf "%s-web" (include "trawl.fullname" .) }}{{ end }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.web.cookieSecret.existingSecretKey | default "cookie.key" }}
+                path: cookie.key
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

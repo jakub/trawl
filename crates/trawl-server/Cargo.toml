@@ -79,14 +79,19 @@ copyright = "2025-2026, Jakub Burgis"
 depends = "$auto"
 section = "net"
 priority = "optional"
-conf-files = ["/etc/trawl/trawld.toml", "/etc/default/trawld"]
+conf-files = ["/etc/trawl/trawld.toml", "/etc/default/trawld", "/etc/default/trawl-web"]
 maintainer-scripts = "debian/"
-systemd-units = { unit-name = "trawld", enable = true, start = true }
+systemd-units = [
+    { unit-name = "trawld", enable = true, start = true },
+    { unit-name = "trawl-web", enable = true, start = true },
+]
 assets = [
     ["target/release/trawld", "usr/bin/", "755"],
     ["target/release/trawl-admin", "usr/bin/", "755"],
+    ["target/release/trawl-web", "usr/bin/", "755"],
     ["debian/trawld.toml", "etc/trawl/", "644"],
     ["debian/trawld.default", "etc/default/trawld", "644"],
+    ["debian/trawl-web.default", "etc/default/trawl-web", "644"],
     ["debian/trawl.sysusers.conf", "usr/lib/sysusers.d/trawl.conf", "644"],
 ]
 

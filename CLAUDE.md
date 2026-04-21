@@ -72,6 +72,17 @@ for local iteration there are two faster flows:
 - **trunk serve** (SPA hot reload): `cd crates/trawl-web-ui && trunk serve` — proxies `/api/*` to a separately-run `trawl-web` on :8090. full docs in `Trunk.toml`.
 - **env override**: `TRAWL_WEB_SPA_DIR=$(pwd)/crates/trawl-web-ui/dist cargo run -p trawl-web` — `trawl-web` serves a pre-built `dist/` from disk instead of its embedded copy. lets you rebuild the SPA without recompiling the binary.
 
+### packaging
+
+`trawl-web` ships by default in both distribution channels:
+
+- **debian**: bundled inside the `trawl-server` .deb alongside `trawld` + `trawl-admin`. postinst generates `/var/lib/trawl/web.cookie` (32 random bytes) and enables+starts `trawl-web.service` — the proxy listens on `127.0.0.1:8090` out of the box. the `[web]` block in `/etc/trawl/trawld.toml` is shared with trawld.
+- **helm**: sidecar container in the same StatefulSet pod as trawld, guarded by `web.enabled` (default true). cookie key is stored in a chart-managed Secret and preserved across upgrades via helm's `lookup` function. ingress defaults to the web sidecar (`ingress.backend: web`) — switch to `ingress.backend: trawld` for bearer-token api clients.
+
+both distributions pre-generate/preserve the cookie secret so sessions survive restart.
+
+CLI clients (`trawl query`, `trawl-client`) and vector still hit **trawld directly** on port 5514 — the proxy only speaks cookies and hard-404s `/api/v1/ingest`.
+
 ### environments
 
 config uses named profiles (`~/.config/trawl/config.toml`):

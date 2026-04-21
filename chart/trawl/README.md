@@ -93,9 +93,11 @@ tls:
       kind: ClusterIssuer
 ```
 
-## Ingress
+## Web UI and Ingress
 
-trawld speaks HTTPS natively, so the ingress must proxy to an HTTPS backend. The chart adds the `nginx.ingress.kubernetes.io/backend-protocol: HTTPS` annotation automatically.
+The chart runs a **trawl-web sidecar** in the same pod as trawld by default. It serves the SPA and translates browser cookie sessions into bearer tokens against trawld on loopback.
+
+Ingress targets the sidecar by default (plain HTTP port 8090):
 
 ```yaml
 ingress:
@@ -110,6 +112,28 @@ ingress:
     - secretName: trawl-ingress-tls
       hosts:
         - trawl.example.com
+```
+
+Two things to keep in mind:
+
+1. **API clients keep talking to trawld directly.** `trawl query`, the `trawl-client` library, and vector all use bearer tokens against trawld's HTTPS port (5514). The web-UI ingress rejects non-cookie auth and blocks `/api/v1/ingest` outright. In-cluster clients hit the Service on 5514; external clients need a LoadBalancer or a second ingress with `ingress.backend: trawld`.
+2. **Cookie flags assume end-to-end TLS.** The proxy sets `Secure` on session cookies. If your ingress TLS-terminates AND forwards plain HTTP to the Service, browsers will discard the cookie. Flip `web.allowInsecureCookies: true` only in that topology — never over the open internet.
+
+Switch the ingress backend to the raw HTTPS API instead:
+
+```yaml
+ingress:
+  enabled: true
+  backend: trawld
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+```
+
+Disable the web UI entirely (trawld-only deployment):
+
+```yaml
+web:
+  enabled: false
 ```
 
 ## Gateway API (HTTPRoute)
@@ -255,11 +279,20 @@ config:
 | `image.tag` | string | `""` (appVersion) | Image tag override |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy |
 | `service.type` | string | `ClusterIP` | Service type |
-| `service.port` | int | `5514` | HTTPS service port |
+| `service.port` | int | `5514` | trawld HTTPS service port |
+| `service.webPort` | int | `8090` | trawl-web session proxy port (only when `web.enabled`) |
 | `service.syslog.enabled` | bool | `false` | Expose syslog ports |
 | `service.syslog.udpPort` | int | `1514` | Syslog UDP port |
 | `service.syslog.tcpPort` | int | `1514` | Syslog TCP port |
 | `ingress.enabled` | bool | `false` | Create an Ingress resource |
+| `ingress.backend` | string | `web` | Target service port: `web` (trawl-web, default) or `trawld` (raw HTTPS API) |
+| `web.enabled` | bool | `true` | Run the trawl-web session proxy sidecar |
+| `web.bindAddr` | string | `0.0.0.0:8090` | Bind address for trawl-web (pod-IP reachable) |
+| `web.sessionTtlSecs` | int | `86400` | Browser session lifetime (seconds) |
+| `web.allowInsecureCookies` | bool | `false` | Drop `Secure` flag on session cookies (behind TLS-terminating ingress only) |
+| `web.resources` | object | cpu 50m / mem 64Mi–256Mi | Resource requests/limits for the sidecar |
+| `web.cookieSecret.existingSecret` | string | `""` | Name of a pre-existing Secret holding the cookie key (chart generates one when empty) |
+| `web.cookieSecret.existingSecretKey` | string | `cookie.key` | Key within the Secret that holds the 32-byte AEAD key |
 | `httpRoute.enabled` | bool | `false` | Create a Gateway API HTTPRoute |
 | `httpRoute.parentRef.name` | string | `""` | Gateway name |
 | `httpRoute.parentRef.namespace` | string | `""` | Gateway namespace |

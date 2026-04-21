@@ -1,0 +1,43 @@
+[Unit]
+Description=Trawl web session proxy
+Documentation=https://github.com/jakub/trawl
+After=network-online.target trawld.service
+Wants=network-online.target trawld.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/trawl-web --config /etc/trawl/trawld.toml
+User=trawl
+Group=trawl
+EnvironmentFile=-/etc/default/trawl-web
+
+# State & logging — share trawld's state dir (read-only access to web.cookie).
+StateDirectory=trawl
+LogsDirectory=trawl
+WorkingDirectory=/var/lib/trawl
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Sandboxing
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/trawl
+ReadOnlyPaths=/etc/trawl
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

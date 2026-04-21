@@ -51,7 +51,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }}, wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -81,7 +81,14 @@ jobs:
 
       - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
         with:
-          tool: cargo-zigbuild,cargo-deb
+          tool: cargo-zigbuild,cargo-deb,trunk,wasm-bindgen-cli
+
+      # Build the leptos SPA first so rust-embed picks up a populated
+      # dist/ when trawl-web compiles. wasm toolchain is host-only, so
+      # this runs before the cross-target cargo zigbuild step.
+      - name: Build web UI SPA
+        working-directory: crates/trawl-web-ui
+        run: trunk build --release
 
       - name: Build
         run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
@@ -99,6 +106,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/trawl" "${staging}/"
           cp "target/${{ matrix.target }}/release/trawld" "${staging}/"
           cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
+          cp "target/${{ matrix.target }}/release/trawl-web" "${staging}/"
           tar czf "${staging}.tar.gz" "${staging}"
 
       - name: Upload tarball
@@ -308,7 +316,8 @@ jobs:
             tar xzf dist/trawl-*-${target}.tar.gz
             cp trawl-*-${target}/trawld "docker-ctx/${arch}/"
             cp trawl-*-${target}/trawl-admin "docker-ctx/${arch}/"
-            chmod +x "docker-ctx/${arch}/trawld" "docker-ctx/${arch}/trawl-admin"
+            cp trawl-*-${target}/trawl-web "docker-ctx/${arch}/"
+            chmod +x "docker-ctx/${arch}/trawld" "docker-ctx/${arch}/trawl-admin" "docker-ctx/${arch}/trawl-web"
           done
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3

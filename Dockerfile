@@ -12,7 +12,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY docker-ctx/${TARGETARCH}/trawld docker-ctx/${TARGETARCH}/trawl-admin /usr/bin/
+COPY docker-ctx/${TARGETARCH}/trawld docker-ctx/${TARGETARCH}/trawl-admin docker-ctx/${TARGETARCH}/trawl-web /usr/bin/
 
 RUN groupadd -r trawl \
     && useradd -r -g trawl -s /usr/sbin/nologin -d /var/lib/trawl trawl \
@@ -21,7 +21,7 @@ RUN groupadd -r trawl \
 
 USER trawl
 
-EXPOSE 5514 1514/udp 1514/tcp
+EXPOSE 5514 1514/udp 1514/tcp 8090
 
 ENTRYPOINT ["trawld"]
 CMD ["--config", "/etc/trawl/trawld.toml", "--no-monitor"]

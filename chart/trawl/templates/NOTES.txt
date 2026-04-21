@@ -24,8 +24,15 @@ Web access:  https://{{ . }}
 {{- end }}
 {{- else }}
 
-Direct access (port-forward):
+Direct API access (port-forward, bearer-token clients):
 
   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 5514:{{ .Values.service.port }}
   curl -k https://localhost:5514/api/v1/health
+{{- if .Values.web.enabled }}
+
+Web UI (browsers):
+
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 8090:{{ .Values.service.webPort | default 8090 }}
+  open http://localhost:8090
+{{- end }}
 {{- end }}

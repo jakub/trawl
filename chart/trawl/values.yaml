@@ -17,6 +17,8 @@ fullnameOverride: ""
 service:
   type: ClusterIP
   port: 5514
+  # Web UI (trawl-web session proxy) — only published when .Values.web.enabled.
+  webPort: 8090
   # Optional annotations (e.g. for cloud load balancers).
   annotations: {}
   # Native syslog listener ports (requires config.syslog.enabled).
@@ -26,12 +28,19 @@ service:
     tcpPort: 1514
 
 # -- Ingress (disabled by default)
-# trawld speaks HTTPS natively — the ingress must use backend-protocol HTTPS.
+# When ingress.backend is "web" (default) the ingress targets the trawl-web
+# sidecar — browser users get the SPA, cookie-authed sessions translate to
+# bearer tokens under the hood. Switch to "trawld" to expose the raw HTTPS
+# API directly (for bearer-token API clients), at which point you must set
+# the nginx backend-protocol annotation to HTTPS.
 ingress:
   enabled: false
+  # "web"    — browser UI via trawl-web sidecar (default)
+  # "trawld" — raw HTTPS API (requires backend-protocol: HTTPS annotation)
+  backend: web
   className: ""
   annotations: {}
-  # Example for nginx-ingress:
+  # For ingress.backend=trawld, add:
   #   nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
   hosts:
     - host: trawl.local
@@ -197,6 +206,42 @@ resources:
 #     - name: RUST_BACKTRACE
 #       value: "1"
 extraEnv: []
+
+# -- Browser-facing web UI (trawl-web session proxy)
+# Runs as a sidecar container in the same pod as trawld. Serves the SPA
+# and translates cookie-authenticated requests to bearer-token requests
+# against the local trawld.
+#
+# API clients that use bearer tokens directly (CLI, trawl-client library,
+# vector log ingest) must talk to the trawld HTTPS service on port 5514,
+# NOT to the trawl-web port — the proxy rejects non-cookie auth and blocks
+# /api/v1/ingest outright.
+web:
+  enabled: true
+  # Must bind to a pod-IP-reachable address (not loopback), so the
+  # Service's `web` port can route to it.
+  bindAddr: "0.0.0.0:8090"
+  sessionTtlSecs: 86400
+  # Drop the Secure cookie flag. Enable ONLY if a TLS-terminating ingress
+  # sits in front and strips it.
+  allowInsecureCookies: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  extraEnv: []
+
+  # Cookie secret — a 32-byte AEAD key.
+  #
+  # When existingSecret is empty the chart generates a Secret on first
+  # install and preserves the value on helm upgrade via a lookup shim.
+  # Supply your own Secret (e.g. from an external secrets manager) by
+  # setting existingSecret to its name.
+  cookieSecret:
+    existingSecret: ""
+    existingSecretKey: "cookie.key"
 
 # -- Log level
 logLevel: "trawl_server=info"

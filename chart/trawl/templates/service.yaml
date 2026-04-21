@@ -15,6 +15,12 @@ spec:
       port: {{ .Values.service.port }}
       targetPort: https
       protocol: TCP
+    {{- if .Values.web.enabled }}
+    - name: web
+      port: {{ .Values.service.webPort | default 8090 }}
+      targetPort: web
+      protocol: TCP
+    {{- end }}
     {{- if .Values.service.syslog.enabled }}
     - name: syslog-udp
       port: {{ .Values.service.syslog.udpPort }}

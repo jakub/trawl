@@ -30,6 +30,11 @@ curl -fsSL https://github.com/jakub/trawl/releases/latest/download/trawl-v0.1.8-
   | tar xz
 ```
 
+The `trawld` package also installs and enables `trawl-web.service`, the
+browser-facing session proxy that serves the web UI on `127.0.0.1:8090`.
+Put a TLS-terminating reverse proxy (caddy / nginx / traefik) in front if
+you want external access.
+
 ## Quick example
 
 ```bash

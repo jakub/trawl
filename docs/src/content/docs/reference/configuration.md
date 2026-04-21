@@ -119,6 +119,30 @@ Revoked keys remain valid for up to `auth_cache_ttl_secs` (default 5 minutes) on
 | `max_runs_per_schedule` | integer | `100` | Completed runs kept per schedule |
 | `report_retention_days` | integer | `30` | Delete report runs older than N days |
 
+### `[web]`
+
+Browser-facing session proxy (`trawl-web` binary). Reads the same `trawld.toml` and runs as a separate systemd unit (`trawl-web.service` on Debian, sidecar container in the Helm chart).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bind_addr` | string | `"127.0.0.1:8090"` | Listen address. Defaults to loopback — front with a reverse proxy for external access |
+| `upstream_url` | string | derived from `[server].http_addr` | trawld URL. Wildcard binds are rewritten to loopback |
+| `cookie_secret_path` | string | (none) | Path to a file holding the 32-byte AEAD cookie-encryption key |
+| `cookie_secret_env` | string | (none) | Env var holding the base64-encoded key. Takes precedence over `cookie_secret_path` |
+| `session_ttl_secs` | integer | `86400` | Browser session lifetime (24h default) |
+| `allow_insecure_cookies` | bool | `false` | Drop `Secure` flag on session cookies. Set true **only** when the proxy sits behind a TLS-terminating reverse proxy |
+
+If neither `cookie_secret_path` nor `cookie_secret_env` is set, the proxy generates an ephemeral key on each startup — sessions won't survive restart. The Debian `trawld` package generates a persistent key at `/var/lib/trawl/web.cookie` automatically via its `postinst` script.
+
+API clients using bearer tokens (the CLI, `trawl-client`, vector) talk to trawld directly on port 5514 — the proxy only handles cookie-authed browser traffic and blocks `/api/v1/ingest` outright.
+
+```toml
+[web]
+bind_addr = "127.0.0.1:8090"
+cookie_secret_path = "/var/lib/trawl/web.cookie"
+session_ttl_secs = 86400
+```
+
 ### `[syslog]`
 
 Native syslog listener for receiving logs from network appliances.

@@ -103,4 +103,12 @@ data:
     report_max_rows = {{ .Values.config.scheduler.reportMaxRows | int }}
     max_runs_per_schedule = {{ .Values.config.scheduler.maxRunsPerSchedule | int }}
     report_retention_days = {{ .Values.config.scheduler.reportRetentionDays | int }}
+    {{- if .Values.web.enabled }}
+
+    [web]
+    bind_addr = {{ .Values.web.bindAddr | quote }}
+    cookie_secret_path = "/etc/trawl/web.cookie"
+    session_ttl_secs = {{ .Values.web.sessionTtlSecs | int }}
+    allow_insecure_cookies = {{ .Values.web.allowInsecureCookies }}
+    {{- end }}
     {{- end }}
