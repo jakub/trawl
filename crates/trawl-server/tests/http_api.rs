@@ -840,9 +840,11 @@ async fn whoami_admin_has_server_manage() {
     // prefix is the stable 8-char fingerprint of the key; downstream
     // consumers (e.g. coastwatch) key audit records off it, so the
     // endpoint must surface it verbatim.
+    assert_eq!(resp.prefix.len(), 8, "prefix must be exactly 8 chars");
     assert!(
-        !resp.prefix.is_empty(),
-        "whoami must expose the key prefix for audit actor identification"
+        resp.prefix.chars().all(|c| c.is_ascii_alphanumeric()),
+        "prefix must be alphanumeric: got {}",
+        resp.prefix
     );
 }
 
