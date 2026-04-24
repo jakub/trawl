@@ -703,6 +703,7 @@ pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIR
         .collect();
 
     Json(WhoAmIResponse {
+        prefix: verified.prefix.clone(),
         name: verified.name.clone(),
         role: verified.role.as_str().to_owned(),
         permissions,
