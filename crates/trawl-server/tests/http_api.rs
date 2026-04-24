@@ -837,6 +837,13 @@ async fn whoami_admin_has_server_manage() {
     assert_eq!(resp.role, "admin");
     assert!(resp.permissions.contains(&"server_manage".to_owned()));
     assert!(resp.permissions.contains(&"query".to_owned()));
+    // prefix is the stable 8-char fingerprint of the key; downstream
+    // consumers (e.g. coastwatch) key audit records off it, so the
+    // endpoint must surface it verbatim.
+    assert!(
+        !resp.prefix.is_empty(),
+        "whoami must expose the key prefix for audit actor identification"
+    );
 }
 
 #[tokio::test]

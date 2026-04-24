@@ -428,6 +428,10 @@ pub struct StatsResponse {
 /// Response from the whoami endpoint — token identity and permissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoAmIResponse {
+    /// Key prefix (stable 8-char fingerprint). Intended as a non-mutable
+    /// actor identifier for downstream audit logging — `name` can change,
+    /// `prefix` cannot.
+    pub prefix: String,
     /// Key name (human-readable label).
     pub name: String,
     /// Role granted by this key (e.g. "admin", "analyst", "reader", "ingest").
@@ -1157,11 +1161,13 @@ mod tests {
     #[test]
     fn whoami_roundtrip() {
         let resp = WhoAmIResponse {
+            prefix: "abcd1234".into(),
             name: "dev-key".into(),
             role: "admin".into(),
             permissions: vec!["query".into(), "schema_read".into(), "server_manage".into()],
         };
         let rt = roundtrip(&resp);
+        assert_eq!(rt.prefix, "abcd1234");
         assert_eq!(rt.name, "dev-key");
         assert_eq!(rt.role, "admin");
         assert_eq!(rt.permissions.len(), 3);
