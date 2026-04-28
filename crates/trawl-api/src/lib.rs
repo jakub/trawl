@@ -428,7 +428,7 @@ pub struct StatsResponse {
 /// Response from the whoami endpoint — token identity and permissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoAmIResponse {
-    /// Key prefix (stable 8-char fingerprint). Intended as a non-mutable
+    /// Key prefix (stable 8-char fingerprint). Intended as an immutable
     /// actor identifier for downstream audit logging — `name` can change,
     /// `prefix` cannot.
     pub prefix: String,

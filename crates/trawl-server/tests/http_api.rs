@@ -842,8 +842,10 @@ async fn whoami_admin_has_server_manage() {
     // endpoint must surface it verbatim.
     assert_eq!(resp.prefix.len(), 8, "prefix must be exactly 8 chars");
     assert!(
-        resp.prefix.chars().all(|c| c.is_ascii_alphanumeric()),
-        "prefix must be alphanumeric: got {}",
+        resp.prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "prefix must be base64url charset: got {}",
         resp.prefix
     );
 }
