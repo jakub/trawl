@@ -22,7 +22,7 @@ use serde::Deserialize;
 use tokio::time::{Instant, sleep_until};
 
 use crate::error::ProxyError;
-use crate::middleware::session_extractor::Session;
+use crate::middleware::session_extractor::Auth;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -32,7 +32,7 @@ pub struct StreamParams {
 
 pub async fn forward(
     State(state): State<AppState>,
-    session: Session,
+    auth: Auth,
     Query(params): Query<StreamParams>,
 ) -> Result<Response, ProxyError> {
     let upstream_url = format!(
@@ -43,7 +43,7 @@ pub async fn forward(
     let upstream_resp = state
         .http()
         .get(&upstream_url)
-        .bearer_auth(session.token())
+        .bearer_auth(auth.token())
         .query(&[("query", &params.query)])
         .send()
         .await
@@ -71,7 +71,11 @@ pub async fn forward(
     // `Body::from_stream` otherwise has no deadline. Dropping the
     // upstream stream also cleanly closes the TCP connection via
     // reqwest's drop handling.
-    let deadline = Instant::now() + remaining_ttl(session.exp(), chrono::Utc::now().timestamp());
+    let ttl = match &auth {
+        Auth::Session(s) => remaining_ttl(s.exp(), chrono::Utc::now().timestamp()),
+        Auth::Bearer(_) => Duration::from_secs(state.session_ttl_secs()),
+    };
+    let deadline = Instant::now() + ttl;
     let capped_stream = byte_stream.take_until(sleep_until(deadline));
 
     // For non-2xx, preserve the upstream Content-Type (typically
@@ -409,5 +413,40 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "stream should close at session.exp (~1s), took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_accepts_bearer_header() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let sse_body = "event: data\ndata: {\"x\":1}\n\n";
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .and(query_param("query", "*"))
+            .and(bearer_token("flt_direct"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=*")
+            .header("authorization", "Bearer flt_direct")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), sse_body.as_bytes());
     }
 }

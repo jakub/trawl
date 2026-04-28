@@ -20,7 +20,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, he
 use axum::response::{IntoResponse, Response};
 
 use crate::error::ProxyError;
-use crate::middleware::session_extractor::Session;
+use crate::middleware::session_extractor::Auth;
 use crate::state::AppState;
 
 /// Headers that are hop-by-hop per RFC 7230 §6.1 and MUST NOT be forwarded
@@ -50,7 +50,7 @@ pub async fn block_ingest() -> Response {
 
 pub async fn forward(
     State(state): State<AppState>,
-    session: Session,
+    auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
     let (parts, body) = req.into_parts();
@@ -60,7 +60,7 @@ pub async fn forward(
     let mut upstream_req = state
         .http()
         .request(reqwest_method(&parts.method), upstream_uri)
-        .bearer_auth(session.token());
+        .bearer_auth(auth.token());
 
     // Forward most headers; strip hop-by-hop and cookies (we already
     // translated cookie → bearer above).
@@ -326,5 +326,72 @@ mod tests {
             built,
             "https://trawld:5514/api/v1/saved?limit=50&cursor=abc"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_accepts_bearer_header() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schema"))
+            .and(bearer_token("flt_direct"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "columns": [{"name": "host", "type": "VARCHAR"}]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("authorization", "Bearer flt_direct")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forward_bearer_wins_over_cookie() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schema"))
+            .and(bearer_token("flt_explicit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("cookie", &cookie)
+            .header("authorization", "Bearer flt_explicit")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forward_rejects_empty_bearer() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("authorization", "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

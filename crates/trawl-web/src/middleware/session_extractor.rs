@@ -8,6 +8,7 @@
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use axum::http::{HeaderValue, header};
 
 use crate::error::ProxyError;
 use crate::session::{self, SESSION_COOKIE, SessionPayload};
@@ -72,6 +73,54 @@ impl FromRequestParts<AppState> for Session {
     }
 }
 
+/// Auth source for proxy handlers: either a decrypted cookie session or a
+/// raw bearer token passed through verbatim.
+#[derive(Debug)]
+pub enum Auth {
+    Session(Session),
+    Bearer(String),
+}
+
+impl Auth {
+    #[must_use]
+    pub fn token(&self) -> &str {
+        match self {
+            Self::Session(s) => s.token(),
+            Self::Bearer(t) => t.as_str(),
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for Auth {
+    type Rejection = ProxyError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(token) = extract_bearer(parts.headers.get(header::AUTHORIZATION)) {
+            return Ok(Self::Bearer(token));
+        }
+        Session::from_request_parts(parts, state)
+            .await
+            .map(Self::Session)
+    }
+}
+
+fn extract_bearer(header: Option<&HeaderValue>) -> Option<String> {
+    let value = header?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_owned())
+    }
+}
+
 /// Parse a Cookie header and return the value of `name`, or None if absent.
 ///
 /// Handles the standard `name1=v1; name2=v2; name3=v3` form. No URL-decoding
@@ -113,5 +162,31 @@ mod tests {
             Some("value"),
             "leading/trailing whitespace around pairs should be tolerated"
         );
+    }
+
+    #[test]
+    fn extract_bearer_case_insensitive() {
+        let hv = |s: &str| Some(HeaderValue::from_str(s).unwrap());
+        assert_eq!(
+            extract_bearer(hv("Bearer flt_tok").as_ref()),
+            Some("flt_tok".to_owned())
+        );
+        assert_eq!(
+            extract_bearer(hv("bearer flt_tok").as_ref()),
+            Some("flt_tok".to_owned())
+        );
+        assert_eq!(
+            extract_bearer(hv("BEARER flt_tok").as_ref()),
+            Some("flt_tok".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_bearer_rejects_empty_and_non_bearer() {
+        let hv = |s: &str| Some(HeaderValue::from_str(s).unwrap());
+        assert_eq!(extract_bearer(hv("Bearer ").as_ref()), None);
+        assert_eq!(extract_bearer(hv("Bearer   ").as_ref()), None);
+        assert_eq!(extract_bearer(hv("Basic dXNlcjpwYXNz").as_ref()), None);
+        assert_eq!(extract_bearer(None), None);
     }
 }
