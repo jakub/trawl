@@ -170,7 +170,7 @@ pub fn StoriesPage() -> impl IntoView {
     }
 }
 
-fn state_badge(s: &str) -> (&'static str, &'static str) {
+pub(crate) fn state_badge(s: &str) -> (&'static str, &'static str) {
     match s.parse::<StoryState>() {
         Ok(StoryState::Emerging) => ("emerging", "--amber"),
         Ok(StoryState::Active) => ("active", "--green"),
@@ -182,7 +182,7 @@ fn state_badge(s: &str) -> (&'static str, &'static str) {
     }
 }
 
-fn class_label(s: &str) -> &'static str {
+pub(crate) fn class_label(s: &str) -> &'static str {
     use coastwatch_api_types::enums::StoryClass;
     match s.parse::<StoryClass>() {
         Ok(StoryClass::Vulnerability) => "VULN",
