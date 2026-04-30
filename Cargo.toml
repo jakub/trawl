@@ -22,6 +22,7 @@ trawl-client = { path = "crates/trawl-client" }
 trawl-config = { path = "crates/trawl-config" }
 trawl-dashboard = { path = "crates/trawl-dashboard" }
 trawl-web = { path = "crates/trawl-web" }
+coastwatch-api-types = { path = "crates/coastwatch-api-types" }
 
 # external deps
 aho-corasick = "1"

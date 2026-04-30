@@ -20,6 +20,7 @@ path = "src/main.rs"
 # The `wasmbind` feature only kicks in on wasm32.
 [dependencies]
 trawl-api = { workspace = true }
+coastwatch-api-types = { workspace = true }
 chrono = { workspace = true, features = ["wasmbind"] }
 
 # Wasm-only deps — leptos, web-sys, gloo-net, etc. `cargo check --workspace`
