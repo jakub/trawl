@@ -1,0 +1,8 @@
+procs:
+  trawld:
+    shell: cargo run -p trawl-server --bin trawld
+  trawl-web:
+    shell: cargo run -p trawl-web
+  trunk:
+    shell: trunk serve
+    cwd: crates/trawl-web-ui
