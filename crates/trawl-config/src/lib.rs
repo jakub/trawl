@@ -821,6 +821,10 @@ pub struct WebConfig {
     /// Drop `Secure` on session cookies. Dev-only; MUST stay `false` in prod.
     #[serde(default)]
     pub allow_insecure_cookies: bool,
+
+    /// URL for the coastwatch intel daemon. Optional — intel features are
+    /// disabled when absent. Example: `"https://coastwatch.internal:7700"`.
+    pub coastwatch_url: Option<String>,
 }
 
 fn default_audit_interval_secs() -> u64 {

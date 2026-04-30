@@ -37,6 +37,7 @@ pub const ENV_INSECURE_UPSTREAM: &str = "TRAWL_WEB_INSECURE_UPSTREAM";
 pub struct ResolvedConfig {
     pub bind_addr: String,
     pub upstream_url: String,
+    pub coastwatch_url: Option<String>,
     pub session_ttl_secs: u64,
     pub allow_insecure_cookies: bool,
     pub insecure_upstream_tls: bool,
@@ -116,6 +117,7 @@ impl ResolvedConfig {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned()),
             upstream_url,
+            coastwatch_url: web.coastwatch_url.clone(),
             session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
             allow_insecure_cookies: web.allow_insecure_cookies,
             insecure_upstream_tls: std::env::var(ENV_INSECURE_UPSTREAM)

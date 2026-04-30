@@ -25,6 +25,7 @@ struct Inner {
     cookie_key: SessionKey,
     http: Client,
     upstream_url: String,
+    coastwatch_url: Option<String>,
     session_ttl_secs: u64,
     allow_insecure_cookies: bool,
 }
@@ -49,6 +50,7 @@ impl AppState {
                 cookie_key: cfg.cookie_key,
                 http,
                 upstream_url: cfg.upstream_url,
+                coastwatch_url: cfg.coastwatch_url,
                 session_ttl_secs: cfg.session_ttl_secs,
                 allow_insecure_cookies: cfg.allow_insecure_cookies,
             }),
@@ -71,6 +73,11 @@ impl AppState {
     }
 
     #[must_use]
+    pub fn coastwatch_url(&self) -> Option<&str> {
+        self.inner.coastwatch_url.as_deref()
+    }
+
+    #[must_use]
     pub fn session_ttl_secs(&self) -> u64 {
         self.inner.session_ttl_secs
     }
@@ -85,6 +92,7 @@ impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field("upstream_url", &self.inner.upstream_url)
+            .field("coastwatch_url", &self.inner.coastwatch_url)
             .field("session_ttl_secs", &self.inner.session_ttl_secs)
             .field("allow_insecure_cookies", &self.inner.allow_insecure_cookies)
             .finish_non_exhaustive()
