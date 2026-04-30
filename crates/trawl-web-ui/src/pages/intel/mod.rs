@@ -2,12 +2,4 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-pub mod history;
-pub mod intel;
-pub mod layout;
-pub mod login;
-pub mod nets;
-pub mod placeholder;
-pub mod runs;
-pub mod schema;
-pub mod search;
+pub mod stories;
