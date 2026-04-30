@@ -10,6 +10,7 @@ use leptos_router::path;
 
 use crate::pages::history::HistoryPage;
 use crate::pages::intel::stories::StoriesPage;
+use crate::pages::intel::story::StoryPage;
 use crate::pages::layout::{NotFound, RedirectTo, Shell};
 use crate::pages::login::Login;
 use crate::pages::nets::NetsPage;
@@ -38,7 +39,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/jobs/runs") view=RunsPage/>
                     <Route path=path!("/intel") view=|| view! { <RedirectTo path="/intel/stories"/> }/>
                     <Route path=path!("/intel/stories") view=StoriesPage/>
-                    <Route path=path!("/intel/stories/:id") view=IntelPlaceholder/>
+                    <Route path=path!("/intel/stories/:id") view=StoryPage/>
                     <Route path=path!("/intel/queue") view=IntelPlaceholder/>
                     <Route path=path!("/intel/entities") view=IntelPlaceholder/>
                     <Route path=path!("/intel/sources") view=IntelPlaceholder/>
