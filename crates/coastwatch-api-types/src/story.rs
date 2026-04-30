@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::marking::MarkingView;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryView {
     pub id: String,
     pub story_class: String,
@@ -16,7 +16,7 @@ pub struct StoryView {
     pub updated_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEventView {
     pub id: String,
     pub delta_type: String,
@@ -27,7 +27,7 @@ pub struct TimelineEventView {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryClaimView {
     pub story_id: String,
     pub claim_id: String,
@@ -43,7 +43,7 @@ pub struct StoryClaimView {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryRelationView {
     pub story_a_id: String,
     pub story_b_id: String,
