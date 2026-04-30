@@ -59,9 +59,9 @@ pub fn SchemaPage() -> impl IntoView {
                     let n_enc = js_sys::encode_uri_component(n)
                         .as_string()
                         .unwrap_or_else(|| n.to_string());
-                    format!("/search?app=search&section=schema&svc={n_enc}&stab={stab}")
+                    format!("/search/schema?svc={n_enc}&stab={stab}")
                 }
-                None => "/search?app=search&section=schema".to_string(),
+                None => "/search/schema".to_string(),
             };
             nav(
                 &url,

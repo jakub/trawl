@@ -36,7 +36,7 @@ pub fn RunsPage() -> impl IntoView {
     let goto_net = {
         let nav = nav.clone();
         move |net_id: i64| {
-            let url = format!("/search?app=jobs&section=nets&net={net_id}&ntab=runs");
+            let url = format!("/jobs/nets?net={net_id}&ntab=runs");
             nav(
                 &url,
                 NavigateOptions {

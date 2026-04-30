@@ -6,7 +6,7 @@
 //! active; the active section is derived from the current pathname.
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_query_map;
+use leptos_router::hooks::use_location;
 
 use crate::state::app_mode::AppMode;
 
@@ -144,25 +144,32 @@ pub fn default_for(mode: AppMode) -> &'static str {
     items_for(mode)[0].id
 }
 
-fn pathname() -> String {
-    web_sys::window()
-        .and_then(|w| w.location().pathname().ok())
-        .unwrap_or_default()
-}
-
 /// `Memo<String>` for the current section, derived from the URL
-/// pathname matched against the active mode's rail items.
+/// pathname matched against the active mode's rail items. Prefers
+/// exact matches, then longest-prefix match, to avoid `/search`
+/// shadowing `/search/history`.
 #[must_use]
 pub fn from_url(mode: Memo<AppMode>) -> Memo<String> {
-    let qm = use_query_map();
+    let location = use_location();
     Memo::new(move |_| {
-        let _ = qm.get();
         let m = mode.get();
-        let path = pathname();
+        let path = location.pathname.get();
         let valid: &[RailItem] = items_for(m);
-        valid
+
+        // Exact match first.
+        if let Some(item) = valid.iter().find(|item| path == item.path) {
+            return item.id.to_string();
+        }
+        // Longest prefix match — sort by path length descending so
+        // /search/history beats /search for /search/history/... paths.
+        let mut by_len: Vec<&RailItem> = valid.iter().collect();
+        by_len.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        if let Some(item) = by_len
             .iter()
-            .find(|item| path == item.path || path.starts_with(&format!("{}/", item.path)))
-            .map_or_else(|| default_for(m).to_string(), |item| item.id.to_string())
+            .find(|item| path.starts_with(&format!("{}/", item.path)))
+        {
+            return item.id.to_string();
+        }
+        default_for(m).to_string()
     })
 }

@@ -64,8 +64,8 @@ pub fn NetsPage() -> impl IntoView {
         let nav = nav.clone();
         move |id: Option<i64>, ntab: &str| {
             let url = match id {
-                Some(n) => format!("/search?app=jobs&section=nets&net={n}&ntab={ntab}"),
-                None => "/search?app=jobs&section=nets".to_string(),
+                Some(n) => format!("/jobs/nets?net={n}&ntab={ntab}"),
+                None => "/jobs/nets".to_string(),
             };
             nav(
                 &url,

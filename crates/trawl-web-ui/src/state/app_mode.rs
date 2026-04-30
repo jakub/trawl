@@ -9,7 +9,7 @@
 //! result rendering. `AppMode` governs which page mounts.
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_query_map;
+use leptos_router::hooks::use_location;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
@@ -43,12 +43,6 @@ impl AppMode {
     }
 }
 
-fn pathname() -> String {
-    web_sys::window()
-        .and_then(|w| w.location().pathname().ok())
-        .unwrap_or_default()
-}
-
 fn mode_from_path(path: &str) -> AppMode {
     if path.starts_with("/intel") {
         AppMode::Intel
@@ -61,14 +55,10 @@ fn mode_from_path(path: &str) -> AppMode {
     }
 }
 
-/// `Memo<AppMode>` derived from the URL pathname. Reactive — the
-/// `use_query_map` subscription fires on every navigation (even
-/// path-only changes), which triggers a re-read of `window.location`.
+/// `Memo<AppMode>` derived from the URL pathname. Reactive — uses the
+/// router's `use_location().pathname` which fires on every navigation.
 #[must_use]
 pub fn from_url() -> Memo<AppMode> {
-    let qm = use_query_map();
-    Memo::new(move |_| {
-        let _ = qm.get();
-        mode_from_path(&pathname())
-    })
+    let location = use_location();
+    Memo::new(move |_| mode_from_path(&location.pathname.get()))
 }

@@ -4,7 +4,7 @@
 
 //! `<HistoryPage/>` — full-page query history browser.
 //!
-//! Lives inside the Search app shell, rendered when `?section=history`.
+//! Lives inside the Search app shell at `/search/history`.
 //! Pulls from `GET /api/v1/history` (paginated) and lets the user:
 //! - filter rows client-side by substring on the query text
 //! - click a row to reload the query into the search editor
@@ -92,7 +92,7 @@ pub fn HistoryPage() -> impl IntoView {
             let cur = hpage.get_untracked();
             if cur > 0 {
                 goto_hpage(
-                    &format!("/search?app=search&section=history&hpage={}", cur - 1),
+                    &format!("/search/history?hpage={}", cur - 1),
                     NavigateOptions {
                         replace: true,
                         ..Default::default()
@@ -106,7 +106,7 @@ pub fn HistoryPage() -> impl IntoView {
         move |_| {
             let cur = hpage.get_untracked();
             goto_hpage(
-                &format!("/search?app=search&section=history&hpage={}", cur + 1),
+                &format!("/search/history?hpage={}", cur + 1),
                 NavigateOptions {
                     replace: true,
                     ..Default::default()
