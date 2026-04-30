@@ -52,6 +52,10 @@ pub enum ProxyError {
     /// browser in detail.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// An optional upstream is not configured.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl IntoResponse for ProxyError {
@@ -66,6 +70,7 @@ impl IntoResponse for ProxyError {
             Self::Session(_) | Self::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
             }
+            Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service unavailable"),
         };
 
         // Severity per variant — blanket `debug!` used to hide network
@@ -81,6 +86,9 @@ impl IntoResponse for ProxyError {
             }
             Self::Session(_) | Self::Internal(_) => {
                 tracing::error!(error = %self, "proxy internal error");
+            }
+            Self::ServiceUnavailable(_) => {
+                tracing::warn!(error = %self, "proxy service unavailable");
             }
         }
 

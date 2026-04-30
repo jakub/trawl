@@ -53,17 +53,35 @@ pub async fn forward(
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
+    do_forward(state.upstream_url(), "", state.http(), auth, req).await
+}
+
+pub async fn forward_intel(
+    State(state): State<AppState>,
+    auth: Auth,
+    req: Request<Body>,
+) -> Result<Response, ProxyError> {
+    let base = state.coastwatch_url().ok_or_else(|| {
+        ProxyError::ServiceUnavailable("coastwatch upstream not configured".into())
+    })?;
+    do_forward(base, "/api/intel", state.http(), auth, req).await
+}
+
+async fn do_forward(
+    base: &str,
+    strip_prefix: &str,
+    http: &reqwest::Client,
+    auth: Auth,
+    req: Request<Body>,
+) -> Result<Response, ProxyError> {
     let (parts, body) = req.into_parts();
 
-    let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
+    let upstream_uri = build_upstream_uri(base, &parts.uri, strip_prefix)?;
 
-    let mut upstream_req = state
-        .http()
+    let mut upstream_req = http
         .request(reqwest_method(&parts.method), upstream_uri)
         .bearer_auth(auth.token());
 
-    // Forward most headers; strip hop-by-hop and cookies (we already
-    // translated cookie → bearer above).
     for (name, value) in &parts.headers {
         if HOP_BY_HOP
             .iter()
@@ -76,8 +94,6 @@ pub async fn forward(
         upstream_req = upstream_req.header(name.as_str(), value);
     }
 
-    // Buffer the body. This is fine for JSON-size payloads; the SSE
-    // streaming endpoint uses a separate handler that streams bytes.
     let body_bytes = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
         .await
         .map_err(|e| ProxyError::BadRequest(format!("request body: {e}")))?;
@@ -102,12 +118,15 @@ pub async fn forward(
 
 const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-fn build_upstream_uri(base: &str, orig: &Uri) -> Result<String, ProxyError> {
+fn build_upstream_uri(base: &str, orig: &Uri, strip_prefix: &str) -> Result<String, ProxyError> {
     let path_and_query = orig
         .path_and_query()
         .map(axum::http::uri::PathAndQuery::as_str)
         .ok_or_else(|| ProxyError::Internal("request URI missing path".into()))?;
-    Ok(format!("{}{path_and_query}", base.trim_end_matches('/')))
+    let stripped = path_and_query
+        .strip_prefix(strip_prefix)
+        .unwrap_or(path_and_query);
+    Ok(format!("{}{stripped}", base.trim_end_matches('/')))
 }
 
 fn reqwest_method(m: &Method) -> reqwest::Method {
@@ -150,6 +169,17 @@ mod tests {
     fn state_pointing_at(upstream: &MockServer) -> AppState {
         let web = WebConfig {
             upstream_url: Some(upstream.uri()),
+            allow_insecure_cookies: true,
+            ..WebConfig::default()
+        };
+        let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
+        AppState::from_config(cfg).unwrap()
+    }
+
+    fn state_with_intel(trawld: &MockServer, coastwatch: &MockServer) -> AppState {
+        let web = WebConfig {
+            upstream_url: Some(trawld.uri()),
+            coastwatch_url: Some(coastwatch.uri()),
             allow_insecure_cookies: true,
             ..WebConfig::default()
         };
@@ -321,11 +351,25 @@ mod tests {
     #[test]
     fn upstream_uri_preserves_query_string() {
         let orig: Uri = "/api/v1/saved?limit=50&cursor=abc".parse().unwrap();
-        let built = build_upstream_uri("https://trawld:5514/", &orig).unwrap();
+        let built = build_upstream_uri("https://trawld:5514/", &orig, "").unwrap();
         assert_eq!(
             built,
             "https://trawld:5514/api/v1/saved?limit=50&cursor=abc"
         );
+    }
+
+    #[test]
+    fn upstream_uri_strips_intel_prefix() {
+        let orig: Uri = "/api/intel/v1/stories?cursor=xyz".parse().unwrap();
+        let built = build_upstream_uri("https://coastwatch:7700", &orig, "/api/intel").unwrap();
+        assert_eq!(built, "https://coastwatch:7700/v1/stories?cursor=xyz");
+    }
+
+    #[test]
+    fn upstream_uri_strips_prefix_without_query() {
+        let orig: Uri = "/api/intel/v1/stories/sto_abc123".parse().unwrap();
+        let built = build_upstream_uri("https://coastwatch:7700", &orig, "/api/intel").unwrap();
+        assert_eq!(built, "https://coastwatch:7700/v1/stories/sto_abc123");
     }
 
     #[tokio::test]
@@ -393,5 +437,51 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn forward_intel_strips_prefix_and_injects_bearer() {
+        let trawld = MockServer::start().await;
+        let coastwatch = MockServer::start().await;
+        let state = state_with_intel(&trawld, &coastwatch);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &trawld).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/stories"))
+            .and(bearer_token("flt_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [], "next_cursor": null, "request_id": "req_1"
+            })))
+            .mount(&coastwatch)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/intel/v1/stories")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forward_intel_returns_503_when_unconfigured() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/intel/v1/stories")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
