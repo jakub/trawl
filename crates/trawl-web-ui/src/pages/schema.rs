@@ -28,7 +28,8 @@ use crate::state::query::{Mode, RangeSpec, navigator};
 
 #[component]
 #[allow(clippy::too_many_lines)]
-pub fn SchemaPage(bus: ToastBus) -> impl IntoView {
+pub fn SchemaPage() -> impl IntoView {
+    let bus = use_context::<ToastBus>().expect("ToastBus context");
     let qm = use_query_map();
     let svc_selected = Memo::new(move |_| qm.get().get("svc"));
     let tab_param = Memo::new(move |_| {

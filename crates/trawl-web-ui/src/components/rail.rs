@@ -5,8 +5,8 @@
 //! `<Rail/>` — 52px left navigation rail.
 //!
 //! Items are mode-aware (Search has Search/History/Schema; Intel has
-//! News/IoCs/Feeds; etc.). Active item gets the amber bar + amber color.
-//! Help is pinned at the bottom of every mode.
+//! Stories/Queue/Entities/Sources; etc.). Active item gets the amber
+//! bar + amber color. Help is pinned at the bottom of every mode.
 
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;
@@ -24,18 +24,8 @@ pub fn Rail(
 
     let go = {
         let nav = nav.clone();
-        move |target_section: &'static str, current_mode: AppMode| {
-            // Preserve mode + the section param; strip everything else
-            // (the search workspace is the only mode that has its own
-            // params, and switching section there is a fresh page).
-            nav(
-                &format!(
-                    "/search?app={}&section={}",
-                    current_mode.as_param(),
-                    target_section
-                ),
-                NavigateOptions::default(),
-            );
+        move |path: &'static str| {
+            nav(path, NavigateOptions::default());
         }
     };
 
@@ -49,7 +39,7 @@ pub fn Rail(
                         <div
                             class="it"
                             class:active=move || section.get() == item.id
-                            on:click=move |_| go(item.id, cur_mode)
+                            on:click=move |_| go(item.path)
                             title=item.label
                         >
                             <RailIconView icon=item.icon/>

@@ -31,7 +31,8 @@ const PAGE_SIZE: usize = 50;
 
 #[component]
 #[allow(clippy::too_many_lines)] // page-level component: header + table + footer
-pub fn HistoryPage(bus: ToastBus) -> impl IntoView {
+pub fn HistoryPage() -> impl IntoView {
+    let bus = use_context::<ToastBus>().expect("ToastBus context");
     let qm = use_query_map();
     let hpage = Memo::new(move |_| {
         qm.get()

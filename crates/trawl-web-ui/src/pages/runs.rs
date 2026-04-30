@@ -12,15 +12,13 @@ use leptos_router::NavigateOptions;
 use leptos_router::hooks::use_navigate;
 
 use crate::api;
-use crate::components::toast::ToastBus;
 use crate::time_fmt::{format_duration, time_ago};
 
 const RUNS_PAGE_SIZE: usize = 20;
 
 #[component]
 #[allow(clippy::too_many_lines)]
-pub fn RunsPage(bus: ToastBus) -> impl IntoView {
-    let _ = bus;
+pub fn RunsPage() -> impl IntoView {
     let page = RwSignal::new(0usize);
     let filter = RwSignal::new(String::new());
 

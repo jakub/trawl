@@ -32,7 +32,8 @@ enum NetSort {
 
 #[component]
 #[allow(clippy::too_many_lines)]
-pub fn NetsPage(bus: ToastBus) -> impl IntoView {
+pub fn NetsPage() -> impl IntoView {
+    let bus = use_context::<ToastBus>().expect("ToastBus context");
     let qm = use_query_map();
     let net_selected: Memo<Option<i64>> =
         Memo::new(move |_| qm.get().get("net").and_then(|s| s.parse::<i64>().ok()));

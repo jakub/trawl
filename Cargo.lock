@@ -910,6 +910,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "coastwatch-api-types"
+version = "0.2.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "codee"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

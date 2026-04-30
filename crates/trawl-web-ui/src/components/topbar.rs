@@ -36,14 +36,7 @@ pub fn TopBar(
     let go = {
         let nav = nav.clone();
         move |target: AppMode| {
-            // Search keeps its current ?q/&page/&mode params via the
-            // search page itself; mode switches always reset to a
-            // bare `/search?app=…` URL since other pages don't share
-            // those params.
-            nav(
-                &format!("/search?app={}", target.as_param()),
-                NavigateOptions::default(),
-            );
+            nav(target.default_path(), NavigateOptions::default());
         }
     };
 
