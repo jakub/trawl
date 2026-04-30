@@ -64,7 +64,7 @@ pub fn StoryPage() -> impl IntoView {
                     let importance = story.importance_score;
                     let markings = story.markings.clone();
                     let parent = story.parent_story_id.clone();
-                    let story_id = id.get();
+                    let story_id = story.id.clone();
 
                     view! {
                         <StoryHeader
@@ -78,8 +78,8 @@ pub fn StoryPage() -> impl IntoView {
                         />
                         <StorySummary summary=summary/>
                         <TimelineSection story_id=story_id.clone() now_ms=now_ms/>
-                        <ClaimsSection story_id=story_id.clone() now_ms=now_ms/>
-                        <RelationsSection story_id=story_id now_ms=now_ms/>
+                        <ClaimsSection story_id=story_id.clone()/>
+                        <RelationsSection story_id=story_id/>
                     }.into_any()
                 }
             }}
@@ -248,10 +248,13 @@ fn TimelineSection(story_id: String, now_ms: i64) -> impl IntoView {
                             }).collect::<Vec<_>>()}
                         </div>
                         {has_more.then(|| {
+                            let is_loading = loading.get();
                             view! {
                                 <div class="tbl-foot">
                                     <span></span>
-                                    <button class="btn-sec" on:click=on_load_more>"load more"</button>
+                                    <button class="btn-sec" disabled=is_loading on:click=on_load_more>
+                                        {if is_loading { "loading\u{2026}" } else { "load more" }}
+                                    </button>
                                 </div>
                             }
                         })}
@@ -263,13 +266,14 @@ fn TimelineSection(story_id: String, now_ms: i64) -> impl IntoView {
 }
 
 #[component]
-fn ClaimsSection(story_id: String, #[allow(unused)] now_ms: i64) -> impl IntoView {
+fn ClaimsSection(story_id: String) -> impl IntoView {
     let items = RwSignal::new(Vec::<StoryClaimView>::new());
     let next_cursor = RwSignal::new(None::<String>);
     let loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
     let expanded = RwSignal::new(None::<String>);
-    let evidence_cache = RwSignal::new(HashMap::<String, Vec<ClaimEvidenceView>>::new());
+    let evidence_cache =
+        RwSignal::new(HashMap::<String, Result<Vec<ClaimEvidenceView>, String>>::new());
 
     let id = story_id.clone();
     Effect::new(move |_| {
@@ -367,9 +371,15 @@ fn ClaimsSection(story_id: String, #[allow(unused)] now_ms: i64) -> impl IntoVie
                                         if !cached.contains_key(&cid) {
                                             let cid2 = cid.clone();
                                             spawn_local(async move {
-                                                if let Ok(page) = api::intel::claim_evidence(&cid2, None).await {
-                                                    evidence_cache.update(|m| { m.insert(cid2, page.items); });
-                                                }
+                                                let result = api::intel::claim_evidence(&cid2, None).await;
+                                                evidence_cache.update(|m| {
+                                                    m.insert(
+                                                        cid2,
+                                                        result
+                                                            .map(|page| page.items)
+                                                            .map_err(|e| e.to_string()),
+                                                    );
+                                                });
                                             });
                                         }
                                     }
@@ -406,12 +416,17 @@ fn ClaimsSection(story_id: String, #[allow(unused)] now_ms: i64) -> impl IntoVie
                                                         <span class="mono" style="color:var(--ink-3)">"loading evidence…"</span>
                                                     </div>
                                                 }.into_any(),
-                                                Some(evs) if evs.is_empty() => view! {
+                                                Some(Err(msg)) => view! {
+                                                    <div class="evidence-panel">
+                                                        <span class="mono" style="color:var(--red)">{format!("error: {msg}")}</span>
+                                                    </div>
+                                                }.into_any(),
+                                                Some(Ok(evs)) if evs.is_empty() => view! {
                                                     <div class="evidence-panel">
                                                         <span class="mono" style="color:var(--ink-3)">"no evidence records"</span>
                                                     </div>
                                                 }.into_any(),
-                                                Some(evs) => view! {
+                                                Some(Ok(evs)) => view! {
                                                     <div class="evidence-panel">
                                                         {evs.iter().map(|ev| {
                                                             let factual = ev.factual_summary.clone()
@@ -441,10 +456,13 @@ fn ClaimsSection(story_id: String, #[allow(unused)] now_ms: i64) -> impl IntoVie
                             }).collect::<Vec<_>>()}
                         </div>
                         {has_more.then(|| {
+                            let is_loading = loading.get();
                             view! {
                                 <div class="tbl-foot">
                                     <span></span>
-                                    <button class="btn-sec" on:click=on_load_more>"load more"</button>
+                                    <button class="btn-sec" disabled=is_loading on:click=on_load_more>
+                                        {if is_loading { "loading\u{2026}" } else { "load more" }}
+                                    </button>
                                 </div>
                             }
                         })}
@@ -456,8 +474,7 @@ fn ClaimsSection(story_id: String, #[allow(unused)] now_ms: i64) -> impl IntoVie
 }
 
 #[component]
-fn RelationsSection(story_id: String, #[prop(into)] now_ms: i64) -> impl IntoView {
-    let _ = now_ms;
+fn RelationsSection(story_id: String) -> impl IntoView {
     let resource = LocalResource::new({
         let id = story_id.clone();
         move || {

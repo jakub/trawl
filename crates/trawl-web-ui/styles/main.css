@@ -34,6 +34,7 @@
   --amber-wash:rgba(200,121,26,.08);
 
   --teal:       #0e8b7a;
+  --teal-wash:  rgba(14,139,122,.10);
   --red:        #b43a2a;
   --red-wash:   rgba(180,58,42,.08);
   --yellow:     #a68210;
@@ -67,6 +68,7 @@
   --amber-wash:rgba(240,168,72,.10);
 
   --teal:       #4ec9b0;
+  --teal-wash:  rgba(78,201,176,.12);
   --red:        #e05a4a;
   --red-wash:   rgba(224,90,74,.12);
   --yellow:     #d4b04a;

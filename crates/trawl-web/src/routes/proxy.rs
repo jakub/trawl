@@ -123,9 +123,15 @@ fn build_upstream_uri(base: &str, orig: &Uri, strip_prefix: &str) -> Result<Stri
         .path_and_query()
         .map(axum::http::uri::PathAndQuery::as_str)
         .ok_or_else(|| ProxyError::Internal("request URI missing path".into()))?;
-    let stripped = path_and_query
-        .strip_prefix(strip_prefix)
-        .unwrap_or(path_and_query);
+    let stripped = if strip_prefix.is_empty() {
+        path_and_query
+    } else {
+        path_and_query.strip_prefix(strip_prefix).ok_or_else(|| {
+            ProxyError::Internal(format!(
+                "path '{path_and_query}' does not start with '{strip_prefix}'"
+            ))
+        })?
+    };
     Ok(format!("{}{stripped}", base.trim_end_matches('/')))
 }
 
@@ -483,5 +489,33 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn forward_intel_mirrors_upstream_4xx() {
+        let trawld = MockServer::start().await;
+        let coastwatch = MockServer::start().await;
+        let state = state_with_intel(&trawld, &coastwatch);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &trawld).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/stories/sto_missing"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"error": "not_found", "request_id": "req_1"})),
+            )
+            .mount(&coastwatch)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/intel/v1/stories/sto_missing")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -154,10 +154,13 @@ pub fn StoriesPage() -> impl IntoView {
                             }).collect::<Vec<_>>()}
                         </div>
                         {if has_more {
+                            let is_loading = loading.get();
                             view! {
                                 <div class="tbl-foot">
                                     <span></span>
-                                    <button class="btn-sec" on:click=on_load_more>"load more"</button>
+                                    <button class="btn-sec" disabled=is_loading on:click=on_load_more>
+                                        {if is_loading { "loading…" } else { "load more" }}
+                                    </button>
                                 </div>
                             }.into_any()
                         } else {
