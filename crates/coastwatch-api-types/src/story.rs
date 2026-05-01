@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+use crate::entity::EntityRef;
 use crate::marking::MarkingView;
+use crate::source::SourceRef;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeRange {
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryView {
@@ -40,6 +48,18 @@ pub struct StoryClaimView {
     pub modality: String,
     pub claim_confidence: f64,
     pub source_class: String,
+    pub source_role: String,
+    pub attribution_confidence: Option<f64>,
+    pub payload: serde_json::Value,
+    pub payload_schema_version: i32,
+    pub subject_entity: Option<EntityRef>,
+    pub object_entity: Option<EntityRef>,
+    pub source: Option<SourceRef>,
+    pub asserted_at: Option<String>,
+    pub disclosed_at: Option<String>,
+    pub event_time_range: Option<TimeRange>,
+    pub observed_time_range: Option<TimeRange>,
+    pub markings: Vec<MarkingView>,
     pub created_at: String,
 }
 
