@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRef {
+    pub id: String,
+    pub name: String,
+    pub source_class: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SourceView {
     pub id: String,

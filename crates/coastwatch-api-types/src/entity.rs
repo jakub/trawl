@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::marking::MarkingView;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityRef {
+    pub id: String,
+    pub entity_type: String,
+    pub canonical_name: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EntityView {
     pub id: String,
