@@ -40,6 +40,7 @@
   --yellow:     #a68210;
   --yellow-wash:rgba(166,130,16,.10);
   --green:      #4a7d3f;
+  --green-wash: rgba(74,125,63,.10);
   --blue:       #2a5c8a;
 
   --shadow-1:    0 1px 0 rgba(0,0,0,.03);
@@ -74,6 +75,7 @@
   --yellow:     #d4b04a;
   --yellow-wash:rgba(212,176,74,.14);
   --green:      #7bbd6a;
+  --green-wash: rgba(123,189,106,.12);
   --blue:       #5a9fd4;
 
   --shadow-1:    0 1px 0 rgba(0,0,0,.3);
@@ -2285,3 +2287,24 @@ textarea:focus-visible,
   background: var(--panel-2); border-left: 2px solid var(--line);
   font-size: var(--table-fs);
 }
+.conf-bar {
+  display: inline-block; width: 32px; height: 6px;
+  border-radius: 3px; vertical-align: middle;
+}
+.modality-icon { font-size: 13px; line-height: 1; cursor: help; }
+.claim-dim { opacity: 0.55; }
+.claim-dim:hover { opacity: 0.85; }
+.source-group-hd {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px; cursor: pointer;
+  border-left: 2px solid var(--line);
+  font-size: var(--table-fs); font-weight: 500;
+}
+.source-group-hd:hover { background: var(--panel-2); }
+.source-group-summary { font-size: 10px; color: var(--ink-3); font-weight: 400; }
+.dup-badge {
+  font-size: 10px; color: var(--ink-3); cursor: pointer;
+  padding: 1px 6px; border-radius: 3px;
+}
+.dup-badge:hover { background: var(--panel-2); }
+.products-row-nofx { background: var(--red-wash); }
