@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # trawl local dev stack: trawld + trawl-web + trunk serve under mprocs.
+# pass --with-coastwatch to also run coastwatch-api + coastwatch-ingest.
 # run from anywhere — resolves repo root via git.
 
 set -euo pipefail
@@ -8,6 +9,14 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
 die() { printf 'bin/dev: %s\n' "$*" >&2; exit 1; }
+
+with_coastwatch=false
+for arg in "$@"; do
+    case "$arg" in
+        --with-coastwatch) with_coastwatch=true ;;
+        *) die "unknown flag: $arg" ;;
+    esac
+done
 
 command -v mprocs >/dev/null || die "mprocs not found. install with 'cargo install mprocs' or 'brew install mprocs'."
 command -v trunk  >/dev/null || die "trunk not found. install with 'cargo install --locked trunk'."
@@ -28,7 +37,65 @@ if [[ -z "${TRAWL_COOKIE_SECRET:-}" ]]; then
 fi
 export TRAWL_COOKIE_SECRET
 
-printf 'bin/dev: building rust bins...\n'
+coastwatch_dir="$repo_root/../coastwatch"
+
+if $with_coastwatch; then
+    [[ -d "$coastwatch_dir" ]] || die "coastwatch repo not found at $coastwatch_dir"
+
+    env_file="$repo_root/.env.coastwatch"
+    if [[ -f "$env_file" ]]; then
+        set -a
+        # shellcheck source=/dev/null
+        source "$env_file"
+        set +a
+        printf 'bin/dev: loaded %s\n' "$env_file"
+    fi
+
+    [[ -n "${DATABASE_URL:-}" ]] || die "DATABASE_URL not set. create .env.coastwatch or export it."
+    export COASTWATCH_TRAWL_URL="${COASTWATCH_TRAWL_URL:-https://127.0.0.1:5514}"
+    export COASTWATCH_TRAWL_INSECURE="${COASTWATCH_TRAWL_INSECURE:-1}"
+fi
+
+printf 'bin/dev: building trawl bins...\n'
 cargo build -p trawl-server -p trawl-web
 
-exec mprocs --config "$repo_root/mprocs.yaml"
+if $with_coastwatch; then
+    printf 'bin/dev: building coastwatch bins...\n'
+    cargo build --manifest-path "$coastwatch_dir/Cargo.toml" -p coastwatch-api -p coastwatch-ingest -p coastwatch-worker
+fi
+
+mprocs_config="$repo_root/mprocs.yaml"
+
+if $with_coastwatch; then
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/trawl-dev-mprocs.XXXXXX")"
+    trap 'rm -rf "$tmpdir"' EXIT
+    mprocs_config="$tmpdir/mprocs.yaml"
+
+    cat > "$mprocs_config" <<YAML
+procs:
+  trawld:
+    shell: cargo run -p trawl-server --bin trawld
+  trawl-web:
+    shell: cargo run -p trawl-web
+  trunk:
+    shell: trunk serve
+    cwd: crates/trawl-web-ui
+  coastwatch-api:
+    shell: cargo run --manifest-path "$coastwatch_dir/Cargo.toml" -p coastwatch-api
+    env:
+      DATABASE_URL: "$DATABASE_URL"
+      COASTWATCH_TRAWL_URL: "$COASTWATCH_TRAWL_URL"
+      COASTWATCH_TRAWL_INSECURE: "$COASTWATCH_TRAWL_INSECURE"
+  coastwatch-ingest:
+    shell: cargo run --manifest-path "$coastwatch_dir/Cargo.toml" -p coastwatch-ingest
+    env:
+      DATABASE_URL: "$DATABASE_URL"
+  coastwatch-worker:
+    shell: cargo run --manifest-path "$coastwatch_dir/Cargo.toml" -p coastwatch-worker
+    env:
+      DATABASE_URL: "$DATABASE_URL"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+YAML
+fi
+
+exec mprocs --config "$mprocs_config"
