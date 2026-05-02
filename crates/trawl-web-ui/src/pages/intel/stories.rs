@@ -74,7 +74,7 @@ pub fn StoriesPage() -> impl IntoView {
                         <div class="tbl">
                             <div class="tbl-body">
                                 <div class="tbl-row" style="cursor:default">
-                                    <span class="mono" style="color:var(--ink-3)">"loading…"</span>
+                                    <span class="mono" style="color:var(--ink-3)">"loading\u{2026}"</span>
                                 </div>
                             </div>
                         </div>
@@ -83,7 +83,7 @@ pub fn StoriesPage() -> impl IntoView {
 
                 if let Some(ref e) = error.get() {
                     let msg = match e {
-                        ApiError::Status(503) => "intel service unavailable — configure web.coastwatch_url in trawld.toml".to_string(),
+                        ApiError::Status(503) => "intel service unavailable \u{2014} configure web.coastwatch_url in trawld.toml".to_string(),
                         other => format!("couldn't load stories: {other}"),
                     };
                     return view! {
@@ -115,40 +115,73 @@ pub fn StoriesPage() -> impl IntoView {
 
                 view! {
                     <div class="tbl">
-                        <div class="tbl-hd">
-                            <div style="flex:0 0 72px">"State"</div>
-                            <div style="flex:0 0 80px">"Class"</div>
-                            <div style="flex:3; min-width:0">"Title"</div>
-                            <div style="flex:0 0 56px; text-align:right">"Score"</div>
-                            <div style="flex:0 0 72px; text-align:right">"Updated"</div>
-                        </div>
                         <div class="tbl-body">
                             {rows.into_iter().map(|story| {
                                 let id = story.id.clone();
                                 let on_click = on_row_click.clone();
                                 let (state_label, state_color) = state_badge(&story.state);
-                                let class_label = class_label(&story.story_class);
+                                let cls = class_label(&story.story_class);
                                 let score = story.importance_score
-                                    .map(|s| format!("{s:.1}"))
-                                    .unwrap_or_else(|| "\u{2014}".into());
+                                    .map(|s| format!("\u{25b2} {s:.1}"))
+                                    .unwrap_or_default();
                                 let updated = time_ago(&story.updated_at, now_ms);
+                                let created = time_ago(&story.created_at, now_ms);
+                                let summary = story.canonical_summary.clone();
+                                let markings = story.markings.clone();
+                                let has_parent = story.parent_story_id.is_some();
 
                                 view! {
-                                    <div class="tbl-row" on:click=move |_| on_click(id.clone())>
-                                        <div style="flex:0 0 72px">
-                                            <span
-                                                class="intel-badge"
-                                                style=format!("background:var({state_color}-wash,var(--panel-2));color:var({state_color})")
-                                            >{state_label}</span>
+                                    <div
+                                        class="story-list-row"
+                                        on:click=move |_| on_click(id.clone())
+                                    >
+                                        <div class="story-list-main">
+                                            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0;flex:1">
+                                                <span
+                                                    class="intel-badge"
+                                                    style=format!("background:var({state_color}-wash,var(--panel-2));color:var({state_color})")
+                                                >{state_label}</span>
+                                                <span class="intel-badge" style="background:var(--panel-2);color:var(--blue)">
+                                                    {cls}
+                                                </span>
+                                                {markings.into_iter().map(|m| {
+                                                    let (bg, fg) = marking_colors(&m);
+                                                    let label = if m.scheme.eq_ignore_ascii_case("TLP") {
+                                                        format!("TLP:{}", m.value.to_uppercase())
+                                                    } else {
+                                                        format!("{}:{}", m.scheme, m.value)
+                                                    };
+                                                    view! {
+                                                        <span class="intel-badge" style=format!("background:{bg};color:{fg};font-weight:600")>
+                                                            {label}
+                                                        </span>
+                                                    }
+                                                }).collect::<Vec<_>>()}
+                                                {has_parent.then(|| view! {
+                                                    <span class="intel-badge" style="background:var(--panel-2);color:var(--ink-3)">
+                                                        "\u{2934}"
+                                                    </span>
+                                                })}
+                                                <span class="story-list-title">{story.canonical_title}</span>
+                                            </div>
+                                            <div style="display:flex;align-items:center;gap:10px;flex-shrink:0">
+                                                {(!score.is_empty()).then(|| view! {
+                                                    <span class="mono" style="color:var(--ink-2);font-size:11px">
+                                                        {score}
+                                                    </span>
+                                                })}
+                                            </div>
                                         </div>
-                                        <div style="flex:0 0 80px">
-                                            <span class="intel-badge" style="background:var(--panel-2);color:var(--blue)">
-                                                {class_label}
+                                        <div class="story-list-sub">
+                                            <span class="story-list-summary">
+                                                {summary.unwrap_or_default()}
+                                            </span>
+                                            <span class="story-list-times">
+                                                <span title=story.updated_at>{format!("updated {updated}")}</span>
+                                                " \u{00b7} "
+                                                <span title=story.created_at>{format!("created {created}")}</span>
                                             </span>
                                         </div>
-                                        <div style="flex:3; min-width:0" class="path">{story.canonical_title}</div>
-                                        <div style="flex:0 0 56px; text-align:right" class="mono">{score}</div>
-                                        <div style="flex:0 0 72px; text-align:right; color:var(--ink-3)" class="mono">{updated}</div>
                                     </div>
                                 }
                             }).collect::<Vec<_>>()}
@@ -159,7 +192,7 @@ pub fn StoriesPage() -> impl IntoView {
                                 <div class="tbl-foot">
                                     <span></span>
                                     <button class="btn-sec" disabled=is_loading on:click=on_load_more>
-                                        {if is_loading { "loading…" } else { "load more" }}
+                                        {if is_loading { "loading\u{2026}" } else { "load more" }}
                                     </button>
                                 </div>
                             }.into_any()
@@ -196,5 +229,18 @@ pub(crate) fn class_label(s: &str) -> &'static str {
         Ok(StoryClass::Policy) => "POLICY",
         Ok(StoryClass::General) => "GENERAL",
         Err(_) => "???",
+    }
+}
+
+fn marking_colors(m: &coastwatch_api_types::marking::MarkingView) -> (&'static str, &'static str) {
+    if m.scheme.eq_ignore_ascii_case("TLP") {
+        match m.value.to_uppercase().as_str() {
+            "RED" => ("var(--red-wash)", "var(--red)"),
+            "AMBER" | "AMBER+STRICT" => ("var(--amber-wash)", "var(--amber)"),
+            "GREEN" => ("rgba(74,125,63,.10)", "var(--green)"),
+            _ => ("var(--panel-2)", "var(--ink-3)"),
+        }
+    } else {
+        ("var(--panel-2)", "var(--ink-2)")
     }
 }

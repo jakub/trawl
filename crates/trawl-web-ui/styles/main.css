@@ -2309,6 +2309,55 @@ textarea:focus-visible,
 .dup-badge:hover { background: var(--panel-2); }
 .products-row-nofx { background: var(--red-wash); }
 
+/* ── Story list: two-line card rows ─────────────────────────── */
+.story-list-row {
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--line-2);
+  transition: background 80ms;
+}
+.story-list-row:last-child { border-bottom: 0; }
+.story-list-row:hover { background: var(--panel-2); }
+.story-list-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.story-list-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.story-list-sub {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 3px;
+}
+.story-list-summary {
+  font-size: 11.5px;
+  color: var(--ink-2);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.story-list-times {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 /* ── Story detail: columnar layout ──────────────────────────── */
 .story-cols {
   display: grid;
