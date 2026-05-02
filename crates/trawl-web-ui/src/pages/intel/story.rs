@@ -20,6 +20,7 @@ use crate::time_fmt::time_ago;
 
 use super::stories::{class_label, state_badge};
 
+#[derive(Clone, PartialEq)]
 struct HeaderMeta {
     source_names: Vec<String>,
     product_names: Vec<String>,
@@ -621,10 +622,11 @@ fn ClaimsSection(
                                     });
                                 };
 
+                                let display_name = source_name.clone();
                                 view! {
                                     <div>
                                         <div class="source-group-hd" on:click=on_toggle_source>
-                                            <span style="font-weight:600">{&source_name}</span>
+                                            <span style="font-weight:600">{display_name}</span>
                                             <span class="intel-badge" style="background:var(--panel-2);color:var(--ink-3)">
                                                 {sc_display}
                                             </span>
@@ -1155,8 +1157,7 @@ fn source_role_badge(role: &str) -> (&'static str, &'static str) {
         "republisher" => ("republisher", "--ink-4"),
         "commentary" => ("commentary", "--ink-3"),
         "" => ("", "--ink-4"),
-        other if other.is_empty() => ("", "--ink-4"),
-        _ => (role, "--ink-3"),
+        _ => ("other", "--ink-3"),
     }
 }
 

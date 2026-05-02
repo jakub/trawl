@@ -27,7 +27,7 @@ pub struct ClaimRelationView {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimEvidenceView {
     pub fragment_id: String,
     pub post_id: String,

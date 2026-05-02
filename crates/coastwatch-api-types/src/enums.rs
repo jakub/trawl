@@ -42,7 +42,7 @@ macro_rules! snake_case_enum {
     };
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParseEnumError {
     pub type_name: &'static str,
     pub value: String,
