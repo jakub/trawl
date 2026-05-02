@@ -1015,10 +1015,9 @@ fn derive_header_meta(claims: &[StoryClaimView]) -> HeaderMeta {
             }
         }
         if is_affected_product(&claim.claim_type) {
-            if let Some(ref entity) = claim.object_entity {
-                if !product_names.contains(&entity.canonical_name) {
-                    product_names.push(entity.canonical_name.clone());
-                }
+            let name = extract_product_name(claim);
+            if name != "\u{2014}" && !product_names.contains(&name) {
+                product_names.push(name);
             }
             if let Some(status) = claim
                 .payload
@@ -1044,18 +1043,29 @@ fn is_affected_product(ct: &str) -> bool {
 }
 
 fn extract_product_name(claim: &StoryClaimView) -> String {
-    claim
-        .object_entity
-        .as_ref()
-        .map(|e| e.canonical_name.clone())
+    if let Some(ref entity) = claim.object_entity {
+        return entity.canonical_name.clone();
+    }
+    let vendor = claim
+        .payload
+        .get("vendor")
+        .and_then(serde_json::Value::as_str);
+    let product = claim
+        .payload
+        .get("product")
+        .and_then(serde_json::Value::as_str)
         .or_else(|| {
             claim
                 .payload
                 .get("affected_product")
                 .and_then(serde_json::Value::as_str)
-                .map(String::from)
-        })
-        .unwrap_or_else(|| "\u{2014}".into())
+        });
+    match (vendor, product) {
+        (Some(v), Some(p)) if v != p => format!("{v} {p}"),
+        (_, Some(p)) => p.to_string(),
+        (Some(v), None) => v.to_string(),
+        (None, None) => "\u{2014}".into(),
+    }
 }
 
 fn format_severity(payload: &serde_json::Value) -> (String, &'static str) {
@@ -1077,23 +1087,42 @@ fn format_severity(payload: &serde_json::Value) -> (String, &'static str) {
 }
 
 fn format_versions(payload: &serde_json::Value) -> String {
-    let Some(av) = payload.get("affected_versions") else {
-        return "\u{2014}".into();
-    };
-    if let Some(obj) = av.as_object() {
-        let introduced = obj
-            .get("introduced")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?");
-        match obj.get("fixed").and_then(serde_json::Value::as_str) {
-            Some(f) => format!("{introduced} \u{2013} {f}"),
-            None => format!("\u{2265} {introduced}"),
+    if let Some(av) = payload.get("affected_versions") {
+        if let Some(obj) = av.as_object() {
+            let introduced = obj
+                .get("introduced")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            return match obj.get("fixed").and_then(serde_json::Value::as_str) {
+                Some(f) => format!("{introduced} \u{2013} {f}"),
+                None => format!("\u{2265} {introduced}"),
+            };
+        } else if let Some(s) = av.as_str() {
+            return s.to_string();
         }
-    } else if let Some(s) = av.as_str() {
-        s.to_string()
-    } else {
-        "\u{2014}".into()
     }
+    if let Some(vr) = payload.get("version_range") {
+        if let Some(exact) = vr.get("Exact").and_then(serde_json::Value::as_str) {
+            return exact.to_string();
+        }
+        if let Some(obj) = vr.as_object() {
+            if let Some(range) = obj.get("Range") {
+                let start = range
+                    .get("start")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let end = range
+                    .get("end")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                return format!("{start} \u{2013} {end}");
+            }
+        }
+        if let Some(s) = vr.as_str() {
+            return s.to_string();
+        }
+    }
+    "\u{2014}".into()
 }
 
 fn format_fix_status(payload: &serde_json::Value) -> (String, Option<bool>) {
@@ -1149,15 +1178,15 @@ fn conf_bar_color(confidence: f64) -> &'static str {
     }
 }
 
-fn source_role_badge(role: &str) -> (&'static str, &'static str) {
+fn source_role_badge(role: &str) -> (String, &'static str) {
     match role {
-        "primary_author" => ("primary", "--green"),
-        "corroborating" => ("corroborating", "--ink-3"),
-        "aggregator" => ("aggregator", "--blue"),
-        "republisher" => ("republisher", "--ink-4"),
-        "commentary" => ("commentary", "--ink-3"),
-        "" => ("", "--ink-4"),
-        _ => ("other", "--ink-3"),
+        "primary_author" => ("primary".into(), "--green"),
+        "corroborating" => ("corroborating".into(), "--ink-3"),
+        "aggregator" => ("aggregator".into(), "--blue"),
+        "republisher" => ("republisher".into(), "--ink-4"),
+        "commentary" => ("commentary".into(), "--ink-3"),
+        "" => (String::new(), "--ink-4"),
+        other => (other.replace('_', " "), "--ink-3"),
     }
 }
 
@@ -1230,6 +1259,7 @@ fn marking_colors(m: &MarkingView) -> (&'static str, &'static str) {
 
 fn relationship_badge(s: &str) -> (&'static str, &'static str) {
     match s.parse::<StoryClaimRelationship>() {
+        Ok(StoryClaimRelationship::Evidence) => ("evidence", "--green"),
         Ok(StoryClaimRelationship::Contradiction) => ("contradiction", "--red"),
         Ok(StoryClaimRelationship::Supersession) => ("supersession", "--yellow"),
         Ok(StoryClaimRelationship::Correction) => ("correction", "--yellow"),

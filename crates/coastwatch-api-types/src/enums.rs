@@ -114,6 +114,7 @@ snake_case_enum! {
 
 snake_case_enum! {
     pub enum StoryClaimRelationship {
+        Evidence => "evidence",
         Duplicate => "duplicate",
         Evolution => "evolution",
         Related => "related",
@@ -319,6 +320,7 @@ mod tests {
         story_claim_relationship_roundtrip,
         StoryClaimRelationship,
         [
+            StoryClaimRelationship::Evidence,
             StoryClaimRelationship::Duplicate,
             StoryClaimRelationship::Evolution,
             StoryClaimRelationship::Related,
