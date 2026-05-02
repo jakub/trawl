@@ -173,9 +173,16 @@ pub fn StoriesPage() -> impl IntoView {
                                             </div>
                                         </div>
                                         <div class="story-list-sub">
-                                            <span class="story-list-summary">
-                                                {summary.unwrap_or_default()}
-                                            </span>
+                                            {match summary {
+                                                Some(s) => view! {
+                                                    <span class="story-list-summary">{s}</span>
+                                                }.into_any(),
+                                                None => view! {
+                                                    <span class="story-list-summary" style="color:var(--ink-4);font-style:italic">
+                                                        "no summary yet"
+                                                    </span>
+                                                }.into_any(),
+                                            }}
                                             <span class="story-list-times">
                                                 <span title=story.updated_at>{format!("updated {updated}")}</span>
                                                 " \u{00b7} "
