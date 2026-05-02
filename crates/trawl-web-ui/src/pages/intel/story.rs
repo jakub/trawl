@@ -9,7 +9,7 @@ use coastwatch_api_types::enums::{
     Modality, Polarity, SourceClass, StoryClaimRelationship, StoryRelation,
 };
 use coastwatch_api_types::marking::MarkingView;
-use coastwatch_api_types::story::{StoryClaimView, TimelineEventView};
+use coastwatch_api_types::story::{StoryClaimView, TimeRange, TimelineEventView};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
@@ -83,6 +83,8 @@ pub fn StoryPage() -> impl IntoView {
                     let markings = story.markings.clone();
                     let parent = story.parent_story_id.clone();
                     let story_id = story.id.clone();
+                    let created_at = story.created_at.clone();
+                    let updated_at = story.updated_at.clone();
 
                     view! {
                         <StoryHeader
@@ -94,12 +96,28 @@ pub fn StoryPage() -> impl IntoView {
                             markings=markings
                             parent_story_id=parent
                             meta=header_meta
+                            created_at=created_at.clone()
+                            updated_at=updated_at.clone()
+                            now_ms=now_ms
                         />
                         <StorySummary summary=summary/>
-                        <AffectedProductsSection claims=all_claims/>
-                        <TimelineSection story_id=story_id.clone() now_ms=now_ms/>
-                        <ClaimsSection story_id=story_id.clone() items=all_claims/>
-                        <RelationsSection story_id=story_id/>
+                        <div class="story-cols">
+                            <div class="story-sidebar">
+                                <StoryVitals
+                                    created_at=created_at
+                                    updated_at=updated_at
+                                    importance=importance
+                                    claims=all_claims
+                                    now_ms=now_ms
+                                />
+                                <VerticalTimeline story_id=story_id.clone() now_ms=now_ms/>
+                            </div>
+                            <div>
+                                <AffectedProductsSection claims=all_claims now_ms=now_ms/>
+                                <ClaimsSection story_id=story_id.clone() items=all_claims now_ms=now_ms/>
+                                <RelationsSection story_id=story_id now_ms=now_ms/>
+                            </div>
+                        </div>
                     }.into_any()
                 }
             }}
@@ -107,7 +125,10 @@ pub fn StoryPage() -> impl IntoView {
     }
 }
 
+// ── Header ─────────────────────────────────────────────────────
+
 #[component]
+#[allow(clippy::too_many_lines)]
 fn StoryHeader(
     title: String,
     state_label: &'static str,
@@ -117,8 +138,13 @@ fn StoryHeader(
     markings: Vec<MarkingView>,
     parent_story_id: Option<String>,
     meta: Memo<Option<HeaderMeta>>,
+    created_at: String,
+    updated_at: String,
+    now_ms: i64,
 ) -> impl IntoView {
     let score = importance.map(|s| format!("{s:.1}")).unwrap_or_default();
+    let created_ago = time_ago(&created_at, now_ms);
+    let updated_ago = time_ago(&updated_at, now_ms);
 
     view! {
         <div class="page-hd compact" style="border-left:2px solid var(--amber)">
@@ -173,6 +199,11 @@ fn StoryHeader(
                         </p>
                     })
                 }}
+                <p class="sub" style="margin:0;color:var(--ink-3);font-size:11px">
+                    <span title=created_at>{"created "}{created_ago}</span>
+                    " \u{00b7} "
+                    <span title=updated_at>{"updated "}{updated_ago}</span>
+                </p>
                 {parent_story_id.map(|pid| {
                     let href = format!("/intel/stories/{pid}");
                     view! {
@@ -204,12 +235,194 @@ fn StorySummary(summary: Option<String>) -> impl IntoView {
     }
 }
 
-// ── Affected products ───────────────────────────────────────────
+// ── Vitals card ────────────────────────────────────────────────
 
 #[component]
-fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>) -> impl IntoView {
+fn StoryVitals(
+    created_at: String,
+    updated_at: String,
+    importance: Option<f64>,
+    claims: RwSignal<Vec<StoryClaimView>>,
+    now_ms: i64,
+) -> impl IntoView {
+    let created_ago = time_ago(&created_at, now_ms);
+    let updated_ago = time_ago(&updated_at, now_ms);
+    let score_label = importance
+        .map(|s| format!("{s:.1}"))
+        .unwrap_or_else(|| "\u{2014}".into());
+
     view! {
-        <div style="padding:0 var(--pad)">
+        <div class="story-vitals">
+            <div class="story-vitals-row">
+                <span class="story-vitals-label">"Created"</span>
+                <span class="story-vitals-val" title=created_at>{created_ago}</span>
+            </div>
+            <div class="story-vitals-row">
+                <span class="story-vitals-label">"Updated"</span>
+                <span class="story-vitals-val" title=updated_at>{updated_ago}</span>
+            </div>
+            <div class="story-vitals-row">
+                <span class="story-vitals-label">"Importance"</span>
+                <span class="story-vitals-val">{score_label}</span>
+            </div>
+            {move || {
+                let all = claims.get();
+                if all.is_empty() {
+                    return ().into_any();
+                }
+                let claim_count = all.len();
+                let source_count = {
+                    let mut names = Vec::new();
+                    for c in &all {
+                        if let Some(ref s) = c.source {
+                            if !names.contains(&s.name) {
+                                names.push(s.name.clone());
+                            }
+                        }
+                    }
+                    names.len()
+                };
+                view! {
+                    <div class="story-vitals-row">
+                        <span class="story-vitals-label">"Claims"</span>
+                        <span class="story-vitals-val">{claim_count.to_string()}</span>
+                    </div>
+                    <div class="story-vitals-row">
+                        <span class="story-vitals-label">"Sources"</span>
+                        <span class="story-vitals-val">{source_count.to_string()}</span>
+                    </div>
+                }.into_any()
+            }}
+        </div>
+    }
+}
+
+// ── Vertical timeline ──────────────────────────────────────────
+
+#[component]
+fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
+    let items = RwSignal::new(Vec::<TimelineEventView>::new());
+    let next_cursor = RwSignal::new(None::<String>);
+    let loading = RwSignal::new(true);
+    let error = RwSignal::new(None::<String>);
+
+    let id = story_id.clone();
+    Effect::new(move |_| {
+        let id = id.clone();
+        spawn_local(async move {
+            match api::intel::story_timeline(&id, None).await {
+                Ok(page) => {
+                    let mut evts = page.items;
+                    evts.reverse();
+                    items.set(evts);
+                    next_cursor.set(page.next_cursor);
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            loading.set(false);
+        });
+    });
+
+    let load_id = story_id;
+    let on_load_more = move |_| {
+        let cursor = next_cursor.get_untracked();
+        let id = load_id.clone();
+        loading.set(true);
+        spawn_local(async move {
+            match api::intel::story_timeline(&id, cursor.as_deref()).await {
+                Ok(page) => {
+                    items.update(|v| {
+                        let mut new_evts = page.items;
+                        new_evts.reverse();
+                        // prepend older events at the beginning (chrono order)
+                        new_evts.append(v);
+                        *v = new_evts;
+                    });
+                    next_cursor.set(page.next_cursor);
+                }
+                Err(e) => error.set(Some(e.to_string())),
+            }
+            loading.set(false);
+        });
+    };
+
+    view! {
+        <div>
+            <div class="intel-section-hd" style="margin-top:0">"Timeline"</div>
+            {move || {
+                if loading.get() && items.get().is_empty() {
+                    return view! {
+                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
+                    }.into_any();
+                }
+                if let Some(ref e) = error.get() {
+                    return view! {
+                        <p class="mono" style="color:var(--red);font-size:var(--table-fs)">{e.clone()}</p>
+                    }.into_any();
+                }
+                let rows = items.get();
+                if rows.is_empty() {
+                    return view! {
+                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no timeline events yet"</p>
+                    }.into_any();
+                }
+                let has_more = next_cursor.get().is_some();
+                let on_load_more = on_load_more.clone();
+                view! {
+                    <div class="v-timeline">
+                        {rows.into_iter().map(|ev| {
+                            let when = time_ago(&ev.occurred_at, now_ms);
+                            let (delta_label, delta_color) = delta_badge(&ev.delta_type);
+                            let material_class = if ev.material { "v-timeline-node material" } else { "v-timeline-node" };
+                            let origin_color = match ev.origin.as_str() {
+                                "analyst" => "--amber",
+                                "backfill" => "--ink-4",
+                                _ => "--ink-3",
+                            };
+                            view! {
+                                <div class=material_class>
+                                    <div class="v-timeline-dot"
+                                        style=format!("background:var({delta_color})")
+                                    />
+                                    <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
+                                        <span class="intel-badge"
+                                            style=format!("background:var({delta_color}-wash,var(--panel-2));color:var({delta_color})")
+                                        >{delta_label}</span>
+                                        <span class="v-timeline-when" title=ev.occurred_at.clone()>{when}</span>
+                                    </div>
+                                    <div class="v-timeline-summary">{ev.summary}</div>
+                                    <div class="v-timeline-origin" style=format!("color:var({origin_color})")>
+                                        {ev.origin}
+                                    </div>
+                                </div>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </div>
+                    {has_more.then(|| {
+                        let is_loading = loading.get();
+                        view! {
+                            <button
+                                class="btn-sec"
+                                style="margin-top:8px;width:100%"
+                                disabled=is_loading
+                                on:click=on_load_more
+                            >
+                                {if is_loading { "loading\u{2026}" } else { "load older" }}
+                            </button>
+                        }
+                    })}
+                }.into_any()
+            }}
+        </div>
+    }
+}
+
+// ── Affected products ──────────────────────────────────────────
+
+#[component]
+fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>, now_ms: i64) -> impl IntoView {
+    view! {
+        <div>
             {move || {
                 let all = claims.get();
                 let products: Vec<_> = all
@@ -227,7 +440,8 @@ fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>) -> impl IntoVi
                             <div style="flex:0 0 80px">"Severity"</div>
                             <div style="flex:1">"Affected"</div>
                             <div style="flex:1">"Fix"</div>
-                            <div style="flex:0 0 140px;text-align:right">"Source"</div>
+                            <div style="flex:0 0 100px">"Disclosed"</div>
+                            <div style="flex:0 0 120px;text-align:right">"Source"</div>
                         </div>
                         <div class="tbl-body">
                             {products.into_iter().map(|claim| {
@@ -240,6 +454,15 @@ fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>) -> impl IntoVi
                                     .as_ref()
                                     .map(|s| s.name.clone())
                                     .unwrap_or_else(|| "\u{2014}".into());
+                                let disclosed = claim
+                                    .disclosed_at
+                                    .as_ref()
+                                    .map(|d| time_ago(d, now_ms))
+                                    .unwrap_or_else(|| "\u{2014}".into());
+                                let disclosed_title = claim
+                                    .disclosed_at
+                                    .clone()
+                                    .unwrap_or_default();
                                 let row_class = if fix_known == Some(false) {
                                     "products-row-nofx"
                                 } else {
@@ -262,7 +485,10 @@ fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>) -> impl IntoVi
                                         <div style="flex:1">
                                             <span style=format!("color:var({fix_color})")>{fix_label}</span>
                                         </div>
-                                        <div style="flex:0 0 140px;text-align:right;color:var(--ink-3)" class="mono">
+                                        <div style="flex:0 0 100px" class="mono" title=disclosed_title>
+                                            <span style="color:var(--ink-2)">{disclosed}</span>
+                                        </div>
+                                        <div style="flex:0 0 120px;text-align:right;color:var(--ink-3)" class="mono">
                                             {source}
                                         </div>
                                     </div>
@@ -276,128 +502,15 @@ fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>) -> impl IntoVi
     }
 }
 
-// ── Timeline ────────────────────────────────────────────────────
-
-#[component]
-fn TimelineSection(story_id: String, now_ms: i64) -> impl IntoView {
-    let items = RwSignal::new(Vec::<TimelineEventView>::new());
-    let next_cursor = RwSignal::new(None::<String>);
-    let loading = RwSignal::new(true);
-    let error = RwSignal::new(None::<String>);
-
-    let id = story_id.clone();
-    Effect::new(move |_| {
-        let id = id.clone();
-        spawn_local(async move {
-            match api::intel::story_timeline(&id, None).await {
-                Ok(page) => {
-                    items.set(page.items);
-                    next_cursor.set(page.next_cursor);
-                }
-                Err(e) => error.set(Some(e.to_string())),
-            }
-            loading.set(false);
-        });
-    });
-
-    let load_id = story_id;
-    let on_load_more = move |_| {
-        let cursor = next_cursor.get_untracked();
-        let id = load_id.clone();
-        loading.set(true);
-        spawn_local(async move {
-            match api::intel::story_timeline(&id, cursor.as_deref()).await {
-                Ok(page) => {
-                    items.update(|v| v.extend(page.items));
-                    next_cursor.set(page.next_cursor);
-                }
-                Err(e) => error.set(Some(e.to_string())),
-            }
-            loading.set(false);
-        });
-    };
-
-    view! {
-        <div style="padding:0 var(--pad)">
-            <div class="intel-section-hd">"Timeline"</div>
-            {move || {
-                if loading.get() && items.get().is_empty() {
-                    return view! {
-                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
-                    }.into_any();
-                }
-                if let Some(ref e) = error.get() {
-                    return view! {
-                        <p class="mono" style="color:var(--red);font-size:var(--table-fs)">{e.clone()}</p>
-                    }.into_any();
-                }
-                let rows = items.get();
-                if rows.is_empty() {
-                    return view! {
-                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no timeline events yet"</p>
-                    }.into_any();
-                }
-                let has_more = next_cursor.get().is_some();
-                let on_load_more = on_load_more.clone();
-                view! {
-                    <div class="tbl" style="margin-bottom:16px">
-                        <div class="tbl-body">
-                            {rows.into_iter().map(|ev| {
-                                let when = time_ago(&ev.occurred_at, now_ms);
-                                let (delta_label, delta_color) = delta_badge(&ev.delta_type);
-                                let material_style = if ev.material {
-                                    "border-left:2px solid var(--amber);"
-                                } else {
-                                    ""
-                                };
-                                let origin_color = match ev.origin.as_str() {
-                                    "analyst" => "--amber",
-                                    "backfill" => "--ink-4",
-                                    _ => "--ink-3",
-                                };
-                                view! {
-                                    <div class="tbl-row" style=format!("cursor:default;{material_style}")>
-                                        <div style="flex:0 0 72px;color:var(--ink-3)" class="mono" title=ev.occurred_at.clone()>
-                                            {when}
-                                        </div>
-                                        <div style="flex:0 0 140px;display:flex;align-items:center;gap:6px">
-                                            <span class="intel-badge"
-                                                style=format!("background:var({delta_color}-wash,var(--panel-2));color:var({delta_color})")
-                                            >{delta_label}</span>
-                                        </div>
-                                        <div style="flex:3;min-width:0;color:var(--ink-2)">{ev.summary}</div>
-                                        <div style="flex:0 0 72px;text-align:right">
-                                            <span class="mono" style=format!("color:var({origin_color});font-size:10px")>
-                                                {ev.origin}
-                                            </span>
-                                        </div>
-                                    </div>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                        {has_more.then(|| {
-                            let is_loading = loading.get();
-                            view! {
-                                <div class="tbl-foot">
-                                    <span></span>
-                                    <button class="btn-sec" disabled=is_loading on:click=on_load_more>
-                                        {if is_loading { "loading\u{2026}" } else { "load more" }}
-                                    </button>
-                                </div>
-                            }
-                        })}
-                    </div>
-                }.into_any()
-            }}
-        </div>
-    }
-}
-
-// ── Claims ──────────────────────────────────────────────────────
+// ── Claims ─────────────────────────────────────────────────────
 
 #[component]
 #[allow(clippy::too_many_lines)]
-fn ClaimsSection(story_id: String, items: RwSignal<Vec<StoryClaimView>>) -> impl IntoView {
+fn ClaimsSection(
+    story_id: String,
+    items: RwSignal<Vec<StoryClaimView>>,
+    now_ms: i64,
+) -> impl IntoView {
     let next_cursor = RwSignal::new(None::<String>);
     let loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
@@ -445,7 +558,7 @@ fn ClaimsSection(story_id: String, items: RwSignal<Vec<StoryClaimView>>) -> impl
     };
 
     view! {
-        <div style="padding:0 var(--pad)">
+        <div>
             <div class="intel-section-hd">"Claims"</div>
             {move || {
                 if loading.get() && items.get().is_empty() {
@@ -480,12 +593,13 @@ fn ClaimsSection(story_id: String, items: RwSignal<Vec<StoryClaimView>>) -> impl
                             <div style="flex:0 0 48px;text-align:right">"Conf"</div>
                         </div>
                         <div class="tbl-body">
-                            {groups.into_iter().map(|(source_name, source_class, group_claims)| {
+                            {groups.into_iter().map(|(source_name, source_class, source_role, group_claims)| {
                                 let type_summary = summarize_claim_types(&group_claims);
                                 let sc_display = source_class
                                     .parse::<SourceClass>()
                                     .map(|s| s.to_string())
                                     .unwrap_or(source_class);
+                                let (role_label, role_color) = source_role_badge(&source_role);
 
                                 let is_collapsed = collapsed.contains(&source_name);
 
@@ -514,6 +628,11 @@ fn ClaimsSection(story_id: String, items: RwSignal<Vec<StoryClaimView>>) -> impl
                                             <span class="intel-badge" style="background:var(--panel-2);color:var(--ink-3)">
                                                 {sc_display}
                                             </span>
+                                            {(!role_label.is_empty()).then(|| view! {
+                                                <span class="intel-badge"
+                                                    style=format!("background:var({role_color}-wash,var(--panel-2));color:var({role_color})")
+                                                >{role_label}</span>
+                                            })}
                                             <span class="source-group-summary">{type_summary}</span>
                                         </div>
                                         {(!is_collapsed).then(move || {
@@ -530,7 +649,7 @@ fn ClaimsSection(story_id: String, items: RwSignal<Vec<StoryClaimView>>) -> impl
                                             view! {
                                                 <div>
                                                     {primary.into_iter().map(|claim| {
-                                                        claim_row(claim, false, expanded, evidence_cache)
+                                                        claim_row(claim, false, expanded, evidence_cache, now_ms)
                                                     }).collect::<Vec<_>>()}
                                                     {has_dupes.then(move || view! {
                                                         <div>
@@ -539,7 +658,7 @@ fn ClaimsSection(story_id: String, items: RwSignal<Vec<StoryClaimView>>) -> impl
                                                             </div>
                                                             {dupes_expanded.then(move || {
                                                                 duplicates.into_iter().map(|claim| {
-                                                                    claim_row(claim, true, expanded, evidence_cache)
+                                                                    claim_row(claim, true, expanded, evidence_cache, now_ms)
                                                                 }).collect::<Vec<_>>()
                                                             })}
                                                         </div>
@@ -575,6 +694,7 @@ fn claim_row(
     dim: bool,
     expanded: RwSignal<Option<String>>,
     evidence_cache: RwSignal<HashMap<String, Result<Vec<ClaimEvidenceView>, String>>>,
+    now_ms: i64,
 ) -> impl IntoView {
     let claim_id = claim.claim_id.clone();
     let is_warning = matches!(
@@ -600,6 +720,10 @@ fn claim_row(
     let (mod_icon, mod_color) = modality_icon(&claim.modality);
     let conf_pct = claim.claim_confidence * 100.0;
     let conf_color = conf_bar_color(claim.claim_confidence);
+
+    // Build the meta line items
+    let meta_parts = build_claim_meta(&claim, now_ms);
+    let claim_markings = claim.markings.clone();
 
     let toggle_id = claim_id.clone();
     let on_toggle = move |e: web_sys::MouseEvent| {
@@ -657,6 +781,33 @@ fn claim_row(
                     />
                 </div>
             </div>
+            {(!meta_parts.is_empty() || !claim_markings.is_empty()).then(|| {
+                view! {
+                    <div class="claim-meta">
+                        {meta_parts.into_iter().enumerate().map(|(i, part)| {
+                            view! {
+                                <>
+                                    {(i > 0).then(|| view! { <span class="sep">"\u{00b7}"</span> })}
+                                    {part}
+                                </>
+                            }
+                        }).collect::<Vec<_>>()}
+                        {claim_markings.into_iter().map(|m| {
+                            let (bg, fg) = marking_colors(&m);
+                            let label = if m.scheme.eq_ignore_ascii_case("TLP") {
+                                format!("TLP:{}", m.value.to_uppercase())
+                            } else {
+                                format!("{}:{}", m.scheme, m.value)
+                            };
+                            view! {
+                                <span class="intel-badge" style=format!("background:{bg};color:{fg};font-size:9px")>
+                                    {label}
+                                </span>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </div>
+                }
+            })}
             {move || {
                 let exp = expanded.get();
                 if exp.as_deref() != Some(&evidence_id) {
@@ -686,6 +837,7 @@ fn claim_row(
                                     .unwrap_or_else(|| "\u{2014}".into());
                                 let claim_s = ev.claim_summary.clone()
                                     .unwrap_or_else(|| "\u{2014}".into());
+                                let ingested = time_ago(&ev.created_at, now_ms);
                                 view! {
                                     <div style="margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--line)">
                                         <div style="font-size:var(--table-fs);margin-bottom:2px">
@@ -694,8 +846,10 @@ fn claim_row(
                                         <div style="font-size:var(--table-fs);color:var(--ink-2)">
                                             <strong>"claim: "</strong>{claim_s}
                                         </div>
-                                        <div class="mono" style="font-size:10px;color:var(--ink-4);margin-top:2px">
-                                            {format!("fragment {} span {}\u{2013}{}", ev.fragment_id, ev.span_start, ev.span_end)}
+                                        <div class="mono" style="font-size:10px;color:var(--ink-4);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap">
+                                            <span>{format!("post {}", ev.post_id)}</span>
+                                            <span>{format!("fragment #{} span {}\u{2013}{}", ev.fragment_index, ev.span_start, ev.span_end)}</span>
+                                            <span title=ev.created_at.clone()>{format!("ingested {ingested}")}</span>
                                         </div>
                                     </div>
                                 }
@@ -708,10 +862,10 @@ fn claim_row(
     }
 }
 
-// ── Relations ───────────────────────────────────────────────────
+// ── Relations ──────────────────────────────────────────────────
 
 #[component]
-fn RelationsSection(story_id: String) -> impl IntoView {
+fn RelationsSection(story_id: String, now_ms: i64) -> impl IntoView {
     let resource = LocalResource::new({
         let id = story_id.clone();
         move || {
@@ -721,7 +875,7 @@ fn RelationsSection(story_id: String) -> impl IntoView {
     });
 
     view! {
-        <div style="padding:0 var(--pad)">
+        <div>
             <div class="intel-section-hd">"Related stories"</div>
             {move || match resource.get() {
                 None => view! {
@@ -751,6 +905,7 @@ fn RelationsSection(story_id: String) -> impl IntoView {
                                     let conf = rel.confidence
                                         .map(|c| format!(" ({:.0}%)", c * 100.0))
                                         .unwrap_or_default();
+                                    let linked_ago = time_ago(&rel.created_at, now_ms);
                                     view! {
                                         <div class="tbl-row" style="cursor:default">
                                             <div style="flex:0 0 100px">
@@ -761,6 +916,11 @@ fn RelationsSection(story_id: String) -> impl IntoView {
                                             <div style="flex:1">
                                                 <a class="link" href=href>{other_id.clone()}</a>
                                                 <span class="mono" style="color:var(--ink-3);font-size:10px">{conf}</span>
+                                            </div>
+                                            <div style="flex:0 0 80px;text-align:right" class="mono">
+                                                <span style="color:var(--ink-4);font-size:10px" title=rel.created_at.clone()>
+                                                    {linked_ago}
+                                                </span>
                                             </div>
                                         </div>
                                     }
@@ -774,7 +934,72 @@ fn RelationsSection(story_id: String) -> impl IntoView {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────
+
+fn build_claim_meta(claim: &StoryClaimView, now_ms: i64) -> Vec<String> {
+    let mut parts = Vec::new();
+
+    // subject → object entities
+    let subj = claim
+        .subject_entity
+        .as_ref()
+        .map(|e| e.canonical_name.clone());
+    let obj = claim
+        .object_entity
+        .as_ref()
+        .map(|e| e.canonical_name.clone());
+    match (subj, obj) {
+        (Some(s), Some(o)) => parts.push(format!("{s} \u{2192} {o}")),
+        (Some(s), None) => parts.push(s),
+        (None, Some(o)) => parts.push(o),
+        (None, None) => {}
+    }
+
+    if let Some(ref ts) = claim.asserted_at {
+        parts.push(format!("asserted {}", time_ago(ts, now_ms)));
+    }
+    if let Some(ref ts) = claim.disclosed_at {
+        parts.push(format!("disclosed {}", time_ago(ts, now_ms)));
+    }
+    if let Some(ref tr) = claim.event_time_range {
+        let label = format_time_range("event", tr, now_ms);
+        if !label.is_empty() {
+            parts.push(label);
+        }
+    }
+    if let Some(ref tr) = claim.observed_time_range {
+        let label = format_time_range("observed", tr, now_ms);
+        if !label.is_empty() {
+            parts.push(label);
+        }
+    }
+    if let Some(conf) = claim.confidence {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        parts.push(format!("attach: {:.0}%", conf * 100.0));
+    }
+    if let Some(conf) = claim.attribution_confidence {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        parts.push(format!("attrib: {:.0}%", conf * 100.0));
+    }
+    if let Some(ref by) = claim.attached_by {
+        parts.push(by.clone());
+    }
+
+    parts
+}
+
+fn format_time_range(prefix: &str, range: &TimeRange, now_ms: i64) -> String {
+    match (&range.start, &range.end) {
+        (Some(s), Some(e)) => format!(
+            "{prefix}: {} \u{2013} {}",
+            time_ago(s, now_ms),
+            time_ago(e, now_ms)
+        ),
+        (Some(s), None) => format!("{prefix}: {} \u{2013}", time_ago(s, now_ms)),
+        (None, Some(e)) => format!("{prefix}: \u{2013} {}", time_ago(e, now_ms)),
+        (None, None) => String::new(),
+    }
+}
 
 fn derive_header_meta(claims: &[StoryClaimView]) -> HeaderMeta {
     let mut source_names = Vec::new();
@@ -922,25 +1147,39 @@ fn conf_bar_color(confidence: f64) -> &'static str {
     }
 }
 
+fn source_role_badge(role: &str) -> (&'static str, &'static str) {
+    match role {
+        "primary_author" => ("primary", "--green"),
+        "corroborating" => ("corroborating", "--ink-3"),
+        "aggregator" => ("aggregator", "--blue"),
+        "republisher" => ("republisher", "--ink-4"),
+        "commentary" => ("commentary", "--ink-3"),
+        "" => ("", "--ink-4"),
+        other if other.is_empty() => ("", "--ink-4"),
+        _ => (role, "--ink-3"),
+    }
+}
+
 fn group_claims_by_source(
     claims: Vec<StoryClaimView>,
-) -> Vec<(String, String, Vec<StoryClaimView>)> {
-    let mut groups: Vec<(String, String, Vec<StoryClaimView>)> = Vec::new();
+) -> Vec<(String, String, String, Vec<StoryClaimView>)> {
+    let mut groups: Vec<(String, String, String, Vec<StoryClaimView>)> = Vec::new();
     let mut unknown: Vec<StoryClaimView> = Vec::new();
 
     for claim in claims {
         let key = claim.source.as_ref().map(|s| s.name.clone());
         match key {
             Some(name) => {
-                if let Some(group) = groups.iter_mut().find(|(n, _, _)| *n == name) {
-                    group.2.push(claim);
+                if let Some(group) = groups.iter_mut().find(|(n, _, _, _)| *n == name) {
+                    group.3.push(claim);
                 } else {
                     let class = claim
                         .source
                         .as_ref()
                         .map(|s| s.source_class.clone())
                         .unwrap_or_default();
-                    groups.push((name, class, vec![claim]));
+                    let role = claim.source_role.clone();
+                    groups.push((name, class, role, vec![claim]));
                 }
             }
             None => unknown.push(claim),
@@ -948,7 +1187,12 @@ fn group_claims_by_source(
     }
 
     if !unknown.is_empty() {
-        groups.push(("unknown source".into(), String::new(), unknown));
+        groups.push((
+            "unknown source".into(),
+            String::new(),
+            String::new(),
+            unknown,
+        ));
     }
 
     groups
