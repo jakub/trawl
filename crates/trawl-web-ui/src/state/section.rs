@@ -89,6 +89,12 @@ pub fn items_for(mode: AppMode) -> &'static [RailItem] {
                 icon: Zap,
                 path: "/intel/sources",
             },
+            RailItem {
+                id: "derivations",
+                label: "Derivations",
+                icon: Link,
+                path: "/intel/derivations",
+            },
         ],
         AppMode::Jobs => &[
             RailItem {
