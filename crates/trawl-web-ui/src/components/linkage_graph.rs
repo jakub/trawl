@@ -8,6 +8,8 @@
 use std::collections::HashSet;
 
 use coastwatch_api_types::story::{StoryClaimView, StoryRelationView};
+
+use super::truncate;
 use leptos::prelude::*;
 use serde::Serialize;
 use wasm_bindgen::JsCast;
@@ -182,18 +184,6 @@ fn build_graph_elements(
     }
 
     elements
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max.min(s.len());
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\u{2026}", &s[..end])
-    }
 }
 
 // ── Lifecycle ─────────────────────────��───────────────────────

@@ -5,6 +5,7 @@
 use coastwatch_api_types::derivation::{AncestryView, DerivationView, DescendantView};
 use leptos::prelude::*;
 
+use super::truncate;
 use crate::time_fmt::time_ago;
 
 #[derive(Debug, Clone)]
@@ -46,24 +47,85 @@ pub(crate) fn transformation_color(t: &str) -> &'static str {
     }
 }
 
-fn render_marking_diff(before: serde_json::Value, after: serde_json::Value) -> impl IntoView {
+fn extract_internal_tags(v: &serde_json::Value) -> Vec<String> {
+    v.get("internal")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_known_marking_shape(v: &serde_json::Value) -> bool {
+    v.as_object()
+        .is_some_and(|obj| obj.keys().all(|k| k == "tlp" || k == "internal"))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn render_marking_diff(
+    before: serde_json::Value,
+    after: serde_json::Value,
+) -> impl IntoView {
     if before.is_null() || after.is_null() || before == after {
         return view! { <span></span> }.into_any();
     }
 
-    let before_tlp = before
-        .get("tlp")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("?")
-        .to_uppercase();
-    let after_tlp = after
-        .get("tlp")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("?")
-        .to_uppercase();
+    if !is_known_marking_shape(&before) || !is_known_marking_shape(&after) {
+        let before_json = serde_json::to_string(&before).unwrap_or_default();
+        let after_json = serde_json::to_string(&after).unwrap_or_default();
+        let full = format!("{before_json} \u{2192} {after_json}");
+        let label = format!(
+            "{} \u{2192} {}",
+            truncate(&before_json, 50),
+            truncate(&after_json, 50)
+        );
+        return view! {
+            <span
+                class="intel-badge"
+                style="background:var(--panel-2);color:var(--ink-3);font-size:9px;text-transform:none"
+                title=full
+            >
+                {label}
+            </span>
+        }
+        .into_any();
+    }
 
-    if before_tlp != after_tlp {
-        let label = format!("TLP:{before_tlp} \u{2192} TLP:{after_tlp}");
+    let before_tlp_raw = before
+        .get("tlp")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let after_tlp_raw = after
+        .get("tlp")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+
+    let tlp_changed = !before_tlp_raw.eq_ignore_ascii_case(after_tlp_raw);
+    let before_tags = extract_internal_tags(&before);
+    let after_tags = extract_internal_tags(&after);
+    let tags_changed = before_tags != after_tags;
+
+    if !tlp_changed && !tags_changed {
+        return view! {
+            <span
+                class="intel-badge"
+                style="background:var(--panel-2);color:var(--ink-3);font-size:9px"
+            >
+                "marking changed"
+            </span>
+        }
+        .into_any();
+    }
+
+    let tlp_badge = tlp_changed.then(|| {
+        let label = format!(
+            "TLP:{} \u{2192} TLP:{}",
+            before_tlp_raw.to_uppercase(),
+            after_tlp_raw.to_uppercase()
+        );
         view! {
             <span
                 class="intel-badge"
@@ -72,18 +134,84 @@ fn render_marking_diff(before: serde_json::Value, after: serde_json::Value) -> i
                 {label}
             </span>
         }
-        .into_any()
-    } else {
+    });
+
+    let tags_badge = tags_changed.then(|| {
+        let fmt = |tags: &[String]| {
+            if tags.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("[{}]", tags.join(", "))
+            }
+        };
+        let label = format!("{} \u{2192} {}", fmt(&before_tags), fmt(&after_tags));
         view! {
             <span
                 class="intel-badge"
-                style="background:var(--panel-2);color:var(--ink-3);font-size:9px"
+                style="background:var(--teal-wash);color:var(--ink-2);font-size:9px;text-transform:none"
             >
-                "marking changed"
+                {label}
             </span>
         }
-        .into_any()
+    });
+
+    view! {
+        <span style="display:contents">
+            {tlp_badge}
+            {tags_badge}
+        </span>
     }
+    .into_any()
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn render_derivation_meta(
+    redaction_reason: Option<String>,
+    approved_by: Option<String>,
+    approved_at: Option<String>,
+    now_ms: i64,
+) -> impl IntoView {
+    if redaction_reason.is_none() && approved_by.is_none() {
+        return view! { <span></span> }.into_any();
+    }
+
+    let reason_el = redaction_reason.map(|reason| {
+        let display = format!("reason: {}", truncate(&reason, 30));
+        view! {
+            <span
+                style="font-size:9px;color:var(--ink-3);font-style:italic"
+                title=reason
+            >
+                {display}
+            </span>
+        }
+    });
+
+    let approval_el = approved_by.map(|principal| {
+        let name = principal
+            .split_once(':')
+            .map_or(principal.as_str(), |(_, name)| name);
+        let label = match approved_at {
+            Some(ref ts) => format!("{name} {}", time_ago(ts, now_ms)),
+            None => name.to_string(),
+        };
+        view! {
+            <span style="font-size:9px;color:var(--ink-3)">
+                {label}
+            </span>
+        }
+    });
+
+    let separator = reason_el.is_some() && approval_el.is_some();
+
+    view! {
+        <span style="display:contents">
+            {reason_el}
+            {separator.then(|| view! { <span style="font-size:9px;color:var(--ink-4)">" · "</span> })}
+            {approval_el}
+        </span>
+    }
+    .into_any()
 }
 
 #[component]
@@ -126,6 +254,12 @@ pub fn LineageTree(
                     let indent = format!("padding-left:{}px", depth * 12);
 
                     let marking_diff = render_marking_diff(d.marking_before, d.marking_after);
+                    let deriv_meta = render_derivation_meta(
+                        d.redaction_reason,
+                        d.approved_by_principal_id,
+                        d.approved_at,
+                        now_ms,
+                    );
 
                     let invalidation_title = d.invalidation_reason
                         .unwrap_or_default();
@@ -157,6 +291,7 @@ pub fn LineageTree(
                                 {source_ref}" \u{2192} "{derived_ref}
                             </span>
                             {marking_diff}
+                            {deriv_meta}
                             <span class="lineage-time">{created}</span>
                             {show_invalidate.then(|| {
                                 let id = drv_id.clone();

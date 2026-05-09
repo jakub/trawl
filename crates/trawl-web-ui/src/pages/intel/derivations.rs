@@ -13,7 +13,8 @@ use crate::api;
 use crate::api::MeResponse;
 use crate::components::confirm_with_reason_modal::ConfirmWithReasonModal;
 use crate::components::lineage_tree::{
-    LineageNode, LineageTree, can_write_derivations, transformation_color,
+    LineageNode, LineageTree, can_write_derivations, render_derivation_meta, render_marking_diff,
+    transformation_color,
 };
 use crate::components::toast::{ToastBus, ToastKind};
 use crate::time_fmt::time_ago;
@@ -278,6 +279,13 @@ pub fn DerivationsPage() -> impl IntoView {
                                     let source = format!("{} {}", d.source_object_type, d.source_object_id);
                                     let derived = format!("{} {}", d.derived_object_type, d.derived_object_id);
                                     let created = time_ago(&d.created_at, now_ms);
+                                    let marking = render_marking_diff(d.marking_before, d.marking_after);
+                                    let meta = render_derivation_meta(
+                                        d.redaction_reason,
+                                        d.approved_by_principal_id,
+                                        d.approved_at,
+                                        now_ms,
+                                    );
                                     let inv_reason = d.invalidation_reason.clone().unwrap_or_default();
                                     view! {
                                         <div class="tbl-row" style=row_style title=inv_reason>
@@ -293,6 +301,10 @@ pub fn DerivationsPage() -> impl IntoView {
                                             </div>
                                             <div class="mono" style="flex:1;font-size:10px;color:var(--ink-2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
                                                 {source}" \u{2192} "{derived}
+                                            </div>
+                                            <div style="flex:0 0 auto;display:flex;gap:4px;align-items:center">
+                                                {marking}
+                                                {meta}
                                             </div>
                                             <div class="mono" style="flex:0 0 80px;font-size:10px;color:var(--ink-4);text-align:right">
                                                 {created}
