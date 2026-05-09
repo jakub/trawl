@@ -76,7 +76,7 @@ pub struct RetractSourceBody {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetractSourceResponse {
     pub invalidated_ids: Vec<String>,
     pub requires_review_ids: Vec<String>,
