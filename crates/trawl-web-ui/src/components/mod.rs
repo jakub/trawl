@@ -4,11 +4,13 @@
 
 pub mod chart;
 pub mod confirm_modal;
+pub mod confirm_with_reason_modal;
 pub mod editor;
 pub mod editor_wrap;
 pub mod export_modal;
 pub mod facet_sidebar;
 pub mod histogram;
+pub mod lineage_tree;
 pub mod linkage_graph;
 pub mod live_badge;
 pub mod meta_strip;

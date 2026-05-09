@@ -2309,6 +2309,45 @@ textarea:focus-visible,
 .dup-badge:hover { background: var(--panel-2); }
 .products-row-nofx { background: var(--red-wash); }
 
+/* ── Lineage tree ────────────────────────────────────────────── */
+.lineage-section { margin-top: 12px; }
+.lineage-tree { display: flex; flex-direction: column; gap: 1px; }
+.lineage-node {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 0; font-size: var(--table-fs);
+  border-left: 2px solid var(--line); padding-left: 8px;
+}
+.lineage-invalidated {
+  opacity: 0.5; text-decoration: line-through;
+  border-left-color: var(--red);
+}
+.lineage-depth {
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--ink-4); min-width: 14px; text-align: right;
+}
+.lineage-ref {
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--ink-2); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lineage-time {
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--ink-4); white-space: nowrap;
+}
+
+/* ── Reason textarea (confirm-with-reason modal) ─────────────── */
+.reason-input {
+  width: 100%; min-height: 60px; padding: 6px 8px;
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 3px;
+  font-family: var(--font-mono); font-size: 12px;
+  resize: vertical;
+}
+.reason-input:focus {
+  outline: none; box-shadow: 0 0 0 3px var(--amber-glow);
+  border-color: var(--amber);
+}
+
 /* ── Story list: two-line card rows ─────────────────────────── */
 .story-list-row {
   padding: 8px 12px;
