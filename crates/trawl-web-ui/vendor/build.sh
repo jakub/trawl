@@ -30,6 +30,15 @@ npx esbuild src/codemirror.ts \
   --outfile=codemirror.js \
   --log-level=warning
 
+echo "[vendor] bundling cytoscape.js"
+npx esbuild src/cytoscape.ts \
+  --bundle \
+  --format=esm \
+  --minify \
+  --target=es2022 \
+  --outfile=cytoscape.js \
+  --log-level=warning
+
 echo "[vendor] bundling uplot.js"
 npx esbuild src/uplot.ts \
   --bundle \
@@ -44,4 +53,4 @@ npx esbuild src/uplot.ts \
 cp node_modules/uplot/dist/uPlot.min.css uplot.css
 
 echo "[vendor] ✓ bundles built:"
-ls -lh codemirror.js uplot.js uplot.css
+ls -lh codemirror.js cytoscape.js uplot.js uplot.css

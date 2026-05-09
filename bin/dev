@@ -90,6 +90,7 @@ procs:
     shell: cargo run --manifest-path "$coastwatch_dir/Cargo.toml" -p coastwatch-ingest
     env:
       DATABASE_URL: "$DATABASE_URL"
+      COASTWATCH_GITHUB_TOKEN: "${COASTWATCH_GITHUB_TOKEN:-}"
   coastwatch-worker:
     shell: cargo run --manifest-path "$coastwatch_dir/Cargo.toml" -p coastwatch-worker
     env:

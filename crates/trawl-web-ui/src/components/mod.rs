@@ -9,6 +9,7 @@ pub mod editor_wrap;
 pub mod export_modal;
 pub mod facet_sidebar;
 pub mod histogram;
+pub mod linkage_graph;
 pub mod live_badge;
 pub mod meta_strip;
 pub mod net_drawer;

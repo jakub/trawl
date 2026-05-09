@@ -9,13 +9,17 @@ use coastwatch_api_types::enums::{
     Modality, Polarity, SourceClass, StoryClaimRelationship, StoryRelation,
 };
 use coastwatch_api_types::marking::MarkingView;
-use coastwatch_api_types::story::{StoryClaimView, TimeRange, TimelineEventView};
+use coastwatch_api_types::pagination::PaginatedBody;
+use coastwatch_api_types::story::{
+    StoryClaimView, StoryRelationView, TimeRange, TimelineEventView,
+};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
 
 use crate::api;
 use crate::api::ApiError;
+use crate::components::linkage_graph::LinkageGraph;
 use crate::time_fmt::time_ago;
 
 use super::stories::{class_label, state_badge};
@@ -42,6 +46,19 @@ pub fn StoryPage() -> impl IntoView {
     });
 
     let all_claims = RwSignal::new(Vec::<StoryClaimView>::new());
+
+    let relations_resource = LocalResource::new(move || {
+        let story_id = id.get();
+        async move { api::intel::story_relations(&story_id).await }
+    });
+
+    let relations_for_graph = Memo::new(move |_| {
+        relations_resource
+            .get()
+            .and_then(Result::ok)
+            .map(|body| body.items)
+            .unwrap_or_default()
+    });
 
     let header_meta = Memo::new(move |_| {
         let claims = all_claims.get();
@@ -79,6 +96,7 @@ pub fn StoryPage() -> impl IntoView {
                     let (state_label, state_color) = state_badge(&story.state);
                     let cls = class_label(&story.story_class);
                     let title = story.canonical_title.clone();
+                    let graph_title = title.clone();
                     let summary = story.canonical_summary.clone();
                     let importance = story.importance_score;
                     let markings = story.markings.clone();
@@ -116,9 +134,15 @@ pub fn StoryPage() -> impl IntoView {
                             <div>
                                 <AffectedProductsSection claims=all_claims now_ms=now_ms/>
                                 <ClaimsSection story_id=story_id.clone() items=all_claims now_ms=now_ms/>
-                                <RelationsSection story_id=story_id now_ms=now_ms/>
+                                <RelationsSection story_id=story_id.clone() relations=relations_resource now_ms=now_ms/>
                             </div>
                         </div>
+                        <LinkageGraph
+                            story_id=story_id.clone()
+                            story_title=graph_title
+                            claims=all_claims
+                            relations=Signal::derive(move || relations_for_graph.get())
+                        />
                     }.into_any()
                 }
             }}
@@ -752,10 +776,11 @@ fn claim_row(
         }
     };
 
+    let data_id = claim_id.clone();
     let evidence_id = claim_id;
 
     view! {
-        <div>
+        <div data-claim-id=data_id>
             <div class=dim_class style=row_style on:click=on_toggle>
                 <div style="flex:0 0 88px">
                     <span class="intel-badge" style=format!("background:var({rel_color}-wash,var(--panel-2));color:var({rel_color})")>
@@ -867,19 +892,15 @@ fn claim_row(
 // ── Relations ──────────────────────────────────────────────────
 
 #[component]
-fn RelationsSection(story_id: String, now_ms: i64) -> impl IntoView {
-    let resource = LocalResource::new({
-        let id = story_id.clone();
-        move || {
-            let id = id.clone();
-            async move { api::intel::story_relations(&id).await }
-        }
-    });
-
+fn RelationsSection(
+    story_id: String,
+    relations: LocalResource<Result<PaginatedBody<StoryRelationView>, ApiError>>,
+    now_ms: i64,
+) -> impl IntoView {
     view! {
         <div>
             <div class="intel-section-hd">"Related stories"</div>
-            {move || match resource.get() {
+            {move || match relations.get() {
                 None => view! {
                     <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
                 }.into_any(),

@@ -5,4 +5,5 @@
 //! `wasm-bindgen` shims for the vendored JS bundles.
 
 pub mod codemirror;
+pub mod cytoscape;
 pub mod uplot;

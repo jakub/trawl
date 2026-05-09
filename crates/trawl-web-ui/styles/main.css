@@ -2469,3 +2469,11 @@ textarea:focus-visible,
 .claim-meta .sep { color: var(--ink-4); }
 .claim-meta .mono { font-family: var(--font-mono); }
 .claim-meta .entity { color: var(--ink-2); font-weight: 500; }
+
+/* ── Linkage graph ─────────────────────────────────────────── */
+.linkage-section { padding: 0 var(--pad); margin-top: 8px; }
+.linkage-canvas {
+  width: 100%; height: 480px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 4px;
+}
