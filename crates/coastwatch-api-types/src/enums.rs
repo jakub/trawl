@@ -122,6 +122,7 @@ snake_case_enum! {
         Correction => "correction",
         Contradiction => "contradiction",
         Supersession => "supersession",
+        Evidence => "evidence",
     }
 }
 
@@ -329,6 +330,7 @@ mod tests {
             StoryClaimRelationship::Correction,
             StoryClaimRelationship::Contradiction,
             StoryClaimRelationship::Supersession,
+            StoryClaimRelationship::Evidence,
         ]
     );
 

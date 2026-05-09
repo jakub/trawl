@@ -5,13 +5,13 @@ use crate::marking::MarkingView;
 use crate::redaction::RedactionNotice;
 use crate::source::SourceRef;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimeRange {
     pub start: Option<String>,
     pub end: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoryView {
     pub id: String,
     pub story_class: String,
@@ -32,7 +32,7 @@ pub struct SetParentBody {
     pub parent_story_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimelineEventView {
     pub id: String,
     pub delta_type: String,
@@ -43,7 +43,7 @@ pub struct TimelineEventView {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoryClaimView {
     pub story_id: String,
     pub claim_id: String,
@@ -73,7 +73,7 @@ pub struct StoryClaimView {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoryRelationView {
     pub story_a_id: String,
     pub story_b_id: String,
