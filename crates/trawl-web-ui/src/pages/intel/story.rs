@@ -18,7 +18,8 @@ use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
 
 use crate::api;
-use crate::api::ApiError;
+use crate::api::{ApiError, MeResponse};
+use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
 use crate::components::linkage_graph::LinkageGraph;
 use crate::time_fmt::time_ago;
 
@@ -130,6 +131,7 @@ pub fn StoryPage() -> impl IntoView {
                                     now_ms=now_ms
                                 />
                                 <VerticalTimeline story_id=story_id.clone() now_ms=now_ms/>
+                                <StoryLineage story_id=story_id.clone() now_ms=now_ms/>
                             </div>
                             <div>
                                 <AffectedProductsSection claims=all_claims now_ms=now_ms/>
@@ -442,6 +444,98 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
     }
 }
 
+// ── Story lineage (sidebar) ────────────────────────────────────
+
+#[component]
+fn StoryLineage(story_id: String, now_ms: i64) -> impl IntoView {
+    let me = use_context::<RwSignal<Option<MeResponse>>>();
+    let can_write = Memo::new(move |_| {
+        me.and_then(|s| s.get())
+            .map(|m| can_write_derivations(&m.role))
+            .unwrap_or(false)
+    });
+
+    let ancestors = RwSignal::new(Vec::<LineageNode>::new());
+    let descendants = RwSignal::new(Vec::<LineageNode>::new());
+    let loading = RwSignal::new(true);
+    let error = RwSignal::new(None::<String>);
+
+    let sid = story_id.clone();
+    let sid2 = sid.clone();
+    Effect::new(move |_| {
+        let id = sid.clone();
+        spawn_local(async move {
+            match api::intel::get_ancestry("story", &id, None).await {
+                Ok(body) => {
+                    ancestors.set(body.data.into_iter().map(LineageNode::from).collect());
+                }
+                Err(e) => error.set(Some(format!("ancestry: {e}"))),
+            }
+        });
+        let id2 = sid2.clone();
+        spawn_local(async move {
+            match api::intel::get_descendants("story", &id2, None).await {
+                Ok(body) => {
+                    descendants.set(body.data.into_iter().map(LineageNode::from).collect());
+                }
+                Err(e) => {
+                    error.update(|existing| {
+                        let msg = format!("descendants: {e}");
+                        *existing = Some(
+                            existing
+                                .as_ref()
+                                .map(|prev| format!("{prev}; {msg}"))
+                                .unwrap_or(msg),
+                        );
+                    });
+                }
+            }
+            loading.set(false);
+        });
+    });
+
+    view! {
+        <div style="margin-top:12px">
+            {move || {
+                if loading.get() {
+                    return view! {
+                        <div class="intel-section-hd">"Lineage"</div>
+                        <span class="mono" style="font-size:11px;color:var(--ink-3)">"loading\u{2026}"</span>
+                    }.into_any();
+                }
+                if let Some(ref e) = error.get() {
+                    return view! {
+                        <div class="intel-section-hd">"Lineage"</div>
+                        <span class="mono" style="font-size:11px;color:var(--red)">{format!("error: {e}")}</span>
+                    }.into_any();
+                }
+                let anc = ancestors.get();
+                let desc = descendants.get();
+                if anc.is_empty() && desc.is_empty() {
+                    return view! {
+                        <div class="intel-section-hd">"Lineage"</div>
+                        <p class="mono" style="font-size:11px;color:var(--ink-3);margin:4px 0">"no derivation history"</p>
+                    }.into_any();
+                }
+                view! {
+                    <LineageTree
+                        label="Sources"
+                        nodes=anc
+                        can_write=can_write.get()
+                        now_ms=now_ms
+                    />
+                    <LineageTree
+                        label="Derived"
+                        nodes=desc
+                        can_write=can_write.get()
+                        now_ms=now_ms
+                    />
+                }.into_any()
+            }}
+        </div>
+    }
+}
+
 // ── Affected products ──────────────────────────────────────────
 
 #[component]
@@ -542,6 +636,10 @@ fn ClaimsSection(
     let expanded = RwSignal::new(None::<String>);
     let evidence_cache =
         RwSignal::new(HashMap::<String, Result<Vec<ClaimEvidenceView>, String>>::new());
+    let lineage_cache = RwSignal::new(HashMap::<
+        String,
+        Result<(Vec<LineageNode>, Vec<LineageNode>), String>,
+    >::new());
     let collapsed_sources = RwSignal::new(HashSet::<String>::new());
     let show_dupes = RwSignal::new(HashSet::<String>::new());
 
@@ -549,6 +647,7 @@ fn ClaimsSection(
     Effect::new(move |_| {
         items.set(Vec::new());
         evidence_cache.set(HashMap::new());
+        lineage_cache.set(HashMap::new());
         expanded.set(None);
         collapsed_sources.set(HashSet::new());
         show_dupes.set(HashSet::new());
@@ -675,7 +774,7 @@ fn ClaimsSection(
                                             view! {
                                                 <div>
                                                     {primary.into_iter().map(|claim| {
-                                                        claim_row(claim, false, expanded, evidence_cache, now_ms)
+                                                        claim_row(claim, false, expanded, evidence_cache, lineage_cache, now_ms)
                                                     }).collect::<Vec<_>>()}
                                                     {has_dupes.then(move || view! {
                                                         <div>
@@ -684,7 +783,7 @@ fn ClaimsSection(
                                                             </div>
                                                             {dupes_expanded.then(move || {
                                                                 duplicates.into_iter().map(|claim| {
-                                                                    claim_row(claim, true, expanded, evidence_cache, now_ms)
+                                                                    claim_row(claim, true, expanded, evidence_cache, lineage_cache, now_ms)
                                                                 }).collect::<Vec<_>>()
                                                             })}
                                                         </div>
@@ -720,6 +819,7 @@ fn claim_row(
     dim: bool,
     expanded: RwSignal<Option<String>>,
     evidence_cache: RwSignal<HashMap<String, Result<Vec<ClaimEvidenceView>, String>>>,
+    lineage_cache: RwSignal<HashMap<String, Result<(Vec<LineageNode>, Vec<LineageNode>), String>>>,
     now_ms: i64,
 ) -> impl IntoView {
     let claim_id = claim.claim_id.clone();
@@ -770,6 +870,24 @@ fn claim_row(
                             cid2,
                             result.map(|page| page.items).map_err(|e| e.to_string()),
                         );
+                    });
+                });
+            }
+            let lineage_cached = lineage_cache.get_untracked();
+            if !lineage_cached.contains_key(&cid) {
+                let cid2 = cid.clone();
+                spawn_local(async move {
+                    let anc = api::intel::get_ancestry("claim", &cid2, Some(2)).await;
+                    let desc = api::intel::get_descendants("claim", &cid2, Some(2)).await;
+                    let result = match (anc, desc) {
+                        (Ok(a), Ok(d)) => Ok((
+                            a.data.into_iter().map(LineageNode::from).collect(),
+                            d.data.into_iter().map(LineageNode::from).collect(),
+                        )),
+                        (Err(e), _) | (_, Err(e)) => Err(e.to_string()),
+                    };
+                    lineage_cache.update(|m| {
+                        m.insert(cid2, result);
                     });
                 });
             }
@@ -857,32 +975,57 @@ fn claim_row(
                             <span class="mono" style="color:var(--ink-3)">"no evidence records"</span>
                         </div>
                     }.into_any(),
-                    Some(Ok(evs)) => view! {
-                        <div class="evidence-panel">
-                            {evs.iter().map(|ev| {
-                                let factual = ev.factual_summary.clone()
-                                    .unwrap_or_else(|| "\u{2014}".into());
-                                let claim_s = ev.claim_summary.clone()
-                                    .unwrap_or_else(|| "\u{2014}".into());
-                                let ingested = time_ago(&ev.created_at, now_ms);
+                    Some(Ok(evs)) => {
+                        let lineage = lineage_cache.get();
+                        let lineage_view = match lineage.get(&evidence_id) {
+                            Some(Ok((anc, desc))) if !anc.is_empty() || !desc.is_empty() => {
                                 view! {
-                                    <div style="margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--line)">
-                                        <div style="font-size:var(--table-fs);margin-bottom:2px">
-                                            <strong>"factual: "</strong>{factual}
-                                        </div>
-                                        <div style="font-size:var(--table-fs);color:var(--ink-2)">
-                                            <strong>"claim: "</strong>{claim_s}
-                                        </div>
-                                        <div class="mono" style="font-size:10px;color:var(--ink-4);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap">
-                                            <span>{format!("post {}", ev.post_id)}</span>
-                                            <span>{format!("fragment #{} span {}\u{2013}{}", ev.fragment_index, ev.span_start, ev.span_end)}</span>
-                                            <span title=ev.created_at.clone()>{format!("ingested {ingested}")}</span>
-                                        </div>
+                                    <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line)">
+                                        <LineageTree
+                                            label="Sources"
+                                            nodes=anc.clone()
+                                            can_write=false
+                                            now_ms=now_ms
+                                        />
+                                        <LineageTree
+                                            label="Derived"
+                                            nodes=desc.clone()
+                                            can_write=false
+                                            now_ms=now_ms
+                                        />
                                     </div>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                    }.into_any(),
+                                }.into_any()
+                            }
+                            _ => ().into_any(),
+                        };
+                        view! {
+                            <div class="evidence-panel">
+                                {evs.iter().map(|ev| {
+                                    let factual = ev.factual_summary.clone()
+                                        .unwrap_or_else(|| "\u{2014}".into());
+                                    let claim_s = ev.claim_summary.clone()
+                                        .unwrap_or_else(|| "\u{2014}".into());
+                                    let ingested = time_ago(&ev.created_at, now_ms);
+                                    view! {
+                                        <div style="margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--line)">
+                                            <div style="font-size:var(--table-fs);margin-bottom:2px">
+                                                <strong>"factual: "</strong>{factual}
+                                            </div>
+                                            <div style="font-size:var(--table-fs);color:var(--ink-2)">
+                                                <strong>"claim: "</strong>{claim_s}
+                                            </div>
+                                            <div class="mono" style="font-size:10px;color:var(--ink-4);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap">
+                                                <span>{format!("post {}", ev.post_id)}</span>
+                                                <span>{format!("fragment #{} span {}\u{2013}{}", ev.fragment_index, ev.span_start, ev.span_end)}</span>
+                                                <span title=ev.created_at.clone()>{format!("ingested {ingested}")}</span>
+                                            </div>
+                                        </div>
+                                    }
+                                }).collect::<Vec<_>>()}
+                                {lineage_view}
+                            </div>
+                        }.into_any()
+                    },
                 }
             }}
         </div>
