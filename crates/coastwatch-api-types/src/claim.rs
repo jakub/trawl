@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::marking::MarkingView;
+use crate::redaction::RedactionNotice;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaimView {
@@ -11,9 +12,11 @@ pub struct ClaimView {
     pub polarity: String,
     pub modality: String,
     pub claim_confidence: f64,
-    pub source_class: String,
+    pub source_class: Option<String>,
     pub asserted_at: Option<String>,
     pub markings: Vec<MarkingView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redaction: Option<RedactionNotice>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -27,7 +30,7 @@ pub struct ClaimRelationView {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ClaimEvidenceView {
     pub fragment_id: String,
     pub post_id: String,

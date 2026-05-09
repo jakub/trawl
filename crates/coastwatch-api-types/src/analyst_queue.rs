@@ -12,6 +12,7 @@ pub struct AnalystQueueItemView {
     pub decision_id: Option<String>,
     pub assigned_to: Option<String>,
     pub priority: i32,
+    pub dedupe_key: String,
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
@@ -38,6 +39,15 @@ pub struct AnalystActionResponse {
     pub audit_event_id: String,
     pub new_status: String,
     pub request_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EvidencePacketView {
+    pub id: String,
+    pub packet_type: String,
+    pub payload: serde_json::Value,
+    pub created_by: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

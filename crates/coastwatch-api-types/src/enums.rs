@@ -42,7 +42,7 @@ macro_rules! snake_case_enum {
     };
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ParseEnumError {
     pub type_name: &'static str,
     pub value: String,
@@ -114,7 +114,6 @@ snake_case_enum! {
 
 snake_case_enum! {
     pub enum StoryClaimRelationship {
-        Evidence => "evidence",
         Duplicate => "duplicate",
         Evolution => "evolution",
         Related => "related",
@@ -170,19 +169,21 @@ snake_case_enum! {
 
 snake_case_enum! {
     pub enum QueueItemType {
-        CandidateMerge => "candidate_merge",
-        MaterialDelta => "material_delta",
         Contradiction => "contradiction",
-        ManualReview => "manual_review",
+        Correction => "correction",
+        Supersession => "supersession",
+        CandidateMerge => "candidate_merge",
     }
 }
 
 snake_case_enum! {
     pub enum QueueItemStatus {
-        Pending => "pending",
-        Assigned => "assigned",
-        Resolved => "resolved",
-        Expired => "expired",
+        Open => "open",
+        Approved => "approved",
+        Rejected => "rejected",
+        Attached => "attached",
+        Superseded => "superseded",
+        Cancelled => "cancelled",
     }
 }
 
@@ -320,7 +321,6 @@ mod tests {
         story_claim_relationship_roundtrip,
         StoryClaimRelationship,
         [
-            StoryClaimRelationship::Evidence,
             StoryClaimRelationship::Duplicate,
             StoryClaimRelationship::Evolution,
             StoryClaimRelationship::Related,
@@ -386,10 +386,10 @@ mod tests {
         queue_item_type_roundtrip,
         QueueItemType,
         [
-            QueueItemType::CandidateMerge,
-            QueueItemType::MaterialDelta,
             QueueItemType::Contradiction,
-            QueueItemType::ManualReview,
+            QueueItemType::Correction,
+            QueueItemType::Supersession,
+            QueueItemType::CandidateMerge,
         ]
     );
 
@@ -397,10 +397,12 @@ mod tests {
         queue_item_status_roundtrip,
         QueueItemStatus,
         [
-            QueueItemStatus::Pending,
-            QueueItemStatus::Assigned,
-            QueueItemStatus::Resolved,
-            QueueItemStatus::Expired,
+            QueueItemStatus::Open,
+            QueueItemStatus::Approved,
+            QueueItemStatus::Rejected,
+            QueueItemStatus::Attached,
+            QueueItemStatus::Superseded,
+            QueueItemStatus::Cancelled,
         ]
     );
 

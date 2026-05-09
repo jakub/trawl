@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::marking::MarkingView;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EntityRef {
     pub id: String,
     pub entity_type: String,
@@ -38,4 +38,12 @@ pub struct EntityRelationView {
     pub relation: String,
     pub confidence: Option<f64>,
     pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddAliasRequest {
+    pub alias: String,
+    pub alias_kind: String,
+    pub source: String,
+    pub confidence: Option<f64>,
 }
