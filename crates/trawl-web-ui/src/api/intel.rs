@@ -3,12 +3,16 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use coastwatch_api_types::claim::ClaimEvidenceView;
+use coastwatch_api_types::derivation::{
+    AncestryView, DerivationView, DescendantView, RetractSourceResponse,
+};
 use coastwatch_api_types::pagination::{ItemBody, PaginatedBody};
 use coastwatch_api_types::story::{
     StoryClaimView, StoryRelationView, StoryView, TimelineEventView,
 };
 use gloo_net::http::Request;
 use js_sys::encode_uri_component;
+use serde::Serialize;
 
 use super::ApiError;
 
@@ -116,6 +120,111 @@ pub async fn claim_evidence(
         None => format!("{BASE}/claims/{claim_id}/evidence?limit=20"),
     };
     let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+// ── Derivation endpoints ──────────────────────────────────────
+
+pub async fn list_object_derivations(
+    object_type: &str,
+    object_id: &str,
+    cursor: Option<&str>,
+) -> Result<PaginatedBody<DerivationView>, ApiError> {
+    let url = match cursor {
+        Some(c) => format!(
+            "{BASE}/objects/{object_type}/{object_id}/derivations?cursor={}&limit=20",
+            encode_cursor(c)
+        ),
+        None => format!("{BASE}/objects/{object_type}/{object_id}/derivations?limit=20"),
+    };
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+pub async fn get_ancestry(
+    object_type: &str,
+    object_id: &str,
+    max_depth: Option<i32>,
+) -> Result<ItemBody<Vec<AncestryView>>, ApiError> {
+    let depth = max_depth
+        .map(|d| format!("?max_depth={d}"))
+        .unwrap_or_default();
+    let url = format!("{BASE}/objects/{object_type}/{object_id}/ancestry{depth}");
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+pub async fn get_descendants(
+    object_type: &str,
+    object_id: &str,
+    max_depth: Option<i32>,
+) -> Result<ItemBody<Vec<DescendantView>>, ApiError> {
+    let depth = max_depth
+        .map(|d| format!("?max_depth={d}"))
+        .unwrap_or_default();
+    let url = format!("{BASE}/objects/{object_type}/{object_id}/descendants{depth}");
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+#[derive(Serialize)]
+struct ReasonBody<'a> {
+    reason: &'a str,
+}
+
+pub async fn invalidate_derivation(id: &str, reason: &str) -> Result<(), ApiError> {
+    let body = ReasonBody { reason };
+    let resp = Request::post(&format!("{BASE}/derivations/{id}/invalidate"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+    match resp.status() {
+        204 | 200 => Ok(()),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+pub async fn retract_source(
+    object_type: &str,
+    object_id: &str,
+    reason: &str,
+) -> Result<ItemBody<RetractSourceResponse>, ApiError> {
+    let body = ReasonBody { reason };
+    let resp = Request::post(&format!("{BASE}/objects/{object_type}/{object_id}/retract"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
     match resp.status() {
         200 => resp
             .json()
