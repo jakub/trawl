@@ -561,9 +561,11 @@ fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>, now_ms: i64) -
                         <div class="tbl-body">
                             {products.into_iter().map(|claim| {
                                 let product = extract_product_name(claim);
-                                let (sev_label, sev_color) = format_severity(&claim.payload);
-                                let versions = format_versions(&claim.payload);
-                                let (fix_label, fix_known) = format_fix_status(&claim.payload);
+                                let empty = serde_json::Value::Null;
+                                let payload = claim.payload.as_ref().unwrap_or(&empty);
+                                let (sev_label, sev_color) = format_severity(payload);
+                                let versions = format_versions(payload);
+                                let (fix_label, fix_known) = format_fix_status(payload);
                                 let source = claim
                                     .source
                                     .as_ref()
@@ -725,8 +727,8 @@ fn ClaimsSection(
 
                                 let (primary, duplicates): (Vec<_>, Vec<_>) =
                                     group_claims.into_iter().partition(|c| {
-                                        c.relationship.parse::<StoryClaimRelationship>()
-                                            != Ok(StoryClaimRelationship::Duplicate)
+                                        c.relationship.parse::<StoryClaimRelationship>().ok()
+                                            != Some(StoryClaimRelationship::Duplicate)
                                     });
                                 let dup_count = duplicates.len();
                                 let has_dupes = dup_count > 0;
@@ -1181,7 +1183,8 @@ fn derive_header_meta(claims: &[StoryClaimView]) -> HeaderMeta {
             }
             if let Some(status) = claim
                 .payload
-                .get("fix_status")
+                .as_ref()
+                .and_then(|p| p.get("fix_status"))
                 .and_then(serde_json::Value::as_str)
             {
                 if status == "patched" {
@@ -1208,16 +1211,19 @@ fn extract_product_name(claim: &StoryClaimView) -> String {
     }
     let vendor = claim
         .payload
-        .get("vendor")
+        .as_ref()
+        .and_then(|p| p.get("vendor"))
         .and_then(serde_json::Value::as_str);
     let product = claim
         .payload
-        .get("product")
+        .as_ref()
+        .and_then(|p| p.get("product"))
         .and_then(serde_json::Value::as_str)
         .or_else(|| {
             claim
                 .payload
-                .get("affected_product")
+                .as_ref()
+                .and_then(|p| p.get("affected_product"))
                 .and_then(serde_json::Value::as_str)
         });
     match (vendor, product) {
@@ -1368,7 +1374,7 @@ fn group_claims_by_source(
                         .as_ref()
                         .map(|s| s.source_class.clone())
                         .unwrap_or_default();
-                    let role = claim.source_role.clone();
+                    let role = claim.source_role.clone().unwrap_or_default();
                     groups.push((name, class, role, vec![claim]));
                 }
             }
