@@ -461,22 +461,18 @@ fn StoryLineage(story_id: String, now_ms: i64) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
 
     let sid = story_id.clone();
-    let sid2 = sid.clone();
     Effect::new(move |_| {
         let id = sid.clone();
         spawn_local(async move {
             match api::intel::get_ancestry("story", &id, None).await {
                 Ok(body) => {
-                    ancestors.set(body.data.into_iter().map(LineageNode::from).collect());
+                    ancestors.set(body.items.into_iter().map(LineageNode::from).collect());
                 }
                 Err(e) => error.set(Some(format!("ancestry: {e}"))),
             }
-        });
-        let id2 = sid2.clone();
-        spawn_local(async move {
-            match api::intel::get_descendants("story", &id2, None).await {
+            match api::intel::get_descendants("story", &id, None).await {
                 Ok(body) => {
-                    descendants.set(body.data.into_iter().map(LineageNode::from).collect());
+                    descendants.set(body.items.into_iter().map(LineageNode::from).collect());
                 }
                 Err(e) => {
                     error.update(|existing| {
@@ -881,8 +877,8 @@ fn claim_row(
                     let desc = api::intel::get_descendants("claim", &cid2, Some(2)).await;
                     let result = match (anc, desc) {
                         (Ok(a), Ok(d)) => Ok((
-                            a.data.into_iter().map(LineageNode::from).collect(),
-                            d.data.into_iter().map(LineageNode::from).collect(),
+                            a.items.into_iter().map(LineageNode::from).collect(),
+                            d.items.into_iter().map(LineageNode::from).collect(),
                         )),
                         (Err(e), _) | (_, Err(e)) => Err(e.to_string()),
                     };

@@ -35,7 +35,7 @@ pub fn can_write_derivations(role: &str) -> bool {
     role == "admin"
 }
 
-fn transformation_color(t: &str) -> &'static str {
+pub(crate) fn transformation_color(t: &str) -> &'static str {
     match t {
         "redaction" => "--amber",
         "indicator_extraction" => "--blue",

@@ -12,7 +12,9 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 use crate::api;
 use crate::api::MeResponse;
 use crate::components::confirm_with_reason_modal::ConfirmWithReasonModal;
-use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
+use crate::components::lineage_tree::{
+    LineageNode, LineageTree, can_write_derivations, transformation_color,
+};
 use crate::components::toast::{ToastBus, ToastKind};
 use crate::time_fmt::time_ago;
 
@@ -428,17 +430,6 @@ pub fn DerivationsPage() -> impl IntoView {
     }
 }
 
-fn transformation_color(t: &str) -> &'static str {
-    match t {
-        "redaction" => "--amber",
-        "indicator_extraction" => "--blue",
-        "summarization" => "--green",
-        "aggregation" => "--teal",
-        "translation" => "--ink-2",
-        _ => "--ink-3",
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn load_lineage(
     object_type: String,
@@ -467,11 +458,11 @@ fn load_lineage(
         let edges_result = api::intel::list_object_derivations(&ot, &oid, None).await;
 
         match anc_result {
-            Ok(body) => ancestors.set(body.data.into_iter().map(LineageNode::from).collect()),
+            Ok(body) => ancestors.set(body.items.into_iter().map(LineageNode::from).collect()),
             Err(e) => error.set(Some(format!("ancestry: {e}"))),
         }
         match desc_result {
-            Ok(body) => descendants.set(body.data.into_iter().map(LineageNode::from).collect()),
+            Ok(body) => descendants.set(body.items.into_iter().map(LineageNode::from).collect()),
             Err(e) => {
                 error.update(|existing| {
                     let msg = format!("descendants: {e}");

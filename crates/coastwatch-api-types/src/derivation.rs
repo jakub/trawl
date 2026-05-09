@@ -8,9 +8,9 @@ pub struct DerivationView {
     pub source_object_type: String,
     pub source_object_id: String,
     pub transformation: String,
-    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub marking_before: serde_json::Value,
-    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub marking_after: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redaction_reason: Option<String>,

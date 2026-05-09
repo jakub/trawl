@@ -159,7 +159,7 @@ pub async fn get_ancestry(
     object_type: &str,
     object_id: &str,
     max_depth: Option<i32>,
-) -> Result<ItemBody<Vec<AncestryView>>, ApiError> {
+) -> Result<PaginatedBody<AncestryView>, ApiError> {
     let depth = max_depth
         .map(|d| format!("?max_depth={d}"))
         .unwrap_or_default();
@@ -179,7 +179,7 @@ pub async fn get_descendants(
     object_type: &str,
     object_id: &str,
     max_depth: Option<i32>,
-) -> Result<ItemBody<Vec<DescendantView>>, ApiError> {
+) -> Result<PaginatedBody<DescendantView>, ApiError> {
     let depth = max_depth
         .map(|d| format!("?max_depth={d}"))
         .unwrap_or_default();
