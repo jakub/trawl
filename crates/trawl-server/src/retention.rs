@@ -336,16 +336,19 @@ mod tests {
 
     #[test]
     fn age_based_deletes_old_dirs() {
+        let today = chrono::Utc::now().date_naive();
+        let old_date = today - chrono::Duration::days(200);
+        let recent_date = today - chrono::Duration::days(30);
+
         let tmp = tempfile::tempdir().unwrap();
-        let old_dir = tmp.path().join("2025-01-01");
-        let recent_dir = tmp.path().join("2026-02-12");
+        let old_dir = tmp.path().join(old_date.format("%Y-%m-%d").to_string());
+        let recent_dir = tmp.path().join(recent_date.format("%Y-%m-%d").to_string());
         std::fs::create_dir(&old_dir).unwrap();
         std::fs::write(old_dir.join("test.parquet"), b"old data").unwrap();
         std::fs::create_dir(&recent_dir).unwrap();
         std::fs::write(recent_dir.join("test.parquet"), b"recent data").unwrap();
 
         let config = make_config(90, 0);
-        // Use a fixed "today" by calling retention_tick directly.
         retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
 
         assert!(!old_dir.exists(), "old dir should be deleted");
