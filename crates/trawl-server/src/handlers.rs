@@ -51,7 +51,7 @@ pub async fn query(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.has_permission(Permission::Query) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -74,7 +74,7 @@ pub async fn query(
     tracing::info!(
         event_type = "query_start",
         user = %verified.name,
-        role = %verified.role,
+        assignments = %verified.assignments_display(),
         query = %req.query,
         limit,
         offset,
@@ -93,7 +93,10 @@ pub async fn query(
         .map_err(ServerError::BadRequest)?
         .unwrap_or(0);
 
-    let role_str = verified.role.to_string();
+    let role_str = verified
+        .trawl_role()
+        .map_or("none", trawl_auth::roles::Role::as_str)
+        .to_owned();
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
 
@@ -405,7 +408,7 @@ pub async fn schema(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<SchemaResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SchemaRead) {
+    if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -570,7 +573,7 @@ pub async fn queries(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<QueriesResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.has_permission(Permission::Query) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -590,9 +593,9 @@ pub async fn cancel_query(
     Path(query_id): Path<u64>,
 ) -> Result<Json<CancelResponse>, ServerError> {
     // admin can cancel any query, QueryCancel holders can cancel their own
-    let can_cancel = if verified.role.has_permission(Permission::ServerManage) {
+    let can_cancel = if verified.has_permission(Permission::ServerManage) {
         true
-    } else if verified.role.has_permission(Permission::QueryCancel) {
+    } else if verified.has_permission(Permission::QueryCancel) {
         state
             .query
             .tracker
@@ -632,7 +635,7 @@ pub async fn validate_query(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<ValidationResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Validate) {
+    if !verified.has_permission(Permission::Validate) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -675,7 +678,7 @@ pub async fn stats(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<StatsResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::ServerManage) {
+    if !verified.has_permission(Permission::ServerManage) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -693,19 +696,23 @@ pub async fn stats(
 /// `GET /api/v1/whoami` — returns identity and permissions for the current token.
 ///
 /// Available to any authenticated user. No permission check needed — if the
-/// token passed auth middleware, the user is entitled to know their own role.
+/// token passed auth middleware, the user is entitled to know their own identity and grants.
 pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIResponse> {
-    let permissions = verified
-        .role
-        .permissions()
-        .iter()
-        .map(|p| p.as_str().to_owned())
-        .collect();
+    // Permissions are server-scoped: only the trawl-app role contributes
+    // to THIS server's permission set. Other-app grants travel via
+    // `assignments` and are interpreted by their owning consumers.
+    let permissions = verified.trawl_role().map_or_else(Vec::new, |r| {
+        r.permissions()
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect()
+    });
 
     Json(WhoAmIResponse {
         prefix: verified.prefix.clone(),
         name: verified.name.clone(),
-        role: verified.role.as_str().to_owned(),
+        kind: verified.kind,
+        assignments: verified.assignments.clone(),
         permissions,
     })
 }
@@ -718,7 +725,7 @@ pub async fn dashboard(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<DashboardSnapshot>, ServerError> {
-    if !verified.role.has_permission(Permission::ServerManage) {
+    if !verified.has_permission(Permission::ServerManage) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -738,7 +745,7 @@ pub async fn schema_services(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<trawl_api::ServiceSchemaResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SchemaRead) {
+    if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -765,7 +772,7 @@ pub async fn field_values(
     Path(field): Path<String>,
     Query(params): Query<FieldValuesParams>,
 ) -> Result<Json<FieldValuesResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SchemaRead) {
+    if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -872,7 +879,7 @@ pub async fn history(
     Extension(verified): Extension<VerifiedKey>,
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<HistoryResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Query) {
+    if !verified.has_permission(Permission::Query) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -931,7 +938,7 @@ pub async fn list_saved(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<ListSavedResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -980,7 +987,7 @@ pub async fn create_saved(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<CreateSavedRequest>,
 ) -> Result<Json<SavedQueryResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1013,7 +1020,7 @@ pub async fn update_saved(
     Path(id): Path<i64>,
     Json(req): Json<UpdateSavedRequest>,
 ) -> Result<Json<SavedQueryResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1051,7 +1058,7 @@ pub async fn delete_saved(
     Extension(verified): Extension<VerifiedKey>,
     Path(id): Path<i64>,
 ) -> Result<Json<DeleteSavedResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1222,7 +1229,7 @@ pub async fn set_schedule(
     Path(saved_id): Path<i64>,
     Json(req): Json<SetScheduleRequest>,
 ) -> Result<Json<ScheduleResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1276,7 +1283,7 @@ pub async fn get_schedule(
     Extension(verified): Extension<VerifiedKey>,
     Path(saved_id): Path<i64>,
 ) -> Result<Json<ScheduleResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1300,7 +1307,7 @@ pub async fn delete_schedule(
     Extension(verified): Extension<VerifiedKey>,
     Path(saved_id): Path<i64>,
 ) -> Result<Json<DeleteScheduleResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1348,7 +1355,7 @@ pub async fn list_report_runs(
     Path(saved_id): Path<i64>,
     Query(params): Query<ListRunsParams>,
 ) -> Result<Json<ListReportRunsResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1377,7 +1384,7 @@ pub async fn list_all_runs(
     Extension(verified): Extension<VerifiedKey>,
     Query(params): Query<ListRunsParams>,
 ) -> Result<Json<ListAllRunsResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1412,7 +1419,7 @@ pub async fn runs_stats(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<RunsStatsResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1442,7 +1449,7 @@ pub async fn trigger_run(
     Extension(verified): Extension<VerifiedKey>,
     Path(saved_id): Path<i64>,
 ) -> Result<Json<ReportRunSummary>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1529,7 +1536,7 @@ pub async fn get_report_run(
     Extension(verified): Extension<VerifiedKey>,
     Path((saved_id, run_id)): Path<(i64, i64)>,
 ) -> Result<Json<ReportRunResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::SavedQuery) {
+    if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1617,7 +1624,7 @@ pub async fn export(
     Query(params): Query<ExportParams>,
     Json(req): Json<ExportRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    if !verified.role.has_permission(Permission::Export) {
+    if !verified.has_permission(Permission::Export) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
@@ -1630,7 +1637,7 @@ pub async fn export(
     tracing::info!(
         event_type = "export_start",
         user = %verified.name,
-        role = %verified.role,
+        assignments = %verified.assignments_display(),
         query = %req.query,
         %format,
         limit,
@@ -1789,7 +1796,9 @@ fn write_query_log(
     let entry = QueryLogEntry {
         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         user: verified.name.clone(),
-        role: verified.role.to_string(),
+        role: verified
+            .trawl_role()
+            .map_or_else(|| "none".to_owned(), |r| r.to_string()),
         dsl: dsl.to_owned(),
         source: SourceDebug {
             computed: debug.computed_source.clone(),
@@ -2028,7 +2037,7 @@ pub async fn stream_query(
     >,
     ServerError,
 > {
-    if !verified.role.has_permission(Permission::Stream) {
+    if !verified.has_permission(Permission::Stream) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 

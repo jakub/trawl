@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+trawl-api = { workspace = true }
 argon2 = { workspace = true }
 base64ct = { workspace = true }
 chrono = { workspace = true }

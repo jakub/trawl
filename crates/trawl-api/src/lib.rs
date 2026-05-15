@@ -425,7 +425,67 @@ pub struct StatsResponse {
 
 // -- whoami ------------------------------------------------------------------
 
-/// Response from the whoami endpoint — token identity and permissions.
+/// Identity discriminator orthogonal to roles.
+///
+/// Distinguishes interactive principals (humans logging into the UI) from
+/// non-interactive ones (services calling the API). Has no effect on
+/// authorization on its own — apps can use it for richer audit context
+/// or to gate features (e.g. require human consent for destructive ops).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrincipalKind {
+    /// Interactive principal — a person using the UI or CLI.
+    Human,
+    /// Non-interactive principal — a service or automation account.
+    Service,
+}
+
+impl PrincipalKind {
+    /// String representation used on the wire and in the database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Service => "service",
+        }
+    }
+}
+
+impl fmt::Display for PrincipalKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for PrincipalKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "human" => Ok(Self::Human),
+            "service" => Ok(Self::Service),
+            other => Err(format!("unknown principal kind: {other}")),
+        }
+    }
+}
+
+/// A namespaced role grant on an API key.
+///
+/// `app` is an opaque app namespace (e.g. `"trawl"`, `"coastwatch"`); the
+/// role string is interpreted by each app independently — there is no
+/// shared role vocabulary across apps.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RoleAssignment {
+    /// App namespace this grant applies to.
+    pub app: String,
+    /// App-defined role name (e.g. `"admin"` for trawl, `"siem_consumer"` for coastwatch).
+    pub role: String,
+}
+
+/// Response from the whoami endpoint — token identity, kind, and grants.
+///
+/// `permissions` is the server-resolved permission set for THIS server's
+/// app namespace (`"trawl"`). Other consumers (coastwatch et al.) read
+/// `assignments` and resolve their own permission set locally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoAmIResponse {
     /// Key prefix (stable 8-char fingerprint). Intended as an immutable
@@ -434,10 +494,26 @@ pub struct WhoAmIResponse {
     pub prefix: String,
     /// Key name (human-readable label).
     pub name: String,
-    /// Role granted by this key (e.g. "admin", "analyst", "reader", "ingest").
-    pub role: String,
-    /// Permissions granted by this role (e.g. "query", "`server_manage`").
+    /// Whether the underlying principal is a human or a service.
+    pub kind: PrincipalKind,
+    /// All `(app, role)` grants attached to this key, across every app.
+    pub assignments: Vec<RoleAssignment>,
+    /// Permissions for the trawl-app role on THIS server (e.g. `"query"`,
+    /// `"server_manage"`). Empty when the key has no trawl-app grant.
     pub permissions: Vec<String>,
+}
+
+impl WhoAmIResponse {
+    /// Look up the role granted to this principal in the given app namespace.
+    ///
+    /// Returns `None` if the key has no grant in that app. Consumers should
+    /// treat `None` as "not authorized for this app" rather than as a default.
+    pub fn role_for(&self, app: &str) -> Option<&str> {
+        self.assignments
+            .iter()
+            .find(|a| a.app == app)
+            .map(|a| a.role.as_str())
+    }
 }
 
 // -- dashboard ---------------------------------------------------------------
@@ -1163,15 +1239,58 @@ mod tests {
         let resp = WhoAmIResponse {
             prefix: "abcd1234".into(),
             name: "dev-key".into(),
-            role: "admin".into(),
+            kind: PrincipalKind::Human,
+            assignments: vec![RoleAssignment {
+                app: "trawl".into(),
+                role: "admin".into(),
+            }],
             permissions: vec!["query".into(), "schema_read".into(), "server_manage".into()],
         };
         let rt = roundtrip(&resp);
         assert_eq!(rt.prefix, "abcd1234");
         assert_eq!(rt.name, "dev-key");
-        assert_eq!(rt.role, "admin");
+        assert_eq!(rt.kind, PrincipalKind::Human);
+        assert_eq!(rt.assignments.len(), 1);
+        assert_eq!(rt.assignments[0].app, "trawl");
+        assert_eq!(rt.assignments[0].role, "admin");
+        assert_eq!(rt.role_for("trawl"), Some("admin"));
+        assert_eq!(rt.role_for("nonexistent"), None);
         assert_eq!(rt.permissions.len(), 3);
         assert!(rt.permissions.contains(&"server_manage".to_owned()));
+    }
+
+    #[test]
+    fn whoami_multi_app_assignments_roundtrip() {
+        let resp = WhoAmIResponse {
+            prefix: "abcd1234".into(),
+            name: "siem-bot".into(),
+            kind: PrincipalKind::Service,
+            assignments: vec![
+                RoleAssignment {
+                    app: "trawl".into(),
+                    role: "analyst".into(),
+                },
+                RoleAssignment {
+                    app: "coastwatch".into(),
+                    role: "siem_consumer".into(),
+                },
+            ],
+            permissions: vec!["query".into(), "schema_read".into()],
+        };
+        let rt = roundtrip(&resp);
+        assert_eq!(rt.kind, PrincipalKind::Service);
+        assert_eq!(rt.assignments.len(), 2);
+        assert_eq!(rt.role_for("trawl"), Some("analyst"));
+        assert_eq!(rt.role_for("coastwatch"), Some("siem_consumer"));
+        assert_eq!(rt.role_for("missing"), None);
+    }
+
+    #[test]
+    fn principal_kind_wire_format_is_lowercase() {
+        let json = serde_json::to_string(&PrincipalKind::Human).unwrap();
+        assert_eq!(json, "\"human\"");
+        let parsed: PrincipalKind = serde_json::from_str("\"service\"").unwrap();
+        assert_eq!(parsed, PrincipalKind::Service);
     }
 
     #[test]

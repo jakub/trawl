@@ -23,6 +23,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - Value types (`Value`, `QueryResult`, `SchemaColumn`) moved from trawl-engine to trawl-api
 - DuckDB error message strings extracted into named constants
+- **BREAKING**: trawl-auth is now a multi-app identity substrate (ADR-0021). API keys carry 0..N `(app, role)` grants in a new `api_key_role_assignment` table instead of a single flat `role` column. Existing v2 databases are auto-migrated; every pre-existing key gets backfilled with a single `("trawl", <old_role>)` grant and `kind = "human"`.
+- **BREAKING**: `/api/v1/whoami` response shape now returns `{prefix, name, kind, assignments, permissions}` — the flat `role` field is gone (clients should read `assignments` and find the `"trawl"` entry).
+- **BREAKING**: `trawl-admin keys create` replaces `--role <role>` with `--kind <human|service>` plus a repeatable `--grant <app:role>` flag. New subcommands: `keys grant`, `keys revoke-grant`, `keys retype`.
 
 ## [0.2.0] - 2026-04-20
 

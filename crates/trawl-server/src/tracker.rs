@@ -76,7 +76,9 @@ impl QueryTracker {
             ActiveQuery {
                 id,
                 user: verified.name.clone(),
-                role: verified.role.to_string(),
+                role: verified
+                    .trawl_role()
+                    .map_or_else(|| "none".to_owned(), |r| r.to_string()),
                 query: query.to_owned(),
                 started_at: Instant::now(),
             },
@@ -164,7 +166,7 @@ impl QueryTracker {
 
 #[cfg(test)]
 mod tests {
-    use trawl_auth::roles::Role;
+    use trawl_auth::assignments::{PrincipalKind, RoleAssignment};
 
     use super::*;
 
@@ -173,7 +175,11 @@ mod tests {
             id: 1,
             prefix: "testtest".into(),
             name: "test-user".into(),
-            role: Role::Analyst,
+            kind: PrincipalKind::Human,
+            assignments: vec![RoleAssignment {
+                app: "trawl".into(),
+                role: "analyst".into(),
+            }],
         }
     }
 

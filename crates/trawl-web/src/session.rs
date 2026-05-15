@@ -192,7 +192,7 @@ pub struct SessionPayload {
     /// Identity name from `/whoami`, surfaced in the UI's user menu.
     pub name: String,
 
-    /// Role from `/whoami` (e.g. "admin", "analyst"), used for client-side
+    /// Trawl-app role extracted from `/whoami` assignments, used for client-side
     /// gating of admin-only screens.
     pub role: String,
 

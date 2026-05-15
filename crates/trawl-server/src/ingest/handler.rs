@@ -227,7 +227,7 @@ pub async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<IngestResponse>, ServerError> {
-    if !verified.role.has_permission(Permission::Ingest) {
+    if !verified.has_permission(Permission::Ingest) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 

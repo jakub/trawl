@@ -81,7 +81,7 @@ impl std::fmt::Debug for CachedAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedAuth")
             .field("user", &self.verified.name)
-            .field("role", &self.verified.role)
+            .field("assignments", &self.verified.assignments)
             .finish_non_exhaustive()
     }
 }
@@ -216,17 +216,24 @@ mod tests {
         assert_eq!(extract_bearer_token(&headers), Some("flt_testtoken123"));
     }
 
-    #[test]
-    fn auth_cache_hit_returns_verified_key() {
-        use trawl_auth::roles::Role;
-
-        let cache = AuthCache::new(Duration::from_secs(300));
-        let key = VerifiedKey {
+    fn admin_key() -> VerifiedKey {
+        use trawl_auth::assignments::{PrincipalKind, RoleAssignment};
+        VerifiedKey {
             id: 1,
             prefix: "flt_test".into(),
             name: "test-user".into(),
-            role: Role::Admin,
-        };
+            kind: PrincipalKind::Human,
+            assignments: vec![RoleAssignment {
+                app: "trawl".into(),
+                role: "admin".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn auth_cache_hit_returns_verified_key() {
+        let cache = AuthCache::new(Duration::from_secs(300));
+        let key = admin_key();
         cache.insert("token123".into(), key.clone());
 
         let result = cache.get("token123");
@@ -242,16 +249,8 @@ mod tests {
 
     #[test]
     fn auth_cache_expired_returns_none() {
-        use trawl_auth::roles::Role;
-
         let cache = AuthCache::new(Duration::from_millis(1));
-        let key = VerifiedKey {
-            id: 1,
-            prefix: "flt_test".into(),
-            name: "test-user".into(),
-            role: Role::Admin,
-        };
-        cache.insert("token123".into(), key);
+        cache.insert("token123".into(), admin_key());
 
         // Sleep past TTL.
         std::thread::sleep(Duration::from_millis(5));

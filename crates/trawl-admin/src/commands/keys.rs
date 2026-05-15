@@ -7,15 +7,16 @@
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
-use trawl_auth::Role;
+use trawl_auth::assignments::{PrincipalKind, RoleAssignment};
 use trawl_auth::keys::ApiKeyInfo;
 use trawl_auth::store::KeyStore;
 
 /// Create a new API key.
 pub fn create(
-    store: &KeyStore,
+    store: &mut KeyStore,
     name: &str,
-    role: Role,
+    kind: PrincipalKind,
+    assignments: &[RoleAssignment],
     expires: Option<&str>,
 ) -> Result<(), String> {
     let expires_in = match expires {
@@ -24,12 +25,16 @@ pub fn create(
     };
 
     let created = store
-        .create_key(name, role, expires_in)
+        .create_key(name, kind, assignments, expires_in)
         .map_err(|e| e.to_string())?;
 
     eprintln!("created API key:\n");
     eprintln!("  name:    {}", created.info.name);
-    eprintln!("  role:    {}", created.info.role);
+    eprintln!("  kind:    {}", created.info.kind);
+    eprintln!(
+        "  grants:  {}",
+        format_assignments(&created.info.assignments)
+    );
     eprintln!("  prefix:  {}", created.info.prefix);
     if let Some(ref exp) = created.info.expires_at {
         eprintln!("  expires: {exp}");
@@ -73,7 +78,8 @@ pub fn revoke(store: &KeyStore, prefix: &str, yes: bool) -> Result<(), String> {
 
     eprintln!("  prefix:  {}", info.prefix);
     eprintln!("  name:    {}", info.name);
-    eprintln!("  role:    {}", info.role);
+    eprintln!("  kind:    {}", info.kind);
+    eprintln!("  grants:  {}", format_assignments(&info.assignments));
     eprintln!("  created: {}", format_timestamp(&info.created_at));
 
     if !yes {
@@ -102,6 +108,49 @@ pub fn revoke(store: &KeyStore, prefix: &str, yes: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Add a grant to an existing key.
+pub fn grant(store: &KeyStore, prefix: &str, assignment: &RoleAssignment) -> Result<(), String> {
+    store
+        .grant_assignment(prefix, assignment)
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "granted {}:{} to key {}",
+        assignment.app, assignment.role, prefix
+    );
+    Ok(())
+}
+
+/// Remove a grant from an existing key.
+pub fn revoke_grant(store: &KeyStore, prefix: &str, app: &str) -> Result<(), String> {
+    store
+        .revoke_assignment(prefix, app)
+        .map_err(|e| e.to_string())?;
+    eprintln!("revoked grant for app {app} on key {prefix}");
+    Ok(())
+}
+
+/// Change a key's `kind` (human ↔ service).
+pub fn retype(store: &KeyStore, prefix: &str, kind: PrincipalKind) -> Result<(), String> {
+    let info = store.retype_key(prefix, kind).map_err(|e| e.to_string())?;
+    eprintln!(
+        "retyped key {} ({}) as {}",
+        info.prefix, info.name, info.kind
+    );
+    Ok(())
+}
+
+/// Render assignments as a comma-separated `app:role,...` string for CLI output.
+fn format_assignments(assignments: &[RoleAssignment]) -> String {
+    if assignments.is_empty() {
+        return "(none)".to_owned();
+    }
+    assignments
+        .iter()
+        .map(|a| format!("{}:{}", a.app, a.role))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Format a list of keys as a table.
 fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
     let mut table = comfy_table::Table::new();
@@ -113,7 +162,8 @@ fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
     table.set_header(vec![
         "prefix",
         "name",
-        "role",
+        "kind",
+        "grants",
         "active",
         "created",
         "last used",
@@ -123,7 +173,8 @@ fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
         table.add_row(vec![
             key.prefix.clone(),
             key.name.clone(),
-            key.role.to_string(),
+            key.kind.to_string(),
+            format_assignments(&key.assignments),
             if key.active {
                 "yes".to_owned()
             } else {
@@ -241,13 +292,21 @@ mod tests {
         assert_eq!(format_timestamp(ts), "2026-02-10 12:00:00");
     }
 
+    fn grant(app: &str, role: &str) -> RoleAssignment {
+        RoleAssignment {
+            app: app.into(),
+            role: role.into(),
+        }
+    }
+
     fn test_keys() -> Vec<ApiKeyInfo> {
         vec![
             ApiKeyInfo {
                 id: 1,
                 prefix: "dGhpcyBp".into(),
                 name: "web-frontend".into(),
-                role: Role::Analyst,
+                kind: PrincipalKind::Human,
+                assignments: vec![grant("trawl", "analyst")],
                 active: true,
                 created_at: "2026-02-10T12:00:00+00:00".into(),
                 expires_at: Some("2026-05-11T12:00:00+00:00".into()),
@@ -258,7 +317,8 @@ mod tests {
                 id: 2,
                 prefix: "YW5vdGhl".into(),
                 name: "cli-readonly".into(),
-                role: Role::Reader,
+                kind: PrincipalKind::Service,
+                assignments: vec![grant("trawl", "reader")],
                 active: true,
                 created_at: "2026-02-09T08:00:00+00:00".into(),
                 expires_at: None,
@@ -269,7 +329,11 @@ mod tests {
                 id: 3,
                 prefix: "cmV2b2tl".into(),
                 name: "old-key".into(),
-                role: Role::Admin,
+                kind: PrincipalKind::Human,
+                assignments: vec![
+                    grant("trawl", "admin"),
+                    grant("coastwatch", "siem_consumer"),
+                ],
                 active: false,
                 created_at: "2026-01-01T00:00:00+00:00".into(),
                 expires_at: None,

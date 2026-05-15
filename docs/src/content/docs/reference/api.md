@@ -112,7 +112,30 @@ Full dashboard snapshot. Admin only.
 GET /api/v1/whoami
 ```
 
-Returns the identity and permissions of the current token.
+Returns the identity, kind, role grants, and permissions for the current token.
+
+Response shape:
+
+```json
+{
+  "prefix": "abcd1234",
+  "name": "siem-bot",
+  "kind": "service",
+  "assignments": [
+    {"app": "trawl", "role": "analyst"},
+    {"app": "coastwatch", "role": "siem_consumer"}
+  ],
+  "permissions": ["query", "schema_read", "validate", "saved_query", "export", "stream", "query_cancel"]
+}
+```
+
+Fields:
+
+- `kind` — `"human"` or `"service"`. Distinguishes interactive users from non-interactive principals.
+- `assignments` — every `(app, role)` grant attached to the key, across every app. Apps consume only the grants in their own namespace.
+- `permissions` — the trawl-server-resolved permission set for the `"trawl"` assignment. Empty when the key has no `"trawl"` grant. Other consumers (e.g. coastwatch) read `assignments` and resolve permissions locally.
+
+Per ADR-0021, trawl-auth acts as a shared identity substrate: a single API key can carry grants for multiple apps simultaneously.
 
 ### Query history
 

@@ -204,7 +204,11 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "alice", "role": "analyst", "permissions": []
+                "prefix": "testtest",
+                "name": "alice",
+                "kind": "human",
+                "assignments": [{"app": "trawl", "role": "analyst"}],
+                "permissions": ["query", "schema_read", "validate", "saved_query", "export", "stream", "query_cancel"]
             })))
             .mount(upstream)
             .await;

@@ -45,6 +45,32 @@ pub enum AuthError {
     #[error("unknown role: {0}")]
     UnknownRole(String),
 
+    /// Invalid app namespace.
+    #[error("invalid app namespace: {0}")]
+    InvalidApp(String),
+
+    /// Invalid role name in a grant assignment.
+    #[error("invalid role: {0}")]
+    InvalidRole(String),
+
+    /// A grant already exists for this (key, app) pair.
+    #[error("grant already exists for key {prefix} in app {app} (use revoke first)")]
+    GrantExists {
+        /// The key prefix.
+        prefix: String,
+        /// The app namespace.
+        app: String,
+    },
+
+    /// No grant exists for this (key, app) pair.
+    #[error("no grant exists for key {prefix} in app {app}")]
+    GrantNotFound {
+        /// The key prefix.
+        prefix: String,
+        /// The app namespace.
+        app: String,
+    },
+
     /// A saved query with this name already exists for this user.
     #[error("a saved query named '{name}' already exists")]
     DuplicateName {

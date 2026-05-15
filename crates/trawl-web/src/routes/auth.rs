@@ -52,10 +52,11 @@ pub async fn login(
     let ttl = i64::try_from(state.session_ttl_secs())
         .map_err(|_| ProxyError::Internal("session_ttl_secs out of i64 range".into()))?;
 
+    let role = whoami.trawl_role().ok_or(ProxyError::Unauthorized)?;
     let payload = SessionPayload {
         token: Zeroizing::new(req.api_key),
         name: whoami.name.clone(),
-        role: whoami.role.clone(),
+        role: role.clone(),
         exp: now.saturating_add(ttl),
     };
 
@@ -69,7 +70,7 @@ pub async fn login(
 
     let body = LoginResponse {
         name: whoami.name,
-        role: whoami.role,
+        role,
     };
 
     let mut headers = HeaderMap::new();
@@ -83,10 +84,30 @@ pub async fn login(
     Ok((StatusCode::OK, headers, Json(body)).into_response())
 }
 
+/// Local view of the upstream `/whoami` payload — only the fields the proxy
+/// actually uses to build a session. The proxy never gates anything on
+/// non-trawl-app grants, so we extract just the trawl role here.
 #[derive(Debug, Deserialize)]
 struct WhoAmI {
     name: String,
+    #[serde(default)]
+    assignments: Vec<UpstreamAssignment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamAssignment {
+    app: String,
     role: String,
+}
+
+impl WhoAmI {
+    /// Role assigned in the trawl-app namespace, if any.
+    fn trawl_role(&self) -> Option<String> {
+        self.assignments
+            .iter()
+            .find(|a| a.app == "trawl")
+            .map(|a| a.role.clone())
+    }
 }
 
 async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyError> {
@@ -176,8 +197,10 @@ mod tests {
             .and(path("/api/v1/whoami"))
             .and(bearer_token("flt_goodtoken"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "prefix": "abcd1234",
                 "name": "alice",
-                "role": "analyst",
+                "kind": "human",
+                "assignments": [{"app": "trawl", "role": "analyst"}],
                 "permissions": ["query"]
             })))
             .mount(&upstream)
@@ -258,7 +281,11 @@ mod tests {
             .and(path("/api/v1/whoami"))
             .and(bearer_token("flt_prod"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "prod", "role": "admin", "permissions": []
+                "prefix": "abcd1234",
+                "name": "prod",
+                "kind": "human",
+                "assignments": [{"app": "trawl", "role": "admin"}],
+                "permissions": []
             })))
             .mount(&upstream)
             .await;
@@ -301,7 +328,11 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "name": "alice", "role": "analyst", "permissions": []
+                "prefix": "abcd1234",
+                "name": "alice",
+                "kind": "human",
+                "assignments": [{"app": "trawl", "role": "analyst"}],
+                "permissions": []
             })))
             .mount(&upstream)
             .await;

@@ -82,17 +82,28 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
         .get::<VerifiedKey>()
         .ok_or_else(|| ServerError::Internal("verified key not in extensions".into()))?;
 
-    if let Some(limiter) = rate_state.limiter_for_role(verified.role)
-        && limiter.check_key(&verified.prefix).is_err()
-    {
-        tracing::warn!(
-            event_type = "rate_limit_exceeded",
-            user = %verified.name,
-            role = %verified.role,
+    // Per-role rate limiting is gated on the trawl-app role; keys without
+    // a trawl grant bypass the buckets here entirely (per-handler permission
+    // checks will 403 them on any trawl endpoint they actually try to hit).
+    if let Some(trawl_role) = verified.trawl_role() {
+        if let Some(limiter) = rate_state.limiter_for_role(trawl_role)
+            && limiter.check_key(&verified.prefix).is_err()
+        {
+            tracing::warn!(
+                event_type = "rate_limit_exceeded",
+                user = %verified.name,
+                role = %trawl_role,
+                prefix = %verified.prefix,
+                "rate limit exceeded"
+            );
+            return Err(ServerError::RateLimited);
+        }
+    } else {
+        tracing::debug!(
             prefix = %verified.prefix,
-            "rate limit exceeded"
+            name = %verified.name,
+            "rate limiter bypassed: no trawl-app grant"
         );
-        return Err(ServerError::RateLimited);
     }
 
     Ok(next.run(request).await)

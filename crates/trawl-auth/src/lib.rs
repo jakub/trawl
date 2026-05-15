@@ -2,13 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! trawl-auth: API key management and role-based authorization.
+//! trawl-auth: API key management and multi-app role-based authorization.
 //!
-//! `SQLite`-backed store for API keys with three roles (admin, analyst, reader).
+//! `SQLite`-backed store for API keys with namespaced `(app, role)` grants.
 //! Handles key creation, verification, revocation, and permission checking.
 
 /// Error types for the authentication subsystem.
 pub mod error;
+
+/// App namespaces and `(app, role)` grant validation.
+pub mod assignments;
 
 /// API key data types — metadata, creation results, verified identity.
 pub mod keys;
@@ -31,6 +34,10 @@ pub mod schedule;
 /// Token generation, hashing, and verification.
 pub mod token;
 
+pub use assignments::{
+    MAX_APP_NAMESPACE_LEN, PrincipalKind, RoleAssignment, TRAWL_APP, validate_app_namespace,
+    validate_assignment, validate_role_name,
+};
 pub use error::AuthError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use keys::{ApiKeyInfo, CreatedKey, VerifiedKey};

@@ -10,9 +10,18 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 
+use trawl_auth::assignments::{PrincipalKind, RoleAssignment};
 use trawl_auth::roles::Role;
 use trawl_auth::store::KeyStore;
 use trawl_client::HttpClient;
+
+/// Helper: build a single-grant `trawl:<role>` assignment vector for tests.
+fn trawl_only(role: Role) -> Vec<RoleAssignment> {
+    vec![RoleAssignment {
+        app: "trawl".into(),
+        role: role.as_str().into(),
+    }]
+}
 use trawl_server::config::{
     AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig,
     SchedulerConfig, ServerConfig, SyslogConfig, WebConfig,
@@ -149,6 +158,7 @@ struct TestServer {
     admin_token: String,
     reader_token: String,
     ingest_token: String,
+    coastwatch_only_token: String,
 }
 
 /// Poll the health endpoint until the server is ready (up to 1s).
@@ -168,17 +178,46 @@ async fn wait_for_ready(addr: &str) {
 }
 
 /// Set up a test server with custom rate limiting for rate limit tests.
+#[allow(clippy::too_many_lines)]
 async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let data_glob = ensure_fixtures();
     let auth_db = tmp.path().join("auth.db");
 
-    let store = KeyStore::open(&auth_db).unwrap();
-    let analyst = store.create_key("test-key", Role::Analyst, None).unwrap();
-    let admin = store.create_key("admin-key", Role::Admin, None).unwrap();
-    let reader = store.create_key("reader-key", Role::Reader, None).unwrap();
-    let ingest = store.create_key("ingest-key", Role::Ingest, None).unwrap();
+    let mut store = KeyStore::open(&auth_db).unwrap();
+    let analyst = store
+        .create_key(
+            "test-key",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .unwrap();
+    let admin = store
+        .create_key(
+            "admin-key",
+            PrincipalKind::Service,
+            &trawl_only(Role::Admin),
+            None,
+        )
+        .unwrap();
+    let reader = store
+        .create_key(
+            "reader-key",
+            PrincipalKind::Service,
+            &trawl_only(Role::Reader),
+            None,
+        )
+        .unwrap();
+    let ingest = store
+        .create_key(
+            "ingest-key",
+            PrincipalKind::Service,
+            &trawl_only(Role::Ingest),
+            None,
+        )
+        .unwrap();
     drop(store);
 
     let (cert_path, key_path) = ensure_test_cert();
@@ -245,10 +284,12 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
         admin_token: admin.plaintext_token.to_string(),
         reader_token: reader.plaintext_token.to_string(),
         ingest_token: ingest.plaintext_token.to_string(),
+        coastwatch_only_token: String::new(),
     }
 }
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
+#[allow(clippy::too_many_lines)]
 async fn setup() -> TestServer {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
@@ -256,11 +297,50 @@ async fn setup() -> TestServer {
     let auth_db = tmp.path().join("auth.db");
 
     // Create API keys for all test roles.
-    let store = KeyStore::open(&auth_db).unwrap();
-    let analyst = store.create_key("test-key", Role::Analyst, None).unwrap();
-    let admin = store.create_key("admin-key", Role::Admin, None).unwrap();
-    let reader = store.create_key("reader-key", Role::Reader, None).unwrap();
-    let ingest = store.create_key("ingest-key", Role::Ingest, None).unwrap();
+    let mut store = KeyStore::open(&auth_db).unwrap();
+    let analyst = store
+        .create_key(
+            "test-key",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .unwrap();
+    let admin = store
+        .create_key(
+            "admin-key",
+            PrincipalKind::Service,
+            &trawl_only(Role::Admin),
+            None,
+        )
+        .unwrap();
+    let reader = store
+        .create_key(
+            "reader-key",
+            PrincipalKind::Service,
+            &trawl_only(Role::Reader),
+            None,
+        )
+        .unwrap();
+    let ingest = store
+        .create_key(
+            "ingest-key",
+            PrincipalKind::Service,
+            &trawl_only(Role::Ingest),
+            None,
+        )
+        .unwrap();
+    let coastwatch_only = store
+        .create_key(
+            "coastwatch-only",
+            PrincipalKind::Service,
+            &[RoleAssignment {
+                app: "coastwatch".into(),
+                role: "viewer".into(),
+            }],
+            None,
+        )
+        .unwrap();
     drop(store);
 
     let (cert_path, key_path) = ensure_test_cert();
@@ -331,6 +411,7 @@ async fn setup() -> TestServer {
         url: format!("https://{addr}"),
         analyst_token: analyst.plaintext_token.to_string(),
         admin_token: admin.plaintext_token.to_string(),
+        coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
         reader_token: reader.plaintext_token.to_string(),
         ingest_token: ingest.plaintext_token.to_string(),
     }
@@ -834,7 +915,7 @@ async fn whoami_admin_has_server_manage() {
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let resp = admin.whoami().await.unwrap();
-    assert_eq!(resp.role, "admin");
+    assert_eq!(resp.role_for("trawl"), Some("admin"));
     assert!(resp.permissions.contains(&"server_manage".to_owned()));
     assert!(resp.permissions.contains(&"query".to_owned()));
     // prefix is the stable 8-char fingerprint of the key; downstream
@@ -856,7 +937,7 @@ async fn whoami_reader_lacks_server_manage() {
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     let resp = reader.whoami().await.unwrap();
-    assert_eq!(resp.role, "reader");
+    assert_eq!(resp.role_for("trawl"), Some("reader"));
     assert!(!resp.permissions.contains(&"server_manage".to_owned()));
     assert!(resp.permissions.contains(&"query".to_owned()));
 }
@@ -868,6 +949,17 @@ async fn whoami_rejects_missing_auth() {
 
     let result = client.whoami().await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn whoami_no_trawl_grant_returns_empty_permissions() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.coastwatch_only_token).unwrap();
+
+    let resp = client.whoami().await.unwrap();
+    assert_eq!(resp.role_for("trawl"), None);
+    assert_eq!(resp.role_for("coastwatch"), Some("viewer"));
+    assert!(resp.permissions.is_empty());
 }
 
 #[tokio::test]
