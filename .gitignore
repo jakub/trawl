@@ -4,6 +4,7 @@
 # editor / IDE
 .idea/
 .vscode/
+.codex/
 *.swp
 *.swo
 *~
