@@ -162,22 +162,27 @@ impl VerifiedKey {
             .map(|a| a.role.as_str())
     }
 
-    /// Render assignments as `"app1:role1,app2:role2"` for log fields.
-    ///
-    /// Deterministic (sorted by app). Returns `"none"` when empty so log
-    /// filters can match an explicit string.
+    /// Render this key's assignments as `"app1:role1,app2:role2"` for log
+    /// fields. Delegates to [`format_assignments`].
     pub fn assignments_display(&self) -> String {
-        if self.assignments.is_empty() {
-            return "none".to_owned();
-        }
-        let mut sorted: Vec<&RoleAssignment> = self.assignments.iter().collect();
-        sorted.sort_by(|a, b| a.app.cmp(&b.app));
-        sorted
-            .iter()
-            .map(|a| format!("{}:{}", a.app, a.role))
-            .collect::<Vec<_>>()
-            .join(",")
+        format_assignments(&self.assignments)
     }
+}
+
+/// Render a slice of `RoleAssignment` as `"app1:role1,app2:role2"`, sorted
+/// by app for deterministic log/tracing output. Returns `"none"` when empty
+/// so log filters can match an explicit string instead of an absent field.
+pub fn format_assignments(assignments: &[RoleAssignment]) -> String {
+    if assignments.is_empty() {
+        return "none".to_owned();
+    }
+    let mut sorted: Vec<&RoleAssignment> = assignments.iter().collect();
+    sorted.sort_by(|a, b| a.app.cmp(&b.app));
+    sorted
+        .iter()
+        .map(|a| format!("{}:{}", a.app, a.role))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
