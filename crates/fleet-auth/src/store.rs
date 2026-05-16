@@ -27,6 +27,28 @@ use crate::token;
 use crate::types::{ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey};
 use crate::validation::{validate_app_namespace, validate_assignment};
 
+/// Run argon2id hashing on the tokio blocking pool.
+///
+/// Production argon2id with 128 MiB / 3 iterations takes ~200 ms and would
+/// stall a tokio worker thread for that long — invalid-token spray could
+/// starve the runtime. `spawn_blocking` moves the CPU work to a dedicated
+/// pool sized for blocking I/O.
+async fn hash_token_async(plaintext: &str) -> Result<String, AuthError> {
+    let plaintext = plaintext.to_owned();
+    tokio::task::spawn_blocking(move || token::hash_token(&plaintext))
+        .await
+        .map_err(|e| AuthError::Hash(format!("argon2 worker panicked: {e}")))?
+}
+
+/// Run argon2id verification on the tokio blocking pool. See `hash_token_async`.
+async fn verify_token_async(plaintext: &str, hash: &str) -> Result<bool, AuthError> {
+    let plaintext = plaintext.to_owned();
+    let hash = hash.to_owned();
+    tokio::task::spawn_blocking(move || token::verify_token(&plaintext, &hash))
+        .await
+        .map_err(|e| AuthError::Hash(format!("argon2 worker panicked: {e}")))?
+}
+
 /// Postgres + argon2id-cache backed API key store.
 ///
 /// Cheap to `Clone` — the inner `PgPool` is already `Arc`-shared and the
@@ -120,7 +142,7 @@ impl KeyStore {
 
         for _ in 0..MAX_RETRIES {
             let generated = token::generate_token();
-            let hash = token::hash_token(&generated.plaintext)?;
+            let hash = hash_token_async(&generated.plaintext).await?;
 
             let mut tx = self.pool.begin().await?;
 
@@ -223,8 +245,9 @@ impl KeyStore {
 
         let Some(row) = row_opt else {
             // SECURITY: equalize timing with the hit path so prefix existence
-            // doesn't leak via response time.
-            let _ = token::verify_token(plaintext, &token::DUMMY_HASH);
+            // doesn't leak via response time. spawn_blocking so the argon2id
+            // work doesn't block a tokio worker thread.
+            let _ = verify_token_async(plaintext, &token::DUMMY_HASH).await;
             return Err(AuthError::InvalidKey("authentication failed".into()));
         };
 
@@ -239,8 +262,9 @@ impl KeyStore {
         let cache_key = VerificationCacheKey::build(prefix, plaintext, &stored_hash);
 
         if !self.cache.contains(&cache_key) {
-            // Cache miss — pay the argon2id cost.
-            let hash_valid = token::verify_token(plaintext, &stored_hash)?;
+            // Cache miss — pay the argon2id cost on the blocking pool so
+            // the tokio worker thread stays available for other tasks.
+            let hash_valid = verify_token_async(plaintext, &stored_hash).await?;
             if !hash_valid {
                 return Err(AuthError::InvalidKey("authentication failed".into()));
             }
