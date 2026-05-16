@@ -14,7 +14,12 @@ pub mod types;
 pub mod validation;
 
 #[cfg(feature = "keystore")]
+pub mod cache;
+#[cfg(feature = "keystore")]
 pub mod token;
+
+#[cfg(feature = "keystore")]
+pub use cache::{VerificationCache, VerificationCacheKey, VerificationCacheStats};
 
 pub use error::AuthError;
 pub use types::{ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey};
