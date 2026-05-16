@@ -18,12 +18,16 @@ pub mod cache;
 #[cfg(feature = "keystore")]
 pub mod migrations;
 #[cfg(feature = "keystore")]
+pub mod store;
+#[cfg(feature = "keystore")]
 pub mod token;
 
 #[cfg(feature = "keystore")]
 pub use cache::{VerificationCache, VerificationCacheKey, VerificationCacheStats};
 #[cfg(feature = "keystore")]
 pub use migrations::MIGRATOR;
+#[cfg(feature = "keystore")]
+pub use store::KeyStore;
 
 pub use error::AuthError;
 pub use types::{ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey};
