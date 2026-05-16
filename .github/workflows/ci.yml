@@ -59,6 +59,27 @@ jobs:
         env:
           DUCKDB_DOWNLOAD_LIB: "1"
 
+  fleet-auth-tests:
+    # Postgres-backed integration tests for fleet-auth's KeyStore.
+    # Requires a reachable fleet test database with CREATEDB privilege
+    # (each test creates and drops its own ephemeral per-test database).
+    # FLEET_DATABASE_URL secret points at the fleet_test CNPG cluster
+    # using the dedicated fleet_test role (see 1Password homelab vault).
+    name: fleet-auth (postgres)
+    runs-on: k8s-big
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: fleet-auth-tests
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
+        with:
+          tool: nextest
+      - run: cargo nextest run -p fleet-auth --features fast-hash
+        env:
+          FLEET_DATABASE_URL: ${{ secrets.FLEET_DATABASE_URL }}
+
   msrv:
     name: msrv check
     runs-on: k8s-small
