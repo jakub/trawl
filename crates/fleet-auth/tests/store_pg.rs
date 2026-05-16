@@ -24,53 +24,71 @@ use sqlx_core::executor::Executor as _;
 use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 
 /// Reads the base database URL from the environment.
+///
+/// Empty values are treated as unset — important so a CI secret that fails
+/// to inject (lands as empty string) doesn't silently become "no DB", which
+/// in turn would make `FLEET_TESTS_REQUIRED=1` mis-fire.
 fn base_database_url() -> Option<String> {
-    std::env::var("FLEET_DATABASE_URL")
-        .ok()
-        .or_else(|| std::env::var("DATABASE_URL").ok())
+    for var in ["FLEET_DATABASE_URL", "DATABASE_URL"] {
+        if let Ok(v) = std::env::var(var)
+            && !v.is_empty()
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// If set, missing/unreachable Postgres is a hard failure instead of a skip.
+/// CI sets this so a misconfigured `FLEET_DATABASE_URL` secret can't silently
+/// turn the integration suite into a green no-op.
+fn require_database() -> bool {
+    std::env::var("FLEET_TESTS_REQUIRED").is_ok_and(|v| !v.is_empty())
 }
 
 /// RAII fixture: create + migrate a fresh per-test database, hand out a pool,
 /// drop the database on `Drop`.
 struct PgFixture {
-    admin_url: String,
+    admin_opts: PgConnectOptions,
     test_db: String,
     pool: Option<PgPool>,
 }
 
 impl PgFixture {
     async fn setup() -> Option<Self> {
+        use sqlx_core::connection::Connection as _;
+
         let admin_url = base_database_url()?;
+        let admin_opts: PgConnectOptions = admin_url
+            .parse()
+            .expect("FLEET_DATABASE_URL is not a valid Postgres URL");
         let test_db = format!("fleet_auth_test_{}", random_db_suffix());
 
         // Connect to the admin DB to issue CREATE DATABASE — this requires
         // CREATEDB on the connecting role.
-        let mut admin: PgConnection = {
-            use sqlx_core::connection::Connection as _;
-            let opts: PgConnectOptions = admin_url.parse().expect("valid admin URL");
-            PgConnection::connect_with(&opts)
-                .await
-                .expect("connect to admin DB (requires reachable Postgres + CREATEDB)")
-        };
+        let mut admin: PgConnection = PgConnection::connect_with(&admin_opts)
+            .await
+            .expect("connect to admin DB (requires reachable Postgres + CREATEDB)");
 
         admin
             .execute(format!(r#"CREATE DATABASE "{test_db}""#).as_str())
             .await
             .expect("CREATE DATABASE — does the role have CREATEDB?");
 
-        // Build the per-test pool URL by swapping the database name.
-        let test_url = swap_database(&admin_url, &test_db);
-
+        // Swap to the per-test database via the typed options builder instead
+        // of hand-rolling URL surgery — `database()` overrides cleanly and
+        // can't be tricked by usernames containing slashes etc.
+        let test_opts = admin_opts.clone().database(&test_db);
         let pool = PgPoolOptions::new()
             .max_connections(4)
-            .connect(&test_url)
+            .connect_with(test_opts)
             .await
             .expect("connect to per-test DB");
 
         MIGRATOR.run(&pool).await.expect("apply migrations");
 
         Some(Self {
-            admin_url,
+            admin_opts,
             test_db,
             pool: Some(pool),
         })
@@ -88,7 +106,7 @@ impl Drop for PgFixture {
         // WITH (FORCE)` terminates any lingering connections from the per-
         // test pool (its own Drop closes them lazily).
         self.pool.take(); // release our handle so WITH (FORCE) can reclaim
-        let admin_url = self.admin_url.clone();
+        let admin_opts = self.admin_opts.clone();
         let test_db = self.test_db.clone();
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -97,9 +115,7 @@ impl Drop for PgFixture {
                 .expect("teardown runtime");
             rt.block_on(async move {
                 use sqlx_core::connection::Connection as _;
-                if let Ok(opts) = admin_url.parse::<PgConnectOptions>()
-                    && let Ok(mut admin) = PgConnection::connect_with(&opts).await
-                {
+                if let Ok(mut admin) = PgConnection::connect_with(&admin_opts).await {
                     let _ = admin
                         .execute(
                             format!(r#"DROP DATABASE IF EXISTS "{test_db}" WITH (FORCE)"#).as_str(),
@@ -124,32 +140,23 @@ fn random_db_suffix() -> String {
         .collect()
 }
 
-/// Rewrite the database name segment of a Postgres URL.
-fn swap_database(url: &str, new_db: &str) -> String {
-    // Postgres URL: `postgres[ql]://user:pw@host:port/dbname?params`
-    // Replace the path segment between the last '/' and the optional '?'.
-    if let Some(scheme_end) = url.find("://") {
-        let rest = &url[scheme_end + 3..];
-        if let Some(slash) = rest.find('/') {
-            let head = &url[..=scheme_end + 3 + slash];
-            let after_db = &rest[slash + 1..];
-            let tail = after_db.find('?').map_or("", |q| &after_db[q..]);
-            return format!("{head}{new_db}{tail}");
-        }
-    }
-    panic!("malformed Postgres URL: {url}");
-}
-
-/// Macro to skip a test with a clear message when no DB is configured.
+/// Macro to skip a test with a clear message when no DB is configured —
+/// unless `FLEET_TESTS_REQUIRED` is set, in which case the absence is a
+/// hard failure (CI relies on this so a misconfigured secret can't quietly
+/// turn the suite into a green no-op).
 macro_rules! pg_test {
     ($name:ident, $body:expr) => {
         #[tokio::test]
         async fn $name() {
             let Some(fx) = PgFixture::setup().await else {
-                eprintln!(
-                    "fleet-auth integration test '{}' skipped: FLEET_DATABASE_URL not set",
+                let msg = format!(
+                    "fleet-auth integration test '{}' skipped: FLEET_DATABASE_URL not set or empty",
                     stringify!($name)
                 );
+                if require_database() {
+                    panic!("{msg} — but FLEET_TESTS_REQUIRED is set, so this is a hard failure",);
+                }
+                eprintln!("{msg}");
                 return;
             };
             let pool = fx.pool();
