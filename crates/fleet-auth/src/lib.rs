@@ -13,6 +13,9 @@ pub mod error;
 pub mod types;
 pub mod validation;
 
+#[cfg(feature = "keystore")]
+pub mod token;
+
 pub use error::AuthError;
 pub use types::{ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey};
 pub use validation::{
