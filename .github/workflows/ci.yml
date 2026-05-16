@@ -79,6 +79,10 @@ jobs:
       - run: cargo nextest run -p fleet-auth --features fast-hash
         env:
           FLEET_DATABASE_URL: ${{ secrets.FLEET_DATABASE_URL }}
+          # Hard-fail if the secret didn't inject — otherwise the per-test
+          # PgFixture would skip every integration test and the job would
+          # report a misleading green.
+          FLEET_TESTS_REQUIRED: "1"
 
   msrv:
     name: msrv check
