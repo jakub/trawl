@@ -21,6 +21,18 @@ pub enum AuthError {
     #[error("token hashing error: {0}")]
     Hash(String),
 
+    /// Token generation failed to produce a unique prefix after the configured
+    /// retry budget — astronomically unlikely (48-bit prefix space) but coded
+    /// defensively. Distinct from `Hash` so callers can tell hashing errors
+    /// from generation exhaustion.
+    #[error("token generation error: {0}")]
+    TokenGeneration(String),
+
+    /// A requested key expiry duration could not be represented as a
+    /// `chrono::Duration` (would overflow ~292 years from now).
+    #[error("invalid expiry duration: {0}")]
+    InvalidExpiry(String),
+
     /// The provided token is not valid for any reason (bad credentials, key not
     /// found, revoked, expired). Opaque by design — callers cannot distinguish
     /// between these cases to prevent enumeration oracles.

@@ -29,13 +29,25 @@ const PREFIX_LENGTH: usize = 8;
 
 /// A generated API token. Shown to the user exactly once at creation; the
 /// plaintext is never persisted.
-#[derive(Debug, Clone)]
+///
+/// The `Debug` impl redacts `plaintext` — accidental `{:?}` logging of a
+/// freshly-generated token would leak the one-time API key otherwise.
+#[derive(Clone)]
 pub struct GeneratedToken {
     /// Full token string: `flt_` + 43 base64url chars.
     pub plaintext: Zeroizing<String>,
     /// First 8 chars of the base64url body — the operational prefix used
     /// for identification and the indexed DB lookup.
     pub prefix: String,
+}
+
+impl std::fmt::Debug for GeneratedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedToken")
+            .field("prefix", &self.prefix)
+            .field("plaintext", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Pre-computed dummy argon2id hash for timing equalization on prefix miss.
@@ -183,6 +195,21 @@ mod tests {
         let token = generate_token();
         let result = verify_token(&token.plaintext, &DUMMY_HASH);
         assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn generated_token_debug_redacts_plaintext() {
+        let token = generate_token();
+        let debug = format!("{token:?}");
+        assert!(debug.contains("<redacted>"), "expected redaction marker");
+        assert!(
+            !debug.contains(&*token.plaintext.to_string()),
+            "must not contain plaintext token"
+        );
+        assert!(
+            debug.contains(&token.prefix),
+            "prefix is non-secret and should appear in debug"
+        );
     }
 
     #[test]

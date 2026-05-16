@@ -134,11 +134,16 @@ impl KeyStore {
         // land microseconds after the Rust-side `Utc::now() + d` for very
         // short expiries, tripping the `api_keys_expiry_after_create` CHECK.
         let created_at = Utc::now();
-        let expires_at: Option<DateTime<Utc>> = expires_in.map(|d| {
-            let delta =
-                chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::seconds(0));
-            created_at + delta
-        });
+        let expires_at: Option<DateTime<Utc>> = expires_in
+            .map(|d| {
+                let delta = chrono::Duration::from_std(d).map_err(|_| {
+                    AuthError::InvalidExpiry(format!(
+                        "expiry duration {d:?} exceeds chrono::Duration range (~292 years)"
+                    ))
+                })?;
+                Ok::<_, AuthError>(created_at + delta)
+            })
+            .transpose()?;
 
         for _ in 0..MAX_RETRIES {
             let generated = token::generate_token();
@@ -213,7 +218,7 @@ impl KeyStore {
             });
         }
 
-        Err(AuthError::Hash(
+        Err(AuthError::TokenGeneration(
             "failed to generate unique token prefix after retries".into(),
         ))
     }
