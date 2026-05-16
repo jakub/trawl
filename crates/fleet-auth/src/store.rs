@@ -24,7 +24,9 @@ use sqlx_postgres::{PgPool, PgRow};
 use crate::cache::{VerificationCache, VerificationCacheKey, VerificationCacheStats};
 use crate::error::AuthError;
 use crate::token;
-use crate::types::{ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey};
+use crate::types::{
+    ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey, format_assignments,
+};
 use crate::validation::{validate_app_namespace, validate_assignment};
 
 /// Run argon2id hashing on the tokio blocking pool.
@@ -197,7 +199,7 @@ impl KeyStore {
                 prefix = %generated.prefix,
                 name,
                 kind = %kind,
-                assignments = %render_assignments(assignments),
+                assignments = %format_assignments(assignments),
                 "API key created"
             );
 
@@ -303,8 +305,15 @@ impl KeyStore {
             return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
-        // Load assignments fresh from the DB — never cache them. A grant
-        // change must take effect on the very next verify.
+        // Load assignments fresh from the DB — never cache them.
+        //
+        // Note on consistency: a `grant_assignment` / `revoke_assignment`
+        // racing between the UPDATE above and this SELECT will leave the
+        // in-flight verify returning the pre-race assignment set. The next
+        // verify after both operations complete sees the fresh state. At
+        // fleet scale this microsecond-wide window is acceptable; future
+        // hardening would lock the api_keys row (SELECT FOR UPDATE) in a
+        // single transaction spanning UPDATE + SELECT + grant operations.
         let assignments = self.load_assignments(id).await?;
 
         let kind: PrincipalKind = kind_str.parse()?;
@@ -410,23 +419,7 @@ impl KeyStore {
         .rows_affected();
 
         if updated == 0 {
-            let exists: bool = sqlx_core::query::query(
-                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE prefix = $1) AS exists",
-            )
-            .bind(prefix)
-            .fetch_one(&self.pool)
-            .await?
-            .try_get("exists")?;
-
-            return Err(if exists {
-                AuthError::KeyRevoked {
-                    prefix: prefix.to_owned(),
-                }
-            } else {
-                AuthError::KeyNotFound {
-                    prefix: prefix.to_owned(),
-                }
-            });
+            return Err(self.classify_prefix_miss(prefix).await?);
         }
 
         tracing::info!(event_type = "key_revoked", prefix, "API key revoked");
@@ -534,27 +527,35 @@ impl KeyStore {
         .rows_affected();
 
         if updated == 0 {
-            let exists: bool = sqlx_core::query::query(
-                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE prefix = $1) AS exists",
-            )
-            .bind(prefix)
-            .fetch_one(&self.pool)
-            .await?
-            .try_get("exists")?;
-
-            return Err(if exists {
-                AuthError::KeyRevoked {
-                    prefix: prefix.to_owned(),
-                }
-            } else {
-                AuthError::KeyNotFound {
-                    prefix: prefix.to_owned(),
-                }
-            });
+            return Err(self.classify_prefix_miss(prefix).await?);
         }
 
         tracing::info!(event_type = "key_retyped", prefix, kind = %kind, "key kind updated");
         self.get_key_by_prefix(prefix).await
+    }
+
+    /// Classify a "zero rows affected" UPDATE on `api_keys` by prefix —
+    /// distinguishes a not-found prefix from one that exists but is already
+    /// revoked. Used by `revoke_key` and `retype_key`, both of which guard
+    /// their UPDATE on `active = TRUE` / `revoked_at IS NULL`.
+    async fn classify_prefix_miss(&self, prefix: &str) -> Result<AuthError, AuthError> {
+        let exists: bool = sqlx_core::query::query(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE prefix = $1) AS exists",
+        )
+        .bind(prefix)
+        .fetch_one(&self.pool)
+        .await?
+        .try_get("exists")?;
+
+        Ok(if exists {
+            AuthError::KeyRevoked {
+                prefix: prefix.to_owned(),
+            }
+        } else {
+            AuthError::KeyNotFound {
+                prefix: prefix.to_owned(),
+            }
+        })
     }
 
     /// Internal helper: resolve a prefix to its database row id.
@@ -591,15 +592,4 @@ fn row_to_api_key_info_no_assignments(row: &PgRow) -> Result<ApiKeyInfo, AuthErr
         last_used: row.try_get("last_used")?,
         revoked_at: row.try_get("revoked_at")?,
     })
-}
-
-fn render_assignments(assignments: &[RoleAssignment]) -> String {
-    if assignments.is_empty() {
-        return "none".to_owned();
-    }
-    assignments
-        .iter()
-        .map(|a| format!("{}:{}", a.app, a.role))
-        .collect::<Vec<_>>()
-        .join(",")
 }

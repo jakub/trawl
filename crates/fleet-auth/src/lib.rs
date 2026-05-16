@@ -30,7 +30,9 @@ pub use migrations::MIGRATOR;
 pub use store::KeyStore;
 
 pub use error::AuthError;
-pub use types::{ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey};
+pub use types::{
+    ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey, format_assignments,
+};
 pub use validation::{
     MAX_APP_NAMESPACE_LEN, TRAWL_APP, validate_app_namespace, validate_assignment,
     validate_role_name,
