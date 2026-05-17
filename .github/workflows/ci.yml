@@ -61,12 +61,25 @@ jobs:
 
   fleet-auth-tests:
     # Postgres-backed integration tests for fleet-auth's KeyStore.
-    # Requires a reachable fleet test database with CREATEDB privilege
-    # (each test creates and drops its own ephemeral per-test database).
-    # FLEET_DATABASE_URL secret points at the fleet_test CNPG cluster
-    # using the dedicated fleet_test role (see 1Password homelab vault).
+    # Each test creates and drops an ephemeral per-test database, so the
+    # role must have CREATEDB. CI uses a throwaway postgres:18 container
+    # (the default `postgres` superuser has CREATEDB); local-dev and the
+    # homelab dev/prod environments use CNPG.
     name: fleet-auth (postgres)
     runs-on: k8s-big
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=2s
+          --health-timeout=3s
+          --health-retries=15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -78,8 +91,8 @@ jobs:
           tool: nextest
       - run: cargo nextest run -p fleet-auth --features fast-hash
         env:
-          FLEET_DATABASE_URL: ${{ secrets.FLEET_DATABASE_URL }}
-          # Hard-fail if the secret didn't inject — otherwise the per-test
+          FLEET_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          # Hard-fail if the env var didn't inject — otherwise the per-test
           # PgFixture would skip every integration test and the job would
           # report a misleading green.
           FLEET_TESTS_REQUIRED: "1"
