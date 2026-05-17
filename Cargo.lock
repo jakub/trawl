@@ -1726,16 +1726,22 @@ name = "fleet-auth"
 version = "0.2.2"
 dependencies = [
  "argon2",
+ "axum",
  "base64ct",
  "blake3",
+ "chacha20poly1305",
  "chrono",
+ "cookie",
  "dashmap",
  "rand 0.8.5",
  "serde",
+ "serde_json",
  "sqlx-core",
  "sqlx-postgres",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
  "zeroize",
 ]
