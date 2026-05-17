@@ -89,7 +89,7 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
         with:
           tool: nextest
-      - run: cargo nextest run -p fleet-auth --features fast-hash
+      - run: cargo nextest run -p fleet-auth --features "fast-hash,axum"
         env:
           FLEET_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
           # Hard-fail if the env var didn't inject — otherwise the per-test
