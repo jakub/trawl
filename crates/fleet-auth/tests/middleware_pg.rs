@@ -24,8 +24,8 @@ use axum::middleware::from_fn_with_state;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use fleet_auth::{
-    KeyStore, PrincipalKind, RoleAssignment, SessionConfig, SessionKey, SessionPayload,
-    SessionState, VerifiedKey, encrypt, require_bearer, require_session,
+    KeyStore, PrincipalKind, RoleAssignment, SessionConfig, SessionExpiry, SessionKey,
+    SessionPayload, SessionState, VerifiedKey, encrypt, require_bearer, require_session,
 };
 use tower::ServiceExt as _;
 use zeroize::Zeroizing;
@@ -80,7 +80,7 @@ fn issue_session_cookie(session_key: &SessionKey, token: &str, ttl_secs: i64) ->
     let payload = SessionPayload {
         token: Zeroizing::new(token.to_owned()),
         name: "alice".to_owned(),
-        exp: now + ttl_secs,
+        exp: SessionExpiry::after_duration(now, ttl_secs),
     };
     encrypt(session_key, &payload).expect("encrypt cookie")
 }

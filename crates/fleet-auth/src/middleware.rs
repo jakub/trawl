@@ -139,7 +139,11 @@ pub async fn require_session(
 
     let now = chrono::Utc::now().timestamp();
     if session::is_expired(&payload, now) {
-        tracing::info!(exp = payload.exp, now, "auth: session expired");
+        tracing::info!(
+            exp = payload.exp.as_unix_seconds(),
+            now,
+            "auth: session expired"
+        );
         return unauthorized_json("session expired");
     }
 
