@@ -26,6 +26,8 @@ pub mod token;
 pub mod session;
 
 #[cfg(feature = "axum")]
+pub mod handlers;
+#[cfg(feature = "axum")]
 pub mod middleware;
 
 #[cfg(feature = "keystore")]
@@ -42,6 +44,8 @@ pub use session::{
     encrypt, is_expired,
 };
 
+#[cfg(feature = "axum")]
+pub use handlers::{LoginRequest, LoginResponse, login, logout};
 #[cfg(feature = "axum")]
 pub use middleware::{SessionState, require_bearer, require_session};
 

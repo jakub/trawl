@@ -1,0 +1,268 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Postgres-backed integration tests for [`fleet_auth::login`] and
+//! [`fleet_auth::logout`] (ADR-0030, issue coastwatch#34).
+
+#![cfg(feature = "axum")]
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::Request;
+use axum::http::{StatusCode, header};
+use axum::routing::post;
+use fleet_auth::{
+    KeyStore, PrincipalKind, RoleAssignment, SessionConfig, SessionKey, SessionState, decrypt,
+    login, logout,
+};
+use tower::ServiceExt as _;
+
+#[macro_use]
+mod common;
+
+fn router_with_state(state: SessionState) -> Router {
+    Router::new()
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/logout", post(logout))
+        .with_state(state)
+}
+
+fn session_state(store: KeyStore, app_namespace: &str) -> (SessionState, Arc<SessionKey>) {
+    let session_key = Arc::new(SessionKey::generate());
+    let mut cfg = SessionConfig::new("fleet_session", app_namespace).unwrap();
+    cfg.secure = false; // tests don't run over HTTPS
+    "/dashboard".clone_into(&mut cfg.post_login_redirect);
+    let state = SessionState::new(store, Arc::clone(&session_key), Arc::new(cfg)).unwrap();
+    (state, session_key)
+}
+
+fn trawl_grant() -> Vec<RoleAssignment> {
+    vec![RoleAssignment {
+        app: "trawl".into(),
+        role: "analyst".into(),
+    }]
+}
+
+fn login_request(api_key: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(r#"{{"api_key":"{api_key}"}}"#)))
+        .unwrap()
+}
+
+fn logout_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/auth/logout")
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn body_string(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// login
+// ---------------------------------------------------------------------------
+
+pg_test!(
+    login_valid_key_sets_cookie_and_redirects,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let (state, session_key) = session_state(store, "trawl");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(login_request(&created.plaintext_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/dashboard"
+        );
+
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("Set-Cookie")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            set_cookie.starts_with("fleet_session="),
+            "got: {set_cookie}"
+        );
+        assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
+        assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
+        assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
+        assert!(set_cookie.contains("Max-Age="), "got: {set_cookie}");
+        // secure=false in test → no Secure attribute
+        assert!(!set_cookie.contains("Secure"), "got: {set_cookie}");
+
+        // Extract the cookie value and decrypt — proves the round-trip works.
+        let pair = set_cookie.split(';').next().unwrap();
+        let value = pair.split_once('=').unwrap().1;
+        let payload = decrypt(&session_key, value).unwrap();
+        assert_eq!(payload.name, "alice");
+        assert_eq!(payload.token.as_str(), created.plaintext_token.as_str());
+    }
+);
+
+pg_test!(
+    login_includes_domain_when_configured,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let session_key = Arc::new(SessionKey::generate());
+        let mut cfg = SessionConfig::new("fleet_session", "trawl").unwrap();
+        cfg.secure = false;
+        cfg.domain = Some("fleet.localhost".to_owned());
+        "/".clone_into(&mut cfg.post_login_redirect);
+        let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(login_request(&created.plaintext_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("Domain=fleet.localhost"),
+            "got: {set_cookie}"
+        );
+    }
+);
+
+pg_test!(login_rejects_wrong_key, |store: KeyStore| async move {
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
+
+    let response = app
+        .oneshot(login_request("flt_completelybogusvalue"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "failed login must not set a cookie"
+    );
+});
+
+pg_test!(login_rejects_empty_key, |store: KeyStore| async move {
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
+
+    let response = app.oneshot(login_request("")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+});
+
+pg_test!(
+    login_no_grant_returns_403_no_cookie,
+    |store: KeyStore| async move {
+        // Key has grant in trawl, but app namespace is coastwatch.
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let (state, _) = session_state(store, "coastwatch");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(login_request(&created.plaintext_token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "no-grant login must not set a cookie"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = body_string(response).await;
+        assert!(body.contains("alice"), "got: {body}");
+        assert!(body.contains("coastwatch"), "got: {body}");
+    }
+);
+
+// ---------------------------------------------------------------------------
+// logout
+// ---------------------------------------------------------------------------
+
+pg_test!(
+    logout_clears_cookie_with_matching_attrs,
+    |store: KeyStore| async move {
+        let session_key = Arc::new(SessionKey::generate());
+        let mut cfg = SessionConfig::new("fleet_session", "trawl").unwrap();
+        cfg.secure = true;
+        cfg.domain = Some("fleet.home.lan".to_owned());
+        let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
+        let app = router_with_state(state);
+
+        let response = app.oneshot(logout_request()).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("logout sets clear cookie")
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.starts_with("fleet_session=;"),
+            "got: {set_cookie}"
+        );
+        assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
+        assert!(
+            set_cookie.contains("Domain=fleet.home.lan"),
+            "got: {set_cookie}"
+        );
+        assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
+        assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
+        assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
+        assert!(set_cookie.contains("Secure"), "got: {set_cookie}");
+    }
+);
+
+pg_test!(logout_requires_no_session, |store: KeyStore| async move {
+    // Even without a valid cookie, logout succeeds — the browser was
+    // already in a confused state, our job is to make sure the cookie is
+    // gone, not to gate on whether it was valid.
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
+
+    let response = app.oneshot(logout_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(response.headers().contains_key(header::SET_COOKIE));
+});
