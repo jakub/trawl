@@ -48,3 +48,6 @@ crates/trawl-core/fuzz/artifacts/
 crates/trawl-core/fuzz/corpus/
 web_ui_mockups/
 docs/working-plans/
+
+# working plans (gitignored — workspace local)
+docs/working-plans/
