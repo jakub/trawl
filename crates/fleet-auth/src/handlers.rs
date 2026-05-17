@@ -82,18 +82,18 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
     };
 
     let cfg = state.config();
-    if verified.role_for(&cfg.app_namespace).is_none() {
+    if verified.role_for(cfg.app_namespace()).is_none() {
         // No-grant: same body as middleware. NO Set-Cookie — the user never
         // gets a session for an app they can't access.
-        return no_grant_response(&verified.name, &cfg.app_namespace);
+        return no_grant_response(&verified.name, cfg.app_namespace());
     }
 
     let now = chrono::Utc::now().timestamp();
-    let ttl = match i64::try_from(cfg.ttl_secs) {
+    let ttl = match i64::try_from(cfg.ttl_secs()) {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(
-                ttl_secs = cfg.ttl_secs,
+                ttl_secs = cfg.ttl_secs(),
                 ?err,
                 "login: ttl_secs out of i64 range"
             );
@@ -115,12 +115,12 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
     };
 
     let cookie_header = build_session_cookie_header(
-        &cfg.cookie_name,
+        cfg.cookie_name(),
         cookie_value,
-        cfg.ttl_secs,
-        cfg.secure,
-        cfg.same_site,
-        cfg.domain.as_deref(),
+        cfg.ttl_secs(),
+        cfg.secure(),
+        cfg.same_site(),
+        cfg.domain(),
     );
 
     let mut headers = HeaderMap::new();
@@ -132,11 +132,11 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
         }
     };
     headers.insert(header::SET_COOKIE, set_cookie);
-    let location = match cfg.post_login_redirect.parse() {
+    let location = match cfg.post_login_redirect().parse() {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(
-                redirect = %cfg.post_login_redirect,
+                redirect = %cfg.post_login_redirect(),
                 ?err,
                 "login: post_login_redirect not a valid header value"
             );
@@ -174,10 +174,10 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
 pub async fn logout(State(state): State<SessionState>) -> Response {
     let cfg = state.config();
     let cookie_header = build_clear_cookie_header(
-        &cfg.cookie_name,
-        cfg.secure,
-        cfg.same_site,
-        cfg.domain.as_deref(),
+        cfg.cookie_name(),
+        cfg.secure(),
+        cfg.same_site(),
+        cfg.domain(),
     );
 
     let mut headers = HeaderMap::new();

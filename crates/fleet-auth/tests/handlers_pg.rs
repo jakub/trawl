@@ -32,9 +32,13 @@ fn router_with_state(state: SessionState) -> Router {
 
 fn session_state(store: KeyStore, app_namespace: &str) -> (SessionState, Arc<SessionKey>) {
     let session_key = Arc::new(SessionKey::generate());
-    let mut cfg = SessionConfig::new("fleet_session", app_namespace).unwrap();
-    cfg.secure = false; // tests don't run over HTTPS
-    "/dashboard".clone_into(&mut cfg.post_login_redirect);
+    let cfg = SessionConfig::builder()
+        .cookie_name("fleet_session")
+        .app_namespace(app_namespace)
+        .secure(false) // tests don't run over HTTPS
+        .post_login_redirect("/dashboard")
+        .build()
+        .unwrap();
     let state = SessionState::new(store, Arc::clone(&session_key), Arc::new(cfg)).unwrap();
     (state, session_key)
 }
@@ -132,10 +136,14 @@ pg_test!(
             .unwrap();
 
         let session_key = Arc::new(SessionKey::generate());
-        let mut cfg = SessionConfig::new("fleet_session", "trawl").unwrap();
-        cfg.secure = false;
-        cfg.domain = Some("fleet.localhost".to_owned());
-        "/".clone_into(&mut cfg.post_login_redirect);
+        let cfg = SessionConfig::builder()
+            .cookie_name("fleet_session")
+            .app_namespace("trawl")
+            .secure(false)
+            .domain("fleet.localhost")
+            .post_login_redirect("/")
+            .build()
+            .unwrap();
         let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
         let app = router_with_state(state);
 
@@ -224,9 +232,13 @@ pg_test!(
     logout_clears_cookie_with_matching_attrs,
     |store: KeyStore| async move {
         let session_key = Arc::new(SessionKey::generate());
-        let mut cfg = SessionConfig::new("fleet_session", "trawl").unwrap();
-        cfg.secure = true;
-        cfg.domain = Some("fleet.home.lan".to_owned());
+        let cfg = SessionConfig::builder()
+            .cookie_name("fleet_session")
+            .app_namespace("trawl")
+            .secure(true)
+            .domain("fleet.home.lan")
+            .build()
+            .unwrap();
         let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
         let app = router_with_state(state);
 

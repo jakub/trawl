@@ -33,7 +33,8 @@ pub const KEY_LEN: usize = 32;
 /// Length of the `XChaCha20` nonce in bytes.
 pub const NONCE_LEN: usize = 24;
 
-/// Default cookie name when [`SessionConfig::default`] is used.
+/// Default cookie name used by [`SessionConfigBuilder`] when
+/// [`SessionConfigBuilder::cookie_name`] is not set.
 ///
 /// The shared name across fleet apps is `fleet_session` so a single cookie
 /// scoped to the parent domain provides SSO across subdomains.
@@ -227,73 +228,111 @@ impl std::fmt::Debug for SessionPayload {
 /// the same instance for cookie writes, cookie reads, and the namespace
 /// check in `RequireSession`.
 ///
-/// `app_namespace` MUST be non-empty and pass [`validate_app_namespace`] —
-/// [`SessionConfig::validate`] returns an error if not. Construct via
-/// [`SessionConfig::new`] for fail-fast validation, or
-/// [`SessionConfig::default`] followed by direct field mutation when wiring
-/// from a config file.
+/// Construction goes through [`SessionConfig::builder`] (or
+/// [`SessionConfig::new`] for the two-required-fields-only common case).
+/// Both paths run [`SessionConfig::validate`] before handing back a
+/// `SessionConfig`, so a value of this type is always known-valid.
+///
+/// Fields are `pub(crate)` and the struct is `#[non_exhaustive]` so
+/// external callers can neither construct via struct literal nor mutate
+/// post-construction — the only way to set a value is via the builder,
+/// which keeps validation invariants enforced.
 ///
 /// Cloning is cheap — all fields are owned strings and copy types. The
 /// expectation is to wrap in `Arc<SessionConfig>` at startup and share.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SessionConfig {
-    /// Cookie name (e.g. `"fleet_session"`).
-    pub cookie_name: String,
-    /// Optional `Domain=` attribute.
-    ///
-    /// `None` (recommended for single-host deployments) scopes the cookie
-    /// to the exact origin — correct for localhost dev and single-app
-    /// hosting.
-    ///
-    /// `Some(".fleet.home.lan")` scopes to a parent domain so sibling apps
-    /// share the cookie (ADR-0030 SSO). The value MUST match (or be a
-    /// parent suffix of) the host the browser sees in the URL bar — if it
-    /// doesn't, browsers silently accept the `Set-Cookie` but refuse to
-    /// send the cookie back on subsequent requests. Symptom: users login
-    /// successfully (302 returns) and immediately get 401 on the next
-    /// request, with no server-side error to trace. Verify after first
-    /// login via browser devtools → Application → Cookies.
-    pub domain: Option<String>,
-    /// Session lifetime in seconds; sets cookie `Max-Age` and payload `exp`.
-    pub ttl_secs: u64,
-    /// `Secure` flag — set to `true` in production (HTTPS only).
-    pub secure: bool,
-    /// `SameSite` attribute. ADR-0030 mandates `Lax` for cross-subdomain SSO.
-    pub same_site: cookie::SameSite,
-    /// App namespace (e.g. `"trawl"`, `"coastwatch"`). Used to filter
-    /// `VerifiedKey.assignments` in middleware and login handler.
-    pub app_namespace: String,
-    /// Path browsers redirect to after a successful login.
-    pub post_login_redirect: String,
+    pub(crate) cookie_name: String,
+    pub(crate) domain: Option<String>,
+    pub(crate) ttl_secs: u64,
+    pub(crate) secure: bool,
+    pub(crate) same_site: cookie::SameSite,
+    pub(crate) app_namespace: String,
+    pub(crate) post_login_redirect: String,
 }
 
 impl SessionConfig {
-    /// Validate-and-construct.
+    /// Start a builder with SSO-friendly defaults (SameSite=Lax, secure=true,
+    /// 24h TTL, cookie name `"fleet_session"`, post-login redirect `"/"`).
+    #[must_use]
+    pub fn builder() -> SessionConfigBuilder {
+        SessionConfigBuilder::default()
+    }
+
+    /// Convenience for the common "just need the two required fields"
+    /// case. Equivalent to
+    /// `Self::builder().cookie_name(...).app_namespace(...).build()`.
     ///
     /// # Errors
-    /// Returns [`crate::AuthError::InvalidApp`] when `cookie_name` is empty,
-    /// `post_login_redirect` doesn't start with `/`, or `app_namespace` fails
-    /// [`validate_app_namespace`].
+    /// As for [`SessionConfigBuilder::build`].
     pub fn new(
         cookie_name: impl Into<String>,
         app_namespace: impl Into<String>,
     ) -> Result<Self, crate::AuthError> {
-        let cfg = Self {
-            cookie_name: cookie_name.into(),
-            app_namespace: app_namespace.into(),
-            ..Self::default()
-        };
-        cfg.validate()?;
-        Ok(cfg)
+        Self::builder()
+            .cookie_name(cookie_name)
+            .app_namespace(app_namespace)
+            .build()
     }
 
-    /// Validate the configuration. Called by [`Self::new`]; also expose for
-    /// callers that build via [`Self::default`] + field assignment.
+    // -- read accessors --
+
+    /// Cookie name (e.g. `"fleet_session"`).
+    #[must_use]
+    pub fn cookie_name(&self) -> &str {
+        &self.cookie_name
+    }
+
+    /// Optional `Domain=` attribute. See [`SessionConfigBuilder::domain`]
+    /// for the silent-misconfig warning.
+    #[must_use]
+    pub fn domain(&self) -> Option<&str> {
+        self.domain.as_deref()
+    }
+
+    /// Session lifetime in seconds; sets cookie `Max-Age` and payload `exp`.
+    #[must_use]
+    pub const fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
+    /// `Secure` flag — `true` in production (HTTPS only).
+    #[must_use]
+    pub const fn secure(&self) -> bool {
+        self.secure
+    }
+
+    /// `SameSite` attribute.
+    #[must_use]
+    pub const fn same_site(&self) -> cookie::SameSite {
+        self.same_site
+    }
+
+    /// App namespace (e.g. `"trawl"`, `"coastwatch"`).
+    #[must_use]
+    pub fn app_namespace(&self) -> &str {
+        &self.app_namespace
+    }
+
+    /// Path browsers redirect to after a successful login.
+    #[must_use]
+    pub fn post_login_redirect(&self) -> &str {
+        &self.post_login_redirect
+    }
+
+    /// Validate the configuration. The builder calls this in
+    /// [`SessionConfigBuilder::build`]; [`SessionState::new`] also calls
+    /// it defensively in case a future internal path constructs a
+    /// `SessionConfig` without going through the builder.
     ///
     /// # Errors
     /// Returns [`crate::AuthError::InvalidApp`] when `cookie_name` is empty,
-    /// `post_login_redirect` doesn't start with `/`, or `app_namespace`
-    /// fails [`validate_app_namespace`].
+    /// `post_login_redirect` doesn't start with `/` or is otherwise unsafe,
+    /// `same_site == None` without `secure`, or `app_namespace` fails
+    /// [`validate_app_namespace`].
+    ///
+    /// [`SessionState::new`]: crate::middleware::SessionState::new
     pub fn validate(&self) -> Result<(), crate::AuthError> {
         if self.cookie_name.is_empty() {
             return Err(crate::AuthError::InvalidApp(
@@ -311,6 +350,120 @@ impl SessionConfig {
         }
         validate_app_namespace(&self.app_namespace)?;
         Ok(())
+    }
+}
+
+/// Builder for [`SessionConfig`].
+///
+/// SSO-friendly defaults: `cookie_name = "fleet_session"`, `secure = true`,
+/// `same_site = Lax`, `ttl_secs = DEFAULT_TTL_SECS`, no `Domain`, and
+/// `post_login_redirect = "/"`. The two required setters are
+/// [`Self::cookie_name`] (must be non-empty) and [`Self::app_namespace`]
+/// (must pass [`validate_app_namespace`]).
+///
+/// Validation runs in [`Self::build`], so unset/invalid fields surface as a
+/// proper `Result` rather than a panic.
+#[derive(Debug, Default, Clone)]
+pub struct SessionConfigBuilder {
+    cookie_name: Option<String>,
+    domain: Option<String>,
+    ttl_secs: Option<u64>,
+    secure: Option<bool>,
+    same_site: Option<cookie::SameSite>,
+    app_namespace: Option<String>,
+    post_login_redirect: Option<String>,
+}
+
+impl SessionConfigBuilder {
+    /// Set the cookie name. Required; `build()` fails on empty.
+    #[must_use]
+    pub fn cookie_name(mut self, v: impl Into<String>) -> Self {
+        self.cookie_name = Some(v.into());
+        self
+    }
+
+    /// Set the `Domain=` cookie attribute.
+    ///
+    /// Mismatched values silently break: browsers accept the
+    /// `Set-Cookie` but refuse to send the cookie back, producing
+    /// "login succeeds, every subsequent request 401s, nothing in logs".
+    /// Match the host the browser actually sees in the URL bar, or use
+    /// [`Self::no_domain`] (the default) and let the browser scope to
+    /// the origin.
+    #[must_use]
+    pub fn domain(mut self, v: impl Into<String>) -> Self {
+        self.domain = Some(v.into());
+        self
+    }
+
+    /// Explicitly clear any `Domain=` attribute previously set on the
+    /// builder. Equivalent to leaving it unset; provided so a config-file
+    /// loader can reset a value without calling [`Self::domain`] with an
+    /// empty string.
+    #[must_use]
+    pub fn no_domain(mut self) -> Self {
+        self.domain = None;
+        self
+    }
+
+    /// Session lifetime in seconds.
+    #[must_use]
+    pub const fn ttl_secs(mut self, v: u64) -> Self {
+        self.ttl_secs = Some(v);
+        self
+    }
+
+    /// `Secure` cookie flag — set to `true` in production (HTTPS only).
+    #[must_use]
+    pub const fn secure(mut self, v: bool) -> Self {
+        self.secure = Some(v);
+        self
+    }
+
+    /// `SameSite` cookie attribute.
+    #[must_use]
+    pub const fn same_site(mut self, v: cookie::SameSite) -> Self {
+        self.same_site = Some(v);
+        self
+    }
+
+    /// App namespace, e.g. `"trawl"` or `"coastwatch"`. Required.
+    #[must_use]
+    pub fn app_namespace(mut self, v: impl Into<String>) -> Self {
+        self.app_namespace = Some(v.into());
+        self
+    }
+
+    /// Path browsers redirect to after a successful login. Must start
+    /// with `/`, must not be protocol-relative.
+    #[must_use]
+    pub fn post_login_redirect(mut self, v: impl Into<String>) -> Self {
+        self.post_login_redirect = Some(v.into());
+        self
+    }
+
+    /// Build and validate.
+    ///
+    /// # Errors
+    /// Returns [`crate::AuthError::InvalidApp`] when validation fails
+    /// (empty `cookie_name`, invalid `post_login_redirect`,
+    /// `same_site == None` without `secure`, or invalid `app_namespace`).
+    pub fn build(self) -> Result<SessionConfig, crate::AuthError> {
+        let cfg = SessionConfig {
+            cookie_name: self
+                .cookie_name
+                .unwrap_or_else(|| DEFAULT_COOKIE_NAME.to_owned()),
+            domain: self.domain,
+            ttl_secs: self.ttl_secs.unwrap_or(DEFAULT_TTL_SECS),
+            secure: self.secure.unwrap_or(true),
+            // ADR-0030: Lax is required for parent-domain SSO. Strict would
+            // silently break cross-subdomain navigation.
+            same_site: self.same_site.unwrap_or(cookie::SameSite::Lax),
+            app_namespace: self.app_namespace.unwrap_or_default(),
+            post_login_redirect: self.post_login_redirect.unwrap_or_else(|| "/".to_owned()),
+        };
+        cfg.validate()?;
+        Ok(cfg)
     }
 }
 
@@ -348,24 +501,6 @@ fn validate_redirect_path(path: &str) -> Result<(), crate::AuthError> {
         ));
     }
     Ok(())
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            cookie_name: DEFAULT_COOKIE_NAME.to_owned(),
-            domain: None,
-            ttl_secs: DEFAULT_TTL_SECS,
-            secure: true,
-            // ADR-0030: Lax is required for parent-domain SSO. Strict would
-            // silently break cross-subdomain navigation.
-            same_site: cookie::SameSite::Lax,
-            // app_namespace MUST be set explicitly — empty string fails
-            // validate(), which is intentional.
-            app_namespace: String::new(),
-            post_login_redirect: "/".to_owned(),
-        }
-    }
 }
 
 /// Build a `Set-Cookie` header value for a live session cookie.
@@ -781,25 +916,32 @@ mod tests {
     }
 
     #[test]
-    fn session_config_default_is_sso_friendly() {
-        let cfg = SessionConfig::default();
-        assert_eq!(cfg.cookie_name, "fleet_session");
-        assert!(cfg.domain.is_none());
-        assert_eq!(cfg.ttl_secs, DEFAULT_TTL_SECS);
-        assert!(cfg.secure);
-        assert_eq!(cfg.same_site, cookie::SameSite::Lax);
-        assert_eq!(cfg.post_login_redirect, "/");
-        // app_namespace is empty by design — validate() must reject it so
+    fn session_config_builder_emits_sso_friendly_defaults() {
+        let cfg = SessionConfig::builder()
+            .app_namespace("trawl")
+            .build()
+            .unwrap();
+        assert_eq!(cfg.cookie_name(), "fleet_session");
+        assert!(cfg.domain().is_none());
+        assert_eq!(cfg.ttl_secs(), DEFAULT_TTL_SECS);
+        assert!(cfg.secure());
+        assert_eq!(cfg.same_site(), cookie::SameSite::Lax);
+        assert_eq!(cfg.post_login_redirect(), "/");
+        assert_eq!(cfg.app_namespace(), "trawl");
+    }
+
+    #[test]
+    fn session_config_builder_rejects_empty_namespace() {
+        // app_namespace defaults to empty — validate() must reject it so
         // callers can't accidentally ship a wide-open default.
-        assert!(cfg.app_namespace.is_empty());
-        assert!(cfg.validate().is_err());
+        let err = SessionConfig::builder().build().unwrap_err();
+        assert!(matches!(err, crate::AuthError::InvalidApp(_)));
     }
 
     #[test]
     fn session_config_new_validates_namespace() {
         let cfg = SessionConfig::new("fleet_session", "trawl").unwrap();
-        assert_eq!(cfg.app_namespace, "trawl");
-        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.app_namespace(), "trawl");
 
         let err = SessionConfig::new("fleet_session", "BAD!").unwrap_err();
         assert!(matches!(err, crate::AuthError::InvalidApp(_)));
@@ -807,23 +949,21 @@ mod tests {
 
     #[test]
     fn session_config_rejects_empty_cookie_name() {
-        let cfg = SessionConfig {
-            cookie_name: String::new(),
-            app_namespace: "trawl".to_owned(),
-            ..SessionConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
+        let err = SessionConfig::builder()
+            .cookie_name("")
+            .app_namespace("trawl")
+            .build()
+            .unwrap_err();
         assert!(matches!(err, crate::AuthError::InvalidApp(m) if m.contains("cookie_name")));
     }
 
     #[test]
     fn session_config_rejects_relative_redirect() {
-        let cfg = SessionConfig {
-            post_login_redirect: "home".to_owned(),
-            app_namespace: "trawl".to_owned(),
-            ..SessionConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
+        let err = SessionConfig::builder()
+            .app_namespace("trawl")
+            .post_login_redirect("home")
+            .build()
+            .unwrap_err();
         assert!(
             matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("post_login_redirect"))
         );
@@ -831,12 +971,11 @@ mod tests {
 
     #[test]
     fn session_config_rejects_protocol_relative_redirect() {
-        let cfg = SessionConfig {
-            post_login_redirect: "//evil.example.com/path".to_owned(),
-            app_namespace: "trawl".to_owned(),
-            ..SessionConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
+        let err = SessionConfig::builder()
+            .app_namespace("trawl")
+            .post_login_redirect("//evil.example.com/path")
+            .build()
+            .unwrap_err();
         assert!(matches!(err, crate::AuthError::InvalidApp(m) if m.contains("protocol-relative")));
     }
 
@@ -844,12 +983,11 @@ mod tests {
     fn session_config_rejects_backslash_protocol_relative_redirect() {
         // Chrome/Firefox normalise `\` → `/`, so /\evil.com is read as //evil.com.
         for bad in ["/\\evil.example.com/path", "/\\\\evil.example.com"] {
-            let cfg = SessionConfig {
-                post_login_redirect: (*bad).to_owned(),
-                app_namespace: "trawl".to_owned(),
-                ..SessionConfig::default()
-            };
-            let err = cfg.validate().unwrap_err();
+            let err = SessionConfig::builder()
+                .app_namespace("trawl")
+                .post_login_redirect(bad)
+                .build()
+                .unwrap_err();
             assert!(
                 matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("protocol-relative")),
                 "expected protocol-relative rejection for {bad:?}, got {err:?}"
@@ -860,12 +998,11 @@ mod tests {
     #[test]
     fn session_config_rejects_crlf_in_redirect() {
         for bad in ["/ok\r\nX-Injected: 1", "/ok\nfoo", "/ok\0foo", "/ok\x7f"] {
-            let cfg = SessionConfig {
-                post_login_redirect: bad.to_owned(),
-                app_namespace: "trawl".to_owned(),
-                ..SessionConfig::default()
-            };
-            let err = cfg.validate().unwrap_err();
+            let err = SessionConfig::builder()
+                .app_namespace("trawl")
+                .post_login_redirect(bad)
+                .build()
+                .unwrap_err();
             assert!(
                 matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("control")),
                 "expected control-char rejection for {bad:?}, got {err:?}"
@@ -875,16 +1012,26 @@ mod tests {
 
     #[test]
     fn session_config_rejects_samesite_none_without_secure() {
-        let cfg = SessionConfig {
-            secure: false,
-            same_site: cookie::SameSite::None,
-            app_namespace: "trawl".to_owned(),
-            ..SessionConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
+        let err = SessionConfig::builder()
+            .app_namespace("trawl")
+            .secure(false)
+            .same_site(cookie::SameSite::None)
+            .build()
+            .unwrap_err();
         assert!(
             matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("SameSite=None")),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn session_config_no_domain_clears_domain_setter() {
+        let cfg = SessionConfig::builder()
+            .app_namespace("trawl")
+            .domain("fleet.home.lan")
+            .no_domain()
+            .build()
+            .unwrap();
+        assert!(cfg.domain().is_none());
     }
 }
