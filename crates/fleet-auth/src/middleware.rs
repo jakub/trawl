@@ -133,6 +133,7 @@ pub async fn require_session(
     };
 
     let Ok(payload) = session::decrypt(&state.session_key, cookie_value) else {
+        tracing::warn!("auth: session decrypt failed (tampered or wrong key)");
         return unauthorized_json("invalid session");
     };
 
@@ -142,10 +143,16 @@ pub async fn require_session(
     }
 
     let Ok(verified) = state.store.verify_key(payload.token.as_str()).await else {
+        tracing::warn!("auth: session verify_key failed (revoked or invalid)");
         return unauthorized_json("invalid session");
     };
 
     if verified.role_for(&state.config.app_namespace).is_none() {
+        tracing::info!(
+            app = %state.config.app_namespace,
+            name = %verified.name,
+            "auth: session valid but no grant in app namespace (403 no-grant)"
+        );
         return no_grant_response(&verified.name, &state.config.app_namespace);
     }
 
@@ -159,20 +166,32 @@ pub async fn require_session(
 /// `KeyStore::verify_key` → insert [`VerifiedKey`] into request extensions
 /// → call inner.
 ///
-/// Does NOT check namespace grants — bearer service principals legitimately
-/// span apps, and the no-grant 403 HTML page is a UI affordance that
-/// doesn't apply to API clients. Apps gate further with their own role
-/// guards on top.
+/// # Important — does NOT check the app namespace grant
+///
+/// Unlike [`require_session`], this layer accepts *any* verified key
+/// regardless of which app(s) the key has grants in. This is intentional
+/// (ADR-0030: cross-app service principals must be able to call API
+/// routes), but it means **mounting this layer on a route is NOT
+/// sufficient authorisation** — every consumer MUST also gate the route
+/// with its own role guard that inspects `verified.role_for(app)` and
+/// rejects requests without a grant.
+///
+/// In other words: this middleware authenticates, it does not authorise.
+/// Forgetting the role guard on a downstream route accepts any valid
+/// fleet token from any sibling app. The integration test
+/// `bearer_does_not_enforce_namespace` locks this behaviour in.
 pub async fn require_bearer(
     State(state): State<SessionState>,
     mut req: Request,
     next: Next,
 ) -> Response {
     let Some(token) = extract_bearer(req.headers()) else {
+        tracing::warn!("auth: missing or malformed bearer header");
         return unauthorized_json("missing or malformed bearer token");
     };
 
-    let Ok(verified) = state.store.verify_key(&token).await else {
+    let Ok(verified) = state.store.verify_key(token).await else {
+        tracing::warn!("auth: bearer verify_key failed");
         return unauthorized_json("invalid bearer token");
     };
 
@@ -182,36 +201,40 @@ pub async fn require_bearer(
 
 /// Parse a Cookie header and return the value of `name`, or None if absent.
 ///
-/// Handles the standard `name1=v1; name2=v2; name3=v3` form. No
-/// URL-decoding — session cookie values are base64url, which is cookie-safe.
+/// Returns the LAST match (not the first) when the same name appears more
+/// than once. RFC 6265 §5.4 sends more-specific cookies later in the header,
+/// so the last value is the one that wins for the most-specific scope. This
+/// also defangs the trivial "send a junk earlier cookie with the same name"
+/// trick — the legitimate path-scoped cookie always trumps it.
+///
+/// No URL-decoding — session cookie values are base64url, which is
+/// cookie-safe.
 fn find_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    let mut found = None;
     for pair in header.split(';') {
         let pair = pair.trim();
         if let Some((k, v)) = pair.split_once('=')
             && k == name
         {
-            return Some(v);
+            found = Some(v);
         }
     }
-    None
+    found
 }
 
 /// Extract the token from an `Authorization: Bearer <token>` header.
 ///
 /// Case-insensitive on the scheme name (RFC 7235 §2.1). Rejects empty
-/// tokens and any non-Bearer scheme.
-fn extract_bearer(headers: &HeaderMap<HeaderValue>) -> Option<String> {
+/// tokens and any non-Bearer scheme. Borrows from the header — no
+/// per-request alloc on the bearer hot path.
+fn extract_bearer(headers: &HeaderMap<HeaderValue>) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {
         return None;
     }
     let token = token.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_owned())
-    }
+    if token.is_empty() { None } else { Some(token) }
 }
 
 /// Build a small `{"error": ..., "detail": ...}` JSON body for an error
@@ -305,19 +328,19 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer flt_tok"),
         );
-        assert_eq!(extract_bearer(&h), Some("flt_tok".to_owned()));
+        assert_eq!(extract_bearer(&h), Some("flt_tok"));
 
         h.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("bearer flt_tok"),
         );
-        assert_eq!(extract_bearer(&h), Some("flt_tok".to_owned()));
+        assert_eq!(extract_bearer(&h), Some("flt_tok"));
 
         h.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("BEARER flt_tok"),
         );
-        assert_eq!(extract_bearer(&h), Some("flt_tok".to_owned()));
+        assert_eq!(extract_bearer(&h), Some("flt_tok"));
     }
 
     #[test]

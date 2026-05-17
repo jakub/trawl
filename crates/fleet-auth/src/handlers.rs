@@ -134,6 +134,17 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
 /// Always returns 204 with a `Set-Cookie` clear directive — never errors,
 /// never requires a valid session (logout works even with a stale cookie).
 /// Attributes match what login sets so browsers accept the clear.
+///
+/// # CSRF caveat
+///
+/// This handler does NOT perform CSRF / origin validation. Because the
+/// `fleet_session` cookie is shared across sibling apps under a parent
+/// domain, a forged cross-site POST to any app's logout endpoint can clear
+/// the shared cookie and sign the user out of every sibling app
+/// (annoyance, not data loss). Consumers wiring this route on a
+/// browser-facing surface SHOULD layer a CSRF token check or
+/// Origin/Referer validation in front. The library does not enforce one
+/// because there is no CSRF infrastructure shared across fleet apps yet.
 pub async fn logout(State(state): State<SessionState>) -> Response {
     let cfg = state.config();
     let cookie_header = build_clear_cookie_header(
