@@ -487,13 +487,19 @@ pg_test!(
 
 pg_test!(
     session_state_rejects_invalid_config,
-    |store: KeyStore| async move {
-        let bad_config = Arc::new(SessionConfig {
-            cookie_name: String::new(), // empty — must reject
-            ..SessionConfig::default()
-        });
-        let session_key = Arc::new(SessionKey::generate());
-        let err = SessionState::new(store, session_key, bad_config).unwrap_err();
+    |_store: KeyStore| async move {
+        // After the I4 lockdown, external code can't construct an
+        // invalid SessionConfig — `#[non_exhaustive]` and `pub(crate)`
+        // fields force every external value through
+        // `SessionConfig::builder().build()`, which validates first.
+        // Verify the builder itself rejects an empty cookie name so the
+        // chokepoint that previously sat in SessionState::new is still
+        // observable to consumers.
+        let err = SessionConfig::builder()
+            .cookie_name("")
+            .app_namespace("trawl")
+            .build()
+            .unwrap_err();
         assert!(matches!(err, fleet_auth::AuthError::InvalidApp(_)));
     }
 );

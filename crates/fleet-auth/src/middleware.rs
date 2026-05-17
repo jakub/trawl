@@ -128,7 +128,7 @@ pub async fn require_session(
         return unauthorized_json("missing session cookie");
     };
 
-    let Some(cookie_value) = find_cookie(cookie_header, &state.config.cookie_name) else {
+    let Some(cookie_value) = find_cookie(cookie_header, state.config.cookie_name()) else {
         return unauthorized_json("missing session cookie");
     };
 
@@ -152,13 +152,13 @@ pub async fn require_session(
         Err(err) => return classify_verify_error(err, "session"),
     };
 
-    if verified.role_for(&state.config.app_namespace).is_none() {
+    if verified.role_for(state.config.app_namespace()).is_none() {
         tracing::info!(
-            app = %state.config.app_namespace,
+            app = state.config.app_namespace(),
             name = %verified.name,
             "auth: session valid but no grant in app namespace (403 no-grant)"
         );
-        return no_grant_response(&verified.name, &state.config.app_namespace);
+        return no_grant_response(&verified.name, state.config.app_namespace());
     }
 
     req.extensions_mut().insert(verified);
