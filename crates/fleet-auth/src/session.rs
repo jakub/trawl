@@ -388,7 +388,10 @@ pub fn is_expired(payload: &SessionPayload, now: i64) -> bool {
 }
 
 /// Serde adapter so `Zeroizing<String>` round-trips as a plain JSON string.
-mod zeroizing_string {
+///
+/// `pub(crate)` so other modules in the crate (notably `handlers::LoginRequest`)
+/// can reuse the same `deserialize_with` adapter rather than duplicating it.
+pub(crate) mod zeroizing_string {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use zeroize::Zeroizing;
 

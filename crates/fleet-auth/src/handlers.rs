@@ -31,9 +31,9 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::middleware::{SessionState, no_grant_response, unauthorized_json};
+use crate::middleware::{SessionState, error_response, no_grant_response, unauthorized_json};
 use crate::session::{
-    self, SessionPayload, build_clear_cookie_header, build_session_cookie_header,
+    self, SessionPayload, build_clear_cookie_header, build_session_cookie_header, zeroizing_string,
 };
 
 /// `POST /login` request body.
@@ -43,7 +43,7 @@ use crate::session::{
 /// error path.
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
-    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    #[serde(with = "zeroizing_string")]
     pub api_key: Zeroizing<String>,
 }
 
@@ -68,12 +68,11 @@ pub struct LoginResponse {
 pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginRequest>) -> Response {
     let api_key = req.api_key;
     if api_key.trim().is_empty() {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "application/json")],
-            r#"{"error":"bad_request","detail":"api_key is required"}"#,
-        )
-            .into_response();
+            "bad_request",
+            "api_key is required",
+        );
     }
 
     let Ok(verified) = state.store().verify_key(api_key.as_str()).await else {
@@ -154,19 +153,5 @@ pub async fn logout(State(state): State<SessionState>) -> Response {
 }
 
 fn internal_error(detail: &str) -> Response {
-    let body = format!(r#"{{"error":"internal","detail":"{detail}"}}"#);
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response()
-}
-
-fn deserialize_zeroizing_string<'de, D>(d: D) -> Result<Zeroizing<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(d)?;
-    Ok(Zeroizing::new(s))
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", detail)
 }
