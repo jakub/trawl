@@ -57,6 +57,7 @@ session = [
     "dep:chacha20poly1305",
     "dep:chrono",
     "dep:cookie",
+    "dep:rand",
     "dep:serde_json",
 ]
 # Axum middleware (RequireSession, RequireBearer) + login/logout handler

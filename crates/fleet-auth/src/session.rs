@@ -19,10 +19,9 @@ use std::fs;
 use std::path::Path;
 
 use base64ct::{Base64, Base64Unpadded, Base64Url, Base64UrlUnpadded, Encoding};
-use chacha20poly1305::{
-    KeyInit, XChaCha20Poly1305, XNonce,
-    aead::{Aead, OsRng, rand_core::RngCore},
-};
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -64,8 +63,12 @@ pub enum SessionError {
     #[error("cookie AEAD verification failed (tampered or wrong key)")]
     Aead,
 
+    /// JSON serialise/deserialise failure. Carries the error as `String`
+    /// rather than `serde_json::Error` so the public API doesn't leak the
+    /// underlying codec — swapping to a different framing later wouldn't
+    /// be a SemVer break.
     #[error("cookie JSON payload malformed: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(String),
 
     #[error("session expired")]
     Expired,
@@ -332,7 +335,7 @@ pub fn build_clear_cookie_header(
 /// payloads) or `Aead` if the AEAD primitive refuses to encrypt (also
 /// effectively never).
 pub fn encrypt(key: &SessionKey, payload: &SessionPayload) -> Result<String, SessionError> {
-    let plaintext = serde_json::to_vec(payload)?;
+    let plaintext = serde_json::to_vec(payload).map_err(|e| SessionError::Json(e.to_string()))?;
 
     let cipher = XChaCha20Poly1305::new(key.0.as_ref().into());
 
@@ -374,7 +377,8 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
         .decrypt(nonce, ciphertext)
         .map_err(|_| SessionError::Aead)?;
 
-    let payload: SessionPayload = serde_json::from_slice(&plaintext)?;
+    let payload: SessionPayload =
+        serde_json::from_slice(&plaintext).map_err(|e| SessionError::Json(e.to_string()))?;
     Ok(payload)
 }
 

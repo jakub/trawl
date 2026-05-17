@@ -43,6 +43,10 @@ pub use session::{
     SessionKey, SessionPayload, build_clear_cookie_header, build_session_cookie_header, decrypt,
     encrypt, is_expired,
 };
+// Re-export `cookie::SameSite` so consumers don't need to add `cookie` as a
+// direct dep just to populate `SessionConfig.same_site`.
+#[cfg(feature = "session")]
+pub use cookie::SameSite;
 
 #[cfg(feature = "axum")]
 pub use handlers::{LoginRequest, LoginResponse, login, logout};
