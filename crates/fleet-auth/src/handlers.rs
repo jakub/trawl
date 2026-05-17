@@ -31,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::middleware::{SessionState, error_response, no_grant_response, unauthorized_json};
+use crate::middleware::{SessionState, classify_verify_error, error_response, no_grant_response};
 use crate::session::{
     self, SessionPayload, build_clear_cookie_header, build_session_cookie_header, zeroizing_string,
 };
@@ -75,8 +75,9 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
         );
     }
 
-    let Ok(verified) = state.store().verify_key(api_key.as_str()).await else {
-        return unauthorized_json("invalid api key");
+    let verified = match state.store().verify_key(api_key.as_str()).await {
+        Ok(v) => v,
+        Err(err) => return classify_verify_error(err, "login"),
     };
 
     let cfg = state.config();
@@ -87,8 +88,16 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
     }
 
     let now = chrono::Utc::now().timestamp();
-    let Ok(ttl) = i64::try_from(cfg.ttl_secs) else {
-        return internal_error("session ttl_secs out of i64 range");
+    let ttl = match i64::try_from(cfg.ttl_secs) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                ttl_secs = cfg.ttl_secs,
+                ?err,
+                "login: ttl_secs out of i64 range"
+            );
+            return internal_error("session ttl_secs out of i64 range");
+        }
     };
     let payload = SessionPayload {
         token: api_key,
@@ -96,8 +105,12 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
         exp: now.saturating_add(ttl),
     };
 
-    let Ok(cookie_value) = session::encrypt(state.session_key(), &payload) else {
-        return internal_error("session encrypt failed");
+    let cookie_value = match session::encrypt(state.session_key(), &payload) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, "login: session encrypt failed");
+            return internal_error("session encrypt failed");
+        }
     };
 
     let cookie_header = build_session_cookie_header(
@@ -110,12 +123,24 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
     );
 
     let mut headers = HeaderMap::new();
-    let Ok(set_cookie) = cookie_header.parse() else {
-        return internal_error("session cookie header value invalid");
+    let set_cookie = match cookie_header.parse() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, "login: session cookie header value invalid");
+            return internal_error("session cookie header value invalid");
+        }
     };
     headers.insert(header::SET_COOKIE, set_cookie);
-    let Ok(location) = cfg.post_login_redirect.parse() else {
-        return internal_error("post_login_redirect not a valid header value");
+    let location = match cfg.post_login_redirect.parse() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                redirect = %cfg.post_login_redirect,
+                ?err,
+                "login: post_login_redirect not a valid header value"
+            );
+            return internal_error("post_login_redirect not a valid header value");
+        }
     };
     headers.insert(header::LOCATION, location);
 
@@ -155,8 +180,12 @@ pub async fn logout(State(state): State<SessionState>) -> Response {
     );
 
     let mut headers = HeaderMap::new();
-    let Ok(set_cookie) = cookie_header.parse() else {
-        return internal_error("clear cookie header value invalid");
+    let set_cookie = match cookie_header.parse() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, "logout: clear cookie header value invalid");
+            return internal_error("clear cookie header value invalid");
+        }
     };
     headers.insert(header::SET_COOKIE, set_cookie);
 

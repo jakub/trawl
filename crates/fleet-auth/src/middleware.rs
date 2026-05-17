@@ -139,12 +139,13 @@ pub async fn require_session(
 
     let now = chrono::Utc::now().timestamp();
     if session::is_expired(&payload, now) {
+        tracing::info!(exp = payload.exp, now, "auth: session expired");
         return unauthorized_json("session expired");
     }
 
-    let Ok(verified) = state.store.verify_key(payload.token.as_str()).await else {
-        tracing::warn!("auth: session verify_key failed (revoked or invalid)");
-        return unauthorized_json("invalid session");
+    let verified = match state.store.verify_key(payload.token.as_str()).await {
+        Ok(v) => v,
+        Err(err) => return classify_verify_error(err, "session"),
     };
 
     if verified.role_for(&state.config.app_namespace).is_none() {
@@ -190,9 +191,9 @@ pub async fn require_bearer(
         return unauthorized_json("missing or malformed bearer token");
     };
 
-    let Ok(verified) = state.store.verify_key(token).await else {
-        tracing::warn!("auth: bearer verify_key failed");
-        return unauthorized_json("invalid bearer token");
+    let verified = match state.store.verify_key(token).await {
+        Ok(v) => v,
+        Err(err) => return classify_verify_error(err, "bearer"),
     };
 
     req.extensions_mut().insert(verified);
@@ -249,6 +250,74 @@ pub(crate) fn error_response(status: StatusCode, kind: &str, detail: &str) -> Re
 
 pub(crate) fn unauthorized_json(message: &str) -> Response {
     error_response(StatusCode::UNAUTHORIZED, "unauthorized", message)
+}
+
+/// 503 Service Unavailable for transient backend failures in the auth path.
+///
+/// Distinct from 401 so operators can alarm separately on "auth backend
+/// down" vs "wrong credentials" — collapsing the two during a Postgres
+/// blip used to send on-call hunting for a brute-force attack while the
+/// DB was actually just rebooting. Paired with `tracing::error!(target:
+/// "auth.backend", ...)` at the call site for filterable alerting.
+pub(crate) fn service_unavailable_json(detail: &str) -> Response {
+    error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", detail)
+}
+
+/// Classify a [`KeyStore::verify_key`] failure into the right HTTP response.
+///
+/// Centralised so the three auth paths (session, bearer, login) agree on
+/// status codes + tracing targets:
+///
+/// - `Database` / `Migration` / `Hash` / `TokenGeneration` → 503 with
+///   `tracing::error!(target: "auth.backend", ...)`, so operators can
+///   alarm on backend health independently of 401 spikes.
+/// - `InvalidKey` / `MalformedToken` → 401 with `tracing::warn!` —
+///   legitimate auth failure.
+/// - Anything else → 500 + `tracing::error!`. Shouldn't happen in this
+///   call path (`verify_key` doesn't produce admin-only variants), so a
+///   loud signal beats a silent one.
+///
+/// `path` is a short tag ("session", "bearer", "login") that gets folded
+/// into the log line so the same KDF panic looks different depending on
+/// which surface it hit.
+pub(crate) fn classify_verify_error(err: AuthError, path: &str) -> Response {
+    match err {
+        AuthError::Database(err) => {
+            tracing::error!(target: "auth.backend", %path, ?err, "auth: db error");
+            service_unavailable_json("auth backend unavailable")
+        }
+        AuthError::Migration(err) => {
+            tracing::error!(target: "auth.backend", %path, ?err, "auth: migration error");
+            service_unavailable_json("auth backend unavailable")
+        }
+        AuthError::Hash(err) => {
+            tracing::error!(target: "auth.backend", %path, err, "auth: hash worker failed");
+            service_unavailable_json("auth backend unavailable")
+        }
+        AuthError::TokenGeneration(err) => {
+            tracing::error!(target: "auth.backend", %path, err, "auth: token generation exhausted");
+            service_unavailable_json("auth backend unavailable")
+        }
+        err @ (AuthError::InvalidKey(_) | AuthError::MalformedToken(_)) => {
+            tracing::warn!(%path, ?err, "auth: invalid or revoked key");
+            let detail = if path == "bearer" {
+                "invalid bearer token"
+            } else if path == "login" {
+                "invalid api key"
+            } else {
+                "invalid session"
+            };
+            unauthorized_json(detail)
+        }
+        err => {
+            tracing::error!(%path, ?err, "auth: unexpected verify_key error");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "auth check failed",
+            )
+        }
+    }
 }
 
 /// Build the no-grant 403 HTML body.
