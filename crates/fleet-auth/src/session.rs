@@ -145,6 +145,51 @@ impl std::fmt::Debug for SessionKey {
     }
 }
 
+/// Absolute unix-second expiry timestamp.
+///
+/// Newtype around the raw second count so callers can't accidentally mix
+/// seconds with milliseconds — the `coastwatch-web` consumer is the
+/// second to use this module and one stray `.timestamp_millis()` would
+/// produce sessions that live 1000× too long without any compile-time
+/// or runtime signal.
+///
+/// `#[serde(transparent)]` keeps the on-the-wire shape a bare integer
+/// so existing encrypted cookies still decrypt unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionExpiry(i64);
+
+impl SessionExpiry {
+    /// Construct from an absolute unix-second timestamp.
+    #[must_use]
+    pub const fn from_unix_seconds(secs: i64) -> Self {
+        Self(secs)
+    }
+
+    /// `now + duration_secs`, saturating on overflow.
+    #[must_use]
+    pub const fn after_duration(now: i64, duration_secs: i64) -> Self {
+        Self(now.saturating_add(duration_secs))
+    }
+
+    /// As a raw unix-second timestamp (for serialisation, comparisons,
+    /// or tracing field formatting).
+    #[must_use]
+    pub const fn as_unix_seconds(self) -> i64 {
+        self.0
+    }
+
+    /// Has this expiry passed at `now`?
+    ///
+    /// Uses `<` (strictly earlier) so the cookie is valid up to and
+    /// *including* the `exp` second — see [`is_expired`] for the
+    /// boundary rationale.
+    #[must_use]
+    pub const fn is_past(self, now: i64) -> bool {
+        self.0 < now
+    }
+}
+
 /// Plaintext payload stored inside an encrypted session cookie.
 ///
 /// App-agnostic per ADR-0030: `role` is *not* in the payload — each app
@@ -166,7 +211,7 @@ pub struct SessionPayload {
     pub name: String,
 
     /// Absolute unix-second expiry timestamp.
-    pub exp: i64,
+    pub exp: SessionExpiry,
 }
 
 impl std::fmt::Debug for SessionPayload {
@@ -453,7 +498,7 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
 /// so middleware can decide once-per-request what "now" means.
 #[must_use]
 pub fn is_expired(payload: &SessionPayload, now: i64) -> bool {
-    payload.exp < now
+    payload.exp.is_past(now)
 }
 
 /// Serde adapter so `Zeroizing<String>` round-trips as a plain JSON string.
@@ -482,7 +527,7 @@ mod tests {
         SessionPayload {
             token: Zeroizing::new("flt_testtoken123".to_string()),
             name: "alice".to_string(),
-            exp: 1_700_000_000,
+            exp: SessionExpiry::from_unix_seconds(1_700_000_000),
         }
     }
 
@@ -496,7 +541,7 @@ mod tests {
 
         assert_eq!(decoded.token.as_str(), "flt_testtoken123");
         assert_eq!(decoded.name, "alice");
-        assert_eq!(decoded.exp, 1_700_000_000);
+        assert_eq!(decoded.exp.as_unix_seconds(), 1_700_000_000);
     }
 
     #[test]
@@ -556,7 +601,7 @@ mod tests {
     #[test]
     fn expired_detected() {
         let payload = SessionPayload {
-            exp: 100,
+            exp: SessionExpiry::from_unix_seconds(100),
             ..sample_payload()
         };
         assert!(is_expired(&payload, 200));
@@ -565,6 +610,27 @@ mod tests {
         // doc comment). The cookie is valid up to and including `exp`.
         assert!(!is_expired(&payload, 100));
         assert!(is_expired(&payload, 101));
+    }
+
+    #[test]
+    fn session_expiry_after_duration_saturates() {
+        // Headroom enough that i64::MAX is well past any realistic ttl,
+        // but assert saturation explicitly so a future refactor can't
+        // sneak in a panic on overflow.
+        let expiry = SessionExpiry::after_duration(i64::MAX - 5, 100);
+        assert_eq!(expiry.as_unix_seconds(), i64::MAX);
+    }
+
+    #[test]
+    fn session_expiry_serde_is_bare_integer() {
+        // #[serde(transparent)] keeps the wire format a bare i64, so
+        // SessionPayload JSON shape stays back-compatible with cookies
+        // written by earlier builds.
+        let expiry = SessionExpiry::from_unix_seconds(1_700_000_000);
+        let json = serde_json::to_string(&expiry).unwrap();
+        assert_eq!(json, "1700000000");
+        let back: SessionExpiry = serde_json::from_str("1700000000").unwrap();
+        assert_eq!(back, expiry);
     }
 
     #[test]

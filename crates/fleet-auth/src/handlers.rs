@@ -33,7 +33,8 @@ use zeroize::Zeroizing;
 
 use crate::middleware::{SessionState, classify_verify_error, error_response, no_grant_response};
 use crate::session::{
-    self, SessionPayload, build_clear_cookie_header, build_session_cookie_header, zeroizing_string,
+    self, SessionExpiry, SessionPayload, build_clear_cookie_header, build_session_cookie_header,
+    zeroizing_string,
 };
 
 /// `POST /login` request body.
@@ -102,7 +103,7 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
     let payload = SessionPayload {
         token: api_key,
         name: verified.name.clone(),
-        exp: now.saturating_add(ttl),
+        exp: SessionExpiry::after_duration(now, ttl),
     };
 
     let cookie_value = match session::encrypt(state.session_key(), &payload) {
