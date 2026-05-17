@@ -149,16 +149,22 @@ pub fn parse_grant(s: &str) -> Result<RoleAssignment, AdminError> {
     })
 }
 
-/// Render assignments as `"app1:role1, app2:role2"`, or `"(none)"` if empty.
+/// Render assignments as `"app1:role1, app2:role2"`, sorted by app, or
+/// `"(none)"` if empty.
 ///
 /// CLI-output flavour of [`fleet_auth::format_assignments`] — that one uses
 /// `"none"` and comma-without-space for log fields, this one uses
-/// `"(none)"` and comma-space for human reading.
+/// `"(none)"` and comma-space for human reading. Sort matches fleet-auth's
+/// for deterministic table output even when callers hand us an unsorted
+/// slice (fleet-auth's `load_assignments` already orders by app, but
+/// belt-and-braces keeps snapshot tests stable).
 fn format_assignments(assignments: &[RoleAssignment]) -> String {
     if assignments.is_empty() {
         return "(none)".to_owned();
     }
-    assignments
+    let mut sorted: Vec<&RoleAssignment> = assignments.iter().collect();
+    sorted.sort_by(|a, b| a.app.cmp(&b.app));
+    sorted
         .iter()
         .map(|a| format!("{}:{}", a.app, a.role))
         .collect::<Vec<_>>()
@@ -221,11 +227,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, AdminError> {
     }
 
     let s = s.trim();
-    if s.is_empty() {
-        return Err(AdminError::Arg("empty duration string".into()));
-    }
-
-    let (num_str, unit) = s.split_at(s.len() - 1);
+    // `split_at` takes a BYTE index — slicing at `s.len() - 1` on a
+    // multi-byte trailing char would panic on a non-char-boundary. Walk
+    // the chars and slice on the codepoint start instead.
+    let last_char_start = s
+        .char_indices()
+        .next_back()
+        .ok_or_else(|| AdminError::Arg("empty duration string".into()))?
+        .0;
+    let (num_str, unit) = s.split_at(last_char_start);
     if num_str.is_empty() {
         return Err(AdminError::Arg(format!(
             "missing numeric value in duration: {s}"
@@ -334,6 +344,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_multibyte_trailing_char_doesnt_panic() {
+        // `日` is 3 bytes — naive `split_at(len-1)` would panic on a
+        // non-char-boundary. Must come back as a clean Arg error instead.
+        let err = parse_duration("90日").unwrap_err().to_string();
+        assert!(err.contains("unknown duration unit"), "got: {err}");
+    }
+
+    #[test]
+    fn format_assignments_sorts_by_app() {
+        let unsorted = vec![
+            grant_for("zebra", "ro"),
+            grant_for("alpha", "rw"),
+            grant_for("mango", "admin"),
+        ];
+        assert_eq!(
+            format_assignments(&unsorted),
+            "alpha:rw, mango:admin, zebra:ro"
+        );
+    }
+
+    #[test]
     fn parse_duration_rejects_never_literal() {
         let err = parse_duration("never").unwrap_err().to_string();
         assert!(err.contains("omitting --expires"), "got: {err}");
@@ -418,6 +449,7 @@ mod tests {
     fn format_assignments_renders_or_falls_back() {
         assert_eq!(format_assignments(&[]), "(none)");
         let a = vec![grant_for("trawl", "admin"), grant_for("cw", "ro")];
-        assert_eq!(format_assignments(&a), "trawl:admin, cw:ro");
+        // Sorted by app — see [`format_assignments`].
+        assert_eq!(format_assignments(&a), "cw:ro, trawl:admin");
     }
 }

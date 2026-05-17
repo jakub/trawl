@@ -105,23 +105,19 @@ async fn main() {
 }
 
 async fn run() -> Result<(), AdminError> {
-    let cli = Cli::parse();
-
-    // `generate-session-key` is the only subcommand that doesn't need the
-    // database — and operationally must work BEFORE the DB exists, since it
-    // produces the key the server is then deployed with. Short-circuit
-    // before pool construction so a missing `DATABASE_URL` isn't an error
-    // here.
-    if matches!(cli.command, Command::GenerateSessionKey) {
-        return commands::session_key::run();
-    }
-
-    let pool = connect_pool().await?;
-
-    match cli.command {
-        Command::GenerateSessionKey => unreachable!("handled above"),
-        Command::Migrate => commands::migrate::run(&pool).await,
-        Command::Keys { action } => dispatch_keys(KeyStore::from_pool(pool), action).await,
+    match Cli::parse().command {
+        // Skip pool construction — `generate-session-key` must work before
+        // the database exists, since it produces the key the server is
+        // deployed with.
+        Command::GenerateSessionKey => commands::session_key::run(),
+        Command::Migrate => {
+            let pool = connect_pool().await?;
+            commands::migrate::run(&pool).await
+        }
+        Command::Keys { action } => {
+            let pool = connect_pool().await?;
+            dispatch_keys(KeyStore::from_pool(pool), action).await
+        }
     }
 }
 
