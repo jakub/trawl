@@ -22,12 +22,22 @@ pub mod store;
 #[cfg(feature = "keystore")]
 pub mod token;
 
+#[cfg(feature = "session")]
+pub mod session;
+
 #[cfg(feature = "keystore")]
 pub use cache::{VerificationCache, VerificationCacheKey, VerificationCacheStats};
 #[cfg(feature = "keystore")]
 pub use migrations::MIGRATOR;
 #[cfg(feature = "keystore")]
 pub use store::KeyStore;
+
+#[cfg(feature = "session")]
+pub use session::{
+    DEFAULT_COOKIE_NAME, DEFAULT_TTL_SECS, KEY_LEN, NONCE_LEN, SessionConfig, SessionError,
+    SessionKey, SessionPayload, build_clear_cookie_header, build_session_cookie_header, decrypt,
+    encrypt, is_expired,
+};
 
 pub use error::AuthError;
 pub use types::{
