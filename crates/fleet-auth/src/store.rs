@@ -285,36 +285,30 @@ impl KeyStore {
             return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
-        // Conditional UPDATE doubles as a TOCTOU recheck: if the key was
-        // revoked / expired between the initial SELECT and now (e.g.
-        // during a ~200 ms argon2id run on cache miss), zero rows update
-        // and we reject opaquely.
+        // The UPDATE both rechecks liveness and locks the api_keys row until
+        // commit. Grant/revoke operations lock the same row before mutating
+        // assignments, so the assignment SELECT below observes a grant set
+        // that cannot change underneath this in-flight verify.
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx_core::query::query(
             "UPDATE api_keys
              SET last_used = NOW()
              WHERE id = $1
                AND active = TRUE
-               AND (expires_at IS NULL OR expires_at > NOW())",
+               AND (expires_at IS NULL OR expires_at > NOW())
+             RETURNING id",
         )
         .bind(id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        .fetch_optional(&mut *tx)
+        .await?;
 
-        if updated == 0 {
+        if updated.is_none() {
             return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
         // Load assignments fresh from the DB — never cache them.
-        //
-        // Note on consistency: a `grant_assignment` / `revoke_assignment`
-        // racing between the UPDATE above and this SELECT will leave the
-        // in-flight verify returning the pre-race assignment set. The next
-        // verify after both operations complete sees the fresh state. At
-        // fleet scale this microsecond-wide window is acceptable; future
-        // hardening would lock the api_keys row (SELECT FOR UPDATE) in a
-        // single transaction spanning UPDATE + SELECT + grant operations.
-        let assignments = self.load_assignments(id).await?;
+        let assignments = Self::load_assignments_in_tx(&mut tx, id).await?;
+        tx.commit().await?;
 
         let kind: PrincipalKind = kind_str.parse()?;
 
@@ -341,6 +335,31 @@ impl KeyStore {
         )
         .bind(key_id)
         .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(RoleAssignment {
+                    app: row.try_get("app")?,
+                    role: row.try_get("role")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Load all `(app, role)` grants within an existing transaction.
+    async fn load_assignments_in_tx(
+        tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+        key_id: i64,
+    ) -> Result<Vec<RoleAssignment>, AuthError> {
+        let rows = sqlx_core::query::query(
+            "SELECT app, role
+             FROM api_key_role_assignment
+             WHERE key_id = $1
+             ORDER BY app",
+        )
+        .bind(key_id)
+        .fetch_all(&mut **tx)
         .await?;
 
         rows.into_iter()
@@ -437,7 +456,8 @@ impl KeyStore {
         assignment: &RoleAssignment,
     ) -> Result<(), AuthError> {
         validate_assignment(assignment)?;
-        let key_id = self.get_key_id_by_prefix(prefix).await?;
+        let mut tx = self.pool.begin().await?;
+        let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
 
         let result = sqlx_core::query::query(
             "INSERT INTO api_key_role_assignment (key_id, app, role)
@@ -446,11 +466,12 @@ impl KeyStore {
         .bind(key_id)
         .bind(&assignment.app)
         .bind(&assignment.role)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
 
         match result {
             Ok(_) => {
+                tx.commit().await?;
                 tracing::info!(
                     event_type = "grant_added",
                     prefix,
@@ -476,14 +497,15 @@ impl KeyStore {
     /// silently succeeding would mask typos.
     pub async fn revoke_assignment(&self, prefix: &str, app: &str) -> Result<(), AuthError> {
         validate_app_namespace(app)?;
-        let key_id = self.get_key_id_by_prefix(prefix).await?;
+        let mut tx = self.pool.begin().await?;
+        let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
 
         let removed = sqlx_core::query::query(
             "DELETE FROM api_key_role_assignment WHERE key_id = $1 AND app = $2",
         )
         .bind(key_id)
         .bind(app)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
 
@@ -493,6 +515,8 @@ impl KeyStore {
                 app: app.to_owned(),
             });
         }
+
+        tx.commit().await?;
 
         tracing::info!(
             event_type = "grant_revoked",
@@ -564,6 +588,29 @@ impl KeyStore {
             .bind(prefix)
             .fetch_optional(&self.pool)
             .await?;
+        let Some(row) = row_opt else {
+            return Err(AuthError::KeyNotFound {
+                prefix: prefix.to_owned(),
+            });
+        };
+        Ok(row.try_get("id")?)
+    }
+
+    /// Lock the key row for the duration of assignment mutation.
+    async fn lock_key_id_by_prefix(
+        &self,
+        tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+        prefix: &str,
+    ) -> Result<i64, AuthError> {
+        let row_opt = sqlx_core::query::query(
+            "SELECT id
+             FROM api_keys
+             WHERE prefix = $1
+             FOR UPDATE",
+        )
+        .bind(prefix)
+        .fetch_optional(&mut **tx)
+        .await?;
         let Some(row) = row_opt else {
             return Err(AuthError::KeyNotFound {
                 prefix: prefix.to_owned(),

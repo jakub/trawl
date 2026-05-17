@@ -425,6 +425,65 @@ pg_test!(
     }
 );
 
+pg_test!(
+    revoke_assignment_waits_for_key_row_lock,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key(
+                "lock-step",
+                PrincipalKind::Human,
+                &[
+                    RoleAssignment {
+                        app: "trawl".into(),
+                        role: "admin".into(),
+                    },
+                    RoleAssignment {
+                        app: "coastwatch".into(),
+                        role: "siem_consumer".into(),
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // `verify_key` now holds this same row lock while it fetches
+        // assignments. Holding it manually gives the regression test a
+        // deterministic interleaving instead of hoping the scheduler lands
+        // inside a microsecond race window.
+        let mut tx = store.pool().begin().await.unwrap();
+        sqlx_core::query::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
+            .bind(created.info.id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+
+        let revoke_store = store.clone();
+        let prefix = created.info.prefix.clone();
+        let revoke =
+            tokio::spawn(
+                async move { revoke_store.revoke_assignment(&prefix, "coastwatch").await },
+            );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !revoke.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "revoke_assignment must wait for the key row lock"
+        );
+
+        tx.commit().await.unwrap();
+        revoke.await.unwrap().unwrap();
+
+        let verified = store.verify_key(&created.plaintext_token).await.unwrap();
+        assert_eq!(verified.role_for("coastwatch"), None);
+    }
+);
+
 // ---------------------------------------------------------------------------
 // admin operations
 // ---------------------------------------------------------------------------
