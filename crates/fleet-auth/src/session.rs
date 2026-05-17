@@ -194,8 +194,20 @@ impl std::fmt::Debug for SessionPayload {
 pub struct SessionConfig {
     /// Cookie name (e.g. `"fleet_session"`).
     pub cookie_name: String,
-    /// Optional `Domain=` attribute. `None` means no Domain attribute (the
-    /// browser scopes to the exact origin, correct for localhost dev).
+    /// Optional `Domain=` attribute.
+    ///
+    /// `None` (recommended for single-host deployments) scopes the cookie
+    /// to the exact origin — correct for localhost dev and single-app
+    /// hosting.
+    ///
+    /// `Some(".fleet.home.lan")` scopes to a parent domain so sibling apps
+    /// share the cookie (ADR-0030 SSO). The value MUST match (or be a
+    /// parent suffix of) the host the browser sees in the URL bar — if it
+    /// doesn't, browsers silently accept the `Set-Cookie` but refuse to
+    /// send the cookie back on subsequent requests. Symptom: users login
+    /// successfully (302 returns) and immediately get 401 on the next
+    /// request, with no server-side error to trace. Verify after first
+    /// login via browser devtools → Application → Cookies.
     pub domain: Option<String>,
     /// Session lifetime in seconds; sets cookie `Max-Age` and payload `exp`.
     pub ttl_secs: u64,

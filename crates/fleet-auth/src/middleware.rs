@@ -203,10 +203,13 @@ pub async fn require_bearer(
 /// Parse a Cookie header and return the value of `name`, or None if absent.
 ///
 /// Returns the LAST match (not the first) when the same name appears more
-/// than once. RFC 6265 §5.4 sends more-specific cookies later in the header,
-/// so the last value is the one that wins for the most-specific scope. This
-/// also defangs the trivial "send a junk earlier cookie with the same name"
-/// trick — the legitimate path-scoped cookie always trumps it.
+/// than once. RFC 6265 §5.4 doesn't fully define ordering when multiple
+/// cookies with the same name exist at different domain scopes
+/// (parent-domain vs subdomain) — browsers vary. Pick the last value as a
+/// deterministic tiebreak so behaviour is stable across clients. Practical
+/// impact is minimal because `fleet_session` is always set at `path=/` and
+/// any domain-scope collision implies a misconfigured `Domain=` attribute,
+/// which an operator should fix upstream.
 ///
 /// No URL-decoding — session cookie values are base64url, which is
 /// cookie-safe.
