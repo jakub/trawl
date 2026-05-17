@@ -1,0 +1,32 @@
+[package]
+name = "fleet-admin"
+description = "Operational CLI for the fleet keystore — migrations, session keys, API key lifecycle (ADR-0030)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fleet-admin"
+path = "src/main.rs"
+
+[dependencies]
+fleet-auth = { workspace = true, features = ["keystore", "session"] }
+chrono = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+fleet-auth = { workspace = true, features = ["keystore", "session", "fast-hash"] }
+insta = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

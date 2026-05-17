@@ -1722,6 +1722,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-admin"
+version = "0.2.2"
+dependencies = [
+ "chrono",
+ "clap",
+ "comfy-table",
+ "fleet-auth",
+ "insta",
+ "rand 0.8.5",
+ "sqlx-core",
+ "sqlx-postgres",
+ "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "fleet-auth"
 version = "0.2.2"
 dependencies = [
