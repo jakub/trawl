@@ -214,21 +214,25 @@ fn extract_bearer(headers: &HeaderMap<HeaderValue>) -> Option<String> {
     }
 }
 
-fn unauthorized_json(message: &str) -> Response {
-    let body = format!(r#"{{"error":"unauthorized","detail":"{message}"}}"#);
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response()
+/// Build a small `{"error": ..., "detail": ...}` JSON body for an error
+/// response. Uses `serde_json` so `detail` can never break JSON framing —
+/// crucial because callers pass arbitrary user-facing strings, and a future
+/// caller that forwards user-controlled bytes here would otherwise turn this
+/// into a JSON-injection footgun.
+pub(crate) fn error_response(status: StatusCode, kind: &str, detail: &str) -> Response {
+    let body = serde_json::json!({ "error": kind, "detail": detail }).to_string();
+    (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+pub(crate) fn unauthorized_json(message: &str) -> Response {
+    error_response(StatusCode::UNAUTHORIZED, "unauthorized", message)
 }
 
 /// Build the no-grant 403 HTML body.
 ///
 /// Cookie is NOT cleared (per ADR-0030: the user can navigate back to a
 /// sibling app where they DO have a grant without re-authenticating).
-fn no_grant_response(name: &str, app: &str) -> Response {
+pub(crate) fn no_grant_response(name: &str, app: &str) -> Response {
     let body = format!(
         "<!doctype html>\n\
          <html lang=\"en\"><head><meta charset=\"utf-8\">\
