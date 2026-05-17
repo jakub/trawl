@@ -286,6 +286,14 @@ fn validate_redirect_path(path: &str) -> Result<(), crate::AuthError> {
             "post_login_redirect must not be protocol-relative, got: {path}"
         )));
     }
+    // Browsers normalise `\` → `/` in URL parsing (WHATWG URL spec), so
+    // `/\evil.com/path` is interpreted as a protocol-relative redirect to
+    // evil.com. Close the gap.
+    if path.starts_with("/\\") {
+        return Err(crate::AuthError::InvalidApp(format!(
+            "post_login_redirect must not be protocol-relative (backslash-normalised), got: {path}"
+        )));
+    }
     if path
         .bytes()
         .any(|b| b == b'\r' || b == b'\n' || b == 0 || b == 0x7f)
@@ -755,6 +763,23 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, crate::AuthError::InvalidApp(m) if m.contains("protocol-relative")));
+    }
+
+    #[test]
+    fn session_config_rejects_backslash_protocol_relative_redirect() {
+        // Chrome/Firefox normalise `\` → `/`, so /\evil.com is read as //evil.com.
+        for bad in ["/\\evil.example.com/path", "/\\\\evil.example.com"] {
+            let cfg = SessionConfig {
+                post_login_redirect: (*bad).to_owned(),
+                app_namespace: "trawl".to_owned(),
+                ..SessionConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("protocol-relative")),
+                "expected protocol-relative rejection for {bad:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]
