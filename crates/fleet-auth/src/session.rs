@@ -123,8 +123,7 @@ impl SessionKey {
     }
 
     /// Load a key from a file. The file must contain exactly 32 bytes (raw,
-    /// not base64). Trailing newlines are NOT trimmed — generate keys with
-    /// `fleet-admin generate-session-key`, which writes raw bytes.
+    /// not base64). Trailing newlines are NOT trimmed.
     ///
     /// # Errors
     /// Returns `KeyFile` on IO failure or `KeyLength` if the file is the
@@ -135,6 +134,16 @@ impl SessionKey {
             .try_into()
             .map_err(|v: Vec<u8>| SessionError::KeyLength(v.len()))?;
         Ok(Self::from_bytes(arr))
+    }
+
+    /// Encode the key as base64url (no padding) — the format
+    /// [`Self::from_base64`] reads back.
+    ///
+    /// Returns a [`Zeroizing`] string so the encoded form is scrubbed from
+    /// memory when the binding goes out of scope. Print it immediately and
+    /// move on; do not stash it in a long-lived `String`.
+    pub fn to_base64url(&self) -> Zeroizing<String> {
+        Zeroizing::new(Base64UrlUnpadded::encode_string(self.0.as_ref()))
     }
 }
 
@@ -823,6 +832,24 @@ mod tests {
 
         let loaded = SessionKey::from_base64(&b64).unwrap();
 
+        let cookie = encrypt(&original, &sample_payload()).unwrap();
+        let decoded = decrypt(&loaded, &cookie).unwrap();
+        assert_eq!(decoded.name, "alice");
+    }
+
+    #[test]
+    fn to_base64url_roundtrips_through_from_base64() {
+        let original = SessionKey::generate();
+        let encoded = original.to_base64url();
+
+        // Pure base64url-no-pad — no `+`, `/`, or `=`.
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        assert!(!encoded.contains('='));
+        // 32 bytes -> ceil(32 * 4 / 3) -> 43 chars unpadded.
+        assert_eq!(encoded.len(), 43);
+
+        let loaded = SessionKey::from_base64(encoded.as_str()).unwrap();
         let cookie = encrypt(&original, &sample_payload()).unwrap();
         let decoded = decrypt(&loaded, &cookie).unwrap();
         assert_eq!(decoded.name, "alice");
