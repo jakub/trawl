@@ -386,7 +386,11 @@ pub fn build_clear_cookie_header(
 /// payloads) or `Aead` if the AEAD primitive refuses to encrypt (also
 /// effectively never).
 pub fn encrypt(key: &SessionKey, payload: &SessionPayload) -> Result<String, SessionError> {
-    let plaintext = serde_json::to_vec(payload).map_err(|e| SessionError::Json(e.to_string()))?;
+    // Wrap the serialised plaintext in Zeroizing so the bearer token bytes
+    // don't linger on the heap after the function returns (ADR-0030: treat
+    // tokens as secrets, scrub on drop).
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(payload).map_err(|e| SessionError::Json(e.to_string()))?);
 
     let cipher = XChaCha20Poly1305::new(key.0.as_ref().into());
 
@@ -395,7 +399,7 @@ pub fn encrypt(key: &SessionKey, payload: &SessionPayload) -> Result<String, Ses
     let nonce = XNonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_ref())
+        .encrypt(nonce, plaintext.as_slice())
         .map_err(|_| SessionError::Aead)?;
 
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -424,9 +428,14 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
     let nonce = XNonce::from_slice(nonce_bytes);
 
     let cipher = XChaCha20Poly1305::new(key.0.as_ref().into());
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| SessionError::Aead)?;
+    // Wrap decrypted plaintext in Zeroizing so the bearer token bytes are
+    // wiped after we parse out the SessionPayload (whose .token is itself
+    // Zeroizing<String> with the same posture).
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| SessionError::Aead)?,
+    );
 
     let payload: SessionPayload =
         serde_json::from_slice(&plaintext).map_err(|e| SessionError::Json(e.to_string()))?;
