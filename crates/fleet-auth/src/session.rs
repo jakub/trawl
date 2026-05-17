@@ -66,7 +66,7 @@ pub enum SessionError {
     /// JSON serialise/deserialise failure. Carries the error as `String`
     /// rather than `serde_json::Error` so the public API doesn't leak the
     /// underlying codec — swapping to a different framing later wouldn't
-    /// be a SemVer break.
+    /// be a semver-breaking change.
     #[error("cookie JSON payload malformed: {0}")]
     Json(String),
 
@@ -243,15 +243,46 @@ impl SessionConfig {
                 "cookie_name must not be empty".into(),
             ));
         }
-        if !self.post_login_redirect.starts_with('/') {
-            return Err(crate::AuthError::InvalidApp(format!(
-                "post_login_redirect must start with '/', got: {}",
-                self.post_login_redirect
-            )));
+        validate_redirect_path(&self.post_login_redirect)?;
+        // SameSite=None requires Secure on modern browsers; without it the
+        // cookie is silently treated as Lax (Chrome 80+) — a misconfig the
+        // caller almost certainly didn't intend. Fail fast at construction.
+        if self.same_site == cookie::SameSite::None && !self.secure {
+            return Err(crate::AuthError::InvalidApp(
+                "SameSite=None requires Secure (browsers reject otherwise)".into(),
+            ));
         }
         validate_app_namespace(&self.app_namespace)?;
         Ok(())
     }
+}
+
+/// Validate that a redirect path is safe to use in a `Location:` header.
+///
+/// Rejects:
+/// - paths that don't start with `/` (relative — wrong shape for `Location`)
+/// - protocol-relative `//host` paths (browser follows them as external)
+/// - any byte that would CRLF-inject or break header framing
+fn validate_redirect_path(path: &str) -> Result<(), crate::AuthError> {
+    if !path.starts_with('/') {
+        return Err(crate::AuthError::InvalidApp(format!(
+            "post_login_redirect must start with '/', got: {path}"
+        )));
+    }
+    if path.starts_with("//") {
+        return Err(crate::AuthError::InvalidApp(format!(
+            "post_login_redirect must not be protocol-relative, got: {path}"
+        )));
+    }
+    if path
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || b == 0x7f)
+    {
+        return Err(crate::AuthError::InvalidApp(
+            "post_login_redirect contains control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl Default for SessionConfig {
@@ -382,13 +413,18 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
     Ok(payload)
 }
 
-/// Check whether a payload's `exp` is earlier than or equal to `now`.
+/// Check whether `now` is past a payload's `exp`.
+///
+/// Uses `<` (strictly earlier) so the cookie is valid up to and *including*
+/// the `exp` second. With `<=` a session created at second `N` with
+/// `ttl_secs = 1` would be rejected if the verifying request landed in the
+/// same second — tight, but it does happen at scale.
 ///
 /// Callers supply `now` explicitly so that tests aren't clock-dependent and
 /// so middleware can decide once-per-request what "now" means.
 #[must_use]
 pub fn is_expired(payload: &SessionPayload, now: i64) -> bool {
-    payload.exp <= now
+    payload.exp < now
 }
 
 /// Serde adapter so `Zeroizing<String>` round-trips as a plain JSON string.
@@ -496,8 +532,10 @@ mod tests {
         };
         assert!(is_expired(&payload, 200));
         assert!(!is_expired(&payload, 50));
-        // boundary: exp == now is considered expired (inclusive)
-        assert!(is_expired(&payload, 100));
+        // boundary: exp == now is NOT expired (`<` semantics — see is_expired
+        // doc comment). The cookie is valid up to and including `exp`.
+        assert!(!is_expired(&payload, 100));
+        assert!(is_expired(&payload, 101));
     }
 
     #[test]
@@ -692,7 +730,49 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(
-            matches!(err, crate::AuthError::InvalidApp(m) if m.contains("post_login_redirect"))
+            matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("post_login_redirect"))
+        );
+    }
+
+    #[test]
+    fn session_config_rejects_protocol_relative_redirect() {
+        let cfg = SessionConfig {
+            post_login_redirect: "//evil.example.com/path".to_owned(),
+            app_namespace: "trawl".to_owned(),
+            ..SessionConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, crate::AuthError::InvalidApp(m) if m.contains("protocol-relative")));
+    }
+
+    #[test]
+    fn session_config_rejects_crlf_in_redirect() {
+        for bad in ["/ok\r\nX-Injected: 1", "/ok\nfoo", "/ok\0foo", "/ok\x7f"] {
+            let cfg = SessionConfig {
+                post_login_redirect: bad.to_owned(),
+                app_namespace: "trawl".to_owned(),
+                ..SessionConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("control")),
+                "expected control-char rejection for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_config_rejects_samesite_none_without_secure() {
+        let cfg = SessionConfig {
+            secure: false,
+            same_site: cookie::SameSite::None,
+            app_namespace: "trawl".to_owned(),
+            ..SessionConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("SameSite=None")),
+            "got: {err:?}"
         );
     }
 }

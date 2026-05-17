@@ -273,6 +273,49 @@ pg_test!(
 );
 
 pg_test!(
+    session_grant_revoked_during_session_returns_403,
+    |store: KeyStore| async move {
+        // Key remains active, but the ONLY namespace grant is revoked
+        // after the cookie was issued. The next request must take the
+        // no-grant 403 path, proving middleware re-reads grants from the
+        // DB on each request rather than trusting cached state.
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let (state, session_key) = session_state(store.clone(), "trawl");
+        let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
+        let app = session_router(state);
+
+        store
+            .revoke_assignment(&created.info.prefix, "trawl")
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header(
+                        header::COOKIE,
+                        cookie_header("fleet_session", &cookie_value),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "no-grant 403 must NOT clear the cookie (ADR-0030)"
+        );
+    }
+);
+
+pg_test!(
     session_revoked_key_returns_401,
     |store: KeyStore| async move {
         let created = store
