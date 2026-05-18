@@ -24,6 +24,7 @@ trawl-dashboard = { path = "crates/trawl-dashboard" }
 trawl-web = { path = "crates/trawl-web" }
 coastwatch-api-types = { path = "crates/coastwatch-api-types" }
 fleet-auth = { path = "crates/fleet-auth", default-features = false }
+fleet-ui = { path = "crates/fleet-ui" }
 
 # external deps
 aho-corasick = "1"
