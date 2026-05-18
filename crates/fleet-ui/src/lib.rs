@@ -23,9 +23,19 @@ pub mod button;
 #[cfg(target_arch = "wasm32")]
 pub mod field;
 #[cfg(target_arch = "wasm32")]
+pub mod icon;
+#[cfg(target_arch = "wasm32")]
+pub mod login;
+#[cfg(target_arch = "wasm32")]
 pub mod modal;
 #[cfg(target_arch = "wasm32")]
+pub mod rail;
+#[cfg(target_arch = "wasm32")]
+pub mod shell;
+#[cfg(target_arch = "wasm32")]
 pub mod toast;
+#[cfg(target_arch = "wasm32")]
+pub mod topbar;
 
 pub use theme::{Density, RowStyle, Theme};
 
@@ -34,8 +44,18 @@ pub use button::{Btn, Variant};
 #[cfg(target_arch = "wasm32")]
 pub use field::{Field, Helper};
 #[cfg(target_arch = "wasm32")]
+pub use icon::{Icon, IconView};
+#[cfg(target_arch = "wasm32")]
+pub use login::Login;
+#[cfg(target_arch = "wasm32")]
 pub use modal::ConfirmModal;
+#[cfg(target_arch = "wasm32")]
+pub use rail::{Rail, RailItem};
+#[cfg(target_arch = "wasm32")]
+pub use shell::Shell;
 #[cfg(target_arch = "wasm32")]
 pub use theme::{UiPrefs, install};
 #[cfg(target_arch = "wasm32")]
 pub use toast::{Toast, ToastBus, ToastKind, Toasts};
+#[cfg(target_arch = "wasm32")]
+pub use topbar::{AppLink, ModeTab, TopBar, UserInfo};

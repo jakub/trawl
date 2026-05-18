@@ -13,9 +13,6 @@
 //!   `NodeRef` for the scrim element instead of string-matching the
 //!   `class` attribute, so adding sibling classes to the scrim won't
 //!   silently break dismissal.
-//!
-//! The inline `CloseIcon` SVG stays here — the typed `Icon` enum
-//! arrives in coastwatch#38.
 
 use leptos::ev;
 use leptos::html::Div;
@@ -25,6 +22,7 @@ use leptos_use::{use_event_listener, use_window};
 use wasm_bindgen::JsCast;
 
 use crate::button::{Btn, Variant};
+use crate::icon::{Icon, IconView};
 
 #[component]
 pub fn ConfirmModal(
@@ -78,7 +76,7 @@ pub fn ConfirmModal(
                 <div class="m-hd">
                     <span class="t">{title}</span>
                     <span class="x" title="Close (Esc)" on:click=move |_| on_cancel.run(())>
-                        <CloseIcon/>
+                        <IconView icon=Icon::Close size=12 stroke_width=1.5/>
                     </span>
                 </div>
 
@@ -97,14 +95,5 @@ pub fn ConfirmModal(
                 </div>
             </div>
         </div>
-    }
-}
-
-#[component]
-fn CloseIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="m4 4 8 8M12 4l-8 8"/>
-        </svg>
     }
 }

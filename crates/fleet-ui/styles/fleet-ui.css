@@ -426,3 +426,316 @@ textarea:focus-visible,
   font-family: var(--font-mono);
 }
 .toast .x:hover { color: var(--ink); background: var(--panel-2); }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Login page (.login-shell, .login-card)
+ *
+ *  Centered card on the bg, sized for the API-key form. Reuses the
+ *  generic .field + .btn classes defined above; the .error rule lives
+ *  in the form block so login-specific spacing (margin-bottom) is
+ *  preserved without duplicating the base .error.
+ * ─────────────────────────────────────────────────────────────── */
+.login-shell {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  background: var(--bg);
+}
+
+.login-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 32px;
+  width: 360px;
+  box-shadow: var(--shadow-2);
+}
+
+.login-card h1 {
+  margin: 0 0 20px 0;
+  font-size: 28px;
+  color: var(--amber);
+  font-weight: 700;
+  letter-spacing: -.4px;
+}
+
+.login-card .subtitle {
+  margin: -16px 0 20px 0;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+.login-card .error { margin-bottom: 16px; }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  App shell — grid (topbar / body / footer)
+ *
+ *  Reserved class names from this point down: .shell, .topbar, .body,
+ *  .main, .rail. Apps must NOT redefine these — they're shared chrome.
+ * ─────────────────────────────────────────────────────────────── */
+.shell {
+  display: grid;
+  grid-template-rows: var(--topbar-h) 1fr;
+  height: 100%;
+}
+
+/* Top bar — application chrome.
+   Order: brand · modes · spacer · jump · env · iconbtns · user. */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  height: var(--topbar-h);
+  flex-shrink: 0;
+}
+
+.topbar .brand {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: -.2px;
+  color: var(--ink);
+}
+.topbar .brand .amber {
+  color: var(--amber);
+  text-shadow: 0 0 8px var(--amber-glow);
+}
+
+.topbar .modes { display: flex; gap: 0; margin-left: 4px; }
+.topbar .mode {
+  padding: 4px 11px;
+  font-size: 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+  text-decoration: none;
+}
+.topbar .mode:hover { color: var(--ink); background: var(--panel-2); }
+.topbar .mode.active {
+  color: var(--ink);
+  background: var(--panel-2);
+  font-weight: 500;
+}
+.topbar .mode .dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: transparent;
+}
+.topbar .mode.active .dot { background: var(--amber); }
+
+.topbar .sp { flex: 1; }
+
+.topbar .jump {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 8px 0 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  width: 280px;
+  color: var(--ink-3);
+  font-size: 12px;
+  cursor: text;
+  transition: border-color 120ms;
+}
+.topbar .jump:hover { border-color: var(--ink-4); }
+.topbar .jump .gh { flex: 1; font-family: var(--font-ui); font-size: 12px; }
+
+.topbar .env {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--ink-2);
+  background: var(--panel-2);
+}
+.topbar .env .pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 6px color-mix(in oklab, var(--green) 60%, transparent);
+}
+
+.topbar .iconbtn {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  color: var(--ink-2);
+  border-radius: 3px;
+  cursor: pointer;
+  position: relative;
+  transition: color 120ms, background 120ms;
+}
+.topbar .iconbtn::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 40px;
+  height: 40px;
+  transform: translate(-50%, -50%);
+}
+.topbar .iconbtn:hover { color: var(--ink); background: var(--panel-2); }
+
+.topbar .user-wrap { position: relative; }
+.topbar .user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px 2px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink-2);
+  user-select: none;
+}
+.topbar .user:hover { background: var(--panel-2); }
+.topbar .user .avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--amber);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  letter-spacing: .02em;
+}
+.topbar .user .who { font-family: var(--font-ui); font-size: 12px; }
+
+/* User menu dropdown — anchored to .user-wrap. */
+.user-menu {
+  position: absolute;
+  top: 36px;
+  right: 0;
+  z-index: 80;
+  width: 240px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow-3);
+  padding: 4px;
+  animation: fadeIn 120ms;
+}
+.user-menu .hdr {
+  padding: 10px 10px 8px;
+  border-bottom: 1px solid var(--line-2);
+  margin-bottom: 4px;
+}
+.user-menu .hdr .name { font-size: 13px; font-weight: 600; color: var(--ink); }
+.user-menu .hdr .mail {
+  font-size: 11px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  margin-top: 1px;
+}
+.user-menu .item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink);
+}
+.user-menu .item:hover { background: var(--panel-2); }
+.user-menu .item.disabled { color: var(--ink-3); cursor: not-allowed; }
+.user-menu .item.disabled:hover { background: transparent; }
+.user-menu .item .kbd { margin-left: auto; }
+.user-menu .item.danger { color: var(--red); }
+.user-menu .sep { height: 1px; background: var(--line-2); margin: 4px 0; }
+
+/* Overlay used to click-outside the open menu. */
+.user-wrap > .overlay { position: fixed; inset: 0; z-index: 79; }
+
+/* Body row: rail + main, fills remaining height after the topbar. */
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Left nav rail — mode-aware item list
+ * ─────────────────────────────────────────────────────────────── */
+.rail {
+  width: var(--rail-w);
+  flex-shrink: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 2px;
+}
+.rail .it {
+  width: 40px;
+  height: 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: var(--ink-3);
+  cursor: pointer;
+  border-radius: 3px;
+  position: relative;
+  transition: color 120ms, background 120ms;
+  text-decoration: none;
+}
+.rail .it .lb {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 500;
+}
+.rail .it:hover { color: var(--ink); background: var(--panel-2); }
+.rail .it.active { color: var(--amber); }
+.rail .it.active::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber-glow);
+}
+.rail .bot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: center;
+}
