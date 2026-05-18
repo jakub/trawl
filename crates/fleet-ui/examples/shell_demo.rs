@@ -21,9 +21,9 @@ fn main() {
 }
 
 #[cfg(target_arch = "wasm32")]
-use fleet_ui::{
-    AppLink, Icon, Login, ModeTab, Rail, RailIcon, RailItem, Shell, TopBar, UserInfo, install,
-};
+// TopBar and Rail are exported via fleet-ui but mounted internally by
+// Shell — referencing them here would duplicate the chrome.
+use fleet_ui::{AppLink, Icon, Login, ModeTab, RailIcon, RailItem, Shell, UserInfo, install};
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -126,17 +126,9 @@ fn DemoApp() -> impl IntoView {
                         }.into_any())
                     >
                         <p style="padding:16px">"hello from the demo shell"</p>
-                        <TopBar
-                            brand="(unused but verifies TopBar export)"
-                            brand_accent=""
-                            modes=Signal::derive(Vec::new)
-                            user=Signal::derive(|| None)
-                            on_logout=Callback::new(|()| {})
-                        />
-                        <Rail
-                            items=Signal::derive(|| &[] as &[RailItem])
-                            active=Signal::derive(String::new)
-                        />
+                        // Hidden export sentinel — proves Icon is in scope
+                        // without re-mounting TopBar/Rail (which Shell
+                        // already renders internally).
                         <span hidden=true>{format!("{:?}", Icon::Question)}</span>
                     </Shell>
                 }/>

@@ -77,11 +77,15 @@ pub fn TopBar(
 
             <div class="modes">
                 {move || modes.get().into_iter().map(|tab| {
+                    // Outer move || rebuilds the whole tab list whenever `modes`
+                    // changes, so `tab.active` is fresh per render. The inner
+                    // closure pattern used by Rail (where `active` is a real
+                    // Signal) would silently break here because `tab.active` is
+                    // a plain bool captured by value — there's nothing for a
+                    // reactive re-run to re-read. Keep the class static.
+                    let class = tab_class(tab.active);
                     view! {
-                        <A
-                            href=tab.path
-                            attr:class=move || tab_class(tab.active)
-                        >
+                        <A href=tab.path attr:class=class>
                             <span class="dot"></span>
                             <span>{tab.label}</span>
                         </A>

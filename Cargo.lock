@@ -1816,6 +1816,7 @@ dependencies = [
  "gloo-timers",
  "leptos",
  "leptos-use",
+ "leptos_router",
  "serde_json",
  "wasm-bindgen",
  "web-sys",

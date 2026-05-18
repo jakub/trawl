@@ -38,7 +38,10 @@ pub fn Login(
         on_submit.run((key, post_login_redirect));
     };
 
-    let combined_error = Signal::derive(move || error.get().or_else(|| local_error.get()));
+    // Local validation wins over the external error signal: if the user
+    // hits submit with an empty key after a prior failed attempt, they
+    // need to see "API key is required", not the stale server message.
+    let combined_error = Signal::derive(move || local_error.get().or_else(|| error.get()));
 
     view! {
         <div class="login-shell">
