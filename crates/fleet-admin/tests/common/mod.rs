@@ -4,10 +4,9 @@
 
 //! Shared Postgres test fixture for fleet-admin integration tests.
 //!
-//! Copy of `crates/fleet-auth/tests/common/mod.rs` — see ADR-0030 for the
-//! eventual goal of promoting this into a `fleet-auth` test-support module
-//! once a third fleet binary needs it. Until then, duplication is cheaper
-//! than carving out a new feature flag.
+//! Copy of `crates/fleet-auth/tests/common/mod.rs`.
+//! TODO(adr-0030): promote to a `fleet-auth::test_support` feature when
+//! a third consumer appears.
 //!
 //! Requires a reachable Postgres at `$FLEET_DATABASE_URL` (or `$DATABASE_URL`
 //! as a fallback) with `CREATEDB` privilege. Each test gets a fresh

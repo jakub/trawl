@@ -48,7 +48,6 @@ pg_test!(
         assert!(created.info.active);
         assert!(created.info.revoked_at.is_none());
 
-        // Persisted: list_keys (active_only=true) returns this key.
         let listed = store.list_keys(true).await.expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].prefix, created.info.prefix);
@@ -95,7 +94,6 @@ pg_test!(
         assert!(!info.active);
         assert!(info.revoked_at.is_some(), "revoked_at must be populated");
 
-        // Verifying a revoked token must fail.
         let err = store
             .verify_key(&created.plaintext_token)
             .await
@@ -127,7 +125,6 @@ pg_test!(
             "expected GrantExists for app=trawl, got {err:?}"
         );
 
-        // But a different app on the same key works.
         store
             .grant_assignment(&created.info.prefix, &coastwatch_consumer())
             .await

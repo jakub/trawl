@@ -219,11 +219,10 @@ pub fn parse_grant(s: &str) -> Result<RoleAssignment, AdminError> {
 /// `"(none)"` if empty.
 ///
 /// CLI-output flavour of [`fleet_auth::format_assignments`] — that one uses
-/// `"none"` and comma-without-space for log fields, this one uses
-/// `"(none)"` and comma-space for human reading. Sort matches fleet-auth's
-/// for deterministic table output even when callers hand us an unsorted
-/// slice (fleet-auth's `load_assignments` already orders by app, but
-/// belt-and-braces keeps snapshot tests stable).
+/// `"none"` and comma-without-space for log fields; this one uses
+/// `"(none)"` and comma-space for human reading. Sorted independently of
+/// the input so callers can hand us an arbitrarily-ordered slice and still
+/// get deterministic output.
 fn format_assignments(assignments: &[RoleAssignment]) -> String {
     if assignments.is_empty() {
         return "(none)".to_owned();
