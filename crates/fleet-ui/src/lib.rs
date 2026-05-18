@@ -21,7 +21,9 @@
 pub mod button;
 pub mod field;
 pub mod theme;
+pub mod toast;
 
 pub use button::{Btn, Variant};
 pub use field::Field;
 pub use theme::{Density, RowStyle, Theme, UiPrefs, install};
+pub use toast::{Toast, ToastBus, ToastKind, Toasts};
