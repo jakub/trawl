@@ -20,10 +20,12 @@
 
 pub mod button;
 pub mod field;
+pub mod modal;
 pub mod theme;
 pub mod toast;
 
 pub use button::{Btn, Variant};
 pub use field::Field;
+pub use modal::ConfirmModal;
 pub use theme::{Density, RowStyle, Theme, UiPrefs, install};
 pub use toast::{Toast, ToastBus, ToastKind, Toasts};
