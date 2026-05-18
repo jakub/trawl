@@ -5,14 +5,19 @@
 //! `<ConfirmModal/>` — reusable confirmation dialog (delete,
 //! destructive actions).
 //!
-//! Ported from trawl-web-ui with one substitution: the inline
-//! `class="btn-danger"` / `"btn-pri"` ternary is replaced by the typed
-//! `<Btn variant=Variant::Danger | Primary>` component shipped in this
-//! crate. The cancel button likewise switches to `<Btn variant=Variant::Secondary>`.
+//! Ported from trawl-web-ui with two improvements over the original:
+//! - `confirm_variant: Variant` replaces the `danger: bool` so the
+//!   confirm button's appearance is encoded with the same typed enum
+//!   used everywhere else, defaulting to `Variant::Danger`.
+//! - Scrim dismissal compares the click target's identity against a
+//!   `NodeRef` for the scrim element instead of string-matching the
+//!   `class` attribute, so adding sibling classes to the scrim won't
+//!   silently break dismissal.
 //!
 //! The inline `CloseIcon` SVG stays here — the typed `Icon` enum
 //! arrives in coastwatch#38.
 
+use leptos::html::Div;
 use leptos::prelude::*;
 use leptos::web_sys;
 use wasm_bindgen::JsCast;
@@ -24,45 +29,47 @@ pub fn ConfirmModal(
     title: &'static str,
     message: String,
     confirm_label: &'static str,
-    #[prop(default = true)] danger: bool,
+    #[prop(default = Variant::Danger)] confirm_variant: Variant,
     on_confirm: Callback<()>,
     on_cancel: Callback<()>,
 ) -> impl IntoView {
-    let cancel = move || on_cancel.run(());
-    let cancel_key = cancel;
-    let cancel_scrim = cancel;
-    let cancel_btn = cancel;
+    let scrim_ref = NodeRef::<Div>::new();
 
     let on_keydown = move |e: web_sys::KeyboardEvent| {
         if e.key() == "Escape" {
             e.prevent_default();
-            cancel_key();
+            on_cancel.run(());
         }
     };
 
-    let confirm_variant = if danger {
-        Variant::Danger
-    } else {
-        Variant::Primary
+    let on_scrim_mousedown = move |e: web_sys::MouseEvent| {
+        // Identity comparison: only dismiss when the click landed on the
+        // scrim element itself, not on a descendant. Robust against future
+        // class additions that would have broken the previous
+        // `class_name().contains("modal-scrim")` heuristic.
+        let Some(scrim) = scrim_ref.get() else {
+            return;
+        };
+        let Some(target) = e.target() else { return };
+        let Some(el) = target.dyn_ref::<web_sys::Element>() else {
+            return;
+        };
+        if el.is_same_node(Some(scrim.as_ref())) {
+            on_cancel.run(());
+        }
     };
 
     view! {
         <div
             class="modal-scrim"
-            on:mousedown=move |e: web_sys::MouseEvent| {
-                if let Some(target) = e.target()
-                    && let Some(el) = target.dyn_ref::<web_sys::Element>()
-                    && el.class_name().contains("modal-scrim")
-                {
-                    cancel_scrim();
-                }
-            }
+            node_ref=scrim_ref
+            on:mousedown=on_scrim_mousedown
             on:keydown=on_keydown
         >
             <div class="modal modal-sm" role="alertdialog" aria-modal="true">
                 <div class="m-hd">
                     <span class="t">{title}</span>
-                    <span class="x" title="Close (Esc)" on:click=move |_| cancel_btn()>
+                    <span class="x" title="Close (Esc)" on:click=move |_| on_cancel.run(())>
                         <CloseIcon/>
                     </span>
                 </div>
@@ -73,16 +80,10 @@ pub fn ConfirmModal(
 
                 <div class="m-ft">
                     <div></div>
-                    <Btn
-                        variant=Variant::Secondary
-                        on_click=Callback::new(move |()| on_cancel.run(()))
-                    >
+                    <Btn variant=Variant::Secondary on_click=on_cancel>
                         "Cancel"
                     </Btn>
-                    <Btn
-                        variant=confirm_variant
-                        on_click=Callback::new(move |()| on_confirm.run(()))
-                    >
+                    <Btn variant=confirm_variant on_click=on_confirm>
                         {confirm_label}
                     </Btn>
                 </div>
