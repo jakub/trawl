@@ -11,21 +11,31 @@
 //! rel="css"` directive pointing at `styles/fleet-ui.css` in this
 //! crate's directory.
 //!
-//! The crate is `wasm32`-only — everything below the `#![cfg]` gate
-//! compiles only when targeting `wasm32-unknown-unknown`. On native,
-//! `cargo check -p fleet-ui` resolves to an empty crate, which is the
-//! intended behaviour for `cargo check --workspace` runs.
+//! Most modules are wasm32-only — they pull leptos / web-sys / gloo
+//! and only make sense in a browser. The exception is [`theme::prefs`],
+//! a pure parsing layer that builds on every target so the JSON
+//! contract with `localStorage` can be exercised by native unit tests.
 
-#![cfg(target_arch = "wasm32")]
-
-pub mod button;
-pub mod field;
-pub mod modal;
 pub mod theme;
+
+#[cfg(target_arch = "wasm32")]
+pub mod button;
+#[cfg(target_arch = "wasm32")]
+pub mod field;
+#[cfg(target_arch = "wasm32")]
+pub mod modal;
+#[cfg(target_arch = "wasm32")]
 pub mod toast;
 
+pub use theme::{Density, RowStyle, Theme};
+
+#[cfg(target_arch = "wasm32")]
 pub use button::{Btn, Variant};
+#[cfg(target_arch = "wasm32")]
 pub use field::Field;
+#[cfg(target_arch = "wasm32")]
 pub use modal::ConfirmModal;
-pub use theme::{Density, RowStyle, Theme, UiPrefs, install};
+#[cfg(target_arch = "wasm32")]
+pub use theme::{UiPrefs, install};
+#[cfg(target_arch = "wasm32")]
 pub use toast::{Toast, ToastBus, ToastKind, Toasts};
