@@ -23,6 +23,8 @@ pub mod button;
 #[cfg(target_arch = "wasm32")]
 pub mod field;
 #[cfg(target_arch = "wasm32")]
+pub mod icon;
+#[cfg(target_arch = "wasm32")]
 pub mod modal;
 #[cfg(target_arch = "wasm32")]
 pub mod toast;
@@ -33,6 +35,8 @@ pub use theme::{Density, RowStyle, Theme};
 pub use button::{Btn, Variant};
 #[cfg(target_arch = "wasm32")]
 pub use field::{Field, Helper};
+#[cfg(target_arch = "wasm32")]
+pub use icon::{Icon, IconView};
 #[cfg(target_arch = "wasm32")]
 pub use modal::ConfirmModal;
 #[cfg(target_arch = "wasm32")]
