@@ -27,6 +27,8 @@ pub mod icon;
 #[cfg(target_arch = "wasm32")]
 pub mod modal;
 #[cfg(target_arch = "wasm32")]
+pub mod rail;
+#[cfg(target_arch = "wasm32")]
 pub mod toast;
 
 pub use theme::{Density, RowStyle, Theme};
@@ -39,6 +41,8 @@ pub use field::{Field, Helper};
 pub use icon::{Icon, IconView};
 #[cfg(target_arch = "wasm32")]
 pub use modal::ConfirmModal;
+#[cfg(target_arch = "wasm32")]
+pub use rail::{Rail, RailIcon, RailItem};
 #[cfg(target_arch = "wasm32")]
 pub use theme::{UiPrefs, install};
 #[cfg(target_arch = "wasm32")]
