@@ -842,7 +842,6 @@ mod tests {
         let original = SessionKey::generate();
         let encoded = original.to_base64url();
 
-        // Pure base64url-no-pad — no `+`, `/`, or `=`.
         assert!(!encoded.contains('+'));
         assert!(!encoded.contains('/'));
         assert!(!encoded.contains('='));

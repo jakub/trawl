@@ -24,7 +24,6 @@ pg_test!(
             .await
             .expect("second run is a no-op against migrated schema");
 
-        // And the keystore still works end-to-end.
         let created = store
             .create_key("post-migrate", PrincipalKind::Human, &[], None)
             .await
