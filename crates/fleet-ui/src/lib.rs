@@ -17,3 +17,7 @@
 //! intended behaviour for `cargo check --workspace` runs.
 
 #![cfg(target_arch = "wasm32")]
+
+pub mod theme;
+
+pub use theme::{Density, RowStyle, Theme, UiPrefs, install};
