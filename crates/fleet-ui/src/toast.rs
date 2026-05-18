@@ -18,12 +18,40 @@ pub enum ToastKind {
     Error,
 }
 
+/// A single toast notification. Construction is sealed: instances only
+/// arise from [`ToastBus::push`] (and its kind-specific helpers), so the
+/// monotonic `id` allocated by the bus is the only one in circulation —
+/// preventing a third-party `Toast { id: 0, ... }` from colliding with
+/// keys the `<For>` loop relies on.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Toast {
-    pub id: u64,
-    pub kind: ToastKind,
-    pub title: String,
-    pub detail: Option<String>,
+    pub(crate) id: u64,
+    pub(crate) kind: ToastKind,
+    pub(crate) title: String,
+    pub(crate) detail: Option<String>,
+}
+
+impl Toast {
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> ToastKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
 }
 
 /// Push handle — clone-and-share. Drives the `<Toasts/>` host.
@@ -73,7 +101,25 @@ impl ToastBus {
         });
     }
 
-    fn dismiss(self, id: u64) {
+    /// Variant-encoded sugar over [`Self::push`]. Use these at call
+    /// sites — `bus.push_error("save failed", None)` reads better than
+    /// `bus.push(ToastKind::Error, "save failed", None)`.
+    pub fn push_info(self, title: impl Into<String>, detail: Option<String>) {
+        self.push(ToastKind::Info, title, detail);
+    }
+
+    pub fn push_success(self, title: impl Into<String>, detail: Option<String>) {
+        self.push(ToastKind::Success, title, detail);
+    }
+
+    pub fn push_error(self, title: impl Into<String>, detail: Option<String>) {
+        self.push(ToastKind::Error, title, detail);
+    }
+
+    /// Programmatically dismiss a toast by id (e.g. when an in-flight
+    /// retry succeeds before the auto-dismiss timeout). No-op if the id
+    /// has already been removed.
+    pub fn dismiss(self, id: u64) {
         self.items.update(|v| v.retain(|t| t.id != id));
     }
 }
