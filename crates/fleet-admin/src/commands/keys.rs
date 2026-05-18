@@ -48,7 +48,14 @@ pub async fn create(
         eprintln!("  expires: never");
     }
     eprintln!();
-    println!("{}", &*created.plaintext_token);
+    // write_all avoids the println! formatter's non-zeroized String
+    // intermediate, and the explicit flush ensures the token reaches the
+    // descriptor even on broken-pipe or pre-exit teardown.
+    let mut out = std::io::stdout().lock();
+    out.write_all(created.plaintext_token.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    drop(out);
     eprintln!();
     eprintln!("WARNING: this token will not be shown again. store it securely.");
 

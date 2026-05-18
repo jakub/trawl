@@ -5,6 +5,8 @@
 //! `fleet-admin generate-session-key` — emit a fresh
 //! `XChaCha20`-Poly1305 key in base64url form.
 
+use std::io::Write;
+
 use fleet_auth::SessionKey;
 
 use crate::error::AdminError;
@@ -18,10 +20,12 @@ use crate::error::AdminError;
 // Returns `Result` for shape-parity with the other subcommand entry points
 // (`migrate::run`, `keys::*`), which the top-level dispatch unifies into a
 // single `Result<(), AdminError>` chain.
-#[allow(clippy::unnecessary_wraps)]
 pub fn run() -> Result<(), AdminError> {
     let key = SessionKey::generate();
     let encoded = key.to_base64url();
-    println!("{}", encoded.as_str());
+    let mut out = std::io::stdout().lock();
+    out.write_all(encoded.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()?;
     Ok(())
 }

@@ -4,6 +4,7 @@
 
 //! `fleet-admin` — operational CLI for the shared fleet keystore (ADR-0030).
 
+use std::io::Write;
 use std::process;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -99,6 +100,9 @@ impl From<CliKind> for PrincipalKind {
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
+        // process::exit skips stdlib destructors, so flush stdout
+        // explicitly — any partially-buffered token must reach the fd.
+        let _ = std::io::stdout().flush();
         eprintln!("fleet-admin: {e}");
         process::exit(1);
     }
