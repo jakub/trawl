@@ -30,6 +30,8 @@ pub mod modal;
 pub mod rail;
 #[cfg(target_arch = "wasm32")]
 pub mod toast;
+#[cfg(target_arch = "wasm32")]
+pub mod topbar;
 
 pub use theme::{Density, RowStyle, Theme};
 
@@ -47,3 +49,5 @@ pub use rail::{Rail, RailIcon, RailItem};
 pub use theme::{UiPrefs, install};
 #[cfg(target_arch = "wasm32")]
 pub use toast::{Toast, ToastBus, ToastKind, Toasts};
+#[cfg(target_arch = "wasm32")]
+pub use topbar::{AppLink, ModeTab, TopBar, UserInfo};
