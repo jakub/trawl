@@ -232,6 +232,13 @@ textarea:focus-visible,
   border-color: var(--amber);
 }
 
+.field .field-hint {
+  font-size: 11px;
+  color: var(--ink-3);
+  margin: 4px 0 0;
+  line-height: 1.4;
+}
+
 .error {
   background: var(--red-wash);
   border: 1px solid var(--red);
