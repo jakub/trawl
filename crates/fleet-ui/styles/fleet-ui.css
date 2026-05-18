@@ -1,0 +1,421 @@
+/*
+ * fleet-ui — shared design system (ADR-0030, step 2)
+ *
+ * Tokens, reset, base styles, and component CSS for fleet apps.
+ * Extracted verbatim from trawl-web-ui's "Herring" main.css. App
+ * consumers reach this file via Trunk:
+ *
+ *   <link data-trunk rel="css" href="../fleet-ui/styles/fleet-ui.css"/>
+ *
+ * Trunk resolves the href relative to the consumer's Trunk.toml /
+ * index.html location. From crates/trawl-web-ui/index.html the path
+ * `../fleet-ui/styles/fleet-ui.css` resolves into this crate's
+ * styles/ directory. Coastwatch-web will load it the same way.
+ *
+ * @import is intentionally NOT used here. Trunk doesn't follow
+ * @import — the browser fetches the imported file at runtime, hits
+ * the SPA HTML fallback, and complains about MIME. Ship one combined
+ * file and one <link> tag per consumer.
+ *
+ * What this file ships:
+ *   - Design tokens: :root + [data-theme="light"] + [data-theme="dark"]
+ *   - Typography + spacing custom properties
+ *   - [data-density="comfortable"] overrides
+ *   - Reset + base styles (box-sizing, fonts via font-family only,
+ *     focus ring, scrollbars, ::selection)
+ *   - Universal keyframes: blink, spin, toastIn, fadeIn, modalFadeIn,
+ *     modalIn
+ *   - Base form/button: .field, .btn, .btn-full, .error
+ *   - Variants: .btn-pri, .btn-sec, .btn-danger
+ *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd,
+ *     .m-body, .m-ft
+ *   - Toast host + items: .toasts, .toast, .toast.{success,error,info}
+ *
+ * What this file does NOT ship (stays in trawl-web-ui/styles/main.css):
+ *   - [data-rowstyle] selectors targeting .results-table (the enum is
+ *     shared via fleet-ui, but the selector references trawl's table)
+ *   - .btn-sm, .btn-xs, .btn-icon, .field-label and other extras
+ *   - Trawl-specific modal sub-styles (.m-field, .m-body .preview,
+ *     .m-ft .hint, .export-formats)
+ *   - Anything app-specific: shell, topbar, rail, facets, editor,
+ *     histogram, drawers, schema cards.
+ */
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Design tokens
+ * ─────────────────────────────────────────────────────────────── */
+:root, [data-theme="light"] {
+  --bg:        #faf7f0;
+  --panel:     #fffdf7;
+  --panel-2:   #f3ede0;
+  --panel-3:   #ece5d2;
+  --ink:       #1a1714;
+  --ink-2:     #5c564a;
+  --ink-3:     #8a8272;
+  --ink-4:     #b8b1a0;
+  --line:      #e4ddcc;
+  --line-2:    #efe8d6;
+  --selection: rgba(200,121,26,.20);
+
+  --amber:     #c8791a;
+  --amber-2:   #b56a10;
+  --amber-soft:#f0c87a;
+  --amber-glow:rgba(200,121,26,.22);
+  --amber-wash:rgba(200,121,26,.08);
+
+  --teal:       #0e8b7a;
+  --teal-wash:  rgba(14,139,122,.10);
+  --red:        #b43a2a;
+  --red-2:      #9a2f23;
+  --red-wash:   rgba(180,58,42,.08);
+  --yellow:     #a68210;
+  --yellow-wash:rgba(166,130,16,.10);
+  --green:      #4a7d3f;
+  --green-wash: rgba(74,125,63,.10);
+  --blue:       #2a5c8a;
+
+  --shadow-1:    0 1px 0 rgba(0,0,0,.03);
+  --shadow-2:    0 1px 2px rgba(0,0,0,.06), 0 2px 6px rgba(0,0,0,.04);
+  --shadow-3:    0 4px 16px rgba(0,0,0,.08), 0 1px 3px rgba(0,0,0,.06);
+  --shadow-glow: 0 0 0 3px var(--amber-glow);
+}
+
+[data-theme="dark"] {
+  --bg:        #0f1216;
+  --panel:     #141820;
+  --panel-2:   #1a1f28;
+  --panel-3:   #242b36;
+  --ink:       #e8e3d7;
+  --ink-2:     #9aa0ad;
+  --ink-3:     #6c7280;
+  --ink-4:     #4a505c;
+  --line:      #242a34;
+  --line-2:    #1c212b;
+  --selection: rgba(240,168,72,.22);
+
+  --amber:     #f0a848;
+  --amber-2:   #d08820;
+  --amber-soft:#f4c47a;
+  --amber-glow:rgba(240,168,72,.28);
+  --amber-wash:rgba(240,168,72,.10);
+
+  --teal:       #4ec9b0;
+  --teal-wash:  rgba(78,201,176,.12);
+  --red:        #e05a4a;
+  --red-2:      #c44434;
+  --red-wash:   rgba(224,90,74,.12);
+  --yellow:     #d4b04a;
+  --yellow-wash:rgba(212,176,74,.14);
+  --green:      #7bbd6a;
+  --green-wash: rgba(123,189,106,.12);
+  --blue:       #5a9fd4;
+
+  --shadow-1:    0 1px 0 rgba(0,0,0,.3);
+  --shadow-2:    0 1px 2px rgba(0,0,0,.4), 0 2px 6px rgba(0,0,0,.3);
+  --shadow-3:    0 4px 16px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
+  --shadow-glow: 0 0 0 3px var(--amber-glow);
+}
+
+:root {
+  --font-ui:   "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
+
+  --row-h:      24px;
+  --row-pad-y:  3px;
+  --row-pad-x:  10px;
+  --ui-gap:     10px;
+  --pad:        10px;
+  --editor-fs:  12.5px;
+  --table-fs:   11.5px;
+
+  --topbar-h:   40px;
+  --statusbar-h: 26px;
+  --rail-w:     64px;
+  --facets-w:   224px;
+}
+
+[data-density="comfortable"] {
+  --row-h:     30px;
+  --row-pad-y: 5px;
+  --row-pad-x: 14px;
+  --ui-gap:    14px;
+  --pad:       14px;
+  --editor-fs: 13px;
+  --table-fs:  12.5px;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Reset + base
+ * ─────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+button { font: inherit; }
+::selection { background: var(--selection); }
+
+/* Focus ring — amber glow, never browser blue. */
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-glow);
+}
+
+/* Scrollbars — slim, panel-toned. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-4);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* Motion utilities. */
+@keyframes blink        { 50% { opacity: .2; } }
+@keyframes spin         { to { transform: rotate(360deg); } }
+@keyframes toastIn      { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@keyframes fadeIn       { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modalFadeIn  { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modalIn      {
+  from { opacity: 0; transform: translateY(-6px) scale(.985); }
+  to   { opacity: 1; transform: translateY(0)   scale(1); }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Form: .field, .error
+ * ─────────────────────────────────────────────────────────────── */
+.field {
+  display: block;
+  margin-bottom: 16px;
+}
+
+.field label {
+  display: block;
+  font-size: 10px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  margin-bottom: 6px;
+}
+
+.field input[type="password"],
+.field input[type="text"] {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.field input:focus {
+  outline: none;
+  box-shadow: var(--shadow-glow);
+  border-color: var(--amber);
+}
+
+.error {
+  background: var(--red-wash);
+  border: 1px solid var(--red);
+  color: var(--red);
+  padding: 8px 10px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Buttons
+ *  - .btn        is the large amber primary (login-page form)
+ *  - .btn-pri    is the compact amber primary (modal footers, toolbars)
+ *  - .btn-sec    is the neutral secondary
+ *  - .btn-danger is the destructive variant (NEW — closes the dangling
+ *                reference that existed in confirm_modal.rs before
+ *                extraction)
+ *  - .btn-full   makes any variant width: 100%
+ * ─────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-block;
+  padding: 8px 18px;
+  background: var(--amber);
+  color: #fff;
+  border: 1px solid var(--amber-2);
+  border-radius: 3px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 0 rgba(0,0,0,.06);
+  transition: scale 150ms ease-out;
+}
+.btn:hover { background: var(--amber-2); }
+.btn:active:not(:disabled) { scale: 0.96; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-full { width: 100%; }
+
+.btn-sec {
+  padding: 5px 11px;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+  border-radius: 2px;
+  cursor: pointer;
+}
+.btn-sec:hover { background: var(--panel-3); color: var(--ink); }
+.btn-sec:disabled { opacity: .5; cursor: not-allowed; }
+
+.btn-pri {
+  padding: 5px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  background: var(--amber);
+  color: #fff;
+  border: 1px solid var(--amber-2);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: scale 150ms ease-out;
+}
+.btn-pri:hover { background: var(--amber-2); }
+.btn-pri:active:not(:disabled) { scale: 0.96; }
+.btn-pri:disabled { opacity: .5; cursor: not-allowed; }
+
+.btn-danger {
+  padding: 5px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  background: var(--red);
+  color: #fff;
+  border: 1px solid var(--red-2);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: scale 150ms ease-out;
+}
+.btn-danger:hover { background: var(--red-2); }
+.btn-danger:active:not(:disabled) { scale: 0.96; }
+.btn-danger:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Modal scaffolding
+ *  Only the scrim + frame + header/body/footer slots. Trawl's
+ *  modal-internal fields, previews, and keyboard hints stay in
+ *  trawl-web-ui until they prove generic.
+ * ─────────────────────────────────────────────────────────────── */
+.modal-scrim {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(15, 18, 22, .42);
+  backdrop-filter: blur(2px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 14vh;
+  animation: modalFadeIn 140ms ease;
+}
+[data-theme="light"] .modal-scrim { background: rgba(40, 32, 18, .28); }
+
+.modal {
+  width: 460px; max-width: calc(100vw - 32px);
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: 0 24px 64px -12px rgba(0,0,0,.32),
+              0 8px 24px -8px rgba(0,0,0,.18);
+  display: flex; flex-direction: column;
+  animation: modalIn 180ms cubic-bezier(.2,.8,.2,1);
+  overflow: hidden;
+}
+
+/* modal-sm is a narrower variant used by ConfirmModal. The original
+ * trawl-web-ui CSS referenced this class but never defined it — fleet-ui
+ * closes that gap. */
+.modal-sm { width: 380px; }
+
+.modal .m-hd {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px; border-bottom: 1px solid var(--line);
+}
+.modal .m-hd .t {
+  flex: 1; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
+  color: var(--ink); letter-spacing: -.1px;
+}
+.modal .m-hd .x {
+  cursor: pointer; color: var(--ink-3); padding: 3px 6px; border-radius: 2px;
+  display: grid; place-items: center;
+}
+.modal .m-hd .x:hover { color: var(--ink); background: var(--panel-2); }
+
+.modal .m-body { padding: 14px 16px 14px; display: flex; flex-direction: column; gap: 12px; }
+
+.modal .m-ft {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 16px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--line);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Toasts (bottom-right stack)
+ * ─────────────────────────────────────────────────────────────── */
+.toasts {
+  position: fixed;
+  bottom: calc(var(--statusbar-h) + 14px);
+  right: 16px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  min-width: 280px;
+  max-width: 380px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--amber);
+  border-radius: 3px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  box-shadow: var(--shadow-3);
+  animation: toastIn 180ms cubic-bezier(.2,.8,.2,1);
+  font-size: 12px;
+}
+.toast.success { border-left-color: var(--green); }
+.toast.error   { border-left-color: var(--red); }
+.toast.info    { border-left-color: var(--blue); }
+.toast .body { flex: 1; }
+.toast .title {
+  font-weight: 600;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  margin-bottom: 2px;
+}
+.toast .detail { color: var(--ink-2); font-size: 11px; line-height: 1.4; }
+.toast .x {
+  color: var(--ink-3);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 2px;
+  font-family: var(--font-mono);
+}
+.toast .x:hover { color: var(--ink); background: var(--panel-2); }
