@@ -149,10 +149,12 @@ async fn dispatch_keys(store: KeyStore, action: KeysAction) -> Result<(), AdminE
 }
 
 async fn connect_pool() -> Result<PgPool, AdminError> {
-    let url = std::env::var("DATABASE_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .ok_or(AdminError::MissingDatabaseUrl)?;
+    let url = match std::env::var("DATABASE_URL") {
+        Ok(v) if v.is_empty() => return Err(AdminError::EmptyDatabaseUrl),
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Err(AdminError::MissingDatabaseUrl),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(AdminError::EmptyDatabaseUrl),
+    };
     PgPoolOptions::new()
         .max_connections(4)
         .connect(&url)
