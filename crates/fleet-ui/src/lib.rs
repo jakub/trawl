@@ -19,7 +19,9 @@
 #![cfg(target_arch = "wasm32")]
 
 pub mod button;
+pub mod field;
 pub mod theme;
 
 pub use button::{Btn, Variant};
+pub use field::Field;
 pub use theme::{Density, RowStyle, Theme, UiPrefs, install};
