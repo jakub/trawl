@@ -32,7 +32,7 @@ pub use theme::{Density, RowStyle, Theme};
 #[cfg(target_arch = "wasm32")]
 pub use button::{Btn, Variant};
 #[cfg(target_arch = "wasm32")]
-pub use field::Field;
+pub use field::{Field, Helper};
 #[cfg(target_arch = "wasm32")]
 pub use modal::ConfirmModal;
 #[cfg(target_arch = "wasm32")]
