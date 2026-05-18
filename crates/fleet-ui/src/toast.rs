@@ -49,8 +49,17 @@ impl ToastBus {
 
     /// Push a toast. Auto-dismisses after 4.5s.
     pub fn push(self, kind: ToastKind, title: impl Into<String>, detail: Option<String>) {
-        let id = self.next_id.with_value(|n| n + 1);
-        self.next_id.set_value(id);
+        // Single-closure mutation: no read/write window for a concurrent push to
+        // observe the same `n` and produce a duplicate key in `<For key=|t| t.id>`.
+        // Wasm is single-threaded today; this is insurance against future `spawn_local`
+        // interleaving and the cheapest fix.
+        let id = self
+            .next_id
+            .try_update_value(|n| {
+                *n += 1;
+                *n
+            })
+            .unwrap_or(0);
         let toast = Toast {
             id,
             kind,
