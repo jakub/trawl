@@ -20,7 +20,6 @@ sqlx-core = { workspace = true }
 sqlx-postgres = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-zeroize = { workspace = true }
 
 [dev-dependencies]
 fleet-auth = { workspace = true, features = ["keystore", "session", "fast-hash"] }
