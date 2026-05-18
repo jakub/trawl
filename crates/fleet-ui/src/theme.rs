@@ -17,6 +17,7 @@
 use std::str::FromStr;
 
 use leptos::prelude::*;
+use wasm_bindgen::JsValue;
 
 /// Color theme — light is canonical, dark is parity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +145,14 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
         rowstyle: RwSignal::new(stored.rowstyle),
     };
 
+    // Track the last value we persisted so we never overwrite storage with
+    // what's already there. This matters for the corruption case: if
+    // read_stored fell back to defaults because the blob was malformed,
+    // last_written matches the in-memory snap and we leave the corrupt blob
+    // in place — letting the user inspect it and giving the console warning
+    // time to register before any change wipes the evidence.
+    let last_written = StoredValue::new(stored);
+
     Effect::new(move |_| {
         let snap = Stored {
             theme: prefs.theme.get(),
@@ -151,13 +160,16 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
             rowstyle: prefs.rowstyle.get(),
         };
         apply_to_dom(snap);
-        write_stored(storage_key, snap);
+        if last_written.with_value(|w| *w != snap) {
+            write_stored(storage_key, snap);
+            last_written.set_value(snap);
+        }
     });
 
     prefs
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Stored {
     theme: Theme,
     density: Density,
@@ -181,26 +193,45 @@ fn read_stored(storage_key: &str) -> Stored {
     let Ok(Some(raw)) = storage.get_item(storage_key) else {
         return Stored::default();
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return Stored::default();
+    let value = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => v,
+        Err(err) => {
+            warn(&format!(
+                "fleet-ui: stored prefs at `{storage_key}` are not valid JSON \
+                 ({err}); falling back to defaults. raw payload preserved \
+                 in localStorage for inspection. value: {raw}"
+            ));
+            return Stored::default();
+        }
     };
     let mut out = Stored::default();
-    if let Some(s) = value.get("theme").and_then(|v| v.as_str())
-        && let Ok(t) = s.parse()
-    {
-        out.theme = t;
-    }
-    if let Some(s) = value.get("density").and_then(|v| v.as_str())
-        && let Ok(d) = s.parse()
-    {
-        out.density = d;
-    }
-    if let Some(s) = value.get("rowstyle").and_then(|v| v.as_str())
-        && let Ok(r) = s.parse()
-    {
-        out.rowstyle = r;
-    }
+    parse_field(&value, "theme", |t| out.theme = t);
+    parse_field(&value, "density", |d| out.density = d);
+    parse_field(&value, "rowstyle", |r| out.rowstyle = r);
     out
+}
+
+fn parse_field<T, F>(value: &serde_json::Value, field: &str, mut set: F)
+where
+    T: FromStr,
+    F: FnMut(T),
+{
+    let Some(s) = value.get(field).and_then(|v| v.as_str()) else {
+        // Field missing or wrong shape — keep the existing default. This isn't a
+        // user-visible problem worth a warn; older blobs predate newer fields.
+        return;
+    };
+    match s.parse::<T>() {
+        Ok(parsed) => set(parsed),
+        Err(_) => warn(&format!(
+            "fleet-ui: unknown value `{s}` for stored pref `{field}`; \
+             keeping default. (typo, future variant, or hand-edit?)"
+        )),
+    }
+}
+
+fn warn(msg: &str) {
+    web_sys::console::warn_1(&JsValue::from_str(msg));
 }
 
 fn write_stored(storage_key: &str, s: Stored) {
@@ -212,7 +243,15 @@ fn write_stored(storage_key: &str, s: Stored) {
         "density":  s.density.as_attr(),
         "rowstyle": s.rowstyle.as_attr(),
     });
-    let _ = storage.set_item(storage_key, &payload.to_string());
+    if let Err(err) = storage.set_item(storage_key, &payload.to_string()) {
+        // QuotaExceededError (Safari private browsing, full storage) is the
+        // realistic case. Warn so "my settings stopped sticking" surfaces in
+        // devtools instead of going to ground.
+        warn(&format!(
+            "fleet-ui: failed to persist prefs to localStorage `{storage_key}`: \
+             {err:?}. preferences are still applied this session but won't survive reload."
+        ));
+    }
 }
 
 fn apply_to_dom(s: Stored) {
