@@ -25,6 +25,8 @@ pub mod field;
 #[cfg(target_arch = "wasm32")]
 pub mod icon;
 #[cfg(target_arch = "wasm32")]
+pub mod login;
+#[cfg(target_arch = "wasm32")]
 pub mod modal;
 #[cfg(target_arch = "wasm32")]
 pub mod rail;
@@ -43,6 +45,8 @@ pub use button::{Btn, Variant};
 pub use field::{Field, Helper};
 #[cfg(target_arch = "wasm32")]
 pub use icon::{Icon, IconView};
+#[cfg(target_arch = "wasm32")]
+pub use login::Login;
 #[cfg(target_arch = "wasm32")]
 pub use modal::ConfirmModal;
 #[cfg(target_arch = "wasm32")]
