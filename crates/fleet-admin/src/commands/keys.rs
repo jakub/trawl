@@ -87,10 +87,10 @@ pub async fn revoke(store: &KeyStore, prefix: &str, yes: bool) -> Result<(), Adm
     let info = store.get_key_by_prefix(prefix).await?;
 
     if !info.active {
-        return Err(AdminError::Arg(format!(
-            "key {} ({}) is already revoked",
-            info.prefix, info.name
-        )));
+        return Err(AdminError::AlreadyRevoked {
+            prefix: info.prefix.clone(),
+            name: info.name.clone(),
+        });
     }
 
     eprintln!("  prefix:  {}", info.prefix);
@@ -101,9 +101,7 @@ pub async fn revoke(store: &KeyStore, prefix: &str, yes: bool) -> Result<(), Adm
 
     if !yes {
         if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            return Err(AdminError::Arg(
-                "refusing to revoke without --yes when stdin is not a TTY".into(),
-            ));
+            return Err(AdminError::NonInteractive);
         }
 
         eprint!("\nrevoke this key? [y/N] ");
@@ -142,13 +140,15 @@ pub async fn grant(
 /// Multiple colons are kept in the role half (`foo:super:admin` →
 /// `(foo, super:admin)`) so role names can themselves be namespaced.
 pub fn parse_grant(s: &str) -> Result<RoleAssignment, AdminError> {
-    let (app, role) = s
-        .split_once(':')
-        .ok_or_else(|| AdminError::Arg(format!("invalid --grant {s:?}: expected APP:ROLE")))?;
+    let (app, role) = s.split_once(':').ok_or_else(|| AdminError::InvalidGrant {
+        input: s.to_owned(),
+        reason: "expected APP:ROLE",
+    })?;
     if app.is_empty() || role.is_empty() {
-        return Err(AdminError::Arg(format!(
-            "invalid --grant {s:?}: empty app or role"
-        )));
+        return Err(AdminError::InvalidGrant {
+            input: s.to_owned(),
+            reason: "empty app or role",
+        });
     }
     Ok(RoleAssignment {
         app: app.to_owned(),
@@ -227,30 +227,26 @@ fn format_timestamp(ts: &DateTime<Utc>) -> String {
 /// Units: `s`, `m`, `h`, `d`, `w`. Numeric overflow against `u64::MAX`
 /// seconds is rejected with `duration too large`.
 pub fn parse_duration(s: &str) -> Result<Duration, AdminError> {
+    let original = s;
+    let bad = |reason: &'static str| AdminError::InvalidDuration {
+        input: original.to_owned(),
+        reason,
+    };
+
     if s == "never" {
-        return Err(AdminError::Arg(
-            "use omitting --expires instead of 'never'".into(),
-        ));
+        return Err(bad("omit --expires instead of 'never'"));
     }
 
     let s = s.trim();
     // `split_at` takes a BYTE index — slicing at `s.len() - 1` on a
     // multi-byte trailing char would panic on a non-char-boundary. Walk
     // the chars and slice on the codepoint start instead.
-    let last_char_start = s
-        .char_indices()
-        .next_back()
-        .ok_or_else(|| AdminError::Arg("empty duration string".into()))?
-        .0;
+    let last_char_start = s.char_indices().next_back().ok_or_else(|| bad("empty"))?.0;
     let (num_str, unit) = s.split_at(last_char_start);
     if num_str.is_empty() {
-        return Err(AdminError::Arg(format!(
-            "missing numeric value in duration: {s}"
-        )));
+        return Err(bad("missing numeric value"));
     }
-    let num: u64 = num_str
-        .parse()
-        .map_err(|_| AdminError::Arg(format!("invalid duration number: {num_str}")))?;
+    let num: u64 = num_str.parse().map_err(|_| bad("invalid numeric value"))?;
 
     let seconds = match unit {
         "s" => Some(num),
@@ -258,13 +254,9 @@ pub fn parse_duration(s: &str) -> Result<Duration, AdminError> {
         "h" => num.checked_mul(3600),
         "d" => num.checked_mul(86_400),
         "w" => num.checked_mul(604_800),
-        _ => {
-            return Err(AdminError::Arg(format!(
-                "unknown duration unit: {unit} (use s/m/h/d/w)"
-            )));
-        }
+        _ => return Err(bad("unknown duration unit (use s/m/h/d/w)")),
     }
-    .ok_or_else(|| AdminError::Arg(format!("duration too large: {s}")))?;
+    .ok_or_else(|| bad("duration too large"))?;
 
     Ok(Duration::from_secs(seconds))
 }
@@ -353,7 +345,7 @@ mod tests {
     #[test]
     fn parse_duration_multibyte_trailing_char_doesnt_panic() {
         // `日` is 3 bytes — naive `split_at(len-1)` would panic on a
-        // non-char-boundary. Must come back as a clean Arg error instead.
+        // non-char-boundary. Must come back as a clean error instead.
         let err = parse_duration("90日").unwrap_err().to_string();
         assert!(err.contains("unknown duration unit"), "got: {err}");
     }
@@ -374,7 +366,7 @@ mod tests {
     #[test]
     fn parse_duration_rejects_never_literal() {
         let err = parse_duration("never").unwrap_err().to_string();
-        assert!(err.contains("omitting --expires"), "got: {err}");
+        assert!(err.contains("omit --expires"), "got: {err}");
     }
 
     fn grant_for(app: &str, role: &str) -> RoleAssignment {
