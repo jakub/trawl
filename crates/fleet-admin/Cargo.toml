@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "fleet_admin"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fleet-admin"
 path = "src/main.rs"

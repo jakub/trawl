@@ -12,6 +12,10 @@
 #[macro_use]
 mod common;
 
+use std::time::Duration;
+
+use fleet_admin::commands::keys::{self, KeyPrefix};
+use fleet_admin::error::AdminError;
 use fleet_auth::{AuthError, KeyStore, PrincipalKind, RoleAssignment};
 
 fn trawl_admin() -> RoleAssignment {
@@ -156,5 +160,74 @@ pg_test!(
             matches!(err, AuthError::KeyNotFound { ref prefix } if prefix == "ghostpfx"),
             "expected KeyNotFound, got {err:?}"
         );
+    }
+);
+
+pg_test!(
+    create_with_expires_persists_expires_at,
+    |store: KeyStore| async move {
+        let ninety_days = Duration::from_secs(90 * 86_400);
+        let before = chrono::Utc::now();
+        keys::create(
+            &store,
+            "exp",
+            PrincipalKind::Service,
+            &[trawl_admin()],
+            Some(ninety_days),
+        )
+        .await
+        .expect("create");
+
+        let listed = store.list_keys(true).await.expect("list");
+        assert_eq!(listed.len(), 1);
+        let expires_at = listed[0].expires_at.expect("expires_at must be populated");
+
+        let expected = before + chrono::Duration::seconds(90 * 86_400);
+        let delta = (expires_at - expected).num_seconds().abs();
+        assert!(
+            delta < 5,
+            "expires_at drift {delta}s vs expected {expected}, got {expires_at}"
+        );
+    }
+);
+
+pg_test!(
+    revoke_twice_returns_already_revoked,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("twice", PrincipalKind::Human, &[trawl_admin()], None)
+            .await
+            .unwrap();
+        let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
+
+        keys::revoke(&store, &prefix, true)
+            .await
+            .expect("first revoke");
+
+        let err = keys::revoke(&store, &prefix, true)
+            .await
+            .expect_err("second revoke must error");
+        assert!(
+            matches!(err, AdminError::AlreadyRevoked { ref prefix, .. } if prefix == &created.info.prefix),
+            "expected AlreadyRevoked, got {err:?}"
+        );
+    }
+);
+
+pg_test!(
+    create_duplicate_name_is_allowed,
+    |store: KeyStore| async move {
+        // Pin the schema contract — name is NOT unique, two keys can share
+        // a label (operators distinguish them by prefix).
+        store
+            .create_key("dup", PrincipalKind::Service, &[], None)
+            .await
+            .expect("first");
+        store
+            .create_key("dup", PrincipalKind::Service, &[], None)
+            .await
+            .expect("second");
+        let all = store.list_keys(true).await.unwrap();
+        assert_eq!(all.iter().filter(|k| k.name == "dup").count(), 2);
     }
 );

@@ -12,11 +12,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fleet_auth::{KeyStore, PrincipalKind, RoleAssignment};
 use sqlx_postgres::{PgPool, PgPoolOptions};
 
-mod commands;
-mod error;
-
-use commands::keys::KeyPrefix;
-use error::AdminError;
+use fleet_admin::commands;
+use fleet_admin::commands::keys::KeyPrefix;
+use fleet_admin::error::AdminError;
 
 /// Fleet-wide operational CLI.
 #[derive(Parser)]

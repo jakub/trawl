@@ -29,3 +29,22 @@ pub fn run() -> Result<(), AdminError> {
     out.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use fleet_auth::SessionKey;
+
+    #[test]
+    fn generated_key_encodes_to_43_base64url_chars() {
+        for _ in 0..16 {
+            let encoded = SessionKey::generate().to_base64url();
+            let s = encoded.as_str();
+            assert_eq!(s.len(), 43, "expected 43 chars, got {} in {s:?}", s.len());
+            assert!(
+                s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "non-base64url char in {s:?}"
+            );
+        }
+    }
+}
