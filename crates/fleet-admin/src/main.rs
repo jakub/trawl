@@ -6,6 +6,7 @@
 
 use std::io::Write;
 use std::process;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use fleet_auth::{KeyStore, PrincipalKind, RoleAssignment};
@@ -14,6 +15,7 @@ use sqlx_postgres::{PgPool, PgPoolOptions};
 mod commands;
 mod error;
 
+use commands::keys::KeyPrefix;
 use error::AdminError;
 
 /// Fleet-wide operational CLI.
@@ -51,11 +53,11 @@ enum KeysAction {
         /// Repeatable `app:role` grant (e.g. `--grant trawl:admin
         /// --grant coastwatch:siem_consumer`). May be empty — a grantless
         /// key authenticates but authorizes nothing until grants are added.
-        #[arg(long = "grant", value_name = "APP:ROLE")]
-        grants: Vec<String>,
+        #[arg(long = "grant", value_name = "APP:ROLE", value_parser = commands::keys::parse_grant)]
+        grants: Vec<RoleAssignment>,
         /// Expiration duration (e.g. `90d`, `24h`, `52w`). Omit for no expiry.
-        #[arg(long)]
-        expires: Option<String>,
+        #[arg(long, value_parser = commands::keys::parse_duration)]
+        expires: Option<Duration>,
     },
     /// List API keys (active only by default).
     List {
@@ -66,7 +68,8 @@ enum KeysAction {
     /// Revoke an API key by its prefix.
     Revoke {
         /// The key prefix (shown in `keys list`).
-        prefix: String,
+        #[arg(value_parser = KeyPrefix::parse)]
+        prefix: KeyPrefix,
         /// Skip the interactive confirmation prompt.
         #[arg(long, short)]
         yes: bool,
@@ -74,9 +77,11 @@ enum KeysAction {
     /// Add an `app:role` grant to an existing key.
     Grant {
         /// The key prefix (shown in `keys list`).
-        prefix: String,
+        #[arg(value_parser = KeyPrefix::parse)]
+        prefix: KeyPrefix,
         /// The `app:role` grant to add.
-        grant: String,
+        #[arg(value_parser = commands::keys::parse_grant)]
+        grant: RoleAssignment,
     },
 }
 
@@ -132,19 +137,10 @@ async fn dispatch_keys(store: KeyStore, action: KeysAction) -> Result<(), AdminE
             kind,
             grants,
             expires,
-        } => {
-            let parsed: Vec<RoleAssignment> = grants
-                .iter()
-                .map(|g| commands::keys::parse_grant(g))
-                .collect::<Result<_, _>>()?;
-            commands::keys::create(&store, &name, kind.into(), &parsed, expires.as_deref()).await
-        }
+        } => commands::keys::create(&store, &name, kind.into(), &grants, expires).await,
         KeysAction::List { all } => commands::keys::list(&store, all).await,
         KeysAction::Revoke { prefix, yes } => commands::keys::revoke(&store, &prefix, yes).await,
-        KeysAction::Grant { prefix, grant } => {
-            let assignment = commands::keys::parse_grant(&grant)?;
-            commands::keys::grant(&store, &prefix, &assignment).await
-        }
+        KeysAction::Grant { prefix, grant } => commands::keys::grant(&store, &prefix, &grant).await,
     }
 }
 

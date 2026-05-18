@@ -30,6 +30,9 @@ pub enum AdminError {
     #[error("invalid --expires {input:?}: {reason}")]
     InvalidDuration { input: String, reason: &'static str },
 
+    #[error("invalid key prefix {input:?}: {reason}")]
+    InvalidKeyPrefix { input: String, reason: &'static str },
+
     #[error("key {prefix} ({name}) is already revoked")]
     AlreadyRevoked { prefix: String, name: String },
 
