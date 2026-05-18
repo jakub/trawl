@@ -7,8 +7,8 @@
 //! Brand-skinned card with one password field and a submit button.
 //! All async work — calling the auth endpoint, surfacing errors,
 //! navigating on success — lives in the caller's `on_submit` closure,
-//! which receives the key string and the configured
-//! `post_login_redirect` path. The component is a pure form; the
+//! which receives just the entered API key. The consumer captures its
+//! own post-login redirect target. The component is a pure form; the
 //! consumer drives `error` and `submitting` signals to display
 //! validation feedback and the spinner state.
 
@@ -17,10 +17,9 @@ use leptos::prelude::*;
 
 #[component]
 pub fn Login(
-    brand: &'static str,
-    brand_accent: &'static str,
-    post_login_redirect: &'static str,
-    on_submit: Callback<(String, &'static str)>,
+    #[prop(into)] brand: String,
+    #[prop(into)] brand_accent: String,
+    on_submit: Callback<String>,
     #[prop(into)] error: Signal<Option<String>>,
     #[prop(into)] submitting: Signal<bool>,
 ) -> impl IntoView {
@@ -35,7 +34,7 @@ pub fn Login(
             return;
         }
         set_local_error.set(None);
-        on_submit.run((key, post_login_redirect));
+        on_submit.run(key);
     };
 
     // Local validation wins over the external error signal: if the user

@@ -20,13 +20,13 @@ use crate::topbar::{AppLink, ModeTab, TopBar, UserInfo};
 
 #[component]
 pub fn Shell(
-    brand: &'static str,
-    brand_accent: &'static str,
-    #[prop(into)] rail_items: Signal<&'static [RailItem]>,
+    #[prop(into)] brand: String,
+    #[prop(into)] brand_accent: String,
+    #[prop(into)] rail_items: Signal<Vec<RailItem>>,
     #[prop(into)] rail_active: Signal<String>,
     #[prop(into)] modes: Signal<Vec<ModeTab>>,
     #[prop(into)] user: Signal<Option<UserInfo>>,
-    #[prop(optional)] app_links: &'static [AppLink],
+    #[prop(into, optional)] app_links: Signal<Vec<AppLink>>,
     on_logout: Callback<()>,
     footer: Children,
     children: Children,

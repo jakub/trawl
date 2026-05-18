@@ -16,35 +16,33 @@ fn item_class(active: bool) -> &'static str {
     if active { "it active" } else { "it" }
 }
 
-/// Aliased so trawl-web-ui consumers can rename their imports without
-/// touching item-construction sites.
-pub type RailIcon = Icon;
-
 /// A single item in the rail. `path` is the route navigated to on
 /// click; `id` is the discriminant the parent compares against the
 /// `active` signal to drive the amber-bar styling.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RailItem {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub icon: RailIcon,
-    pub path: &'static str,
+    pub id: String,
+    pub label: String,
+    pub icon: Icon,
+    pub path: String,
 }
 
 #[component]
 pub fn Rail(
-    #[prop(into)] items: Signal<&'static [RailItem]>,
+    #[prop(into)] items: Signal<Vec<RailItem>>,
     #[prop(into)] active: Signal<String>,
 ) -> impl IntoView {
     view! {
         <nav class="rail">
             {move || {
-                items.get().iter().copied().map(|item| {
+                items.get().into_iter().map(|item| {
+                    let id = item.id.clone();
+                    let label_attr = item.label.clone();
                     view! {
                         <A
                             href=item.path
-                            attr:class=move || item_class(active.get() == item.id)
-                            attr:title=item.label
+                            attr:class=move || item_class(active.get() == id)
+                            attr:title=label_attr
                         >
                             <IconView icon=item.icon size=16 stroke_width=1.4/>
                             <span class="lb">{item.label}</span>

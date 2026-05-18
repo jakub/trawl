@@ -21,19 +21,19 @@ use crate::theme::UiPrefs;
 /// without any wiring inside fleet-ui.
 #[derive(Debug, Clone)]
 pub struct ModeTab {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub path: &'static str,
+    pub id: String,
+    pub label: String,
+    pub path: String,
     pub active: bool,
 }
 
 /// A cross-app navigation link rendered in the topbar's app-switcher
-/// area. Coastwatch and trawl will each ship a small static slice so
-/// users can hop between fleet apps without re-authenticating.
-#[derive(Debug, Clone, Copy)]
+/// area. Coastwatch and trawl each ship a small slice so users can hop
+/// between fleet apps without re-authenticating.
+#[derive(Debug, Clone)]
 pub struct AppLink {
-    pub label: &'static str,
-    pub href: &'static str,
+    pub label: String,
+    pub href: String,
     pub active: bool,
 }
 
@@ -48,10 +48,10 @@ pub struct UserInfo {
 
 #[component]
 pub fn TopBar(
-    brand: &'static str,
-    brand_accent: &'static str,
+    #[prop(into)] brand: String,
+    #[prop(into)] brand_accent: String,
     #[prop(into)] modes: Signal<Vec<ModeTab>>,
-    #[prop(optional)] app_links: &'static [AppLink],
+    #[prop(into, optional)] app_links: Signal<Vec<AppLink>>,
     #[prop(into)] user: Signal<Option<UserInfo>>,
     on_logout: Callback<()>,
 ) -> impl IntoView {
@@ -61,6 +61,13 @@ pub fn TopBar(
     let toggle_theme = move |_| {
         if let Some(p) = prefs {
             p.theme.update(|t| *t = t.toggled());
+        } else {
+            // Developer-facing: consumer mounted <TopBar/> without calling
+            // `fleet_ui::install()`, so the theme toggle silently does
+            // nothing. Surface it so it's caught in dev, not QA.
+            leptos::logging::warn!(
+                "fleet-ui TopBar: UiPrefs context missing — did you call fleet_ui::install()?"
+            );
         }
     };
 
@@ -110,16 +117,19 @@ pub fn TopBar(
                 <IconView icon=Icon::Bell size=14 stroke_width=1.5/>
             </div>
 
-            {(!app_links.is_empty()).then(|| view! {
-                <div class="app-links">
-                    {app_links.iter().copied().map(|link| view! {
-                        <a
-                            href=link.href
-                            class=if link.active { "app-link active" } else { "app-link" }
-                        >{link.label}</a>
-                    }).collect::<Vec<_>>()}
-                </div>
-            })}
+            {move || {
+                let links = app_links.get();
+                (!links.is_empty()).then(|| view! {
+                    <div class="app-links">
+                        {links.into_iter().map(|link| {
+                            let class = if link.active { "app-link active" } else { "app-link" };
+                            view! {
+                                <a href=link.href class=class>{link.label}</a>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </div>
+                })
+            }}
 
             <div class="user-wrap">
                 <div class="user" on:click=move |_| menu_open.update(|v| *v = !*v)>
@@ -183,6 +193,15 @@ fn theme_label(prefs: Option<UiPrefs>) -> String {
     use crate::theme::Theme;
     match prefs.map(|p| p.theme.get()) {
         Some(Theme::Dark) => "Switch to light theme".into(),
-        Some(Theme::Light) | None => "Switch to dark theme".into(),
+        Some(Theme::Light) => "Switch to dark theme".into(),
+        None => {
+            // Same root cause as the toggle_theme warn above: consumer
+            // forgot `fleet_ui::install()`. The label is meaningless without
+            // prefs, but we still render something so the UI doesn't break.
+            leptos::logging::warn!(
+                "fleet-ui TopBar: UiPrefs context missing — did you call fleet_ui::install()?"
+            );
+            "Theme (unavailable)".into()
+        }
     }
 }

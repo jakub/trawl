@@ -23,7 +23,7 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 // TopBar and Rail are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
-use fleet_ui::{AppLink, Icon, Login, ModeTab, RailIcon, RailItem, Shell, UserInfo, install};
+use fleet_ui::{AppLink, Icon, Login, ModeTab, RailItem, Shell, UserInfo, install};
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -32,54 +32,58 @@ use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 
 #[cfg(target_arch = "wasm32")]
-static RAIL_ITEMS: &[RailItem] = &[
-    RailItem {
-        id: "home",
-        label: "Home",
-        icon: RailIcon::Grid,
-        path: "/",
-    },
-    RailItem {
-        id: "search",
-        label: "Search",
-        icon: RailIcon::Search,
-        path: "/search",
-    },
-    RailItem {
-        id: "alerts",
-        label: "Alerts",
-        icon: RailIcon::Alert,
-        path: "/alerts",
-    },
-];
+fn rail_items() -> Vec<RailItem> {
+    vec![
+        RailItem {
+            id: "home".into(),
+            label: "Home".into(),
+            icon: Icon::Grid,
+            path: "/".into(),
+        },
+        RailItem {
+            id: "search".into(),
+            label: "Search".into(),
+            icon: Icon::Search,
+            path: "/search".into(),
+        },
+        RailItem {
+            id: "alerts".into(),
+            label: "Alerts".into(),
+            icon: Icon::Alert,
+            path: "/alerts".into(),
+        },
+    ]
+}
 
 #[cfg(target_arch = "wasm32")]
-static APP_LINKS: &[AppLink] = &[
-    AppLink {
-        label: "trawl",
-        href: "https://trawl.example/",
-        active: false,
-    },
-    AppLink {
-        label: "demo",
-        href: "/",
-        active: true,
-    },
-];
+fn app_links() -> Vec<AppLink> {
+    vec![
+        AppLink {
+            label: "trawl".into(),
+            href: "https://trawl.example/".into(),
+            active: false,
+        },
+        AppLink {
+            label: "demo".into(),
+            href: "/".into(),
+            active: true,
+        },
+    ]
+}
 
 #[cfg(target_arch = "wasm32")]
 fn modes() -> Vec<ModeTab> {
     vec![
         ModeTab {
-            id: "logs",
-            label: "Logs",
-            path: "/",
+            id: "logs".into(),
+            label: "Logs".into(),
+            path: "/".into(),
             active: true,
         },
         ModeTab {
-            id: "settings",
-            label: "Settings",
-            path: "/settings",
+            id: "settings".into(),
+            label: "Settings".into(),
+            path: "/settings".into(),
             active: false,
         },
     ]
@@ -88,7 +92,8 @@ fn modes() -> Vec<ModeTab> {
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn DemoApp() -> impl IntoView {
-    let rail_items = Signal::derive(|| RAIL_ITEMS);
+    let rail_items_sig = Signal::derive(rail_items);
+    let app_links_sig = Signal::derive(app_links);
     let rail_active = Signal::derive(|| "home".to_string());
     let modes_sig = Signal::derive(modes);
     let user = Signal::derive(|| {
@@ -105,8 +110,7 @@ fn DemoApp() -> impl IntoView {
                     <Login
                         brand="demo"
                         brand_accent="·"
-                        post_login_redirect="/"
-                        on_submit=Callback::new(|(_key, _redirect): (String, &'static str)| {})
+                        on_submit=Callback::new(|_key: String| {})
                         error=Signal::derive(|| Option::<String>::None)
                         submitting=Signal::derive(|| false)
                     />
@@ -115,11 +119,11 @@ fn DemoApp() -> impl IntoView {
                     <Shell
                         brand="demo"
                         brand_accent="·"
-                        rail_items=rail_items
+                        rail_items=rail_items_sig
                         rail_active=rail_active
                         modes=modes_sig
                         user=user
-                        app_links=APP_LINKS
+                        app_links=app_links_sig
                         on_logout=Callback::new(|()| {})
                         footer=Box::new(|| view! {
                             <div class="statusbar">"demo footer"</div>

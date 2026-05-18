@@ -50,7 +50,7 @@ pub use login::Login;
 #[cfg(target_arch = "wasm32")]
 pub use modal::ConfirmModal;
 #[cfg(target_arch = "wasm32")]
-pub use rail::{Rail, RailIcon, RailItem};
+pub use rail::{Rail, RailItem};
 #[cfg(target_arch = "wasm32")]
 pub use shell::Shell;
 #[cfg(target_arch = "wasm32")]
