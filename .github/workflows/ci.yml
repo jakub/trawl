@@ -126,7 +126,7 @@ jobs:
       - run: cargo deny check
 
   wasm-check:
-    name: wasm32 check (web UI)
+    name: wasm32 check (web UI + fleet-ui)
     runs-on: k8s-small
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -137,6 +137,7 @@ jobs:
         with:
           shared-key: wasm-check
       - run: cargo check -p trawl-web-ui --target wasm32-unknown-unknown
+      - run: cargo check -p fleet-ui --target wasm32-unknown-unknown
 
   vendor-drift:
     name: web UI vendor bundle drift

@@ -1735,7 +1735,6 @@ dependencies = [
  "sqlx-postgres",
  "thiserror 2.0.18",
  "tokio",
- "zeroize",
 ]
 
 [[package]]
@@ -1761,6 +1760,17 @@ dependencies = [
  "tower",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "fleet-ui"
+version = "0.2.2"
+dependencies = [
+ "gloo-timers",
+ "leptos",
+ "serde_json",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
