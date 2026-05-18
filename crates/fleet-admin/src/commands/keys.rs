@@ -503,6 +503,53 @@ mod tests {
         assert_eq!(format_timestamp(&ts), "2026-02-10 12:00:00");
     }
 
+    fn run_prompt(input: &str) -> (bool, String) {
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut writer: Vec<u8> = Vec::new();
+        let result = revoke_prompt(&mut reader, &mut writer).expect("prompt io");
+        (result, String::from_utf8(writer).expect("utf8"))
+    }
+
+    #[test]
+    fn revoke_prompt_accepts_y_variants() {
+        for ans in ["y\n", "Y\n", "yes\n", "YES\n", "  y  \n"] {
+            let (accepted, _) = run_prompt(ans);
+            assert!(accepted, "{ans:?} should accept");
+        }
+    }
+
+    #[test]
+    fn revoke_prompt_rejects_n_and_blank() {
+        for ans in ["n\n", "N\n", "no\n", "\n", "  \n", "maybe\n"] {
+            let (accepted, out) = run_prompt(ans);
+            assert!(!accepted, "{ans:?} should reject");
+            assert!(out.contains("aborted"), "expected 'aborted' in {out:?}");
+            assert!(
+                !out.contains("stdin closed"),
+                "non-EOF should not mention stdin closure"
+            );
+        }
+    }
+
+    #[test]
+    fn revoke_prompt_eof_is_distinguishable_from_no() {
+        let (accepted, out) = run_prompt("");
+        assert!(!accepted);
+        assert!(
+            out.contains("stdin closed before answer"),
+            "expected EOF marker in {out:?}"
+        );
+    }
+
+    #[test]
+    fn revoke_prompt_writes_question_before_reading() {
+        let (_, out) = run_prompt("n\n");
+        assert!(
+            out.contains("revoke this key? [y/N]"),
+            "missing prompt text in {out:?}"
+        );
+    }
+
     #[test]
     fn format_assignments_renders_or_falls_back() {
         assert_eq!(format_assignments(&[]), "(none)");
