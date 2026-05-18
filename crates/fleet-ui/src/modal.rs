@@ -17,9 +17,11 @@
 //! The inline `CloseIcon` SVG stays here — the typed `Icon` enum
 //! arrives in coastwatch#38.
 
+use leptos::ev;
 use leptos::html::Div;
 use leptos::prelude::*;
 use leptos::web_sys;
+use leptos_use::{use_event_listener, use_window};
 use wasm_bindgen::JsCast;
 
 use crate::button::{Btn, Variant};
@@ -35,12 +37,19 @@ pub fn ConfirmModal(
 ) -> impl IntoView {
     let scrim_ref = NodeRef::<Div>::new();
 
-    let on_keydown = move |e: web_sys::KeyboardEvent| {
+    // Window-level Escape: bound to `window` rather than the scrim div so it
+    // fires regardless of focus. The previous scrim-bound `on:keydown` only
+    // dispatched when the scrim itself had focus, which it never does on
+    // open — meaning Esc was a no-op until the user clicked the scrim.
+    // use_event_listener registers an on_cleanup hook internally, so the
+    // listener disposes when the component unmounts; the returned cleanup
+    // handle is discarded intentionally.
+    let _ = use_event_listener(use_window(), ev::keydown, move |e| {
         if e.key() == "Escape" {
             e.prevent_default();
             on_cancel.run(());
         }
-    };
+    });
 
     let on_scrim_mousedown = move |e: web_sys::MouseEvent| {
         // Identity comparison: only dismiss when the click landed on the
@@ -64,7 +73,6 @@ pub fn ConfirmModal(
             class="modal-scrim"
             node_ref=scrim_ref
             on:mousedown=on_scrim_mousedown
-            on:keydown=on_keydown
         >
             <div class="modal modal-sm" role="alertdialog" aria-modal="true">
                 <div class="m-hd">
