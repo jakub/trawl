@@ -132,18 +132,16 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
     eprintln!("  created: {}", format_timestamp(&info.created_at));
 
     if !yes {
-        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        use std::io::IsTerminal as _;
+        let stdin = std::io::stdin();
+        let stderr = std::io::stderr();
+        if !stdin.is_terminal() || !stderr.is_terminal() {
             return Err(AdminError::NonInteractive);
         }
 
-        eprint!("\nrevoke this key? [y/N] ");
-        std::io::stderr().flush()?;
-
-        let mut answer = String::new();
-        std::io::stdin().lock().read_line(&mut answer)?;
-
-        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
-            eprintln!("aborted");
+        let mut writer = stderr.lock();
+        let mut reader = stdin.lock();
+        if !revoke_prompt(&mut reader, &mut writer)? {
             return Ok(());
         }
     }
@@ -151,6 +149,34 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
     let revoked = store.revoke_key(prefix.as_str()).await?;
     eprintln!("revoked key: {} ({})", revoked.prefix, revoked.name);
     Ok(())
+}
+
+/// Pure prompt loop, factored out for unit testing.
+///
+/// Writes `"revoke this key? [y/N] "` and reads one line. Returns `Ok(true)`
+/// only for `y`/`yes` (case-insensitive). EOF (a zero-byte read) is reported
+/// to the operator before falling through to `Ok(false)` — without that,
+/// "stdin closed mid-prompt" looks identical to "user typed n" in logs.
+pub fn revoke_prompt<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> std::io::Result<bool> {
+    write!(writer, "\nrevoke this key? [y/N] ")?;
+    writer.flush()?;
+
+    let mut answer = String::new();
+    let n = reader.read_line(&mut answer)?;
+    if n == 0 {
+        writeln!(writer, "aborted: stdin closed before answer")?;
+        return Ok(false);
+    }
+
+    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+        Ok(true)
+    } else {
+        writeln!(writer, "aborted")?;
+        Ok(false)
+    }
 }
 
 /// Add a grant to an existing key.
