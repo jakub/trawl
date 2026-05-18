@@ -17,6 +17,42 @@ use fleet_auth::{ApiKeyInfo, KeyStore, PrincipalKind, RoleAssignment};
 
 use crate::error::AdminError;
 
+/// API key prefix as shown in `keys list` — 8 base64url chars.
+///
+/// Constructed via [`KeyPrefix::parse`] (clap `value_parser`) so malformed
+/// values are rejected at parse time, not at the SQL boundary.
+#[derive(Debug, Clone)]
+pub struct KeyPrefix(String);
+
+impl KeyPrefix {
+    pub fn parse(s: &str) -> Result<Self, AdminError> {
+        let bad = |reason: &'static str| AdminError::InvalidKeyPrefix {
+            input: s.to_owned(),
+            reason,
+        };
+        if s.len() != 8 {
+            return Err(bad("key prefix must be 8 characters"));
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(bad("key prefix must be base64url (A-Z, a-z, 0-9, _, -)"));
+        }
+        Ok(Self(s.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for KeyPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Create a new API key.
 ///
 /// Emits the plaintext token to stdout exactly once. All metadata
@@ -26,13 +62,9 @@ pub async fn create(
     name: &str,
     kind: PrincipalKind,
     assignments: &[RoleAssignment],
-    expires: Option<&str>,
+    expires: Option<Duration>,
 ) -> Result<(), AdminError> {
-    let expires_in = expires.map(parse_duration).transpose()?;
-
-    let created = store
-        .create_key(name, kind, assignments, expires_in)
-        .await?;
+    let created = store.create_key(name, kind, assignments, expires).await?;
 
     eprintln!("created API key:\n");
     eprintln!("  name:    {}", created.info.name);
@@ -83,8 +115,8 @@ pub async fn list(store: &KeyStore, all: bool) -> Result<(), AdminError> {
 /// Refuses to revoke when stdin is not a TTY and `--yes` was not passed —
 /// scripts must opt in explicitly so an accidental `keys revoke <prefix>`
 /// in a pipeline never silently nukes a key.
-pub async fn revoke(store: &KeyStore, prefix: &str, yes: bool) -> Result<(), AdminError> {
-    let info = store.get_key_by_prefix(prefix).await?;
+pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(), AdminError> {
+    let info = store.get_key_by_prefix(prefix.as_str()).await?;
 
     if !info.active {
         return Err(AdminError::AlreadyRevoked {
@@ -116,7 +148,7 @@ pub async fn revoke(store: &KeyStore, prefix: &str, yes: bool) -> Result<(), Adm
         }
     }
 
-    let revoked = store.revoke_key(prefix).await?;
+    let revoked = store.revoke_key(prefix.as_str()).await?;
     eprintln!("revoked key: {} ({})", revoked.prefix, revoked.name);
     Ok(())
 }
@@ -124,10 +156,10 @@ pub async fn revoke(store: &KeyStore, prefix: &str, yes: bool) -> Result<(), Adm
 /// Add a grant to an existing key.
 pub async fn grant(
     store: &KeyStore,
-    prefix: &str,
+    prefix: &KeyPrefix,
     assignment: &RoleAssignment,
 ) -> Result<(), AdminError> {
-    store.grant_assignment(prefix, assignment).await?;
+    store.grant_assignment(prefix.as_str(), assignment).await?;
     eprintln!(
         "granted {}:{} to key {}",
         assignment.app, assignment.role, prefix
@@ -140,15 +172,16 @@ pub async fn grant(
 /// Multiple colons are kept in the role half (`foo:super:admin` →
 /// `(foo, super:admin)`) so role names can themselves be namespaced.
 pub fn parse_grant(s: &str) -> Result<RoleAssignment, AdminError> {
-    let (app, role) = s.split_once(':').ok_or_else(|| AdminError::InvalidGrant {
+    let bad = |reason: &'static str| AdminError::InvalidGrant {
         input: s.to_owned(),
-        reason: "expected APP:ROLE",
-    })?;
+        reason,
+    };
+    if s.chars().any(char::is_whitespace) {
+        return Err(bad("whitespace not allowed in APP:ROLE"));
+    }
+    let (app, role) = s.split_once(':').ok_or_else(|| bad("expected APP:ROLE"))?;
     if app.is_empty() || role.is_empty() {
-        return Err(AdminError::InvalidGrant {
-            input: s.to_owned(),
-            reason: "empty app or role",
-        });
+        return Err(bad("empty app or role"));
     }
     Ok(RoleAssignment {
         app: app.to_owned(),
