@@ -188,6 +188,13 @@ impl HotBuffer {
 
         for batch in map.values() {
             for event in &batch.events {
+                // Coerce object/array values to their JSON text so the
+                // snapshot's read_json infers them as VARCHAR (see
+                // `coerce_complex_values`). Returns None when there is
+                // nothing to coerce, avoiding a clone on the common path.
+                let coerced = coerce_complex_values(event);
+                let event = coerced.as_ref().unwrap_or(event);
+
                 // Serialization failure here is very unlikely (we parsed it
                 // successfully during ingest), but log and skip rather than
                 // poisoning the entire snapshot.
@@ -243,6 +250,35 @@ impl HotBuffer {
     pub fn config(&self) -> &HotBufferConfig {
         &self.config
     }
+}
+
+/// Replace top-level object/array values in an event with their JSON-text
+/// serialization, returning `None` when the event has no such values.
+///
+/// Compaction coerces complex-typed parquet columns (STRUCT/JSON/LIST) to
+/// VARCHAR for a stable on-disk schema (see
+/// `compaction::coerce_complex_columns_to_varchar`). The hot buffer must
+/// match: if a field is an object here but VARCHAR in parquet, the
+/// query-time `UNION ALL BY NAME` of the hot and cold sources hits a type
+/// conflict and the executor silently drops the cold (parquet) rows.
+/// Stringifying nested values makes the snapshot's `read_json` infer the
+/// column as VARCHAR, keeping both sides aligned. Scalars are untouched.
+fn coerce_complex_values(
+    event: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    use serde_json::Value;
+
+    if !event.values().any(|v| v.is_object() || v.is_array()) {
+        return None;
+    }
+
+    let mut coerced = event.clone();
+    for value in coerced.values_mut() {
+        if value.is_object() || value.is_array() {
+            *value = Value::String(value.to_string());
+        }
+    }
+    Some(coerced)
 }
 
 #[cfg(test)]
@@ -304,6 +340,50 @@ mod tests {
         assert_eq!(content.lines().count(), 3);
         assert!(content.contains("event_0"));
         assert!(content.contains("event_2"));
+    }
+
+    #[test]
+    fn snapshot_stringifies_complex_values() {
+        // An object-valued field must be serialized as a JSON string so the
+        // snapshot's read_json infers it as VARCHAR — matching the parquet
+        // side and avoiding a hot/cold union type conflict that would
+        // silently drop cold rows. Scalars stay as-is.
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        });
+
+        let mut ev = serde_json::Map::new();
+        ev.insert("service".into(), serde_json::Value::String("k".into()));
+        ev.insert("count".into(), serde_json::Value::from(5));
+        ev.insert(
+            "containerID".into(),
+            serde_json::json!({"id": "abc", "rt": "containerd"}),
+        );
+        buf.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "k".into(),
+            byte_size: 100,
+            events: vec![ev],
+        }));
+
+        let tmpfile = buf.snapshot().expect("should have events");
+        let content = std::fs::read_to_string(tmpfile.path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+
+        assert!(
+            parsed["containerID"].is_string(),
+            "object field should be stringified: {content}"
+        );
+        assert!(
+            parsed["containerID"].as_str().unwrap().contains("abc"),
+            "stringified JSON should preserve content"
+        );
+        assert!(
+            parsed["count"].is_number(),
+            "scalar field must not be stringified"
+        );
+        assert!(parsed["service"].is_string());
     }
 
     #[test]
