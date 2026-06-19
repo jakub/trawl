@@ -232,6 +232,11 @@ jobs:
       - name: Download .deb artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          # Only the .deb artifacts — without this filter download-artifact
+          # also tries to fetch the buildx `.dockerbuild` build-record (and the
+          # dist tarballs), and the dockerbuild artifact reliably fails to
+          # download, wedging the whole APT publish.
+          pattern: deb-*
           path: incoming
           merge-multiple: true
 
