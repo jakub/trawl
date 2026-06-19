@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-19
+
+### Fixed
+- Quarantine corrupt WAL `.ndjson` files (NUL-filled or truncated torn-write debris from a hard kill) instead of letting one bad file head-of-line-block a service's compaction forever; good files in the same batch still compact, and an all-corrupt batch is counted as data loss rather than retried indefinitely
+- Per-file read isolation on WAL compaction: a malformed-but-textual file that slips past the byte sniff is isolated and quarantined rather than wedging the whole batch, so no corruption shape can stall compaction
+- fsync WAL writes — data fsync before the rename, parent-directory fsync after — so a hard SIGKILL can no longer leave a full-length but NUL-filled `.ndjson` poison pill; the parent-dir fsync is best-effort so it can't falsely reject an already-durable write
+
 ## [0.3.0] - 2026-06-18
 
 ### Added
@@ -150,7 +157,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Scheduled queries with cron-style execution
 - CI/CD with cross-compiled binaries, .deb packages, and APT repository
 
-[Unreleased]: https://github.com/jakub/trawl/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jakub/trawl/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/jakub/trawl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jakub/trawl/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jakub/trawl/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/jakub/trawl/compare/v0.1.7...v0.1.8
