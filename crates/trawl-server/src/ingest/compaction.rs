@@ -411,16 +411,31 @@ fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
                 let _ = std::fs::remove_file(f);
             }
         } else if tmp.exists() {
-            // Crash after write but before rename — complete the rename.
-            tracing::info!(
-                event_type = "rollup_recovery",
-                compact_service = %service,
-                "recovering rollup: renaming tmp to canonical"
-            );
-            std::fs::rename(&tmp, &canonical)
-                .map_err(|e| format!("rollup recovery rename failed: {e}"))?;
-            for f in &hourly_files {
-                let _ = std::fs::remove_file(f);
+            if is_valid_parquet(&tmp) {
+                // Crash after a complete .tmp write but before rename —
+                // promote it and clean up the merged hourly sources.
+                tracing::info!(
+                    event_type = "rollup_recovery",
+                    compact_service = %service,
+                    "recovering rollup: renaming tmp to canonical"
+                );
+                std::fs::rename(&tmp, &canonical)
+                    .map_err(|e| format!("rollup recovery rename failed: {e}"))?;
+                for f in &hourly_files {
+                    let _ = std::fs::remove_file(f);
+                }
+            } else {
+                // Crash MID-COPY left a truncated .tmp. Promoting it would
+                // persist an unreadable parquet under the canonical name
+                // (the origin of "too small to be a Parquet file" errors).
+                // Quarantine it and KEEP the hourly files so the next tick
+                // re-rolls them from scratch.
+                tracing::warn!(
+                    event_type = "rollup_recovery",
+                    compact_service = %service,
+                    "discarding truncated rollup tmp; retaining hourly files for retry"
+                );
+                quarantine_file(&tmp, service);
             }
         } else {
             // Neither exists — stale marker.
@@ -436,6 +451,69 @@ fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Parquet magic bytes, written at both the start and end of every valid
+/// parquet file.
+const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
+
+/// Cheap structural validity check for a parquet file.
+///
+/// A valid parquet file is at least large enough to hold its header and
+/// footer magic and starts and ends with the `PAR1` magic bytes. This
+/// catches zero-byte and truncated files (e.g. a crash mid-`COPY`) before
+/// they reach `read_parquet`, where they otherwise surface as
+/// "File ... too small to be a Parquet file" and wedge the rollup forever
+/// — no amount of retrying repairs a truncated file.
+fn is_valid_parquet(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    // Header magic (4) + a minimal footer + footer length (4) + trailer
+    // magic (4). Anything below this cannot be a parquet file.
+    if meta.len() < 12 {
+        return false;
+    }
+    let mut head = [0u8; 4];
+    if file.read_exact(&mut head).is_err() || &head != PARQUET_MAGIC {
+        return false;
+    }
+    let mut tail = [0u8; 4];
+    if file.seek(SeekFrom::End(-4)).is_err() || file.read_exact(&mut tail).is_err() {
+        return false;
+    }
+    &tail == PARQUET_MAGIC
+}
+
+/// Move a corrupt/unreadable parquet file aside so it stops wedging the
+/// rollup, preserving the bytes for forensics. Appends `.corrupt` to the
+/// filename, which makes it inert (it no longer matches the `*.parquet`
+/// or `*.tmp` globs that compaction scans).
+fn quarantine_file(path: &Path, service: &str) {
+    let mut quarantined = path.as_os_str().to_owned();
+    quarantined.push(".corrupt");
+    let quarantined = PathBuf::from(quarantined);
+    match std::fs::rename(path, &quarantined) {
+        Ok(()) => tracing::warn!(
+            event_type = "rollup_quarantine",
+            compact_service = %service,
+            from = %path.display(),
+            to = %quarantined.display(),
+            "quarantined corrupt parquet file"
+        ),
+        Err(e) => tracing::error!(
+            event_type = "rollup_quarantine",
+            compact_service = %service,
+            file = %path.display(),
+            error = %e,
+            "failed to quarantine corrupt parquet file"
+        ),
+    }
 }
 
 /// Blocking: merge hourly parquet files for one service into a daily file.
@@ -474,11 +552,33 @@ fn rollup_day_blocking(
 
     // Build the merge input list: all hourly files, plus the existing
     // day-level file (late-arriving data merges into it after a prior
-    // rollup).
+    // rollup). Validate each input and quarantine truncated/corrupt files
+    // so one bad file (e.g. a crash mid-COPY) doesn't wedge the rollup
+    // forever. `merged_hourly` tracks the valid hourlies we will delete on
+    // success — quarantined files are already renamed away.
     let canonical_path = day_dir.join(format!("{service}.parquet"));
-    let mut all_files: Vec<PathBuf> = hourly_files.to_vec();
+    let mut all_files: Vec<PathBuf> = Vec::with_capacity(hourly_files.len() + 1);
+    let mut merged_hourly: Vec<PathBuf> = Vec::with_capacity(hourly_files.len());
+    for f in hourly_files {
+        if is_valid_parquet(f) {
+            all_files.push(f.clone());
+            merged_hourly.push(f.clone());
+        } else {
+            quarantine_file(f, service);
+        }
+    }
     if canonical_path.exists() {
-        all_files.push(canonical_path.clone());
+        if is_valid_parquet(&canonical_path) {
+            all_files.push(canonical_path.clone());
+        } else {
+            quarantine_file(&canonical_path, service);
+        }
+    }
+
+    // Every input was corrupt and has been quarantined — nothing readable
+    // to merge, and nothing left to retry. Return cleanly.
+    if all_files.is_empty() {
+        return Ok(());
     }
 
     let file_list_sql = all_files
@@ -518,14 +618,14 @@ fn rollup_day_blocking(
     }
 
     // Write marker BEFORE rename so recovery knows which hourlies to clean up.
-    write_rollup_marker(day_dir, service, hourly_files)?;
+    write_rollup_marker(day_dir, service, &merged_hourly)?;
 
     // Atomic rename.
     std::fs::rename(&tmp_path, &canonical_path)
         .map_err(|e| format!("rollup rename failed: {e}"))?;
 
-    // Delete hourly source files.
-    for f in hourly_files {
+    // Delete the hourly source files that were merged.
+    for f in &merged_hourly {
         if let Err(e) = std::fs::remove_file(f) {
             tracing::warn!(
                 event_type = "rollup_error",
@@ -546,7 +646,7 @@ fn rollup_day_blocking(
         event_type = "rollup_complete",
         compact_service = %service,
         output = %canonical_path.display(),
-        hourly_files = hourly_files.len(),
+        hourly_files = merged_hourly.len(),
         output_bytes,
         duration_ms,
         "daily rollup complete"
@@ -1863,8 +1963,11 @@ mod tests {
         let tmp_file = day_dir.join("nginx.parquet.tmp");
         let marker = day_dir.join(".rollup-nginx");
 
-        // Simulate: .tmp was written, marker exists, no canonical yet.
-        std::fs::write(&tmp_file, b"merged data").unwrap();
+        // Simulate: a COMPLETE .tmp was written, marker exists, no canonical
+        // yet. A real interrupted-after-write tmp is a valid parquet, so use
+        // f1's bytes (recovery validates before promoting — see
+        // `recovery_discards_truncated_tmp` for the truncated case).
+        std::fs::copy(&f1, &tmp_file).unwrap();
         write_rollup_marker(&day_dir, "nginx", std::slice::from_ref(&f1)).unwrap();
         assert!(!canonical.exists());
         assert!(tmp_file.exists());
@@ -1890,5 +1993,133 @@ mod tests {
 
         recover_rollup_markers(&day_dir).unwrap();
         assert!(!marker.exists(), "stale marker should be removed");
+    }
+
+    #[test]
+    fn is_valid_parquet_detects_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // A real parquet file is valid.
+        let data_dir = dir.join("data");
+        let r = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"x","m":"y"}"#;
+        let good = write_hourly_parquet(&data_dir, "2026-01-15", "01", "x", &[r]);
+        assert!(is_valid_parquet(&good), "real parquet should be valid");
+
+        let empty = dir.join("empty.parquet");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!is_valid_parquet(&empty), "zero-byte file is invalid");
+
+        let trunc = dir.join("trunc.parquet");
+        std::fs::write(&trunc, b"PAR1\x00\x00").unwrap();
+        assert!(!is_valid_parquet(&trunc), "truncated file is invalid");
+
+        let nomagic = dir.join("nomagic.parquet");
+        std::fs::write(&nomagic, b"definitely not a parquet file, but long enough").unwrap();
+        assert!(!is_valid_parquet(&nomagic), "missing PAR1 magic is invalid");
+
+        assert!(
+            !is_valid_parquet(&dir.join("does-not-exist.parquet")),
+            "missing file is invalid"
+        );
+    }
+
+    #[test]
+    fn rollup_quarantines_truncated_hourly_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"ok"}"#;
+        let good = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
+
+        // A truncated parquet in another hour (crash mid-COPY).
+        let bad_dir = data_dir.join(date).join("02");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let bad = bad_dir.join("nginx.parquet");
+        std::fs::write(&bad, b"PAR1\x00\x00").unwrap();
+
+        let day_dir = data_dir.join(date);
+        rollup_day_blocking(&day_dir, "nginx", &[good.clone(), bad.clone()], "2GB").unwrap();
+
+        // Good data rolled up; corrupt file quarantined, not read.
+        let daily = day_dir.join("nginx.parquet");
+        assert!(daily.exists(), "daily file built from the valid hourly");
+        assert!(!good.exists(), "consumed valid hourly should be deleted");
+        assert!(!bad.exists(), "corrupt file should be renamed away");
+
+        let mut corrupt = bad.into_os_string();
+        corrupt.push(".corrupt");
+        assert!(
+            PathBuf::from(corrupt).exists(),
+            "corrupt file should be quarantined to .corrupt"
+        );
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    daily.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "only the valid row should be present");
+    }
+
+    #[test]
+    fn rollup_skips_when_all_inputs_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        let bad_dir = data_dir.join(date).join("00");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let bad = bad_dir.join("svc.parquet");
+        std::fs::write(&bad, b"").unwrap(); // zero-byte
+
+        let day_dir = data_dir.join(date);
+        // No error (nothing recoverable to retry), no daily file produced.
+        rollup_day_blocking(&day_dir, "svc", std::slice::from_ref(&bad), "2GB").unwrap();
+
+        assert!(
+            !day_dir.join("svc.parquet").exists(),
+            "no daily file from all-corrupt input"
+        );
+        assert!(!bad.exists(), "corrupt file should be quarantined");
+    }
+
+    #[test]
+    fn recovery_discards_truncated_tmp() {
+        // Crash mid-COPY: a truncated .tmp must NOT be promoted to canonical,
+        // and the hourly files must be retained for a fresh rollup.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
+
+        let day_dir = data_dir.join(date);
+        let canonical = day_dir.join("nginx.parquet");
+        let tmp_file = day_dir.join("nginx.parquet.tmp");
+
+        std::fs::write(&tmp_file, b"PAR1trunc").unwrap();
+        write_rollup_marker(&day_dir, "nginx", std::slice::from_ref(&f1)).unwrap();
+
+        recover_rollup_markers(&day_dir).unwrap();
+
+        assert!(
+            !canonical.exists(),
+            "must NOT promote a truncated tmp to canonical"
+        );
+        assert!(!tmp_file.exists(), "truncated tmp should be moved aside");
+        assert!(f1.exists(), "hourly file retained for re-rollup");
+        assert!(
+            !day_dir.join(".rollup-nginx").exists(),
+            "marker should be removed"
+        );
     }
 }
