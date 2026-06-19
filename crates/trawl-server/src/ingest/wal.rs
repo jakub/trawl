@@ -4,10 +4,15 @@
 
 //! Write-ahead log for crash-safe event ingestion.
 //!
-//! Each ingest request writes events to a WAL file atomically:
-//! write to `.tmp`, then rename to `.ndjson`. The compaction task
-//! later converts these to parquet.
+//! Each ingest request writes events to a WAL file durably: write to
+//! `.tmp`, fsync the data, rename to `.ndjson`, then fsync the parent
+//! directory. The fsync *before* the rename is what prevents a hard kill
+//! from leaving a full-length but NUL-filled file (unflushed blocks read
+//! back as zeros) — an unparseable poison pill that would later wedge
+//! compaction. The compaction task converts these to parquet.
 
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -51,7 +56,15 @@ impl WalWriter {
         &self.wal_dir
     }
 
-    /// Write events atomically: `.tmp` → rename to `.ndjson`.
+    /// Write events durably: create `.tmp`, fsync its data, rename to
+    /// `.ndjson`, then fsync the parent directory so the rename itself
+    /// survives a crash.
+    ///
+    /// The fsync *before* the rename prevents a torn write: without it the
+    /// rename can be journaled before the data blocks reach the device, so a
+    /// hard kill / power loss leaves a full-length `.ndjson` of NUL bytes
+    /// that head-of-line-blocks compaction. The parent-directory fsync makes
+    /// the rename entry durable so a crash can't lose the just-acked batch.
     ///
     /// Returns the final path of the WAL file on success.
     pub fn write(&self, service: &str, events: &[u8]) -> std::io::Result<PathBuf> {
@@ -59,8 +72,17 @@ impl WalWriter {
         let tmp_path = self.wal_dir.join(format!("{filename}.tmp"));
         let final_path = self.wal_dir.join(format!("{filename}.ndjson"));
 
-        std::fs::write(&tmp_path, events)?;
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(events)?;
+        file.sync_all()?;
+        drop(file);
+
         std::fs::rename(&tmp_path, &final_path)?;
+
+        // fsync the directory entry so the rename is durable, not just the
+        // file's data. On a fresh open this is the canonical "make a rename
+        // crash-safe" step.
+        File::open(&self.wal_dir)?.sync_all()?;
 
         Ok(final_path)
     }
