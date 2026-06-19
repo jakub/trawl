@@ -128,15 +128,24 @@ impl Executor {
             outcome = self.execute_emitted(&coerced, max_rows, utc_offset_secs);
         }
 
-        let mut result = match &outcome {
-            // Columns present → real result (possibly empty rows). Return as-is.
-            Ok(r) if !r.columns.is_empty() => outcome?,
+        // Classify the (possibly retried) outcome, then route on the pure
+        // `cold_action` decision so the cold-drop warn stays testable.
+        let class = match &outcome {
+            // Columns present → real result (possibly empty rows).
+            Ok(r) if !r.columns.is_empty() => HotColdOutcome::Columns,
             // No columns (no parquet source files), database error (UNION
             // fails on missing source), or binder error remapped to Emit
             // (column not found in empty parquet) → fall back to hot-only.
             // ResultTooLarge is excluded: the query worked, just too many rows.
             Ok(_) | Err(EngineError::Database(_) | EngineError::Emit(_)) => {
-                if type_conflict {
+                HotColdOutcome::FallBack
+            }
+            Err(_) => HotColdOutcome::Fatal,
+        };
+        let mut result = match cold_action(class, type_conflict) {
+            ColdAction::ReturnOutcome => outcome?,
+            ColdAction::HotOnly { warn_cold_drop } => {
+                if warn_cold_drop {
                     // A hot/cold column type conflict was detected but the
                     // coerced retry did not resolve it (conflict-detection
                     // failed, found no columns, or the retry itself errored).
@@ -155,7 +164,6 @@ impl Executor {
                     other => other?,
                 }
             }
-            Err(_) => outcome?,
         };
         if !emitted.rust_stages.is_empty() {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
@@ -367,9 +375,11 @@ impl Executor {
     ///
     /// `fast_path` may be empty (the insurance path, where the fast-path
     /// describe itself raised a union conflict); then every irreconcilable
-    /// column is reported `VARCHAR` and reconcilable columns keep their single
-    /// observed type. Column order follows the fast path when present, else
-    /// first-seen per-file order, so the result is deterministic.
+    /// column is reported `VARCHAR`, a column with union-able drift gets
+    /// `DuckDB`'s reconciled type (a per-column `union_by_name` describe — not
+    /// a first-seen guess), and a column with a single observed type keeps it.
+    /// Column order follows the fast path when present, else first-seen per-file
+    /// order, so the result is deterministic.
     fn describe_schema_columns_coerced(
         &self,
         source: &str,
@@ -434,13 +444,34 @@ impl Executor {
                 .collect());
         }
 
-        // Insurance path: no fast-path baseline. Report VARCHAR for
-        // irreconcilable columns, else the single observed type.
+        // Insurance path: no fast-path baseline (the fast-path describe itself
+        // raised a union conflict). Reconcile from scratch:
+        //  - irreconcilable drift (mixed top-level kinds) → VARCHAR, the type a
+        //    real query's coerced retry produces;
+        //  - union-able drift (same kind, >1 observed type — e.g. BIGINT vs
+        //    DOUBLE, or two STRUCT shapes) → ask DuckDB for the reconciled type
+        //    rather than guessing the first-seen one, which would under-report
+        //    (report BIGINT for a column a query reads as DOUBLE);
+        //  - a single observed type → use it (no ambiguity).
+        // This branch is cold/defensive — unreachable on DuckDB versions where
+        // DESCRIBE tolerates union-able drift — so the per-column describe's
+        // O(drifted columns) extra queries here are acceptable.
+        let file_list = files
+            .iter()
+            .map(|f| format!("'{}'", f.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
         Ok(col_types
             .into_iter()
             .map(|(name, types)| {
                 let data_type = if is_irreconcilable(&types) {
                     "VARCHAR".to_owned()
+                } else if types.len() > 1 {
+                    // Same-kind drift: defer to DuckDB's own reconciliation. If
+                    // even the single-column describe errors, the column is in
+                    // fact irreconcilable → VARCHAR.
+                    self.reconciled_column_type(&file_list, &name)
+                        .unwrap_or_else(|| "VARCHAR".to_owned())
                 } else {
                     types
                         .into_iter()
@@ -450,6 +481,24 @@ impl Executor {
                 SchemaColumn { name, data_type }
             })
             .collect())
+    }
+
+    /// Ask `DuckDB` for the `union_by_name`-reconciled type of a single column
+    /// across `file_list` — a pre-built, single-quote-escaped `'f1', 'f2', ...`
+    /// SQL list. The column identifier is double-quote-escaped (`"` → `""`) for
+    /// the same interpolation-safety reason the paths are quote-escaped.
+    ///
+    /// Returns `None` if even the single-column describe errors — at which point
+    /// the column is genuinely irreconcilable and the caller falls back to
+    /// `VARCHAR`. Only reached from the cold insurance path above.
+    fn reconciled_column_type(&self, file_list: &str, column: &str) -> Option<String> {
+        let ident = column.replace('"', "\"\"");
+        let described = self
+            .describe_types(&format!(
+                "SELECT \"{ident}\" FROM read_parquet([{file_list}], union_by_name=true)"
+            ))
+            .ok()?;
+        described.into_iter().next().map(|(_, ty)| ty)
     }
 
     /// Sample distinct values for a field (for autocomplete).
@@ -839,12 +888,58 @@ pub fn is_union_type_conflict(e: &duckdb::Error) -> bool {
     msg.contains("Conversion") || msg.contains("remap") || msg.contains("type mismatch")
 }
 
+/// Classification of the hot+cold union outcome that `run_query_with_hot`
+/// branches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotColdOutcome {
+    /// The union produced columns (rows may be empty) — an authoritative
+    /// result; return it as-is.
+    Columns,
+    /// No columns (no parquet files) or a recoverable `Database`/`Emit` error
+    /// (missing source / binder-remapped column) — fall back to a hot-only read.
+    FallBack,
+    /// A non-recoverable error (e.g. `ResultTooLarge`, parse) — propagate it.
+    Fatal,
+}
+
+/// What `run_query_with_hot` should do with a classified outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdAction {
+    /// Return the union outcome unchanged.
+    ReturnOutcome,
+    /// Read hot-only. `warn_cold_drop` is true when a hot/cold type conflict
+    /// was detected but survived coercion, so the hot-only fallback now
+    /// silently drops cold/parquet rows — worth a `query_cold_drop` warn.
+    HotOnly { warn_cold_drop: bool },
+}
+
+/// Decide the next step for a classified hot+cold union outcome.
+///
+/// Split out as a pure function so the `query_cold_drop`-warn contract is
+/// unit-testable without constructing a live `DuckDB` conflict that survives
+/// VARCHAR coercion (the seam that triggers it is hard to provoke
+/// deterministically). The warn fires exactly when we fall back to hot-only
+/// AND a hot/cold type conflict was detected — never on a legitimate
+/// cold-start hot-only path (`type_conflict == false`).
+fn cold_action(outcome: HotColdOutcome, type_conflict: bool) -> ColdAction {
+    match outcome {
+        HotColdOutcome::Columns | HotColdOutcome::Fatal => ColdAction::ReturnOutcome,
+        HotColdOutcome::FallBack => ColdAction::HotOnly {
+            warn_cold_drop: type_conflict,
+        },
+    }
+}
+
 /// Whether a `DuckDB` type name (as reported by `DESCRIBE`) is a complex
 /// (nested) type — `STRUCT`/`MAP`/`LIST`/array `[]`/`UNION`/`JSON`. These are
 /// the types that, when the same column is `VARCHAR` in another file, raise a
 /// read-time union conflict. A schema describe that reports one of these may
 /// be masking cross-file drift that only surfaces at query time.
-fn is_complex_type(data_type: &str) -> bool {
+///
+/// Shared with trawl-server's compaction path (re-exported in `lib.rs`) so the
+/// schema describe and compaction's write-time coercion agree on exactly which
+/// `DuckDB` types must be coerced to `VARCHAR`.
+pub fn is_complex_type(data_type: &str) -> bool {
     let t = data_type.to_ascii_uppercase();
     t.starts_with("STRUCT")
         || t.starts_with("MAP")
@@ -1081,7 +1176,9 @@ mod tests {
 
     use duckdb::Connection;
 
-    use super::{Executor, is_union_type_conflict};
+    use super::{
+        ColdAction, Executor, HotColdOutcome, cold_action, is_complex_type, is_union_type_conflict,
+    };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
     /// type/value expression (e.g. `{'a': 1}` for a `STRUCT`, `'plain'` for a
@@ -1285,6 +1382,92 @@ mod tests {
             result.row_count(),
             1,
             "the single hot row must survive the cold-start hot-only fallback"
+        );
+    }
+
+    #[test]
+    fn cold_action_warns_only_on_conflict_fallback() {
+        // The contract: the query_cold_drop warn (and hot-only drop of cold
+        // rows) happens iff we fall back to hot-only AND a hot/cold type
+        // conflict was detected. This is the seam that's near-impossible to
+        // provoke live (a conflict that survives VARCHAR coercion), so assert
+        // it directly on the pure decision.
+        assert_eq!(
+            cold_action(HotColdOutcome::FallBack, true),
+            ColdAction::HotOnly {
+                warn_cold_drop: true
+            },
+            "fallback after a detected conflict must warn + drop cold rows"
+        );
+        assert_eq!(
+            cold_action(HotColdOutcome::FallBack, false),
+            ColdAction::HotOnly {
+                warn_cold_drop: false
+            },
+            "a legitimate cold-start fallback (no conflict) must NOT warn"
+        );
+        // Columns present, or a fatal error: return the outcome unchanged
+        // regardless of whether a conflict was flagged — never a cold-drop.
+        assert_eq!(
+            cold_action(HotColdOutcome::Columns, true),
+            ColdAction::ReturnOutcome,
+            "an authoritative columnful result is returned as-is"
+        );
+        assert_eq!(
+            cold_action(HotColdOutcome::Fatal, true),
+            ColdAction::ReturnOutcome,
+            "a non-recoverable error is propagated, not masked by a hot-only read"
+        );
+    }
+
+    #[test]
+    fn is_complex_type_classifies_duckdb_types() {
+        // Relocated from trawl-server's compaction.rs when the classifier was
+        // consolidated here — both lanes now share this one function.
+        assert!(is_complex_type("JSON"));
+        assert!(is_complex_type("STRUCT(v BIGINT)"));
+        assert!(is_complex_type("MAP(VARCHAR, JSON)"));
+        assert!(is_complex_type("UNION(a INTEGER, b VARCHAR)"));
+        assert!(is_complex_type("VARCHAR[]"));
+        assert!(is_complex_type("BIGINT[]"));
+        assert!(!is_complex_type("VARCHAR"));
+        assert!(!is_complex_type("BIGINT"));
+        assert!(!is_complex_type("TIMESTAMP"));
+        assert!(!is_complex_type("DOUBLE"));
+    }
+
+    #[test]
+    fn insurance_path_reports_reconciled_type_not_first_seen() {
+        // Drive the empty-fast_path insurance branch directly (it's unreachable
+        // through describe_schema on a DuckDB that tolerates union-able drift).
+        // `meta` is BIGINT in the lexically-first file and DOUBLE in the second;
+        // union_by_name reconciles to DOUBLE. A first-seen guess would report
+        // BIGINT, so asserting DOUBLE proves the hardening.
+        let dir = tempfile::tempdir().unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &dir.path().join("00.parquet"), "CAST(1 AS BIGINT)");
+        write_meta_parquet(
+            &setup,
+            &dir.path().join("01.parquet"),
+            "CAST(1.5 AS DOUBLE)",
+        );
+
+        let exec = Executor::new().unwrap();
+        let glob = format!("{}/*.parquet", dir.path().display());
+        let columns = exec
+            .describe_schema_columns_coerced(&glob, Vec::new())
+            .expect("insurance-path reconcile must not error on union-able scalar drift");
+
+        let meta = columns
+            .iter()
+            .find(|c| c.name == "meta")
+            .expect("schema must include the drifted `meta` column");
+        assert_eq!(
+            meta.data_type.to_ascii_uppercase(),
+            "DOUBLE",
+            "insurance path must report DuckDB's reconciled type (DOUBLE), not \
+             the first-seen BIGINT, got `{}`",
+            meta.data_type
         );
     }
 }

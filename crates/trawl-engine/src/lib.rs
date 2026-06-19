@@ -22,3 +22,8 @@ pub use trawl_api::value;
 // compaction path so both lanes agree on which `DuckDB` errors warrant a
 // cast-to-`VARCHAR` fallback (vs quarantine/abort).
 pub use executor::is_union_type_conflict;
+
+// The complex-type classifier is likewise shared with compaction's write-time
+// coercion, so the schema describe and the compaction writer agree on exactly
+// which `DuckDB` types get folded to `VARCHAR`.
+pub use executor::is_complex_type;
