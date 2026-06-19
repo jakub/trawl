@@ -59,9 +59,15 @@ pub fn spawn_compaction(
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
                     match compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit).await {
-                        Ok(()) => {
+                        Ok(rollup_failures) => {
                             if let Some(ref stats) = compaction_stats {
                                 stats.total_runs.fetch_add(1, Ordering::Relaxed);
+                                // WAL compaction ran; surface any best-effort
+                                // rollup failures so they're visible on the
+                                // dashboard instead of only in logs.
+                                if rollup_failures > 0 {
+                                    stats.total_errors.fetch_add(rollup_failures, Ordering::Relaxed);
+                                }
                                 let epoch_secs = SystemTime::now()
                                     .duration_since(SystemTime::UNIX_EPOCH)
                                     .map_or(0, |d| d.as_secs());
@@ -87,6 +93,11 @@ pub fn spawn_compaction(
 
 /// Run one compaction cycle.
 ///
+/// Returns the number of per-service daily rollups that failed this cycle
+/// (0 on a clean run). WAL compaction errors are surfaced as `Err`; rollup
+/// failures are best-effort and reported via the count so the caller can
+/// track them without failing the whole cycle.
+///
 /// Public for integration tests only — not part of the external API.
 /// Called internally by [`spawn_compaction`].
 pub async fn compact_once(
@@ -97,7 +108,7 @@ pub async fn compact_once(
     hot_buffer: Option<&Arc<HotBuffer>>,
     chunk_size: usize,
     memory_limit: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     // Remove orphaned .parquet.tmp files from interrupted compaction runs.
     cleanup_stale_tmp_files(data_dir, min_age * 2);
 
@@ -182,12 +193,21 @@ pub async fn compact_once(
 
     // After WAL compaction, consolidate older days' hourly files into
     // per-service daily files. This dramatically reduces file count for
-    // long lookback queries.
-    if daily_rollup && let Err(e) = rollup_once(data_dir, memory_limit).await {
-        tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
-    }
+    // long lookback queries. Rollup is best-effort: a failure for one
+    // day/service is counted and retried next tick, not propagated.
+    let rollup_failures = if daily_rollup {
+        match rollup_once(data_dir, memory_limit).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
+                1
+            }
+        }
+    } else {
+        0
+    };
 
-    Ok(())
+    Ok(rollup_failures)
 }
 
 /// Consolidate hourly per-service parquet files into daily files.
@@ -195,8 +215,9 @@ pub async fn compact_once(
 /// For each date-directory older than today, collects all
 /// `{hour}/{service}.parquet` files, merges them (sorted by timestamp)
 /// into `{date}/{service}.parquet`, then removes the hourly sources.
-async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<(), String> {
+async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let mut failures: u64 = 0;
 
     let date_dirs =
         std::fs::read_dir(data_dir).map_err(|e| format!("failed to read data_dir: {e}"))?;
@@ -260,6 +281,7 @@ async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<(), String> 
             {
                 Ok(()) => {}
                 Err(e) => {
+                    failures += 1;
                     tracing::error!(
                         event_type = "rollup_error",
                         compact_service = %service,
@@ -278,7 +300,7 @@ async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<(), String> 
         }
     }
 
-    Ok(())
+    Ok(failures)
 }
 
 /// Check if a directory name looks like a date (YYYY-MM-DD).
