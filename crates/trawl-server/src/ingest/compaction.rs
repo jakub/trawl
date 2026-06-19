@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
-use trawl_engine::is_union_type_conflict;
+use trawl_engine::{is_complex_type, is_union_type_conflict};
 
 use crate::hot_buffer::HotBuffer;
 use crate::state::CompactionStats;
@@ -249,6 +249,13 @@ async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String>
         // starting new ones. This ensures crash-orphaned hourly files
         // are cleaned up without re-merging already-consolidated data.
         if let Err(e) = recover_rollup_markers(&path) {
+            // A wedged recovery is data-loss-adjacent (an interrupted rollup
+            // left orphaned hourlies/tmp that couldn't be cleaned up), so count
+            // it on the error tally like the quarantine path does — otherwise it
+            // is visible only in logs, never on the dashboard counter. Counting
+            // (not `continue`) is deliberate: the day's fresh rollup below can
+            // still make progress on other services.
+            failures += 1;
             tracing::error!(
                 event_type = "rollup_error",
                 date = %dir_name,
@@ -275,27 +282,26 @@ async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String>
             let files = files.clone();
 
             let mem_limit = memory_limit.to_owned();
-            match tokio::task::spawn_blocking(move || {
+            let outcome = tokio::task::spawn_blocking(move || {
                 rollup_day_blocking(&day_dir, &svc, &files, &mem_limit)
             })
             .await
-            .map_err(|e| format!("rollup task panicked: {e}"))?
-            {
-                Ok(outcome) => {
-                    // Quarantined inputs are soft, Ok-path data-loss — fold
-                    // them into the failure tally so dropped service/days show
-                    // on the dashboard counter alongside hard rollup failures.
-                    quarantined_total += outcome.quarantined;
-                }
-                Err(e) => {
-                    failures += 1;
-                    tracing::error!(
-                        event_type = "rollup_error",
-                        compact_service = %service,
-                        error = %e,
-                        "rollup failed for service, will retry next tick"
-                    );
-                }
+            .map_err(|e| format!("rollup task panicked: {e}"))?;
+
+            // Quarantined inputs are data-loss whether or not the merge then
+            // succeeded — fold the count in unconditionally so it lands on the
+            // dashboard counter even when the merge errored and dropped its
+            // valid output (the quarantined files are already renamed aside, so
+            // a retry can't re-count them).
+            quarantined_total += outcome.quarantined;
+            if let Err(e) = outcome.result {
+                failures += 1;
+                tracing::error!(
+                    event_type = "rollup_error",
+                    compact_service = %service,
+                    error = %e,
+                    "rollup failed for service, will retry next tick"
+                );
             }
         }
 
@@ -596,11 +602,20 @@ fn retire_merged_hourly(path: &Path) -> Result<(), String> {
 }
 
 /// Outcome of one per-service daily rollup.
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// Carries `quarantined` alongside `result` so the data-loss count survives a
+/// hard merge error: quarantining renames the bad input to `.corrupt`, so a
+/// later retry can't re-see (and re-count) it — if a `result: Err` dropped the
+/// tally, those quarantines would never reach the dashboard counter.
+#[derive(Debug, Clone)]
 struct RollupOutcome {
     /// Inputs quarantined this call (corrupt/truncated → `.corrupt`).
-    /// Counts as data-loss against the compaction error counter.
+    /// Counts as data-loss against the compaction error counter, whether or not
+    /// the merge itself then succeeded.
     quarantined: u64,
+    /// Whether the merge wrote a daily file (`Ok`) or failed and must retry
+    /// next tick (`Err`).
+    result: Result<(), String>,
 }
 
 /// Blocking: merge hourly parquet files for one service into a daily file.
@@ -612,12 +627,40 @@ struct RollupOutcome {
 /// Uses a `.rollup-{service}` marker file for crash safety: the marker
 /// lists which hourly files are being merged, enabling recovery without
 /// re-reading already-consolidated data.
+///
+/// Thin wrapper over [`rollup_day_inner`] that pairs the accumulated quarantine
+/// count with the merge result, so the count is reported even when the merge
+/// then errors — every `?` bail-out in the inner body would otherwise drop it.
 fn rollup_day_blocking(
     day_dir: &Path,
     service: &str,
     hourly_files: &[PathBuf],
     memory_limit: &str,
-) -> Result<RollupOutcome, String> {
+) -> RollupOutcome {
+    let mut quarantined: u64 = 0;
+    let result = rollup_day_inner(
+        day_dir,
+        service,
+        hourly_files,
+        memory_limit,
+        &mut quarantined,
+    );
+    RollupOutcome {
+        quarantined,
+        result,
+    }
+}
+
+/// The fallible body of one per-service rollup. Increments `*quarantined` as
+/// corrupt inputs are renamed aside; [`rollup_day_blocking`] pairs that running
+/// count with this `Result` so a mid-merge `Err` can't lose it.
+fn rollup_day_inner(
+    day_dir: &Path,
+    service: &str,
+    hourly_files: &[PathBuf],
+    memory_limit: &str,
+    quarantined: &mut u64,
+) -> Result<(), String> {
     let rollup_start = std::time::Instant::now();
     let conn =
         duckdb::Connection::open_in_memory().map_err(|e| format!("DuckDB open failed: {e}"))?;
@@ -646,7 +689,6 @@ fn rollup_day_blocking(
     let canonical_path = day_dir.join(format!("{service}.parquet"));
     let mut all_files: Vec<PathBuf> = Vec::with_capacity(hourly_files.len() + 1);
     let mut merged_hourly: Vec<PathBuf> = Vec::with_capacity(hourly_files.len());
-    let mut quarantined: u64 = 0;
     for f in hourly_files {
         if is_valid_parquet(f) {
             all_files.push(f.clone());
@@ -655,7 +697,7 @@ fn rollup_day_blocking(
             // A failed quarantine is a HARD error — the bad file still
             // matches `*.parquet` and would wedge the rollup forever.
             quarantine_file(f, service)?;
-            quarantined += 1;
+            *quarantined += 1;
         }
     }
     if canonical_path.exists() {
@@ -663,7 +705,7 @@ fn rollup_day_blocking(
             all_files.push(canonical_path.clone());
         } else {
             quarantine_file(&canonical_path, service)?;
-            quarantined += 1;
+            *quarantined += 1;
         }
     }
 
@@ -673,15 +715,15 @@ fn rollup_day_blocking(
     // level (the partial-corrupt path only logs a cheerful rollup_complete)
     // and report the quarantine count so it lands on the dashboard counter.
     if all_files.is_empty() {
-        if quarantined > 0 {
+        if *quarantined > 0 {
             tracing::error!(
                 event_type = "rollup_data_loss",
                 compact_service = %service,
-                quarantined,
+                quarantined = *quarantined,
                 "all rollup inputs corrupt; quarantined, no daily file produced — DATA LOSS"
             );
         }
-        return Ok(RollupOutcome { quarantined });
+        return Ok(());
     }
 
     // Path provenance: service is sanitized to [A-Za-z0-9_-] at ingest
@@ -769,7 +811,7 @@ fn rollup_day_blocking(
         "daily rollup complete"
     );
 
-    Ok(RollupOutcome { quarantined })
+    Ok(())
 }
 
 /// Rollup fallback: union hourly parquet files when their schemas conflict.
@@ -933,17 +975,6 @@ fn read_wal_to_table(
     }
 
     coerce_complex_columns_to_varchar(conn, service)
-}
-
-/// Return true if a `DuckDB` type string denotes a complex/nested type
-/// (STRUCT, MAP, JSON, LIST, or UNION) rather than a flat scalar.
-fn is_complex_type(dtype: &str) -> bool {
-    let t = dtype.to_ascii_uppercase();
-    t == "JSON"
-        || t.starts_with("STRUCT")
-        || t.starts_with("MAP")
-        || t.starts_with("UNION")
-        || t.contains("[]") // LIST types render as e.g. `VARCHAR[]`
 }
 
 /// Coerce every complex-typed column in `wal_batch` to VARCHAR.
@@ -1746,19 +1777,6 @@ mod tests {
     }
 
     #[test]
-    fn is_complex_type_classifies_duckdb_types() {
-        assert!(is_complex_type("JSON"));
-        assert!(is_complex_type("STRUCT(v BIGINT)"));
-        assert!(is_complex_type("MAP(VARCHAR, JSON)"));
-        assert!(is_complex_type("VARCHAR[]"));
-        assert!(is_complex_type("BIGINT[]"));
-        assert!(!is_complex_type("VARCHAR"));
-        assert!(!is_complex_type("BIGINT"));
-        assert!(!is_complex_type("TIMESTAMP"));
-        assert!(!is_complex_type("DOUBLE"));
-    }
-
-    #[test]
     fn compaction_coerces_complex_fields_to_varchar() {
         // Root-cause fix: an object-valued field must be written as VARCHAR
         // so hourly files never disagree on its physical type. Scalars keep
@@ -1915,7 +1933,9 @@ mod tests {
         let f2 = write_hourly_parquet(&data_dir, date, "02", "nginx", &[r2, r3]);
 
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "nginx", &[f1.clone(), f2.clone()], "2GB").unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f1.clone(), f2.clone()], "2GB")
+            .result
+            .unwrap();
 
         // Day-level file should exist.
         let daily = day_dir.join("nginx.parquet");
@@ -1950,14 +1970,18 @@ mod tests {
         let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "nginx", &[f1], "2GB").unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f1], "2GB")
+            .result
+            .unwrap();
 
         // Late-arriving data creates a new hourly file.
         let r2 = r#"{"timestamp":"2026-01-15T03:00:00Z","service":"nginx","msg":"late"}"#;
         let f2 = write_hourly_parquet(&data_dir, date, "03", "nginx", &[r2]);
 
         // Second rollup: should merge existing daily + new hourly.
-        rollup_day_blocking(&day_dir, "nginx", &[f2], "2GB").unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f2], "2GB")
+            .result
+            .unwrap();
 
         let daily = day_dir.join("nginx.parquet");
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1987,7 +2011,9 @@ mod tests {
         let f2 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r2]);
 
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "nginx", &[f1, f2], "2GB").unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f1, f2], "2GB")
+            .result
+            .unwrap();
 
         // Verify rows are sorted by timestamp (ascending).
         let daily = day_dir.join("nginx.parquet");
@@ -2022,7 +2048,9 @@ mod tests {
         let f2 = write_hourly_parquet(&data_dir, date, "02", "ctrl", &[r2]);
 
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "ctrl", &[f1.clone(), f2.clone()], "2GB").unwrap();
+        rollup_day_blocking(&day_dir, "ctrl", &[f1.clone(), f2.clone()], "2GB")
+            .result
+            .unwrap();
 
         let daily = day_dir.join("ctrl.parquet");
         assert!(daily.exists(), "daily parquet should exist after fallback");
@@ -2134,7 +2162,9 @@ mod tests {
         let day_dir = data_dir.join(date);
         let marker = day_dir.join(".rollup-nginx");
 
-        rollup_day_blocking(&day_dir, "nginx", &[f1], "2GB").unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[f1], "2GB")
+            .result
+            .unwrap();
 
         // Marker should be cleaned up after successful rollup.
         assert!(!marker.exists(), "marker should be removed after rollup");
@@ -2264,8 +2294,11 @@ mod tests {
         std::fs::write(&bad, b"PAR1\x00\x00").unwrap();
 
         let day_dir = data_dir.join(date);
-        let outcome =
-            rollup_day_blocking(&day_dir, "nginx", &[good.clone(), bad.clone()], "2GB").unwrap();
+        let outcome = rollup_day_blocking(&day_dir, "nginx", &[good.clone(), bad.clone()], "2GB");
+        assert!(
+            outcome.result.is_ok(),
+            "partial-corrupt rollup should still produce a daily file"
+        );
         assert_eq!(outcome.quarantined, 1, "one corrupt input quarantined");
 
         // Good data rolled up; corrupt file quarantined, not read.
@@ -2309,8 +2342,11 @@ mod tests {
         let day_dir = data_dir.join(date);
         // No error (nothing recoverable to retry), no daily file produced,
         // but the quarantine count surfaces the data-loss.
-        let outcome =
-            rollup_day_blocking(&day_dir, "svc", std::slice::from_ref(&bad), "2GB").unwrap();
+        let outcome = rollup_day_blocking(&day_dir, "svc", std::slice::from_ref(&bad), "2GB");
+        assert!(
+            outcome.result.is_ok(),
+            "all-corrupt rollup returns Ok — nothing readable to retry"
+        );
         assert_eq!(outcome.quarantined, 1, "the all-corrupt input is counted");
 
         assert!(
@@ -2318,6 +2354,49 @@ mod tests {
             "no daily file from all-corrupt input"
         );
         assert!(!bad.exists(), "corrupt file should be quarantined");
+    }
+
+    #[test]
+    fn rollup_keeps_quarantine_count_when_merge_errors() {
+        // One input is corrupt (quarantined, count=1); a SECOND input passes the
+        // magic-byte sniff but is unreadable by read_parquet (valid PAR1
+        // bookends, bogus footer length), so the merge COPY hard-errors. The
+        // quarantine count must still ride out on the outcome: a naive
+        // `return Err` would drop it, and since the quarantined file is already
+        // renamed `.corrupt`, a retry tick could never re-count it.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        // Corrupt (zero-byte) input → quarantined.
+        let corrupt_dir = data_dir.join(date).join("00");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        let corrupt = corrupt_dir.join("nginx.parquet");
+        std::fs::write(&corrupt, b"").unwrap();
+
+        // Sniff-valid but unreadable input → hard COPY error. 12 bytes: PAR1
+        // header + a 0xFFFFFFFF "footer length" (points way past the file) +
+        // PAR1 trailer. Passes is_valid_parquet; read_parquet cannot parse it.
+        let unreadable_dir = data_dir.join(date).join("01");
+        std::fs::create_dir_all(&unreadable_dir).unwrap();
+        let unreadable = unreadable_dir.join("nginx.parquet");
+        std::fs::write(&unreadable, b"PAR1\xff\xff\xff\xffPAR1").unwrap();
+
+        let day_dir = data_dir.join(date);
+        let outcome = rollup_day_blocking(
+            &day_dir,
+            "nginx",
+            &[corrupt.clone(), unreadable.clone()],
+            "2GB",
+        );
+        assert!(
+            outcome.result.is_err(),
+            "an unreadable surviving input must fail the merge"
+        );
+        assert_eq!(
+            outcome.quarantined, 1,
+            "the quarantine count must survive the hard merge error, not be dropped"
+        );
     }
 
     #[test]
@@ -2465,7 +2544,9 @@ mod tests {
         let day_dir = data_dir.join(date);
 
         // First rollup builds the daily file and retires the hourly.
-        rollup_day_blocking(&day_dir, "nginx", std::slice::from_ref(&f1), "2GB").unwrap();
+        rollup_day_blocking(&day_dir, "nginx", std::slice::from_ref(&f1), "2GB")
+            .result
+            .unwrap();
 
         let daily = day_dir.join("nginx.parquet");
         assert!(daily.exists());
@@ -2489,7 +2570,9 @@ mod tests {
 
         // Second rollup over the canonical only (no live hourlies) — must not
         // double the count even though `.merged` bytes sit alongside.
-        rollup_day_blocking(&day_dir, "nginx", &[], "2GB").unwrap();
+        rollup_day_blocking(&day_dir, "nginx", &[], "2GB")
+            .result
+            .unwrap();
 
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let count: i64 = conn
