@@ -110,11 +110,15 @@ impl Executor {
         // would otherwise fall through to the hot-only path below and
         // silently drop every cold row. Detect the conflicting columns and
         // retry the union with them coerced to VARCHAR on both sides,
-        // preserving hot AND cold data. Both a false positive (no conflicts
-        // found) and a describe failure degrade safely to the path below.
+        // preserving hot AND cold data. A false positive (no conflicts found)
+        // or a describe failure degrades to the hot-only path below — but if
+        // a conflict was detected and the coerced retry still failed, that
+        // degradation drops cold/parquet rows and is now logged at warn
+        // (`event_type = "query_cold_drop"`), distinct from a legitimate
+        // cold-start hot-only path (where `type_conflict` is false).
         let type_conflict = matches!(
             &outcome,
-            Err(EngineError::Database(e)) if is_type_mismatch_error(e)
+            Err(EngineError::Database(e)) if is_union_type_conflict(e)
         );
         if type_conflict
             && let Ok(cols) = self.hot_cold_conflicts(source, hot_source)
@@ -132,6 +136,17 @@ impl Executor {
             // (column not found in empty parquet) → fall back to hot-only.
             // ResultTooLarge is excluded: the query worked, just too many rows.
             Ok(_) | Err(EngineError::Database(_) | EngineError::Emit(_)) => {
+                if type_conflict {
+                    // A hot/cold column type conflict was detected but the
+                    // coerced retry did not resolve it (conflict-detection
+                    // failed, found no columns, or the retry itself errored).
+                    // We are about to return HOT-ONLY results, silently
+                    // omitting all cold/parquet rows.
+                    tracing::warn!(
+                        event_type = "query_cold_drop",
+                        "hot/cold type conflict survived coercion; returning hot-only results, cold/parquet rows dropped"
+                    );
+                }
                 let hot_emitted = emitter::emit(&ast, hot_source)?;
                 match self.execute_emitted(&hot_emitted, max_rows, utc_offset_secs) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
@@ -252,22 +267,59 @@ impl Executor {
     }
 
     /// Describe the schema without reading row data.
+    ///
+    /// Fast path: a single `DESCRIBE` over `read_parquet(union_by_name=true)`.
+    /// `DuckDB` resolves that describe without reading rows, and its result is
+    /// exactly the schema a *successful* query sees: for all-scalar columns and
+    /// for union-able same-kind complex columns (`STRUCT`-vs-`STRUCT`,
+    /// `LIST`-vs-`LIST`) it reports the MERGED type — e.g. `STRUCT(x INTEGER)`
+    /// in one file and `STRUCT(y INTEGER)` in another merge to
+    /// `STRUCT(x INTEGER, y INTEGER)`, which a query then reads fine.
+    ///
+    /// The fast path lies in exactly one situation: when a column's per-file
+    /// types are NOT union-reconcilable (a complex type in one file and a
+    /// `VARCHAR`/scalar in another, or different complex kinds like
+    /// `STRUCT`-vs-`LIST`). There the describe still reports the complex side
+    /// (it never reads rows) but a real query fails at read time with a Binder
+    /// "remap" / `Conversion` error, and the executor's coerced retry casts the
+    /// column to `VARCHAR` — so a query effectively sees `VARCHAR`.
+    ///
+    /// So we keep the fast-path describe as the baseline and only RECONCILE
+    /// when it reports a complex type that *might* be masking an irreconcilable
+    /// mix. The reconcile per-file-describes and overrides a column to
+    /// `VARCHAR` ONLY when its observed per-file types span more than one
+    /// top-level kind (scalar-vs-complex or mixed complex kinds) — the cases a
+    /// real query cannot read. Union-able same-kind drift keeps the merged
+    /// fast-path type, so `/api/v1/schema` reports what queries actually
+    /// return. The error-triggered branch is kept as insurance for any
+    /// `DuckDB` version/path where the describe itself raises a union conflict.
     pub fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError> {
         // Validate source path before interpolation — DuckDB doesn't truly
         // parameterize table-valued function arguments.
         emitter::validate_source_path(source)?;
 
-        let mut stmt = self
-            .conn
-            .prepare("DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)")?;
-        let mut rows = stmt.query([source])?;
-
-        let mut columns = Vec::new();
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(0)?;
-            let data_type: String = row.get(1)?;
-            columns.push(SchemaColumn { name, data_type });
-        }
+        let columns = match self.describe_schema_columns(source) {
+            // No complex columns → the fast path is authoritative and cannot be
+            // masking drift; return it without paying O(files) per-file
+            // describes on every /schema call.
+            Ok(cols) if !cols.iter().any(|c| is_complex_type(&c.data_type)) => cols,
+            // A complex type MIGHT be masking an irreconcilable cross-file mix
+            // the fast-path describe can't see. Reconcile per-file, but keep the
+            // merged fast-path type for any column whose drift is union-able.
+            // This is gated on complex-type PRESENCE, not actual drift: detecting
+            // drift requires the per-file describes themselves, so a column that
+            // is a consistent `STRUCT` across all files still pays O(files) here.
+            // In practice compaction coerces complex columns to VARCHAR at write
+            // time, so steady-state parquet is all-scalar and takes the fast path
+            // above; this branch only fires on un-migrated/external parquet.
+            Ok(cols) => self.describe_schema_columns_coerced(source, cols)?,
+            // Insurance: some paths/versions raise the conflict at describe. We
+            // have no fast-path baseline here, so reconcile from scratch.
+            Err(EngineError::Database(e)) if is_union_type_conflict(&e) => {
+                self.describe_schema_columns_coerced(source, Vec::new())?
+            }
+            Err(e) => return Err(e),
+        };
 
         // Count matching files.
         let file_count: i64 =
@@ -280,6 +332,124 @@ impl Executor {
             columns,
             file_count: u64::try_from(file_count).unwrap_or(0),
         })
+    }
+
+    /// Fast-path schema describe: a single `DESCRIBE` over the union of all
+    /// matching parquet files. Cheap (no row reads) but blind to cross-file
+    /// drift — the caller reconciles per-file when it reports a complex type.
+    fn describe_schema_columns(&self, source: &str) -> Result<Vec<SchemaColumn>, EngineError> {
+        let mut stmt = self
+            .conn
+            .prepare("DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)")?;
+        let mut rows = stmt.query([source])?;
+
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let data_type: String = row.get(1)?;
+            columns.push(SchemaColumn { name, data_type });
+        }
+        Ok(columns)
+    }
+
+    /// Reconcile a parquet glob's schema against the fast-path describe by
+    /// per-file-describing every file and overriding ONLY the columns whose
+    /// drift a real query cannot read.
+    ///
+    /// `fast_path` is the `read_parquet(union_by_name=true)` describe — the
+    /// schema a *successful* query sees, including the MERGED type for union-
+    /// able same-kind complex drift (`STRUCT`-vs-`STRUCT`, `LIST`-vs-`LIST`).
+    /// We keep it verbatim except for columns whose per-file observed types
+    /// span more than one top-level kind (a complex type vs a scalar, or mixed
+    /// complex kinds like `STRUCT`-vs-`LIST`): those make a real query error,
+    /// so the executor's coerced retry casts them to `VARCHAR`, and that is
+    /// what `/api/v1/schema` must advertise.
+    ///
+    /// `fast_path` may be empty (the insurance path, where the fast-path
+    /// describe itself raised a union conflict); then every irreconcilable
+    /// column is reported `VARCHAR` and reconcilable columns keep their single
+    /// observed type. Column order follows the fast path when present, else
+    /// first-seen per-file order, so the result is deterministic.
+    fn describe_schema_columns_coerced(
+        &self,
+        source: &str,
+        fast_path: Vec<SchemaColumn>,
+    ) -> Result<Vec<SchemaColumn>, EngineError> {
+        use indexmap::IndexMap;
+
+        // Glob-expand to concrete files. `glob(?)` is parameterized, so no
+        // interpolation here; the per-file DESCRIBE below interpolates the
+        // resulting paths (trusted — derived from the operator's data_dir),
+        // escaping single quotes to stay consistent with the rest of the file.
+        let mut glob_stmt = self.conn.prepare("SELECT file FROM glob(?)")?;
+        let mut glob_rows = glob_stmt.query([source])?;
+        let mut files: Vec<String> = Vec::new();
+        while let Some(row) = glob_rows.next()? {
+            files.push(row.get::<_, String>(0)?);
+        }
+
+        // First-seen column order → observed distinct per-file types.
+        let mut col_types: IndexMap<String, Vec<String>> = IndexMap::new();
+        for file in &files {
+            let safe = file.replace('\'', "''");
+            let types = self.describe_types(&format!("SELECT * FROM read_parquet('{safe}')"))?;
+            for (name, ty) in types {
+                let observed = col_types.entry(name).or_default();
+                if !observed.contains(&ty) {
+                    observed.push(ty);
+                }
+            }
+        }
+
+        // A column is irreconcilable when its per-file types span more than one
+        // top-level kind — the union would error and a query falls back to a
+        // VARCHAR cast. Same-kind drift (incl. all-scalar) is union-able.
+        let is_irreconcilable = |types: &[String]| -> bool {
+            let mut kinds = types.iter().map(|t| top_level_kind(t));
+            let Some(first) = kinds.next() else {
+                return false;
+            };
+            kinds.any(|k| k != first)
+        };
+
+        // Prefer the fast-path baseline: it carries the merged union type for
+        // union-able complex drift. Override a column to VARCHAR only when its
+        // per-file types prove an irreconcilable mix.
+        if !fast_path.is_empty() {
+            return Ok(fast_path
+                .into_iter()
+                .map(|col| {
+                    let irreconcilable = col_types
+                        .get(&col.name)
+                        .is_some_and(|types| is_irreconcilable(types));
+                    if irreconcilable {
+                        SchemaColumn {
+                            name: col.name,
+                            data_type: "VARCHAR".to_owned(),
+                        }
+                    } else {
+                        col
+                    }
+                })
+                .collect());
+        }
+
+        // Insurance path: no fast-path baseline. Report VARCHAR for
+        // irreconcilable columns, else the single observed type.
+        Ok(col_types
+            .into_iter()
+            .map(|(name, types)| {
+                let data_type = if is_irreconcilable(&types) {
+                    "VARCHAR".to_owned()
+                } else {
+                    types
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| "VARCHAR".to_owned())
+                };
+                SchemaColumn { name, data_type }
+            })
+            .collect())
     }
 
     /// Sample distinct values for a field (for autocomplete).
@@ -652,13 +822,67 @@ fn is_binder_column_error(e: &duckdb::Error) -> bool {
 
 /// Check if a `DuckDB` error is a column type conflict raised when a
 /// `UNION ALL BY NAME` (or `read_parquet(..., union_by_name=true)`) cannot
-/// reconcile a column's type across sources — e.g. JSON/STRUCT vs VARCHAR
-/// ("Conversion"/"remap") or a scalar mismatch. Distinct from a
-/// missing-column binder error. False positives are harmless: the caller
-/// retries conflict detection, finds none, and falls through unchanged.
-fn is_type_mismatch_error(e: &duckdb::Error) -> bool {
+/// reconcile a column's type across sources — e.g. JSON/STRUCT vs `VARCHAR`.
+///
+/// Matches two real `DuckDB` 1.4.x strings:
+/// - the union path raises a `"Conversion"` error;
+/// - the `read_parquet(union_by_name)` path raises a Binder
+///   `"Struct remap can only remap nested types, not 'VARCHAR'"` error
+///   (the `"remap"` substring), plus the generic `"type mismatch"`.
+///
+/// Deliberately does NOT match `"too small to be a Parquet file"`: that is a
+/// corruption error, handled by quarantining the file, not by the cast
+/// fallback. False positives are harmless — the caller retries conflict
+/// detection, finds none, and falls through unchanged.
+pub fn is_union_type_conflict(e: &duckdb::Error) -> bool {
     let msg = e.to_string();
     msg.contains("Conversion") || msg.contains("remap") || msg.contains("type mismatch")
+}
+
+/// Whether a `DuckDB` type name (as reported by `DESCRIBE`) is a complex
+/// (nested) type — `STRUCT`/`MAP`/`LIST`/array `[]`/`UNION`/`JSON`. These are
+/// the types that, when the same column is `VARCHAR` in another file, raise a
+/// read-time union conflict. A schema describe that reports one of these may
+/// be masking cross-file drift that only surfaces at query time.
+fn is_complex_type(data_type: &str) -> bool {
+    let t = data_type.to_ascii_uppercase();
+    t.starts_with("STRUCT")
+        || t.starts_with("MAP")
+        || t.starts_with("LIST")
+        || t.starts_with("UNION")
+        || t == "JSON"
+        || t.ends_with("[]")
+}
+
+/// Classify a `DuckDB` type name (as reported by `DESCRIBE`) into its
+/// top-level *kind* — the granularity at which `read_parquet(union_by_name)`
+/// either reconciles a column or errors.
+///
+/// Two per-file types with the SAME kind are union-able: `STRUCT(x INTEGER)`
+/// and `STRUCT(y INTEGER)` merge to `STRUCT(x INTEGER, y INTEGER)`;
+/// `INTEGER[]` and `VARCHAR[]` merge to `VARCHAR[]`. Two types with DIFFERENT
+/// kinds are not: a `STRUCT` vs a scalar `VARCHAR`, or a `STRUCT` vs a `LIST`,
+/// makes a real query raise a Binder "remap" / `Conversion` error, after which
+/// the executor casts the column to `VARCHAR`.
+///
+/// All scalar types collapse to a single `"scalar"` kind: scalar-vs-scalar
+/// drift (e.g. `BIGINT` vs `VARCHAR`) is reconciled by the union to a common
+/// type, so it is never flagged irreconcilable here.
+fn top_level_kind(data_type: &str) -> &'static str {
+    let t = data_type.trim().to_ascii_uppercase();
+    if t.starts_with("STRUCT") {
+        "struct"
+    } else if t.starts_with("MAP") {
+        "map"
+    } else if t.starts_with("UNION") {
+        "union"
+    } else if t == "JSON" {
+        "json"
+    } else if t.starts_with("LIST") || t.ends_with("[]") {
+        "list"
+    } else {
+        "scalar"
+    }
 }
 
 /// Remap a `DuckDB` binder error about missing columns to `EngineError::Emit`
@@ -849,4 +1073,218 @@ fn days_to_ymd(days: i32) -> (i32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
 
     (y as i32, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use duckdb::Connection;
+
+    use super::{Executor, is_union_type_conflict};
+
+    /// Write a one-row parquet file whose `meta` column has the given SQL
+    /// type/value expression (e.g. `{'a': 1}` for a `STRUCT`, `'plain'` for a
+    /// `VARCHAR`). Mirrors the cold-fixture shape used in `integration.rs`.
+    fn write_meta_parquet(conn: &Connection, path: &Path, meta_expr: &str) {
+        conn.execute_batch(&format!(
+            "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                          'svc' AS service, {meta_expr} AS meta) \
+             TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+    }
+
+    /// Provoke a live `read_parquet(union_by_name=true)` type conflict by
+    /// reading two files where `meta` is `STRUCT` in one and `VARCHAR` in the
+    /// other. Returns the raw `DuckDB` error.
+    fn read_parquet_remap_error(dir: &Path) -> duckdb::Error {
+        let conn = Connection::open_in_memory().unwrap();
+        let struct_file = dir.join("struct.parquet");
+        let varchar_file = dir.join("varchar.parquet");
+        write_meta_parquet(&conn, &struct_file, "{'a': 1}");
+        write_meta_parquet(&conn, &varchar_file, "'plain'");
+        let glob = format!("{}/*.parquet", dir.display());
+        conn.prepare("SELECT * FROM read_parquet(?, union_by_name=true)")
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([glob.as_str()])?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            })
+            .expect_err("STRUCT-vs-VARCHAR read_parquet union must error")
+    }
+
+    /// Provoke a live `UNION ALL BY NAME` Conversion error: a `STRUCT` column
+    /// unioned with a `VARCHAR` column of the same name.
+    fn union_conversion_error() -> duckdb::Error {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.prepare("SELECT {'a': 1} AS meta UNION ALL BY NAME SELECT 'plain' AS meta")
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            })
+            .expect_err("STRUCT-vs-VARCHAR UNION ALL BY NAME must error")
+    }
+
+    /// Provoke a live "too small to be a Parquet file" corruption error by
+    /// pointing `read_parquet` at a file with valid head magic but no trailer.
+    fn corruption_error(dir: &Path) -> duckdb::Error {
+        let conn = Connection::open_in_memory().unwrap();
+        let bad = dir.join("truncated.parquet");
+        std::fs::write(&bad, b"PAR1\x00\x00").unwrap();
+        let path = format!("{}", bad.display());
+        conn.prepare("SELECT * FROM read_parquet(?)")
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([path.as_str()])?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            })
+            .expect_err("truncated parquet must error")
+    }
+
+    /// Provoke a benign binder / missing-column error.
+    fn benign_binder_error() -> duckdb::Error {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.prepare("SELECT nonexistent_col FROM (SELECT 1 AS x)")
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            })
+            .expect_err("missing-column query must error")
+    }
+
+    #[test]
+    fn is_union_type_conflict_matches_real_strings() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let remap = read_parquet_remap_error(dir.path());
+        assert!(
+            is_union_type_conflict(&remap),
+            "read_parquet remap error should classify as a union type conflict: {remap}"
+        );
+
+        let conversion = union_conversion_error();
+        assert!(
+            is_union_type_conflict(&conversion),
+            "UNION ALL BY NAME conversion error should classify as a union type conflict: {conversion}"
+        );
+
+        let corrupt = corruption_error(dir.path());
+        assert!(
+            !is_union_type_conflict(&corrupt),
+            "corruption error must NOT classify as a type conflict (handled by quarantine): {corrupt}"
+        );
+
+        let benign = benign_binder_error();
+        assert!(
+            !is_union_type_conflict(&benign),
+            "benign missing-column error must NOT classify as a type conflict: {benign}"
+        );
+    }
+
+    #[test]
+    fn describe_schema_tolerates_cross_file_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        // `meta` is a STRUCT in file A and a VARCHAR in file B — the exact
+        // cross-file drift that would 500 a raw union DESCRIBE.
+        write_meta_parquet(&setup, &dir.path().join("a.parquet"), "{'a': 1}");
+        write_meta_parquet(&setup, &dir.path().join("b.parquet"), "'plain'");
+
+        let exec = Executor::new().unwrap();
+        let glob = format!("{}/*.parquet", dir.path().display());
+        let schema = exec
+            .describe_schema(&glob)
+            .expect("describe_schema must tolerate cross-file drift, not error");
+
+        let meta = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "meta")
+            .expect("schema must include the drifted `meta` column");
+        assert_eq!(
+            meta.data_type, "VARCHAR",
+            "drifted column must be reported as VARCHAR (the rollup-convergence type)"
+        );
+        // Non-drifted columns keep their real types.
+        assert!(
+            schema.columns.iter().any(|c| c.name == "service"),
+            "non-drifted columns must still be present"
+        );
+        assert_eq!(schema.file_count, 2, "both files should be counted");
+    }
+
+    #[test]
+    fn describe_schema_keeps_union_able_struct_drift() {
+        // `meta` is `STRUCT(x INTEGER)` in file A and `STRUCT(y INTEGER)` in
+        // file B — realistic per-batch JSON inference on sparse nested objects.
+        // `read_parquet(union_by_name=true)` MERGES these to
+        // `STRUCT(x INTEGER, y INTEGER)` and a real query reads them fine, so
+        // describe_schema must report the merged STRUCT, NOT collapse to
+        // VARCHAR (which would make /api/v1/schema lie about a column queries
+        // return as a STRUCT — the inverse of the drift S1 set out to prevent).
+        let dir = tempfile::tempdir().unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &dir.path().join("a.parquet"), "{'x': 1}");
+        write_meta_parquet(&setup, &dir.path().join("b.parquet"), "{'y': 2}");
+
+        let exec = Executor::new().unwrap();
+        let glob = format!("{}/*.parquet", dir.path().display());
+        let schema = exec
+            .describe_schema(&glob)
+            .expect("describe_schema must tolerate union-able struct drift");
+
+        let meta = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "meta")
+            .expect("schema must include the `meta` column");
+        assert!(
+            meta.data_type.to_ascii_uppercase().starts_with("STRUCT"),
+            "union-able cross-file STRUCT drift must report the merged STRUCT \
+             type (a real query reads it as a STRUCT), got `{}`",
+            meta.data_type
+        );
+
+        // Prove describe matches read time: a SELECT over the same glob must
+        // succeed, returning both rows the union merges.
+        let result = exec
+            .run_query("* | fields meta", &glob, usize::MAX, 0)
+            .expect("SELECT meta over the merged-STRUCT glob must succeed");
+        assert_eq!(
+            result.row_count(),
+            2,
+            "both rows must survive the merged-STRUCT union read"
+        );
+    }
+
+    #[test]
+    fn run_query_with_hot_returns_hot_on_cold_start() {
+        // Cold start: the parquet source matches zero files, so the union
+        // raises a "no files" error (NOT a type conflict). The hot-only
+        // fallback must return the hot row without erroring and WITHOUT
+        // logging a cold-drop (type_conflict is false here).
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+
+        let exec = Executor::new().unwrap();
+        // Glob that matches no parquet files (cold start).
+        let source = format!("{}/nonexistent/*.parquet", dir.path().display());
+        let result = exec
+            .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+            .expect("cold-start query must return hot rows, not error");
+        assert_eq!(
+            result.row_count(),
+            1,
+            "the single hot row must survive the cold-start hot-only fallback"
+        );
+    }
 }

@@ -17,3 +17,8 @@ pub mod timezone;
 // so that existing `trawl_engine::value::*` imports across the workspace
 // continue to work without changes.
 pub use trawl_api::value;
+
+// The union-type-conflict classifier is shared with trawl-server's
+// compaction path so both lanes agree on which `DuckDB` errors warrant a
+// cast-to-`VARCHAR` fallback (vs quarantine/abort).
+pub use executor::is_union_type_conflict;
