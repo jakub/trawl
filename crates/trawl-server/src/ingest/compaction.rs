@@ -7,7 +7,7 @@
 //! Periodically scans the WAL directory for `.ndjson` files, groups
 //! them by service, and uses `DuckDB` to convert each batch to parquet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -472,32 +472,50 @@ fn rollup_day_blocking(
     ))
     .map_err(|e| format!("SET memory_limit/threads failed: {e}"))?;
 
-    // Build file list for read_parquet.
-    let mut file_list_parts = Vec::with_capacity(hourly_files.len() + 1);
-    for f in hourly_files {
-        file_list_parts.push(format!("'{}'", f.to_string_lossy()));
-    }
-
-    // If a day-level file already exists (e.g. late-arriving data after a
-    // previous rollup), include it in the merge.
+    // Build the merge input list: all hourly files, plus the existing
+    // day-level file (late-arriving data merges into it after a prior
+    // rollup).
     let canonical_path = day_dir.join(format!("{service}.parquet"));
+    let mut all_files: Vec<PathBuf> = hourly_files.to_vec();
     if canonical_path.exists() {
-        file_list_parts.push(format!("'{}'", canonical_path.to_string_lossy()));
+        all_files.push(canonical_path.clone());
     }
 
-    let file_list_sql = file_list_parts.join(", ");
+    let file_list_sql = all_files
+        .iter()
+        .map(|f| format!("'{}'", f.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
     let tmp_path = day_dir.join(format!("{service}.parquet.tmp"));
 
-    // Read, merge, sort by timestamp, and write to tmp file.
-    conn.execute_batch(&format!(
+    // Read, merge, sort by timestamp, and write to tmp file. The fast path
+    // leans on `union_by_name` to reconcile heterogeneous schemas, but that
+    // only unifies by column NAME — it cannot bridge a column that is JSON
+    // or STRUCT in one hourly file and VARCHAR in another (independent
+    // per-batch type inference at write time produces exactly this drift).
+    // On that bind-time type/remap error, fall back to describing each file
+    // and casting the conflicting columns to VARCHAR before unioning.
+    let fast = conn.execute_batch(&format!(
         "COPY (\
              SELECT * FROM read_parquet([{file_list_sql}], union_by_name=true) \
              ORDER BY \"timestamp\"\
          ) TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY, \
              BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
         tmp_path.to_string_lossy(),
-    ))
-    .map_err(|e| format!("rollup COPY failed: {e}"))?;
+    ));
+    match fast {
+        Ok(()) => {}
+        Err(e) if is_type_mismatch_error(&e) => {
+            tracing::warn!(
+                event_type = "rollup_fallback",
+                compact_service = %service,
+                error = %e,
+                "rollup type conflict across hourly files, falling back to VARCHAR casts"
+            );
+            rollup_with_casts(&conn, &all_files, &tmp_path, service)?;
+        }
+        Err(e) => return Err(format!("rollup COPY failed: {e}")),
+    }
 
     // Write marker BEFORE rename so recovery knows which hourlies to clean up.
     write_rollup_marker(day_dir, service, hourly_files)?;
@@ -535,6 +553,76 @@ fn rollup_day_blocking(
     );
 
     Ok(())
+}
+
+/// Rollup fallback: union hourly parquet files when their schemas conflict.
+///
+/// The fast-path `read_parquet([...], union_by_name=true)` fails at bind
+/// time when the same column name has incompatible physical types across
+/// files (e.g. JSON/STRUCT in one hour, VARCHAR in another). This rebuilds
+/// the merge explicitly: `DESCRIBE` every file, find columns whose type
+/// differs across files, cast those to `VARCHAR` in each branch, and
+/// `UNION ALL BY NAME` so heterogeneous column sets still line up (missing
+/// columns become NULL). Mirrors [`merge_with_existing`] but generalised
+/// to N files for the daily rollup.
+fn rollup_with_casts(
+    conn: &duckdb::Connection,
+    files: &[PathBuf],
+    tmp_path: &Path,
+    service: &str,
+) -> Result<(), String> {
+    // Describe every input file and accumulate the set of types seen per
+    // column name across all files.
+    let mut col_types: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut schemas: Vec<Vec<ColInfo>> = Vec::with_capacity(files.len());
+    for f in files {
+        let schema = describe_source(
+            conn,
+            &format!("SELECT * FROM read_parquet('{}')", f.display()),
+        )?;
+        for col in &schema {
+            col_types
+                .entry(col.name.clone())
+                .or_default()
+                .insert(col.dtype.clone());
+        }
+        schemas.push(schema);
+    }
+
+    // A column conflicts when it appears with more than one distinct type.
+    let conflicts: Vec<String> = col_types
+        .into_iter()
+        .filter(|(_, types)| types.len() > 1)
+        .map(|(name, _)| name)
+        .collect();
+
+    tracing::info!(
+        event_type = "rollup_fallback",
+        compact_service = %service,
+        conflicting_columns = ?conflicts,
+        "casting conflicting columns to VARCHAR for rollup"
+    );
+
+    // Build one casting SELECT per file and union them by name.
+    let union_sql = files
+        .iter()
+        .zip(&schemas)
+        .map(|(f, schema)| {
+            format!(
+                "SELECT {} FROM read_parquet('{}')",
+                build_cast_select(schema, &conflicts),
+                f.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL BY NAME ");
+
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM ({union_sql}) ORDER BY \"timestamp\") TO '{}' \
+         (FORMAT PARQUET, COMPRESSION SNAPPY, BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
+        tmp_path.to_string_lossy(),
+    ))
+    .map_err(|e| format!("rollup (type fallback) failed: {e}"))
 }
 
 /// Compact a batch of WAL files for a single service into parquet.
@@ -673,14 +761,23 @@ fn build_cast_select(schema: &[ColInfo], conflicts: &[String]) -> String {
 }
 
 /// Return true if the error looks like a type/cast mismatch from
-/// `DuckDB` — the kind that `UNION ALL BY NAME` raises when column
-/// types are incompatible (e.g. JSON vs VARCHAR).
+/// `DuckDB` — the kind that `UNION ALL BY NAME` or `read_parquet(...,
+/// union_by_name=true)` raises when column types are incompatible across
+/// sources (e.g. JSON vs VARCHAR for the same column name).
+///
+/// The `remap` clause catches `read_parquet`'s schema-unification error
+/// "Binder Error: Struct remap can only remap nested types, not 'VARCHAR'",
+/// raised at bind time when one file has a column as STRUCT and another
+/// has it as a flat scalar. Note: this deliberately does NOT match
+/// "too small to be a Parquet file" (a corruption error, not a type
+/// conflict — that is handled by quarantining the file instead).
 fn is_type_mismatch_error(e: &duckdb::Error) -> bool {
     let msg = e.to_string();
     msg.contains("Conversion")
         || msg.contains("Type")
         || msg.contains("Cast")
         || msg.contains("type mismatch")
+        || msg.contains("remap")
 }
 
 /// Merge `wal_batch` with an existing parquet file via `UNION ALL BY NAME`.
@@ -1582,6 +1679,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first_msg, "early", "rows should be sorted by timestamp");
+    }
+
+    #[test]
+    fn rollup_merges_despite_type_conflict_across_hours() {
+        // The prod failure: hour 01 wrote `offset` as a JSON/STRUCT object,
+        // hour 02 wrote it as a plain string ("540.203µs"). The bare
+        // read_parquet(union_by_name=true) raises a bind-time type/remap
+        // error; the rollup must fall back to VARCHAR casts and still merge.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let date = "2026-01-15";
+
+        let r1 =
+            r#"{"timestamp":"2026-01-15T01:00:00Z","service":"ctrl","offset":{"v":1,"u":"x"}}"#;
+        let r2 = r#"{"timestamp":"2026-01-15T02:00:00Z","service":"ctrl","offset":"540.203µs"}"#;
+        let f1 = write_hourly_parquet(&data_dir, date, "01", "ctrl", &[r1]);
+        let f2 = write_hourly_parquet(&data_dir, date, "02", "ctrl", &[r2]);
+
+        let day_dir = data_dir.join(date);
+        rollup_day_blocking(&day_dir, "ctrl", &[f1.clone(), f2.clone()], "2GB").unwrap();
+
+        let daily = day_dir.join("ctrl.parquet");
+        assert!(daily.exists(), "daily parquet should exist after fallback");
+        assert!(!f1.exists(), "hourly file 1 should be deleted");
+        assert!(!f2.exists(), "hourly file 2 should be deleted");
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    daily.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "both rows present despite offset type conflict");
+
+        // The conflicting column must be unified to VARCHAR.
+        let col_type: String = conn
+            .query_row(
+                &format!(
+                    "SELECT typeof(\"offset\") FROM read_parquet('{}') LIMIT 1",
+                    daily.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(col_type, "VARCHAR", "offset should be cast to VARCHAR");
     }
 
     #[test]
