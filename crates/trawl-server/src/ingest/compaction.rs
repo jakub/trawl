@@ -761,6 +761,10 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
 /// Tries auto-detection first (`maximum_depth=2`). If `DuckDB` hits a
 /// "Duplicate name" error (nested JSON keys that collide when flattened),
 /// falls back to an explicit column list with `json` typed as opaque JSON.
+///
+/// After the table is built, any column `DuckDB` inferred as a complex type
+/// (STRUCT/MAP/JSON/LIST) is coerced to VARCHAR — see
+/// [`coerce_complex_columns_to_varchar`] for why.
 fn read_wal_to_table(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -782,7 +786,7 @@ fn read_wal_to_table(
     ));
 
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(e) if e.to_string().contains("Duplicate name") => {
             tracing::warn!(
                 event_type = "compaction_fallback",
@@ -803,10 +807,70 @@ fn read_wal_to_table(
                  level: 'VARCHAR', message: 'VARCHAR', \
                  service: 'VARCHAR', timestamp: 'VARCHAR'}})"
             ))
-            .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
+            .map_err(|e| format!("read_json (explicit columns) failed: {e}"))?;
         }
-        Err(e) => Err(format!("read_json failed: {e}")),
+        Err(e) => return Err(format!("read_json failed: {e}")),
     }
+
+    coerce_complex_columns_to_varchar(conn, service)
+}
+
+/// Return true if a `DuckDB` type string denotes a complex/nested type
+/// (STRUCT, MAP, JSON, LIST, or UNION) rather than a flat scalar.
+fn is_complex_type(dtype: &str) -> bool {
+    let t = dtype.to_ascii_uppercase();
+    t == "JSON"
+        || t.starts_with("STRUCT")
+        || t.starts_with("MAP")
+        || t.starts_with("UNION")
+        || t.contains("[]") // LIST types render as e.g. `VARCHAR[]`
+}
+
+/// Coerce every complex-typed column in `wal_batch` to VARCHAR.
+///
+/// This is the root-cause fix for cross-file schema drift. `DuckDB` infers
+/// each column's type independently per compaction batch, so a field that
+/// is object-valued in one batch (→ STRUCT/JSON) but only ever a string in
+/// another (→ VARCHAR) lands with different physical types across hourly
+/// parquet files. Those later collide under `read_parquet(...,
+/// union_by_name=true)` at both rollup AND query time (which has no
+/// fallback and degrades to dropping cold rows).
+///
+/// Forcing complex columns to VARCHAR converges both cases: an object
+/// becomes its JSON text and a plain string stays a string — both VARCHAR —
+/// so every hourly file shares a stable schema for that column. Scalars
+/// (numbers, booleans, timestamps) keep their types. The DSL never relies
+/// on a column being JSON/STRUCT-typed (dotted fields are flat identifiers;
+/// `json()`/`json_extract()` accept VARCHAR), so this is transparent to
+/// queries. The hot-buffer snapshot is coerced symmetrically so the
+/// query-time union of hot + cold sources stays type-aligned.
+fn coerce_complex_columns_to_varchar(
+    conn: &duckdb::Connection,
+    service: &str,
+) -> Result<(), String> {
+    let schema = describe_source(conn, "SELECT * FROM wal_batch")?;
+    let complex: Vec<String> = schema
+        .iter()
+        .filter(|c| is_complex_type(&c.dtype))
+        .map(|c| c.name.clone())
+        .collect();
+
+    if complex.is_empty() {
+        return Ok(());
+    }
+
+    tracing::debug!(
+        event_type = "compaction_coerce",
+        compact_service = %service,
+        columns = ?complex,
+        "coercing complex columns to VARCHAR for a stable on-disk schema"
+    );
+
+    let select = build_cast_select(&schema, &complex);
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TABLE wal_batch AS SELECT {select} FROM wal_batch"
+    ))
+    .map_err(|e| format!("complex column coercion failed: {e}"))
 }
 
 /// Column name and type from `DuckDB` `DESCRIBE`.
@@ -1579,6 +1643,66 @@ mod tests {
             col_type, "VARCHAR",
             "conflicting column should be cast to VARCHAR"
         );
+    }
+
+    #[test]
+    fn is_complex_type_classifies_duckdb_types() {
+        assert!(is_complex_type("JSON"));
+        assert!(is_complex_type("STRUCT(v BIGINT)"));
+        assert!(is_complex_type("MAP(VARCHAR, JSON)"));
+        assert!(is_complex_type("VARCHAR[]"));
+        assert!(is_complex_type("BIGINT[]"));
+        assert!(!is_complex_type("VARCHAR"));
+        assert!(!is_complex_type("BIGINT"));
+        assert!(!is_complex_type("TIMESTAMP"));
+        assert!(!is_complex_type("DOUBLE"));
+    }
+
+    #[test]
+    fn compaction_coerces_complex_fields_to_varchar() {
+        // Root-cause fix: an object-valued field must be written as VARCHAR
+        // so hourly files never disagree on its physical type. Scalars keep
+        // their inferred types.
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let r = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"k","containerID":{"id":"abc"},"count":5}"#;
+        let f = write_wal_file(&wal_dir, "k", &[r]);
+        compact_service_blocking(std::slice::from_ref(&f), &data_dir, "k", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+
+        // The object field is coerced to VARCHAR, preserving the JSON text.
+        let (ty, val): (String, String) = conn
+            .query_row(
+                &format!(
+                    "SELECT typeof(\"containerID\"), \"containerID\" \
+                     FROM read_parquet('{}') LIMIT 1",
+                    parquet[0].display()
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ty, "VARCHAR", "object field must be coerced to VARCHAR");
+        assert!(val.contains("abc"), "JSON text should be preserved: {val}");
+
+        // A scalar field keeps its inferred numeric type.
+        let count_ty: String = conn
+            .query_row(
+                &format!(
+                    "SELECT typeof(\"count\") FROM read_parquet('{}') LIMIT 1",
+                    parquet[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(count_ty, "VARCHAR", "scalar field must keep its type");
     }
 
     #[test]
