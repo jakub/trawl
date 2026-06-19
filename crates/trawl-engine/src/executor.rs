@@ -103,10 +103,30 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
-        let result = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
-        let mut result = match &result {
+        let mut outcome = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
+
+        // A column type conflict between the hot and cold sources (e.g. a
+        // field that is BIGINT in parquet but VARCHAR in the hot snapshot)
+        // would otherwise fall through to the hot-only path below and
+        // silently drop every cold row. Detect the conflicting columns and
+        // retry the union with them coerced to VARCHAR on both sides,
+        // preserving hot AND cold data. Both a false positive (no conflicts
+        // found) and a describe failure degrade safely to the path below.
+        let type_conflict = matches!(
+            &outcome,
+            Err(EngineError::Database(e)) if is_type_mismatch_error(e)
+        );
+        if type_conflict
+            && let Ok(cols) = self.hot_cold_conflicts(source, hot_source)
+            && !cols.is_empty()
+        {
+            let coerced = emitter::emit_with_hot_source_coerced(&ast, source, hot_source, &cols)?;
+            outcome = self.execute_emitted(&coerced, max_rows, utc_offset_secs);
+        }
+
+        let mut result = match &outcome {
             // Columns present → real result (possibly empty rows). Return as-is.
-            Ok(r) if !r.columns.is_empty() => result?,
+            Ok(r) if !r.columns.is_empty() => outcome?,
             // No columns (no parquet source files), database error (UNION
             // fails on missing source), or binder error remapped to Emit
             // (column not found in empty parquet) → fall back to hot-only.
@@ -120,7 +140,7 @@ impl Executor {
                     other => other?,
                 }
             }
-            Err(_) => result?,
+            Err(_) => outcome?,
         };
         if !emitted.rust_stages.is_empty() {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
@@ -188,6 +208,47 @@ impl Executor {
         }
 
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Describe the `(name, type)` of every column produced by `query`.
+    fn describe_types(&self, query: &str) -> Result<Vec<(String, String)>, EngineError> {
+        let mut stmt = self.conn.prepare(&format!("DESCRIBE {query}"))?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+        }
+        Ok(out)
+    }
+
+    /// Find columns shared by the cold (parquet) and hot (ndjson) sources
+    /// whose inferred types differ — the columns that must be coerced to
+    /// VARCHAR for the hot+cold `UNION ALL BY NAME` to bind.
+    ///
+    /// Returns an error (caught by the caller, which then falls back to
+    /// hot-only) if either source cannot be described — e.g. on cold start
+    /// with no parquet files.
+    fn hot_cold_conflicts(
+        &self,
+        source: &str,
+        hot_source: &str,
+    ) -> Result<Vec<String>, EngineError> {
+        let cold_reader = emitter::source_reader(source)?;
+        let hot_reader = emitter::hot_source_reader(hot_source)?;
+
+        let cold = self.describe_types(&format!("SELECT * FROM {cold_reader}"))?;
+        // Describe the hot side with the same timestamp cast the union
+        // applies, so the always-TIMESTAMP key isn't flagged as a conflict.
+        let hot = self.describe_types(&format!(
+            "SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") FROM {hot_reader}"
+        ))?;
+
+        let hot_types: std::collections::HashMap<String, String> = hot.into_iter().collect();
+        Ok(cold
+            .into_iter()
+            .filter(|(name, ty)| hot_types.get(name).is_some_and(|h| h != ty))
+            .map(|(name, _)| name)
+            .collect())
     }
 
     /// Describe the schema without reading row data.
@@ -587,6 +648,17 @@ fn is_no_files_error(e: &duckdb::Error) -> bool {
 fn is_binder_column_error(e: &duckdb::Error) -> bool {
     let msg = e.to_string();
     msg.contains(DUCKDB_BINDER_ERROR_MSG) && (msg.contains("column") || msg.contains("not found"))
+}
+
+/// Check if a `DuckDB` error is a column type conflict raised when a
+/// `UNION ALL BY NAME` (or `read_parquet(..., union_by_name=true)`) cannot
+/// reconcile a column's type across sources — e.g. JSON/STRUCT vs VARCHAR
+/// ("Conversion"/"remap") or a scalar mismatch. Distinct from a
+/// missing-column binder error. False positives are harmless: the caller
+/// retries conflict detection, finds none, and falls through unchanged.
+fn is_type_mismatch_error(e: &duckdb::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("Conversion") || msg.contains("remap") || msg.contains("type mismatch")
 }
 
 /// Remap a `DuckDB` binder error about missing columns to `EngineError::Emit`
