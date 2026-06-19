@@ -80,9 +80,22 @@ impl WalWriter {
         std::fs::rename(&tmp_path, &final_path)?;
 
         // fsync the directory entry so the rename is durable, not just the
-        // file's data. On a fresh open this is the canonical "make a rename
-        // crash-safe" step.
-        File::open(&self.wal_dir)?.sync_all()?;
+        // file's data — the canonical "make a rename crash-safe" step.
+        //
+        // Best-effort: the data fsync above already made the bytes durable and
+        // the rename has published the file (the compactor WILL consume it), so
+        // a dir-fsync failure here only weakens crash-survival of the rename
+        // entry. It must NOT fail an otherwise-successful, already-visible write
+        // — that would falsely reject the batch and risk a duplicate on retry.
+        if let Err(e) = File::open(&self.wal_dir).and_then(|d| d.sync_all()) {
+            tracing::warn!(
+                event_type = "wal_dir_fsync_failed",
+                dir = %self.wal_dir.display(),
+                error = %e,
+                "WAL parent-dir fsync failed; write is durable but the rename \
+                 entry may not survive a crash"
+            );
+        }
 
         Ok(final_path)
     }
