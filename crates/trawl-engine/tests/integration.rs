@@ -520,3 +520,44 @@ fn export_parquet_rejects_rust_stages() {
 
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn hot_cold_type_conflict_keeps_both_rows() {
+    // Cold parquet has `meta` as a STRUCT (object value); the hot snapshot
+    // has it as a plain string (VARCHAR). The hot+cold UNION ALL BY NAME
+    // raises a Conversion Error. The executor must detect the conflict,
+    // coerce `meta` to VARCHAR on both sides, and keep BOTH the cold and hot
+    // rows — not silently fall back to hot-only and drop the cold row.
+    use duckdb::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cold = dir.path().join("cold.parquet");
+    let hot = dir.path().join("hot.ndjson");
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                      'svc' AS service, {{'a': 1}} AS meta) \
+         TO '{}' (FORMAT PARQUET)",
+        cold.display()
+    ))
+    .unwrap();
+
+    std::fs::write(
+        &hot,
+        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+    )
+    .unwrap();
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!("{}/*.parquet", dir.path().display());
+    let result = exec
+        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+        .unwrap();
+
+    assert_eq!(
+        result.row_count(),
+        2,
+        "both cold (struct meta) and hot (string meta) rows must survive the coerced retry"
+    );
+}

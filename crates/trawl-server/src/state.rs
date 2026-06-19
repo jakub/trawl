@@ -168,7 +168,10 @@ pub struct CompactionStats {
     pub last_run_epoch_secs: AtomicU64,
     /// Total successful compaction cycles.
     pub total_runs: AtomicU64,
-    /// Total failed compaction cycles.
+    /// Total compaction failures: failed WAL-compaction cycles PLUS
+    /// per-service daily-rollup failures and quarantined-input data-loss
+    /// counts (so this can exceed `total_runs` — it is a failure/data-loss
+    /// tally, not a cycle count).
     pub total_errors: AtomicU64,
 }
 

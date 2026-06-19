@@ -20,7 +20,7 @@ use state::EmitterState;
 
 pub use fields::map_field_name;
 pub use functions::is_aggregate_function;
-pub use state::validate_source_path;
+pub use state::{hot_source_reader, source_reader, validate_source_path};
 pub use validate::validate_pipeline;
 
 use std::fmt;
@@ -144,6 +144,22 @@ pub fn emit_with_hot_source(
     hot_source: &str,
 ) -> Result<EmittedQuery, EmitError> {
     let state = EmitterState::with_hot_source(source, hot_source)?;
+    emit_from_state(query, state)
+}
+
+/// Emit a hot+cold union query with `varchar_cols` coerced to VARCHAR on
+/// both sides.
+///
+/// The executor calls this to retry a query whose hot+cold union failed on
+/// a column type conflict, coercing the conflicting columns so both the hot
+/// and cold rows survive instead of dropping the cold side.
+pub fn emit_with_hot_source_coerced(
+    query: &Query,
+    source: &str,
+    hot_source: &str,
+    varchar_cols: &[String],
+) -> Result<EmittedQuery, EmitError> {
+    let state = EmitterState::with_hot_source_coerced(source, hot_source, varchar_cols)?;
     emit_from_state(query, state)
 }
 
@@ -1055,6 +1071,40 @@ mod tests {
         let query = parser::parse("*").unwrap();
         let err = emit_with_hot_source(&query, SRC, "/tmp/bad;path.ndjson").unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn hot_source_coerced_empty_matches_plain() {
+        // The empty-coercion path must be byte-identical to the plain hot
+        // source so the common case is unchanged.
+        let query = parser::parse("service=nginx").unwrap();
+        let plain = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson").unwrap();
+        let coerced =
+            emit_with_hot_source_coerced(&query, SRC, "/tmp/hot_abc123.ndjson", &[]).unwrap();
+        assert_eq!(plain.sql, coerced.sql);
+    }
+
+    #[test]
+    fn hot_source_coerced_casts_columns_both_sides() {
+        let query = parser::parse("*").unwrap();
+        let cols = vec!["status".to_string(), "containerID".to_string()];
+        let sql = emit_with_hot_source_coerced(&query, SRC, "/tmp/hot_abc123.ndjson", &cols)
+            .unwrap()
+            .sql;
+        // Cold (parquet) side casts the conflicting columns to VARCHAR.
+        assert!(
+            sql.contains(r#"REPLACE (CAST("status" AS VARCHAR) AS "status""#),
+            "cold side should cast status: {sql}"
+        );
+        assert!(
+            sql.contains(r#"CAST("containerID" AS VARCHAR) AS "containerID""#),
+            "should cast containerID: {sql}"
+        );
+        // Hot side keeps the timestamp cast and adds the VARCHAR casts.
+        assert!(
+            sql.contains(r#"CAST("timestamp" AS TIMESTAMP) AS "timestamp""#),
+            "hot side keeps timestamp cast: {sql}"
+        );
     }
 
     // -----------------------------------------------------------------------

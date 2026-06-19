@@ -154,6 +154,48 @@ fn build_reader(source: &str) -> Result<String, super::EmitError> {
     }
 }
 
+/// Build the `read_json` reader expression for a hot-buffer ndjson snapshot.
+///
+/// `field_appearance_threshold=0` prevents `DuckDB` from collapsing
+/// heterogeneous-schema events into a single MAP column.
+fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
+    validate_source_path(hot)?;
+    Ok(format!(
+        "read_json('{hot}', format='newline_delimited', records=true, \
+         auto_detect=true, field_appearance_threshold=0)"
+    ))
+}
+
+/// Build the body of a `REPLACE (...)` clause casting `varchar_cols` to
+/// VARCHAR. When `with_timestamp` is set, the canonical timestamp cast is
+/// prepended (the hot side always needs it to match parquet's TIMESTAMP).
+/// `timestamp` is never coerced to VARCHAR — it is the sort/partition key.
+fn varchar_replace_list(varchar_cols: &[String], with_timestamp: bool) -> String {
+    let mut parts = Vec::with_capacity(varchar_cols.len() + 1);
+    if with_timestamp {
+        parts.push("CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\"".to_string());
+    }
+    for col in varchar_cols {
+        if col == "timestamp" {
+            continue;
+        }
+        let q = super::fields::quote_field(col);
+        parts.push(format!("CAST({q} AS VARCHAR) AS {q}"));
+    }
+    parts.join(", ")
+}
+
+/// Public accessor for the parquet/list source reader expression, so the
+/// engine can `DESCRIBE` the same cold source the emitter reads from.
+pub fn source_reader(source: &str) -> Result<String, super::EmitError> {
+    build_reader(source)
+}
+
+/// Public accessor for the hot-buffer reader expression (see [`hot_reader`]).
+pub fn hot_source_reader(hot: &str) -> Result<String, super::EmitError> {
+    hot_reader(hot)
+}
+
 impl EmitterState {
     pub(crate) fn new(source: &str) -> Result<Self, super::EmitError> {
         let reader = build_reader(source)?;
@@ -167,13 +209,39 @@ impl EmitterState {
     /// `field_appearance_threshold=0` prevents `DuckDB` from collapsing
     /// heterogeneous-schema events into a single MAP column.
     pub(crate) fn with_hot_source(primary: &str, hot: &str) -> Result<Self, super::EmitError> {
-        validate_source_path(hot)?;
+        Self::with_hot_source_coerced(primary, hot, &[])
+    }
+
+    /// Like [`with_hot_source`], but additionally coerces `varchar_cols` to
+    /// VARCHAR on BOTH branches of the union.
+    ///
+    /// Used by the executor to retry a query whose hot+cold union failed on
+    /// a column type conflict (e.g. the same field is BIGINT in parquet but
+    /// VARCHAR in the hot snapshot). Coercing the conflicting columns on both
+    /// sides keeps the union valid, preserving hot AND cold rows instead of
+    /// the executor falling back to hot-only and dropping the cold side.
+    ///
+    /// With an empty `varchar_cols` this is byte-identical to the original
+    /// composite source.
+    pub(crate) fn with_hot_source_coerced(
+        primary: &str,
+        hot: &str,
+        varchar_cols: &[String],
+    ) -> Result<Self, super::EmitError> {
         let primary_reader = build_reader(primary)?;
+        let hot_reader = hot_reader(hot)?;
+
+        let cold_replace = varchar_replace_list(varchar_cols, false);
+        let cold_select = if cold_replace.is_empty() {
+            format!("SELECT * FROM {primary_reader}")
+        } else {
+            format!("SELECT * REPLACE ({cold_replace}) FROM {primary_reader}")
+        };
+
+        let hot_replace = varchar_replace_list(varchar_cols, true);
         let composite = format!(
-            "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
-             SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
-             FROM read_json('{hot}', format='newline_delimited', records=true, \
-             auto_detect=true, field_appearance_threshold=0))"
+            "({cold_select} UNION ALL BY NAME \
+             SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
         );
         Ok(Self::with_source(composite))
     }
