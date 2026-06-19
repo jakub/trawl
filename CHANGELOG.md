@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-18
+
 ### Added
 - Documentation site at [trawl.sh](https://trawl.sh) (Starlight/Astro)
 - Fuzz testing for parser and emitter (cargo-fuzz + libfuzzer)
@@ -19,6 +21,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `unreachable!()` in export handler replaced with error return
 - Timechart auto-bucket for >30 day ranges (was 1h, now 1d)
 - Source list validation handles unspaced comma-separated paths
+- Heal hot/cold and cross-file parquet **schema drift**: complex columns (STRUCT/JSON/array) are coerced to VARCHAR at compaction write time and symmetrically in the hot buffer, so a field that is an object in one batch and a plain string in another no longer drops cold/parquet rows at query time or wedges the daily rollup
+- Quarantine corrupt/truncated parquet inputs (renamed `.corrupt`) instead of letting one bad file wedge the daily rollup forever; surface the resulting data loss on the compaction error counter
+- Daily-rollup accounting hardening: count quarantined inputs even when the merge then hard-errors, count a wedged rollup recovery, and make hourly-file cleanup idempotent so a partially-completed recovery can't loop
 
 ### Changed
 - Value types (`Value`, `QueryResult`, `SchemaColumn`) moved from trawl-engine to trawl-api
@@ -142,7 +147,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Scheduled queries with cron-style execution
 - CI/CD with cross-compiled binaries, .deb packages, and APT repository
 
-[Unreleased]: https://github.com/jakub/trawl/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/jakub/trawl/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jakub/trawl/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/jakub/trawl/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/jakub/trawl/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/jakub/trawl/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/jakub/trawl/compare/v0.1.5...v0.1.6
