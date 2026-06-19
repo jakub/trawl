@@ -115,6 +115,11 @@ pub async fn compact_once(
 
     let files = scan_wal_files(wal_dir, min_age).map_err(|e| format!("scan failed: {e}"))?;
 
+    // Tally of corrupt WAL files quarantined this cycle. Folded into the
+    // return value so it lands on `CompactionStats.total_errors` as a
+    // data-loss signal, mirroring the rollup quarantine count.
+    let mut wal_quarantined: u64 = 0;
+
     if !files.is_empty() {
         // Group WAL files by service prefix.
         let groups = group_by_service(files);
@@ -157,21 +162,30 @@ pub async fn compact_once(
                     .collect();
 
                 match compact_service_batch(chunk, data_dir, service, memory_limit).await {
-                    Ok(()) => {
+                    Ok(quarantined) => {
+                        wal_quarantined += quarantined;
+
                         // Remove fully compacted batches from the hot buffer.
                         if let Some(buf) = &hot_buffer {
                             buf.drain(&batch_ids);
                         }
 
-                        // Clean up consumed WAL files.
+                        // Clean up consumed WAL files. A file that was
+                        // quarantined (renamed to `.corrupt`) is already gone
+                        // from its original path — NotFound means the goal
+                        // (no longer a re-compactable WAL file) is satisfied.
                         for f in chunk {
-                            if let Err(e) = std::fs::remove_file(f) {
-                                tracing::warn!(
-                                    event_type = "compaction_error",
-                                    file = %f.display(),
-                                    error = %e,
-                                    "failed to delete consumed WAL file"
-                                );
+                            match std::fs::remove_file(f) {
+                                Ok(()) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        event_type = "compaction_error",
+                                        file = %f.display(),
+                                        error = %e,
+                                        "failed to delete consumed WAL file"
+                                    );
+                                }
                             }
                         }
                     }
@@ -208,7 +222,7 @@ pub async fn compact_once(
         0
     };
 
-    Ok(rollup_failures)
+    Ok(rollup_failures + wal_quarantined)
 }
 
 /// Consolidate hourly per-service parquet files into daily files.
@@ -475,7 +489,7 @@ fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
                     compact_service = %service,
                     "discarding truncated rollup tmp; retaining hourly files for retry"
                 );
-                quarantine_file(&tmp, service)?;
+                quarantine_file(&tmp, service, "rollup_quarantine")?;
             }
         } else {
             // Neither exists — stale marker. Nothing to strand, so the marker
@@ -533,36 +547,66 @@ fn is_valid_parquet(path: &Path) -> bool {
     &tail == PARQUET_MAGIC
 }
 
-/// Move a corrupt/unreadable parquet file aside so it stops wedging the
-/// rollup, preserving the bytes for forensics. Appends `.corrupt` to the
-/// filename, which makes it inert (it no longer matches the `*.parquet`
-/// or `*.tmp` globs that compaction scans).
+/// Cheap content sniff for a WAL ndjson file, catching the torn-write
+/// corruption signature before it reaches `read_json` — where it otherwise
+/// fails with "Malformed JSON ... unexpected character" and wedges the whole
+/// batch. Like a truncated parquet, no amount of retrying repairs a file of
+/// zeros, so the only escape is to set it aside.
 ///
-/// A failed rename is a HARD error: the bad file still matches `*.parquet`
-/// and would re-wedge the rollup on every tick forever, so callers must
-/// surface (and count) the failure rather than swallow it.
-fn quarantine_file(path: &Path, service: &str) -> Result<(), String> {
+/// A WAL file is text: newline-delimited JSON objects. We reject it as
+/// corrupt if it is empty (`read_json(records=true)` errors on empty input),
+/// contains a NUL byte (illegal in JSON text and the dead giveaway of a torn
+/// write whose data blocks never flushed), or is not valid UTF-8. An
+/// unreadable file is likewise rejected — `read_json` can't read it either,
+/// so quarantining beats wedging.
+///
+/// This deliberately does NOT fully JSON-parse each line: that would
+/// re-implement `read_json` and reject merely-malformed-but-textual data, a
+/// different (and rarer) class than the crash debris this guards against.
+fn is_valid_ndjson(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    if bytes.is_empty() || bytes.contains(&0u8) {
+        return false;
+    }
+    std::str::from_utf8(&bytes).is_ok()
+}
+
+/// Move a corrupt/unreadable file aside so it stops wedging compaction,
+/// preserving the bytes for forensics. Appends `.corrupt` to the filename,
+/// which makes it inert: it no longer matches the `*.parquet`/`*.tmp` globs
+/// the rollup scans, nor the `*.ndjson` glob WAL compaction scans.
+///
+/// `event_type` tags the structured log so operators can distinguish a
+/// rollup quarantine (`rollup_quarantine`) from a WAL-compaction one
+/// (`compaction_quarantine`).
+///
+/// A failed rename is a HARD error: the bad file still matches the scan glob
+/// and would re-wedge on every tick forever, so callers must surface (and
+/// count) the failure rather than swallow it.
+fn quarantine_file(path: &Path, service: &str, event_type: &str) -> Result<(), String> {
     let mut quarantined = path.as_os_str().to_owned();
     quarantined.push(".corrupt");
     let quarantined = PathBuf::from(quarantined);
     match std::fs::rename(path, &quarantined) {
         Ok(()) => {
             tracing::warn!(
-                event_type = "rollup_quarantine",
+                event_type,
                 compact_service = %service,
                 from = %path.display(),
                 to = %quarantined.display(),
-                "quarantined corrupt parquet file"
+                "quarantined corrupt file"
             );
             Ok(())
         }
         Err(e) => {
             tracing::error!(
-                event_type = "rollup_quarantine",
+                event_type,
                 compact_service = %service,
                 file = %path.display(),
                 error = %e,
-                "failed to quarantine corrupt parquet file"
+                "failed to quarantine corrupt file"
             );
             Err(format!("failed to quarantine {}: {e}", path.display()))
         }
@@ -696,7 +740,7 @@ fn rollup_day_inner(
         } else {
             // A failed quarantine is a HARD error — the bad file still
             // matches `*.parquet` and would wedge the rollup forever.
-            quarantine_file(f, service)?;
+            quarantine_file(f, service, "rollup_quarantine")?;
             *quarantined += 1;
         }
     }
@@ -704,7 +748,7 @@ fn rollup_day_inner(
         if is_valid_parquet(&canonical_path) {
             all_files.push(canonical_path.clone());
         } else {
-            quarantine_file(&canonical_path, service)?;
+            quarantine_file(&canonical_path, service, "rollup_quarantine")?;
             *quarantined += 1;
         }
     }
@@ -893,7 +937,7 @@ async fn compact_service_batch(
     data_dir: &Path,
     service: &str,
     memory_limit: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let wal_files = wal_files.to_vec();
     let data_dir = data_dir.to_path_buf();
     let service = service.to_owned();
@@ -1166,8 +1210,40 @@ fn compact_service_blocking(
     data_dir: &Path,
     service: &str,
     memory_limit: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let compact_start = std::time::Instant::now();
+
+    // Validate WAL inputs before they reach `read_json`. A single corrupt
+    // file (e.g. a pure-NUL torn write from a hard kill) fails the whole
+    // multi-file `read_json` call and, with no quarantine, head-of-line
+    // blocks this service's compaction forever — re-scanned and re-failed
+    // every tick. Sniff each file and move the corrupt ones aside (bytes
+    // preserved), mirroring the rollup parquet-quarantine path.
+    let mut valid_files: Vec<PathBuf> = Vec::with_capacity(wal_files.len());
+    let mut quarantined: u64 = 0;
+    for f in wal_files {
+        if is_valid_ndjson(f) {
+            valid_files.push(f.clone());
+        } else {
+            quarantine_file(f, service, "compaction_quarantine")?;
+            quarantined += 1;
+        }
+    }
+
+    if valid_files.is_empty() {
+        // Every file in the batch was corrupt — nothing readable to compact.
+        // This is data loss (torn writes are unrecoverable), not an error:
+        // there is nothing to retry, so surface it via the quarantine count
+        // rather than wedging. Mirrors the rollup all-corrupt branch.
+        tracing::error!(
+            event_type = "compaction_data_loss",
+            compact_service = %service,
+            quarantined,
+            "all WAL files in batch were corrupt — no parquet produced, DATA LOSS"
+        );
+        return Ok(quarantined);
+    }
+
     let conn =
         duckdb::Connection::open_in_memory().map_err(|e| format!("DuckDB open failed: {e}"))?;
 
@@ -1188,7 +1264,7 @@ fn compact_service_blocking(
     ))
     .map_err(|e| format!("SET memory_limit/threads failed: {e}"))?;
 
-    read_wal_to_table(&conn, wal_files, service)?;
+    read_wal_to_table(&conn, &valid_files, service)?;
 
     // Determine output directory from current time.
     let now = chrono::Utc::now();
@@ -1259,7 +1335,7 @@ fn compact_service_blocking(
         event_type = "compaction_complete",
         compact_service = %service,
         output = %canonical_path.display(),
-        wal_files = wal_files.len(),
+        wal_files = valid_files.len(),
         merged,
         rows,
         output_bytes,
@@ -1267,7 +1343,7 @@ fn compact_service_blocking(
         "compaction complete"
     );
 
-    Ok(())
+    Ok(quarantined)
 }
 
 /// Remove stale `.parquet.tmp` files left by interrupted compaction or
@@ -2279,6 +2355,126 @@ mod tests {
     }
 
     #[test]
+    fn is_valid_ndjson_detects_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let good = dir.join("good.ndjson");
+        std::fs::write(&good, b"{\"service\":\"x\",\"message\":\"hi\"}\n").unwrap();
+        assert!(is_valid_ndjson(&good), "real ndjson should be valid");
+
+        // Pure-NUL file: the torn-write crash signature (unflushed blocks read
+        // back as 0x00). 662 bytes mirrors the live homelab debris.
+        let nul = dir.join("nul.ndjson");
+        std::fs::write(&nul, [0u8; 662]).unwrap();
+        assert!(!is_valid_ndjson(&nul), "all-NUL file is corrupt");
+
+        // A valid record followed by an embedded NUL (partial torn write).
+        let partial = dir.join("partial.ndjson");
+        std::fs::write(&partial, b"{\"a\":1}\n\x00\x00\x00").unwrap();
+        assert!(!is_valid_ndjson(&partial), "embedded NUL is corrupt");
+
+        // Zero-byte: read_json(records=true) errors on empty input, so an
+        // empty WAL file would wedge compaction just like a NUL one.
+        let empty = dir.join("empty.ndjson");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!is_valid_ndjson(&empty), "zero-byte file is invalid");
+
+        // Non-UTF-8 garbage (no NUL byte) exercises the UTF-8 branch.
+        let binary = dir.join("binary.ndjson");
+        std::fs::write(&binary, [0xff, 0xfe, 0xfd, 0x01]).unwrap();
+        assert!(!is_valid_ndjson(&binary), "non-UTF-8 is invalid");
+
+        assert!(
+            !is_valid_ndjson(&dir.join("does-not-exist.ndjson")),
+            "missing file is invalid"
+        );
+    }
+
+    #[test]
+    fn compact_quarantines_nul_ndjson_keeps_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let good = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"hello"}"#;
+        let good_file = write_wal_file(&wal_dir, "nginx", &[good]);
+
+        // A pure-NUL WAL file (the torn-write crash signature: unflushed
+        // blocks read back as 0x00). write_wal_file only writes text, so write
+        // it directly; keep the `nginx_` prefix so it groups with the good
+        // file's service. 662 bytes mirrors the live homelab debris.
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let bad_file = wal_dir.join(format!("nginx_{millis}_bad.ndjson"));
+        std::fs::write(&bad_file, [0u8; 662]).unwrap();
+
+        let quarantined =
+            compact_service_blocking(&[good_file, bad_file.clone()], &data_dir, "nginx", "2GB")
+                .unwrap();
+        assert_eq!(quarantined, 1, "the NUL file should be quarantined");
+
+        // Good data still compacts to exactly one parquet.
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1, "good WAL must still produce a parquet");
+
+        // Corrupt file renamed aside; bytes preserved for forensics.
+        assert!(!bad_file.exists(), "corrupt WAL renamed away");
+        let mut corrupt = bad_file.into_os_string();
+        corrupt.push(".corrupt");
+        assert!(
+            PathBuf::from(corrupt).exists(),
+            "corrupt WAL quarantined to .corrupt"
+        );
+
+        // Only the good row landed.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "only the valid row should be present");
+    }
+
+    #[test]
+    fn compact_all_nul_is_data_loss_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let a = wal_dir.join(format!("svc_{millis}_a.ndjson"));
+        let b = wal_dir.join(format!("svc_{millis}_b.ndjson"));
+        std::fs::write(&a, [0u8; 128]).unwrap();
+        std::fs::write(&b, [0u8; 128]).unwrap();
+
+        // All inputs corrupt: no parquet, no error (nothing readable to retry),
+        // but both are counted as quarantined data-loss.
+        let quarantined =
+            compact_service_blocking(&[a.clone(), b.clone()], &data_dir, "svc", "2GB").unwrap();
+        assert_eq!(quarantined, 2, "both corrupt inputs counted");
+
+        assert!(
+            find_files_by_ext(&data_dir, "parquet").is_empty(),
+            "no parquet from all-corrupt batch"
+        );
+        assert!(!a.exists() && !b.exists(), "both corrupt files quarantined");
+    }
+
+    #[test]
     fn rollup_quarantines_truncated_hourly_file() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
@@ -2711,7 +2907,7 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("blocker"), b"x").unwrap();
 
-        let result = quarantine_file(&bad, "svc");
+        let result = quarantine_file(&bad, "svc", "rollup_quarantine");
         assert!(
             result.is_err(),
             "quarantine must surface a rename failure as Err"
