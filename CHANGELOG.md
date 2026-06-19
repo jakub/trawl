@@ -32,6 +32,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **BREAKING**: `/api/v1/whoami` response shape now returns `{prefix, name, kind, assignments, permissions}` — the flat `role` field is gone (clients should read `assignments` and find the `"trawl"` entry).
 - **BREAKING**: `trawl-admin keys create` replaces `--role <role>` with `--kind <human|service>` plus a repeatable `--grant <app:role>` flag. New subcommands: `keys grant`, `keys revoke-grant`, `keys retype`.
 
+### Security
+- Bump dependencies to clear advisories: `tar` 0.4.46 (RUSTSEC PAX desync, build-time), `rand` 0.8.6/0.9.3 (RUSTSEC unsoundness); docs toolchain `astro` 6.4.6 (SSRF/XSS), `vite` 7.3.5 (`fs.deny` bypass), `js-yaml` 4.2.0 (merge-key DoS)
+
 ## [0.2.0] - 2026-04-20
 
 ### Added
