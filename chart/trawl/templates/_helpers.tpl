@@ -66,3 +66,20 @@ Container image with tag defaulting to appVersion.
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag }}
 {{- end }}
+
+{{/*
+trawld container securityContext: the shared securityContext, plus
+CAP_SYS_PTRACE when crash-dump capture is enabled. The crash handler forks
+and ptraces itself to write a minidump, which the node's yama/ptrace_scope=2
+gates behind that capability. Scoped to trawld only — init-auth and trawl-web
+keep the unmodified securityContext.
+*/}}
+{{- define "trawl.trawldSecurityContext" -}}
+{{- $sc := deepCopy .Values.securityContext -}}
+{{- if .Values.crashDump.enabled -}}
+{{- $caps := default (dict) $sc.capabilities -}}
+{{- $_ := set $caps "add" (append (default (list) $caps.add) "SYS_PTRACE" | uniq) -}}
+{{- $_ := set $sc "capabilities" $caps -}}
+{{- end -}}
+{{- toYaml $sc -}}
+{{- end }}

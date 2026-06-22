@@ -86,6 +86,12 @@ spec:
               value: /var/lib/trawl
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- if .Values.crashDump.enabled }}
+            - name: TRAWL_CRASH_DUMP_DIR
+              value: {{ .Values.crashDump.mountPath | quote }}
+            - name: TRAWL_CRASH_DUMP_RETAIN
+              value: {{ .Values.crashDump.retain | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -109,7 +115,7 @@ spec:
               scheme: HTTPS
             periodSeconds: 10
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- include "trawl.trawldSecurityContext" . | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
@@ -125,6 +131,10 @@ spec:
             - name: tls
               mountPath: /etc/trawl/tls
               readOnly: true
+            {{- end }}
+            {{- if .Values.crashDump.enabled }}
+            - name: cores
+              mountPath: {{ .Values.crashDump.mountPath | quote }}
             {{- end }}
         {{- if .Values.web.enabled }}
         - name: trawl-web
@@ -214,8 +224,9 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  {{- if .Values.persistence.enabled }}
+  {{- if or .Values.persistence.enabled .Values.crashDump.enabled }}
   volumeClaimTemplates:
+    {{- if .Values.persistence.enabled }}
     - metadata:
         name: data
         labels:
@@ -229,4 +240,20 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.size }}
+    {{- end }}
+    {{- if .Values.crashDump.enabled }}
+    - metadata:
+        name: cores
+        labels:
+          {{- include "trawl.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.crashDump.storageClass }}
+        storageClassName: {{ .Values.crashDump.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.crashDump.size }}
+    {{- end }}
   {{- end }}
