@@ -16,7 +16,8 @@
 //!   process dies with the original signal (exit 139 for `SIGSEGV`).
 //! - the monitor exits when the client disconnects (parent died or shut down).
 
-use std::fs::File;
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -72,7 +73,7 @@ pub fn init() -> Option<Guard> {
 
 /// Parent side: spawn the monitor, connect, install the handler.
 fn install(dir: &Path) -> Result<Guard, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create dump dir {}: {e}", dir.display()))?;
+    create_dump_dir(dir).map_err(|e| format!("create dump dir {}: {e}", dir.display()))?;
     let retain = retain_from_env();
     // Prune leftover dumps from previous runs at startup (a safe context — never
     // inside the signal handler, where directory enumeration is not async-safe).
@@ -176,7 +177,7 @@ fn run_monitor(dir: &Path) -> ! {
 
 fn monitor_main(dir: &Path) -> Result<(), String> {
     let socket = std::env::var(SOCKET_ENV).map_err(|_| "monitor missing socket env".to_owned())?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("create dump dir: {e}"))?;
+    create_dump_dir(dir).map_err(|e| format!("create dump dir: {e}"))?;
 
     let mut server = Server::with_name(SocketName::abstract_namespace(&socket))
         .map_err(|e| format!("bind monitor socket: {e}"))?;
@@ -205,7 +206,14 @@ impl ServerHandler for MonitorHandler {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let path = self.dir.join(format!("trawld-crash-{stamp}.dmp"));
-        let file = File::create(&path)?;
+        // 0o600: a minidump is a verbatim copy of process memory (API tokens,
+        // TLS keys, auth-db rows), so it must never be group/world-readable.
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
         Ok((file, path))
     }
 
@@ -230,6 +238,14 @@ impl ServerHandler for MonitorHandler {
             LoopAction::Continue
         }
     }
+}
+
+/// Create the dump directory (and any missing parents) restricted to the owner.
+/// Dumps hold raw process memory, so the directory must not be group/world-
+/// accessible; `0o700` only affects components this call actually creates (an
+/// existing mount point keeps the perms the orchestrator gave it).
+fn create_dump_dir(dir: &Path) -> std::io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
 fn retain_from_env() -> usize {
