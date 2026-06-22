@@ -868,6 +868,54 @@ mod tests {
         assert_eq!(parsed.errors[1].index, 3);
     }
 
+    // --- depth-limit regression tests ---
+
+    // DuckDB's `read_json` is a recursive-descent parser: JSON nested past
+    // ~500 levels overflows the (2 MB) `spawn_blocking` stack and the C++
+    // frames can leap the guard page into a raw SIGSEGV. `maximum_depth=2`
+    // does NOT protect against this — that param caps schema-inference
+    // flattening, not parse recursion. What actually keeps adversarially-deep
+    // JSON away from `read_json` is that ingest re-serializes every event
+    // through `serde_json`, whose default recursion limit (128) rejects it at
+    // the door, before it is ever written to the WAL. These tests pin that
+    // invariant: if a refactor ever calls `Deserializer::disable_recursion_limit()`
+    // (or enables serde_json's `unbounded_depth`), they break loudly.
+
+    /// A pathologically-deep ndjson line is rejected per-line and never reaches
+    /// a WAL batch; sibling good lines on the same request still survive.
+    #[test]
+    fn parse_ndjson_rejects_deeply_nested_event() {
+        const DEPTH: usize = 1000; // well past serde_json's 128 limit
+        let deep = format!("{}1{}", "{\"a\":".repeat(DEPTH), "}".repeat(DEPTH));
+        let data = format!("{deep}\n{{\"service\":\"nginx\",\"message\":\"ok\"}}");
+        let parsed = parse_events(data.as_bytes(), &test_defaults()).unwrap();
+        // Deep line (index 0) rejected; good line (index 1) accepted.
+        assert_eq!(total_accepted(&parsed), 1);
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].index, 0);
+        assert!(
+            parsed.errors[0].message.contains("recursion"),
+            "expected a serde recursion-limit rejection, got: {}",
+            parsed.errors[0].message
+        );
+    }
+
+    /// A deeply-nested event in a JSON array aborts the whole request at parse
+    /// time (the array path has no per-event isolation), so nothing is written.
+    #[test]
+    fn parse_json_array_rejects_deeply_nested_event() {
+        const DEPTH: usize = 1000;
+        let deep = format!("{}1{}", "{\"a\":".repeat(DEPTH), "}".repeat(DEPTH));
+        let data = format!("[{deep}]");
+        let err = parse_events(data.as_bytes(), &test_defaults())
+            .expect_err("deeply-nested array event must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("recursion"),
+            "expected a serde recursion-limit rejection, got: {msg}"
+        );
+    }
+
     // --- defaults tests ---
 
     #[test]

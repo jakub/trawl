@@ -22,6 +22,7 @@ trawl-client = { path = "crates/trawl-client" }
 trawl-config = { path = "crates/trawl-config" }
 trawl-dashboard = { path = "crates/trawl-dashboard" }
 trawl-web = { path = "crates/trawl-web" }
+trawl-crashdump = { path = "crates/trawl-crashdump" }
 coastwatch-api-types = { path = "crates/coastwatch-api-types" }
 fleet-auth = { path = "crates/fleet-auth", default-features = false }
 fleet-ui = { path = "crates/fleet-ui" }
@@ -42,7 +43,7 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["bracketed-paste"] }
 dashmap = "6"
 comfy-table = "7"
-duckdb = { version = "1.4" }
+duckdb = { version = "1.5" }
 flate2 = "1"
 futures = "0.3"
 fs4 = "0.13"
@@ -113,7 +114,9 @@ syslog_loose = "0.23"
 zstd = "0.13"
 
 [profile.release]
-strip = true
+# Keep the symbol table (drop only DWARF) so minidump-stackwalk can resolve
+# Rust frames + the libduckdb module in crash dumps. See trawl-crashdump.
+strip = "debuginfo"
 lto = "thin"
 
 [workspace.lints.rust]

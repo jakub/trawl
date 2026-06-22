@@ -35,9 +35,21 @@ struct Cli {
     no_monitor: bool,
 }
 
-#[tokio::main]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install crash-dump capture before any threads are spawned or the async
+    // runtime is built: the minidump monitor is launched by re-execing this
+    // binary, which is only fork-safe while the process is single-threaded. In
+    // monitor mode this never returns. Held for the whole process lifetime.
+    let _crashdump = trawl_crashdump::init();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install ring crypto provider");
