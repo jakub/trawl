@@ -73,13 +73,15 @@ persistence:
     - ReadWriteOnce
 
 # -- Crash-dump (minidump) capture
-# When enabled, trawld installs a fatal-signal handler that writes a minidump
-# to a dedicated PVC on SIGSEGV/SIGABRT/SIGBUS, then re-raises so the process
-# still exits and is restarted. The handler forks and ptraces itself to capture
-# the dump, so the trawld container is granted CAP_SYS_PTRACE — only when this
-# is enabled, and only on trawld (init-auth and trawl-web are untouched). The
-# dump PVC is separate from the data PVC, so dumps stay out of data backups and
-# survive container restarts, pod reschedules, and node reboots. Off by default.
+# When enabled, trawld re-execs itself as a separate minidump *monitor* process
+# and installs a fatal-signal handler. On SIGSEGV/SIGABRT/SIGBUS the handler asks
+# the monitor to write a minidump to a dedicated PVC, then re-raises so the
+# process still exits and is restarted. The monitor ptraces the crashed trawld
+# (a process can't ptrace its own thread group), so the trawld container is
+# granted CAP_SYS_PTRACE — only when this is enabled, and only on trawld
+# (init-auth and trawl-web are untouched). The dump PVC is separate from the data
+# PVC, so dumps stay out of data backups and survive container restarts, pod
+# reschedules, and node reboots. Off by default.
 #
 # trawld reads the contract below from the environment:
 #   TRAWL_CRASH_DUMP_DIR    <- mountPath
