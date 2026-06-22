@@ -1,0 +1,32 @@
+[package]
+name = "trawl-crashdump"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# This crate deliberately does NOT inherit `[workspace.lints]` (which forbids
+# unsafe). Installing a fatal-signal handler and writing the breadcrumb require
+# unsafe; this is the one crate where it is allowed, isolated and audited. The
+# rest of the workspace stays at `unsafe_code = "forbid"`. Lints otherwise
+# mirror the workspace exactly, with forbid -> deny so the two unsafe blocks
+# can carry an explicit `#[allow(unsafe_code)]`.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# Crash-dump capture is Linux-only (ptrace + minidump). On every other platform
+# this crate is a no-op stub with no dependencies, so the daemon still builds.
+[target.'cfg(target_os = "linux")'.dependencies]
+crash-handler = "0.7.0"
+libc = "0.2.186"
+minidumper = "0.10.1"
