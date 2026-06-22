@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-21
+
+### Added
+- Out-of-process crash-dump (minidump) capture for `trawld`. On a fatal signal (SIGSEGV/SIGABRT/SIGBUS) a re-exec'd monitor process writes a minidump before the process dies, turning an opaque exit-139 into a `.dmp` that `minidump-stackwalk` can symbolicate against the Rust frames and the libduckdb module. New `trawl-crashdump` crate (the one place `unsafe` is allowed in the workspace); opt-in via the Helm `crashDump` block (off by default, requires `CAP_SYS_PTRACE` on the trawld container only). Dumps are written owner-only (`0600`) since they contain raw process memory. Debian/systemd parity is tracked separately.
+
+### Fixed
+- Bump DuckDB 1.5.1 → 1.5.4 to pick up JSON/Parquet segfault and out-of-bounds hardening (upstream #21594, #21972, #21635, #23100) on the `read_json`/`read_parquet` paths trawld drives hardest during compaction and hot-buffer queries — the leading suspect for the recurring exit-139 crashes. Pinned a serde recursion-limit regression test so pathologically deep JSON keeps being rejected at ingest rather than reaching the recursive-descent parser.
+
 ## [0.3.1] - 2026-06-19
 
 ### Fixed
@@ -157,7 +165,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Scheduled queries with cron-style execution
 - CI/CD with cross-compiled binaries, .deb packages, and APT repository
 
-[Unreleased]: https://github.com/jakub/trawl/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/jakub/trawl/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/jakub/trawl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/jakub/trawl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jakub/trawl/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jakub/trawl/compare/v0.1.8...v0.2.0
