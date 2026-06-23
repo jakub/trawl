@@ -24,9 +24,15 @@ use parquet::file::statistics::Statistics;
 
 use trawl_api::value::ParquetColumnStats;
 
-/// Stat-value samples longer than this are truncated, so a pathological value
-/// can't bloat the schema cache.
+/// Stat-value samples longer than this (in characters) are truncated at
+/// `display()`, so a pathological value can't bloat the schema cache.
 const MAX_SAMPLE_LEN: usize = 256;
+
+/// Byte-array stat samples are truncated to this many bytes *at decode time*, so
+/// a multi-MB min/max blob can't spike memory while it's held in the
+/// accumulator. Sized so `display()`'s `MAX_SAMPLE_LEN`-char cap is never
+/// starved (UTF-8 is at most 4 bytes/char), keeping the rendered sample intact.
+const MAX_SAMPLE_BYTES: usize = MAX_SAMPLE_LEN * 4;
 
 /// Error reading a parquet file's footer. Carries the offending path so callers
 /// can quarantine and log exactly which file failed.
@@ -108,7 +114,10 @@ impl StatVal {
             }
             Statistics::Double(_) => take::<8>(bytes).map(|a| Self::Float(f64::from_le_bytes(a))),
             Statistics::ByteArray(_) | Statistics::FixedLenByteArray(_) => {
-                Some(Self::Bytes(bytes.to_vec()))
+                // Cap the retained sample so a pathological multi-MB stat value
+                // can't bloat the accumulator (it's only ever a display sample).
+                let end = bytes.len().min(MAX_SAMPLE_BYTES);
+                Some(Self::Bytes(bytes[..end].to_vec()))
             }
             // INT96 is a deprecated 96-bit timestamp; skip its min/max sample
             // rather than guess at the legacy nanos-of-day encoding.
@@ -119,6 +128,13 @@ impl StatVal {
     /// Whether `self` orders strictly before `other`, or `None` when the two are
     /// different kinds (a column's type changed across files) and so can't be
     /// compared.
+    ///
+    /// `Bytes` are compared as unsigned byte-lexical order, which matches
+    /// parquet's modern UNSIGNED sort order for `BYTE_ARRAY` stats. Legacy files
+    /// that wrote SIGNED byte-array min/max could in principle mis-order a
+    /// high-bit-set value, but these are display-only samples, so the impact is
+    /// cosmetic. (Samples are also truncated to `MAX_SAMPLE_BYTES`, so two values
+    /// sharing that prefix compare equal — again, sample-only.)
     fn precedes(&self, other: &Self) -> Option<bool> {
         match (self, other) {
             (Self::Bool(a), Self::Bool(b)) => Some(a < b),
@@ -269,7 +285,10 @@ impl StatsAccumulator {
             .map(|(column_name, c)| ParquetColumnStats {
                 column_name,
                 total_count: c.num_values,
-                null_count: c.null_count,
+                // Defensive clamp: a corrupt-but-parseable footer could report
+                // more nulls than values, underflowing a downstream
+                // `total_count - null_count`. Nulls can never exceed values.
+                null_count: c.null_count.min(c.num_values),
                 min_value: c.min.as_ref().map(StatVal::display),
                 max_value: c.max.as_ref().map(StatVal::display),
                 compressed_bytes: c.compressed_bytes,
@@ -340,6 +359,33 @@ mod tests {
         // Typed merge: min is 5, not "10" (which a lexical string compare gives).
         assert_eq!(n.min_value.as_deref(), Some("5"));
         assert_eq!(n.max_value.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn long_byte_array_sample_is_truncated() {
+        // A pathologically large byte-array stat must be bounded at decode (so it
+        // can't bloat the accumulator) and again at display. Tested directly
+        // because DuckDB itself truncates footer min/max stats to a small bound,
+        // so a round-tripped file never reaches the decode cap.
+        use parquet::data_type::ByteArray;
+        use parquet::file::statistics::ValueStatistics;
+
+        let stats = Statistics::ByteArray(ValueStatistics::<ByteArray>::new(
+            None, None, None, None, false,
+        ));
+        let raw = vec![b'x'; 5000];
+        let decoded = StatVal::decode(&stats, &raw).unwrap();
+
+        // Decode caps the retained bytes at MAX_SAMPLE_BYTES.
+        match &decoded {
+            StatVal::Bytes(b) => assert_eq!(b.len(), MAX_SAMPLE_BYTES),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+
+        // display() caps at MAX_SAMPLE_LEN chars then appends one ellipsis.
+        let sample = decoded.display();
+        assert_eq!(sample.chars().count(), MAX_SAMPLE_LEN + 1);
+        assert!(sample.ends_with('…'));
     }
 
     #[test]
