@@ -74,7 +74,18 @@ const DATE_PART_UNITS: &[&str] = &[
     // epoch omitted: float precision diverges between eval and DuckDB text roundtrip
 ];
 
-const STRING_VALS: &[&str] = &["nginx", "error", "web-1", "hello", "UPPER", "  spaced  "];
+// Include non-ASCII values so the parity harness exercises byte-vs-character
+// divergence in scalar fns like length() (DuckDB LENGTH counts characters).
+const STRING_VALS: &[&str] = &[
+    "nginx",
+    "error",
+    "web-1",
+    "hello",
+    "UPPER",
+    "  spaced  ",
+    "café",
+    "日本語",
+];
 
 const INT_VALS: &[i64] = &[0, 1, 42, 100, -5, 200, 500];
 

@@ -492,7 +492,10 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
         "upper" => unary_str(args, str::to_uppercase),
         #[allow(clippy::cast_possible_wrap)]
         "length" | "len" => args.first().map_or(EvalValue::Null, |v| match v {
-            EvalValue::Str(s) => EvalValue::Int(s.len() as i64),
+            // DuckDB's LENGTH() (emitted by emitter::functions) returns the
+            // character count, not the byte count, so use chars().count() to
+            // keep the streaming evaluator in parity with the batch path.
+            EvalValue::Str(s) => EvalValue::Int(s.chars().count() as i64),
             _ => EvalValue::Null,
         }),
         "trim" => unary_str(args, |s| s.trim().to_string()),
@@ -1612,6 +1615,13 @@ mod tests {
     fn fn_length() {
         let expr = call("length", vec![lit_str("hello")]);
         assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(5));
+    }
+
+    #[test]
+    fn fn_length_counts_chars_not_bytes() {
+        // DuckDB LENGTH() returns character count; "café" is 4 chars / 5 bytes.
+        let expr = call("length", vec![lit_str("café")]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(4));
     }
 
     #[test]
