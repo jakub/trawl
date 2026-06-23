@@ -315,7 +315,7 @@ Date/time functions operate on **timestamps** — the `timestamp` field is store
 
 #### Date/time unit allowlist
 
-The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **string literal** from the allowed set. Non-literal expressions (field refs, computed values) and unlisted units are rejected at parse time in both batch and streaming modes.
+The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **string literal** from the allowed set. Non-literal expressions (field refs, computed values) and unlisted units are rejected at emit time in both batch and streaming modes.
 
 | Function | Allowed units |
 |----------|--------------|
