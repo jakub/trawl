@@ -358,6 +358,20 @@ fn eval_eq(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
         (EvalValue::Int(a), EvalValue::Int(b)) => EvalValue::Bool(a == b),
         (EvalValue::Bool(a), EvalValue::Bool(b)) => EvalValue::Bool(a == b),
         (EvalValue::Str(a), EvalValue::Str(b)) => EvalValue::Bool(a == b),
+        (EvalValue::Timestamp(a), EvalValue::Timestamp(b)) => EvalValue::Bool(a == b),
+        // Str vs Timestamp: coerce Str to Timestamp; fall back to Str-vs-Str on
+        // parse failure so non-timestamp strings don't regress.
+        (EvalValue::Timestamp(_), EvalValue::Str(_))
+        | (EvalValue::Str(_), EvalValue::Timestamp(_)) => {
+            match (lhs.as_timestamp(), rhs.as_timestamp()) {
+                (Some(a), Some(b)) => EvalValue::Bool(a == b),
+                // Str that doesn't parse as timestamp: fall through to str repr
+                _ => match (lhs.as_str_repr(), rhs.as_str_repr()) {
+                    (Some(a), Some(b)) => EvalValue::Bool(a == b),
+                    _ => EvalValue::Null,
+                },
+            }
+        }
         // cross-type numeric comparison
         _ => match (lhs.as_f64(), rhs.as_f64()) {
             (Some(a), Some(b)) => EvalValue::Bool(a == b),
@@ -378,6 +392,19 @@ fn eval_cmp(
     let ordering = match (lhs, rhs) {
         (EvalValue::Int(a), EvalValue::Int(b)) => Some(a.cmp(b)),
         (EvalValue::Str(a), EvalValue::Str(b)) => Some(a.cmp(b)),
+        (EvalValue::Timestamp(a), EvalValue::Timestamp(b)) => Some(a.cmp(b)),
+        // Str vs Timestamp: coerce Str to Timestamp for ordering; fall back to
+        // Str-vs-Str so non-timestamp strings don't regress.
+        (EvalValue::Timestamp(_), EvalValue::Str(_))
+        | (EvalValue::Str(_), EvalValue::Timestamp(_)) => {
+            match (lhs.as_timestamp(), rhs.as_timestamp()) {
+                (Some(a), Some(b)) => Some(a.cmp(&b)),
+                _ => match (lhs.as_str_repr(), rhs.as_str_repr()) {
+                    (Some(a), Some(b)) => Some(a.cmp(&b)),
+                    _ => None,
+                },
+            }
+        }
         _ => match (lhs.as_f64(), rhs.as_f64()) {
             (Some(a), Some(b)) => a.partial_cmp(&b), // both are values, not refs
             _ => None,
@@ -1367,6 +1394,59 @@ mod tests {
     fn cmp_null_propagation() {
         let expr = binary(lit_int(5), BinaryOp::Gt, lit_null());
         assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    // ── M5: Timestamp vs Str coercion in eval_cmp/eval_eq ──────────
+
+    #[test]
+    fn timestamp_gt_str_past_is_true() {
+        // now() > a past timestamp string: should be true
+        let expr = binary(
+            call("now", vec![]),
+            BinaryOp::Gt,
+            lit_str("2000-01-01 00:00:00"),
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+    }
+
+    #[test]
+    fn timestamp_lt_str_future_is_true() {
+        let expr = binary(
+            call("now", vec![]),
+            BinaryOp::Lt,
+            lit_str("2999-12-31 23:59:59"),
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+    }
+
+    #[test]
+    fn timestamp_eq_str_same_instant() {
+        // strptime produces Timestamp; compare to the same string
+        let expr = binary(
+            call(
+                "strptime",
+                vec![lit_str("2026-01-15 10:20:30"), lit_str("%Y-%m-%d %H:%M:%S")],
+            ),
+            BinaryOp::Eq,
+            lit_str("2026-01-15 10:20:30"),
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+    }
+
+    #[test]
+    fn where_timestamp_gt_now_for_future_event() {
+        // Event with far-future timestamp: `timestamp > now()` should be true.
+        let ev = event(&json!({"timestamp": "2999-12-31 23:59:59"}));
+        let expr = binary(field("timestamp"), BinaryOp::Gt, call("now", vec![]));
+        assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(true));
+    }
+
+    #[test]
+    fn where_timestamp_gt_now_for_past_event() {
+        // Event with past timestamp: `timestamp > now()` should be false.
+        let ev = event(&json!({"timestamp": "2000-01-01 00:00:00"}));
+        let expr = binary(field("timestamp"), BinaryOp::Gt, call("now", vec![]));
+        assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(false));
     }
 
     // ── logical ops ────────────────────────────────────────────────
