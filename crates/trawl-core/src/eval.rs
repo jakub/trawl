@@ -1085,6 +1085,17 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
     };
+    // A `fmt` is fully user-controlled (a DSL string literal). chrono turns an
+    // invalid/incompatible specifier (e.g. `%Q`) into `Item::Error`, whose
+    // `Display` returns `fmt::Error` — `ts.format(fmt).to_string()` would then
+    // PANIC ("a Display implementation returned an error unexpectedly").
+    // Detect the error item up front and return Null instead (mirrors the batch
+    // path, where DuckDB STRFTIME returns a clean query error, not a crash).
+    if chrono::format::StrftimeItems::new(fmt)
+        .any(|item| matches!(item, chrono::format::Item::Error))
+    {
+        return EvalValue::Null;
+    }
     EvalValue::Str(ts.format(fmt).to_string())
 }
 
@@ -2370,6 +2381,22 @@ mod tests {
             eval_expr(&expr, &empty_event()),
             EvalValue::Str("2026-03-15 10:20:30".to_string())
         );
+    }
+
+    #[test]
+    fn fn_strftime_invalid_specifier_returns_null_not_panic() {
+        // `%Q` is not a chrono specifier; chrono yields Item::Error whose
+        // Display returns fmt::Error, so the old `.to_string()` panicked.
+        // Remote-triggerable via the SSE streaming path (#22 reviewer finding).
+        let expr = call("strftime", vec![ts("2026-03-15 10:20:30"), lit_str("%Q")]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    #[test]
+    fn fn_strftime_trailing_percent_returns_null_not_panic() {
+        // A dangling `%` is also an Item::Error in chrono.
+        let expr = call("strftime", vec![ts("2026-03-15 10:20:30"), lit_str("%Y-%")]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
     }
 
     // strptime
