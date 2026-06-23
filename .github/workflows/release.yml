@@ -47,6 +47,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}, wasm32-unknown-unknown
+          # llvm-tools ships llvm-strip, used to strip the shipped binaries
+          # after breakpad symbols are dumped (see the dump_syms/strip steps).
+          components: llvm-tools
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -91,6 +94,55 @@ jobs:
       # SPA crate — which was already built by the preceding trunk step.
       - name: Build
         run: cargo zigbuild --release --workspace --exclude trawl-web-ui --target ${{ matrix.target }}.2.31
+        env:
+          # Zig's lld strips .symtab regardless of the profile's
+          # strip = "debuginfo". Override strip to false so the build retains
+          # full symbols + DWARF; the dump_syms step below harvests breakpad
+          # .sym files from these fat binaries before they are stripped for
+          # shipping. --build-id=sha1 stamps a content-based GNU build-id note
+          # so the runtime minidump's module id matches the published .sym's
+          # DEBUG_ID (the id is preserved across the later llvm-strip).
+          CARGO_PROFILE_RELEASE_STRIP: "false"
+          RUSTFLAGS: "-C link-arg=-Wl,--build-id=sha1"
+
+      - name: Install dump_syms
+        run: |
+          set -euo pipefail
+          version="2.3.7"
+          sha256="928f9902244f63be4b3b0acf56963ecad97b7227ecfd9ee645d73683f75a9285"
+          url="https://github.com/mozilla/dump_syms/releases/download/v${version}/dump_syms-x86_64-unknown-linux-gnu.tar.xz"
+          curl --proto '=https' --tlsv1.2 -fLsS "$url" -o dump_syms.tar.xz
+          echo "${sha256}  dump_syms.tar.xz" | sha256sum --check --strict
+          tar -xf dump_syms.tar.xz --strip-components=1 -C /usr/local/bin dump_syms-x86_64-unknown-linux-gnu/dump_syms
+          rm dump_syms.tar.xz
+          dump_syms --version
+
+      # Harvest breakpad symbols from the FAT binaries (with .symtab + DWARF)
+      # BEFORE stripping. --store writes <module>/<DEBUG_ID>/<module>.sym, the
+      # exact layout `minidump-stackwalk --symbols-url` expects. libduckdb is
+      # statically linked, so each binary's .sym also covers its C++ frames.
+      - name: Dump breakpad symbols
+        run: |
+          set -euo pipefail
+          bindir="target/${{ matrix.target }}/release"
+          for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
+            dump_syms --store symbols/ "${bindir}/${bin}"
+          done
+          find symbols -type f | sort
+
+      # Strip the shipped binaries now that symbols are captured, so the
+      # deb/tarball stay lean. llvm-strip keeps allocated notes (including
+      # .note.gnu.build-id) by default, so the shipped build-id still matches
+      # the .sym DEBUG_ID. Strip in place, before the deb/tarball steps.
+      - name: Strip shipped binaries
+        run: |
+          set -euo pipefail
+          llvm_strip="$(find "$(rustc --print sysroot)"/lib/rustlib/*/bin -name llvm-strip | head -1)"
+          echo "using ${llvm_strip}"
+          bindir="target/${{ matrix.target }}/release"
+          for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
+            "${llvm_strip}" "${bindir}/${bin}"
+          done
 
       - name: Build .deb packages
         run: |
@@ -121,6 +173,13 @@ jobs:
         with:
           name: deb-${{ matrix.target }}
           path: target/${{ matrix.target }}/debian/*.deb
+          if-no-files-found: error
+
+      - name: Upload breakpad symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: symbols-${{ matrix.target }}
+          path: symbols/
           if-no-files-found: error
 
   build-macos:
@@ -240,6 +299,15 @@ jobs:
           path: incoming
           merge-multiple: true
 
+      - name: Download breakpad symbols
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          # merge amd64 + arm64 stores into one tree; DEBUG_IDs differ per arch
+          # so there are no path collisions.
+          pattern: symbols-*
+          path: symbols-incoming
+          merge-multiple: true
+
       - name: Import GPG key
         run: |
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import || true
@@ -287,8 +355,20 @@ jobs:
 
           gpg --batch --yes --armor --export "${gpg_key}" > gpg.key
 
+      # Publish the breakpad symbol store at the gh-pages root so it serves at
+      # https://trawl.sh/symbols/<module>/<DEBUG_ID>/<module>.sym — the URL
+      # `minidump-stackwalk --symbols-url https://trawl.sh/symbols/` resolves
+      # against. Merged into the existing tree (per-arch DEBUG_IDs don't clash);
+      # the shared `git add -A` + commit + push below picks it up.
+      - name: Publish breakpad symbols
+        run: |
+          set -euo pipefail
+          mkdir -p symbols
+          cp -a symbols-incoming/. symbols/
+          find symbols -type f -name '*.sym' | sort
+
       - name: Clean up incoming artifacts
-        run: rm -rf incoming
+        run: rm -rf incoming symbols-incoming
 
       - name: Commit and push
         run: |

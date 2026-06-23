@@ -115,8 +115,13 @@ syslog_loose = "0.23"
 zstd = "0.13"
 
 [profile.release]
-# Keep the symbol table (drop only DWARF) so minidump-stackwalk can resolve
-# Rust frames + the libduckdb module in crash dumps. See trawl-crashdump.
+# Drops DWARF for normal/local release builds. This does NOT keep symbols
+# usable for crash dumps under the release CI: that build cross-links with
+# zig, whose lld strips .symtab regardless of this setting. So release CI
+# overrides strip to false, runs dump_syms to publish breakpad .sym files
+# (the symbolication source for minidumps — including the statically linked
+# libduckdb frames), then llvm-strips the shipped artifacts with the GNU
+# build-id note preserved. See .github/workflows/release.yml + trawl-crashdump.
 strip = "debuginfo"
 lto = "thin"
 
