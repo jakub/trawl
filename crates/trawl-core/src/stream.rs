@@ -354,10 +354,8 @@ fn validate_expr_units(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPla
                 // If arg exists check it; if it doesn't exist arity validation will
                 // catch it elsewhere.
                 if arg.is_some() {
-                    validate_unit_literal(name, *idx, raw).map_err(|e| {
-                        let _ = allowlist;
-                        StreamPlanError::InvalidUnit(e.to_string())
-                    })?;
+                    validate_unit_literal(name, *idx, allowlist, raw)
+                        .map_err(|e| StreamPlanError::InvalidUnit(e.to_string()))?;
                 }
             }
             // Recurse into all args.

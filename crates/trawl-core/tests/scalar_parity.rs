@@ -16,7 +16,7 @@ use std::io::Write;
 use duckdb::Connection;
 use serde_json::{Map, Value};
 use trawl_core::ast::PipeStage;
-use trawl_core::emitter::{self, SqlValue};
+use trawl_core::emitter::{self, DATE_PART_UNITS, DATE_UNITS, SqlValue};
 use trawl_core::eval::{EvalValue, eval_expr, parse_timestamp, timestamp_to_duckdb_text};
 use trawl_core::parser;
 
@@ -64,15 +64,11 @@ const TS_VALS: &[&str] = &[
     "2023-11-07 17:30:45",
 ];
 
-const DATE_UNITS: &[&str] = &[
-    "year", "quarter", "month", "week", "day", "hour", "minute", "second",
-];
-
-const DATE_PART_UNITS: &[&str] = &[
-    "year", "quarter", "month", "week", "day", "hour", "minute", "second", "dow",
-    "doy",
-    // epoch omitted: float precision diverges between eval and DuckDB text roundtrip
-];
+// Date/time unit allowlists are imported from the emitter (see `use` above) so
+// the generator can never silently drift from the real allowlist: if the
+// emitter grows a unit, this test exercises it automatically. `date_part`'s
+// "epoch" is filtered out at generation time (float precision diverges between
+// eval and the DuckDB text roundtrip) — see `random_date_part`.
 
 // Include non-ASCII values so the parity harness exercises byte-vs-character
 // divergence in scalar fns like length() (DuckDB LENGTH counts characters).
@@ -192,7 +188,11 @@ fn random_conditional(rng: &mut Rng) -> String {
 }
 
 fn random_date_part(rng: &mut Rng) -> String {
-    let unit = rng.pick(DATE_PART_UNITS);
+    // Exclude "epoch": its float result diverges between eval and the DuckDB
+    // text roundtrip. Everything else in the emitter allowlist is fair game,
+    // so a newly-added unit flows in here without a test edit.
+    let units: Vec<&&str> = DATE_PART_UNITS.iter().filter(|u| **u != "epoch").collect();
+    let unit = rng.pick(&units);
     let ts = ts_lit(rng);
     format!("date_part(\"{unit}\", {ts})")
 }

@@ -75,12 +75,12 @@ pub(crate) fn literal_int_positions(name: &str) -> &'static [usize] {
 // ── Date/time unit allowlists ─────────────────────────────────────────
 
 /// Units valid for `date_trunc` and `date_diff`.
-const DATE_UNITS: &[&str] = &[
+pub const DATE_UNITS: &[&str] = &[
     "year", "quarter", "month", "week", "day", "hour", "minute", "second",
 ];
 
 /// Units valid for `date_part` (superset of `DATE_UNITS`).
-const DATE_PART_UNITS: &[&str] = &[
+pub const DATE_PART_UNITS: &[&str] = &[
     "year", "quarter", "month", "week", "day", "hour", "minute", "second", "dow", "doy", "epoch",
 ];
 
@@ -98,14 +98,17 @@ pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [
 
 /// Validate that a date/time unit argument is a known literal.
 ///
-/// `unit_literal` is `Some(value)` when the arg at `arg_idx` is a string
-/// literal, or `None` when it is a computed expression. Rejects non-literals
-/// and unknown units; this check runs in **both** the batch and streaming paths
-/// so an unsupported unit can never error in batch while silently nulling in
-/// live tail.
+/// `allowlist` is the set of accepted unit names for this `(func, arg)` pair
+/// (the caller already fetched it via `unit_literal_positions`, so it is passed
+/// in directly rather than re-derived). `unit_literal` is `Some(value)` when the
+/// arg at `arg_idx` is a string literal, or `None` when it is a computed
+/// expression. Rejects non-literals and unknown units; this check runs in
+/// **both** the batch and streaming paths so an unsupported unit can never error
+/// in batch while silently nulling in live tail.
 pub(crate) fn validate_unit_literal(
     func_name: &str,
     arg_idx: usize,
+    allowlist: &[&str],
     unit_literal: Option<&str>,
 ) -> Result<(), EmitError> {
     let Some(unit) = unit_literal else {
@@ -116,10 +119,6 @@ pub(crate) fn validate_unit_literal(
             ),
         });
     };
-    let allowlist = unit_literal_positions(func_name)
-        .iter()
-        .find(|(i, _)| *i == arg_idx)
-        .map_or(&[] as &[&str], |(_, al)| *al);
     if !allowlist.is_empty() && !allowlist.contains(&unit.to_lowercase().as_str()) {
         return Err(EmitError::UnsupportedOperation {
             message: format!(
@@ -790,7 +789,7 @@ mod tests {
             "year", "month", "day", "hour", "minute", "second", "dow", "doy", "epoch",
         ] {
             assert!(
-                validate_unit_literal("date_part", 0, Some(unit)).is_ok(),
+                validate_unit_literal("date_part", 0, DATE_PART_UNITS, Some(unit)).is_ok(),
                 "date_part should accept unit {unit:?}"
             );
         }
@@ -802,7 +801,7 @@ mod tests {
             "year", "quarter", "month", "week", "day", "hour", "minute", "second",
         ] {
             assert!(
-                validate_unit_literal("date_trunc", 0, Some(unit)).is_ok(),
+                validate_unit_literal("date_trunc", 0, DATE_UNITS, Some(unit)).is_ok(),
                 "date_trunc should accept unit {unit:?}"
             );
         }
@@ -814,7 +813,7 @@ mod tests {
             "year", "quarter", "month", "week", "day", "hour", "minute", "second",
         ] {
             assert!(
-                validate_unit_literal("date_diff", 0, Some(unit)).is_ok(),
+                validate_unit_literal("date_diff", 0, DATE_UNITS, Some(unit)).is_ok(),
                 "date_diff should accept unit {unit:?}"
             );
         }
@@ -822,7 +821,8 @@ mod tests {
 
     #[test]
     fn date_part_rejects_unknown_unit() {
-        let err = validate_unit_literal("date_part", 0, Some("nanosecond")).unwrap_err();
+        let err =
+            validate_unit_literal("date_part", 0, DATE_PART_UNITS, Some("nanosecond")).unwrap_err();
         assert!(
             matches!(err, EmitError::UnsupportedOperation { ref message } if message.contains("nanosecond")),
             "unexpected error: {err}"
@@ -832,14 +832,14 @@ mod tests {
     #[test]
     fn date_trunc_rejects_dow_not_in_allowlist() {
         // dow is in DATE_PART_UNITS but NOT in DATE_UNITS (date_trunc allowlist)
-        let err = validate_unit_literal("date_trunc", 0, Some("dow")).unwrap_err();
+        let err = validate_unit_literal("date_trunc", 0, DATE_UNITS, Some("dow")).unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
     }
 
     #[test]
     fn date_diff_rejects_non_literal() {
         // None means the arg was a computed expression, not a string literal
-        let err = validate_unit_literal("date_diff", 0, None).unwrap_err();
+        let err = validate_unit_literal("date_diff", 0, DATE_UNITS, None).unwrap_err();
         assert!(
             matches!(err, EmitError::UnsupportedOperation { ref message } if message.contains("literal")),
             "unexpected: {err}"

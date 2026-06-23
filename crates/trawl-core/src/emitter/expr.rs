@@ -47,13 +47,15 @@ pub(crate) fn emit_expr(
                                 ),
                             }),
                         }
-                    } else if unit_positions.iter().any(|(pos, _)| *pos == i) {
+                    } else if let Some((_, allowlist)) =
+                        unit_positions.iter().find(|(pos, _)| *pos == i)
+                    {
                         // Date/time unit args must be string literals from the allowlist.
                         let raw = match &a.node {
                             Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
                             _ => None,
                         };
-                        validate_unit_literal(name, i, raw)?;
+                        validate_unit_literal(name, i, allowlist, raw)?;
                         emit_expr(a, state)
                     } else {
                         emit_expr(a, state)
