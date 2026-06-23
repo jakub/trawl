@@ -152,16 +152,27 @@ jobs:
             echo "::error::llvm-strip not found under $(rustc --print sysroot)/lib/rustlib/*/bin -- is the llvm-tools component installed?" >&2
             exit 1
           fi
-          llvm_readelf="${llvm_strip%/*}/llvm-readelf"
+          # llvm-tools ships llvm-objcopy but NOT llvm-readelf, so verify the
+          # build-id by extracting the note section with objcopy and checking it
+          # is non-empty (an absent note extracts to a 0-byte file; verified on
+          # real ELF). objcopy writes a separate output, leaving the binary as-is.
+          llvm_objcopy="${llvm_strip%/*}/llvm-objcopy"
+          if [ ! -x "${llvm_objcopy}" ]; then
+            echo "::error::llvm-objcopy not found next to llvm-strip -- cannot verify build-id" >&2
+            exit 1
+          fi
           echo "using ${llvm_strip}"
           bindir="target/${{ matrix.target }}/release"
           for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
             "${llvm_strip}" "${bindir}/${bin}"
-            if ! "${llvm_readelf}" -n "${bindir}/${bin}" | grep -qiE "build[ _]?id"; then
+            rm -f build-id.note
+            "${llvm_objcopy}" -O binary --only-section=.note.gnu.build-id "${bindir}/${bin}" build-id.note 2>/dev/null || true
+            if [ ! -s build-id.note ]; then
               echo "::error::${bin} (${{ matrix.target }}) has no GNU build-id note after strip -- minidumps would never symbolicate" >&2
               exit 1
             fi
           done
+          rm -f build-id.note
 
       - name: Build .deb packages
         run: |
