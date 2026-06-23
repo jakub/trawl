@@ -56,7 +56,7 @@ impl EvalValue {
         match self {
             Self::Str(s) => Some(s.clone()),
             Self::Int(n) => Some(n.to_string()),
-            Self::Float(n) => Some(n.to_string()),
+            Self::Float(n) => Some(duckdb_double_to_string(*n)),
             Self::Bool(b) => Some(b.to_string()),
             Self::Timestamp(ts) => Some(timestamp_to_duckdb_text(ts)),
             Self::Null | Self::Array(_) => None,
@@ -91,6 +91,56 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
         let full = format!("{}.{micros:06}", ts.format("%Y-%m-%d %H:%M:%S"));
         full.trim_end_matches('0').to_string()
     }
+}
+
+/// Render an `f64` to text exactly as `DuckDB`'s `CAST(DOUBLE AS VARCHAR)` does.
+///
+/// `DuckDB` (verified against v1.5.4 / engine 1.10504.0, the version trawl
+/// ships) uses the shortest round-tripping decimal digit sequence — the same
+/// digits Rust's `{:?}` Debug formatter produces — then applies fixed
+/// presentation rules that diverge from Rust's `Display`/`Debug`:
+///
+/// 1. Integer-valued doubles always carry a `.0` suffix (`1.0`, not `1`).
+/// 2. Negative zero loses its sign: `-0.0` → `"0.0"`.
+/// 3. Scientific notation kicks in at the SAME magnitude thresholds as Rust's
+///    `{:?}` (`>= 1e16` and `< 1e-4`), so we lean on Debug for the switch-over.
+/// 4. The exponent ALWAYS carries a sign and is zero-padded to a minimum of two
+///    digits (`e+05`, `e-05`, `e+16`, `e+100`), where Rust `{:?}` emits `e16` /
+///    `e-5` (no sign, no pad).
+/// 5. Specials render lowercase: `inf`, `-inf`, `nan`.
+///
+/// This is the single renderer behind `tostring()`, `concat()`/`||`, and any
+/// other `CAST(… AS VARCHAR)` over a float in the batch path; mirroring it in
+/// streaming eval closes the #22-class batch-vs-live divergence.
+fn duckdb_double_to_string(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".to_string();
+    }
+    if x.is_infinite() {
+        return if x < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    // Both +0.0 and -0.0 compare equal to 0.0; DuckDB strips the sign.
+    if x == 0.0 {
+        return "0.0".to_string();
+    }
+
+    // Rust Debug already gives shortest-roundtrip digits, the `.0` suffix on
+    // integer-valued doubles, and the same sci-notation thresholds as DuckDB.
+    let s = format!("{x:?}");
+    let Some(e_pos) = s.find('e') else {
+        return s;
+    };
+
+    // Rewrite the exponent to DuckDB form: always-signed, min two digits.
+    let (mantissa, exp) = s.split_at(e_pos);
+    let exp = &exp[1..]; // drop the 'e'
+    let (sign, mag) = match exp.strip_prefix('-') {
+        Some(rest) => ('-', rest),
+        None => ('+', exp.strip_prefix('+').unwrap_or(exp)),
+    };
+    // `{:02}` zero-pads to 2 digits; 3-digit exponents pass through unpadded.
+    let mag: u32 = mag.parse().unwrap_or(0);
+    format!("{mantissa}e{sign}{mag:02}")
 }
 
 /// Parse a timestamp string using `DuckDB`'s practical ISO set.
@@ -473,7 +523,9 @@ fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
             other => EvalValue::Bool(!other.is_truthy()),
         },
         UnaryOp::Neg => match operand {
-            EvalValue::Int(n) => EvalValue::Int(-n),
+            // checked_neg returns None on i64::MIN; null out rather than
+            // panic (debug) / wrap (release), consistent with div/mod guards.
+            EvalValue::Int(n) => n.checked_neg().map_or(EvalValue::Null, EvalValue::Int),
             EvalValue::Float(n) => EvalValue::Float(-n),
             _ => EvalValue::Null,
         },
@@ -581,7 +633,9 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
 
         // numeric
         "abs" => args.first().map_or(EvalValue::Null, |v| match v {
-            EvalValue::Int(n) => EvalValue::Int(n.abs()),
+            // checked_abs returns None on i64::MIN; null out rather than
+            // panic (debug) / wrap (release), consistent with div/mod guards.
+            EvalValue::Int(n) => n.checked_abs().map_or(EvalValue::Null, EvalValue::Int),
             EvalValue::Float(n) => EvalValue::Float(n.abs()),
             _ => EvalValue::Null,
         }),
@@ -796,7 +850,18 @@ fn eval_floor(args: &[EvalValue]) -> EvalValue {
     })
 }
 
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+/// `substr(s, start [, len])` — mirrors `DuckDB`'s `SUBSTRING` semantics.
+///
+/// 1-based and CHARACTER-based (multibyte UTF-8 counts as one char). NOT
+/// `PostgreSQL` semantics. Negative `start` counts from the end (`-1` = last
+/// char); `start == 0` stays a position before the first char (NOT clamped to
+/// 1). Negative `len` is a real LEFTWARD window exclusive of `start`. The
+/// resulting inclusive 1-based window `[lo, hi]` is clamped to `[1, char_len]`;
+/// `lo > hi` yields the empty string. NULL propagates from any arg.
+///
+/// All bound arithmetic is done in `i64` (bounds can legitimately go negative
+/// or exceed the string length before clamping) — do NOT cast to `usize` until
+/// after the `lo > hi` guard, or out-of-range inputs underflow-panic.
 fn eval_substr(args: &[EvalValue]) -> EvalValue {
     if args.len() < 2 || args.len() > 3 {
         return EvalValue::Null;
@@ -807,29 +872,40 @@ fn eval_substr(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Int(start) = args[1] else {
         return EvalValue::Null;
     };
-    // SQL SUBSTR is 1-indexed
-    let start_idx = if start < 1 { 0 } else { (start - 1) as usize };
-    let chars: Vec<char> = s.chars().collect();
 
-    if start_idx >= chars.len() {
+    let chars: Vec<char> = s.chars().collect();
+    let n = i64::try_from(chars.len()).unwrap_or(i64::MAX);
+
+    // Negative start counts from the end; 0 stays a position before the first
+    // char. Saturating add: an adversarial start near i64::MIN must not overflow
+    // before clamping (panics in debug, wraps in release).
+    let start = if start < 0 {
+        n.saturating_add(start).saturating_add(1)
+    } else {
+        start
+    };
+
+    // Inclusive 1-based window [lo, hi]. Saturating arithmetic throughout —
+    // out-of-range start/len bounds clamp to the string range below.
+    let (lo, hi) = match args.get(2) {
+        None => (start, n),
+        Some(EvalValue::Int(len)) => match len.cmp(&0) {
+            std::cmp::Ordering::Equal => return EvalValue::Str(String::new()),
+            // Leftward, exclusive of start itself.
+            std::cmp::Ordering::Less => (start.saturating_add(*len), start.saturating_sub(1)),
+            std::cmp::Ordering::Greater => (start, start.saturating_add(*len).saturating_sub(1)),
+        },
+        Some(_) => return EvalValue::Null,
+    };
+
+    let lo = lo.max(1);
+    let hi = hi.min(n);
+    if lo > hi {
         return EvalValue::Str(String::new());
     }
-
-    if args.len() == 3 {
-        let len = match &args[2] {
-            EvalValue::Int(n) => {
-                if *n < 0 {
-                    return EvalValue::Str(String::new());
-                }
-                *n as usize
-            }
-            _ => return EvalValue::Null,
-        };
-        let end = (start_idx + len).min(chars.len());
-        EvalValue::Str(chars[start_idx..end].iter().collect())
-    } else {
-        EvalValue::Str(chars[start_idx..].iter().collect())
-    }
+    // 0-based slice [lo-1 .. hi]; both are now in 1..=n so the casts are safe.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    EvalValue::Str(chars[(lo - 1) as usize..hi as usize].iter().collect())
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -1710,6 +1786,204 @@ mod tests {
     fn fn_substr_null() {
         let expr = call("substr", vec![lit_null(), lit_int(1)]);
         assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    #[test]
+    fn substr_duckdb_window_semantics() {
+        // Verified against DuckDB v1.5.4: negative/zero start, negative len,
+        // out-of-range bounds, UTF-8 char counting. (start, Some(len)) -> out.
+        let cases: &[(&str, i64, Option<i64>, &str)] = &[
+            ("abcdef", -1, Some(3), "f"),
+            ("abcdef", 0, Some(3), "ab"),
+            ("abcdef", -2, Some(4), "ef"),
+            ("abcdef", 1, Some(3), "abc"),
+            ("abcdef", 2, Some(100), "bcdef"),
+            ("abcdef", -5, Some(3), "bcd"),
+            ("abcdef", 3, Some(0), ""),
+            ("abcdef", 3, Some(-1), "b"),
+            ("abcdef", -5, Some(7), "bcdef"),
+            ("abcdef", 0, Some(1), ""),
+            ("abcdef", 0, Some(7), "abcdef"),
+            ("abcdef", -10, Some(5), "a"),
+            ("abcdef", -10, Some(11), "abcdef"),
+            ("abcdef", 3, Some(-2), "ab"),
+            ("abcdef", 4, Some(-2), "bc"),
+            ("abcdef", 1, Some(-1), ""),
+            ("abcdef", 10, Some(3), ""),
+            ("abcdef", 7, Some(3), ""),
+            ("abcdef", 5, Some(-3), "bcd"),
+            ("abcdef", 6, Some(-3), "cde"),
+            ("abcdef", -1, Some(-3), "cde"),
+            ("abcdef", 0, Some(-3), ""),
+            ("abcdef", 2, Some(-5), "a"),
+            ("abcdef", 4, Some(-5), "abc"),
+            ("abcdef", 3, Some(-100), "ab"),
+            ("abcdef", 3, None, "cdef"),
+            ("abcdef", -2, None, "ef"),
+            ("abcdef", 0, None, "abcdef"),
+            ("abcdef", -100, Some(3), ""),
+            ("abcdef", -6, Some(1), "a"),
+            ("abcdef", -7, Some(2), "a"),
+            ("héllo", 1, Some(3), "hél"),
+            ("héllo", -2, Some(2), "lo"),
+            ("", 1, Some(3), ""),
+        ];
+        for (s, start, len, want) in cases {
+            let mut args = vec![EvalValue::Str((*s).to_string()), EvalValue::Int(*start)];
+            if let Some(l) = len {
+                args.push(EvalValue::Int(*l));
+            }
+            assert_eq!(
+                eval_substr(&args),
+                EvalValue::Str((*want).to_string()),
+                "substr({s:?}, {start}, {len:?})"
+            );
+        }
+        // NULL propagation.
+        assert_eq!(
+            eval_substr(&[EvalValue::Null, EvalValue::Int(1), EvalValue::Int(3)]),
+            EvalValue::Null
+        );
+        assert_eq!(
+            eval_substr(&[
+                EvalValue::Str("x".into()),
+                EvalValue::Null,
+                EvalValue::Int(3)
+            ]),
+            EvalValue::Null
+        );
+        assert_eq!(
+            eval_substr(&[
+                EvalValue::Str("x".into()),
+                EvalValue::Int(1),
+                EvalValue::Null
+            ]),
+            EvalValue::Null
+        );
+    }
+
+    #[test]
+    fn abs_and_neg_null_on_i64_min_overflow() {
+        // abs(i64::MIN) and -(i64::MIN) overflow; both must null out, not panic.
+        let abs_expr = call("abs", vec![lit_int(i64::MIN)]);
+        assert_eq!(eval_expr(&abs_expr, &empty_event()), EvalValue::Null);
+
+        let neg_expr = unary(UnaryOp::Neg, lit_int(i64::MIN));
+        assert_eq!(eval_expr(&neg_expr, &empty_event()), EvalValue::Null);
+
+        // Sanity: ordinary values still work.
+        let ok = call("abs", vec![lit_int(-5)]);
+        assert_eq!(eval_expr(&ok, &empty_event()), EvalValue::Int(5));
+    }
+
+    #[test]
+    fn substr_extreme_bounds_do_not_panic() {
+        // i64::MIN/MAX start and len must clamp via saturating arithmetic, not
+        // overflow-panic (debug) / wrap (release). The exact output is not the
+        // contract here — surviving the math is.
+        for (start, len) in [
+            (i64::MIN, i64::MAX),
+            (i64::MAX, i64::MAX),
+            (i64::MIN, i64::MIN),
+            (i64::MAX, i64::MIN),
+        ] {
+            assert!(matches!(
+                eval_substr(&[
+                    EvalValue::Str("abcdef".into()),
+                    EvalValue::Int(start),
+                    EvalValue::Int(len),
+                ]),
+                EvalValue::Str(_)
+            ));
+        }
+        // Positive in-range len still works.
+        assert_eq!(
+            eval_substr(&[
+                EvalValue::Str("abcdef".into()),
+                EvalValue::Int(1),
+                EvalValue::Int(i64::MAX),
+            ]),
+            EvalValue::Str("abcdef".into())
+        );
+    }
+
+    #[test]
+    fn duckdb_double_text_matches_cast_to_varchar() {
+        // Verified against DuckDB v1.5.4 CAST(DOUBLE AS VARCHAR).
+        let cases: &[(f64, &str)] = &[
+            (1.0, "1.0"),
+            (2.0, "2.0"),
+            (0.0, "0.0"),
+            (-0.0, "0.0"),
+            (1.5, "1.5"),
+            (-1.5, "-1.5"),
+            (-42.75, "-42.75"),
+            (0.1, "0.1"),
+            (0.7, "0.7"),
+            (1.1, "1.1"),
+            (100.1, "100.1"),
+            (123.456, "123.456"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (2.0 / 3.0, "0.6666666666666666"),
+            (std::f64::consts::PI, "3.141592653589793"),
+            (std::f64::consts::SQRT_2, "1.4142135623730951"),
+            (0.123_456_789_012_345_68, "0.12345678901234568"),
+            (0.300_000_000_000_000_04, "0.30000000000000004"),
+            (100_000.0, "100000.0"),
+            (1_000_000_000_000_000.0, "1000000000000000.0"),
+            (9_999_000_000_000_000.0, "9999000000000000.0"),
+            (1e16, "1e+16"),
+            (1.5e16, "1.5e+16"),
+            (1e17, "1e+17"),
+            (1e20, "1e+20"),
+            (1.234_567_89e30, "1.23456789e+30"),
+            (-1.234_567_89e30, "-1.23456789e+30"),
+            (1e100, "1e+100"),
+            (1.797_693_134_862_315_7e308, "1.7976931348623157e+308"),
+            (0.001, "0.001"),
+            (0.0001, "0.0001"),
+            (0.000_123_4, "0.0001234"),
+            (9.999e-5, "9.999e-05"),
+            (1e-5, "1e-05"),
+            (1.234e-5, "1.234e-05"),
+            (1e-7, "1e-07"),
+            (1e-10, "1e-10"),
+            (1e-99, "1e-99"),
+            (1e-100, "1e-100"),
+            (1e-308, "1e-308"),
+            (5e-324, "5e-324"),
+            (1.234_567_89e-30, "1.23456789e-30"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ];
+        for (x, want) in cases {
+            assert_eq!(&duckdb_double_to_string(*x), want, "duckdb_double({x})");
+        }
+    }
+
+    #[test]
+    fn fn_tostring_float_renders_duckdb_way() {
+        // tostring(1.0) -> "1.0" (DuckDB), not "1" (Rust to_string).
+        let expr = call("tostring", vec![lit_float(1.0)]);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn fn_concat_float_renders_duckdb_way() {
+        let expr = call("concat", vec![lit_str("x="), lit_float(0.1)]);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("x=0.1".to_string())
+        );
+        let expr = call("concat", vec![lit_str("n="), lit_float(2.0)]);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("n=2.0".to_string())
+        );
     }
 
     #[test]

@@ -89,12 +89,35 @@ const STRING_VALS: &[&str] = &[
 
 const INT_VALS: &[i64] = &[0, 1, 42, 100, -5, 200, 500];
 
+// Float DSL literals spanning the DuckDB CAST(DOUBLE AS VARCHAR) presentation
+// rules: integer-valued (.0 suffix), plain decimals, magnitudes that flip into
+// sci-notation on render (the VALUE decides, so the literal stays plain —
+// the DSL float grammar requires `digits.digits`, no `e` notation), negatives,
+// and zero. Drives the F1 tostring/concat float-text parity.
+const FLOAT_LITS: &[&str] = &[
+    "0.0",
+    "1.0",
+    "2.0",
+    "1.5",
+    "-1.5",
+    "-42.75",
+    "0.1",
+    "123.456",
+    "100000.0",
+    "10000000000000000.0", // 1e16 -> renders "1e+16"
+    "15000000000000000.0", // 1.5e16 -> renders "1.5e+16"
+    "0.0001",
+    "0.00009999",   // 9.999e-5 -> renders "9.999e-05"
+    "0.00001",      // 1e-5 -> renders "1e-05"
+    "0.0000000001", // 1e-10 -> renders "1e-10"
+];
+
 // ── DSL expression generation ─────────────────────────────────────────
 
 /// Generate a scalar DSL expression string (no `now()`, no field refs
 /// that could be absent from the fixed event).
 fn random_scalar_expr(rng: &mut Rng) -> Option<String> {
-    match rng.range(13) {
+    match rng.range(14) {
         0 => Some(random_string_fn(rng)),
         1 => Some(random_numeric_fn(rng)),
         2 => Some(random_conditional(rng)),
@@ -108,6 +131,7 @@ fn random_scalar_expr(rng: &mut Rng) -> Option<String> {
         10 => Some(random_typeof(rng)),
         11 => Some(random_coalesce(rng)),
         12 => Some(random_concat(rng)),
+        13 => Some(random_substr(rng)),
         _ => unreachable!(),
     }
 }
@@ -124,6 +148,10 @@ fn str_lit(rng: &mut Rng) -> String {
 
 fn int_lit(rng: &mut Rng) -> String {
     rng.pick(INT_VALS).to_string()
+}
+
+fn float_lit(rng: &mut Rng) -> String {
+    (*rng.pick(FLOAT_LITS)).to_string()
 }
 
 fn random_string_fn(rng: &mut Rng) -> String {
@@ -202,8 +230,31 @@ fn random_tonumber(rng: &mut Rng) -> String {
 }
 
 fn random_tostring(rng: &mut Rng) -> String {
-    let i = int_lit(rng);
-    format!("tostring({i})")
+    // Mix ints AND floats: float text rendering (1.0 -> "1.0", 1e16 -> "1e+16")
+    // is the F1 divergence this exercises. The String arm of values_match does
+    // an exact compare, so DuckDB CAST(DOUBLE AS VARCHAR) must byte-match eval.
+    if rng.bool() {
+        format!("tostring({})", int_lit(rng))
+    } else {
+        format!("tostring({})", float_lit(rng))
+    }
+}
+
+/// `substr(s, start [, len])` with negative/zero starts and out-of-range
+/// lengths — the F2 window-semantics blind spot. start in -8..=8, optional
+/// len in -8..=8 (incl. 0). Closes the gap that let `DuckDB`'s from-end /
+/// leftward-window behaviour drift from the streaming evaluator.
+fn random_substr(rng: &mut Rng) -> String {
+    let s = str_lit(rng);
+    #[allow(clippy::cast_possible_wrap)]
+    let start = rng.range(17) as i64 - 8; // -8..=8
+    if rng.bool() {
+        format!("substr({s}, {start})")
+    } else {
+        #[allow(clippy::cast_possible_wrap)]
+        let len = rng.range(17) as i64 - 8; // -8..=8
+        format!("substr({s}, {start}, {len})")
+    }
 }
 
 fn random_typeof(rng: &mut Rng) -> String {
