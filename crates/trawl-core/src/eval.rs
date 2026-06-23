@@ -559,18 +559,15 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
             }
         }
         "concat" => {
-            let mut result = String::new();
-            for arg in args {
-                match arg {
-                    EvalValue::Str(s) => result.push_str(s),
-                    EvalValue::Int(n) => result.push_str(&n.to_string()),
-                    EvalValue::Float(n) => result.push_str(&n.to_string()),
-                    EvalValue::Bool(b) => result.push_str(&b.to_string()),
-                    EvalValue::Null | EvalValue::Array(_) | EvalValue::Timestamp(_) => {
-                        return Some(EvalValue::Null);
-                    }
-                }
-            }
+            // DuckDB CONCAT() *ignores* NULL args (unlike `||`, which
+            // propagates NULL) and casts each non-null arg to VARCHAR before
+            // joining — so CONCAT(NULL) == '' and CONCAT('x','-',NULL) == 'x-'.
+            // `as_str_repr` mirrors that CAST-to-VARCHAR (incl. Timestamp →
+            // DuckDB text); Null/Array yield None and are skipped. (Array can
+            // never legally reach CONCAT — DuckDB rejects it at bind time and
+            // the emitter errors too — so skipping it can't produce a value
+            // DuckDB wouldn't.)
+            let result: String = args.iter().filter_map(EvalValue::as_str_repr).collect();
             EvalValue::Str(result)
         }
 
@@ -1687,6 +1684,49 @@ mod tests {
     fn fn_substr_null() {
         let expr = call("substr", vec![lit_null(), lit_int(1)]);
         assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    #[test]
+    fn fn_concat_mixed_types() {
+        // DuckDB casts each arg to VARCHAR before joining (int/float/bool/ts).
+        let expr = call(
+            "concat",
+            vec![lit_str("n="), lit_int(42), lit_str("/"), lit_bool(true)],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("n=42/true".to_string())
+        );
+    }
+
+    #[test]
+    fn fn_concat_skips_null() {
+        // DuckDB CONCAT *ignores* NULL args (unlike `||`): CONCAT('a',NULL,'b')=='ab'.
+        let expr = call("concat", vec![lit_str("a"), lit_null(), lit_str("b")]);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("ab".to_string())
+        );
+    }
+
+    #[test]
+    fn fn_concat_trailing_null() {
+        // CONCAT('x','-',NULL) == 'x-' (the #22 batch-vs-live drift case).
+        let expr = call("concat", vec![lit_str("x"), lit_str("-"), lit_null()]);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("x-".to_string())
+        );
+    }
+
+    #[test]
+    fn fn_concat_all_null_is_empty_string() {
+        // DuckDB CONCAT(NULL) == '' (empty string), NOT NULL.
+        let expr = call("concat", vec![lit_null(), lit_null()]);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str(String::new())
+        );
     }
 
     // ── scalar functions: numeric ──────────────────────────────────

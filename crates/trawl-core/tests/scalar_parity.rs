@@ -83,7 +83,7 @@ const INT_VALS: &[i64] = &[0, 1, 42, 100, -5, 200, 500];
 /// Generate a scalar DSL expression string (no `now()`, no field refs
 /// that could be absent from the fixed event).
 fn random_scalar_expr(rng: &mut Rng) -> Option<String> {
-    match rng.range(12) {
+    match rng.range(13) {
         0 => Some(random_string_fn(rng)),
         1 => Some(random_numeric_fn(rng)),
         2 => Some(random_conditional(rng)),
@@ -96,6 +96,7 @@ fn random_scalar_expr(rng: &mut Rng) -> Option<String> {
         9 => Some(random_tostring(rng)),
         10 => Some(random_typeof(rng)),
         11 => Some(random_coalesce(rng)),
+        12 => Some(random_concat(rng)),
         _ => unreachable!(),
     }
 }
@@ -206,6 +207,23 @@ fn random_coalesce(rng: &mut Rng) -> String {
     let a = str_lit(rng);
     let b = str_lit(rng);
     format!("coalesce({a}, {b})")
+}
+
+/// 2–4 concat args, each a string/int literal or a bare `null`. Exercises
+/// `DuckDB`'s CONCAT NULL-skipping and CAST-to-VARCHAR join against the
+/// streaming evaluator (the #22 batch-vs-live drift this fix closes).
+/// (Floats omitted: `DuckDB` float→text rendering differs from Rust's.)
+fn random_concat(rng: &mut Rng) -> String {
+    let n = 2 + rng.range(3); // 2..=4 args
+    let args: Vec<String> = (0..n)
+        .map(|_| match rng.range(3) {
+            0 => str_lit(rng),
+            1 => int_lit(rng),
+            2 => "null".to_string(),
+            _ => unreachable!(),
+        })
+        .collect();
+    format!("concat({})", args.join(", "))
 }
 
 // ── Event fixture (all fields present to avoid binder errors) ─────────
