@@ -29,8 +29,11 @@ deliberate and documented here.
   (`eval_cmp`/`eval_eq`) coerce a `Str` against a `Timestamp` via `as_timestamp`,
   falling back to the prior `Str`-vs-`Str` path when parsing fails (no regression
   for non-timestamp strings).
-- **`date_diff` replicates DuckDB's boundary-crossing count exactly**, not
-  floored elapsed time (`date_diff('hour','…23:59:59','…00:00:00') == 1`).
+- **`date_diff` replicates DuckDB's per-unit count exactly.** For year, quarter,
+  month, day, hour, minute and second this is a boundary-crossing count, not
+  floored elapsed time (`date_diff('hour','…23:59:59','…00:00:00') == 1`). The
+  one exception is `week`: DuckDB computes it as integer `days / 7` (verified
+  against live DuckDB, pinned by the parity test), *not* a week-boundary count.
 - **The date/time unit vocabulary is a validated allowlist** — `{year, quarter,
   month, week, day, hour, minute, second}` (plus `dow`, `doy`, `epoch` for
   `date_part`). The unit must be a string literal; unknown units and non-literal
