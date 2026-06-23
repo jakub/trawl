@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "coastwatch-api-types"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-admin"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "clap",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-auth"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "argon2",
  "axum",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-ui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "gloo-timers",
  "leptos",
@@ -6189,7 +6189,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-admin"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "clap",
@@ -6204,7 +6204,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-api"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -6212,7 +6212,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-auth"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "argon2",
  "base64ct",
@@ -6230,7 +6230,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "arboard",
  "chrono",
@@ -6260,7 +6260,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-client"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-stream",
  "futures",
@@ -6276,7 +6276,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-config"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "serde",
@@ -6287,7 +6287,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aho-corasick",
  "chrono",
@@ -6301,7 +6301,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-crashdump"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "crash-handler",
  "libc",
@@ -6310,7 +6310,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-dashboard"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "insta",
  "ratatui",
@@ -6320,7 +6320,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-engine"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "duckdb",
@@ -6338,7 +6338,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -6394,7 +6394,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-web"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "base64ct",
@@ -6427,7 +6427,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-web-ui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "coastwatch-api-types",
@@ -7517,7 +7517,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "clap",
 ]

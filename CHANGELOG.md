@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-22
+
+### Added
+- Release builds now publish Breakpad symbol files with GNU build-ids, so `trawld` minidumps (from the 0.3.2 crash-dump capture) symbolicate against the Rust frames and the statically linked libduckdb module. Symbols are harvested before the shipped binaries are stripped — keeping the binaries lean — and published to a `symbols/` store on gh-pages for `minidump-stackwalk --symbols-url`. The build asserts the GNU build-id survives stripping on both architectures, failing the release loudly rather than shipping binaries that could never be symbolicated.
+
+### Fixed
+- Eliminate a `trawld` crash-loop: the background schema-refresh job called DuckDB's `parquet_metadata()`, which can SIGSEGV on a worker thread (uncatchable) and take the whole daemon down. Per-column schema-browser statistics (null/min/max/compressed size and row counts) are now read directly from parquet footers in safe Rust, so a corrupt or mid-write file is logged and skipped — and retried on the next refresh — instead of crashing the daemon.
+
+### Security
+- Override the documentation site's transitive `esbuild` dependency to 0.28.1, clearing GHSA-g7r4-m6w7-qqqr (development-server arbitrary file read; low severity, does not affect the published static site).
+
 ## [0.3.2] - 2026-06-21
 
 ### Added
@@ -165,7 +176,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Scheduled queries with cron-style execution
 - CI/CD with cross-compiled binaries, .deb packages, and APT repository
 
-[Unreleased]: https://github.com/jakub/trawl/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/jakub/trawl/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/jakub/trawl/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/jakub/trawl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/jakub/trawl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jakub/trawl/compare/v0.2.0...v0.3.0
