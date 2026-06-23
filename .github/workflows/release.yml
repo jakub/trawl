@@ -113,7 +113,10 @@ jobs:
           url="https://github.com/mozilla/dump_syms/releases/download/v${version}/dump_syms-x86_64-unknown-linux-gnu.tar.xz"
           curl --proto '=https' --tlsv1.2 -fLsS "$url" -o dump_syms.tar.xz
           echo "${sha256}  dump_syms.tar.xz" | sha256sum --check --strict
-          tar -xf dump_syms.tar.xz --strip-components=1 -C /usr/local/bin dump_syms-x86_64-unknown-linux-gnu/dump_syms
+          # Self-hosted runners can't write /usr/local/bin; install into the
+          # cargo bin dir, which is writable and already on PATH for later steps.
+          mkdir -p "$CARGO_HOME/bin"
+          tar -xf dump_syms.tar.xz --strip-components=1 -C "$CARGO_HOME/bin" dump_syms-x86_64-unknown-linux-gnu/dump_syms
           rm dump_syms.tar.xz
           dump_syms --version
 
