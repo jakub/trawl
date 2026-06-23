@@ -294,8 +294,42 @@ Available in `let`/`eval` and `where` expressions.
 | `if(cond, then, else)` | Ternary conditional |
 | `isnull(x)` / `isnotnull(x)` | Null checks |
 | `coalesce(a, b, ...)` | First non-null value |
-| `typeof(x)` | Value type name |
-| `now()` | Current timestamp |
+| `typeof(x)` | Value type name (returns `"VARCHAR"`, `"DOUBLE"`, `"TIMESTAMP"`, …) |
+| `now()` | Current timestamp (timezone-naive, wall-clock UTC) |
+| `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`) |
+| `tostring(x)` | Cast to string (`null` for null/array input) |
+
+### Date and time functions
+
+Date/time functions operate on **timestamps** — the `timestamp` field is stored as a timezone-naive `TIMESTAMP` in both the batch and streaming paths (any timezone offset is discarded at ingest, keeping wall-clock components).
+
+| Function | Description |
+|----------|-------------|
+| `date_part(unit, ts)` | Extract a calendar component (returns integer or float for `epoch`) |
+| `date_trunc(unit, ts)` | Truncate to start of period (returns timestamp) |
+| `date_diff(unit, start, end)` | Count calendar-unit boundaries crossed (`end - start`) |
+| `strftime(ts, fmt)` | Format timestamp as string (chrono `%`-codes) |
+| `strptime(str, fmt)` | Parse string to timestamp (returns `null` on failure) |
+
+**Note:** the argument order for `strftime` is `(timestamp, format)` — the opposite of C `strftime` and DuckDB's `STRFTIME`. This is intentional for DSL readability.
+
+#### Date/time unit allowlist
+
+The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **string literal** from the allowed set. Non-literal expressions (field refs, computed values) and unlisted units are rejected at parse time in both batch and streaming modes.
+
+| Function | Allowed units |
+|----------|--------------|
+| `date_part` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `dow`, `doy`, `epoch` |
+| `date_trunc` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second` |
+| `date_diff` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second` |
+
+`dow` = day of week (Sunday = 0 … Saturday = 6). `doy` = day of year (1–366). `epoch` = seconds since Unix epoch (float).
+
+`date_trunc("week", ts)` truncates to **Monday midnight** (ISO 8601 week start).
+
+#### strftime/strptime format codes
+
+Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce identical output in both batch (DuckDB) and streaming (chrono) paths. Locale-dependent or non-standard codes (`%c`, `%Z`, `%e` with padding) follow chrono semantics and may differ from DuckDB.
 
 ## Examples
 
