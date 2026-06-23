@@ -10,6 +10,7 @@
 
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use crate::emitter::map_field_name;
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use serde_json::{Map, Value};
 
 /// Result of evaluating an expression against an event.
@@ -21,6 +22,9 @@ pub enum EvalValue {
     Float(f64),
     Str(String),
     Array(Vec<EvalValue>),
+    /// Timezone-naive timestamp, mirroring `DuckDB`'s `AS TIMESTAMP` cast
+    /// which discards any offset and keeps wall-clock components.
+    Timestamp(NaiveDateTime),
 }
 
 impl EvalValue {
@@ -33,6 +37,7 @@ impl EvalValue {
             Self::Float(n) => *n != 0.0,
             Self::Str(s) => !s.is_empty(),
             Self::Array(a) => !a.is_empty(),
+            Self::Timestamp(_) => true,
         }
     }
 
@@ -53,9 +58,91 @@ impl EvalValue {
             Self::Int(n) => Some(n.to_string()),
             Self::Float(n) => Some(n.to_string()),
             Self::Bool(b) => Some(b.to_string()),
+            Self::Timestamp(ts) => Some(timestamp_to_duckdb_text(ts)),
             Self::Null | Self::Array(_) => None,
         }
     }
+
+    /// Try to parse self as a `NaiveDateTime` (`DuckDB` ISO set).
+    ///
+    /// Accepts: T or space separator, optional fractional seconds,
+    /// optional offset (discarded to match `AS TIMESTAMP` semantics),
+    /// date-only (→ midnight). Unparseable → `None`.
+    pub(crate) fn as_timestamp(&self) -> Option<NaiveDateTime> {
+        match self {
+            Self::Timestamp(ts) => Some(*ts),
+            Self::Str(s) => parse_timestamp(s),
+            _ => None,
+        }
+    }
+}
+
+/// Render a `NaiveDateTime` in `DuckDB`'s canonical text format.
+///
+/// `DuckDB` represents timestamps as `"YYYY-MM-DD HH:MM:SS[.ffffff]"` with
+/// trailing fractional-second zeros trimmed. This must byte-match `DuckDB`
+/// output for the parity tests to pass.
+pub(crate) fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
+    let micros = ts.and_utc().timestamp_subsec_micros();
+    if micros == 0 {
+        ts.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        // Format full 6-digit microsecond precision, then trim trailing zeros.
+        let full = format!("{}.{micros:06}", ts.format("%Y-%m-%d %H:%M:%S"));
+        full.trim_end_matches('0').to_string()
+    }
+}
+
+/// Parse a timestamp string using `DuckDB`'s practical ISO set.
+///
+/// Accepts T or space separator, optional fractional seconds (up to 6 digits),
+/// optional UTC offset (discarded — mirrors `CAST AS TIMESTAMP` semantics),
+/// and date-only (→ midnight).
+pub(crate) fn parse_timestamp(s: &str) -> Option<NaiveDateTime> {
+    // Try datetime formats (T and space separators, with/without fractional secs).
+    // Strip optional trailing offset (+HH:MM, -HH:MM, Z) before matching
+    // naive formats so offsets are silently discarded.
+    const DT_FMTS: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ];
+
+    let stripped = strip_offset(s);
+    let s = stripped.as_deref().unwrap_or(s);
+
+    for fmt in DT_FMTS {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(dt);
+        }
+    }
+
+    // Date-only → midnight.
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0).expect("midnight is valid"));
+    }
+
+    None
+}
+
+/// Strip a trailing UTC offset from a timestamp string (returns new string if
+/// an offset was found, `None` if the string doesn't appear to carry one).
+fn strip_offset(s: &str) -> Option<String> {
+    let s = s.trim();
+    // Check for trailing 'Z'
+    if let Some(base) = s.strip_suffix('Z') {
+        return Some(base.to_string());
+    }
+    // Check for trailing +HH:MM or -HH:MM (exactly 6 chars at end)
+    if s.len() >= 6 {
+        let tail = &s[s.len() - 6..];
+        let sign = tail.as_bytes().first().copied();
+        if (sign == Some(b'+') || sign == Some(b'-')) && tail.as_bytes()[3] == b':' {
+            return Some(s[..s.len() - 6].to_string());
+        }
+    }
+    None
 }
 
 impl From<EvalValue> for Value {
@@ -69,6 +156,9 @@ impl From<EvalValue> for Value {
             }
             EvalValue::Str(s) => Value::String(s),
             EvalValue::Array(a) => Value::Array(a.into_iter().map(Value::from).collect()),
+            // Serialize timestamps in DuckDB canonical text format so the event
+            // map round-trips correctly through serde_json.
+            EvalValue::Timestamp(ts) => Value::String(timestamp_to_duckdb_text(&ts)),
         }
     }
 }
@@ -107,7 +197,7 @@ pub fn eval_expr(expr: &Spanned<Expr>, event: &Map<String, Value>) -> EvalValue 
         Expr::Unary { op, operand } => eval_unary(*op, eval_expr(operand, event)),
         Expr::FunctionCall { name, args } => {
             let evaluated: Vec<EvalValue> = args.iter().map(|a| eval_expr(a, event)).collect();
-            eval_scalar_fn(name, &evaluated)
+            eval_scalar_fn(name, &evaluated).unwrap_or(EvalValue::Null)
         }
         Expr::InList { expr: target, list } => {
             let target_val = eval_expr(target, event);
@@ -360,9 +450,16 @@ fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
 
 // ── scalar functions ───────────────────────────────────────────────
 
+/// Evaluate a scalar function call.
+///
+/// Returns `Some(value)` if the function name is known and handled,
+/// `None` if it is unknown (distinct from `Some(Null)` which means the
+/// function evaluated to SQL NULL). The call site maps `None →
+/// EvalValue::Null` so existing behaviour is preserved; the `Option`
+/// wrapper exists so the coverage test can detect un-implemented scalars.
 #[allow(clippy::too_many_lines)]
-fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
-    match name {
+fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
+    let v = match name {
         // string
         "lower" => unary_str(args, str::to_lowercase),
         "upper" => unary_str(args, str::to_uppercase),
@@ -376,7 +473,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
         "rtrim" => unary_str(args, |s| s.trim_end().to_string()),
         "replace" => {
             if args.len() != 3 {
-                return EvalValue::Null;
+                return Some(EvalValue::Null);
             }
             match (&args[0], &args[1], &args[2]) {
                 (EvalValue::Str(s), EvalValue::Str(from), EvalValue::Str(to)) => {
@@ -388,7 +485,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
         "substr" => eval_substr(args),
         "contains" => {
             if args.len() != 2 {
-                return EvalValue::Null;
+                return Some(EvalValue::Null);
             }
             match (&args[0], &args[1]) {
                 (EvalValue::Str(s), EvalValue::Str(sub)) => {
@@ -399,7 +496,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
         }
         "startswith" => {
             if args.len() != 2 {
-                return EvalValue::Null;
+                return Some(EvalValue::Null);
             }
             match (&args[0], &args[1]) {
                 (EvalValue::Str(s), EvalValue::Str(pre)) => {
@@ -410,7 +507,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
         }
         "endswith" => {
             if args.len() != 2 {
-                return EvalValue::Null;
+                return Some(EvalValue::Null);
             }
             match (&args[0], &args[1]) {
                 (EvalValue::Str(s), EvalValue::Str(suf)) => {
@@ -421,7 +518,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
         }
         "split" => {
             if args.len() != 3 {
-                return EvalValue::Null;
+                return Some(EvalValue::Null);
             }
             match (&args[0], &args[1], &args[2]) {
                 (EvalValue::Str(s), EvalValue::Str(delim), EvalValue::Int(idx)) => {
@@ -442,7 +539,9 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
                     EvalValue::Int(n) => result.push_str(&n.to_string()),
                     EvalValue::Float(n) => result.push_str(&n.to_string()),
                     EvalValue::Bool(b) => result.push_str(&b.to_string()),
-                    EvalValue::Null | EvalValue::Array(_) => return EvalValue::Null,
+                    EvalValue::Null | EvalValue::Array(_) | EvalValue::Timestamp(_) => {
+                        return Some(EvalValue::Null);
+                    }
                 }
             }
             EvalValue::Str(result)
@@ -461,7 +560,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
         // conditional / type
         "if" => {
             if args.len() != 3 {
-                return EvalValue::Null;
+                return Some(EvalValue::Null);
             }
             if args[0].is_truthy() {
                 args[1].clone()
@@ -472,7 +571,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
         "coalesce" => {
             for arg in args {
                 if !matches!(arg, EvalValue::Null) {
-                    return arg.clone();
+                    return Some(arg.clone());
                 }
             }
             EvalValue::Null
@@ -492,20 +591,19 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
                     EvalValue::Float(_) => "DOUBLE",
                     EvalValue::Str(_) => "VARCHAR",
                     EvalValue::Array(_) => "ARRAY",
+                    EvalValue::Timestamp(_) => "TIMESTAMP",
                 }
                 .to_string(),
             )
         }),
-        "now" => {
-            let now = chrono::Utc::now();
-            EvalValue::Str(now.to_rfc3339())
-        }
+        // M4: now() returns Timestamp (M1 added NaiveDateTime variant)
+        "now" => EvalValue::Timestamp(chrono::Utc::now().naive_utc()),
         // conditional
         "case" => {
             let pairs = args.len() / 2;
             for i in 0..pairs {
                 if args[i * 2].is_truthy() {
-                    return args[i * 2 + 1].clone();
+                    return Some(args[i * 2 + 1].clone());
                 }
             }
             // odd arg count → last arg is default
@@ -544,8 +642,18 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> EvalValue {
             _ => EvalValue::Null,
         }),
 
-        _ => EvalValue::Null,
-    }
+        // M3: date/time scalar functions
+        "tonumber" => eval_tonumber(args),
+        "tostring" => eval_tostring(args),
+        "date_part" => eval_date_part(args),
+        "date_trunc" => eval_date_trunc(args),
+        "date_diff" => eval_date_diff(args),
+        "strftime" => eval_strftime(args),
+        "strptime" => eval_strptime(args),
+
+        _ => return None,
+    };
+    Some(v)
 }
 
 /// Convert a `JSONPath` like `$.foo.bar[0]` to a JSON Pointer like `/foo/bar/0`.
@@ -717,6 +825,264 @@ fn eval_round(args: &[EvalValue]) -> EvalValue {
         let factor = 10_f64.powi(precision as i32);
         EvalValue::Float((val * factor).round() / factor)
     }
+}
+
+// ── M3: date/time scalar function implementations ──────────────────
+
+/// `tonumber(x)` — mirrors `TRY_CAST(x AS DOUBLE)`.
+#[allow(clippy::cast_precision_loss)]
+fn eval_tonumber(args: &[EvalValue]) -> EvalValue {
+    match args.first() {
+        Some(EvalValue::Int(n)) => EvalValue::Float(*n as f64),
+        Some(EvalValue::Float(n)) => EvalValue::Float(*n),
+        Some(EvalValue::Str(s)) => s
+            .trim()
+            .parse::<f64>()
+            .map_or(EvalValue::Null, EvalValue::Float),
+        None | Some(_) => EvalValue::Null,
+    }
+}
+
+/// `tostring(x)` — mirrors `CAST(x AS VARCHAR)`.
+fn eval_tostring(args: &[EvalValue]) -> EvalValue {
+    match args.first() {
+        None | Some(EvalValue::Null | EvalValue::Array(_)) => EvalValue::Null,
+        Some(v) => v.as_str_repr().map_or(EvalValue::Null, EvalValue::Str),
+    }
+}
+
+/// `date_part(unit, ts)` — mirrors `DATE_PART(unit, ts)`.
+fn eval_date_part(args: &[EvalValue]) -> EvalValue {
+    if args.len() != 2 {
+        return EvalValue::Null;
+    }
+    let EvalValue::Str(unit) = &args[0] else {
+        return EvalValue::Null;
+    };
+    let Some(ts) = args[1].as_timestamp() else {
+        return EvalValue::Null;
+    };
+    match unit.to_lowercase().as_str() {
+        "year" => EvalValue::Int(i64::from(ts.year())),
+        "quarter" => EvalValue::Int(i64::from((ts.month() - 1) / 3 + 1)),
+        "month" => EvalValue::Int(i64::from(ts.month())),
+        "week" => EvalValue::Int(i64::from(ts.iso_week().week())),
+        "day" => EvalValue::Int(i64::from(ts.day())),
+        "hour" => EvalValue::Int(i64::from(ts.hour())),
+        "minute" => EvalValue::Int(i64::from(ts.minute())),
+        "second" => EvalValue::Int(i64::from(ts.second())),
+        "dow" => {
+            // DuckDB: Sunday=0 … Saturday=6
+            let dow = match ts.weekday() {
+                Weekday::Sun => 0,
+                Weekday::Mon => 1,
+                Weekday::Tue => 2,
+                Weekday::Wed => 3,
+                Weekday::Thu => 4,
+                Weekday::Fri => 5,
+                Weekday::Sat => 6,
+            };
+            EvalValue::Int(dow)
+        }
+        "doy" => EvalValue::Int(i64::from(ts.ordinal())),
+        "epoch" => {
+            // seconds since Unix epoch as float (matches DuckDB EPOCH semantics)
+            #[allow(clippy::cast_precision_loss)]
+            let epoch_secs = ts.and_utc().timestamp() as f64
+                + f64::from(ts.and_utc().timestamp_subsec_micros()) / 1_000_000.0;
+            EvalValue::Float(epoch_secs)
+        }
+        _ => EvalValue::Null,
+    }
+}
+
+/// `date_trunc(unit, ts)` — mirrors `DATE_TRUNC(unit, ts)`.
+fn eval_date_trunc(args: &[EvalValue]) -> EvalValue {
+    if args.len() != 2 {
+        return EvalValue::Null;
+    }
+    let EvalValue::Str(unit) = &args[0] else {
+        return EvalValue::Null;
+    };
+    let Some(ts) = args[1].as_timestamp() else {
+        return EvalValue::Null;
+    };
+    let truncated = match unit.to_lowercase().as_str() {
+        "year" => NaiveDate::from_ymd_opt(ts.year(), 1, 1).and_then(|d| d.and_hms_opt(0, 0, 0)),
+        "quarter" => {
+            let q_start_month = ((ts.month() - 1) / 3) * 3 + 1;
+            NaiveDate::from_ymd_opt(ts.year(), q_start_month, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        }
+        "month" => {
+            NaiveDate::from_ymd_opt(ts.year(), ts.month(), 1).and_then(|d| d.and_hms_opt(0, 0, 0))
+        }
+        "week" => {
+            // DuckDB truncates week to Monday (ISO 8601)
+            let days_since_monday = match ts.weekday() {
+                Weekday::Mon => 0,
+                Weekday::Tue => 1,
+                Weekday::Wed => 2,
+                Weekday::Thu => 3,
+                Weekday::Fri => 4,
+                Weekday::Sat => 5,
+                Weekday::Sun => 6,
+            };
+            ts.date()
+                .checked_sub_days(chrono::Days::new(days_since_monday))
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        }
+        "day" => ts.date().and_hms_opt(0, 0, 0),
+        "hour" => NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
+            .and_then(|d| d.and_time(NaiveTime::from_hms_opt(ts.hour(), 0, 0)?).into()),
+        "minute" => NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day()).and_then(|d| {
+            d.and_time(NaiveTime::from_hms_opt(ts.hour(), ts.minute(), 0)?)
+                .into()
+        }),
+        "second" => NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day()).and_then(|d| {
+            d.and_time(NaiveTime::from_hms_opt(
+                ts.hour(),
+                ts.minute(),
+                ts.second(),
+            )?)
+            .into()
+        }),
+        _ => None,
+    };
+    truncated.map_or(EvalValue::Null, EvalValue::Timestamp)
+}
+
+/// `date_diff(unit, start, end)` — mirrors `DATE_DIFF(unit, start, end)`.
+///
+/// Replicates `DuckDB`'s boundary-crossing count (not floored elapsed time).
+/// Example: `date_diff('hour', '…23:59:59', '…00:00:01')` = 1 (crosses the
+/// hour boundary once), not 0 (which floored division would produce).
+#[allow(clippy::cast_possible_truncation)]
+fn eval_date_diff(args: &[EvalValue]) -> EvalValue {
+    if args.len() != 3 {
+        return EvalValue::Null;
+    }
+    let EvalValue::Str(unit) = &args[0] else {
+        return EvalValue::Null;
+    };
+    let Some(start) = args[1].as_timestamp() else {
+        return EvalValue::Null;
+    };
+    let Some(end) = args[2].as_timestamp() else {
+        return EvalValue::Null;
+    };
+    let count: i64 = match unit.to_lowercase().as_str() {
+        "year" => i64::from(end.year() - start.year()),
+        "quarter" => {
+            let start_q = i64::from(start.year()) * 4 + i64::from((start.month() - 1) / 3);
+            let end_q = i64::from(end.year()) * 4 + i64::from((end.month() - 1) / 3);
+            end_q - start_q
+        }
+        "month" => {
+            let start_m = i64::from(start.year()) * 12 + i64::from(start.month() - 1);
+            let end_m = i64::from(end.year()) * 12 + i64::from(end.month() - 1);
+            end_m - start_m
+        }
+        "week" => {
+            // Boundary-crossing: truncate both to Monday of their ISO week, then
+            // count 7-day spans between truncated values.
+            let start_trunc = trunc_to_week(start);
+            let end_trunc = trunc_to_week(end);
+            let diff = end_trunc.signed_duration_since(start_trunc);
+            diff.num_weeks()
+        }
+        "day" => {
+            // Truncate to day midnight, count days between truncated values.
+            let start_trunc = start.date().and_hms_opt(0, 0, 0).unwrap_or(start);
+            let end_trunc = end.date().and_hms_opt(0, 0, 0).unwrap_or(end);
+            let diff = end_trunc.signed_duration_since(start_trunc);
+            diff.num_days()
+        }
+        "hour" => {
+            // Boundary-crossing: truncate both to hour, count hours between.
+            let start_trunc = trunc_to_hour(start);
+            let end_trunc = trunc_to_hour(end);
+            let diff = end_trunc.signed_duration_since(start_trunc);
+            diff.num_hours()
+        }
+        "minute" => {
+            let start_trunc = trunc_to_minute(start);
+            let end_trunc = trunc_to_minute(end);
+            let diff = end_trunc.signed_duration_since(start_trunc);
+            diff.num_minutes()
+        }
+        "second" => {
+            let start_trunc = trunc_to_second(start);
+            let end_trunc = trunc_to_second(end);
+            let diff = end_trunc.signed_duration_since(start_trunc);
+            diff.num_seconds()
+        }
+        _ => return EvalValue::Null,
+    };
+    EvalValue::Int(count)
+}
+
+/// Truncate a `NaiveDateTime` to the start of its ISO week (Monday midnight).
+fn trunc_to_week(ts: NaiveDateTime) -> NaiveDateTime {
+    let days_since_monday = match ts.weekday() {
+        Weekday::Mon => 0,
+        Weekday::Tue => 1,
+        Weekday::Wed => 2,
+        Weekday::Thu => 3,
+        Weekday::Fri => 4,
+        Weekday::Sat => 5,
+        Weekday::Sun => 6,
+    };
+    ts.date()
+        .checked_sub_days(chrono::Days::new(days_since_monday))
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .unwrap_or(ts)
+}
+
+fn trunc_to_hour(ts: NaiveDateTime) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
+        .and_then(|d| d.and_hms_opt(ts.hour(), 0, 0))
+        .unwrap_or(ts)
+}
+
+fn trunc_to_minute(ts: NaiveDateTime) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
+        .and_then(|d| d.and_hms_opt(ts.hour(), ts.minute(), 0))
+        .unwrap_or(ts)
+}
+
+fn trunc_to_second(ts: NaiveDateTime) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
+        .and_then(|d| d.and_hms_opt(ts.hour(), ts.minute(), ts.second()))
+        .unwrap_or(ts)
+}
+
+/// `strftime(ts, fmt)` — DSL arg order is (ts, fmt); mirrors `STRFTIME(fmt, ts)`.
+fn eval_strftime(args: &[EvalValue]) -> EvalValue {
+    if args.len() != 2 {
+        return EvalValue::Null;
+    }
+    let Some(ts) = args[0].as_timestamp() else {
+        return EvalValue::Null;
+    };
+    let EvalValue::Str(fmt) = &args[1] else {
+        return EvalValue::Null;
+    };
+    EvalValue::Str(ts.format(fmt).to_string())
+}
+
+/// `strptime(str, fmt)` — parse a string to `Timestamp` using chrono format.
+fn eval_strptime(args: &[EvalValue]) -> EvalValue {
+    if args.len() != 2 {
+        return EvalValue::Null;
+    }
+    let EvalValue::Str(s) = &args[0] else {
+        return EvalValue::Null;
+    };
+    let EvalValue::Str(fmt) = &args[1] else {
+        return EvalValue::Null;
+    };
+    NaiveDateTime::parse_from_str(s, fmt).map_or(EvalValue::Null, EvalValue::Timestamp)
 }
 
 #[cfg(test)]
@@ -1385,11 +1751,99 @@ mod tests {
         );
     }
 
+    // fn_now is tested in M4 — the test was intentionally changed to assert
+    // Timestamp(_) when now() was updated to return a Timestamp.
     #[test]
-    fn fn_now_returns_string() {
+    fn fn_now_returns_timestamp() {
+        let before = chrono::Utc::now().naive_utc();
         let expr = call("now", vec![]);
         let result = eval_expr(&expr, &empty_event());
-        assert!(matches!(result, EvalValue::Str(_)));
+        let after = chrono::Utc::now().naive_utc();
+        let EvalValue::Timestamp(ts) = result else {
+            panic!("expected Timestamp, got {result:?}");
+        };
+        assert!(ts >= before, "now() timestamp should be >= start");
+        assert!(ts <= after, "now() timestamp should be <= end");
+    }
+
+    // ── Timestamp variant ──────────────────────────────────────────
+
+    #[test]
+    fn timestamp_to_duckdb_text_no_frac() {
+        let ts = chrono::NaiveDateTime::parse_from_str("2026-01-15 14:30:00", "%Y-%m-%d %H:%M:%S")
+            .unwrap();
+        assert_eq!(timestamp_to_duckdb_text(&ts), "2026-01-15 14:30:00");
+    }
+
+    #[test]
+    fn timestamp_to_duckdb_text_with_micros() {
+        let ts = chrono::NaiveDateTime::parse_from_str(
+            "2026-01-15 14:30:00.123456",
+            "%Y-%m-%d %H:%M:%S%.f",
+        )
+        .unwrap();
+        assert_eq!(timestamp_to_duckdb_text(&ts), "2026-01-15 14:30:00.123456");
+    }
+
+    #[test]
+    fn timestamp_to_duckdb_text_trims_trailing_zeros() {
+        let ts = chrono::NaiveDateTime::parse_from_str(
+            "2026-01-15 14:30:00.100000",
+            "%Y-%m-%d %H:%M:%S%.f",
+        )
+        .unwrap();
+        // DuckDB trims trailing zeros: .100000 → .1
+        assert_eq!(timestamp_to_duckdb_text(&ts), "2026-01-15 14:30:00.1");
+    }
+
+    #[test]
+    fn as_timestamp_from_t_separator() {
+        let v = EvalValue::Str("2026-01-15T14:30:00Z".to_string());
+        let ts = v.as_timestamp().unwrap();
+        assert_eq!(ts.to_string(), "2026-01-15 14:30:00");
+    }
+
+    #[test]
+    fn as_timestamp_from_space_separator() {
+        let v = EvalValue::Str("2026-01-15 14:30:00".to_string());
+        let ts = v.as_timestamp().unwrap();
+        assert_eq!(ts.to_string(), "2026-01-15 14:30:00");
+    }
+
+    #[test]
+    fn as_timestamp_date_only_is_midnight() {
+        let v = EvalValue::Str("2026-01-15".to_string());
+        let ts = v.as_timestamp().unwrap();
+        assert_eq!(ts.to_string(), "2026-01-15 00:00:00");
+    }
+
+    #[test]
+    fn as_timestamp_discards_offset() {
+        // Offset +02:00 is discarded, wall-clock components are kept.
+        let v = EvalValue::Str("2026-01-15T14:30:00+02:00".to_string());
+        let ts = v.as_timestamp().unwrap();
+        assert_eq!(ts.to_string(), "2026-01-15 14:30:00");
+    }
+
+    #[test]
+    fn as_timestamp_unparseable_is_none() {
+        let v = EvalValue::Str("not-a-date".to_string());
+        assert!(v.as_timestamp().is_none());
+    }
+
+    #[test]
+    fn timestamp_is_truthy() {
+        let ts = chrono::NaiveDateTime::parse_from_str("2026-01-15 00:00:00", "%Y-%m-%d %H:%M:%S")
+            .unwrap();
+        assert!(EvalValue::Timestamp(ts).is_truthy());
+    }
+
+    #[test]
+    fn timestamp_to_json_is_duckdb_text() {
+        let ts = chrono::NaiveDateTime::parse_from_str("2026-01-15 14:30:00", "%Y-%m-%d %H:%M:%S")
+            .unwrap();
+        let json_val = Value::from(EvalValue::Timestamp(ts));
+        assert_eq!(json_val, json!("2026-01-15 14:30:00"));
     }
 
     // ── EvalValue conversions ──────────────────────────────────────
@@ -1498,5 +1952,348 @@ mod tests {
             ],
         );
         assert_eq!(eval_expr(&expr, &ev), EvalValue::Int(0));
+    }
+
+    // ── M3: date/time scalar functions ─────────────────────────────
+
+    fn ts(s: &str) -> Spanned<Expr> {
+        lit_str(s)
+    }
+
+    fn ndt(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+            .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+            .unwrap_or_else(|e| panic!("bad ndt str {s}: {e}"))
+    }
+
+    // tonumber
+    #[test]
+    fn fn_tonumber_from_str() {
+        let expr = call("tonumber", vec![lit_str("1.23")]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.23));
+    }
+
+    #[test]
+    fn fn_tonumber_from_int() {
+        let expr = call("tonumber", vec![lit_int(42)]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(42.0));
+    }
+
+    #[test]
+    fn fn_tonumber_from_float() {
+        let expr = call("tonumber", vec![lit_float(1.5)]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.5));
+    }
+
+    #[test]
+    fn fn_tonumber_non_numeric_str() {
+        let expr = call("tonumber", vec![lit_str("nope")]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    // tostring
+    #[test]
+    fn fn_tostring_int() {
+        let expr = call("tostring", vec![lit_int(42)]);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("42".to_string())
+        );
+    }
+
+    #[test]
+    fn fn_tostring_null() {
+        let expr = call("tostring", vec![lit_null()]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    #[test]
+    fn fn_tostring_timestamp() {
+        let expr = call(
+            "tostring",
+            vec![call(
+                "strptime",
+                vec![lit_str("2026-01-15 14:30:00"), lit_str("%Y-%m-%d %H:%M:%S")],
+            )],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("2026-01-15 14:30:00".to_string())
+        );
+    }
+
+    // date_part
+    #[test]
+    fn fn_date_part_year() {
+        let expr = call(
+            "date_part",
+            vec![lit_str("year"), ts("2026-03-15 10:20:30")],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(2026));
+    }
+
+    #[test]
+    fn fn_date_part_month() {
+        let expr = call(
+            "date_part",
+            vec![lit_str("month"), ts("2026-03-15 10:20:30")],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(3));
+    }
+
+    #[test]
+    fn fn_date_part_day() {
+        let expr = call("date_part", vec![lit_str("day"), ts("2026-03-15 10:20:30")]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(15));
+    }
+
+    #[test]
+    fn fn_date_part_hour() {
+        let expr = call(
+            "date_part",
+            vec![lit_str("hour"), ts("2026-03-15 10:20:30")],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(10));
+    }
+
+    #[test]
+    fn fn_date_part_dow_sunday() {
+        // 2026-03-15 is a Sunday → DOW=0
+        let expr = call("date_part", vec![lit_str("dow"), ts("2026-03-15 00:00:00")]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(0));
+    }
+
+    #[test]
+    fn fn_date_part_quarter() {
+        let expr = call(
+            "date_part",
+            vec![lit_str("quarter"), ts("2026-07-01 00:00:00")],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(3));
+    }
+
+    #[test]
+    fn fn_date_part_unknown_unit() {
+        let expr = call(
+            "date_part",
+            vec![lit_str("millennium"), ts("2026-01-01 00:00:00")],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    // date_trunc
+    #[test]
+    fn fn_date_trunc_year() {
+        let expr = call(
+            "date_trunc",
+            vec![lit_str("year"), ts("2026-07-15 10:20:30")],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Timestamp(ndt("2026-01-01 00:00:00"))
+        );
+    }
+
+    #[test]
+    fn fn_date_trunc_month() {
+        let expr = call(
+            "date_trunc",
+            vec![lit_str("month"), ts("2026-07-15 10:20:30")],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Timestamp(ndt("2026-07-01 00:00:00"))
+        );
+    }
+
+    #[test]
+    fn fn_date_trunc_day() {
+        let expr = call(
+            "date_trunc",
+            vec![lit_str("day"), ts("2026-07-15 10:20:30")],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Timestamp(ndt("2026-07-15 00:00:00"))
+        );
+    }
+
+    #[test]
+    fn fn_date_trunc_hour() {
+        let expr = call(
+            "date_trunc",
+            vec![lit_str("hour"), ts("2026-07-15 10:20:30")],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Timestamp(ndt("2026-07-15 10:00:00"))
+        );
+    }
+
+    #[test]
+    fn fn_date_trunc_week_to_monday() {
+        // 2026-07-15 is a Wednesday → week should truncate to Monday 2026-07-13
+        let expr = call(
+            "date_trunc",
+            vec![lit_str("week"), ts("2026-07-15 10:20:30")],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Timestamp(ndt("2026-07-13 00:00:00"))
+        );
+    }
+
+    // date_diff — ADR boundary-crossing cases
+    #[test]
+    fn fn_date_diff_hour_boundary_crossing() {
+        // ADR's canonical test: 23:59:59 → 00:00:00 next day = 1 hour boundary crossed
+        let expr = call(
+            "date_diff",
+            vec![
+                lit_str("hour"),
+                ts("2026-01-01 23:59:59"),
+                ts("2026-01-02 00:00:00"),
+            ],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(1));
+    }
+
+    #[test]
+    fn fn_date_diff_day() {
+        let expr = call(
+            "date_diff",
+            vec![
+                lit_str("day"),
+                ts("2026-01-01 00:00:00"),
+                ts("2026-01-08 00:00:00"),
+            ],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(7));
+    }
+
+    #[test]
+    fn fn_date_diff_month() {
+        let expr = call(
+            "date_diff",
+            vec![
+                lit_str("month"),
+                ts("2026-01-15 00:00:00"),
+                ts("2026-03-15 00:00:00"),
+            ],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(2));
+    }
+
+    #[test]
+    fn fn_date_diff_negative() {
+        // end before start → negative count
+        let expr = call(
+            "date_diff",
+            vec![
+                lit_str("day"),
+                ts("2026-01-08 00:00:00"),
+                ts("2026-01-01 00:00:00"),
+            ],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(-7));
+    }
+
+    #[test]
+    fn fn_date_diff_week_boundary() {
+        // Mon 2026-07-13 → Mon 2026-07-20 = 1 week
+        let expr = call(
+            "date_diff",
+            vec![
+                lit_str("week"),
+                ts("2026-07-13 23:59:59"),
+                ts("2026-07-20 00:00:00"),
+            ],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(1));
+    }
+
+    // strftime
+    #[test]
+    fn fn_strftime_basic() {
+        let expr = call(
+            "strftime",
+            vec![ts("2026-03-15 10:20:30"), lit_str("%Y-%m-%d")],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("2026-03-15".to_string())
+        );
+    }
+
+    #[test]
+    fn fn_strftime_full() {
+        let expr = call(
+            "strftime",
+            vec![ts("2026-03-15 10:20:30"), lit_str("%Y-%m-%d %H:%M:%S")],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("2026-03-15 10:20:30".to_string())
+        );
+    }
+
+    // strptime
+    #[test]
+    fn fn_strptime_success() {
+        let expr = call(
+            "strptime",
+            vec![lit_str("2026-03-15 10:20:30"), lit_str("%Y-%m-%d %H:%M:%S")],
+        );
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Timestamp(ndt("2026-03-15 10:20:30"))
+        );
+    }
+
+    #[test]
+    fn fn_strptime_failure_returns_null() {
+        let expr = call(
+            "strptime",
+            vec![lit_str("not-a-date"), lit_str("%Y-%m-%d %H:%M:%S")],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    // typeof(now())
+    #[test]
+    fn fn_typeof_now_is_timestamp() {
+        let expr = call("typeof", vec![call("now", vec![])]);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Str("TIMESTAMP".to_string())
+        );
+    }
+
+    // M7: coverage test — every non-aggregate KNOWN_FUNCTION must return Some(_)
+    // from eval_scalar_fn. Fails CI if a scalar is added to the emitter but not eval.
+    #[test]
+    fn all_scalar_known_functions_return_some() {
+        use crate::emitter::is_aggregate_function;
+        use crate::parser::suggest::KNOWN_FUNCTIONS;
+        // Generous arg list: enough variety that arity/type checks don't block.
+        let ts_val = EvalValue::Timestamp(ndt("2026-01-15 10:20:30"));
+        let generous_args = vec![
+            ts_val.clone(),
+            EvalValue::Str("year".to_string()),
+            EvalValue::Int(1),
+            EvalValue::Float(1.0),
+            EvalValue::Bool(true),
+        ];
+        for &func in KNOWN_FUNCTIONS {
+            if is_aggregate_function(func) {
+                continue; // aggregates are not in eval_scalar_fn
+            }
+            let result = eval_scalar_fn(func, &generous_args);
+            assert!(
+                result.is_some(),
+                "eval_scalar_fn({func:?}, ...) returned None — \
+                 add it to eval_scalar_fn or the coverage test will keep failing"
+            );
+        }
     }
 }
