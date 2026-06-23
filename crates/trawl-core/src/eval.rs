@@ -134,11 +134,16 @@ fn strip_offset(s: &str) -> Option<String> {
     if let Some(base) = s.strip_suffix('Z') {
         return Some(base.to_string());
     }
-    // Check for trailing +HH:MM or -HH:MM (exactly 6 chars at end)
-    if s.len() >= 6 {
-        let tail = &s[s.len() - 6..];
-        let sign = tail.as_bytes().first().copied();
-        if (sign == Some(b'+') || sign == Some(b'-')) && tail.as_bytes()[3] == b':' {
+    // Check for trailing +HH:MM or -HH:MM (exactly 6 bytes at end).
+    // Use checked indexing: a non-char-boundary slice (e.g. when the byte at
+    // `len - 6` is a UTF-8 continuation byte of a multi-byte sequence) makes
+    // `s.get` return None rather than panicking. A valid offset is pure ASCII,
+    // so when `get` yields Some, `len - 6` is guaranteed a char boundary and
+    // the head slice below cannot panic either.
+    if let Some(tail) = s.len().checked_sub(6).and_then(|i| s.get(i..)) {
+        let bytes = tail.as_bytes();
+        let sign = bytes[0];
+        if (sign == b'+' || sign == b'-') && bytes[3] == b':' {
             return Some(s[..s.len() - 6].to_string());
         }
     }
@@ -1943,6 +1948,21 @@ mod tests {
     #[test]
     fn as_timestamp_unparseable_is_none() {
         let v = EvalValue::Str("not-a-date".to_string());
+        assert!(v.as_timestamp().is_none());
+    }
+
+    #[test]
+    fn as_timestamp_non_utf8_boundary_does_not_panic() {
+        // Regression: strip_offset's `&s[s.len() - 6..]` byte-sliced into the
+        // middle of a multi-byte UTF-8 sequence and panicked. "🦀🦀" is 8 bytes;
+        // index 2 (len - 6) is a continuation byte. This is reachable from
+        // ingested log field values via Str<->Timestamp coercion, so it must
+        // return None gracefully, not panic.
+        let v = EvalValue::Str("🦀🦀".to_string());
+        assert!(v.as_timestamp().is_none());
+
+        // A field value whose byte at len - 6 lands mid-emoji.
+        let v = EvalValue::Str("err: 🦀🦀".to_string());
         assert!(v.as_timestamp().is_none());
     }
 
