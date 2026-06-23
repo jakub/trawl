@@ -20,6 +20,7 @@ use state::EmitterState;
 
 pub use fields::map_field_name;
 pub use functions::is_aggregate_function;
+pub(crate) use functions::{unit_literal_positions, validate_unit_literal};
 pub use state::{hot_source_reader, source_reader, validate_source_path};
 pub use validate::validate_pipeline;
 
