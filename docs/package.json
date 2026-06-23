@@ -12,5 +12,8 @@
     "astro": "^6.0.4",
     "@astrojs/starlight": "^0.38.1",
     "sharp": "^0.34.5"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
   }
 }
