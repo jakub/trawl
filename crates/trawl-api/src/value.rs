@@ -289,10 +289,10 @@ pub struct SchemaResult {
     pub file_count: u64,
 }
 
-/// Per-column statistics from parquet row group metadata.
+/// Per-column statistics aggregated from parquet file footers.
 ///
-/// Returned by [`Executor::parquet_column_stats`] — aggregated across
-/// all row groups in the matched parquet files.
+/// Produced by the footer-stats reader in `trawl-engine`'s `parquet_stats`
+/// module, summed across all row groups in the matched parquet files.
 #[derive(Debug, Clone)]
 pub struct ParquetColumnStats {
     /// Column name (`path_in_schema`).

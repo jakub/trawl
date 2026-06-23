@@ -10,6 +10,7 @@
 
 pub mod error;
 pub mod executor;
+pub mod parquet_stats;
 pub mod post_process;
 pub mod timezone;
 
