@@ -11,36 +11,27 @@
 //! Per-column statistics are read from parquet footers in safe Rust (see
 //! [`trawl_engine::parquet_stats`]) rather than via `DuckDB`'s
 //! `parquet_metadata()` table function, which can `SIGSEGV` on some files and
-//! take the whole daemon down. As defence-in-depth against any *other* native
-//! crash on a poisoned file (e.g. the `DuckDB` `DESCRIBE` still used for column
-//! types), each file is write-ahead-logged to an in-flight marker before it is
-//! touched: if a refresh dies mid-file, the next start reads the marker, logs
-//! the suspect loudly, and quarantines it so the daemon stops crash-looping.
+//! take the whole daemon down. Because the footer reader turns a poisoned file
+//! into a catchable [`Err`] rather than an uncatchable crash, a bad file is
+//! simply skipped for that pass and retried on the next one — no daemon death,
+//! no persistent quarantine to drift out of sync. The skip is logged loudly so
+//! the offending file can be identified, deduplicated across passes (via the
+//! `warned` set) so a persistently-broken file doesn't spam the log every tick.
 //!
 //! Follows the same pattern as [`crate::monitor::spawn_snapshot_collector`].
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use trawl_api::{DailyCount, ServiceColumnStats, ServiceSchema};
 use trawl_engine::executor::Executor;
 use trawl_engine::parquet_stats::{self, StatsAccumulator};
 
 use crate::state::{AppState, CachedServiceSchema};
-
-/// File (in the data dir) listing parquet paths known to crash or fail the
-/// refresh; these are skipped on every subsequent pass. One path per line.
-const QUARANTINE_FILE: &str = ".trawl-schema-quarantine";
-/// Write-ahead marker (in the data dir) naming the unit currently being read.
-/// Its survival across a process death is the signal that that unit crashed us.
-const MARKER_FILE: &str = ".trawl-schema-refresh.inflight";
-/// Marker prefix for the `DuckDB` `DESCRIBE` step (which works per-service glob,
-/// not per-file, so a crash there can't be pinned to a single file).
-const DESCRIBE_MARK: &str = "describe:";
 
 /// Spawn the background schema refresh task.
 ///
@@ -52,12 +43,20 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
         let mut interval = tokio::time::interval(ttl);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Files skipped (unreadable) on the previous pass, so we log each newly
+        // broken file once rather than every tick. Shared with the blocking
+        // refresh closure; lives for the process.
+        let warned: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+
         loop {
             interval.tick().await;
 
             let fallback_glob = state.query.pool.fallback_glob().to_owned();
-            let result =
-                tokio::task::spawn_blocking(move || refresh_service_schema(&fallback_glob)).await;
+            let warned = Arc::clone(&warned);
+            let result = tokio::task::spawn_blocking(move || {
+                refresh_service_schema(&fallback_glob, &warned)
+            })
+            .await;
 
             match result {
                 Ok(Ok(services)) => {
@@ -100,9 +99,11 @@ struct FileInfo {
 /// Perform the full service schema refresh.
 ///
 /// Walks parquet files, groups by service, then for each service reads parquet
-/// footers for column stats and row counts.
+/// footers for column stats and row counts. `warned` carries the set of files
+/// that failed to read on the previous pass so each break is logged once.
 fn refresh_service_schema(
     fallback_glob: &str,
+    warned: &Mutex<HashSet<PathBuf>>,
 ) -> Result<Vec<ServiceSchema>, Box<dyn std::error::Error + Send + Sync>> {
     let base = fallback_glob
         .find('*')
@@ -113,10 +114,10 @@ fn refresh_service_schema(
         return Ok(Vec::new());
     }
 
-    // Load the persistent quarantine, then recover from any marker a previous
-    // refresh left behind when it crashed mid-file.
-    let mut quarantine = load_quarantine(base);
-    recover_stale_marker(base, &mut quarantine);
+    // Files we'd already warned about (snapshot of last pass), and the files we
+    // skip this pass — used to log each newly-broken file exactly once.
+    let prev_warned = warned.lock().clone();
+    let mut skipped_now: HashSet<PathBuf> = HashSet::new();
 
     let entries = crate::metrics::walk_parquet_files(base)?;
 
@@ -141,24 +142,36 @@ fn refresh_service_schema(
     let mut result = Vec::with_capacity(by_service.len());
 
     for (service, files) in &by_service {
-        let schema = build_service_schema(service, files, base, &mut quarantine)?;
+        let schema = build_service_schema(service, files, base, &prev_warned, &mut skipped_now)?;
         result.push(schema);
     }
+
+    // Remember this pass's skips: files that recovered drop out of the set, so a
+    // future re-break is logged again.
+    *warned.lock() = skipped_now;
 
     Ok(result)
 }
 
 /// Build schema for a single service from its file list.
+///
+/// `prev_warned` is the read-only set of files already logged as broken;
+/// `skipped_now` accumulates the files skipped this pass.
 fn build_service_schema(
     service: &str,
     files: &[FileInfo],
     base: &Path,
-    quarantine: &mut BTreeSet<PathBuf>,
+    prev_warned: &HashSet<PathBuf>,
+    skipped_now: &mut HashSet<PathBuf>,
 ) -> Result<ServiceSchema, Box<dyn std::error::Error + Send + Sync>> {
     // Aggregate file-level metadata. `daily_counts` is seeded with every date
-    // seen in the directory tree (so a date whose only files are quarantined
-    // still appears, with a count of 0) and filled with exact per-file row
+    // seen in the directory tree (so a date whose only files are skipped this
+    // pass still appears, with a count of 0) and filled with exact per-file row
     // counts from the footers below.
+    //
+    // Note: a parquet file directly under `base` with no YYYY-MM-DD ancestor
+    // contributes to `total_events` but not to any daily bucket — the two
+    // totals can legitimately diverge for date-less files.
     let mut dates: BTreeSet<String> = BTreeSet::new();
     let mut total_bytes: u64 = 0;
     let mut daily_counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -176,15 +189,10 @@ fn build_service_schema(
     let latest_date = dates.iter().next_back().cloned();
 
     // Read per-column stats + row counts from each file's footer (pure Rust, no
-    // DuckDB). Each file is marker-guarded: a crash leaves the marker naming it,
-    // and an `Err` (corrupt/unreadable) quarantines it inline — neither can take
-    // the daemon down.
+    // DuckDB). An unreadable file (corrupt, truncated, or caught mid-write) is a
+    // catchable `Err`, never a crash: skip it this pass and retry next time.
     let mut acc = StatsAccumulator::default();
     for f in files {
-        if quarantine.contains(&f.path) {
-            continue;
-        }
-        write_marker(base, &f.path.to_string_lossy());
         match parquet_stats::read_file_stats(&f.path) {
             Ok(stats) => {
                 if let Some(ref d) = f.date {
@@ -193,17 +201,19 @@ fn build_service_schema(
                 acc.add_file(stats);
             }
             Err(e) => {
-                tracing::warn!(
-                    event_type = "schema_refresh_file_skip",
-                    file = %f.path.display(),
-                    error = %e,
-                    "unreadable parquet file; quarantining and skipping"
-                );
-                add_to_quarantine(base, &f.path);
-                quarantine.insert(f.path.clone());
+                // Log once per break (the file wasn't already on the warned
+                // list), so a persistently-broken file doesn't spam every tick.
+                if !prev_warned.contains(&f.path) {
+                    tracing::warn!(
+                        event_type = "schema_refresh_file_skip",
+                        file = %f.path.display(),
+                        error = %e,
+                        "unreadable parquet file; skipping this pass, will retry next refresh"
+                    );
+                }
+                skipped_now.insert(f.path.clone());
             }
         }
-        clear_marker(base);
     }
 
     let total_events = acc.total_rows();
@@ -212,12 +222,12 @@ fn build_service_schema(
     // Build a service-scoped glob for the DuckDB schema describe.
     let service_glob = format!("{}/**/{}.parquet", base.to_string_lossy(), service);
 
-    // Column names + types via DuckDB DESCRIBE (the reconciler for cross-file
-    // schema drift). This still touches libduckdb, so guard it with a marker too.
-    write_marker(base, &format!("{DESCRIBE_MARK}{service_glob}"));
+    // Column names + types via DuckDB DESCRIBE — the reconciler for cross-file
+    // schema drift. DESCRIBE reads only the footer schema (names/types), not the
+    // row-group stat values that crash `parquet_metadata()`, so it stays off the
+    // crash path the footer reader was added to avoid.
     let executor = Executor::new()?;
     let schema_result = executor.describe_schema(&service_glob);
-    clear_marker(base);
     let schema_columns = schema_result.as_ref().map_or(&[][..], |r| &r.columns);
 
     // Merge column stats with schema column types.
@@ -252,79 +262,6 @@ fn build_service_schema(
         total_events,
         daily_event_counts,
     })
-}
-
-/// Load the quarantine list (parquet paths to skip) from the data dir.
-fn load_quarantine(base: &Path) -> BTreeSet<PathBuf> {
-    match std::fs::read_to_string(base.join(QUARANTINE_FILE)) {
-        Ok(contents) => contents
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(PathBuf::from)
-            .collect(),
-        Err(_) => BTreeSet::new(),
-    }
-}
-
-/// Append a parquet path to the persistent quarantine (best-effort).
-fn add_to_quarantine(base: &Path, file: &Path) {
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(base.join(QUARANTINE_FILE))
-    {
-        let _ = writeln!(f, "{}", file.display());
-        let _ = f.sync_all();
-    }
-}
-
-/// Write the in-flight marker naming the unit about to be read, flushing it to
-/// disk so it survives a process death (the marker's survival is the crash
-/// signal recovered on the next start).
-fn write_marker(base: &Path, unit: &str) {
-    if let Ok(mut f) = File::create(base.join(MARKER_FILE)) {
-        let _ = f.write_all(unit.as_bytes());
-        let _ = f.sync_all();
-    }
-}
-
-/// Clear the in-flight marker after a unit was read without crashing.
-fn clear_marker(base: &Path) {
-    let _ = std::fs::remove_file(base.join(MARKER_FILE));
-}
-
-/// If a marker survived from a previous refresh, that unit crashed the daemon.
-/// Log it loudly and — when it names a specific file — quarantine it.
-fn recover_stale_marker(base: &Path, quarantine: &mut BTreeSet<PathBuf>) {
-    let marker = base.join(MARKER_FILE);
-    let Ok(contents) = std::fs::read_to_string(&marker) else {
-        return;
-    };
-    let _ = std::fs::remove_file(&marker);
-    let unit = contents.trim();
-    if unit.is_empty() {
-        return;
-    }
-
-    if let Some(glob) = unit.strip_prefix(DESCRIBE_MARK) {
-        tracing::error!(
-            event_type = "schema_refresh_crash_recovered",
-            suspect = %glob,
-            "schema refresh previously crashed while DESCRIBE-ing this service's parquet; \
-             continuing (a glob describe can't be pinned to one file)"
-        );
-    } else {
-        let path = PathBuf::from(unit);
-        tracing::error!(
-            event_type = "schema_refresh_crash_recovered",
-            suspect_file = %unit,
-            "schema refresh previously crashed reading this parquet file; quarantining it. \
-             Inspect the file and file it upstream (likely a DuckDB parquet-metadata bug)"
-        );
-        add_to_quarantine(base, &path);
-        quarantine.insert(path);
-    }
 }
 
 /// Walk ancestors of a path looking for a YYYY-MM-DD directory component.
@@ -385,7 +322,8 @@ mod tests {
         );
 
         let glob = format!("{}/**/*.parquet", base.display());
-        let services = refresh_service_schema(&glob).unwrap();
+        let warned = Mutex::new(HashSet::new());
+        let services = refresh_service_schema(&glob, &warned).unwrap();
 
         let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
         assert_eq!(nginx.file_count, 2);
@@ -411,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_is_quarantined_not_fatal() {
+    fn corrupt_file_is_skipped_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         write_service_parquet(
@@ -421,37 +359,58 @@ mod tests {
             "SELECT * FROM (VALUES (1)) t(n)",
         );
         // A bogus ".parquet" that the footer reader will reject.
-        let bad_dir = base.join("2026-06-20");
-        let bad = bad_dir.join("bad.parquet");
+        let bad = base.join("2026-06-20").join("bad.parquet");
         std::fs::write(&bad, b"not parquet at all").unwrap();
 
         // Refresh succeeds despite the bad file...
         let glob = format!("{}/**/*.parquet", base.display());
-        let services = refresh_service_schema(&glob).unwrap();
+        let warned = Mutex::new(HashSet::new());
+        let services = refresh_service_schema(&glob, &warned).unwrap();
         assert!(services.iter().any(|s| s.name == "good"));
 
-        // ...and the bad file is now persisted in the quarantine.
-        let quarantined = load_quarantine(base);
-        assert!(quarantined.contains(&bad), "bad file should be quarantined");
-        // No marker is left behind after a clean (if degraded) pass.
-        assert!(!base.join(MARKER_FILE).exists());
+        // ...the bad file's service has zero events (it was skipped)...
+        let bad_svc = services.iter().find(|s| s.name == "bad").unwrap();
+        assert_eq!(bad_svc.total_events, 0);
+
+        // ...the skip is recorded for log-dedup across passes...
+        assert!(warned.lock().contains(&bad));
+
+        // ...and NO persistent quarantine/marker artifact is written to disk.
+        assert!(!base.join(".trawl-schema-quarantine").exists());
+        assert!(!base.join(".trawl-schema-refresh.inflight").exists());
     }
 
     #[test]
-    fn stale_file_marker_quarantines_suspect_on_recovery() {
+    fn recovered_file_is_picked_up_next_pass() {
+        // A file that fails one pass but reads on the next must NOT be lost
+        // permanently (the regression the persistent quarantine introduced).
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
-        let victim = base.join("2026-06-20").join("victim.parquet");
+        let svc = base.join("2026-06-20").join("svc.parquet");
+        std::fs::create_dir_all(svc.parent().unwrap()).unwrap();
+        std::fs::write(&svc, b"garbage, not parquet yet").unwrap();
 
-        // Simulate a previous refresh that died while reading `victim`.
-        std::fs::write(base.join(MARKER_FILE), victim.to_string_lossy().as_bytes()).unwrap();
+        let glob = format!("{}/**/*.parquet", base.display());
+        let warned = Mutex::new(HashSet::new());
 
-        let mut quarantine = load_quarantine(base);
-        recover_stale_marker(base, &mut quarantine);
+        // Pass 1: file is garbage → skipped, zero events, recorded in warned.
+        let pass1 = refresh_service_schema(&glob, &warned).unwrap();
+        let svc1 = pass1.iter().find(|s| s.name == "svc").unwrap();
+        assert_eq!(svc1.total_events, 0);
+        assert!(warned.lock().contains(&svc));
 
-        assert!(quarantine.contains(&victim));
-        assert!(load_quarantine(base).contains(&victim));
-        // Marker is consumed.
-        assert!(!base.join(MARKER_FILE).exists());
+        // The file becomes valid (e.g. compaction finished writing it).
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES (1), (2)) t(n)) TO '{}' (FORMAT PARQUET)",
+            svc.display()
+        ))
+        .unwrap();
+
+        // Pass 2: it reads cleanly and its rows are counted; warned set clears.
+        let pass2 = refresh_service_schema(&glob, &warned).unwrap();
+        let svc2 = pass2.iter().find(|s| s.name == "svc").unwrap();
+        assert_eq!(svc2.total_events, 2);
+        assert!(!warned.lock().contains(&svc));
     }
 }
