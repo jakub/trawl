@@ -1,0 +1,126 @@
+name: Dev image
+
+# Manual-only lean image build for fast k8s iteration. Unlike release.yml
+# this builds a SINGLE arm64 image and skips all the release ceremony
+# (second arch, macOS, .deb/APT, breakpad symbols, GitHub release, Helm
+# package). The image is tagged with the git short-sha and pushed to ghcr,
+# so `helm upgrade --set image.tag=sha-...` rolls the pod reliably despite
+# the chart's imagePullPolicy: IfNotPresent (a re-pushed *same* tag would
+# not re-pull). Everything runs in one job — no artifact round-trip.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dev-image:
+    name: build + push arm64 dev image
+    runs-on: k8s-big
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Compute image tag
+        id: tag
+        run: echo "value=sha-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-unknown-linux-gnu, wasm32-unknown-unknown
+
+      # Own cache (shared-key, stable across dev-image runs) so dev churn
+      # doesn't evict release.yml's `release-<target>` entry. First run is a
+      # cold libduckdb C++ build; every run after is the warm rust delta.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: dev-aarch64-linux
+
+      - name: Install zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+
+      # arm64 is cross-compiled from the x86_64 runner; pull in the arm64
+      # libc so zig's lld can link. Mirrors release.yml's cross leg.
+      - name: Install cross-arch dpkg libs
+        run: |
+          sudo dpkg --add-architecture arm64
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] && sudo sed -i '/^Architectures:/!s/^Types: deb/Architectures: amd64\nTypes: deb/' "$f"
+          done
+          for f in /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] && sudo sed -i '/\[arch=/!s/^deb /deb [arch=amd64] /' "$f"
+          done
+          codename="$(lsb_release -cs)"
+          printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s %s\n' \
+            "$codename"          "main universe" \
+            "$codename-updates"  "main universe" \
+            "$codename-security" "main universe" \
+            | sudo tee /etc/apt/sources.list.d/arm64.list
+          sudo apt-get update
+          sudo apt-get install -y libc6-arm64-cross dpkg-dev
+
+      - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
+        with:
+          tool: cargo-zigbuild,trunk,wasm-bindgen-cli
+
+      # Build the leptos SPA first so rust-embed bakes a populated dist/ into
+      # trawl-web (the web sidecar shares this image). Same ordering as release.
+      - name: Build web UI SPA
+        working-directory: crates/trawl-web-ui
+        run: trunk build --release
+
+      # No CARGO_PROFILE_RELEASE_STRIP=false / --build-id override here (unlike
+      # release.yml): a dev image publishes no breakpad symbols, so the default
+      # profile's strip = "debuginfo" + zig lld's .symtab strip give lean
+      # binaries straight out of the build — smaller image, faster push.
+      - name: Build
+        run: cargo zigbuild --release --workspace --exclude trawl-web-ui --target aarch64-unknown-linux-gnu.2.31
+
+      # Stage exactly the three binaries the Dockerfile COPYs into
+      # docker-ctx/arm64/ (buildx sets TARGETARCH=arm64 for linux/arm64).
+      - name: Stage binaries for the image
+        run: |
+          mkdir -p docker-ctx/arm64
+          bindir="target/aarch64-unknown-linux-gnu/release"
+          cp "${bindir}/trawld" "${bindir}/trawl-admin" "${bindir}/trawl-web" docker-ctx/arm64/
+          chmod +x docker-ctx/arm64/trawld docker-ctx/arm64/trawl-admin docker-ctx/arm64/trawl-web
+
+      # QEMU is needed: the Dockerfile's apt-get/groupadd RUN steps execute in
+      # the arm64 target context on this x86_64 host.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.value }}
+
+      - name: Deploy hint
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+          REPO: ${{ github.repository }}
+        run: |
+          tag="$TAG"
+          image="ghcr.io/${REPO}:${tag}"
+          {
+            echo "### Dev image pushed"
+            echo ""
+            echo "\`${image}\`"
+            echo ""
+            echo "Roll it onto the cluster (substitute your release name):"
+            echo ""
+            echo '```sh'
+            echo "helm upgrade <release> ./chart/trawl --reuse-values --set image.tag=${tag}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
