@@ -10,7 +10,7 @@
 
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use crate::emitter::map_field_name;
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use serde_json::{Map, Value};
 
 /// Result of evaluating an expression against an event.
@@ -83,7 +83,9 @@ impl EvalValue {
 /// trailing fractional-second zeros trimmed. This must byte-match `DuckDB`
 /// output for the parity tests to pass.
 pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
-    let micros = ts.and_utc().timestamp_subsec_micros();
+    // Sub-second micros straight off the naive time — no need to build a
+    // DateTime<Utc> just to read them.
+    let micros = ts.nanosecond() / 1000;
     if micros == 0 {
         ts.format("%Y-%m-%d %H:%M:%S").to_string()
     } else {
@@ -159,8 +161,7 @@ pub fn parse_timestamp(s: &str) -> Option<NaiveDateTime> {
         "%Y-%m-%d %H:%M:%S",
     ];
 
-    let stripped = strip_offset(s);
-    let s = stripped.as_deref().unwrap_or(s);
+    let s = strip_offset(s).unwrap_or(s);
 
     for fmt in DT_FMTS {
         if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
@@ -176,13 +177,14 @@ pub fn parse_timestamp(s: &str) -> Option<NaiveDateTime> {
     None
 }
 
-/// Strip a trailing UTC offset from a timestamp string (returns new string if
-/// an offset was found, `None` if the string doesn't appear to carry one).
-fn strip_offset(s: &str) -> Option<String> {
+/// Strip a trailing UTC offset from a timestamp string, returning a borrowed
+/// slice of the input when an offset was found, or `None` if the string doesn't
+/// appear to carry one (the no-op case allocates nothing).
+fn strip_offset(s: &str) -> Option<&str> {
     let s = s.trim();
     // Check for trailing 'Z'
     if let Some(base) = s.strip_suffix('Z') {
-        return Some(base.to_string());
+        return Some(base);
     }
     // Check for trailing +HH:MM or -HH:MM (exactly 6 bytes at end).
     // Use checked indexing: a non-char-boundary slice (e.g. when the byte at
@@ -194,7 +196,7 @@ fn strip_offset(s: &str) -> Option<String> {
         let bytes = tail.as_bytes();
         let sign = bytes[0];
         if (sign == b'+' || sign == b'-') && bytes[3] == b':' {
-            return Some(s[..s.len() - 6].to_string());
+            return s.get(..s.len() - 6);
         }
     }
     None
@@ -979,25 +981,15 @@ fn eval_date_part(args: &[EvalValue]) -> EvalValue {
         "hour" => EvalValue::Int(i64::from(ts.hour())),
         "minute" => EvalValue::Int(i64::from(ts.minute())),
         "second" => EvalValue::Int(i64::from(ts.second())),
-        "dow" => {
-            // DuckDB: Sunday=0 … Saturday=6
-            let dow = match ts.weekday() {
-                Weekday::Sun => 0,
-                Weekday::Mon => 1,
-                Weekday::Tue => 2,
-                Weekday::Wed => 3,
-                Weekday::Thu => 4,
-                Weekday::Fri => 5,
-                Weekday::Sat => 6,
-            };
-            EvalValue::Int(dow)
-        }
+        // DuckDB: Sunday=0 … Saturday=6, exactly num_days_from_sunday().
+        "dow" => EvalValue::Int(i64::from(ts.weekday().num_days_from_sunday())),
         "doy" => EvalValue::Int(i64::from(ts.ordinal())),
         "epoch" => {
             // seconds since Unix epoch as float (matches DuckDB EPOCH semantics)
+            let utc = ts.and_utc();
             #[allow(clippy::cast_precision_loss)]
-            let epoch_secs = ts.and_utc().timestamp() as f64
-                + f64::from(ts.and_utc().timestamp_subsec_micros()) / 1_000_000.0;
+            let epoch_secs =
+                utc.timestamp() as f64 + f64::from(utc.timestamp_subsec_micros()) / 1_000_000.0;
             EvalValue::Float(epoch_secs)
         }
         _ => EvalValue::Null,
@@ -1026,35 +1018,18 @@ fn eval_date_trunc(args: &[EvalValue]) -> EvalValue {
             NaiveDate::from_ymd_opt(ts.year(), ts.month(), 1).and_then(|d| d.and_hms_opt(0, 0, 0))
         }
         "week" => {
-            // DuckDB truncates week to Monday (ISO 8601)
-            let days_since_monday = match ts.weekday() {
-                Weekday::Mon => 0,
-                Weekday::Tue => 1,
-                Weekday::Wed => 2,
-                Weekday::Thu => 3,
-                Weekday::Fri => 4,
-                Weekday::Sat => 5,
-                Weekday::Sun => 6,
-            };
+            // DuckDB truncates week to Monday (ISO 8601); num_days_from_monday()
+            // is Mon=0 … Sun=6, exactly the offset back to Monday.
+            let days_since_monday = u64::from(ts.weekday().num_days_from_monday());
             ts.date()
                 .checked_sub_days(chrono::Days::new(days_since_monday))
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
         }
         "day" => ts.date().and_hms_opt(0, 0, 0),
-        "hour" => NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
-            .and_then(|d| d.and_time(NaiveTime::from_hms_opt(ts.hour(), 0, 0)?).into()),
-        "minute" => NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day()).and_then(|d| {
-            d.and_time(NaiveTime::from_hms_opt(ts.hour(), ts.minute(), 0)?)
-                .into()
-        }),
-        "second" => NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day()).and_then(|d| {
-            d.and_time(NaiveTime::from_hms_opt(
-                ts.hour(),
-                ts.minute(),
-                ts.second(),
-            )?)
-            .into()
-        }),
+        // hour/minute/second share the truncators used by date_diff.
+        "hour" => Some(trunc_to_hour(ts)),
+        "minute" => Some(trunc_to_minute(ts)),
+        "second" => Some(trunc_to_second(ts)),
         _ => None,
     };
     truncated.map_or(EvalValue::Null, EvalValue::Timestamp)
@@ -1133,20 +1108,18 @@ fn eval_date_diff(args: &[EvalValue]) -> EvalValue {
 }
 
 fn trunc_to_hour(ts: NaiveDateTime) -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
-        .and_then(|d| d.and_hms_opt(ts.hour(), 0, 0))
-        .unwrap_or(ts)
+    ts.date().and_hms_opt(ts.hour(), 0, 0).unwrap_or(ts)
 }
 
 fn trunc_to_minute(ts: NaiveDateTime) -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
-        .and_then(|d| d.and_hms_opt(ts.hour(), ts.minute(), 0))
+    ts.date()
+        .and_hms_opt(ts.hour(), ts.minute(), 0)
         .unwrap_or(ts)
 }
 
 fn trunc_to_second(ts: NaiveDateTime) -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
-        .and_then(|d| d.and_hms_opt(ts.hour(), ts.minute(), ts.second()))
+    ts.date()
+        .and_hms_opt(ts.hour(), ts.minute(), ts.second())
         .unwrap_or(ts)
 }
 
