@@ -134,14 +134,30 @@ jobs:
       # deb/tarball stay lean. llvm-strip keeps allocated notes (including
       # .note.gnu.build-id) by default, so the shipped build-id still matches
       # the .sym DEBUG_ID. Strip in place, before the deb/tarball steps.
+      #
+      # After each strip, ASSERT the build-id note actually survived: the entire
+      # symbolication chain hinges on the runtime minidump's module id matching
+      # the published .sym DEBUG_ID, and zig's lld defaults to --build-id=none,
+      # so a silent miss (here or on a future toolchain bump) would ship green
+      # builds whose crash dumps never resolve. Runs on both matrix legs, so it
+      # also covers the aarch64 cross binaries.
       - name: Strip shipped binaries
         run: |
           set -euo pipefail
-          llvm_strip="$(find "$(rustc --print sysroot)"/lib/rustlib/*/bin -name llvm-strip | head -1)"
+          llvm_strip="$(find "$(rustc --print sysroot)"/lib/rustlib/*/bin -name llvm-strip | head -n1 || true)"
+          if [ -z "${llvm_strip}" ] || [ ! -x "${llvm_strip}" ]; then
+            echo "::error::llvm-strip not found under $(rustc --print sysroot)/lib/rustlib/*/bin -- is the llvm-tools component installed?" >&2
+            exit 1
+          fi
+          llvm_readelf="${llvm_strip%/*}/llvm-readelf"
           echo "using ${llvm_strip}"
           bindir="target/${{ matrix.target }}/release"
           for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
             "${llvm_strip}" "${bindir}/${bin}"
+            if ! "${llvm_readelf}" -n "${bindir}/${bin}" | grep -qiE "build[ _]?id"; then
+              echo "::error::${bin} (${{ matrix.target }}) has no GNU build-id note after strip -- minidumps would never symbolicate" >&2
+              exit 1
+            fi
           done
 
       - name: Build .deb packages
