@@ -82,7 +82,7 @@ impl EvalValue {
 /// `DuckDB` represents timestamps as `"YYYY-MM-DD HH:MM:SS[.ffffff]"` with
 /// trailing fractional-second zeros trimmed. This must byte-match `DuckDB`
 /// output for the parity tests to pass.
-pub(crate) fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
+pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
     let micros = ts.and_utc().timestamp_subsec_micros();
     if micros == 0 {
         ts.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -98,7 +98,7 @@ pub(crate) fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 /// Accepts T or space separator, optional fractional seconds (up to 6 digits),
 /// optional UTC offset (discarded — mirrors `CAST AS TIMESTAMP` semantics),
 /// and date-only (→ midnight).
-pub(crate) fn parse_timestamp(s: &str) -> Option<NaiveDateTime> {
+pub fn parse_timestamp(s: &str) -> Option<NaiveDateTime> {
     // Try datetime formats (T and space separators, with/without fractional secs).
     // Strip optional trailing offset (+HH:MM, -HH:MM, Z) before matching
     // naive formats so offsets are silently discarded.
@@ -1011,12 +1011,14 @@ fn eval_date_diff(args: &[EvalValue]) -> EvalValue {
             end_m - start_m
         }
         "week" => {
-            // Boundary-crossing: truncate both to Monday of their ISO week, then
-            // count 7-day spans between truncated values.
-            let start_trunc = trunc_to_week(start);
-            let end_trunc = trunc_to_week(end);
-            let diff = end_trunc.signed_duration_since(start_trunc);
-            diff.num_weeks()
+            // DuckDB counts weeks as days/7 (integer division truncating towards
+            // zero, i.e. DATE_DIFF('day', start, end) / 7). It does NOT
+            // use ISO-week-boundary crossing; this matches the verified
+            // DuckDB 1.x behaviour confirmed via parity tests.
+            let start_trunc = start.date().and_hms_opt(0, 0, 0).unwrap_or(start);
+            let end_trunc = end.date().and_hms_opt(0, 0, 0).unwrap_or(end);
+            let days = end_trunc.signed_duration_since(start_trunc).num_days();
+            days / 7
         }
         "day" => {
             // Truncate to day midnight, count days between truncated values.
@@ -1047,23 +1049,6 @@ fn eval_date_diff(args: &[EvalValue]) -> EvalValue {
         _ => return EvalValue::Null,
     };
     EvalValue::Int(count)
-}
-
-/// Truncate a `NaiveDateTime` to the start of its ISO week (Monday midnight).
-fn trunc_to_week(ts: NaiveDateTime) -> NaiveDateTime {
-    let days_since_monday = match ts.weekday() {
-        Weekday::Mon => 0,
-        Weekday::Tue => 1,
-        Weekday::Wed => 2,
-        Weekday::Thu => 3,
-        Weekday::Fri => 4,
-        Weekday::Sat => 5,
-        Weekday::Sun => 6,
-    };
-    ts.date()
-        .checked_sub_days(chrono::Days::new(days_since_monday))
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .unwrap_or(ts)
 }
 
 fn trunc_to_hour(ts: NaiveDateTime) -> NaiveDateTime {
