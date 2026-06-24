@@ -22,7 +22,10 @@ use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, WhereStage,
 };
-use crate::emitter::{map_field_name, unit_literal_positions, validate_unit_literal};
+use crate::emitter::{
+    format_literal_position, map_field_name, unit_literal_positions, validate_format_literal,
+    validate_unit_literal,
+};
 use crate::eval::eval_expr;
 
 // ── stream plan ────────────────────────────────────────────────────
@@ -57,6 +60,8 @@ pub enum StreamPlanError {
     InvalidRegex(String),
     /// A date/time unit argument is invalid (non-literal or not allowlisted).
     InvalidUnit(String),
+    /// A `strftime`/`strptime` format string literal contains an invalid code.
+    InvalidFormat(String),
 }
 
 impl fmt::Display for StreamPlanError {
@@ -67,6 +72,7 @@ impl fmt::Display for StreamPlanError {
             }
             Self::InvalidRegex(msg) => write!(f, "invalid regex: {msg}"),
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
+            Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
         }
     }
 }
@@ -336,11 +342,12 @@ fn compile_let(s: &LetStage) -> Result<CompiledStage, StreamPlanError> {
     })
 }
 
-/// Walk an expression tree and validate any date/time unit literal arguments.
+/// Walk an expression tree and validate date/time unit and format literals.
 ///
-/// This replicates the check `emit_expr` performs on the batch path so that
-/// an unsupported unit is rejected at `compile_stream_plan` time rather than
-/// silently evaluating to `Null` in live tail.
+/// This replicates the checks `emit_expr` performs on the batch path so that an
+/// unsupported unit, or an invalid `strftime`/`strptime` format literal, is
+/// rejected at `compile_stream_plan` time rather than silently evaluating to
+/// `Null` (or, in batch, erroring) in live tail.
 fn validate_expr_units(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPlanError> {
     match &expr.node {
         Expr::FunctionCall { name, args } => {
@@ -357,6 +364,14 @@ fn validate_expr_units(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPla
                     validate_unit_literal(name, *idx, allowlist, raw)
                         .map_err(|e| StreamPlanError::InvalidUnit(e.to_string()))?;
                 }
+            }
+            // strftime/strptime format literal: reject invalid codes up front. A
+            // non-literal format keeps its runtime behaviour (eval nulls).
+            if let Some(idx) = format_literal_position(name)
+                && let Some(Expr::Literal(LiteralValue::String(s))) = args.get(idx).map(|a| &a.node)
+            {
+                validate_format_literal(name, s)
+                    .map_err(|e| StreamPlanError::InvalidFormat(e.to_string()))?;
             }
             // Recurse into all args.
             for arg in args {
@@ -2415,5 +2430,81 @@ mod tests {
         let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
         let err = compile_stream_plan(&pipeline).unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidUnit(_)));
+    }
+
+    // ── format-literal validation (streaming path) ──────────────────
+
+    fn make_strftime_stage(fmt: &str) -> Spanned<PipeStage> {
+        span(PipeStage::Let(LetStage {
+            assignments: vec![(
+                "s".into(),
+                span(Expr::FunctionCall {
+                    name: "strftime".into(),
+                    args: vec![
+                        span(Expr::FieldRef("timestamp".into())),
+                        span(Expr::Literal(LiteralValue::String(fmt.to_string()))),
+                    ],
+                }),
+            )],
+            keyword: "let",
+        }))
+    }
+
+    fn make_strptime_stage(fmt: &str) -> Spanned<PipeStage> {
+        span(PipeStage::Let(LetStage {
+            assignments: vec![(
+                "t".into(),
+                span(Expr::FunctionCall {
+                    name: "strptime".into(),
+                    args: vec![
+                        span(Expr::FieldRef("message".into())),
+                        span(Expr::Literal(LiteralValue::String(fmt.to_string()))),
+                    ],
+                }),
+            )],
+            keyword: "let",
+        }))
+    }
+
+    #[test]
+    fn stream_strftime_accepts_standard_format() {
+        let pipeline = vec![make_strftime_stage("%Y-%m-%d %H:%M:%S")];
+        assert!(compile_stream_plan(&pipeline).is_ok());
+    }
+
+    #[test]
+    fn stream_strftime_rejects_invalid_format() {
+        let pipeline = vec![make_strftime_stage("%Q")];
+        let err = compile_stream_plan(&pipeline).unwrap_err();
+        assert!(
+            matches!(err, StreamPlanError::InvalidFormat(ref msg) if msg.contains("%Q")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn stream_strptime_rejects_invalid_format() {
+        let pipeline = vec![make_strptime_stage("%Q")];
+        let err = compile_stream_plan(&pipeline).unwrap_err();
+        assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
+    }
+
+    #[test]
+    fn stream_where_strftime_rejects_invalid_format() {
+        // validate_expr_units should also fire inside where conditions
+        let condition = span(Expr::Binary {
+            lhs: Box::new(span(Expr::FunctionCall {
+                name: "strftime".into(),
+                args: vec![
+                    span(Expr::FieldRef("timestamp".into())),
+                    span(Expr::Literal(LiteralValue::String("%Q".to_string()))),
+                ],
+            })),
+            op: BinaryOp::Eq,
+            rhs: Box::new(span(Expr::Literal(LiteralValue::String("x".to_string())))),
+        });
+        let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
+        let err = compile_stream_plan(&pipeline).unwrap_err();
+        assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
     }
 }

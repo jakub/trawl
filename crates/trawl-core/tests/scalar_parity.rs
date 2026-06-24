@@ -329,72 +329,109 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
         .collect()
 }
 
-/// Run a `let x = <expr>` query and return the value of the computed `x` column.
-/// Returns `None` if the column is NULL, the query fails, or the result is empty.
-fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -> Option<Value> {
+/// Outcome of running a `let x = <expr>` query through the batch (`DuckDB`) path.
+#[derive(Debug, PartialEq)]
+enum SqlOutcome {
+    /// `DuckDB` produced a value for `x` (including a SQL `NULL` -> `Value::Null`).
+    Value(Value),
+    /// `DuckDB` raised an error (prepare/query failed). The streaming evaluator
+    /// cannot error, so its contract is to yield `Null` wherever batch errors —
+    /// the property loop asserts that rather than silently skipping.
+    Errored,
+    /// Not a `DuckDB`-comparison case (parse/emit failure, empty result, or a
+    /// column type the harness can't faithfully read back).
+    Skip,
+}
+
+/// Run a `let x = <expr>` query and return the outcome of the computed `x`
+/// column. A `DuckDB` error is surfaced as [`SqlOutcome::Errored`] (NOT skipped),
+/// so the harness can no longer hide a batch error behind a silent skip.
+fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -> SqlOutcome {
     let Ok(query) = parser::parse(dsl) else {
-        return None;
+        return SqlOutcome::Skip;
     };
 
-    let mut tmp = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
+    let Ok(mut tmp) = tempfile::Builder::new().suffix(".ndjson").tempfile() else {
+        return SqlOutcome::Skip;
+    };
     let ev = Value::Object(event.clone());
-    writeln!(tmp, "{ev}").ok()?;
-    tmp.flush().ok()?;
-    let tmp_path = tmp.path().to_str()?;
+    if writeln!(tmp, "{ev}").and_then(|()| tmp.flush()).is_err() {
+        return SqlOutcome::Skip;
+    }
+    let Some(tmp_path) = tmp.path().to_str() else {
+        return SqlOutcome::Skip;
+    };
 
     let Ok(emitted) = emitter::emit(&query, tmp_path) else {
-        return None;
+        return SqlOutcome::Skip;
     };
 
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
 
-    let mut stmt = conn.prepare(&emitted.sql).ok()?;
-    let mut rows = stmt.query(param_refs.as_slice()).ok()?;
-    let row = rows.next().ok()??;
+    // A prepare/query failure is a real DuckDB ERROR, not a skip.
+    let Ok(mut stmt) = conn.prepare(&emitted.sql) else {
+        return SqlOutcome::Errored;
+    };
+    let Ok(mut rows) = stmt.query(param_refs.as_slice()) else {
+        return SqlOutcome::Errored;
+    };
+    let Ok(Some(row)) = rows.next() else {
+        // Empty result set: nothing to compare.
+        return SqlOutcome::Skip;
+    };
 
     // Find the `x` column index, use ValueRef to inspect the DuckDB type
     // so we don't mistakenly cast VARCHAR "500" → i64 500.
     let ncols = row.as_ref().column_count();
     for col_idx in (0..ncols).rev() {
-        let name = row.as_ref().column_name(col_idx).ok()?;
+        let Ok(name) = row.as_ref().column_name(col_idx) else {
+            return SqlOutcome::Skip;
+        };
         if name == "x" {
             use duckdb::types::ValueRef;
-            let vr = row.get_ref(col_idx).ok()?;
-            return Some(match vr {
+            let Ok(vr) = row.get_ref(col_idx) else {
+                return SqlOutcome::Skip;
+            };
+            let val = match vr {
                 ValueRef::Null => Value::Null,
                 ValueRef::Boolean(b) => Value::Bool(b),
                 ValueRef::TinyInt(n) => Value::Number(i64::from(n).into()),
                 ValueRef::SmallInt(n) => Value::Number(i64::from(n).into()),
                 ValueRef::Int(n) => Value::Number(i64::from(n).into()),
                 ValueRef::BigInt(n) => Value::Number(n.into()),
-                ValueRef::HugeInt(n) => Value::Number(i64::try_from(n).ok()?.into()),
+                ValueRef::HugeInt(n) => match i64::try_from(n) {
+                    Ok(n) => Value::Number(n.into()),
+                    Err(_) => return SqlOutcome::Skip,
+                },
                 ValueRef::UTinyInt(n) => Value::Number(i64::from(n).into()),
                 ValueRef::USmallInt(n) => Value::Number(i64::from(n).into()),
                 ValueRef::UInt(n) => Value::Number(i64::from(n).into()),
-                ValueRef::UBigInt(n) => Value::Number(i64::try_from(n).ok()?.into()),
+                ValueRef::UBigInt(n) => match i64::try_from(n) {
+                    Ok(n) => Value::Number(n.into()),
+                    Err(_) => return SqlOutcome::Skip,
+                },
                 ValueRef::Float(f) => {
                     serde_json::Number::from_f64(f64::from(f)).map_or(Value::Null, Value::Number)
                 }
                 ValueRef::Double(f) => {
                     serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number)
                 }
-                ValueRef::Text(bytes) => {
-                    Value::String(std::str::from_utf8(bytes).ok()?.to_string())
-                }
-                ValueRef::Blob(_) => return None, // skip binary
+                ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(s) => Value::String(s.to_string()),
+                    Err(_) => return SqlOutcome::Skip,
+                },
+                ValueRef::Blob(_) => return SqlOutcome::Skip, // skip binary
                 // Timestamp-like values: render as string via Display
-                _ => {
-                    if let Ok(s) = row.get::<_, String>(col_idx) {
-                        Value::String(s)
-                    } else {
-                        return None;
-                    }
-                }
-            });
+                _ => match row.get::<_, String>(col_idx) {
+                    Ok(s) => Value::String(s),
+                    Err(_) => return SqlOutcome::Skip,
+                },
+            };
+            return SqlOutcome::Value(val);
         }
     }
-    None
+    SqlOutcome::Skip
 }
 
 // ── Value comparison ──────────────────────────────────────────────────
@@ -480,16 +517,9 @@ fn scalar_eval_matches_sql_parity() {
 
         let dsl = format!("* | let x = {expr_str}");
 
-        // ── Batch path (DuckDB) ──
-        let sql_val = sql_scalar_result(&conn, &dsl, &event);
-
-        // If DuckDB fails or returns None, skip this iteration
-        let Some(sql_result) = sql_val else {
-            skipped += 1;
-            continue;
-        };
-
-        // ── Streaming path (eval_expr) ──
+        // ── Streaming path (eval_expr) ── computed first so it is available to
+        // assert against a DuckDB error (the streaming contract is: eval can't
+        // error, so it must yield Null wherever batch errors).
         let Ok(query) = parser::parse(&dsl) else {
             skipped += 1;
             continue;
@@ -515,13 +545,35 @@ fn scalar_eval_matches_sql_parity() {
         let eval_result = eval_expr(expr, &event);
         let eval_normalized = normalize_eval(&eval_result);
 
-        assert!(
-            values_match(&eval_normalized, &sql_result),
-            "SCALAR PARITY MISMATCH (iteration {i})\n\
-             dsl: {dsl:?}\n\
-             eval: {eval_normalized:?}\n\
-             sql:  {sql_result:?}"
-        );
+        // ── Batch path (DuckDB) ──
+        match sql_scalar_result(&conn, &dsl, &event) {
+            SqlOutcome::Skip => {
+                skipped += 1;
+                continue;
+            }
+            SqlOutcome::Errored => {
+                // The harness no longer hides batch errors: assert eval also
+                // yields Null. A non-Null eval here is a genuine divergence.
+                assert_eq!(
+                    eval_normalized,
+                    Value::Null,
+                    "BATCH ERRORED but streaming did NOT null (iteration {i})\n\
+                     dsl: {dsl:?}\n\
+                     eval: {eval_normalized:?}"
+                );
+                passed += 1;
+                continue;
+            }
+            SqlOutcome::Value(sql_result) => {
+                assert!(
+                    values_match(&eval_normalized, &sql_result),
+                    "SCALAR PARITY MISMATCH (iteration {i})\n\
+                     dsl: {dsl:?}\n\
+                     eval: {eval_normalized:?}\n\
+                     sql:  {sql_result:?}"
+                );
+            }
+        }
 
         passed += 1;
     }
@@ -531,6 +583,48 @@ fn scalar_eval_matches_sql_parity() {
         passed >= 350,
         "too many skipped iterations: {skipped} skipped, {passed} passed"
     );
+}
+
+/// The harness must surface a `DuckDB` error as [`SqlOutcome::Errored`] (not a
+/// silent skip), and the streaming contract is that eval yields `Null` wherever
+/// batch errors. These type-mismatch expressions error in the `DuckDB` binder;
+/// eval — being permissive — nulls. This proves both halves: the harness no longer
+/// hides batch errors, and the streaming path honours the null-where-batch-errors
+/// contract for these cases.
+#[test]
+fn batch_errors_imply_streaming_null() {
+    let conn = Connection::open_in_memory().unwrap();
+    let event = fixed_event();
+    for dsl in [
+        r#"* | let x = replace("abc", "a", 5)"#, // wrong-type replace arg
+        "* | let x = service + 1",               // varchar + int
+        r#"* | let x = round("abc")"#,           // round of varchar
+    ] {
+        assert_eq!(
+            sql_scalar_result(&conn, dsl, &event),
+            SqlOutcome::Errored,
+            "expected DuckDB to error for {dsl:?}"
+        );
+
+        let query = parser::parse(dsl).unwrap();
+        let ls = query
+            .pipeline
+            .iter()
+            .find_map(|s| {
+                if let PipeStage::Let(ls) = &s.node {
+                    Some(ls)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let (_, expr) = ls.assignments.first().unwrap();
+        assert_eq!(
+            normalize_eval(&eval_expr(expr, &event)),
+            Value::Null,
+            "streaming eval must yield Null where batch errors for {dsl:?}"
+        );
+    }
 }
 
 /// Regression: `strftime` over a nested `strptime` with literal args.
@@ -548,9 +642,11 @@ fn strftime_over_strptime_binds_params_in_order() {
     let dsl = r#"* | let x = strftime(strptime("2023-11-07 17:30:45", "%Y-%m-%d %H:%M:%S"), "%Y")"#;
 
     // Batch path (real DuckDB).
-    let sql_result = sql_scalar_result(&conn, dsl, &event)
-        .expect("batch strftime(strptime(...)) must not error or null");
-    assert_eq!(sql_result, Value::String("2023".to_string()));
+    assert_eq!(
+        sql_scalar_result(&conn, dsl, &event),
+        SqlOutcome::Value(Value::String("2023".to_string())),
+        "batch strftime(strptime(...)) must not error or null"
+    );
 
     // Streaming path (eval).
     let query = parser::parse(dsl).unwrap();

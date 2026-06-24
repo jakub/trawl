@@ -96,6 +96,19 @@ pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [
     }
 }
 
+/// Arg position (0-indexed) of a `strftime`/`strptime` format string, if any.
+///
+/// When the arg at this index is a string literal, both the batch (`emit_expr`)
+/// and streaming (`stream::validate_expr_formats`) paths run it through
+/// `validate_format_literal` so an invalid code is rejected identically.
+pub(crate) fn format_literal_position(name: &str) -> Option<usize> {
+    match name {
+        // DSL arg order: strftime(ts, fmt), strptime(str, fmt) — fmt is index 1.
+        "strftime" | "strptime" => Some(1),
+        _ => None,
+    }
+}
+
 /// Validate that a date/time unit argument is a known literal.
 ///
 /// `allowlist` is the set of accepted unit names for this `(func, arg)` pair
@@ -125,6 +138,29 @@ pub(crate) fn validate_unit_literal(
                 "{func_name}() unit {unit:?} is not in the allowed set: {}",
                 allowlist.join(", ")
             ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a `strftime`/`strptime` format-string **literal**.
+///
+/// chrono is the canonical format authority for both the batch (`DuckDB`) and
+/// streaming (eval) paths. An invalid code (e.g. `%Q`) or a trailing `%`
+/// parses into a `chrono::format::Item::Error`; rejecting it here at
+/// emit/compile time makes both paths fail identically instead of
+/// erroring-in-batch / silently-nulling-in-stream. The same `Item::Error`
+/// detection is used by the defensive runtime guard in `eval::eval_strftime`.
+///
+/// Only call this for string-literal format args — a non-literal (field ref)
+/// can't be checked up front and keeps its pre-existing runtime behaviour.
+pub(crate) fn validate_format_literal(func_name: &str, fmt: &str) -> Result<(), EmitError> {
+    if chrono::format::StrftimeItems::new(fmt)
+        .any(|item| matches!(item, chrono::format::Item::Error))
+    {
+        return Err(EmitError::InvalidFormat {
+            func_name: func_name.to_string(),
+            format: fmt.to_string(),
         });
     }
     Ok(())
@@ -893,6 +929,52 @@ mod tests {
         let q = parser::parse(r#"* | let d = date_trunc("dow", timestamp)"#).unwrap();
         let err = emit(&q, "/data/**/*.parquet").unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
+    }
+
+    // ── validate_format_literal ─────────────────────────────────────────
+
+    #[test]
+    fn validate_format_literal_accepts_standard_codes() {
+        for fmt in ["%Y-%m-%d", "%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y"] {
+            assert!(
+                validate_format_literal("strftime", fmt).is_ok(),
+                "should accept format {fmt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_format_literal_rejects_invalid_code() {
+        let err = validate_format_literal("strftime", "%Q").unwrap_err();
+        assert!(
+            matches!(err, EmitError::InvalidFormat { ref func_name, ref format }
+                if func_name == "strftime" && format == "%Q"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_format_literal_rejects_trailing_percent() {
+        let err = validate_format_literal("strptime", "%Y-%m-%d %").unwrap_err();
+        assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
+    }
+
+    #[test]
+    fn emit_strftime_invalid_format_errors() {
+        use crate::emitter::emit;
+        use crate::parser;
+        let q = parser::parse(r#"* | let s = strftime(timestamp, "%Q")"#).unwrap();
+        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
+    }
+
+    #[test]
+    fn emit_strptime_invalid_format_errors() {
+        use crate::emitter::emit;
+        use crate::parser;
+        let q = parser::parse(r#"* | let t = strptime(message, "%Q")"#).unwrap();
+        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
     }
 
     // ── default_agg_alias ───────────────────────────────────────────────

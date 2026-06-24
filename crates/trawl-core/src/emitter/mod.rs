@@ -21,7 +21,9 @@ use state::EmitterState;
 pub use fields::map_field_name;
 pub use functions::is_aggregate_function;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};
-pub(crate) use functions::{unit_literal_positions, validate_unit_literal};
+pub(crate) use functions::{
+    format_literal_position, unit_literal_positions, validate_format_literal, validate_unit_literal,
+};
 pub use state::{hot_source_reader, source_reader, validate_source_path};
 pub use validate::validate_pipeline;
 
@@ -80,6 +82,11 @@ pub enum EmitError {
     UnsupportedOperation {
         message: String,
     },
+    /// A `strftime`/`strptime` format-string literal contains an invalid code.
+    InvalidFormat {
+        func_name: String,
+        format: String,
+    },
 }
 
 impl fmt::Display for EmitError {
@@ -95,6 +102,9 @@ impl fmt::Display for EmitError {
             Self::InvalidAggregation { message } => write!(f, "invalid aggregation: {message}"),
             Self::UnsupportedOperation { message } => {
                 write!(f, "unsupported operation: {message}")
+            }
+            Self::InvalidFormat { func_name, format } => {
+                write!(f, "{func_name}(): invalid format string {format:?}")
             }
         }
     }

@@ -1157,12 +1157,14 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
     };
-    // A `fmt` is fully user-controlled (a DSL string literal). chrono turns an
-    // invalid/incompatible specifier (e.g. `%Q`) into `Item::Error`, whose
-    // `Display` returns `fmt::Error` — `ts.format(fmt).to_string()` would then
-    // PANIC ("a Display implementation returned an error unexpectedly").
-    // Detect the error item up front and return Null instead (mirrors the batch
-    // path, where DuckDB STRFTIME returns a clean query error, not a crash).
+    // A `fmt` is fully user-controlled. chrono turns an invalid/incompatible
+    // specifier (e.g. `%Q`) into `Item::Error`, whose `Display` returns
+    // `fmt::Error` — `ts.format(fmt).to_string()` would then PANIC ("a Display
+    // implementation returned an error unexpectedly"). Detect the error item up
+    // front and return Null instead. Invalid format LITERALS are now rejected at
+    // emit/compile time in BOTH paths (see emitter::validate_format_literal),
+    // so this guard is belt-and-suspenders: it defends against a non-literal
+    // (field-ref) format that can't be checked upfront.
     if chrono::format::StrftimeItems::new(fmt)
         .any(|item| matches!(item, chrono::format::Item::Error))
     {
