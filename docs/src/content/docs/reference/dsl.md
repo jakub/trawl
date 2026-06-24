@@ -307,7 +307,7 @@ Date/time functions operate on **timestamps** — the `timestamp` field is store
 |----------|-------------|
 | `date_part(unit, ts)` | Extract a calendar component (returns integer or float for `epoch`) |
 | `date_trunc(unit, ts)` | Truncate to start of period (returns timestamp) |
-| `date_diff(unit, start, end)` | Count calendar-unit boundaries crossed (`end - start`) |
+| `date_diff(unit, start, end)` | Count calendar-unit boundaries crossed (`end - start`); `week` is the exception (see note below) |
 | `strftime(ts, fmt)` | Format timestamp as string (chrono `%`-codes) |
 | `strptime(str, fmt)` | Parse string to timestamp (returns `null` on failure) |
 
@@ -317,7 +317,7 @@ Date/time functions operate on **timestamps** — the `timestamp` field is store
 
 #### Date/time unit allowlist
 
-The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **string literal** from the allowed set. Non-literal expressions (field refs, computed values) and unlisted units are rejected at emit time in both batch and streaming modes.
+The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **string literal** from the allowed set. Non-literal expressions (field refs, computed values) and unlisted units are rejected before execution in both batch and streaming modes (batch validates at SQL-emit time, streaming at stream-plan compile time).
 
 | Function | Allowed units |
 |----------|--------------|
@@ -329,9 +329,13 @@ The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **st
 
 `date_trunc("week", ts)` truncates to **Monday midnight** (ISO 8601 week start).
 
+`date_diff` counts boundary crossings between the two timestamps for `year`, `quarter`, `month`, `day`, `hour`, `minute`, and `second`. The `week` unit is the exception: DuckDB computes it as the whole number of days between the dates divided by 7 (integer division toward zero), **not** week-boundary crossings.
+
 #### strftime/strptime format codes
 
-Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce identical output in both batch (DuckDB) and streaming (chrono) paths. Locale-dependent or non-standard codes (`%c`, `%Z`, `%e` with padding) follow chrono semantics and may differ from DuckDB.
+Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce identical output in both batch (DuckDB) and streaming (chrono) paths. chrono operates on a timezone-naive timestamp, so it is **not** locale-dependent — but codes that depend on timezone or locale (`%Z`, `%z`, `%c`, `%x`, `%X`) render empty or fixed under chrono's naive semantics and can differ from DuckDB. Stick to explicit numeric codes for portable output.
+
+Invalid format codes (e.g. `%Q`, or a trailing `%`) are rejected before execution in both paths when the format is a string literal — they no longer error in batch while silently nulling in streaming.
 
 ## Examples
 

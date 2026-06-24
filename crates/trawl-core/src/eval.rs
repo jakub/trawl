@@ -684,7 +684,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
                 .to_string(),
             )
         }),
-        // M4: now() returns Timestamp (M1 added NaiveDateTime variant)
+        // now() returns a Timestamp (timezone-naive wall-clock UTC)
         "now" => EvalValue::Timestamp(chrono::Utc::now().naive_utc()),
         // conditional
         "case" => {
@@ -730,7 +730,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
             _ => EvalValue::Null,
         }),
 
-        // M3: date/time scalar functions
+        // date/time scalar functions
         "tonumber" => eval_tonumber(args),
         "tostring" => eval_tostring(args),
         "date_part" => eval_date_part(args),
@@ -937,7 +937,7 @@ fn eval_round(args: &[EvalValue]) -> EvalValue {
     }
 }
 
-// ── M3: date/time scalar function implementations ──────────────────
+// ── date/time scalar function implementations ──────────────────────
 
 /// `tonumber(x)` — mirrors `TRY_CAST(x AS DOUBLE)`.
 #[allow(clippy::cast_precision_loss)]
@@ -1471,7 +1471,7 @@ mod tests {
         assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
     }
 
-    // ── M5: Timestamp vs Str coercion in eval_cmp/eval_eq ──────────
+    // ── Timestamp vs Str coercion in eval_cmp/eval_eq ──────────────
 
     #[test]
     fn timestamp_gt_str_past_is_true() {
@@ -2154,8 +2154,8 @@ mod tests {
         );
     }
 
-    // fn_now is tested in M4 — the test was intentionally changed to assert
-    // Timestamp(_) when now() was updated to return a Timestamp.
+    // now() returns a Timestamp, so this asserts Timestamp(_) rather than a
+    // string/int representation.
     #[test]
     fn fn_now_returns_timestamp() {
         let before = chrono::Utc::now().naive_utc();
@@ -2372,7 +2372,7 @@ mod tests {
         assert_eq!(eval_expr(&expr, &ev), EvalValue::Int(0));
     }
 
-    // ── M3: date/time scalar functions ─────────────────────────────
+    // ── date/time scalar functions ─────────────────────────────────
 
     fn ts(s: &str) -> Spanned<Expr> {
         lit_str(s)
@@ -2585,10 +2585,10 @@ mod tests {
         );
     }
 
-    // date_diff — ADR boundary-crossing cases
+    // date_diff — boundary-crossing cases
     #[test]
     fn fn_date_diff_hour_boundary_crossing() {
-        // ADR's canonical test: 23:59:59 → 00:00:00 next day = 1 hour boundary crossed
+        // canonical case: 23:59:59 → 00:00:00 next day = 1 hour boundary crossed
         let expr = call(
             "date_diff",
             vec![
@@ -2727,7 +2727,7 @@ mod tests {
         );
     }
 
-    // M7: coverage test — every non-aggregate KNOWN_FUNCTION must return Some(_)
+    // coverage test — every non-aggregate KNOWN_FUNCTION must return Some(_)
     // from eval_scalar_fn. Fails CI if a scalar is added to the emitter but not eval.
     #[test]
     fn all_scalar_known_functions_return_some() {
