@@ -218,6 +218,12 @@ fn random_strftime(rng: &mut Rng) -> String {
 }
 
 fn random_strptime(rng: &mut Rng) -> String {
+    if rng.range(4) == 0 {
+        // Unparseable input against a valid format: batch (TRY_STRPTIME) and
+        // streaming both yield NULL, so the two paths agree on a data-parse
+        // failure (TRY_STRPTIME nulls instead of erroring the whole query).
+        return "strptime(\"not-a-date\", \"%Y-%m-%d %H:%M:%S\")".to_string();
+    }
     let ts = rng.pick(TS_VALS);
     // strptime returns a Timestamp — wrap it in strftime to get a string for comparison
     format!("strftime(strptime(\"{ts}\", \"%Y-%m-%d %H:%M:%S\"), \"%Y-%m-%d %H:%M:%S\")")

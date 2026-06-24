@@ -229,7 +229,11 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
         // with literal args), the placeholders bound positionally to the wrong
         // values and the call misbound.
         "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[0], a[1])),
-        "strptime" => require_n_args(name, args, 2, |a| format!("STRPTIME({}, {})", a[0], a[1])),
+        // TRY_STRPTIME (not STRPTIME) so an unparseable input yields NULL, not a
+        // whole-query error — matching the streaming eval path, which nulls.
+        "strptime" => require_n_args(name, args, 2, |a| {
+            format!("TRY_STRPTIME({}, {})", a[0], a[1])
+        }),
         // conditional
         "case" => {
             if args.len() < 2 {
@@ -646,6 +650,16 @@ mod tests {
         assert_eq!(
             translate_function("strftime", &args(&["ts", "fmt"])).unwrap(),
             "STRFTIME(ts, fmt)"
+        );
+    }
+
+    #[test]
+    fn translate_strptime_uses_try_variant() {
+        // TRY_STRPTIME nulls on unparseable input (matches streaming eval), so a
+        // single bad value never errors the whole batch query.
+        assert_eq!(
+            translate_function("strptime", &args(&["s", "fmt"])).unwrap(),
+            "TRY_STRPTIME(s, fmt)"
         );
     }
 

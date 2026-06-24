@@ -311,7 +311,9 @@ Date/time functions operate on **timestamps** — the `timestamp` field is store
 | `strftime(ts, fmt)` | Format timestamp as string (chrono `%`-codes) |
 | `strptime(str, fmt)` | Parse string to timestamp (returns `null` on failure) |
 
-**Note:** the argument order for `strftime` is `(timestamp, format)` — the opposite of C `strftime` and DuckDB's `STRFTIME`. This is intentional for DSL readability.
+**Note:** the argument order for `strftime` is `(timestamp, format)` — the opposite of C `strftime`. DuckDB's `STRFTIME` is overloaded and accepts this order directly, so it is emitted unchanged.
+
+**Note:** `strptime` returns `null` when a value cannot be parsed against the format — a single unparseable value yields `null`, not a query error. This holds in both the batch path (emitted as DuckDB `TRY_STRPTIME`) and the streaming path.
 
 #### Date/time unit allowlist
 
