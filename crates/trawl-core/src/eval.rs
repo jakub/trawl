@@ -1190,8 +1190,11 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
 /// does), and an unparseable value returns `Null` — matching the `TRY_STRPTIME`
 /// the batch emitter uses.
 ///
-/// Exotic/locale codes (`%y` two-digit-year pivot, `%I` without `%p`, …) follow
-/// chrono rather than bit-matching `DuckDB`, per ADR-0001's parity contract.
+/// Codes that interact with the base injection or with time zones can diverge
+/// from `DuckDB` and follow chrono per ADR-0001's parity contract: a *bare*
+/// two-digit year (`%y` alone) resolves to `Null` — the injected `1900` base year
+/// conflicts with the parsed mod-100 — and offset codes (`%z`/`%Z`) keep the
+/// wall-clock time chrono parses rather than normalizing to UTC.
 fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;
@@ -1242,8 +1245,10 @@ fn resolve_date(parsed: &mut chrono::format::Parsed) -> Option<NaiveDate> {
 /// Resolve a `NaiveTime` from a partially-filled `Parsed`, zero-filling the
 /// components a format omits (`DuckDB`'s `00:00:00` base). Mirrors `resolve_date`:
 /// chrono first (so am/pm and fractional seconds resolve), then hour→minute→second
-/// defaults with a retry after each. `None` means a present time field can't be
-/// resolved (e.g. `%I` with no `%p`) — the caller nulls.
+/// defaults with a retry after each. `None` means a present time field is out of
+/// range (a value chrono itself rejects) — the caller nulls. Note `%I` without
+/// `%p` does NOT null: the `set_hour(0)` default supplies the missing am/pm half,
+/// so it resolves to the 24-hour reading (matching `DuckDB`).
 fn resolve_time(parsed: &mut chrono::format::Parsed) -> Option<NaiveTime> {
     if let Ok(time) = parsed.to_naive_time() {
         return Some(time);
