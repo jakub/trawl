@@ -224,9 +224,17 @@ fn random_strptime(rng: &mut Rng) -> String {
 }
 
 fn random_tonumber(rng: &mut Rng) -> String {
-    // Use integer string literals so the result is exact
-    let n = rng.pick(INT_VALS).unsigned_abs();
-    format!("tonumber(\"{n}\")")
+    if rng.bool() {
+        // Digit-separator strings: `1_000`/`1_0.0_5` parse to a value in BOTH
+        // paths; `_1000` is unparseable in both (DuckDB returns NULL -> skipped).
+        // Proves the underscore-strip rule stays in DuckDB TRY_CAST parity.
+        let s = rng.pick(&["1_000", "1_0.0_5", "_1000"]);
+        format!("tonumber(\"{s}\")")
+    } else {
+        // Use integer string literals so the result is exact
+        let n = rng.pick(INT_VALS).unsigned_abs();
+        format!("tonumber(\"{n}\")")
+    }
 }
 
 fn random_tostring(rng: &mut Rng) -> String {
