@@ -668,3 +668,53 @@ fn strftime_over_strptime_binds_params_in_order() {
         Value::String("2023".to_string())
     );
 }
+
+/// Regression: `strptime` with a PARTIAL format must fill components the same way
+/// `DuckDB` does — a date-only format yields `00:00:00`, a time-only format yields
+/// the `1900-01-01` base. Before the cascade in `eval_strptime`, chrono's
+/// `NaiveDateTime::parse_from_str` rejected both (it needs a full datetime), so
+/// streaming silently nulled while batch returned a timestamp. Each case is
+/// rendered back through `strftime` so we compare the FILLED value against real
+/// `DuckDB`.
+#[test]
+fn strptime_partial_formats_match_duckdb() {
+    let conn = Connection::open_in_memory().unwrap();
+    let event = fixed_event();
+    for (dsl, want) in [
+        (
+            // date-only -> midnight
+            r#"* | let x = strftime(strptime("2023-11-07", "%Y-%m-%d"), "%Y-%m-%d %H:%M:%S")"#,
+            "2023-11-07 00:00:00",
+        ),
+        (
+            // time-only -> 1900-01-01 base
+            r#"* | let x = strftime(strptime("14:30:00", "%H:%M:%S"), "%Y-%m-%d %H:%M:%S")"#,
+            "1900-01-01 14:30:00",
+        ),
+    ] {
+        assert_eq!(
+            sql_scalar_result(&conn, dsl, &event),
+            SqlOutcome::Value(Value::String(want.to_string())),
+            "batch strptime partial-format must fill like DuckDB for {dsl:?}"
+        );
+
+        let query = parser::parse(dsl).unwrap();
+        let ls = query
+            .pipeline
+            .iter()
+            .find_map(|s| {
+                if let PipeStage::Let(ls) = &s.node {
+                    Some(ls)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let (_, expr) = ls.assignments.first().unwrap();
+        assert_eq!(
+            normalize_eval(&eval_expr(expr, &event)),
+            Value::String(want.to_string()),
+            "streaming strptime partial-format must match DuckDB for {dsl:?}"
+        );
+    }
+}

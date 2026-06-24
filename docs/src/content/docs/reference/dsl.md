@@ -337,6 +337,8 @@ Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce i
 
 Invalid format codes (e.g. `%Q`, or a trailing `%`) are rejected before execution in both paths when the format is a string literal — they no longer error in batch while silently nulling in streaming.
 
+**Partial formats:** `strptime` fills components the format omits, matching DuckDB — a **date-only** format (e.g. `%Y-%m-%d`) yields midnight (`00:00:00`), and a **time-only** format (e.g. `%H:%M:%S`) yields the `1900-01-01` base date. Other partial formats — year-only (`%Y`), year-month, a bare month-day, or a date paired with an *incomplete* time (`%Y-%m-%d %H`) — are matched in the batch path but not yet in streaming, where they return `null`. Use a full datetime, a clean date-only, or a clean time-only format for batch/streaming parity.
+
 ## Examples
 
 ```

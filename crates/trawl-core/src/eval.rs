@@ -10,7 +10,7 @@
 
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use crate::emitter::map_field_name;
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::{Map, Value};
 
 /// Result of evaluating an expression against an event.
@@ -1174,6 +1174,22 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
 }
 
 /// `strptime(str, fmt)` — parse a string to `Timestamp` using chrono format.
+///
+/// `DuckDB`'s `STRPTIME` fills the components a format omits from a
+/// `1900-01-01 00:00:00` base: a date-only format yields midnight, a time-only
+/// format yields `1900-01-01`. chrono's `NaiveDateTime::parse_from_str` requires
+/// BOTH halves, so we cascade full-datetime → date-only (→ `00:00:00`) →
+/// time-only (→ `1900-01-01`) to mirror `DuckDB` for those cases. Each tier uses
+/// chrono's own parser, which rejects trailing input, so a full-datetime string
+/// never spuriously matches a date-only format (both paths `Null`, as `DuckDB`
+/// does). Returns `Null` on unparseable input, matching the `TRY_STRPTIME` the
+/// batch emitter now uses.
+///
+/// Residual divergence: other partial formats — year-only (`%Y`), year-month, a
+/// bare month-day, or a date plus an INCOMPLETE time (`%Y-%m-%d %H`) — are not
+/// matched here (the date-only tier drops the stray time fields `DuckDB` would
+/// keep). These are documented in the DSL reference and tracked as a follow-up;
+/// they are rare in practice and the common date-only/time-only cases are exact.
 fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;
@@ -1184,7 +1200,11 @@ fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
     };
-    NaiveDateTime::parse_from_str(s, fmt).map_or(EvalValue::Null, EvalValue::Timestamp)
+    let base_date = NaiveDate::from_ymd_opt(1900, 1, 1).expect("1900-01-01 is a valid date");
+    NaiveDateTime::parse_from_str(s, fmt)
+        .or_else(|_| NaiveDate::parse_from_str(s, fmt).map(|d| d.and_time(NaiveTime::MIN)))
+        .or_else(|_| NaiveTime::parse_from_str(s, fmt).map(|t| base_date.and_time(t)))
+        .map_or(EvalValue::Null, EvalValue::Timestamp)
 }
 
 #[cfg(test)]
