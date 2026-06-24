@@ -7,7 +7,10 @@ use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use super::EmitError;
 use super::SqlValue;
 use super::fields::quote_field;
-use super::functions::{literal_int_positions, translate_function};
+use super::functions::{
+    format_literal_position, literal_int_positions, translate_function, unit_literal_positions,
+    validate_format_literal, validate_unit_literal,
+};
 use super::state::EmitterState;
 
 /// Recursively translate an expression AST node to a SQL fragment.
@@ -29,6 +32,8 @@ pub(crate) fn emit_expr(
         }
         Expr::FunctionCall { name, args } => {
             let lit_positions = literal_int_positions(name);
+            let unit_positions = unit_literal_positions(name);
+            let fmt_position = format_literal_position(name);
             let translated_args: Vec<String> = args
                 .iter()
                 .enumerate()
@@ -44,7 +49,27 @@ pub(crate) fn emit_expr(
                                 ),
                             }),
                         }
+                    } else if let Some((_, allowlist)) =
+                        unit_positions.iter().find(|(pos, _)| *pos == i)
+                    {
+                        // Date/time unit args must be string literals from the allowlist.
+                        let raw = match &a.node {
+                            Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
+                            _ => None,
+                        };
+                        validate_unit_literal(name, i, allowlist, raw)?;
+                        emit_expr(a, state)
                     } else {
+                        if fmt_position == Some(i) {
+                            // strftime/strptime format arg: reject invalid format
+                            // codes at emit time when it is a string literal, so
+                            // batch and streaming fail identically. A non-literal
+                            // (field ref) can't be checked here and keeps its
+                            // pre-existing runtime behaviour.
+                            if let Expr::Literal(LiteralValue::String(s)) = &a.node {
+                                validate_format_literal(name, s)?;
+                            }
+                        }
                         emit_expr(a, state)
                     }
                 })

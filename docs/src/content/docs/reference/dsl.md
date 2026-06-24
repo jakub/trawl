@@ -294,8 +294,50 @@ Available in `let`/`eval` and `where` expressions.
 | `if(cond, then, else)` | Ternary conditional |
 | `isnull(x)` / `isnotnull(x)` | Null checks |
 | `coalesce(a, b, ...)` | First non-null value |
-| `typeof(x)` | Value type name |
-| `now()` | Current timestamp |
+| `typeof(x)` | Value type name (returns `"VARCHAR"`, `"DOUBLE"`, `"TIMESTAMP"`, …) |
+| `now()` | Current timestamp (timezone-naive, wall-clock UTC) |
+| `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`) |
+| `tostring(x)` | Cast to string (`null` for null/array input) |
+
+### Date and time functions
+
+Date/time functions operate on **timestamps** — the `timestamp` field is stored as a timezone-naive `TIMESTAMP` in both the batch and streaming paths (any timezone offset is discarded at ingest, keeping wall-clock components).
+
+| Function | Description |
+|----------|-------------|
+| `date_part(unit, ts)` | Extract a calendar component (returns integer or float for `epoch`) |
+| `date_trunc(unit, ts)` | Truncate to start of period (returns timestamp) |
+| `date_diff(unit, start, end)` | Count calendar-unit boundaries crossed (`end - start`); `week` is the exception (see note below) |
+| `strftime(ts, fmt)` | Format timestamp as string (chrono `%`-codes) |
+| `strptime(str, fmt)` | Parse string to timestamp (returns `null` on failure) |
+
+**Note:** the argument order for `strftime` is `(timestamp, format)` — the opposite of C `strftime`. DuckDB's `STRFTIME` is overloaded and accepts this order directly, so it is emitted unchanged.
+
+**Note:** `strptime` returns `null` when a value cannot be parsed against the format — a single unparseable value yields `null`, not a query error. This holds in both the batch path (emitted as DuckDB `TRY_STRPTIME`) and the streaming path.
+
+#### Date/time unit allowlist
+
+The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **string literal** from the allowed set. Non-literal expressions (field refs, computed values) and unlisted units are rejected before execution in both batch and streaming modes (batch validates at SQL-emit time, streaming at stream-plan compile time).
+
+| Function | Allowed units |
+|----------|--------------|
+| `date_part` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `dow`, `doy`, `epoch` |
+| `date_trunc` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second` |
+| `date_diff` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second` |
+
+`dow` = day of week (Sunday = 0 … Saturday = 6). `doy` = day of year (1–366). `epoch` = seconds since Unix epoch (float).
+
+`date_trunc("week", ts)` truncates to **Monday midnight** (ISO 8601 week start).
+
+`date_diff` counts boundary crossings between the two timestamps for `year`, `quarter`, `month`, `day`, `hour`, `minute`, and `second`. The `week` unit is the exception: DuckDB computes it as the whole number of days between the dates divided by 7 (integer division toward zero), **not** week-boundary crossings.
+
+#### strftime/strptime format codes
+
+Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce identical output in both batch (DuckDB) and streaming (chrono) paths. chrono operates on a timezone-naive timestamp, so it is **not** locale-dependent — but codes that depend on timezone or locale (`%Z`, `%z`, `%c`, `%x`, `%X`) render empty or fixed under chrono's naive semantics and can differ from DuckDB. Stick to explicit numeric codes for portable output.
+
+Invalid format codes (e.g. `%Q`, or a trailing `%`) are rejected before execution in both paths when the format is a string literal — they no longer error in batch while silently nulling in streaming.
+
+**Partial formats:** `strptime` fills components the format omits, matching DuckDB — a **date-only** format (e.g. `%Y-%m-%d`) yields midnight (`00:00:00`), and a **time-only** format (e.g. `%H:%M:%S`) yields the `1900-01-01` base date. Other partial formats — year-only (`%Y`), year-month, a bare month-day, or a date paired with an *incomplete* time (`%Y-%m-%d %H`) — are matched in the batch path but not yet in streaming, where they return `null`. Use a full datetime, a clean date-only, or a clean time-only format for batch/streaming parity.
 
 ## Examples
 

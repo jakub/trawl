@@ -72,6 +72,100 @@ pub(crate) fn literal_int_positions(name: &str) -> &'static [usize] {
     }
 }
 
+// ── Date/time unit allowlists ─────────────────────────────────────────
+
+/// Units valid for `date_trunc` and `date_diff`.
+pub const DATE_UNITS: &[&str] = &[
+    "year", "quarter", "month", "week", "day", "hour", "minute", "second",
+];
+
+/// Units valid for `date_part` (superset of `DATE_UNITS`).
+pub const DATE_PART_UNITS: &[&str] = &[
+    "year", "quarter", "month", "week", "day", "hour", "minute", "second", "dow", "doy", "epoch",
+];
+
+/// Arg positions (0-indexed) that must be string literal date/time unit names.
+///
+/// Returns `(arg_index, allowlist)` pairs. The `emit_expr` `FunctionCall` arm
+/// calls `validate_unit_literal` for each returned pair.
+pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [&'static str])] {
+    match name {
+        "date_part" => &[(0, DATE_PART_UNITS)],
+        "date_trunc" | "date_diff" => &[(0, DATE_UNITS)],
+        _ => &[],
+    }
+}
+
+/// Arg position (0-indexed) of a `strftime`/`strptime` format string, if any.
+///
+/// When the arg at this index is a string literal, both the batch (`emit_expr`)
+/// and streaming (`stream::validate_expr_formats`) paths run it through
+/// `validate_format_literal` so an invalid code is rejected identically.
+pub(crate) fn format_literal_position(name: &str) -> Option<usize> {
+    match name {
+        // DSL arg order: strftime(ts, fmt), strptime(str, fmt) — fmt is index 1.
+        "strftime" | "strptime" => Some(1),
+        _ => None,
+    }
+}
+
+/// Validate that a date/time unit argument is a known literal.
+///
+/// `allowlist` is the set of accepted unit names for this `(func, arg)` pair
+/// (the caller already fetched it via `unit_literal_positions`, so it is passed
+/// in directly rather than re-derived). `unit_literal` is `Some(value)` when the
+/// arg at `arg_idx` is a string literal, or `None` when it is a computed
+/// expression. Rejects non-literals and unknown units; this check runs in
+/// **both** the batch and streaming paths so an unsupported unit can never error
+/// in batch while silently nulling in live tail.
+pub(crate) fn validate_unit_literal(
+    func_name: &str,
+    arg_idx: usize,
+    allowlist: &[&str],
+    unit_literal: Option<&str>,
+) -> Result<(), EmitError> {
+    let Some(unit) = unit_literal else {
+        return Err(EmitError::UnsupportedOperation {
+            message: format!(
+                "{func_name}() argument {} must be a string literal unit name, not an expression",
+                arg_idx + 1
+            ),
+        });
+    };
+    if !allowlist.is_empty() && !allowlist.contains(&unit.to_lowercase().as_str()) {
+        return Err(EmitError::UnsupportedOperation {
+            message: format!(
+                "{func_name}() unit {unit:?} is not in the allowed set: {}",
+                allowlist.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a `strftime`/`strptime` format-string **literal**.
+///
+/// chrono is the canonical format authority for both the batch (`DuckDB`) and
+/// streaming (eval) paths. An invalid code (e.g. `%Q`) or a trailing `%`
+/// parses into a `chrono::format::Item::Error`; rejecting it here at
+/// emit/compile time makes both paths fail identically instead of
+/// erroring-in-batch / silently-nulling-in-stream. The same `Item::Error`
+/// detection is used by the defensive runtime guard in `eval::eval_strftime`.
+///
+/// Only call this for string-literal format args — a non-literal (field ref)
+/// can't be checked up front and keeps its pre-existing runtime behaviour.
+pub(crate) fn validate_format_literal(func_name: &str, fmt: &str) -> Result<(), EmitError> {
+    if chrono::format::StrftimeItems::new(fmt)
+        .any(|item| matches!(item, chrono::format::Item::Error))
+    {
+        return Err(EmitError::InvalidFormat {
+            func_name: func_name.to_string(),
+            format: fmt.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Translate a DSL function call to `DuckDB` SQL.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, EmitError> {
@@ -163,9 +257,19 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
         "date_diff" => require_n_args(name, args, 3, |a| {
             format!("DATE_DIFF({}, {}, {})", a[0], a[1], a[2])
         }),
-        // strftime: DSL is (timestamp, format), DuckDB is (format, timestamp) — swap args
-        "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[1], a[0])),
-        "strptime" => require_n_args(name, args, 2, |a| format!("STRPTIME({}, {})", a[0], a[1])),
+        // strftime: emit in DSL order (timestamp, format). DuckDB's STRFTIME is
+        // overloaded and accepts (timestamp, format) directly, so no swap is
+        // needed. The previous text-swap (`a[1], a[0]`) desynchronized the `?`
+        // placeholders from emit_expr's DSL-order param push: whenever the
+        // timestamp arg itself produced bound params (e.g. a nested strptime
+        // with literal args), the placeholders bound positionally to the wrong
+        // values and the call misbound.
+        "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[0], a[1])),
+        // TRY_STRPTIME (not STRPTIME) so an unparseable input yields NULL, not a
+        // whole-query error — matching the streaming eval path, which nulls.
+        "strptime" => require_n_args(name, args, 2, |a| {
+            format!("TRY_STRPTIME({}, {})", a[0], a[1])
+        }),
         // conditional
         "case" => {
             if args.len() < 2 {
@@ -574,6 +678,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn translate_strftime_dsl_order() {
+        // DSL (ts, fmt) emits in the same order — STRFTIME is overloaded in
+        // DuckDB so no swap is needed, and emitting in DSL order keeps the `?`
+        // placeholders aligned with emit_expr's DSL-order param push.
+        assert_eq!(
+            translate_function("strftime", &args(&["ts", "fmt"])).unwrap(),
+            "STRFTIME(ts, fmt)"
+        );
+    }
+
+    #[test]
+    fn translate_strptime_uses_try_variant() {
+        // TRY_STRPTIME nulls on unparseable input (matches streaming eval), so a
+        // single bad value never errors the whole batch query.
+        assert_eq!(
+            translate_function("strptime", &args(&["s", "fmt"])).unwrap(),
+            "TRY_STRPTIME(s, fmt)"
+        );
+    }
+
     // ── translate_function: new aggregates ───────────────────────────────
 
     #[test]
@@ -721,6 +846,135 @@ mod tests {
                 "{name} should not be aggregate"
             );
         }
+    }
+
+    // ── validate_unit_literal ───────────────────────────────────────────
+
+    #[test]
+    fn date_part_accepts_allowlisted_units() {
+        for unit in [
+            "year", "month", "day", "hour", "minute", "second", "dow", "doy", "epoch",
+        ] {
+            assert!(
+                validate_unit_literal("date_part", 0, DATE_PART_UNITS, Some(unit)).is_ok(),
+                "date_part should accept unit {unit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_trunc_accepts_allowlisted_units() {
+        for unit in [
+            "year", "quarter", "month", "week", "day", "hour", "minute", "second",
+        ] {
+            assert!(
+                validate_unit_literal("date_trunc", 0, DATE_UNITS, Some(unit)).is_ok(),
+                "date_trunc should accept unit {unit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_diff_accepts_allowlisted_units() {
+        for unit in [
+            "year", "quarter", "month", "week", "day", "hour", "minute", "second",
+        ] {
+            assert!(
+                validate_unit_literal("date_diff", 0, DATE_UNITS, Some(unit)).is_ok(),
+                "date_diff should accept unit {unit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_part_rejects_unknown_unit() {
+        let err =
+            validate_unit_literal("date_part", 0, DATE_PART_UNITS, Some("nanosecond")).unwrap_err();
+        assert!(
+            matches!(err, EmitError::UnsupportedOperation { ref message } if message.contains("nanosecond")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn date_trunc_rejects_dow_not_in_allowlist() {
+        // dow is in DATE_PART_UNITS but NOT in DATE_UNITS (date_trunc allowlist)
+        let err = validate_unit_literal("date_trunc", 0, DATE_UNITS, Some("dow")).unwrap_err();
+        assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
+    }
+
+    #[test]
+    fn date_diff_rejects_non_literal() {
+        // None means the arg was a computed expression, not a string literal
+        let err = validate_unit_literal("date_diff", 0, DATE_UNITS, None).unwrap_err();
+        assert!(
+            matches!(err, EmitError::UnsupportedOperation { ref message } if message.contains("literal")),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn emit_date_part_unknown_unit_errors() {
+        use crate::emitter::emit;
+        use crate::parser;
+        let q = parser::parse(r#"* | let h = date_part("nanosecond", timestamp)"#).unwrap();
+        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
+    }
+
+    #[test]
+    fn emit_date_trunc_dow_errors() {
+        use crate::emitter::emit;
+        use crate::parser;
+        let q = parser::parse(r#"* | let d = date_trunc("dow", timestamp)"#).unwrap();
+        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
+    }
+
+    // ── validate_format_literal ─────────────────────────────────────────
+
+    #[test]
+    fn validate_format_literal_accepts_standard_codes() {
+        for fmt in ["%Y-%m-%d", "%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y"] {
+            assert!(
+                validate_format_literal("strftime", fmt).is_ok(),
+                "should accept format {fmt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_format_literal_rejects_invalid_code() {
+        let err = validate_format_literal("strftime", "%Q").unwrap_err();
+        assert!(
+            matches!(err, EmitError::InvalidFormat { ref func_name, ref format }
+                if func_name == "strftime" && format == "%Q"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_format_literal_rejects_trailing_percent() {
+        let err = validate_format_literal("strptime", "%Y-%m-%d %").unwrap_err();
+        assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
+    }
+
+    #[test]
+    fn emit_strftime_invalid_format_errors() {
+        use crate::emitter::emit;
+        use crate::parser;
+        let q = parser::parse(r#"* | let s = strftime(timestamp, "%Q")"#).unwrap();
+        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
+    }
+
+    #[test]
+    fn emit_strptime_invalid_format_errors() {
+        use crate::emitter::emit;
+        use crate::parser;
+        let q = parser::parse(r#"* | let t = strptime(message, "%Q")"#).unwrap();
+        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
     }
 
     // ── default_agg_alias ───────────────────────────────────────────────
