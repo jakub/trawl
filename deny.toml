@@ -10,6 +10,12 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # paste 1.0.15 is flagged unmaintained (RUSTSEC-2024-0436). It is a
+    # compile-time proc-macro with no runtime attack surface, pulled transitively
+    # by parquet; there is no replacement until parquet drops it upstream.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 confidence-threshold = 0.93
