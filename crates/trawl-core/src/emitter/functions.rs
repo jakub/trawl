@@ -221,8 +221,14 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
         "date_diff" => require_n_args(name, args, 3, |a| {
             format!("DATE_DIFF({}, {}, {})", a[0], a[1], a[2])
         }),
-        // strftime: DSL is (timestamp, format), DuckDB is (format, timestamp) — swap args
-        "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[1], a[0])),
+        // strftime: emit in DSL order (timestamp, format). DuckDB's STRFTIME is
+        // overloaded and accepts (timestamp, format) directly, so no swap is
+        // needed. The previous text-swap (`a[1], a[0]`) desynchronized the `?`
+        // placeholders from emit_expr's DSL-order param push: whenever the
+        // timestamp arg itself produced bound params (e.g. a nested strptime
+        // with literal args), the placeholders bound positionally to the wrong
+        // values and the call misbound.
+        "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[0], a[1])),
         "strptime" => require_n_args(name, args, 2, |a| format!("STRPTIME({}, {})", a[0], a[1])),
         // conditional
         "case" => {
@@ -629,6 +635,17 @@ mod tests {
         assert_eq!(
             translate_function("tostring", &args(&["x"])).unwrap(),
             "CAST(x AS VARCHAR)"
+        );
+    }
+
+    #[test]
+    fn translate_strftime_dsl_order() {
+        // DSL (ts, fmt) emits in the same order — STRFTIME is overloaded in
+        // DuckDB so no swap is needed, and emitting in DSL order keeps the `?`
+        // placeholders aligned with emit_expr's DSL-order param push.
+        assert_eq!(
+            translate_function("strftime", &args(&["ts", "fmt"])).unwrap(),
+            "STRFTIME(ts, fmt)"
         );
     }
 

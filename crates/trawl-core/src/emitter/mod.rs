@@ -930,7 +930,9 @@ mod tests {
     }
 
     #[test]
-    fn fn_strftime_arg_swap() {
+    fn fn_strftime_dsl_order() {
+        // strftime emits in DSL order (ts, fmt); DuckDB's STRFTIME is overloaded
+        // so no arg swap is needed (see emitter::functions strftime arm).
         assert_snapshot!(emit_dsl(
             r#"* | let formatted = strftime(timestamp, "%Y-%m-%d")"#
         ));

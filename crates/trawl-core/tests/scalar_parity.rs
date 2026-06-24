@@ -526,3 +526,43 @@ fn scalar_eval_matches_sql_parity() {
         "too many skipped iterations: {skipped} skipped, {passed} passed"
     );
 }
+
+/// Regression: `strftime` over a nested `strptime` with literal args.
+///
+/// Both args carry bound params, so the old emitter text-swap (`a[1], a[0]`)
+/// misbound the `?` placeholders against `emit_expr`'s DSL-order param push,
+/// yielding NULL/error in batch. Emitting in DSL order keeps them aligned;
+/// both paths must produce `"2023"`.
+#[test]
+fn strftime_over_strptime_binds_params_in_order() {
+    let conn = Connection::open_in_memory().unwrap();
+    let event = fixed_event();
+    // Full datetime so chrono's NaiveDateTime::parse_from_str succeeds (date-only
+    // formats are a separate chrono-vs-DuckDB divergence, not the param bug here).
+    let dsl = r#"* | let x = strftime(strptime("2023-11-07 17:30:45", "%Y-%m-%d %H:%M:%S"), "%Y")"#;
+
+    // Batch path (real DuckDB).
+    let sql_result = sql_scalar_result(&conn, dsl, &event)
+        .expect("batch strftime(strptime(...)) must not error or null");
+    assert_eq!(sql_result, Value::String("2023".to_string()));
+
+    // Streaming path (eval).
+    let query = parser::parse(dsl).unwrap();
+    let ls = query
+        .pipeline
+        .iter()
+        .find_map(|s| {
+            if let PipeStage::Let(ls) = &s.node {
+                Some(ls)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let (_, expr) = ls.assignments.first().unwrap();
+    let eval_result = eval_expr(expr, &event);
+    assert_eq!(
+        normalize_eval(&eval_result),
+        Value::String("2023".to_string())
+    );
+}
