@@ -1176,20 +1176,22 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
 /// `strptime(str, fmt)` — parse a string to `Timestamp` using chrono format.
 ///
 /// `DuckDB`'s `STRPTIME` fills the components a format omits from a
-/// `1900-01-01 00:00:00` base: a date-only format yields midnight, a time-only
-/// format yields `1900-01-01`. chrono's `NaiveDateTime::parse_from_str` requires
-/// BOTH halves, so we cascade full-datetime → date-only (→ `00:00:00`) →
-/// time-only (→ `1900-01-01`) to mirror `DuckDB` for those cases. Each tier uses
-/// chrono's own parser, which rejects trailing input, so a full-datetime string
-/// never spuriously matches a date-only format (both paths `Null`, as `DuckDB`
-/// does). Returns `Null` on unparseable input, matching the `TRY_STRPTIME` the
-/// batch emitter now uses.
+/// `1900-01-01 00:00:00` base: a year-only format yields `…-01-01 00:00:00`, a
+/// date-only format yields midnight, a time-only format yields `1900-01-01`, and
+/// a date with an INCOMPLETE time (`%Y-%m-%d %H`) keeps the hour and zero-fills
+/// minute/second. We mirror this exactly by parsing once into a
+/// `chrono::format::Parsed`, then resolving each half — letting chrono resolve
+/// derived fields first (ISO week, ordinal `%j`, `%s` epoch, am/pm) and injecting
+/// the `1900-01-01 00:00:00` defaults only for components that are genuinely
+/// missing (see `resolve_date`/`resolve_time`).
 ///
-/// Residual divergence: other partial formats — year-only (`%Y`), year-month, a
-/// bare month-day, or a date plus an INCOMPLETE time (`%Y-%m-%d %H`) — are not
-/// matched here (the date-only tier drops the stray time fields `DuckDB` would
-/// keep). These are documented in the DSL reference and tracked as a follow-up;
-/// they are rare in practice and the common date-only/time-only cases are exact.
+/// `chrono::format::parse` matches the whole input against the whole format, so
+/// trailing or insufficient input still rejects (both paths `Null`, as `DuckDB`
+/// does), and an unparseable value returns `Null` — matching the `TRY_STRPTIME`
+/// the batch emitter uses.
+///
+/// Exotic/locale codes (`%y` two-digit-year pivot, `%I` without `%p`, …) follow
+/// chrono rather than bit-matching `DuckDB`, per ADR-0001's parity contract.
 fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;
@@ -1200,11 +1202,62 @@ fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
     };
-    let base_date = NaiveDate::from_ymd_opt(1900, 1, 1).expect("1900-01-01 is a valid date");
-    NaiveDateTime::parse_from_str(s, fmt)
-        .or_else(|_| NaiveDate::parse_from_str(s, fmt).map(|d| d.and_time(NaiveTime::MIN)))
-        .or_else(|_| NaiveTime::parse_from_str(s, fmt).map(|t| base_date.and_time(t)))
-        .map_or(EvalValue::Null, EvalValue::Timestamp)
+    let mut parsed = chrono::format::Parsed::new();
+    if chrono::format::parse(&mut parsed, s, chrono::format::StrftimeItems::new(fmt)).is_err() {
+        return EvalValue::Null;
+    }
+    // A fully-specified datetime (or a `%s` epoch) resolves directly.
+    if let Ok(dt) = parsed.to_naive_datetime_with_offset(0) {
+        return EvalValue::Timestamp(dt);
+    }
+    match (resolve_date(&mut parsed), resolve_time(&mut parsed)) {
+        (Some(date), Some(time)) => EvalValue::Timestamp(date.and_time(time)),
+        _ => EvalValue::Null,
+    }
+}
+
+/// Resolve a `NaiveDate` from a partially-filled `Parsed`, supplying the date
+/// components `DuckDB` would take from its `1900-01-01` base. chrono is tried
+/// first so derived fields (ISO week, ordinal `%j`) win; the base defaults are
+/// then injected most-significant first, retrying after each. `set_*` no-ops when
+/// the field already holds a value, so a year-only or ordinal-only input is never
+/// over-determined with a stray month/day. `None` means the present fields are
+/// contradictory (e.g. Feb 30) — the caller nulls, as `DuckDB` does.
+fn resolve_date(parsed: &mut chrono::format::Parsed) -> Option<NaiveDate> {
+    if let Ok(date) = parsed.to_naive_date() {
+        return Some(date);
+    }
+    let _ = parsed.set_year(1900);
+    if let Ok(date) = parsed.to_naive_date() {
+        return Some(date);
+    }
+    let _ = parsed.set_month(1);
+    if let Ok(date) = parsed.to_naive_date() {
+        return Some(date);
+    }
+    let _ = parsed.set_day(1);
+    parsed.to_naive_date().ok()
+}
+
+/// Resolve a `NaiveTime` from a partially-filled `Parsed`, zero-filling the
+/// components a format omits (`DuckDB`'s `00:00:00` base). Mirrors `resolve_date`:
+/// chrono first (so am/pm and fractional seconds resolve), then hour→minute→second
+/// defaults with a retry after each. `None` means a present time field can't be
+/// resolved (e.g. `%I` with no `%p`) — the caller nulls.
+fn resolve_time(parsed: &mut chrono::format::Parsed) -> Option<NaiveTime> {
+    if let Ok(time) = parsed.to_naive_time() {
+        return Some(time);
+    }
+    let _ = parsed.set_hour(0);
+    if let Ok(time) = parsed.to_naive_time() {
+        return Some(time);
+    }
+    let _ = parsed.set_minute(0);
+    if let Ok(time) = parsed.to_naive_time() {
+        return Some(time);
+    }
+    let _ = parsed.set_second(0);
+    parsed.to_naive_time().ok()
 }
 
 #[cfg(test)]
@@ -2735,6 +2788,28 @@ mod tests {
             vec![lit_str("not-a-date"), lit_str("%Y-%m-%d %H:%M:%S")],
         );
         assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+    }
+
+    // Partial formats fill omitted components from DuckDB's 1900-01-01 00:00:00
+    // base (parity asserted against real DuckDB in tests/scalar_parity.rs).
+    #[test]
+    fn fn_strptime_partial_formats_fill_like_duckdb() {
+        for (input, fmt, want) in [
+            ("2023", "%Y", "2023-01-01 00:00:00"),
+            ("2023-11", "%Y-%m", "2023-11-01 00:00:00"),
+            ("11-07", "%m-%d", "1900-11-07 00:00:00"),
+            ("2023-11-07 14", "%Y-%m-%d %H", "2023-11-07 14:00:00"),
+            // unchanged date-only / time-only cases stay exact
+            ("2023-11-07", "%Y-%m-%d", "2023-11-07 00:00:00"),
+            ("14:30:00", "%H:%M:%S", "1900-01-01 14:30:00"),
+        ] {
+            let expr = call("strptime", vec![lit_str(input), lit_str(fmt)]);
+            assert_eq!(
+                eval_expr(&expr, &empty_event()),
+                EvalValue::Timestamp(ndt(want)),
+                "strptime({input:?}, {fmt:?})"
+            );
+        }
     }
 
     // typeof(now())

@@ -83,6 +83,18 @@ const STRING_VALS: &[&str] = &[
     "日本語",
 ];
 
+// Partial strptime formats whose component fill (from the `1900-01-01 00:00:00`
+// base) the streaming evaluator and DuckDB's STRPTIME agree on. Shared by the
+// generative property test so each filled case is checked against real DuckDB
+// every run — mirrors the deterministic `strptime_partial_formats_match_duckdb`
+// table. Only formats with exact streaming/batch parity belong here.
+const STRPTIME_PARTIALS: &[(&str, &str)] = &[
+    ("2023", "%Y"),                   // year-only -> 2023-01-01 00:00:00
+    ("2023-11", "%Y-%m"),             // year-month -> 2023-11-01 00:00:00
+    ("11-07", "%m-%d"),               // bare month-day -> 1900-11-07 00:00:00
+    ("2023-11-07 14", "%Y-%m-%d %H"), // date + incomplete time -> ...14:00:00
+];
+
 const INT_VALS: &[i64] = &[0, 1, 42, 100, -5, 200, 500];
 
 // Float DSL literals spanning the DuckDB CAST(DOUBLE AS VARCHAR) presentation
@@ -223,6 +235,13 @@ fn random_strptime(rng: &mut Rng) -> String {
         // streaming both yield NULL, so the two paths agree on a data-parse
         // failure (TRY_STRPTIME nulls instead of erroring the whole query).
         return "strptime(\"not-a-date\", \"%Y-%m-%d %H:%M:%S\")".to_string();
+    }
+    if rng.range(4) == 0 {
+        // Partial format: streaming fills omitted components from the
+        // 1900-01-01 00:00:00 base exactly like DuckDB. Render through strftime
+        // so the filled timestamp is compared as a string.
+        let (input, fmt) = rng.pick(STRPTIME_PARTIALS);
+        return format!("strftime(strptime(\"{input}\", \"{fmt}\"), \"%Y-%m-%d %H:%M:%S\")");
     }
     let ts = rng.pick(TS_VALS);
     // strptime returns a Timestamp — wrap it in strftime to get a string for comparison
@@ -690,6 +709,26 @@ fn strptime_partial_formats_match_duckdb() {
             // time-only -> 1900-01-01 base
             r#"* | let x = strftime(strptime("14:30:00", "%H:%M:%S"), "%Y-%m-%d %H:%M:%S")"#,
             "1900-01-01 14:30:00",
+        ),
+        (
+            // year-only -> month/day fill to 1, time to midnight
+            r#"* | let x = strftime(strptime("2023", "%Y"), "%Y-%m-%d %H:%M:%S")"#,
+            "2023-01-01 00:00:00",
+        ),
+        (
+            // year-month -> day fills to 1
+            r#"* | let x = strftime(strptime("2023-11", "%Y-%m"), "%Y-%m-%d %H:%M:%S")"#,
+            "2023-11-01 00:00:00",
+        ),
+        (
+            // bare month-day -> year fills to the 1900 base
+            r#"* | let x = strftime(strptime("11-07", "%m-%d"), "%Y-%m-%d %H:%M:%S")"#,
+            "1900-11-07 00:00:00",
+        ),
+        (
+            // date + INCOMPLETE time -> minute/second fill to 0 (not dropped)
+            r#"* | let x = strftime(strptime("2023-11-07 14", "%Y-%m-%d %H"), "%Y-%m-%d %H:%M:%S")"#,
+            "2023-11-07 14:00:00",
         ),
     ] {
         assert_eq!(

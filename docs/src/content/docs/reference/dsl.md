@@ -337,7 +337,7 @@ Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce i
 
 Invalid format codes (e.g. `%Q`, or a trailing `%`) are rejected before execution in both paths when the format is a string literal — they no longer error in batch while silently nulling in streaming.
 
-**Partial formats:** `strptime` fills components the format omits, matching DuckDB — a **date-only** format (e.g. `%Y-%m-%d`) yields midnight (`00:00:00`), and a **time-only** format (e.g. `%H:%M:%S`) yields the `1900-01-01` base date. Other partial formats — year-only (`%Y`), year-month, a bare month-day, or a date paired with an *incomplete* time (`%Y-%m-%d %H`) — are matched in the batch path but not yet in streaming, where they return `null`. Use a full datetime, a clean date-only, or a clean time-only format for batch/streaming parity.
+**Partial formats:** `strptime` fills the components a format omits from a `1900-01-01 00:00:00` base, identically in the batch (DuckDB) and streaming paths. A **date-only** format (e.g. `%Y-%m-%d`) yields midnight (`00:00:00`); a **time-only** format (e.g. `%H:%M:%S`) yields the `1900-01-01` base date; **year-only** (`%Y` → `2023-01-01 00:00:00`), **year-month** (`%Y-%m` → `2023-11-01 00:00:00`), a bare **month-day** (`%m-%d` → `1900-11-07 00:00:00`), and a date with an *incomplete* time (`%Y-%m-%d %H` → `…14:00:00`) all fill the same way. Exotic or locale-dependent codes (`%y` two-digit-year, `%I` without `%p`, `%Z`/`%z`) follow chrono in the streaming path and may differ from DuckDB.
 
 ## Examples
 
