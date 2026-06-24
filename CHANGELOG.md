@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Streaming `strptime` now fills the components a partial format omits from a `1900-01-01 00:00:00` base exactly like the batch (DuckDB) path: year-only (`%Y`), year-month (`%Y-%m`), bare month-day (`%m-%d`), and a date paired with an incomplete time (`%Y-%m-%d %H`) all resolve to the same timestamp in live and compacted queries. The last case previously returned a wrong value (the stray hour was dropped to midnight); the others returned `null`. Closes the residual divergence left by #24 (#25).
+
 ## [0.3.3] - 2026-06-22
 
 ### Added

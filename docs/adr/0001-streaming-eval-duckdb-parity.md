@@ -74,6 +74,13 @@ deliberate and documented here.
   `eval_scalar_fn` — the coverage test fails otherwise. This is the point.
 - Exotic/locale `strftime`/`strptime` format codes (`%c`, `%Z`, …) follow
   chrono and may differ from DuckDB. Documented in the DSL reference.
+- Issue #25 closed the residual `strptime` partial-format gap: streaming now
+  resolves via `chrono::format::Parsed` and fills omitted components from the
+  `1900-01-01 00:00:00` base exactly like DuckDB (year-only, year-month,
+  month-day, and date-plus-incomplete-time). The common date/time partials are now
+  at parity; the remaining divergences are the exotic/locale codes above plus a
+  bare two-digit year (`%y` alone, which nulls) and offset codes (`%z`/`%Z`, which
+  keep chrono's wall-clock time) — both follow chrono.
 - `Timestamp → VARCHAR` rendering (`tostring`, and `From<EvalValue> for Value`
   when a `Timestamp`-valued `let` is serialized into the event) must match
   DuckDB's timestamp text format (space separator, microsecond precision,
