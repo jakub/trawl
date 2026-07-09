@@ -8,9 +8,18 @@
 //! Owns the [`ToastBus`] via `provide_context`. Owns nothing else.
 //! Does NOT do auth, fetch `/me`, render a status bar, or know what
 //! routes the app has. Consumers wrap `Shell` with whatever
-//! app-specific concerns they need — trawl's `AuthShell` (forthcoming)
-//! gates on `/me`, owns its `StatusBar`, passes that as the `footer`
-//! prop, and renders its router `<Outlet/>` as `children`.
+//! app-specific concerns they need — trawl's `AuthShell` gates on
+//! `/me`, owns its `StatusBar`, passes that as the `footer` prop, and
+//! renders its router `<Outlet/>` as `children`.
+//!
+//! # ToastBus contract
+//!
+//! Shell is the single owner of the toast stack: one bus, one
+//! `<Toasts/>` host, provided via context. `children` and `footer`
+//! closures execute inside Shell's body, so `<Outlet/>` page content
+//! reaches the bus with `expect_context::<ToastBus>()`. Consumers must
+//! not create their own bus or mount their own `<Toasts/>` inside a
+//! Shell — see [`crate::toast`] for the full contract.
 
 use leptos::prelude::*;
 

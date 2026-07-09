@@ -2,21 +2,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Toasts/>` host + `ToastBus` push handle.
+//! `<Toasts/>` host + `ToastBus` push handle (wasm-only runtime).
 //!
 //! Toasts auto-dismiss after 4.5s via a `gloo_timers::future::TimeoutFuture`
-//! launched per push. Border-left color encodes the kind.
+//! launched per push. Border-left color encodes the kind — the class
+//! mapping lives on [`ToastKind::as_class`] so it's testable natively.
 
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToastKind {
-    Info,
-    Success,
-    Error,
-}
+use super::kinds::ToastKind;
 
 /// A single toast notification. Construction is sealed: instances only
 /// arise from [`ToastBus::push`] (and its kind-specific helpers), so the
@@ -56,10 +52,16 @@ impl Toast {
 
 /// Push handle — clone-and-share. Drives the `<Toasts/>` host.
 ///
-/// Construct once at app boot (typically inside `<App/>` so the
-/// `RwSignal` lives in the reactive root), then either pass it as a
-/// prop to `<Toasts bus=bus/>` or stash it with `provide_context(bus)`
-/// for descendants to pick up via `use_context`.
+/// # Ownership contract
+///
+/// In an app composed around [`Shell`](crate::shell::Shell), the Shell
+/// owns the bus: it calls `ToastBus::new()`, `provide_context`s it,
+/// and mounts the single `<Toasts/>` host. Everything rendered inside
+/// the Shell (router `<Outlet/>` content, footer, modals) pushes via
+/// `expect_context::<ToastBus>()`. Do NOT construct a second bus or
+/// mount a second `<Toasts/>` inside a Shell — that produces two
+/// competing toast stacks. Only screens rendered outside a Shell need
+/// their own `ToastBus::new()` + `<Toasts bus=bus/>` pair.
 #[derive(Debug, Clone, Copy)]
 pub struct ToastBus {
     items: RwSignal<Vec<Toast>>,
@@ -139,11 +141,7 @@ pub fn Toasts(bus: ToastBus) -> impl IntoView {
                 key=|t| t.id
                 children=move |t| {
                     let id = t.id;
-                    let cls = match t.kind {
-                        ToastKind::Info => "toast info",
-                        ToastKind::Success => "toast success",
-                        ToastKind::Error => "toast error",
-                    };
+                    let cls = format!("toast {}", t.kind.as_class());
                     view! {
                         <div class=cls>
                             <div class="body">
