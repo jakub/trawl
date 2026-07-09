@@ -11,19 +11,18 @@ use trawl_api::ExportFormat;
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::download;
+use fleet_ui::{ToastBus, ToastKind};
 
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn ExportModal(
     /// The DSL query to export. Shown read-only in the preview strip.
     query: String,
-    /// Bus for success / error toasts.
-    bus: ToastBus,
     /// Called on close — `true` if a download completed, `false` on cancel.
     on_close: Callback<bool>,
 ) -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
     let format = RwSignal::new(ExportFormat::Csv);
     let downloading = RwSignal::new(false);
 

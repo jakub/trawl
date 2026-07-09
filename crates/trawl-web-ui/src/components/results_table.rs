@@ -12,8 +12,8 @@
 
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::clipboard::write_clipboard;
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{Filter, FilterOp};
+use fleet_ui::{ToastBus, ToastKind};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::cmp::Ordering;
@@ -34,8 +34,8 @@ pub fn ResultsTable(
     /// Navigate to a fresh search with the given DSL query and default
     /// filters/range. Used by "Show context" and "Find similar".
     on_navigate: Callback<String>,
-    bus: ToastBus,
 ) -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
     view! {
         <div class="results">
             {move || match rows.get() {

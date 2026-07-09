@@ -19,9 +19,9 @@ use crate::api;
 use crate::components::confirm_modal::ConfirmModal;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::save_as_net_modal::SaveAsNetModal;
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{time_ago, time_until};
+use fleet_ui::{ToastBus, ToastKind};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetSort {
@@ -33,7 +33,7 @@ enum NetSort {
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn NetsPage() -> impl IntoView {
-    let bus = use_context::<ToastBus>().expect("ToastBus context");
+    let bus = expect_context::<ToastBus>();
     let qm = use_query_map();
     let net_selected: Memo<Option<i64>> =
         Memo::new(move |_| qm.get().get("net").and_then(|s| s.parse::<i64>().ok()));
@@ -409,7 +409,6 @@ pub fn NetsPage() -> impl IntoView {
                     <NetDrawer
                         net=net
                         tab=tab_sig
-                        bus=bus
                         on_close=on_close
                         on_tab_change=on_tab_change
                         on_search=on_search
@@ -422,7 +421,6 @@ pub fn NetsPage() -> impl IntoView {
             <Show when=move || show_create_modal.get()>
                 <SaveAsNetModal
                     query=String::new()
-                    bus=bus
                     on_close=Callback::new(move |saved: bool| {
                         show_create_modal.set(false);
                         if saved { refresh.update(|n| *n += 1); }

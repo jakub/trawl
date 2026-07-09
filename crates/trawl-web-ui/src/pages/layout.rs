@@ -15,11 +15,11 @@ use leptos_router::components::Outlet;
 use crate::api;
 use crate::components::rail::Rail;
 use crate::components::status_bar::{StatusBar, StatusKind};
-use crate::components::toast::{ToastBus, Toasts};
 use crate::components::topbar::TopBar;
 use crate::state::app_mode;
 use crate::state::query::RangeSpec;
 use crate::state::section;
+use fleet_ui::{ToastBus, Toasts};
 
 /// Shared status signals that the Shell owns and the StatusBar reads.
 /// Search (or any page that wants to drive the status bar) writes to

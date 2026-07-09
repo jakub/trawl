@@ -10,12 +10,12 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::api::ApiError;
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::time_fmt::time_ago;
+use fleet_ui::{ToastBus, ToastKind};
 
 #[component]
 pub fn StoriesPage() -> impl IntoView {
-    let bus = use_context::<ToastBus>().expect("ToastBus context");
+    let bus = expect_context::<ToastBus>();
     let items = RwSignal::new(Vec::<StoryView>::new());
     let next_cursor = RwSignal::new(None::<String>);
     let loading = RwSignal::new(true);

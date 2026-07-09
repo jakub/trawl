@@ -36,5 +36,4 @@ pub mod service_drawer;
 pub mod sparkline;
 pub mod status_bar;
 pub mod tabs;
-pub mod toast;
 pub mod topbar;

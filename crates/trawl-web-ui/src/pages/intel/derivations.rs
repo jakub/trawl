@@ -16,8 +16,8 @@ use crate::components::lineage_tree::{
     LineageNode, LineageTree, can_write_derivations, render_derivation_meta, render_marking_diff,
     transformation_color,
 };
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::time_fmt::time_ago;
+use fleet_ui::{ToastBus, ToastKind};
 
 const OBJECT_TYPES: &[&str] = &[
     "story",
@@ -32,7 +32,7 @@ const OBJECT_TYPES: &[&str] = &[
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn DerivationsPage() -> impl IntoView {
-    let bus = use_context::<ToastBus>().expect("ToastBus context");
+    let bus = expect_context::<ToastBus>();
     let me = use_context::<RwSignal<Option<MeResponse>>>();
     let can_write = Memo::new(move |_| {
         me.and_then(|s| s.get())
