@@ -22,6 +22,10 @@ path = "src/main.rs"
 trawl-api = { workspace = true }
 coastwatch-api-types = { workspace = true }
 chrono = { workspace = true, features = ["wasmbind"] }
+# Unconditional (like coastwatch): fleet-ui's pure-native modules
+# (theme::prefs, toast::kinds) ride along for host builds; the leptos
+# component surface only enters the graph on wasm32.
+fleet-ui = { workspace = true }
 
 # Wasm-only deps — leptos, web-sys, gloo-net, etc. `cargo check --workspace`
 # on native skips these entirely, but the binary compiles against them when

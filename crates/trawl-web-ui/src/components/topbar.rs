@@ -13,9 +13,10 @@ use leptos::task::spawn_local;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::use_navigate;
 
+use fleet_ui::UiPrefs;
+
 use crate::api;
 use crate::state::app_mode::AppMode;
-use crate::state::theme::UiPrefs;
 
 #[component]
 pub fn TopBar(
@@ -54,7 +55,7 @@ pub fn TopBar(
 
     let toggle_theme = move |_| {
         if let Some(p) = prefs {
-            p.theme.update(|t| *t = t.toggled());
+            p.theme().update(|t| *t = t.toggled());
         }
     };
 
@@ -152,8 +153,8 @@ fn avatar_initials(me: Option<&api::MeResponse>) -> String {
 }
 
 fn theme_label(prefs: Option<UiPrefs>) -> String {
-    use crate::state::theme::Theme;
-    match prefs.map(|p| p.theme.get()) {
+    use fleet_ui::Theme;
+    match prefs.map(|p| p.theme().get()) {
         Some(Theme::Dark) => "Switch to light theme".into(),
         Some(Theme::Light) | None => "Switch to dark theme".into(),
     }

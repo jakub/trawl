@@ -19,11 +19,12 @@ use crate::pages::placeholder::{IntelPlaceholder, SettingsPlaceholder};
 use crate::pages::runs::RunsPage;
 use crate::pages::schema::SchemaPage;
 use crate::pages::search::Search;
-use crate::state::theme;
 
 #[component]
 pub fn App() -> impl IntoView {
-    let prefs = theme::install();
+    // Theme/density/rowstyle prefs come from fleet-ui; the storage key
+    // stays "trawl.ui" so pre-migration prefs round-trip (AC4).
+    let prefs = fleet_ui::install("trawl.ui");
     provide_context(prefs);
 
     view! {

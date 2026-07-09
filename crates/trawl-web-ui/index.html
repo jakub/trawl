@@ -17,6 +17,9 @@
       since rust 1.82. revisit when we pin a newer wasm-opt.
     -->
     <link data-trunk rel="rust" data-bin="trawl-web-ui" data-wasm-opt="0"/>
+    <!-- fleet-ui design system FIRST so app-specific selectors in
+         main.css keep cascade priority. -->
+    <link data-trunk rel="css" href="../fleet-ui/styles/fleet-ui.css"/>
     <link data-trunk rel="css" href="styles/main.css"/>
     <!-- Vendored JS bundles copied into dist/vendor/ so wasm-bindgen's
          `module = "/vendor/codemirror.js"` path resolves at runtime. -->

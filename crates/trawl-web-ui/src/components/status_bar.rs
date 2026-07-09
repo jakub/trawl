@@ -7,15 +7,15 @@
 //!
 //! Sources count + indexed total + ingest rate are stubbed (`—`)
 //! until `/api/v1/stats` gets wired through. Theme toggle calls
-//! `UiPrefs::theme.update()` and the `state::theme` effect
+//! `UiPrefs::theme().update()` and fleet-ui's install effect
 //! re-projects to `<html data-theme>`.
 
+use fleet_ui::{Theme, UiPrefs};
 use leptos::prelude::*;
 use leptos::web_sys;
 
 use crate::api;
 use crate::state::query::RangeSpec;
-use crate::state::theme::{Theme, UiPrefs};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
@@ -49,12 +49,12 @@ pub fn StatusBar(
 
     let toggle_theme = move |_| {
         if let Some(p) = prefs {
-            p.theme.update(|t| *t = t.toggled());
+            p.theme().update(|t| *t = t.toggled());
         }
     };
 
     let theme_label = move || {
-        prefs.map_or("light", |p| match p.theme.get() {
+        prefs.map_or("light", |p| match p.theme().get() {
             Theme::Light => "light",
             Theme::Dark => "dark",
         })
