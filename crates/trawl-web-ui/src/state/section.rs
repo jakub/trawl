@@ -5,44 +5,27 @@
 //! Per-mode rail section. The valid set depends on which `AppMode` is
 //! active; the active section is derived from the current pathname.
 
+use fleet_ui::Icon;
 use leptos::prelude::*;
 use leptos_router::hooks::use_location;
 
 use crate::state::app_mode::AppMode;
 
-/// Single item rendered in the left rail.
+/// Single item rendered in the left rail — a `&'static` descriptor;
+/// the `AuthShell` maps these onto owned `fleet_ui::RailItem`s at the
+/// Shell boundary. Icons are `fleet_ui::Icon` (ADR-0030: apps never
+/// inline raw SVG for chrome).
 #[derive(Debug, Clone, Copy)]
 pub struct RailItem {
     pub id: &'static str,
     pub label: &'static str,
-    pub icon: RailIcon,
+    pub icon: Icon,
     pub path: &'static str,
-}
-
-/// Icons we currently render in the rail. Kept as an enum so the SVG
-/// path stays in one place rather than scattered across templates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum RailIcon {
-    Search,
-    Clock,
-    Database,
-    News,
-    Alert,
-    Link,
-    Zap,
-    Check,
-    Grid,
-    User,
-    Chart,
-    Question,
 }
 
 #[must_use]
 pub fn items_for(mode: AppMode) -> &'static [RailItem] {
-    use RailIcon::{
-        Alert, Chart, Clock, Database, Grid, Link, News, Search as SearchIcon, User, Zap,
-    };
+    use Icon::{Alert, Chart, Clock, Database, Grid, Link, News, Search as SearchIcon, User, Zap};
     match mode {
         AppMode::Search => &[
             RailItem {

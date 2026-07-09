@@ -2,9 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `/login` — paste API key, submit, redirect to `/search`.
+//! `/login` — thin wrapper over [`fleet_ui::Login`]: error mapping +
+//! hard redirect to `/search` on success. The empty-key check lives in
+//! the fleet component.
 
-use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -12,18 +13,10 @@ use crate::api;
 
 #[component]
 pub fn Login() -> impl IntoView {
-    let (api_key, set_api_key) = signal(String::new());
     let (error, set_error) = signal::<Option<String>>(None);
     let (submitting, set_submitting) = signal(false);
 
-    let on_submit = move |ev: SubmitEvent| {
-        ev.prevent_default();
-        let key = api_key.get();
-        if key.trim().is_empty() {
-            set_error.set(Some("API key is required".into()));
-            return;
-        }
-
+    let on_submit = Callback::new(move |key: String| {
         set_submitting.set(true);
         set_error.set(None);
 
@@ -44,35 +37,18 @@ pub fn Login() -> impl IntoView {
                 }
             }
         });
-    };
+    });
 
+    // brand_accent="" (not the topbar's "_"): the pre-migration login
+    // h1 was plain amber "trawl" with no accent glyph, and zero visual
+    // change is the contract. The empty amber span renders nothing.
     view! {
-        <div class="login-shell">
-            <form class="login-card" on:submit=on_submit>
-                <h1>"trawl"</h1>
-                <p class="subtitle">"sign in with your API key"</p>
-
-                {move || error.get().map(|msg| view! { <div class="error">{msg}</div> })}
-
-                <label class="field">
-                    <span>"API key"</span>
-                    <input
-                        type="password"
-                        autocomplete="off"
-                        spellcheck="false"
-                        prop:value=move || api_key.get()
-                        on:input=move |ev| set_api_key.set(event_target_value(&ev))
-                    />
-                </label>
-
-                <button
-                    type="submit"
-                    class="btn btn-full"
-                    disabled=move || submitting.get()
-                >
-                    {move || if submitting.get() { "Signing In…" } else { "Sign In" }}
-                </button>
-            </form>
-        </div>
+        <fleet_ui::Login
+            brand="trawl"
+            brand_accent=""
+            on_submit=on_submit
+            error=error
+            submitting=submitting
+        />
     }
 }

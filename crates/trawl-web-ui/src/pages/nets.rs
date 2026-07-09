@@ -16,11 +16,11 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::SavedQueryResponse;
 
 use crate::api;
-use crate::components::confirm_modal::ConfirmModal;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{time_ago, time_until};
+use fleet_ui::ConfirmModal;
 use fleet_ui::{ToastBus, ToastKind};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -441,7 +441,6 @@ pub fn NetsPage() -> impl IntoView {
                             title="Delete net"
                             message=msg
                             confirm_label="Delete"
-                            danger=true
                             on_confirm=Callback::new(move |()| {
                                 confirm_delete.set(None);
                                 do_delete(del_id, del_name.clone());

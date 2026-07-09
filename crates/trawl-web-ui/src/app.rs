@@ -12,7 +12,7 @@ use crate::pages::history::HistoryPage;
 use crate::pages::intel::derivations::DerivationsPage;
 use crate::pages::intel::stories::StoriesPage;
 use crate::pages::intel::story::StoryPage;
-use crate::pages::layout::{NotFound, RedirectTo, Shell};
+use crate::pages::layout::{AuthShell, NotFound, RedirectTo};
 use crate::pages::login::Login;
 use crate::pages::nets::NetsPage;
 use crate::pages::placeholder::{IntelPlaceholder, SettingsPlaceholder};
@@ -31,7 +31,7 @@ pub fn App() -> impl IntoView {
         <Router>
             <Routes fallback=|| view! { <NotFound/> }>
                 <Route path=path!("/login") view=Login/>
-                <ParentRoute path=path!("") view=Shell>
+                <ParentRoute path=path!("") view=AuthShell>
                     <Route path=path!("/") view=|| view! { <RedirectTo path="/search"/> }/>
                     <Route path=path!("/search") view=Search/>
                     <Route path=path!("/search/history") view=HistoryPage/>
