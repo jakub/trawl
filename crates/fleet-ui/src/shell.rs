@@ -37,7 +37,14 @@ pub fn Shell(
     #[prop(into)] user: Signal<Option<UserInfo>>,
     #[prop(into, optional)] app_links: Signal<Vec<AppLink>>,
     on_logout: Callback<()>,
-    footer: Children,
+    /// App footer (status bar). Optional — footer-less apps omit it and
+    /// the shell grid's `auto` row collapses to zero height.
+    #[prop(optional)]
+    footer: Option<Children>,
+    /// Bottom-pinned rail slot, passed through to [`Rail`]'s `bottom`
+    /// prop (rendered inside `<div class="bot">`).
+    #[prop(optional)]
+    rail_bottom: Option<Children>,
     children: Children,
 ) -> impl IntoView {
     let bus = ToastBus::new();
@@ -54,12 +61,15 @@ pub fn Shell(
                 on_logout=on_logout
             />
             <div class="body">
-                <Rail items=rail_items active=rail_active/>
+                {match rail_bottom {
+                    Some(b) => view! { <Rail items=rail_items active=rail_active bottom=b/> }.into_any(),
+                    None => view! { <Rail items=rail_items active=rail_active/> }.into_any(),
+                }}
                 <main class="main">
                     {children()}
                 </main>
             </div>
-            {footer()}
+            {footer.map(|f| f())}
             <Toasts bus=bus/>
         </div>
     }

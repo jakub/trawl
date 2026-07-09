@@ -19,18 +19,27 @@ fn item_class(active: bool) -> &'static str {
 /// A single item in the rail. `path` is the route navigated to on
 /// click; `id` is the discriminant the parent compares against the
 /// `active` signal to drive the amber-bar styling.
+///
+/// `badge` is an optional count chip (unread stories, pending
+/// editions…). Like `ModeTab.active`, it's a plain value — callers
+/// rebuild the item Vec reactively when the count changes.
 #[derive(Debug, Clone)]
 pub struct RailItem {
     pub id: String,
     pub label: String,
     pub icon: Icon,
     pub path: String,
+    pub badge: Option<u64>,
 }
 
 #[component]
 pub fn Rail(
     #[prop(into)] items: Signal<Vec<RailItem>>,
     #[prop(into)] active: Signal<String>,
+    /// Bottom-pinned slot rendered inside `<div class="bot">` (trawl's
+    /// inert "Help — coming soon" stub). Omitted → no `.bot` div.
+    #[prop(optional)]
+    bottom: Option<Children>,
 ) -> impl IntoView {
     view! {
         <nav class="rail">
@@ -46,10 +55,12 @@ pub fn Rail(
                         >
                             <IconView icon=item.icon size=16 stroke_width=1.4/>
                             <span class="lb">{item.label}</span>
+                            {item.badge.map(|n| view! { <span class="badge">{n}</span> })}
                         </A>
                     }
                 }).collect::<Vec<_>>()
             }}
+            {bottom.map(|b| view! { <div class="bot">{b()}</div> })}
         </nav>
     }
 }

@@ -473,9 +473,13 @@ textarea:focus-visible,
  *  Reserved class names from this point down: .shell, .topbar, .body,
  *  .main, .rail. Apps must NOT redefine these — they're shared chrome.
  * ─────────────────────────────────────────────────────────────── */
+/* Rows: topbar / body / footer. The `auto` footer row collapses to
+ * zero for footer-less apps and sizes to the footer's own height
+ * (e.g. trawl's .statusbar at var(--statusbar-h)) when the Shell's
+ * optional footer slot is filled. */
 .shell {
   display: grid;
-  grid-template-rows: var(--topbar-h) 1fr;
+  grid-template-rows: var(--topbar-h) 1fr auto;
   height: 100%;
 }
 
@@ -731,6 +735,24 @@ textarea:focus-visible,
   width: 2px;
   background: var(--amber);
   box-shadow: 0 0 6px var(--amber-glow);
+}
+/* Count chip — RailItem.badge. Anchored to the item's top-right
+ * corner (the .it is position: relative). */
+.rail .it .badge {
+  position: absolute;
+  top: 2px;
+  right: 0;
+  min-width: 15px;
+  padding: 1px 4px;
+  border-radius: 8px;
+  background: var(--amber-wash);
+  color: var(--amber);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 .rail .bot {
   margin-top: auto;

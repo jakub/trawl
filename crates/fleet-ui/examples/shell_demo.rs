@@ -39,18 +39,23 @@ fn rail_items() -> Vec<RailItem> {
             label: "Home".into(),
             icon: Icon::Grid,
             path: "/".into(),
+            badge: None,
         },
         RailItem {
             id: "search".into(),
             label: "Search".into(),
             icon: Icon::Search,
             path: "/search".into(),
+            badge: None,
         },
         RailItem {
             id: "alerts".into(),
             label: "Alerts".into(),
             icon: Icon::Alert,
             path: "/alerts".into(),
+            // Count chip — the slot coastwatch previously smuggled into
+            // the label text ("Editions (N)").
+            badge: Some(3),
         },
     ]
 }
@@ -125,8 +130,17 @@ fn DemoApp() -> impl IntoView {
                         user=user
                         app_links=app_links_sig
                         on_logout=Callback::new(|()| {})
+                        // footer is #[prop(optional)] now — a footer-less app
+                        // simply omits it. The demo passes one to exercise the
+                        // slot (and the `auto` grid row sizing).
                         footer=Box::new(|| view! {
                             <div class="statusbar">"demo footer"</div>
+                        }.into_any())
+                        // bottom-pinned rail slot (trawl's "Help — coming soon").
+                        rail_bottom=Box::new(|| view! {
+                            <div class="it" title="Pinned — demo">
+                                <span class="lb">"Pinned"</span>
+                            </div>
                         }.into_any())
                     >
                         <p style="padding:16px">"hello from the demo shell"</p>
