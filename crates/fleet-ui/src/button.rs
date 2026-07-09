@@ -18,6 +18,10 @@ pub enum Variant {
     Primary,
     Secondary,
     Danger,
+    /// The large amber form primary (bare `.btn`) — the login page's
+    /// submit button. Distinct from [`Variant::Primary`], which is the
+    /// compact `.btn-pri` used in modal footers and toolbars.
+    Form,
 }
 
 impl Variant {
@@ -26,24 +30,29 @@ impl Variant {
             Self::Primary => "btn-pri",
             Self::Secondary => "btn-sec",
             Self::Danger => "btn-danger",
+            Self::Form => "btn",
         }
     }
 }
 
-/// Compact button used in modal footers, toolbars, and toast actions.
+/// Typed button used in modal footers, toolbars, and forms.
 ///
 /// `on_click` carries `Callback<()>` — the variant encodes the
 /// semantic, the underlying mouse event is unused at every existing
-/// call site. Callers that need richer event data can wrap a raw
-/// `<button>` or extend this signature later.
+/// call site. It's optional: a submit button inside a `<form>` needs
+/// no click handler (an attribute-less `<button>` in a form defaults
+/// to `type=submit`, so the form's `on:submit` fires). Callers that
+/// need richer event data can wrap a raw `<button>` or extend this
+/// signature later.
 ///
-/// `full` opts into `btn-full` (width: 100%), used on the login form's
-/// large submit button.
+/// `disabled` is a reactive `Signal<bool>` (`#[prop(into)]`, so plain
+/// `disabled=true` still compiles); `full` opts into `btn-full`
+/// (width: 100%), used on the login form's large submit button.
 #[component]
 pub fn Btn(
     variant: Variant,
-    on_click: Callback<()>,
-    #[prop(default = false)] disabled: bool,
+    #[prop(into, optional)] on_click: Option<Callback<()>>,
+    #[prop(into, optional)] disabled: Signal<bool>,
     #[prop(default = false)] full: bool,
     children: Children,
 ) -> impl IntoView {
@@ -56,8 +65,12 @@ pub fn Btn(
     view! {
         <button
             class=class
-            disabled=disabled
-            on:click=move |_| on_click.run(())
+            disabled=move || disabled.get()
+            on:click=move |_| {
+                if let Some(cb) = on_click {
+                    cb.run(());
+                }
+            }
         >
             {children()}
         </button>

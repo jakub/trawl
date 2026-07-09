@@ -15,6 +15,8 @@
 use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
 
+use crate::button::{Btn, Variant};
+
 #[component]
 pub fn Login(
     #[prop(into)] brand: String,
@@ -63,13 +65,12 @@ pub fn Login(
                     />
                 </label>
 
-                <button
-                    type="submit"
-                    class="btn btn-full"
-                    disabled=move || submitting.get()
-                >
+                // Dogfooding: fleet-ui's own Btn, not raw class="btn btn-full"
+                // markup. No on_click — a <button> inside a <form> defaults to
+                // type=submit, so the form's on:submit drives the flow.
+                <Btn variant=Variant::Form full=true disabled=submitting>
                     {move || if submitting.get() { "Signing In…" } else { "Sign In" }}
-                </button>
+                </Btn>
             </form>
         </div>
     }

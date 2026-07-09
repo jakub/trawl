@@ -3,14 +3,18 @@
  *
  * Tokens, reset, base styles, and component CSS for fleet apps.
  * Extracted verbatim from trawl-web-ui's "Herring" main.css. App
- * consumers reach this file via Trunk:
+ * consumers reach this file via Trunk's `data-trunk rel="css"`
+ * directive; Trunk resolves the href relative to the consumer's
+ * index.html location. The two current consumers:
  *
- *   <link data-trunk rel="css" href="../fleet-ui/styles/fleet-ui.css"/>
+ *   trawl (crates/trawl-web-ui/index.html — sibling crate):
+ *     <link data-trunk rel="css" href="../fleet-ui/styles/fleet-ui.css"/>
  *
- * Trunk resolves the href relative to the consumer's Trunk.toml /
- * index.html location. From crates/trawl-web-ui/index.html the path
- * `../fleet-ui/styles/fleet-ui.css` resolves into this crate's
- * styles/ directory. Coastwatch-web will load it the same way.
+ *   coastwatch (crates/web-ui/index.html — sibling repo checkout):
+ *     <link data-trunk rel="css" href="../../../trawl/crates/fleet-ui/styles/fleet-ui.css"/>
+ *
+ * In both apps this file is linked BEFORE the app's own stylesheet so
+ * app-specific selectors keep cascade priority.
  *
  * @import is intentionally NOT used here. Trunk doesn't follow
  * @import — the browser fetches the imported file at runtime, hits
@@ -30,15 +34,18 @@
  *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd,
  *     .m-body, .m-ft
  *   - Toast host + items: .toasts, .toast, .toast.{success,error,info}
+ *   - Login page: .login-shell, .login-card
+ *   - App chrome: .shell grid, .topbar (brand/modes/jump/env/user),
+ *     .user-menu, .body, .main, .rail (+ .badge chip, .bot slot)
  *
- * What this file does NOT ship (stays in trawl-web-ui/styles/main.css):
+ * What this file does NOT ship (stays in each app's own stylesheet):
  *   - [data-rowstyle] selectors targeting .results-table (the enum is
  *     shared via fleet-ui, but the selector references trawl's table)
  *   - .btn-sm, .btn-xs, .btn-icon, .field-label and other extras
  *   - Trawl-specific modal sub-styles (.m-field, .m-body .preview,
- *     .m-ft .hint, .export-formats)
- *   - Anything app-specific: shell, topbar, rail, facets, editor,
- *     histogram, drawers, schema cards.
+ *     .m-ft .hint, .export-formats) and the status bar (.statusbar)
+ *   - Anything app-specific: facets, editor, histogram, drawers,
+ *     schema cards.
  */
 
 /* ─────────────────────────────────────────────────────────────────
