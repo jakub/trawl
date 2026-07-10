@@ -18,8 +18,8 @@ use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::components::sparkline::Sparkline;
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::time_fmt::{format_duration, time_ago};
+use fleet_ui::{ToastBus, ToastKind};
 
 const RUNS_PAGE_SIZE: usize = 20;
 const RESULT_PREVIEW_ROWS: usize = 20;
@@ -31,12 +31,12 @@ const INTERVAL_PRESETS: &[&str] = &["5m", "15m", "1h", "6h", "24h", "1w"];
 pub fn NetDrawer(
     net: SavedQueryResponse,
     tab: Signal<String>,
-    bus: ToastBus,
     on_close: Callback<()>,
     on_tab_change: Callback<String>,
     on_search: Callback<String>,
     on_refresh: Callback<()>,
 ) -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
     let net_for_query = net.clone();
     let net_for_runs = net.clone();
     let query_for_run = net.query.clone();

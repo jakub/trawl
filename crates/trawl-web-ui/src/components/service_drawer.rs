@@ -29,8 +29,8 @@ use trawl_api::{QueryResponse, ServiceColumnStats, ServiceSchema};
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::components::toast::ToastBus;
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
+use fleet_ui::{ToastBus, ToastKind};
 
 /// Display cap for the live-tail viewport — keeps the DOM snappy. The
 /// ring underneath still holds up to `LIVE_RING_CAPACITY` events.
@@ -44,12 +44,12 @@ const TOP_CARDINALITY_ROWS: usize = 6;
 pub fn ServiceDrawer(
     svc: ServiceSchema,
     tab: Signal<String>,
-    bus: ToastBus,
     on_close: Callback<()>,
     on_tab_change: Callback<String>,
     on_search: Callback<String>,
     on_use_field: Callback<String>,
 ) -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
     let svc_for_card = svc.clone();
     let svc_for_head = svc.clone();
     let svc_for_over = svc.clone();
@@ -544,7 +544,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
             Some(lc) => lifecycle.set_value(Some(lc)),
             None => {
                 bus.push(
-                    crate::components::toast::ToastKind::Error,
+                    ToastKind::Error,
                     "Tail unavailable",
                     Some(format!(
                         "Couldn't open a live stream for {svc_name_for_toast}."

@@ -6432,6 +6432,7 @@ dependencies = [
  "chrono",
  "coastwatch-api-types",
  "console_error_panic_hook",
+ "fleet-ui",
  "gloo-net 0.7.0",
  "gloo-timers",
  "js-sys",

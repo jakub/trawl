@@ -15,8 +15,8 @@ use leptos::web_sys;
 
 use crate::clipboard::write_clipboard;
 use crate::components::editor::DslEditor;
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{QUICK_RANGES, RangeSpec};
+use fleet_ui::{ToastBus, ToastKind};
 
 #[component]
 pub fn EditorWrap(
@@ -37,9 +37,8 @@ pub fn EditorWrap(
     running: Signal<bool>,
     /// Bubbles "save" click to the parent so it can open the save modal.
     on_save: Callback<()>,
-    /// Toast bus for share/format feedback.
-    bus: ToastBus,
 ) -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
     let on_run = on_submit;
     let format_trigger = RwSignal::new(0_u64);
 

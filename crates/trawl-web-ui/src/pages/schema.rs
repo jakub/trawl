@@ -23,13 +23,13 @@ use crate::api;
 use crate::components::service_card::ServiceCard;
 use crate::components::service_card_fmt::today_yesterday_utc;
 use crate::components::service_drawer::ServiceDrawer;
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{Mode, RangeSpec, navigator};
+use fleet_ui::{ToastBus, ToastKind};
 
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn SchemaPage() -> impl IntoView {
-    let bus = use_context::<ToastBus>().expect("ToastBus context");
+    let bus = expect_context::<ToastBus>();
     let qm = use_query_map();
     let svc_selected = Memo::new(move |_| qm.get().get("svc"));
     let tab_param = Memo::new(move |_| {
@@ -225,7 +225,6 @@ pub fn SchemaPage() -> impl IntoView {
                     <ServiceDrawer
                         svc=svc
                         tab=tab_sig
-                        bus=bus
                         on_close=on_close
                         on_tab_change=on_tab_change
                         on_search=on_search

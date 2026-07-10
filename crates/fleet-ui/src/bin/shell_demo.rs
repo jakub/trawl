@@ -3,15 +3,25 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Minimal Shell composition demo — proves the public API can be
-//! wired by an app that isn't trawl. Builds under wasm32 via:
+//! wired by an app that isn't trawl, including the [`ToastBus`] context
+//! contract: a child inside `Shell` (see [`ToastProbe`]) reaches the
+//! Shell-owned bus via `expect_context` and fires both a success and an
+//! error toast.
+//!
+//! This is a `src/bin` target (not an `examples/` file) so `cargo check
+//! -p fleet-ui --target wasm32-unknown-unknown` — the CI wasm gate —
+//! covers it by default (a plain `cargo check` builds bins but skips
+//! examples). Compile it standalone with:
 //!
 //! ```sh
-//! cargo build -p fleet-ui --example shell_demo --target wasm32-unknown-unknown
+//! cargo build -p fleet-ui --bin shell_demo --target wasm32-unknown-unknown
 //! ```
 //!
-//! For an actual rendered preview, a consumer would wire this into
-//! a `Trunk.toml` with `index.html` and `trunk serve`. The CI gate
-//! is the wasm compile; visual verification is manual.
+//! For a live rendered preview — the way AC5's "toasts fire via context"
+//! is actually observed — the crate ships `index.html` + `Trunk.toml`
+//! next to `Cargo.toml`, so `cd crates/fleet-ui && trunk serve` renders
+//! it with the real fleet-ui CSS. No backend or auth required: a success
+//! and an error toast fire on mount, and buttons re-fire on demand.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
@@ -23,7 +33,7 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 // TopBar and Rail are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
-use fleet_ui::{AppLink, Icon, Login, ModeTab, RailItem, Shell, UserInfo, install};
+use fleet_ui::{AppLink, Icon, Login, ModeTab, RailItem, Shell, ToastBus, UserInfo, install};
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -39,18 +49,23 @@ fn rail_items() -> Vec<RailItem> {
             label: "Home".into(),
             icon: Icon::Grid,
             path: "/".into(),
+            badge: None,
         },
         RailItem {
             id: "search".into(),
             label: "Search".into(),
             icon: Icon::Search,
             path: "/search".into(),
+            badge: None,
         },
         RailItem {
             id: "alerts".into(),
             label: "Alerts".into(),
             icon: Icon::Alert,
             path: "/alerts".into(),
+            // Count chip — the slot coastwatch previously smuggled into
+            // the label text ("Editions (N)").
+            badge: Some(3),
         },
     ]
 }
@@ -89,9 +104,56 @@ fn modes() -> Vec<ModeTab> {
     ]
 }
 
+/// Stands in for a page/modal rendered inside `Shell`: it reaches the
+/// Shell-owned [`ToastBus`] via `expect_context` (never constructing its
+/// own bus or `<Toasts/>` host) and fires both a success and an error
+/// toast. This is the "toasts fire via context" contract in miniature —
+/// verifiable with `trunk serve` alone, no backend or auth required. One
+/// of each fires on mount so a fresh load is self-evident; the buttons
+/// re-fire on demand.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn ToastProbe() -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
+
+    Effect::new(move |_| {
+        bus.push_success("Saved", Some("net created".into()));
+        bus.push_error("Export failed", Some("disk full".into()));
+    });
+
+    view! {
+        <div style="padding:16px;display:flex;flex-direction:column;gap:8px;align-items:flex-start">
+            <p>"hello from the demo shell"</p>
+            <div style="display:flex;gap:8px">
+                <button
+                    class="btn"
+                    on:click=move |_| bus.push_success("Saved", Some("net created".into()))
+                >
+                    "fire success"
+                </button>
+                <button
+                    class="btn"
+                    on:click=move |_| bus.push_error("Export failed", Some("disk full".into()))
+                >
+                    "fire error"
+                </button>
+            </div>
+        </div>
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn DemoApp() -> impl IntoView {
+    // Theme prefs must be installed from *inside* the component body:
+    // `install` registers an `Effect`, and effects can only be spawned
+    // once leptos's executor is live (which `mount_to_body` sets up
+    // before it renders this component). Calling it from `main` — before
+    // mount — panics with "spawn_local before a global executor was
+    // initialized". This mirrors trawl-web-ui's `App`, which likewise
+    // calls `fleet_ui::install` in its body.
+    let _prefs = install("fleet-ui-demo:prefs");
+
     let rail_items_sig = Signal::derive(rail_items);
     let app_links_sig = Signal::derive(app_links);
     let rail_active = Signal::derive(|| "home".to_string());
@@ -125,11 +187,23 @@ fn DemoApp() -> impl IntoView {
                         user=user
                         app_links=app_links_sig
                         on_logout=Callback::new(|()| {})
+                        // footer is #[prop(optional)] now — a footer-less app
+                        // simply omits it. The demo passes one to exercise the
+                        // slot (and the `auto` grid row sizing).
                         footer=Box::new(|| view! {
                             <div class="statusbar">"demo footer"</div>
                         }.into_any())
+                        // bottom-pinned rail slot (trawl's "Help — coming soon").
+                        rail_bottom=Box::new(|| view! {
+                            <div class="it" title="Pinned — demo">
+                                <span class="lb">"Pinned"</span>
+                            </div>
+                        }.into_any())
                     >
-                        <p style="padding:16px">"hello from the demo shell"</p>
+                        // Child rendered inside Shell — reaches the
+                        // Shell-owned ToastBus via expect_context and fires
+                        // success + error toasts (AC5's context contract).
+                        <ToastProbe/>
                         // Hidden export sentinel — proves Icon is in scope
                         // without re-mounting TopBar/Rail (which Shell
                         // already renders internally).
@@ -143,6 +217,5 @@ fn DemoApp() -> impl IntoView {
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    let _prefs = install("fleet-ui-demo:prefs");
     mount_to_body(DemoApp);
 }

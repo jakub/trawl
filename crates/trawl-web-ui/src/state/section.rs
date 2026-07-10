@@ -4,45 +4,40 @@
 
 //! Per-mode rail section. The valid set depends on which `AppMode` is
 //! active; the active section is derived from the current pathname.
+//!
+//! `RailItem`, `items_for`, and `default_for` are pure `&'static` data
+//! and build on every target so they can be unit-tested natively;
+//! `from_url` (the reactive `Memo`) is wasm32-only.
 
+// On native, only the tests consume `items_for` / `default_for`.
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
+use fleet_ui::Icon;
+#[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use leptos_router::hooks::use_location;
 
 use crate::state::app_mode::AppMode;
 
-/// Single item rendered in the left rail.
+/// Single item rendered in the left rail — a `&'static` descriptor;
+/// the `AuthShell` maps these onto owned `fleet_ui::RailItem`s at the
+/// Shell boundary. Icons are `fleet_ui::Icon` (ADR-0030: apps never
+/// inline raw SVG for chrome).
 #[derive(Debug, Clone, Copy)]
 pub struct RailItem {
     pub id: &'static str,
     pub label: &'static str,
-    pub icon: RailIcon,
+    pub icon: Icon,
     pub path: &'static str,
 }
 
-/// Icons we currently render in the rail. Kept as an enum so the SVG
-/// path stays in one place rather than scattered across templates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum RailIcon {
-    Search,
-    Clock,
-    Database,
-    News,
-    Alert,
-    Link,
-    Zap,
-    Check,
-    Grid,
-    User,
-    Chart,
-    Question,
-}
-
+// A flat `&'static` lookup table — splitting the match arms would only
+// obscure the per-mode rail definitions.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn items_for(mode: AppMode) -> &'static [RailItem] {
-    use RailIcon::{
-        Alert, Chart, Clock, Database, Grid, Link, News, Search as SearchIcon, User, Zap,
-    };
+    use Icon::{Alert, Chart, Clock, Database, Grid, Link, News, Search as SearchIcon, User, Zap};
     match mode {
         AppMode::Search => &[
             RailItem {
@@ -154,6 +149,7 @@ pub fn default_for(mode: AppMode) -> &'static str {
 /// pathname matched against the active mode's rail items. Prefers
 /// exact matches, then longest-prefix match, to avoid `/search`
 /// shadowing `/search/history`.
+#[cfg(target_arch = "wasm32")]
 #[must_use]
 pub fn from_url(mode: Memo<AppMode>) -> Memo<String> {
     let location = use_location();
@@ -178,4 +174,39 @@ pub fn from_url(mode: Memo<AppMode>) -> Memo<String> {
         }
         default_for(m).to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn every_mode_has_a_non_empty_rail_with_a_valid_default() {
+        for mode in AppMode::ALL {
+            let items = items_for(mode);
+            assert!(!items.is_empty(), "{mode:?} has no rail items");
+
+            // `default_for` indexes `items_for(mode)[0]` — assert it holds so
+            // the `from_url` fallback branch can never panic.
+            assert_eq!(
+                default_for(mode),
+                items[0].id,
+                "{mode:?} default should be its first item's id",
+            );
+
+            // ids must be unique per mode so section routing is unambiguous.
+            // (Settings items intentionally share `path: \"/settings\"`, so
+            // path uniqueness is deliberately NOT asserted.)
+            let mut ids = HashSet::new();
+            for item in items {
+                assert!(
+                    ids.insert(item.id),
+                    "{mode:?} has a duplicate rail item id: {}",
+                    item.id,
+                );
+            }
+        }
+    }
 }

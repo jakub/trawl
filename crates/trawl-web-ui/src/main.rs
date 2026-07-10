@@ -33,7 +33,9 @@ mod interop;
 #[cfg(target_arch = "wasm32")]
 mod pages;
 
-#[cfg(target_arch = "wasm32")]
+// `state` is ungated: its `app_mode` + `section` submodules carry pure
+// `&'static` data whose contracts are exercised by native `cargo test`;
+// the leptos-backed submodules inside it stay wasm32-gated.
 mod state;
 
 #[cfg(target_arch = "wasm32")]

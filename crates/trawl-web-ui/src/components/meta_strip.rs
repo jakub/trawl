@@ -6,8 +6,8 @@
 
 use leptos::prelude::*;
 
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{Filter, FilterOp};
+use fleet_ui::{ToastBus, ToastKind};
 
 #[component]
 pub fn MetaStrip(
@@ -25,8 +25,8 @@ pub fn MetaStrip(
     on_remove: Callback<usize>,
     /// Called when the user clicks the export action.
     on_export: Callback<()>,
-    bus: ToastBus,
 ) -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
     view! {
         <div class="meta">
             <div class="meta-count">

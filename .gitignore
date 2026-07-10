@@ -34,6 +34,9 @@ data/
 # trawl-web-ui trunk build output
 crates/trawl-web-ui/dist/
 
+# fleet-ui shell_demo trunk build output
+crates/fleet-ui/dist/
+
 # runtime-generated TLS certs (trawld self-signed)
 tls/
 

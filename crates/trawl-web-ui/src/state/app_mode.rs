@@ -7,8 +7,18 @@
 //! Distinct from the search-page `Mode` (Snapshot/Live) — that one
 //! lives under `state::query` and only governs the search workspace's
 //! result rendering. `AppMode` governs which page mounts.
+//!
+//! The enum + `mode_from_path` are pure and build on every target so
+//! `section`'s native tests can name modes; `from_url` (the reactive
+//! `Memo`) is wasm32-only.
 
+// On native, only the pure enum feeds `section`'s tests — the label /
+// path accessors are wasm-only consumers.
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
+#[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use leptos_router::hooks::use_location;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +67,7 @@ fn mode_from_path(path: &str) -> AppMode {
 
 /// `Memo<AppMode>` derived from the URL pathname. Reactive — uses the
 /// router's `use_location().pathname` which fires on every navigation.
+#[cfg(target_arch = "wasm32")]
 #[must_use]
 pub fn from_url() -> Memo<AppMode> {
     let location = use_location();

@@ -8,9 +8,18 @@
 //! Owns the [`ToastBus`] via `provide_context`. Owns nothing else.
 //! Does NOT do auth, fetch `/me`, render a status bar, or know what
 //! routes the app has. Consumers wrap `Shell` with whatever
-//! app-specific concerns they need — trawl's `AuthShell` (forthcoming)
-//! gates on `/me`, owns its `StatusBar`, passes that as the `footer`
-//! prop, and renders its router `<Outlet/>` as `children`.
+//! app-specific concerns they need — trawl's `AuthShell` gates on
+//! `/me`, owns its `StatusBar`, passes that as the `footer` prop, and
+//! renders its router `<Outlet/>` as `children`.
+//!
+//! # ToastBus contract
+//!
+//! Shell is the single owner of the toast stack: one bus, one
+//! `<Toasts/>` host, provided via context. `children` and `footer`
+//! closures execute inside Shell's body, so `<Outlet/>` page content
+//! reaches the bus with `expect_context::<ToastBus>()`. Consumers must
+//! not create their own bus or mount their own `<Toasts/>` inside a
+//! Shell — see [`crate::toast`] for the full contract.
 
 use leptos::prelude::*;
 
@@ -28,7 +37,14 @@ pub fn Shell(
     #[prop(into)] user: Signal<Option<UserInfo>>,
     #[prop(into, optional)] app_links: Signal<Vec<AppLink>>,
     on_logout: Callback<()>,
-    footer: Children,
+    /// App footer (status bar). Optional — footer-less apps omit it and
+    /// the shell grid's `auto` row collapses to zero height.
+    #[prop(optional)]
+    footer: Option<Children>,
+    /// Bottom-pinned rail slot, passed through to [`Rail`]'s `bottom`
+    /// prop (rendered inside `<div class="bot">`).
+    #[prop(optional)]
+    rail_bottom: Option<Children>,
     children: Children,
 ) -> impl IntoView {
     let bus = ToastBus::new();
@@ -45,12 +61,12 @@ pub fn Shell(
                 on_logout=on_logout
             />
             <div class="body">
-                <Rail items=rail_items active=rail_active/>
+                <Rail items=rail_items active=rail_active bottom=rail_bottom/>
                 <main class="main">
                     {children()}
                 </main>
             </div>
-            {footer()}
+            {footer.map(|f| f())}
             <Toasts bus=bus/>
         </div>
     }

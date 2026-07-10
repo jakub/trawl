@@ -30,7 +30,6 @@ use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::status_bar::StatusKind;
 use crate::components::tabs::{ResultsTab, Tabs};
-use crate::components::toast::ToastBus;
 use crate::pages::layout::ShellStatus;
 use crate::state::query::{
     Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, url_signals,
@@ -42,7 +41,6 @@ use crate::state::stream_session::{
 
 #[component]
 pub fn Search() -> impl IntoView {
-    let bus = use_context::<ToastBus>().expect("ToastBus context");
     let shell_status = use_context::<ShellStatus>().expect("ShellStatus context");
 
     let query_text = RwSignal::new(String::new());
@@ -290,7 +288,6 @@ pub fn Search() -> impl IntoView {
                     on_range_change=on_range_change
                     running=running
                     on_save=on_save
-                    bus=bus
                 />
                 <MetaStrip
                     count=last_count
@@ -298,7 +295,6 @@ pub fn Search() -> impl IntoView {
                     filters=filters_sig
                     on_remove=on_remove_filter
                     on_export=on_export
-                    bus=bus
                 />
                 <Tabs active=active_tab count=last_count/>
                 {move || match (active_tab.get(), mode.get()) {
@@ -311,7 +307,6 @@ pub fn Search() -> impl IntoView {
                                 on_paginate=on_paginate
                                 on_add_filter=on_add_filter
                                 on_navigate=on_navigate_q
-                                bus=bus
                             />
                         </>
                     }.into_any(),
@@ -330,14 +325,12 @@ pub fn Search() -> impl IntoView {
         <Show when=move || show_save_modal.get()>
             <SaveAsNetModal
                 query=effective_q.get_untracked()
-                bus=bus
                 on_close=Callback::new(move |_| show_save_modal.set(false))
             />
         </Show>
         <Show when=move || show_export_modal.get()>
             <ExportModal
                 query=effective_q.get_untracked()
-                bus=bus
                 on_close=Callback::new(move |_| show_export_modal.set(false))
             />
         </Show>

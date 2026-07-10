@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Login/>` — generic API-key sign-in form.
+//! Wasm-only `<Login/>` component — the leptos wiring around the pure
+//! [`validate`](super::validate) helpers.
 //!
 //! Brand-skinned card with one password field and a submit button.
 //! All async work — calling the auth endpoint, surfacing errors,
@@ -14,6 +15,9 @@
 
 use leptos::ev::SubmitEvent;
 use leptos::prelude::*;
+
+use super::validate::{combined, validate_key};
+use crate::button::{Btn, Variant};
 
 #[component]
 pub fn Login(
@@ -29,8 +33,8 @@ pub fn Login(
     let on_form_submit = move |ev: SubmitEvent| {
         ev.prevent_default();
         let key = api_key.get();
-        if key.trim().is_empty() {
-            set_local_error.set(Some("API key is required".into()));
+        if let Err(msg) = validate_key(&key) {
+            set_local_error.set(Some(msg.into()));
             return;
         }
         set_local_error.set(None);
@@ -40,7 +44,7 @@ pub fn Login(
     // Local validation wins over the external error signal: if the user
     // hits submit with an empty key after a prior failed attempt, they
     // need to see "API key is required", not the stale server message.
-    let combined_error = Signal::derive(move || local_error.get().or_else(|| error.get()));
+    let combined_error = Signal::derive(move || combined(local_error.get(), error.get()));
 
     view! {
         <div class="login-shell">
@@ -63,13 +67,12 @@ pub fn Login(
                     />
                 </label>
 
-                <button
-                    type="submit"
-                    class="btn btn-full"
-                    disabled=move || submitting.get()
-                >
+                // Dogfooding: fleet-ui's own Btn, not raw class="btn btn-full"
+                // markup. No on_click — a <button> inside a <form> defaults to
+                // type=submit, so the form's on:submit drives the flow.
+                <Btn variant=Variant::Form full=true disabled=submitting>
                     {move || if submitting.get() { "Signing In…" } else { "Sign In" }}
-                </button>
+                </Btn>
             </form>
         </div>
     }

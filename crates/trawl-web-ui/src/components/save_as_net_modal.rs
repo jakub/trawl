@@ -26,7 +26,7 @@ use leptos::web_sys;
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::components::toast::{ToastBus, ToastKind};
+use fleet_ui::{ToastBus, ToastKind};
 
 #[component]
 #[allow(clippy::too_many_lines)] // single-component dialog tree, not worth splitting further
@@ -34,14 +34,13 @@ use crate::components::toast::{ToastBus, ToastKind};
 pub fn SaveAsNetModal(
     /// The DSL query to save. Shown read-only in the preview strip.
     query: String,
-    /// Bus for success / error toasts. Cloned in.
-    bus: ToastBus,
     /// Called after a successful save OR cancel — parent should clear
     /// whatever made the modal open. The bool is `true` on save, `false`
     /// on cancel; the parent can use that to decide whether to also
     /// clear the row selection, etc.
     on_close: Callback<bool>,
 ) -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
     let suggested = suggest_name(&query);
     let name = RwSignal::new(suggested);
     let submitting = RwSignal::new(false);

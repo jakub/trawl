@@ -21,9 +21,9 @@ use trawl_api::HistoryEntryResponse;
 
 use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
-use crate::components::toast::{ToastBus, ToastKind};
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{format_duration, time_ago};
+use fleet_ui::{ToastBus, ToastKind};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -32,7 +32,7 @@ const PAGE_SIZE: usize = 50;
 #[component]
 #[allow(clippy::too_many_lines)] // page-level component: header + table + footer
 pub fn HistoryPage() -> impl IntoView {
-    let bus = use_context::<ToastBus>().expect("ToastBus context");
+    let bus = expect_context::<ToastBus>();
     let qm = use_query_map();
     let hpage = Memo::new(move |_| {
         qm.get()
@@ -255,7 +255,7 @@ pub fn HistoryPage() -> impl IntoView {
             </div>
 
             {move || save_target.get().map(|q| view! {
-                <SaveAsNetModal query=q bus=bus on_close=on_modal_close/>
+                <SaveAsNetModal query=q on_close=on_modal_close/>
             })}
         </div>
     }

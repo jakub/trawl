@@ -3,14 +3,18 @@
  *
  * Tokens, reset, base styles, and component CSS for fleet apps.
  * Extracted verbatim from trawl-web-ui's "Herring" main.css. App
- * consumers reach this file via Trunk:
+ * consumers reach this file via Trunk's `data-trunk rel="css"`
+ * directive; Trunk resolves the href relative to the consumer's
+ * index.html location. The two current consumers:
  *
- *   <link data-trunk rel="css" href="../fleet-ui/styles/fleet-ui.css"/>
+ *   trawl (crates/trawl-web-ui/index.html — sibling crate):
+ *     <link data-trunk rel="css" href="../fleet-ui/styles/fleet-ui.css"/>
  *
- * Trunk resolves the href relative to the consumer's Trunk.toml /
- * index.html location. From crates/trawl-web-ui/index.html the path
- * `../fleet-ui/styles/fleet-ui.css` resolves into this crate's
- * styles/ directory. Coastwatch-web will load it the same way.
+ *   coastwatch (crates/web-ui/index.html — sibling repo checkout):
+ *     <link data-trunk rel="css" href="../../../trawl/crates/fleet-ui/styles/fleet-ui.css"/>
+ *
+ * In both apps this file is linked BEFORE the app's own stylesheet so
+ * app-specific selectors keep cascade priority.
  *
  * @import is intentionally NOT used here. Trunk doesn't follow
  * @import — the browser fetches the imported file at runtime, hits
@@ -30,15 +34,18 @@
  *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd,
  *     .m-body, .m-ft
  *   - Toast host + items: .toasts, .toast, .toast.{success,error,info}
+ *   - Login page: .login-shell, .login-card
+ *   - App chrome: .shell grid, .topbar (brand/modes/jump/env/user),
+ *     .user-menu, .body, .main, .rail (+ .badge chip, .bot slot)
  *
- * What this file does NOT ship (stays in trawl-web-ui/styles/main.css):
+ * What this file does NOT ship (stays in each app's own stylesheet):
  *   - [data-rowstyle] selectors targeting .results-table (the enum is
  *     shared via fleet-ui, but the selector references trawl's table)
  *   - .btn-sm, .btn-xs, .btn-icon, .field-label and other extras
  *   - Trawl-specific modal sub-styles (.m-field, .m-body .preview,
- *     .m-ft .hint, .export-formats)
- *   - Anything app-specific: shell, topbar, rail, facets, editor,
- *     histogram, drawers, schema cards.
+ *     .m-ft .hint, .export-formats) and the status bar (.statusbar)
+ *   - Anything app-specific: facets, editor, histogram, drawers,
+ *     schema cards.
  */
 
 /* ─────────────────────────────────────────────────────────────────
@@ -473,9 +480,13 @@ textarea:focus-visible,
  *  Reserved class names from this point down: .shell, .topbar, .body,
  *  .main, .rail. Apps must NOT redefine these — they're shared chrome.
  * ─────────────────────────────────────────────────────────────── */
+/* Rows: topbar / body / footer. The `auto` footer row collapses to
+ * zero for footer-less apps and sizes to the footer's own height
+ * (e.g. trawl's .statusbar at var(--statusbar-h)) when the Shell's
+ * optional footer slot is filled. */
 .shell {
   display: grid;
-  grid-template-rows: var(--topbar-h) 1fr;
+  grid-template-rows: var(--topbar-h) 1fr auto;
   height: 100%;
 }
 
@@ -731,6 +742,24 @@ textarea:focus-visible,
   width: 2px;
   background: var(--amber);
   box-shadow: 0 0 6px var(--amber-glow);
+}
+/* Count chip — RailItem.badge. Anchored to the item's top-right
+ * corner (the .it is position: relative). */
+.rail .it .badge {
+  position: absolute;
+  top: 2px;
+  right: 0;
+  min-width: 15px;
+  padding: 1px 4px;
+  border-radius: 8px;
+  background: var(--amber-wash);
+  color: var(--amber);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 .rail .bot {
   margin-top: auto;
