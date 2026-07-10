@@ -76,8 +76,11 @@ fn custom_properties(css: &str) -> BTreeSet<String> {
 }
 
 /// The class families fleet-ui components render, which moved out of
-/// `main.css`. Kept in sync with `css_chrome_parity.rs`'s fleet-side
-/// presence assertions; here we assert their app-side absence.
+/// `main.css`; here we assert their app-side absence. The fleet-side
+/// presence guards live in two places: the issue #28 chrome rows are
+/// covered by `css_chrome_parity.rs`, and the issue #31 small-widget
+/// rows by `fleet-ui/tests/component_class_contract.rs`'s `emits(...)`
+/// assertions.
 const MOVED_SELECTORS: &[&str] = &[
     ".btn-sm",
     ".btn-xs",
