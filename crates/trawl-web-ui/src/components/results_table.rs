@@ -13,7 +13,7 @@
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::clipboard::write_clipboard;
 use crate::state::query::{Filter, FilterOp};
-use fleet_ui::{Btn, Size, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, Size, ToastBus, ToastKind, Variant};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::cmp::Ordering;
@@ -38,9 +38,10 @@ pub fn ResultsTable(
     let bus = expect_context::<ToastBus>();
     view! {
         <div class="results">
-            {move || match rows.get() {
-                None => view! { <div class="results-loading">"loading…"</div> }.into_any(),
-                Some(Ok(resp)) => view! {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(rows.get()))
+                label="results"
+                render=Box::new(move |resp: QueryResponse| view! {
                     <ResultsTableBody
                         resp=resp
                         page=page
@@ -49,13 +50,8 @@ pub fn ResultsTable(
                         on_navigate=on_navigate
                         bus=bus
                     />
-                }.into_any(),
-                Some(Err(err)) => view! {
-                    <div class="results-error">
-                        {format!("query failed: {err}")}
-                    </div>
-                }.into_any(),
-            }}
+                }.into_any())
+            />
         </div>
     }
 }

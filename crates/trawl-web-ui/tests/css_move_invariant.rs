@@ -133,6 +133,8 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".sd-dot",
     ".sd-dot.errors",
     ".run .kbd-inline",
+    ".results-loading",
+    ".results-error",
 ];
 
 #[test]

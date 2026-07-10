@@ -9,9 +9,10 @@ use coastwatch_api_types::enums::{
     Modality, Polarity, SourceClass, StoryClaimRelationship, StoryRelation,
 };
 use coastwatch_api_types::marking::MarkingView;
+use coastwatch_api_types::pagination::ItemBody;
 use coastwatch_api_types::pagination::PaginatedBody;
 use coastwatch_api_types::story::{
-    StoryClaimView, StoryRelationView, TimeRange, TimelineEventView,
+    StoryClaimView, StoryRelationView, StoryView, TimeRange, TimelineEventView,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -22,7 +23,7 @@ use crate::api::{ApiError, MeResponse};
 use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
 use crate::components::linkage_graph::LinkageGraph;
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, Variant};
 
 use super::stories::{class_label, state_badge};
 
@@ -72,28 +73,16 @@ pub fn StoryPage() -> impl IntoView {
 
     view! {
         <div class="page">
-            {move || match story_resource.get() {
-                None => view! {
-                    <div class="page-hd compact">
-                        <div><h1 class="mono" style="color:var(--ink-3)">"loading\u{2026}"</h1></div>
-                    </div>
-                }.into_any(),
-                Some(Err(ref e)) => {
-                    let msg = match e {
+            <Loaded
+                state=Signal::derive(move || {
+                    LoadState::from_resource_with(story_resource.get(), |e| match e {
                         ApiError::Status(404) => "story not found".to_string(),
                         ApiError::Status(503) => "intel service unavailable".to_string(),
-                        other => format!("error: {other}"),
-                    };
-                    view! {
-                        <div class="page-hd compact">
-                            <div>
-                                <h1 style="color:var(--red)">{msg}</h1>
-                                <p class="sub">"The story may not exist or you may not have permission to view it."</p>
-                            </div>
-                        </div>
-                    }.into_any()
-                }
-                Some(Ok(ref body)) => {
+                        other => other.to_string(),
+                    })
+                })
+                label="story"
+                render=Box::new(move |body: ItemBody<StoryView>| {
                     let story = &body.data;
                     let (state_label, state_color) = state_badge(&story.state);
                     let cls = class_label(&story.story_class);
@@ -147,8 +136,8 @@ pub fn StoryPage() -> impl IntoView {
                             relations=Signal::derive(move || relations_for_graph.get())
                         />
                     }.into_any()
-                }
-            }}
+                })
+            />
         </div>
     }
 }
@@ -377,18 +366,18 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
     view! {
         <div>
             <div class="intel-section-hd" style="margin-top:0">"Timeline"</div>
-            {move || {
-                if loading.get() && items.get().is_empty() {
-                    return view! {
-                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
-                    }.into_any();
-                }
-                if let Some(ref e) = error.get() {
-                    return view! {
-                        <p class="mono" style="color:var(--red);font-size:var(--table-fs)">{e.clone()}</p>
-                    }.into_any();
-                }
-                let rows = items.get();
+            <Loaded
+                state=Signal::derive(move || {
+                    if let Some(e) = error.get() {
+                        return LoadState::Error(e);
+                    }
+                    if loading.get() && items.get().is_empty() {
+                        return LoadState::Loading;
+                    }
+                    LoadState::Ready(items.get())
+                })
+                label="timeline"
+                render=Box::new(move |rows: Vec<TimelineEventView>| {
                 if rows.is_empty() {
                     return view! {
                         <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no timeline events yet"</p>
@@ -440,7 +429,8 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                         }
                     })}
                 }.into_any()
-            }}
+            })
+            />
         </div>
     }
 }
@@ -493,42 +483,40 @@ fn StoryLineage(story_id: String, now_ms: i64) -> impl IntoView {
 
     view! {
         <div style="margin-top:12px">
-            {move || {
-                if loading.get() {
-                    return view! {
-                        <div class="intel-section-hd">"Lineage"</div>
-                        <span class="mono" style="font-size:11px;color:var(--ink-3)">"loading\u{2026}"</span>
-                    }.into_any();
-                }
-                if let Some(ref e) = error.get() {
-                    return view! {
-                        <div class="intel-section-hd">"Lineage"</div>
-                        <span class="mono" style="font-size:11px;color:var(--red)">{format!("error: {e}")}</span>
-                    }.into_any();
-                }
-                let anc = ancestors.get();
-                let desc = descendants.get();
-                if anc.is_empty() && desc.is_empty() {
-                    return view! {
-                        <div class="intel-section-hd">"Lineage"</div>
-                        <p class="mono" style="font-size:11px;color:var(--ink-3);margin:4px 0">"no derivation history"</p>
-                    }.into_any();
-                }
-                view! {
-                    <LineageTree
-                        label="Sources"
-                        nodes=anc
-                        can_write=can_write.get()
-                        now_ms=now_ms
-                    />
-                    <LineageTree
-                        label="Derived"
-                        nodes=desc
-                        can_write=can_write.get()
-                        now_ms=now_ms
-                    />
-                }.into_any()
-            }}
+            <div class="intel-section-hd">"Lineage"</div>
+            <Loaded
+                state=Signal::derive(move || {
+                    if let Some(e) = error.get() {
+                        return LoadState::Error(e);
+                    }
+                    if loading.get() {
+                        return LoadState::Loading;
+                    }
+                    LoadState::Ready((ancestors.get(), descendants.get()))
+                })
+                label="lineage"
+                render=Box::new(move |(anc, desc): (Vec<LineageNode>, Vec<LineageNode>)| {
+                    if anc.is_empty() && desc.is_empty() {
+                        return view! {
+                            <p class="mono" style="font-size:11px;color:var(--ink-3);margin:4px 0">"no derivation history"</p>
+                        }.into_any();
+                    }
+                    view! {
+                        <LineageTree
+                            label="Sources"
+                            nodes=anc
+                            can_write=can_write.get()
+                            now_ms=now_ms
+                        />
+                        <LineageTree
+                            label="Derived"
+                            nodes=desc
+                            can_write=can_write.get()
+                            now_ms=now_ms
+                        />
+                    }.into_any()
+                })
+            />
         </div>
     }
 }
@@ -683,18 +671,18 @@ fn ClaimsSection(
     view! {
         <div>
             <div class="intel-section-hd">"Claims"</div>
-            {move || {
-                if loading.get() && items.get().is_empty() {
-                    return view! {
-                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
-                    }.into_any();
-                }
-                if let Some(ref e) = error.get() {
-                    return view! {
-                        <p class="mono" style="color:var(--red);font-size:var(--table-fs)">{e.clone()}</p>
-                    }.into_any();
-                }
-                let rows = items.get();
+            <Loaded
+                state=Signal::derive(move || {
+                    if let Some(e) = error.get() {
+                        return LoadState::Error(e);
+                    }
+                    if loading.get() && items.get().is_empty() {
+                        return LoadState::Loading;
+                    }
+                    LoadState::Ready(items.get())
+                })
+                label="claims"
+                render=Box::new(move |rows: Vec<StoryClaimView>| {
                 if rows.is_empty() {
                     return view! {
                         <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no claims yet"</p>
@@ -811,7 +799,8 @@ fn ClaimsSection(
                         })}
                     </div>
                 }.into_any()
-            }}
+            })
+            />
         </div>
     }
 }
@@ -961,26 +950,23 @@ fn claim_row(
                 if exp.as_deref() != Some(&evidence_id) {
                     return ().into_any();
                 }
-                let cached = evidence_cache.get();
-                match cached.get(&evidence_id) {
-                    None => view! {
-                        <div class="evidence-panel">
-                            <span class="mono" style="color:var(--ink-3)">"loading evidence\u{2026}"</span>
-                        </div>
-                    }.into_any(),
-                    Some(Err(msg)) => view! {
-                        <div class="evidence-panel">
-                            <span class="mono" style="color:var(--red)">{format!("error: {msg}")}</span>
-                        </div>
-                    }.into_any(),
-                    Some(Ok(evs)) if evs.is_empty() => view! {
-                        <div class="evidence-panel">
+                let eid_state = evidence_id.clone();
+                let eid_render = evidence_id.clone();
+                view! {
+                    <div class="evidence-panel">
+                        <Loaded
+                            state=Signal::derive(move || {
+                                LoadState::from_resource(evidence_cache.get().get(&eid_state).cloned())
+                            })
+                            label="evidence"
+                            render=Box::new(move |evs: Vec<ClaimEvidenceView>| {
+                    if evs.is_empty() {
+                        return view! {
                             <span class="mono" style="color:var(--ink-3)">"no evidence records"</span>
-                        </div>
-                    }.into_any(),
-                    Some(Ok(evs)) => {
+                        }.into_any();
+                    }
                         let lineage = lineage_cache.get();
-                        let lineage_view = match lineage.get(&evidence_id) {
+                        let lineage_view = match lineage.get(&eid_render) {
                             Some(Ok((anc, desc))) if !anc.is_empty() || !desc.is_empty() => {
                                 view! {
                                     <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line)">
@@ -1002,7 +988,7 @@ fn claim_row(
                             _ => ().into_any(),
                         };
                         view! {
-                            <div class="evidence-panel">
+                            <div>
                                 {evs.iter().map(|ev| {
                                     let factual = ev.factual_summary.clone()
                                         .unwrap_or_else(|| "\u{2014}".into());
@@ -1028,8 +1014,10 @@ fn claim_row(
                                 {lineage_view}
                             </div>
                         }.into_any()
-                    },
-                }
+                            })
+                        />
+                    </div>
+                }.into_any()
             }}
         </div>
     }
@@ -1046,17 +1034,15 @@ fn RelationsSection(
     view! {
         <div>
             <div class="intel-section-hd">"Related stories"</div>
-            {move || match relations.get() {
-                None => view! {
-                    <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
-                }.into_any(),
-                Some(Err(ref e)) => view! {
-                    <p class="mono" style="color:var(--red);font-size:var(--table-fs)">{e.to_string()}</p>
-                }.into_any(),
-                Some(Ok(ref body)) if body.items.is_empty() => view! {
-                    <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no related stories"</p>
-                }.into_any(),
-                Some(Ok(ref body)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(relations.get()))
+                label="related stories"
+                render=Box::new(move |body: PaginatedBody<StoryRelationView>| {
+                    if body.items.is_empty() {
+                        return view! {
+                            <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no related stories"</p>
+                        }.into_any();
+                    }
                     let current_id = story_id.clone();
                     view! {
                         <div class="tbl" style="margin-bottom:16px">
@@ -1097,8 +1083,8 @@ fn RelationsSection(
                             </div>
                         </div>
                     }.into_any()
-                }
-            }}
+                })
+            />
         </div>
     }
 }

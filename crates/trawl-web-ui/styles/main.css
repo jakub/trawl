@@ -88,20 +88,13 @@
  *  Results table — base styles (augmented by v2 block below)
  * ─────────────────────────────────────────────────────────────── */
 
-.results-loading,
-.results-empty,
-.results-error {
+/* .results-loading / .results-error retired (issue #31): the results
+ * pane renders fleet_ui::Loaded (.load-hint family). */
+.results-empty {
   padding: 12px 16px;
   color: var(--ink-3);
   font-size: 12px;
   font-family: var(--font-mono);
-}
-
-.results-error {
-  color: var(--red);
-  background: var(--red-wash);
-  border: 1px solid var(--red);
-  border-radius: 3px;
 }
 
 .results-table-wrap {

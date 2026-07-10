@@ -13,7 +13,7 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Icon, IconView, Size, StatusDot, Variant};
+use fleet_ui::{Btn, Icon, IconView, LoadState, Loaded, Size, StatusDot, Variant};
 
 const RUNS_PAGE_SIZE: usize = 20;
 
@@ -122,21 +122,11 @@ pub fn RunsPage() -> impl IntoView {
                     <div style="flex:0 0 50px; text-align:right">"Rows"</div>
                 </div>
                 <div class="tbl-body">
-                    {move || {
-                        let now = now_ms();
-                        match runs.get() {
-                            None => view! {
-                                <div class="tbl-empty">"loading runs…"</div>
-                            }.into_any(),
-                            Some(Err(e)) => {
-                                let msg = e.to_string();
-                                view! {
-                                    <div class="tbl-empty" style="color:var(--red)">
-                                        {format!("couldn't load runs: {msg}")}
-                                    </div>
-                                }.into_any()
-                            }
-                            Some(Ok(resp)) => {
+                    <Loaded
+                        state=Signal::derive(move || LoadState::from_resource(runs.get()))
+                        label="runs"
+                        render=Box::new(move |resp: trawl_api::ListAllRunsResponse| {
+                                let now = now_ms();
                                 if resp.runs.is_empty() {
                                     return view! {
                                         <div class="tbl-empty">
@@ -203,9 +193,8 @@ pub fn RunsPage() -> impl IntoView {
                                         </span>
                                     </div>
                                 }.into_any()
-                            }
-                        }
-                    }}
+                        })
+                    />
                 </div>
             </div>
         </div>

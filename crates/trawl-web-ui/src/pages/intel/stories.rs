@@ -11,7 +11,7 @@ use leptos_router::hooks::use_navigate;
 use crate::api;
 use crate::api::ApiError;
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, ToastBus, ToastKind, Variant};
 
 #[component]
 pub fn StoriesPage() -> impl IntoView {
@@ -68,36 +68,21 @@ pub fn StoriesPage() -> impl IntoView {
                 </div>
             </div>
 
-            {move || {
-                if loading.get() && items.get().is_empty() {
-                    return view! {
-                        <div class="tbl">
-                            <div class="tbl-body">
-                                <div class="tbl-row" style="cursor:default">
-                                    <span class="mono" style="color:var(--ink-3)">"loading\u{2026}"</span>
-                                </div>
-                            </div>
-                        </div>
-                    }.into_any();
-                }
-
-                if let Some(ref e) = error.get() {
-                    let msg = match e {
-                        ApiError::Status(503) => "intel service unavailable \u{2014} configure web.coastwatch_url in trawld.toml".to_string(),
-                        other => format!("couldn't load stories: {other}"),
-                    };
-                    return view! {
-                        <div class="tbl">
-                            <div class="tbl-body">
-                                <div class="tbl-row" style="cursor:default">
-                                    <span class="mono" style="color:var(--red)">{msg}</span>
-                                </div>
-                            </div>
-                        </div>
-                    }.into_any();
-                }
-
-                let rows = items.get();
+            <Loaded
+                state=Signal::derive(move || {
+                    if let Some(e) = error.get() {
+                        return LoadState::Error(match e {
+                            ApiError::Status(503) => "intel service unavailable \u{2014} configure web.coastwatch_url in trawld.toml".to_string(),
+                            other => other.to_string(),
+                        });
+                    }
+                    if loading.get() && items.get().is_empty() {
+                        return LoadState::Loading;
+                    }
+                    LoadState::Ready(items.get())
+                })
+                label="stories"
+                render=Box::new(move |rows: Vec<StoryView>| {
                 if rows.is_empty() {
                     return view! {
                         <div class="tbl">
@@ -212,7 +197,8 @@ pub fn StoriesPage() -> impl IntoView {
                         }}
                     </div>
                 }.into_any()
-            }}
+            })
+            />
         </div>
     }
 }

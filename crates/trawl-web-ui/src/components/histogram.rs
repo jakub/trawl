@@ -14,6 +14,7 @@
 //! `max` on the left; time anchors on the bottom derived from the
 //! current `RangeSpec`). Per-bar tooltips appear on hover.
 
+use fleet_ui::{LoadState, Loaded};
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
 use trawl_api::value::Value;
@@ -33,14 +34,12 @@ pub fn Histogram(
 ) -> impl IntoView {
     view! {
         <div class="histo">
-            {move || match rows.get() {
-                None => view! {
-                    <div class="histo-hint">"loading…"</div>
-                }.into_any(),
-                Some(Err(_)) => view! {
-                    <div class="histo-hint">"—"</div>
-                }.into_any(),
-                Some(Ok(resp)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(rows.get()))
+                // Deliberate quiet-error override (issue #31 C4): the
+                // results table already surfaces the query failure.
+                error=Box::new(|_| view! { <div class="histo-hint">"—"</div> }.into_any())
+                render=Box::new(move |resp: QueryResponse| {
                     let buckets = build_buckets(&resp);
                     if buckets.is_empty() {
                         return view! {
@@ -81,8 +80,8 @@ pub fn Histogram(
                             <span>{x_end}</span>
                         </div>
                     }.into_any()
-                }
-            }}
+                })
+            />
         </div>
     }
 }

@@ -20,7 +20,9 @@ use crate::components::net_drawer::NetDrawer;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{time_ago, time_until};
-use fleet_ui::{Btn, ConfirmModal, Icon, IconView, StatusDot, ToastBus, ToastKind, Variant};
+use fleet_ui::{
+    Btn, ConfirmModal, Icon, IconView, LoadState, Loaded, StatusDot, ToastBus, ToastKind, Variant,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetSort {
@@ -218,21 +220,11 @@ pub fn NetsPage() -> impl IntoView {
                     <div style="flex:0 0 40px"></div>
                 </div>
                 <div class="tbl-body">
-                    {move || {
-                        let now = now_ms();
-                        match nets.get() {
-                            None => view! {
-                                <div class="tbl-empty">"loading nets…"</div>
-                            }.into_any(),
-                            Some(Err(e)) => {
-                                let msg = e.to_string();
-                                view! {
-                                    <div class="tbl-empty" style="color:var(--red)">
-                                        {format!("couldn't load nets: {msg}")}
-                                    </div>
-                                }.into_any()
-                            }
-                            Some(Ok(resp)) => {
+                    <Loaded
+                        state=Signal::derive(move || LoadState::from_resource(nets.get()))
+                        label="nets"
+                        render=Box::new(move |resp: trawl_api::ListSavedResponse| {
+                                let now = now_ms();
                                 let needle = filter.get().to_lowercase();
                                 let mut visible: Vec<&SavedQueryResponse> = resp.queries.iter()
                                     .filter(|q| {
@@ -397,9 +389,8 @@ pub fn NetsPage() -> impl IntoView {
                                         <span>{format!("{count} net{}", if count == 1 { "" } else { "s" })}</span>
                                     </div>
                                 }.into_any()
-                            }
-                        }
-                    }}
+                        })
+                    />
                 </div>
             </div>
 

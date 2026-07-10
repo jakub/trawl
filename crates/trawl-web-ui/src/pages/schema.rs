@@ -24,7 +24,7 @@ use crate::components::service_card::ServiceCard;
 use crate::components::service_card_fmt::today_yesterday_utc;
 use crate::components::service_drawer::ServiceDrawer;
 use crate::state::query::{Mode, RangeSpec, navigator};
-use fleet_ui::{Btn, Icon, IconView, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Icon, IconView, LoadState, Loaded, ToastBus, ToastKind, Variant};
 
 #[component]
 #[allow(clippy::too_many_lines)]
@@ -155,19 +155,10 @@ pub fn SchemaPage() -> impl IntoView {
             </div>
 
             <div class=move || if compact.get() { "sc-grid compact" } else { "sc-grid" }>
-                {move || match services.get() {
-                    None => view! {
-                        <div class="sc-more" style="padding:24px">"loading schema…"</div>
-                    }.into_any(),
-                    Some(Err(e)) => {
-                        let msg = e.to_string();
-                        view! {
-                            <div class="sc-more" style="padding:24px; color:var(--red)">
-                                {format!("couldn't load schema: {msg}")}
-                            </div>
-                        }.into_any()
-                    }
-                    Some(Ok(resp)) => {
+                <Loaded
+                    state=Signal::derive(move || LoadState::from_resource(services.get()))
+                    label="schema"
+                    render=Box::new(move |resp: trawl_api::ServiceSchemaResponse| {
                         let needle = filter.get().to_lowercase();
                         let visible: Vec<ServiceSchema> = resp.services.iter()
                             .filter(|s| {
@@ -208,8 +199,8 @@ pub fn SchemaPage() -> impl IntoView {
                                 />
                             }
                         }).collect::<Vec<_>>().into_any()
-                    }
-                }}
+                    })
+                />
             </div>
 
             {move || {

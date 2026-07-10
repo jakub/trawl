@@ -18,8 +18,8 @@ use trawl_api::value::QueryResult;
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
 use fleet_ui::{
-    Btn, Drawer, Size, Sparkline, StatusDot, TabItem, ToastBus, ToastKind, Toggle, Variant,
-    effective_active,
+    Btn, Drawer, LoadState, Loaded, Size, Sparkline, StatusDot, TabItem, ToastBus, ToastKind,
+    Toggle, Variant, effective_active,
 };
 
 const RUNS_PAGE_SIZE: usize = 20;
@@ -482,17 +482,11 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                 }
             }}
 
-            {move || {
-                let now = now_ms();
-                match runs.get() {
-                    None => view! { <div style="padding:12px; color:var(--ink-3)">"loading runs…"</div> }.into_any(),
-                    Some(Err(e)) => {
-                        let msg = e.to_string();
-                        view! {
-                            <div style="padding:12px; color:var(--red)">{format!("couldn't load runs: {msg}")}</div>
-                        }.into_any()
-                    }
-                    Some(Ok(resp)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(runs.get()))
+                label="runs"
+                render=Box::new(move |resp: trawl_api::ListReportRunsResponse| {
+                        let now = now_ms();
                         if resp.runs.is_empty() {
                             return view! {
                                 <div style="padding:12px; color:var(--ink-3)">"no runs yet — attach a schedule to start."</div>
@@ -576,9 +570,8 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                 </div>
                             </div>
                         }.into_any()
-                    }
-                }
-            }}
+                })
+            />
         </div>
     }
 }
@@ -599,13 +592,10 @@ fn RunResultPreview(
 
     view! {
         <div class="run-preview">
-            {move || match result.get() {
-                None => view! { <span style="color:var(--ink-3)">"loading result…"</span> }.into_any(),
-                Some(Err(e)) => {
-                    let msg = e.to_string();
-                    view! { <span style="color:var(--red)">{msg}</span> }.into_any()
-                }
-                Some(Ok(resp)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(result.get()))
+                label="result"
+                render=Box::new(move |resp: trawl_api::ReportRunResponse| {
                     match resp.result {
                         None => view! {
                             <span style="color:var(--ink-3)">"no result data (error or still running)"</span>
@@ -623,8 +613,8 @@ fn RunResultPreview(
                             }.into_any()
                         }
                     }
-                }
-            }}
+                })
+            />
         </div>
     }
 }

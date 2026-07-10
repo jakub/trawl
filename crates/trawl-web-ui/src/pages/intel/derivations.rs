@@ -216,15 +216,18 @@ pub fn DerivationsPage() -> impl IntoView {
                 <Btn variant=Variant::Primary on_click=Callback::new(on_submit_click)>"Load lineage"</Btn>
             </div>
 
-            // Loading / error
+            // Loading / error — the canonical fleet-ui hint class + copy,
+            // rendered directly (not via <Loaded/>) because this page
+            // shows the indicators ABOVE content that stays visible
+            // while a reload is in flight.
             {move || loading.get().then(|| view! {
                 <div style="padding:0 var(--pad)">
-                    <span class="mono" style="color:var(--ink-3)">"loading\u{2026}"</span>
+                    <div class="load-hint">{fleet_ui::loaded::loading_copy(Some("lineage"))}</div>
                 </div>
             })}
             {move || error.get().map(|e| view! {
                 <div style="padding:0 var(--pad)">
-                    <span class="mono" style="color:var(--red)">{format!("error: {e}")}</span>
+                    <div class="load-hint error">{fleet_ui::loaded::error_copy(Some("lineage"), &e)}</div>
                 </div>
             })}
 

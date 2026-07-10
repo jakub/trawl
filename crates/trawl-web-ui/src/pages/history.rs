@@ -23,7 +23,7 @@ use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Icon, IconView, Size, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Icon, IconView, LoadState, Loaded, Size, ToastBus, ToastKind, Variant};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -145,23 +145,10 @@ pub fn HistoryPage() -> impl IntoView {
                     <div style="flex:0 0 72px; text-align:right"></div>
                 </div>
                 <div class="tbl-body">
-                {move || match resource.get() {
-                    None => view! {
-                        <div class="tbl-row" style="cursor:default">
-                            <span class="mono" style="color:var(--ink-3)">"loading…"</span>
-                        </div>
-                    }.into_any(),
-                    Some(Err(e)) => {
-                        let msg = e.to_string();
-                        view! {
-                            <div class="tbl-row" style="cursor:default">
-                                <span class="mono" style="color:var(--red)">
-                                    {format!("couldn't load history: {msg}")}
-                                </span>
-                            </div>
-                        }.into_any()
-                    }
-                    Some(Ok(resp)) => {
+                <Loaded
+                    state=Signal::derive(move || LoadState::from_resource(resource.get()))
+                    label="history"
+                    render=Box::new(move |resp: trawl_api::HistoryResponse| {
                         let needle = filter.get().to_lowercase();
                         let filtered: Vec<HistoryEntryResponse> = resp
                             .entries
@@ -220,8 +207,8 @@ pub fn HistoryPage() -> impl IntoView {
                                 </div>
                             }
                         }).collect::<Vec<_>>().into_any()
-                    }
-                }}
+                    })
+                />
                 </div>
 
                 {move || {
