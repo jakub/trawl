@@ -757,13 +757,7 @@ impl ExecutorPool {
             let hot_tempfile = hot_buffer
                 .as_ref()
                 .and_then(|hb| hb.snapshot())
-                .and_then(|f| {
-                    if f.path().to_str().is_some() {
-                        Some(f)
-                    } else {
-                        None
-                    }
-                });
+                .filter(|f| f.path().to_str().is_some());
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Some(ref hot_file) = hot_tempfile {
