@@ -12,16 +12,16 @@
 //! crate's directory.
 //!
 //! Most modules are wasm32-only — they pull leptos / web-sys / gloo
-//! and only make sense in a browser. The exceptions are [`theme::prefs`]
-//! and [`toast::kinds`]: pure layers that build on every target so the
-//! `localStorage` JSON contract and the toast CSS-class contract can be
+//! and only make sense in a browser. The exceptions are [`theme::prefs`],
+//! [`toast::kinds`], and [`button::variant`]: pure layers that build on
+//! every target so the `localStorage` JSON contract, the toast
+//! CSS-class contract, and the button CSS-class contract can be
 //! exercised by native unit tests (and named by native consumer code).
 
+pub mod button;
 pub mod theme;
 pub mod toast;
 
-#[cfg(target_arch = "wasm32")]
-pub mod button;
 #[cfg(target_arch = "wasm32")]
 pub mod field;
 #[cfg(target_arch = "wasm32")]
@@ -37,11 +37,12 @@ pub mod shell;
 #[cfg(target_arch = "wasm32")]
 pub mod topbar;
 
+pub use button::Variant;
 pub use theme::{Density, RowStyle, Theme};
 pub use toast::ToastKind;
 
 #[cfg(target_arch = "wasm32")]
-pub use button::{Btn, Variant};
+pub use button::Btn;
 #[cfg(target_arch = "wasm32")]
 pub use field::{Field, Helper};
 #[cfg(target_arch = "wasm32")]
