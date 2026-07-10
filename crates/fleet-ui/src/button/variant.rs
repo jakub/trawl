@@ -3,12 +3,17 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Pure button variant. No `leptos`, no `web_sys` — builds on every
-//! target so the CSS-class contract is exercised by native unit tests
-//! (mirrors [`crate::toast::kinds`]). The migration in issue #27
-//! restructured trawl's login submit from hand-written
-//! `class="btn btn-full"` markup into `<Btn variant=Variant::Form>`;
-//! the native test below locks that rendered class attribute so the
-//! zero-visual-change (AC3) contract can't silently drift.
+//! target so the per-variant CSS-class fragment is exercised by native
+//! unit tests (mirrors [`crate::toast::kinds`]). The migration in issue
+//! #27 restructured trawl's login submit from hand-written
+//! `class="btn btn-full"` markup into `<Btn variant=Variant::Form>`.
+//!
+//! Scope note: the rendered class *composition*
+//! (`format!("{} btn-full", …)`) lives in the wasm-only
+//! [`Btn`](super::Btn) component, so it is not verified natively. These
+//! tests only lock the class fragment each variant maps to; the
+//! `btn-full` suffix and the ordering that make up the full attribute
+//! are a wasm-only concern.
 
 /// Visual variant. Maps onto the CSS classes shipped in
 /// `styles/fleet-ui.css`.
@@ -50,17 +55,5 @@ mod tests {
         assert_eq!(Variant::Secondary.css_class(), "btn-sec");
         assert_eq!(Variant::Danger.css_class(), "btn-danger");
         assert_eq!(Variant::Form.css_class(), "btn");
-    }
-
-    /// The migration (issue #27) replaced trawl's raw
-    /// `class="btn btn-full"` login submit markup with
-    /// `<Btn variant=Variant::Form full=true>`. Assert that path still
-    /// produces the byte-identical class attribute — the AC3
-    /// zero-visual-change guard for the one chrome element whose DOM was
-    /// restructured from hand-written markup to a component.
-    #[test]
-    fn form_full_renders_login_class() {
-        let full = format!("{} btn-full", Variant::Form.css_class());
-        assert_eq!(full, "btn btn-full");
     }
 }
