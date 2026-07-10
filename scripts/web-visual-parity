@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# web-visual-parity — produce the AC5 "zero visual change" before/after grid
+# for the trawl-web-ui → fleet-ui migration (issue #28, slice B).
+#
+# WHY THIS EXISTS
+# ---------------
+# AC5 requires a before/after screenshot grid of every migrated surface in
+# BOTH themes, attached to the PR. The structural backstops
+# (`css_chrome_parity::moved_chrome_is_byte_identical_to_premigration`,
+# `css_move_invariant`, login DOM parity) prove the CSS moved byte-identical
+# and lives in one place — but no native test observes rendered pixels.
+# PR #29 produced its grid by an ad-hoc two-build headless capture that lived
+# only in the PR body, so every slice re-improvises it. This script makes the
+# capture repeatable: it pins the exact surface × theme × overlay matrix
+# (`manifest`) and gates the captured pair set on pixel identity (`diff`).
+#
+# METHOD (the two-build capture PR #29 proved, made a command)
+# ------------------------------------------------------------
+#   1. Build the SPA at the pre-migration ref and at HEAD into isolated
+#      dist/ dirs, and serve each on its own port against ONE trawld, so the
+#      *content* is identical and only the chrome differs:
+#
+#        # before build (pre-migration baseline for this slice)
+#        git worktree add /tmp/wvp-before "$(git merge-base HEAD origin/main)"
+#        ( cd /tmp/wvp-before/crates/trawl-web-ui && trunk build --release )
+#        TRAWL_WEB_SPA_DIR=/tmp/wvp-before/crates/trawl-web-ui/dist \
+#          TRAWL_WEB_LISTEN=127.0.0.1:8080 cargo run -p trawl-web &
+#
+#        # after build (this worktree)
+#        ( cd crates/trawl-web-ui && trunk build --release )
+#        TRAWL_WEB_SPA_DIR=$(pwd)/crates/trawl-web-ui/dist \
+#          TRAWL_WEB_LISTEN=127.0.0.1:8081 cargo run -p trawl-web &
+#
+#      (Both trawl-web instances point their [web] upstream at the same
+#      trawld — the live homelab server via the base profile, or a local dev
+#      trawld — so rows/telemetry match. See crates/trawl-web-ui/Trunk.toml.)
+#
+#   2. Walk the `manifest` (below) in a logged-in browser, capturing each
+#      surface at a fixed 1600×900 viewport into two dirs. Authed surfaces
+#      use cookie sessions and the modal/drawer states need click-through, so
+#      this step is driven by the agent browser (claude-in-chrome MCP, or the
+#      chrome extension) — the method AC5 calls out as proven in PR #29 —
+#      writing PNGs named <surface>.<theme>.png:
+#
+#        target/visual-parity/before/login.light.png
+#        target/visual-parity/after/login.light.png   (etc.)
+#
+#      Toggle theme with the statusbar theme control, or seed it headlessly by
+#      writing localStorage `trawl.ui` = {"theme":"nord"|"dark",…} before load.
+#
+#   3. Gate the grid:  scripts/web-visual-parity diff
+#      Any surface whose before/after pixels differ beyond --tolerance is a C5
+#      regression. Attach report.md + the diff/ highlights to the PR.
+#
+# KNOWN BENIGN DELTA (PR #29): with the two-port method the statusbar host
+# label reads ":8080" vs ":8081", ~40px inside one glyph run. Capture both
+# builds on the SAME port sequentially (stop one, start the other), or mask
+# the statusbar host label, to drive that to zero.
+#
+# Usage:
+#   web-visual-parity manifest              # print the canonical capture matrix
+#   web-visual-parity diff [DIR]            # compare DIR/before vs DIR/after
+#     --tolerance PCT   per-pixel colour fuzz before a pixel counts (default 0)
+#     --threshold N     max differing pixels a pair may have and still pass (default 0)
+#
+# Exit codes:
+#   0 — success (diff: all pairs within threshold)
+#   1 — usage / missing dependency
+#   2 — diff: a before/after pair could not be compared (size mismatch, missing)
+#   3 — diff: one or more pairs exceeded the pixel threshold (C5 regression)
+
+set -euo pipefail
+
+# -- the canonical AC5 capture matrix -----------------------------------------
+# Each row: "<surface-id>|<route>|<overlay steps to reach the captured state>".
+# Every surface is captured in BOTH themes (light = the default "nord", dark),
+# so a full grid is 2 × the rows below. Routes verified against
+# crates/trawl-web-ui/src/app.rs.
+MANIFEST=(
+  "login|/login|the login card at rest (Field wrap-mode API-key input + submit)"
+  "login-error|/login|submit an invalid API key so the ErrorBanner (role=alert) renders"
+  "search|/search|run any query so the results table renders"
+  "search-export-modal|/search|open the Export modal (fleet Modal + Btn + Field)"
+  "search-save-net-modal|/search|open the Save-as-net modal (fleet Modal + Btn + Field)"
+  "nets|/jobs/nets|the nets list at rest"
+  "nets-drawer|/jobs/nets|open a net's drawer (fleet Drawer + Tabs) — capture each tab"
+  "nets-confirm-modal|/jobs/nets|trigger a destructive action so the ConfirmModal opens"
+  "schema|/search/schema|the schema page at rest"
+  "schema-service-drawer|/search/schema|open a service drawer (fleet Drawer) — capture each tab"
+  "derivations|/intel/derivations|the derivations list at rest"
+  "derivations-reason-modal|/intel/derivations|open the reason modal (promoted ConfirmWithReasonModal)"
+)
+THEMES=(light dark)
+
+cmd_manifest() {
+  echo "AC5 zero-visual-change capture matrix (issue #28) — ${#MANIFEST[@]} surfaces × ${#THEMES[@]} themes"
+  echo
+  printf '%-26s  %-22s  %s\n' "SURFACE-ID.<theme>" "ROUTE" "STATE TO CAPTURE"
+  printf '%-26s  %-22s  %s\n' "------------------" "-----" "----------------"
+  for row in "${MANIFEST[@]}"; do
+    IFS='|' read -r id route steps <<<"$row"
+    for theme in "${THEMES[@]}"; do
+      printf '%-26s  %-22s  %s\n' "${id}.${theme}" "$route" "$steps"
+    done
+  done
+  echo
+  echo "Capture each into  target/visual-parity/{before,after}/<surface-id>.<theme>.png"
+  echo "then gate with:    scripts/web-visual-parity diff"
+}
+
+cmd_diff() {
+  local dir="target/visual-parity" tolerance="0" threshold="0"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tolerance) tolerance="$2"; shift 2 ;;
+      --threshold) threshold="$2"; shift 2 ;;
+      -*) echo "error: unknown flag $1" >&2; exit 1 ;;
+      *) dir="$1"; shift ;;
+    esac
+  done
+
+  command -v compare >/dev/null 2>&1 || {
+    echo "error: ImageMagick 'compare' not found (brew install imagemagick)" >&2
+    exit 1
+  }
+
+  local before="$dir/before" after="$dir/after" diffdir="$dir/diff"
+  [[ -d "$before" ]] || { echo "error: $before does not exist — capture the 'before' build first" >&2; exit 2; }
+  [[ -d "$after" ]] || { echo "error: $after does not exist — capture the 'after' build first" >&2; exit 2; }
+  mkdir -p "$diffdir"
+
+  local report="$dir/report.md"
+  {
+    echo "# AC5 visual-parity report (issue #28)"
+    echo
+    echo "Fuzz tolerance: \`${tolerance}%\` · per-pair pixel threshold: \`${threshold}\`"
+    echo
+    echo "| surface | differing px | verdict |"
+    echo "|---------|-------------:|:--------|"
+  } >"$report"
+
+  local shots=0 fails=0 errors=0
+  shopt -s nullglob
+  for pre in "$before"/*.png; do
+    shots=$((shots + 1))
+    local name; name="$(basename "$pre")"
+    local post="$after/$name"
+    if [[ ! -f "$post" ]]; then
+      echo "| \`${name%.png}\` | — | :warning: MISSING after/ shot |" >>"$report"
+      errors=$((errors + 1))
+      continue
+    fi
+    # compare: exit 0 identical, 1 differ, >=2 error (e.g. size mismatch).
+    # AE metric ("N (normalized)") goes to stderr; capture it.
+    local ae rc
+    ae="$(compare -metric AE -fuzz "${tolerance}%" "$pre" "$post" "$diffdir/$name" 2>&1)" && rc=0 || rc=$?
+    if [[ $rc -ge 2 ]]; then
+      echo "| \`${name%.png}\` | — | :x: COMPARE ERROR ($ae) |" >>"$report"
+      errors=$((errors + 1))
+      continue
+    fi
+    # First whitespace-delimited token is the differing-pixel count.
+    local px="${ae%% *}"
+    [[ "$px" =~ ^[0-9]+$ ]] || px=0
+    if (( px > threshold )); then
+      echo "| \`${name%.png}\` | $px | :x: REGRESSION |" >>"$report"
+      fails=$((fails + 1))
+    else
+      echo "| \`${name%.png}\` | $px | :white_check_mark: parity |" >>"$report"
+    fi
+  done
+  shopt -u nullglob
+
+  {
+    echo
+    echo "$shots pairs · $fails regressions · $errors missing/errored"
+    echo
+    echo "Diff highlights: \`$diffdir/\`"
+  } >>"$report"
+
+  echo "wrote $report ($shots pairs, $fails regressions, $errors missing/errored)"
+  if (( shots == 0 )); then
+    echo "error: no PNGs found under $before — nothing captured" >&2
+    exit 2
+  fi
+  (( errors > 0 )) && exit 2
+  (( fails > 0 )) && exit 3
+  exit 0
+}
+
+case "${1:-}" in
+  manifest) shift; cmd_manifest "$@" ;;
+  diff) shift; cmd_diff "$@" ;;
+  -h|--help|help|"") sed -n '/^# Usage:/,/^# Exit codes:/p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "error: unknown subcommand '$1' (try: manifest, diff)" >&2; exit 1 ;;
+esac
