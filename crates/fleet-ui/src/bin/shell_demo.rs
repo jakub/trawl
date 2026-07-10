@@ -34,8 +34,8 @@ fn main() {
 // TopBar and Rail are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
 use fleet_ui::{
-    AppLink, Btn, ConfirmWithReasonModal, Icon, Login, Modal, ModeTab, RailItem, Shell, Size,
-    ToastBus, UserInfo, Variant, install,
+    AppLink, Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal, ModeTab,
+    RailItem, Shell, Size, TabItem, Tabs, ToastBus, UserInfo, Variant, install,
 };
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
@@ -142,7 +142,61 @@ fn ToastProbe() -> impl IntoView {
                 </button>
             </div>
             <ModalProbe/>
+            <DrawerProbe/>
+            <ErrorBanner error=Signal::derive(|| Some("demo error banner (role=alert)".to_string()))/>
         </div>
+    }
+}
+
+/// Mounts the issue-#28 Drawer + Tabs from a non-trawl consumer: a
+/// standalone workspace-style strip with a count chip, and a drawer
+/// composing the drawer-style strip, title/actions slots, and body
+/// panes switched by the active tab.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn DrawerProbe() -> impl IntoView {
+    let show_drawer = RwSignal::new(false);
+    let workspace_tab = RwSignal::new("events".to_string());
+    let drawer_tab = RwSignal::new("overview".to_string());
+
+    view! {
+        <Btn variant=Variant::Secondary on_click=Callback::new(move |()| show_drawer.set(true))>
+            "open drawer"
+        </Btn>
+        <div style="width:420px;border:1px solid var(--line)">
+            <Tabs
+                items=vec![
+                    TabItem::with_count("events", "Events", Signal::derive(|| Some(1287))),
+                    TabItem::new("viz", "Visualization"),
+                ]
+                active=workspace_tab
+                on_change=Callback::new(move |id: String| workspace_tab.set(id))
+            />
+        </div>
+        {move || show_drawer.get().then(|| view! {
+            <Drawer
+                tabs=vec![
+                    TabItem::new("overview", "Overview"),
+                    TabItem::new("fields", "Fields"),
+                ]
+                active_tab=drawer_tab
+                on_tab_change=Callback::new(move |id: String| drawer_tab.set(id))
+                on_close=Callback::new(move |()| show_drawer.set(false))
+                meta="1.2k events · 3.4 MB · 12 fields".to_string()
+                title=Box::new(|| view! { <span class="name">"demo-service"</span> }.into_any())
+                actions=Box::new(move || view! {
+                    <Btn variant=Variant::Secondary on_click=Callback::new(|()| {})>
+                        "Search this service"
+                    </Btn>
+                }.into_any())
+            >
+                {move || if drawer_tab.get() == "fields" {
+                    view! { <p>"fields pane"</p> }.into_any()
+                } else {
+                    view! { <p>"overview pane — Esc or scrim click closes"</p> }.into_any()
+                }}
+            </Drawer>
+        })}
     }
 }
 

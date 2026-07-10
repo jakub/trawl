@@ -35,6 +35,9 @@
  *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd
  *     (+ .ic icon chip), .m-body, .m-ft; modal fields: .m-field,
  *     .reason-input (emitted by ConfirmWithReasonModal / Field)
+ *   - Tab strips: .tabs (workspace) + .sd-tabs (drawer) families
+ *   - Drawer shell: .sd-scrim, .sd-drawer, .sd-hd, .sd-ttl,
+ *     .sd-actions, .sd-x, .sd-body (+ sd-fade-in/sd-slide-in)
  *   - Toast host + items: .toasts, .toast, .toast.{success,error,info}
  *   - Login page: .login-shell, .login-card
  *   - App chrome: .shell grid, .topbar (brand/modes/jump/env/user),
@@ -46,8 +49,10 @@
  *   - .btn-icon, .field-label and other extras
  *   - Trawl-specific modal sub-styles (.m-body .preview, .m-ft .hint,
  *     .export-formats) and the status bar (.statusbar)
- *   - Anything app-specific: facets, editor, histogram, drawers,
- *     schema cards.
+ *   - Drawer CONTENT (app-owned panes + title-slot content):
+ *     .sd-overview, .sd-card, .sd-fields, .sd-tail, .sd-dot, .sf-*,
+ *     .sd-ttl .name / .sub, .name-edit
+ *   - Anything app-specific: facets, editor, histogram, schema cards.
  */
 
 /* ─────────────────────────────────────────────────────────────────
@@ -452,6 +457,96 @@ textarea:focus-visible,
   outline: none; box-shadow: 0 0 0 3px var(--amber-glow);
   border-color: var(--amber);
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Tab strips — fleet_ui::Tabs renders BOTH families (issue #28):
+ *  - .tabs / .t / .active  — workspace strip (Events/Visualization)
+ *  - .sd-tabs / .tb / .on  — drawer strip (weights differ on purpose:
+ *    500 active vs 600 on; do not merge)
+ *  Moved verbatim from trawl's main.css. Trawl's .dr-pop .tabs
+ *  popover reskin stays app-side and overrides by cascade order.
+ * ─────────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 0 12px;
+  flex-shrink: 0;
+}
+.tabs .t {
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-ui);
+}
+.tabs .t:hover { color: var(--ink-2); }
+.tabs .t.active { color: var(--ink); border-bottom-color: var(--amber); font-weight: 500; }
+.tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: 11px; }
+.tabs .sp { flex: 1; }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Drawer shell — fleet_ui::Drawer (issue #28). Scrim, right-slide
+ *  panel, header (title slot + actions slot + close), tab strip,
+ *  body. Drawer CONTENT (.sd-overview, .sd-card, .sf-*, .sd-ttl
+ *  .name/.sub, …) stays in each app's stylesheet.
+ * ─────────────────────────────────────────────────────────────── */
+.sd-scrim {
+  position: fixed; inset: 0; background: rgba(20,15,5,.18);
+  z-index: 50; animation: sd-fade-in 140ms ease-out;
+  backdrop-filter: blur(1px);
+}
+.sd-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(720px, 92vw);
+  background: var(--panel); border-left: 1px solid var(--line);
+  box-shadow: -8px 0 32px -10px rgba(0,0,0,.25);
+  z-index: 51;
+  display: flex; flex-direction: column;
+  animation: sd-slide-in 200ms cubic-bezier(.2,.8,.3,1);
+}
+@keyframes sd-fade-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes sd-slide-in { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* Drawer header */
+.sd-hd {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; border-bottom: 1px solid var(--line);
+  gap: 16px; background: var(--panel-2);
+}
+.sd-ttl { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.sd-actions { display: flex; align-items: center; gap: 8px; }
+.sd-x {
+  background: none; border: 1px solid transparent; cursor: pointer;
+  width: 28px; height: 28px; border-radius: 3px;
+  font-size: 18px; color: var(--ink-3); line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.sd-x:hover { background: var(--panel-3); color: var(--ink); border-color: var(--line); }
+
+/* Drawer tabs */
+.sd-tabs {
+  display: flex; align-items: center; gap: 4px;
+  padding: 0 14px; border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.sd-tabs .tb {
+  font-family: var(--font-ui); font-size: 12px; font-weight: 500;
+  color: var(--ink-3); padding: 9px 12px; cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  transition: color 100ms, border-color 100ms;
+}
+.sd-tabs .tb:hover { color: var(--ink-2); }
+.sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--amber); font-weight: 600; }
+.sd-tabs .sp { flex: 1; }
+.sd-tabs .meta { font-size: 11px; color: var(--ink-3); padding-right: 4px; }
+
+.sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Toasts (bottom-right stack)

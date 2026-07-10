@@ -158,6 +158,62 @@ fn modal_family_classes_shipped_with_crate() {
 }
 
 #[test]
+fn tab_strip_families_stay_distinct() {
+    // Issue #28 M3: ONE Tabs component renders BOTH strip families —
+    // the workspace `.tabs > .t.active` (weight 500) and the drawer
+    // `.sd-tabs > .tb.on` (weight 600). Pin the weights separately so
+    // a future "simplify the CSS" pass can't silently merge them.
+    let workspace = rule_body(".tabs .t.active");
+    assert!(
+        workspace.contains("font-weight: 500"),
+        ".tabs .t.active must keep font-weight 500 (workspace strip)"
+    );
+    let drawer = rule_body(".sd-tabs .tb.on");
+    assert!(
+        drawer.contains("font-weight: 600"),
+        ".sd-tabs .tb.on must keep font-weight 600 (drawer strip)"
+    );
+    // Count chip on workspace tabs (the Events row count).
+    assert!(
+        rule_body(".tabs .t .c").contains("tabular-nums"),
+        ".tabs .t .c count chip moved verbatim"
+    );
+}
+
+#[test]
+fn drawer_shell_classes_shipped_with_crate() {
+    // Drawer owns the sd-* SHELL: scrim, panel, header, actions, close,
+    // body. Content selectors (.sd-overview, .sd-card, .sf-*, .sd-ttl
+    // .name/.sub) stay app-side. Bodies pinned to the moved values.
+    assert!(
+        rule_body(".sd-scrim").contains("z-index: 50"),
+        ".sd-scrim moved verbatim"
+    );
+    assert!(
+        rule_body(".sd-drawer").contains("width: min(720px, 92vw)"),
+        ".sd-drawer moved verbatim"
+    );
+    assert!(
+        rule_body(".sd-hd").contains("background: var(--panel-2)"),
+        ".sd-hd moved verbatim"
+    );
+    assert!(
+        rule_body(".sd-x").contains("width: 28px"),
+        ".sd-x close affordance moved verbatim"
+    );
+    assert!(
+        rule_body(".sd-body").contains("padding: 16px 18px"),
+        ".sd-body moved verbatim"
+    );
+    for name in ["sd-fade-in", "sd-slide-in"] {
+        assert!(
+            CSS.contains(&format!("@keyframes {name}")),
+            "drawer keyframe `@keyframes {name}` missing from fleet-ui.css"
+        );
+    }
+}
+
+#[test]
 fn chrome_keyframes_present() {
     for name in [
         "blink",
