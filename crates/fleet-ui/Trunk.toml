@@ -1,0 +1,20 @@
+# Dev affordance for the `shell_demo` bin — the live preview that makes
+# AC5 ("toasts fire via context") observable without a backend:
+#
+#   cd crates/fleet-ui && trunk serve
+#
+# renders the demo Shell at http://127.0.0.1:8081. A success and an
+# error toast fire on mount (ToastProbe reaches the Shell-owned ToastBus
+# via expect_context); the two buttons re-fire on demand. The wasm
+# compile itself is gated in CI by `cargo check -p fleet-ui
+# --target wasm32-unknown-unknown` (bins are checked by default).
+#
+# Port 8081 avoids colliding with trawl-web-ui's default :8080.
+
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8081

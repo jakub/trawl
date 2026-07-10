@@ -6,15 +6,22 @@
 //! wired by an app that isn't trawl, including the [`ToastBus`] context
 //! contract: a child inside `Shell` (see [`ToastProbe`]) reaches the
 //! Shell-owned bus via `expect_context` and fires both a success and an
-//! error toast. Builds under wasm32 via:
+//! error toast.
+//!
+//! This is a `src/bin` target (not an `examples/` file) so `cargo check
+//! -p fleet-ui --target wasm32-unknown-unknown` — the CI wasm gate —
+//! covers it by default (a plain `cargo check` builds bins but skips
+//! examples). Compile it standalone with:
 //!
 //! ```sh
-//! cargo build -p fleet-ui --example shell_demo --target wasm32-unknown-unknown
+//! cargo build -p fleet-ui --bin shell_demo --target wasm32-unknown-unknown
 //! ```
 //!
-//! For an actual rendered preview, a consumer would wire this into
-//! a `Trunk.toml` with `index.html` and `trunk serve`. The CI gate
-//! is the wasm compile; visual verification is manual.
+//! For a live rendered preview — the way AC5's "toasts fire via context"
+//! is actually observed — the crate ships `index.html` + `Trunk.toml`
+//! next to `Cargo.toml`, so `cd crates/fleet-ui && trunk serve` renders
+//! it with the real fleet-ui CSS. No backend or auth required: a success
+//! and an error toast fire on mount, and buttons re-fire on demand.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
@@ -138,6 +145,15 @@ fn ToastProbe() -> impl IntoView {
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn DemoApp() -> impl IntoView {
+    // Theme prefs must be installed from *inside* the component body:
+    // `install` registers an `Effect`, and effects can only be spawned
+    // once leptos's executor is live (which `mount_to_body` sets up
+    // before it renders this component). Calling it from `main` — before
+    // mount — panics with "spawn_local before a global executor was
+    // initialized". This mirrors trawl-web-ui's `App`, which likewise
+    // calls `fleet_ui::install` in its body.
+    let _prefs = install("fleet-ui-demo:prefs");
+
     let rail_items_sig = Signal::derive(rail_items);
     let app_links_sig = Signal::derive(app_links);
     let rail_active = Signal::derive(|| "home".to_string());
@@ -201,6 +217,5 @@ fn DemoApp() -> impl IntoView {
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    let _prefs = install("fleet-ui-demo:prefs");
     mount_to_body(DemoApp);
 }
