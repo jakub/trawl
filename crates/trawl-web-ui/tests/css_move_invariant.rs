@@ -109,7 +109,6 @@ const MOVED_SELECTORS: &[&str] = &[
     ".status-dot.success",
     ".status-dot.error",
     ".status-dot.running",
-    ".status-dot.timeout",
     ".toggle",
     ".toggle input",
     ".toggle-slider",
@@ -144,6 +143,10 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".live-badge.lagged",
     ".sd-dot",
     ".sd-dot.errors",
+    // No timeout tone survived unification: `run_status_tone` folds
+    // timeout into `StatusTone::Error`, so `.status-dot.timeout` renders
+    // nothing and must not creep back into either stylesheet.
+    ".status-dot.timeout",
     ".run .kbd-inline",
     ".results-loading",
     ".results-error",
