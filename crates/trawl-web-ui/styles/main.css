@@ -6,8 +6,9 @@
  * login, buttons, modal scaffolding, toasts) live in fleet-ui:
  * crates/fleet-ui/styles/fleet-ui.css, linked BEFORE this file in
  * index.html so these app-specific selectors keep cascade priority.
- * Nothing defined there may be redefined here (issue #27 AC2 — checked
- * by a selector/custom-property overlap script).
+ * Nothing defined there may be redefined here (issue #27 AC2 — this
+ * no-overlap invariant is maintained by hand today, not enforced by
+ * tooling; keep app-specific selectors out of fleet-ui's namespace).
  *
  * Everything stays in one file per stylesheet: Trunk doesn't resolve
  * @import (browser fetches the imported file, hits the SPA HTML
