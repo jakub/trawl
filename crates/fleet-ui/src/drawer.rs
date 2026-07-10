@@ -46,6 +46,14 @@ pub fn Drawer(
     on_close: Callback<()>,
     #[prop(optional, into)] on_escape: Option<Callback<()>>,
     #[prop(into, optional)] meta: Option<String>,
+    /// Close-glyph size in px. Exists because trawl's drawers drifted
+    /// pre-migration: the service drawer's close X was 12px, the net
+    /// drawer's 14px, and the zero-visual-change contract preserves
+    /// both (the 2px delta is pixel-visible in the stroke tips).
+    /// Unifying on one size is deliberate visual work for a future
+    /// slice, not a migration side effect.
+    #[prop(default = 14)]
+    close_size: u16,
     title: Children,
     #[prop(optional)] actions: Option<Children>,
     children: Children,
@@ -93,7 +101,7 @@ pub fn Drawer(
                     <div class="sd-actions">
                         {actions.map(|a| a())}
                         <span class="sd-x" title="Close (Esc)" on:click=move |_| on_close.run(())>
-                            <IconView icon=Icon::Close size=14 stroke_width=1.5/>
+                            <IconView icon=Icon::Close size=close_size stroke_width=1.5/>
                         </span>
                     </div>
                 </div>

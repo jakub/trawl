@@ -97,6 +97,9 @@ pub fn ServiceDrawer(
             active_tab=eff_tab
             on_tab_change=on_tab_change
             on_close=on_close
+            // Pre-migration this drawer's close X was 12px (net drawer:
+            // 14px) — see the `close_size` prop docs in fleet-ui.
+            close_size=12
             meta=meta_text
             title=Box::new(move || view! {
                 <StatusDot svc=svc_for_head.clone()/>
