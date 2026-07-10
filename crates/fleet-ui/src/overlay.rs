@@ -104,6 +104,22 @@ mod tests {
     }
 
     #[test]
+    fn menu_under_modal_yields_escape_to_the_modal_only() {
+        // Issue #31 C5: an open ActionsMenu is an overlay layer like any
+        // other. When a ConfirmModal (or Drawer) stacks above it, only
+        // the modal is Escape-eligible; when the modal closes, the menu
+        // becomes topmost again and takes the next Escape.
+        let menu = push_overlay();
+        let modal = push_overlay();
+        assert!(modal.is_topmost(), "stacked modal takes Escape");
+        assert!(!menu.is_topmost(), "shadowed menu must not also close");
+
+        modal.release();
+        assert!(menu.is_topmost(), "menu regains Escape after the modal");
+        menu.release();
+    }
+
+    #[test]
     fn release_is_idempotent_and_order_independent() {
         let a = push_overlay();
         let b = push_overlay();

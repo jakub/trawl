@@ -932,3 +932,67 @@ textarea:focus-visible,
   gap: 2px;
   align-items: center;
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Small widgets (issue #31, ADR-0003 unification)
+ *
+ *  One canonical treatment per widget. New families first (.bdg,
+ *  .seg, .load-hint, .actions-wrap — these REPLACE app-side
+ *  .intel-badge / .fmt-btn / .seg-mini / bespoke loading markup);
+ *  the verbatim moves (.kbd, .inp-wrap, .toggle, .status-dot, …)
+ *  are appended by the per-family sweep commits so the move-not-copy
+ *  invariant in trawl's css_move_invariant stays green per commit.
+ * ─────────────────────────────────────────────────────────────── */
+
+/* Badge — <Badge tone=…>. `.bdg`, not `.badge`: the rail count chip
+ * above already owns `.rail .it .badge`, and a top-level `.badge`
+ * rule would leak display/text-transform into it via the cascade. */
+.bdg {
+  display: inline-flex; align-items: center;
+  font-size: 10px; font-weight: 600; letter-spacing: .04em;
+  padding: 1px 6px; border-radius: 3px;
+  white-space: nowrap; text-transform: uppercase;
+}
+.bdg.neutral { background: var(--panel-2);   color: var(--ink-3); }
+.bdg.info    { background: var(--panel-2);   color: var(--blue); }
+.bdg.success { background: var(--green-wash);color: var(--green); }
+.bdg.warn    { background: var(--amber-wash);color: var(--amber); }
+.bdg.danger  { background: var(--red-wash);  color: var(--red); }
+
+/* Segmented — <Segmented/>. One active treatment: amber wash. */
+.seg {
+  display: inline-flex; background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 4px;
+  font-family: var(--font-ui); overflow: hidden;
+}
+.seg-full { display: flex; }
+.seg-full .seg-opt { flex: 1; }
+.seg .seg-opt {
+  padding: 6px 10px; font-size: 12px; font-weight: 500;
+  color: var(--ink-3); background: transparent;
+  border: none; border-right: 1px solid var(--line);
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.seg .seg-opt:last-child { border-right: none; }
+.seg .seg-opt:hover { color: var(--ink-2); }
+.seg .seg-opt.on {
+  background: var(--amber-wash);
+  color: var(--amber);
+  font-weight: 600;
+}
+.seg-sm .seg-opt { padding: 4px 9px; font-size: 11px; }
+
+/* Loaded — <Loaded/> tri-state hints (canonical copy tested natively). */
+.load-hint {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--ink-3);
+  font-family: var(--font-ui);
+}
+.load-hint.error { color: var(--red); }
+
+/* ActionsMenu — positioning context owned by the component (the
+ * trigger `.btn-icon` and panel `.actions-menu` rules move in with
+ * the nets-page sweep commit). */
+.actions-wrap { position: relative; display: inline-block; }
