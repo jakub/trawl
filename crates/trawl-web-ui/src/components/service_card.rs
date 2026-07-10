@@ -11,7 +11,7 @@
 //! `ServiceSchema` covers events, storage, column stats, and
 //! `daily_event_counts` for the sparkline.
 
-use fleet_ui::{Icon, IconView, Sparkline};
+use fleet_ui::{Icon, IconView, Sparkline, StatusDot, StatusTone};
 use leptos::prelude::*;
 use leptos::web_sys;
 use trawl_api::ServiceSchema;
@@ -83,7 +83,11 @@ pub fn ServiceCard(
         }
         cls
     });
-    let dot_class = if healthy { "sd-dot" } else { "sd-dot errors" };
+    let dot_tone = if healthy {
+        StatusTone::Success
+    } else {
+        StatusTone::Error
+    };
 
     let name_open = name.clone();
     let name_search = name.clone();
@@ -96,7 +100,7 @@ pub fn ServiceCard(
         >
             <div class="sc-hd">
                 <div class="sc-title">
-                    <span class=dot_class></span>
+                    <StatusDot tone=dot_tone/>
                     <span class="name">{svc.name.clone()}</span>
                     <span class="sp"></span>
                     <Sparkline data=spark_data color=spark_color w=96 h=20/>

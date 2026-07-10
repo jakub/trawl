@@ -14,12 +14,12 @@ use leptos::task::spawn_local;
 use leptos::web_sys;
 use trawl_api::SavedQueryResponse;
 use trawl_api::value::QueryResult;
-use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
 use fleet_ui::{
-    Btn, Drawer, Size, Sparkline, TabItem, ToastBus, ToastKind, Variant, effective_active,
+    Btn, Drawer, Size, Sparkline, StatusDot, TabItem, ToastBus, ToastKind, Toggle, Variant,
+    effective_active,
 };
 
 const RUNS_PAGE_SIZE: usize = 20;
@@ -404,17 +404,10 @@ fn QuerySchedulePane(
 
                         // enabled toggle
                         <div style="display:flex; align-items:center; gap:8px">
-                            <label class="toggle">
-                                <input
-                                    type="checkbox"
-                                    prop:checked=move || enabled_buf.get()
-                                    on:change=move |e| {
-                                        let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
-                                        enabled_buf.set(el.checked());
-                                    }
-                                />
-                                <span class="toggle-slider"></span>
-                            </label>
+                            <Toggle
+                                checked=enabled_buf
+                                on_change=Callback::new(move |v| enabled_buf.set(v))
+                            />
                             <span style="font-size:12px; color:var(--ink-2)">
                                 {move || if enabled_buf.get() { "Active" } else { "Paused" }}
                             </span>
@@ -516,12 +509,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                             let dur = run.duration_ms.map_or_else(|| "—".to_string(), format_duration);
                             let row_ct = run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string());
                             let status = run.status.clone();
-                            let dot_class = match status.as_str() {
-                                "success" => "status-dot success",
-                                "error" | "timeout" => "status-dot error",
-                                "running" => "status-dot running",
-                                _ => "status-dot",
-                            };
+                            let tone = super::run_status_tone(&status);
                             let err_msg = run.error_message.clone().unwrap_or_default();
                             let is_expanded = move || expanded_run.get() == Some(run_id);
 
@@ -536,7 +524,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                 >
                                     <div style="flex:0 0 80px" class="mono">{when}</div>
                                     <div style="flex:0 0 70px">
-                                        <span class=dot_class></span>
+                                        <StatusDot tone=tone/>
                                         " "
                                         <span style="font-size:11px">{status}</span>
                                     </div>

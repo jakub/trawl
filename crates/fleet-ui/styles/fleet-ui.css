@@ -999,3 +999,58 @@ textarea:focus-visible,
 
 /* Sparkline — <Sparkline/> (moved verbatim from trawl's main.css). */
 .sc-spark { display: block; }
+
+/* StatusDot — <StatusDot tone=…>. Unified canonical dot (issue #31):
+ * trawl's 6px flat `.status-dot` run dots and the 7px ringed
+ * `.sd-dot` schema-health dots fold onto ONE treatment — 7px with the
+ * ring, pulse reserved for the in-flight (running) tone. Bare
+ * `.status-dot` (Neutral) stays an invisible spacer, matching the
+ * pre-unification unknown-status arm. */
+.status-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  display: inline-block; vertical-align: middle;
+  flex-shrink: 0;
+}
+.status-dot.success { background: var(--green);  box-shadow: 0 0 0 2px color-mix(in oklab, var(--green) 25%, transparent); }
+.status-dot.error   { background: var(--red);    box-shadow: 0 0 0 2px color-mix(in oklab, var(--red) 25%, transparent); }
+.status-dot.running { background: var(--amber);  box-shadow: 0 0 0 2px color-mix(in oklab, var(--amber) 25%, transparent); animation: dot-pulse 1.6s ease-in-out infinite; }
+.status-dot.timeout { background: var(--yellow); box-shadow: 0 0 0 2px color-mix(in oklab, var(--yellow) 25%, transparent); }
+@keyframes dot-pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
+
+/* Toggle — <Toggle/> (moved verbatim from trawl's main.css). */
+.toggle {
+  position: relative; display: inline-block; width: 32px; height: 18px;
+}
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+  position: absolute; inset: 0; cursor: pointer;
+  background: var(--line); border-radius: 9px;
+  transition: background 200ms;
+}
+.toggle-slider::before {
+  content: ""; position: absolute; left: 2px; top: 2px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--panel); transition: transform 200ms;
+}
+.toggle input:checked + .toggle-slider { background: var(--amber); }
+.toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
+
+/* Kbd — <Kbd/>. `.kbd` moved verbatim from trawl's main.css (the
+ * topbar user-menu shortcut chips were already emitting it from
+ * fleet-ui, styled across the crate boundary — this closes that gap).
+ * `.kbd-inline` generalizes trawl's `.run .kbd-inline`: the borderless
+ * dimmed treatment for shortcuts inside colored buttons. */
+.kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-3);
+}
+.kbd-inline {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: .6;
+}

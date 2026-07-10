@@ -2,6 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+/// Map a saved-query run status string (trawl-api vocabulary) onto the
+/// fleet-ui status-dot tone. App-side on purpose (ADR-0002): the
+/// status vocabulary is trawl's, only the dot is generic.
+pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
+    match status {
+        "success" => fleet_ui::StatusTone::Success,
+        "error" => fleet_ui::StatusTone::Error,
+        "timeout" => fleet_ui::StatusTone::Timeout,
+        "running" => fleet_ui::StatusTone::Running,
+        _ => fleet_ui::StatusTone::Neutral,
+    }
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()

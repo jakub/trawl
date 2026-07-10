@@ -20,7 +20,7 @@ use crate::components::net_drawer::NetDrawer;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{time_ago, time_until};
-use fleet_ui::{Btn, ConfirmModal, Icon, IconView, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, ConfirmModal, Icon, IconView, StatusDot, ToastBus, ToastKind, Variant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetSort {
@@ -285,12 +285,7 @@ pub fn NetsPage() -> impl IntoView {
                                             match sched.last_run.as_ref() {
                                                 Some(run) => {
                                                     let when = time_ago(&run.started_at, now);
-                                                    let dot_class = match run.status.as_str() {
-                                                        "success" => "status-dot success",
-                                                        "error" | "timeout" => "status-dot error",
-                                                        "running" => "status-dot running",
-                                                        _ => "status-dot",
-                                                    };
+                                                    let tone = crate::components::run_status_tone(&run.status);
                                                     // Compute next run countdown
                                                     let next_run_label = if sched.enabled {
                                                         let started_ms = js_sys::Date::parse(&run.started_at) as i64;
@@ -301,7 +296,7 @@ pub fn NetsPage() -> impl IntoView {
                                                     };
                                                     view! {
                                                         <span>
-                                                            <span class=dot_class></span>
+                                                            <StatusDot tone=tone/>
                                                             " "
                                                             <span class="mono" style="color:var(--ink-2)">{when}</span>
                                                             {next_run_label.map(|label| view! {

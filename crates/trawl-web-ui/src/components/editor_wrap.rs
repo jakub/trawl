@@ -16,7 +16,7 @@ use leptos::web_sys;
 use crate::clipboard::write_clipboard;
 use crate::components::editor::DslEditor;
 use crate::state::query::{QUICK_RANGES, RangeSpec};
-use fleet_ui::{Btn, Icon, IconView, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Icon, IconView, Kbd, ToastBus, ToastKind, Variant};
 
 #[component]
 pub fn EditorWrap(
@@ -115,7 +115,7 @@ pub fn EditorWrap(
                         } else {
                             view! {
                                 <span>"Haul"</span>
-                                <span class="kbd-inline">"⌘⏎"</span>
+                                <Kbd inline=true>"⌘⏎"</Kbd>
                             }.into_any()
                         }}
                     </button>

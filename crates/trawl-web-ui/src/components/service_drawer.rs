@@ -102,7 +102,7 @@ pub fn ServiceDrawer(
             close_size=12
             meta=meta_text
             title=Box::new(move || view! {
-                <StatusDot svc=svc_for_head.clone()/>
+                <HealthDot svc=svc_for_head.clone()/>
                 <span class="name">{svc_for_head.name.clone()}</span>
                 {(!sub_text.is_empty()).then_some(view! {
                     <span class="sub">{sub_text}</span>
@@ -866,12 +866,12 @@ fn FieldTypeDonut(segments: Vec<DonutSegment>, total: usize) -> impl IntoView {
 
 #[component]
 #[allow(clippy::needless_pass_by_value)]
-fn StatusDot(svc: ServiceSchema) -> impl IntoView {
+fn HealthDot(svc: ServiceSchema) -> impl IntoView {
     let (today, yesterday) = super::service_card_fmt::today_yesterday_utc();
-    let class = if super::service_card_fmt::is_healthy(&svc, &today, &yesterday) {
-        "sd-dot"
+    let tone = if super::service_card_fmt::is_healthy(&svc, &today, &yesterday) {
+        fleet_ui::StatusTone::Success
     } else {
-        "sd-dot errors"
+        fleet_ui::StatusTone::Error
     };
-    view! { <span class=class></span> }
+    view! { <fleet_ui::StatusDot tone=tone/> }
 }

@@ -15,7 +15,7 @@ use trawl_api::ExportFormat;
 
 use crate::api;
 use crate::download;
-use fleet_ui::{Btn, Icon, Modal, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Icon, Kbd, Modal, ToastBus, ToastKind, Variant};
 
 #[component]
 #[allow(clippy::needless_pass_by_value)]
@@ -71,10 +71,10 @@ pub fn ExportModal(
             on_submit=do_download
             footer=Box::new(move || view! {
                 <div class="hint">
-                    <span class="kbd">"⌘⏎"</span>
+                    <Kbd>"⌘⏎"</Kbd>
                     " download"
                     <span style="opacity:.5">"·"</span>
-                    <span class="kbd">"Esc"</span>
+                    <Kbd>"Esc"</Kbd>
                     " cancel"
                 </div>
                 <Btn variant=Variant::Secondary on_click=cancel>"Cancel"</Btn>

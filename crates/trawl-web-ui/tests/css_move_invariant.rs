@@ -105,6 +105,19 @@ const MOVED_SELECTORS: &[&str] = &[
     // generalized) into fleet-ui.css as each widget's consumers
     // switched to the fleet component.
     ".sc-spark",
+    ".status-dot",
+    ".status-dot.success",
+    ".status-dot.error",
+    ".status-dot.running",
+    ".status-dot.timeout",
+    ".toggle",
+    ".toggle input",
+    ".toggle-slider",
+    ".toggle-slider::before",
+    ".toggle input:checked + .toggle-slider",
+    ".toggle input:checked + .toggle-slider::before",
+    ".kbd",
+    ".kbd-inline",
 ];
 
 /// Selector families the issue #31 unification RETIRED outright: their
@@ -113,7 +126,14 @@ const MOVED_SELECTORS: &[&str] = &[
 /// `.load-hint`), or was dead (`.live-badge`). Unlike
 /// [`MOVED_SELECTORS`] these must not exist in EITHER stylesheet —
 /// reappearing anywhere means per-site drift is growing back.
-const RETIRED_SELECTORS: &[&str] = &[".live-badge", ".live-badge.live", ".live-badge.lagged"];
+const RETIRED_SELECTORS: &[&str] = &[
+    ".live-badge",
+    ".live-badge.live",
+    ".live-badge.lagged",
+    ".sd-dot",
+    ".sd-dot.errors",
+    ".run .kbd-inline",
+];
 
 #[test]
 fn moved_selectors_absent_from_app_css() {

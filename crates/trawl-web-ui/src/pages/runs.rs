@@ -13,7 +13,7 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Icon, IconView, Size, Variant};
+use fleet_ui::{Btn, Icon, IconView, Size, StatusDot, Variant};
 
 const RUNS_PAGE_SIZE: usize = 20;
 
@@ -163,19 +163,14 @@ pub fn RunsPage() -> impl IntoView {
                                     let dur = gr.run.duration_ms.map_or_else(|| "—".to_string(), format_duration);
                                     let row_ct = gr.run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string());
                                     let status = gr.run.status.clone();
-                                    let dot_class = match status.as_str() {
-                                        "success" => "status-dot success",
-                                        "error" | "timeout" => "status-dot error",
-                                        "running" => "status-dot running",
-                                        _ => "status-dot",
-                                    };
+                                    let tone = crate::components::run_status_tone(&status);
                                     let goto = goto.clone();
 
                                     view! {
                                         <div class="tbl-row" on:click=move |_| goto(net_id)>
                                             <div style="flex:1" class="mono">{net_name}</div>
                                             <div style="flex:0 0 70px">
-                                                <span class=dot_class></span>
+                                                <StatusDot tone=tone/>
                                                 " "
                                                 <span style="font-size:11px">{status}</span>
                                             </div>
