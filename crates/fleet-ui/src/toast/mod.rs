@@ -4,13 +4,17 @@
 
 //! Toast notifications: pure kinds + wasm-only bus/host runtime.
 //!
-//! Split into two layers, mirroring [`crate::theme`]:
+//! Split into pure + wasm layers, mirroring [`crate::theme`]:
 //! - [`kinds`] — the pure [`ToastKind`] enum and its CSS-class
 //!   contract. Builds on every target so native-compiling consumer
 //!   code (API mappers, test helpers) can name toast kinds without
 //!   pulling leptos.
-//! - [`runtime`] — wasm-only `ToastBus` push handle and the
-//!   `<Toasts/>` host component.
+//! - [`stack`] — the pure [`ToastStack`] state machine ([`Toast`] +
+//!   id allocation + push/dismiss). Also target-agnostic, so the
+//!   "a success and an error toast are now live" outcome is unit-tested
+//!   natively rather than eyeballed in a browser.
+//! - [`runtime`] — wasm-only `ToastBus` push handle (a reactive
+//!   `RwSignal<ToastStack>`) and the `<Toasts/>` host component.
 //!
 //! # Bus ownership contract
 //!
@@ -25,11 +29,13 @@
 //! wants toasts) need their own bus + host.
 
 pub mod kinds;
+pub mod stack;
 
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
 
 pub use kinds::ToastKind;
+pub use stack::{Toast, ToastStack};
 
 #[cfg(target_arch = "wasm32")]
-pub use runtime::{Toast, ToastBus, Toasts};
+pub use runtime::{ToastBus, Toasts};

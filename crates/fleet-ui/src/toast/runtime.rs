@@ -13,42 +13,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use super::kinds::ToastKind;
-
-/// A single toast notification. Construction is sealed: instances only
-/// arise from [`ToastBus::push`] (and its kind-specific helpers), so the
-/// monotonic `id` allocated by the bus is the only one in circulation —
-/// preventing a third-party `Toast { id: 0, ... }` from colliding with
-/// keys the `<For>` loop relies on.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Toast {
-    pub(crate) id: u64,
-    pub(crate) kind: ToastKind,
-    pub(crate) title: String,
-    pub(crate) detail: Option<String>,
-}
-
-impl Toast {
-    #[must_use]
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    #[must_use]
-    pub fn kind(&self) -> ToastKind {
-        self.kind
-    }
-
-    #[must_use]
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
-    #[must_use]
-    pub fn detail(&self) -> Option<&str> {
-        self.detail.as_deref()
-    }
-}
+use super::stack::ToastStack;
 
 /// Push handle — clone-and-share. Drives the `<Toasts/>` host.
 ///
@@ -64,42 +29,31 @@ impl Toast {
 /// their own `ToastBus::new()` + `<Toasts bus=bus/>` pair.
 #[derive(Debug, Clone, Copy)]
 pub struct ToastBus {
-    items: RwSignal<Vec<Toast>>,
-    next_id: StoredValue<u64>,
+    stack: RwSignal<ToastStack>,
 }
 
 impl ToastBus {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            items: RwSignal::new(Vec::new()),
-            next_id: StoredValue::new(0),
+            stack: RwSignal::new(ToastStack::new()),
         }
     }
 
     /// Push a toast. Auto-dismisses after 4.5s.
     pub fn push(self, kind: ToastKind, title: impl Into<String>, detail: Option<String>) {
-        // Single-closure mutation: no read/write window for a concurrent push to
-        // observe the same `n` and produce a duplicate key in `<For key=|t| t.id>`.
-        // Wasm is single-threaded today; this is insurance against future `spawn_local`
-        // interleaving and the cheapest fix.
+        // Single-closure mutation: id allocation and append happen atomically
+        // inside `ToastStack::push`, so there's no read/write window for a
+        // concurrent push to observe the same counter and produce a duplicate
+        // key in `<For key=|t| t.id>`. Wasm is single-threaded today; this is
+        // insurance against future `spawn_local` interleaving.
         let id = self
-            .next_id
-            .try_update_value(|n| {
-                *n += 1;
-                *n
-            })
+            .stack
+            .try_update(|s| s.push(kind, title, detail))
             .unwrap_or(0);
-        let toast = Toast {
-            id,
-            kind,
-            title: title.into(),
-            detail,
-        };
-        self.items.update(|v| v.push(toast));
         spawn_local(async move {
             TimeoutFuture::new(4500).await;
-            self.items.update(|v| v.retain(|t| t.id != id));
+            self.stack.update(|s| s.dismiss(id));
         });
     }
 
@@ -122,7 +76,7 @@ impl ToastBus {
     /// retry succeeds before the auto-dismiss timeout). No-op if the id
     /// has already been removed.
     pub fn dismiss(self, id: u64) {
-        self.items.update(|v| v.retain(|t| t.id != id));
+        self.stack.update(|s| s.dismiss(id));
     }
 }
 
@@ -137,7 +91,7 @@ pub fn Toasts(bus: ToastBus) -> impl IntoView {
     view! {
         <div class="toasts">
             <For
-                each=move || bus.items.get()
+                each=move || bus.stack.with(|s| s.items().to_vec())
                 key=|t| t.id
                 children=move |t| {
                     let id = t.id;
