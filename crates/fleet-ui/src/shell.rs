@@ -61,10 +61,7 @@ pub fn Shell(
                 on_logout=on_logout
             />
             <div class="body">
-                {match rail_bottom {
-                    Some(b) => view! { <Rail items=rail_items active=rail_active bottom=b/> }.into_any(),
-                    None => view! { <Rail items=rail_items active=rail_active/> }.into_any(),
-                }}
+                <Rail items=rail_items active=rail_active bottom=rail_bottom/>
                 <main class="main">
                     {children()}
                 </main>
