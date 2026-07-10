@@ -51,3 +51,27 @@ This supersedes ADR-0030's `<Modal/>` deferral and its implied two-consumer
 threshold. The lockstep/no-semver policy is unchanged and is what makes this
 rule cheap: a mis-designed shared API is corrected in place and both consumers
 absorb it on their next rev bump.
+
+## Pending coastwatch compile-fix (as of the #28 fleet-ui rev)
+
+The lockstep model means a fleet-ui API change can leave the sibling consumer
+temporarily uncompilable until its next `TRAWL_REV` bump. One such fix is
+outstanding and is recorded here so it rides the next coastwatch bump — the
+trawl repo does not edit the sibling repo.
+
+- **`crates/web-ui/src/components/rail.rs` — `coastwatch_rail_items`**: add
+  `badge: None` to the `RailItem { .. }` construction and drop the now-stale
+  "`fleet_ui::RailItem` has no badge slot" doc comment. `RailItem` grew a
+  required `badge: Option<u64>` field in slice A (#29); coastwatch's mapper
+  still builds `RailItem { id, label, icon, path }`, so its `trunk build`
+  fails against the current fleet-ui. This is a #29 consequence, **not a #28
+  regression** — it reproduces identically against `origin/main`'s fleet-ui.
+  (Coastwatch's own awaiting-review count can later migrate off the label-text
+  workaround onto the real `badge` slot, but that is a separate feature change,
+  not part of the compile-fix.)
+
+Slice B (#28) adds Modal, Drawer, Tabs, ErrorBanner, a `Btn` size axis, a
+`Field` wrap mode, and new `Icon` glyphs. Every one is additive with
+default-valued props (`ConfirmModal`'s public API is frozen), so #28 introduces
+**no new coastwatch break** — the `badge: None` above is the sole pending
+compile-fix at this rev.
