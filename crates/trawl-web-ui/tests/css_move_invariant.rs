@@ -123,6 +123,13 @@ const MOVED_SELECTORS: &[&str] = &[
     ".results-pager",
     ".inp-wrap",
     ".inp-wrap input",
+    ".btn-icon",
+    ".btn-icon:hover",
+    ".actions-menu",
+    ".actions-menu .item",
+    ".actions-menu .item:hover",
+    ".actions-menu .item.danger",
+    ".actions-menu .item.danger:hover",
 ];
 
 /// Selector families the issue #31 unification RETIRED outright: their

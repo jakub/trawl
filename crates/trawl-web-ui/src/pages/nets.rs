@@ -10,7 +10,6 @@
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos::web_sys;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::SavedQueryResponse;
@@ -21,8 +20,8 @@ use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{time_ago, time_until};
 use fleet_ui::{
-    Btn, ConfirmModal, LoadState, Loaded, Pager, SearchInput, StatusDot, ToastBus, ToastKind,
-    Variant,
+    ActionItem, ActionsMenu, Btn, ConfirmModal, ConfirmState, LoadState, Loaded, Pager,
+    SearchInput, StatusDot, ToastBus, ToastKind, Variant,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,8 +50,8 @@ pub fn NetsPage() -> impl IntoView {
     let sort = RwSignal::new(NetSort::Name);
     let refresh = RwSignal::new(0u64);
     let show_create_modal = RwSignal::new(false);
-    let actions_open: RwSignal<Option<i64>> = RwSignal::new(None);
-    let confirm_delete: RwSignal<Option<(i64, String)>> = RwSignal::new(None);
+    let confirm_delete: RwSignal<ConfirmState<(i64, String)>> =
+        RwSignal::new(ConfirmState::default());
 
     let nets = LocalResource::new(move || {
         let _ = refresh.get();
@@ -181,8 +180,9 @@ pub fn NetsPage() -> impl IntoView {
                 </div>
                 <div class="actions">
                     <SearchInput value=filter placeholder="filter nets…"/>
+                    // (the old `sort-select` class had no CSS rule — dropped,
+                    // issue #31 C7)
                     <select
-                        class="sort-select"
                         on:change=move |e| {
                             let v = event_target_value(&e);
                             sort.set(match v.as_str() {
@@ -318,61 +318,28 @@ pub fn NetsPage() -> impl IntoView {
                                             <div style="flex:3; min-width:0" class="mono path">{query_text}</div>
                                             <div style="flex:0 0 80px">{sched_badge}</div>
                                             <div style="flex:0 0 140px">{last_run_view}</div>
-                                            <div style="flex:0 0 40px; position:relative">
-                                                // Sanctioned #28 sweep exclusion (AC C2): this
-                                                // overflow-menu trigger stays a raw <button> because
-                                                // no Btn variant emits the bespoke icon-only
-                                                // .btn-icon style — same custom-style rationale as
-                                                // the editor `run` button and the export `fmt-btn`
-                                                // tiles.
-                                                <button
-                                                    class="btn-icon"
-                                                    on:click=move |e: web_sys::MouseEvent| {
-                                                        e.stop_propagation();
-                                                        actions_open.update(|v| {
-                                                            *v = if *v == Some(id) { None } else { Some(id) };
-                                                        });
-                                                    }
-                                                >"⋯"</button>
-                                                <Show when=move || actions_open.get() == Some(id)>
-                                                    <div class="actions-menu">
-                                                        <div
-                                                            class="item"
-                                                            on:click={
-                                                                let q = query_for_run.clone();
-                                                                let run = on_run_in_search.clone();
-                                                                move |e: web_sys::MouseEvent| {
-                                                                    e.stop_propagation();
-                                                                    actions_open.set(None);
-                                                                    run(q.clone());
-                                                                }
-                                                            }
-                                                        >"▶ Open in search"</div>
-                                                        <div
-                                                            class="item"
-                                                            on:click={
-                                                                let name = name_for_trigger.clone();
-                                                                let trigger = on_trigger_run.clone();
-                                                                move |e: web_sys::MouseEvent| {
-                                                                    e.stop_propagation();
-                                                                    actions_open.set(None);
-                                                                    trigger(id, name.clone());
-                                                                }
-                                                            }
-                                                        >"⏱ Trigger run"</div>
-                                                        <div
-                                                            class="item danger"
-                                                            on:click={
-                                                                let name = name_for_delete.clone();
-                                                                move |e: web_sys::MouseEvent| {
-                                                                    e.stop_propagation();
-                                                                    actions_open.set(None);
-                                                                    confirm_delete.set(Some((id, name.clone())));
-                                                                }
-                                                            }
-                                                        >"Delete"</div>
-                                                    </div>
-                                                </Show>
+                                            <div style="flex:0 0 40px">
+                                                // fleet_ui::ActionsMenu owns the ⋯ trigger, the
+                                                // open state, and Escape/outside-click dismissal
+                                                // via the overlay stack (issue #31 C5).
+                                                <ActionsMenu items=vec![
+                                                    ActionItem::new("▶ Open in search", {
+                                                        let q = query_for_run.clone();
+                                                        let run = on_run_in_search.clone();
+                                                        Callback::new(move |()| run(q.clone()))
+                                                    }),
+                                                    ActionItem::new("⏱ Trigger run", {
+                                                        let name = name_for_trigger.clone();
+                                                        let trigger = on_trigger_run.clone();
+                                                        Callback::new(move |()| trigger(id, name.clone()))
+                                                    }),
+                                                    ActionItem::danger("Delete", {
+                                                        let name = name_for_delete.clone();
+                                                        Callback::new(move |()| {
+                                                            confirm_delete.update(|c| c.request((id, name.clone())));
+                                                        })
+                                                    }),
+                                                ]/>
                                             </div>
                                         </div>
                                     }
@@ -416,11 +383,13 @@ pub fn NetsPage() -> impl IntoView {
                 />
             </Show>
 
-            // Delete confirmation modal
-            <Show when=move || confirm_delete.get().is_some()>
+            // Delete confirmation modal — open/close plumbing via the
+            // natively-tested fleet_ui::ConfirmState (issue #31); the
+            // ConfirmModal composition stays app-side (ADR-0002).
+            <Show when=move || confirm_delete.get().is_open()>
                 {move || {
-                    let Some((del_id, del_name)) = confirm_delete.get() else {
-                        return view! { }.into_any();
+                    let Some((_, del_name)) = confirm_delete.get().pending().cloned() else {
+                        return ().into_any();
                     };
                     let msg = format!("Permanently delete '{del_name}' and all its run history?");
                     let do_delete = do_delete.clone();
@@ -430,11 +399,16 @@ pub fn NetsPage() -> impl IntoView {
                             message=msg
                             confirm_label="Delete"
                             on_confirm=Callback::new(move |()| {
-                                confirm_delete.set(None);
-                                do_delete(del_id, del_name.clone());
+                                // take() closes the dialog and yields the
+                                // payload exactly once.
+                                if let Some((id, name)) =
+                                    confirm_delete.try_update(|c| c.take()).flatten()
+                                {
+                                    do_delete(id, name);
+                                }
                             })
                             on_cancel=Callback::new(move |()| {
-                                confirm_delete.set(None);
+                                confirm_delete.update(|c| c.cancel());
                             })
                         />
                     }.into_any()
