@@ -161,6 +161,7 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".dr-pop .tabs .t.on",
     ".tbl-foot",
     ".tbl-foot .pager",
+    ".intel-badge",
 ];
 
 #[test]

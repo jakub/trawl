@@ -13,10 +13,10 @@ use crate::api;
 use crate::api::MeResponse;
 use crate::components::lineage_tree::{
     LineageNode, LineageTree, can_write_derivations, render_derivation_meta, render_marking_diff,
-    transformation_color,
+    tone_for_var, transformation_color,
 };
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, ConfirmWithReasonModal, Pager, ToastBus, ToastKind, Variant};
+use fleet_ui::{Badge, Btn, ConfirmWithReasonModal, Pager, ToastBus, ToastKind, Tone, Variant};
 
 const OBJECT_TYPES: &[&str] = &[
     "story",
@@ -292,14 +292,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                     view! {
                                         <div class="tbl-row" style=row_style title=inv_reason>
                                             <div style="flex:0 0 100px">
-                                                <span
-                                                    class="intel-badge"
-                                                    style=format!(
-                                                        "background:var({t_color}-wash,var(--panel-2));color:var({t_color})"
-                                                    )
-                                                >
-                                                    {t_label}
-                                                </span>
+                                                <Badge tone=tone_for_var(t_color)>{t_label}</Badge>
                                             </div>
                                             <div class="mono" style="flex:1;font-size:10px;color:var(--ink-2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
                                                 {source}" \u{2192} "{derived}
@@ -313,9 +306,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                             </div>
                                             {is_inv.then(|| view! {
                                                 <div style="flex:0 0 70px;text-align:right">
-                                                    <span class="intel-badge" style="background:var(--red-wash);color:var(--red)">
-                                                        "invalidated"
-                                                    </span>
+                                                    <Badge tone=Tone::Danger>"invalidated"</Badge>
                                                 </div>
                                             })}
                                         </div>

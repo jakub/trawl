@@ -5,10 +5,25 @@
 use coastwatch_api_types::derivation::{AncestryView, DerivationView, DescendantView};
 use leptos::prelude::*;
 
-use fleet_ui::{Btn, Size, Variant};
+use fleet_ui::{Badge, Btn, Size, Tone, Variant};
 
 use super::truncate;
 use crate::time_fmt::time_ago;
+
+/// Map the intel color-var vocabulary (`--green`, `--red`, …) that the
+/// badge helper fns share with non-badge accents (timeline dots, text
+/// colors) onto the closed fleet-ui badge [`Tone`] set. Known visible
+/// narrowing (sanctioned by ADR-0003, flagged in the PR): teal → Info,
+/// ink-2/ink-3/ink-4 → Neutral.
+pub(crate) fn tone_for_var(var: &str) -> Tone {
+    match var {
+        "--green" => Tone::Success,
+        "--red" => Tone::Danger,
+        "--amber" | "--yellow" => Tone::Warn,
+        "--blue" | "--teal" => Tone::Info,
+        _ => Tone::Neutral,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LineageNode {
@@ -85,13 +100,7 @@ pub(crate) fn render_marking_diff(
             truncate(&after_json, 50)
         );
         return view! {
-            <span
-                class="intel-badge"
-                style="background:var(--panel-2);color:var(--ink-3);font-size:9px;text-transform:none"
-                title=full
-            >
-                {label}
-            </span>
+            <Badge attr:title=full>{label}</Badge>
         }
         .into_any();
     }
@@ -112,12 +121,7 @@ pub(crate) fn render_marking_diff(
 
     if !tlp_changed && !tags_changed {
         return view! {
-            <span
-                class="intel-badge"
-                style="background:var(--panel-2);color:var(--ink-3);font-size:9px"
-            >
-                "marking changed"
-            </span>
+            <Badge>"marking changed"</Badge>
         }
         .into_any();
     }
@@ -129,12 +133,7 @@ pub(crate) fn render_marking_diff(
             after_tlp_raw.to_uppercase()
         );
         view! {
-            <span
-                class="intel-badge"
-                style="background:var(--amber-wash);color:var(--amber);font-size:9px"
-            >
-                {label}
-            </span>
+            <Badge tone=Tone::Warn>{label}</Badge>
         }
     });
 
@@ -148,12 +147,7 @@ pub(crate) fn render_marking_diff(
         };
         let label = format!("{} \u{2192} {}", fmt(&before_tags), fmt(&after_tags));
         view! {
-            <span
-                class="intel-badge"
-                style="background:var(--teal-wash);color:var(--ink-2);font-size:9px;text-transform:none"
-            >
-                {label}
-            </span>
+            <Badge tone=Tone::Info>{label}</Badge>
         }
     });
 
@@ -281,14 +275,7 @@ pub fn LineageTree(
                     view! {
                         <div class=row_class style=indent title=invalidation_title>
                             <span class="lineage-depth">{depth}</span>
-                            <span
-                                class="intel-badge"
-                                style=format!(
-                                    "background:var({t_color}-wash,var(--panel-2));color:var({t_color})"
-                                )
-                            >
-                                {t_label}
-                            </span>
+                            <Badge tone=tone_for_var(t_color)>{t_label}</Badge>
                             <span class="lineage-ref">
                                 {source_ref}" \u{2192} "{derived_ref}
                             </span>

@@ -11,7 +11,9 @@ use leptos_router::hooks::use_navigate;
 use crate::api;
 use crate::api::ApiError;
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
+use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Tone, Variant};
+
+use crate::components::lineage_tree::tone_for_var;
 
 #[component]
 pub fn StoriesPage() -> impl IntoView {
@@ -122,30 +124,21 @@ pub fn StoriesPage() -> impl IntoView {
                                     >
                                         <div class="story-list-main">
                                             <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0;flex:1">
-                                                <span
-                                                    class="intel-badge"
-                                                    style=format!("background:var({state_color}-wash,var(--panel-2));color:var({state_color})")
-                                                >{state_label}</span>
-                                                <span class="intel-badge" style="background:var(--panel-2);color:var(--blue)">
-                                                    {cls}
-                                                </span>
+                                                <Badge tone=tone_for_var(state_color)>{state_label}</Badge>
+                                                <Badge tone=Tone::Info>{cls}</Badge>
                                                 {markings.into_iter().map(|m| {
-                                                    let (bg, fg) = marking_colors(&m);
+                                                    let tone = marking_tone(&m);
                                                     let label = if m.scheme.eq_ignore_ascii_case("TLP") {
                                                         format!("TLP:{}", m.value.to_uppercase())
                                                     } else {
                                                         format!("{}:{}", m.scheme, m.value)
                                                     };
                                                     view! {
-                                                        <span class="intel-badge" style=format!("background:{bg};color:{fg};font-weight:600")>
-                                                            {label}
-                                                        </span>
+                                                        <Badge tone=tone>{label}</Badge>
                                                     }
                                                 }).collect::<Vec<_>>()}
                                                 {has_parent.then(|| view! {
-                                                    <span class="intel-badge" style="background:var(--panel-2);color:var(--ink-3)">
-                                                        "\u{2934}"
-                                                    </span>
+                                                    <Badge>"\u{2934}"</Badge>
                                                 })}
                                                 <span class="story-list-title">{story.canonical_title}</span>
                                             </div>
@@ -228,15 +221,18 @@ pub(crate) fn class_label(s: &str) -> &'static str {
     }
 }
 
-fn marking_colors(m: &coastwatch_api_types::marking::MarkingView) -> (&'static str, &'static str) {
+/// Map a marking onto the closed badge tone set: TLP colors keep their
+/// severity reading (RED→Danger, AMBER→Warn, GREEN→Success); anything
+/// else is Neutral.
+pub(crate) fn marking_tone(m: &coastwatch_api_types::marking::MarkingView) -> Tone {
     if m.scheme.eq_ignore_ascii_case("TLP") {
         match m.value.to_uppercase().as_str() {
-            "RED" => ("var(--red-wash)", "var(--red)"),
-            "AMBER" | "AMBER+STRICT" => ("var(--amber-wash)", "var(--amber)"),
-            "GREEN" => ("rgba(74,125,63,.10)", "var(--green)"),
-            _ => ("var(--panel-2)", "var(--ink-3)"),
+            "RED" => Tone::Danger,
+            "AMBER" | "AMBER+STRICT" => Tone::Warn,
+            "GREEN" => Tone::Success,
+            _ => Tone::Neutral,
         }
     } else {
-        ("var(--panel-2)", "var(--ink-2)")
+        Tone::Neutral
     }
 }

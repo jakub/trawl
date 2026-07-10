@@ -20,12 +20,14 @@ use leptos_router::hooks::use_params_map;
 
 use crate::api;
 use crate::api::{ApiError, MeResponse};
-use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
+use crate::components::lineage_tree::{
+    LineageNode, LineageTree, can_write_derivations, tone_for_var,
+};
 use crate::components::linkage_graph::LinkageGraph;
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, LoadState, Loaded, Pager, Variant};
+use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, Tone, Variant};
 
-use super::stories::{class_label, state_badge};
+use super::stories::{class_label, marking_tone, state_badge};
 
 #[derive(Clone, PartialEq)]
 struct HeaderMeta {
@@ -168,22 +170,17 @@ fn StoryHeader(
             <div style="display:flex;flex-direction:column;gap:6px">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                     <h1 style="margin:0">{title}</h1>
-                    <span
-                        class="intel-badge"
-                        style=format!("background:var({state_color}-wash,var(--panel-2));color:var({state_color})")
-                    >{state_label}</span>
-                    <span class="intel-badge" style="background:var(--panel-2);color:var(--blue)">{class_label}</span>
+                    <Badge tone=tone_for_var(state_color)>{state_label}</Badge>
+                    <Badge tone=Tone::Info>{class_label}</Badge>
                     {markings.into_iter().map(|m| {
-                        let (bg, fg) = marking_colors(&m);
+                        let tone = marking_tone(&m);
                         let label = if m.scheme.eq_ignore_ascii_case("TLP") {
                             format!("TLP:{}", m.value.to_uppercase())
                         } else {
                             format!("{}:{}", m.scheme, m.value)
                         };
                         view! {
-                            <span class="intel-badge" style=format!("background:{bg};color:{fg};font-weight:600")>
-                                {label}
-                            </span>
+                            <Badge tone=tone>{label}</Badge>
                         }
                     }).collect::<Vec<_>>()}
                     {(!score.is_empty()).then(|| view! {
@@ -402,9 +399,7 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                                         style=format!("background:var({delta_color})")
                                     />
                                     <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
-                                        <span class="intel-badge"
-                                            style=format!("background:var({delta_color}-wash,var(--panel-2));color:var({delta_color})")
-                                        >{delta_label}</span>
+                                        <Badge tone=tone_for_var(delta_color)>{delta_label}</Badge>
                                         <span class="v-timeline-when" title=ev.occurred_at.clone()>{when}</span>
                                     </div>
                                     <div class="v-timeline-summary">{ev.summary}</div>
@@ -583,9 +578,7 @@ fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>, now_ms: i64) -
                                     <div class=format!("tbl-row {row_class}") style="cursor:default">
                                         <div style="flex:2;font-weight:500">{product}</div>
                                         <div style="flex:0 0 80px">
-                                            <span class="intel-badge"
-                                                style=format!("background:var({sev_color}-wash,var(--panel-2));color:var({sev_color})")
-                                            >{sev_label}</span>
+                                            <Badge tone=tone_for_var(sev_color)>{sev_label}</Badge>
                                         </div>
                                         <div style="flex:1;color:var(--ink-2)" class="mono">{versions}</div>
                                         <div style="flex:1">
@@ -737,13 +730,9 @@ fn ClaimsSection(
                                     <div>
                                         <div class="source-group-hd" on:click=on_toggle_source>
                                             <span style="font-weight:600">{display_name}</span>
-                                            <span class="intel-badge" style="background:var(--panel-2);color:var(--ink-3)">
-                                                {sc_display}
-                                            </span>
+                                            <Badge>{sc_display}</Badge>
                                             {(!role_label.is_empty()).then(|| view! {
-                                                <span class="intel-badge"
-                                                    style=format!("background:var({role_color}-wash,var(--panel-2));color:var({role_color})")
-                                                >{role_label}</span>
+                                                <Badge tone=tone_for_var(role_color)>{role_label}</Badge>
                                             })}
                                             <span class="source-group-summary">{type_summary}</span>
                                         </div>
@@ -892,14 +881,10 @@ fn claim_row(
         <div data-claim-id=data_id>
             <div class=dim_class style=row_style on:click=on_toggle>
                 <div style="flex:0 0 88px">
-                    <span class="intel-badge" style=format!("background:var({rel_color}-wash,var(--panel-2));color:var({rel_color})")>
-                        {rel_label}
-                    </span>
+                    <Badge tone=tone_for_var(rel_color)>{rel_label}</Badge>
                 </div>
                 <div style="flex:0 0 64px">
-                    <span class="intel-badge" style=format!("background:var({pol_color}-wash,var(--panel-2));color:var({pol_color})")>
-                        {pol_label}
-                    </span>
+                    <Badge tone=tone_for_var(pol_color)>{pol_label}</Badge>
                 </div>
                 <div style="flex:2;min-width:0">{claim_type}</div>
                 <div style="flex:0 0 32px;text-align:center">
@@ -929,16 +914,14 @@ fn claim_row(
                             }
                         }).collect::<Vec<_>>()}
                         {claim_markings.into_iter().map(|m| {
-                            let (bg, fg) = marking_colors(&m);
+                            let tone = marking_tone(&m);
                             let label = if m.scheme.eq_ignore_ascii_case("TLP") {
                                 format!("TLP:{}", m.value.to_uppercase())
                             } else {
                                 format!("{}:{}", m.scheme, m.value)
                             };
                             view! {
-                                <span class="intel-badge" style=format!("background:{bg};color:{fg};font-size:9px")>
-                                    {label}
-                                </span>
+                                <Badge tone=tone>{label}</Badge>
                             }
                         }).collect::<Vec<_>>()}
                     </div>
@@ -1063,9 +1046,7 @@ fn RelationsSection(
                                     view! {
                                         <div class="tbl-row" style="cursor:default">
                                             <div style="flex:0 0 100px">
-                                                <span class="intel-badge" style="background:var(--panel-2);color:var(--ink-2)">
-                                                    {rel_label}
-                                                </span>
+                                                <Badge>{rel_label}</Badge>
                                             </div>
                                             <div style="flex:1">
                                                 <a class="link" href=href>{other_id.clone()}</a>
@@ -1398,19 +1379,6 @@ fn summarize_claim_types(claims: &[StoryClaimView]) -> String {
         .map(|(t, n)| format!("{n}\u{00d7} {}", t.replace('_', " ")))
         .collect::<Vec<_>>()
         .join(" \u{00b7} ")
-}
-
-fn marking_colors(m: &MarkingView) -> (&'static str, &'static str) {
-    if m.scheme.eq_ignore_ascii_case("TLP") {
-        match m.value.to_uppercase().as_str() {
-            "RED" => ("var(--red-wash)", "var(--red)"),
-            "AMBER" | "AMBER+STRICT" => ("var(--amber-wash)", "var(--amber)"),
-            "GREEN" => ("rgba(74,125,63,.10)", "var(--green)"),
-            _ => ("var(--panel-2)", "var(--ink-3)"),
-        }
-    } else {
-        ("var(--panel-2)", "var(--ink-2)")
-    }
 }
 
 fn relationship_badge(s: &str) -> (&'static str, &'static str) {
