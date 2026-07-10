@@ -179,7 +179,7 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     let expected: Vec<String> = e
         .expected()
         .map(|exp| match exp {
-            chumsky::error::RichPattern::Token(c) => format!("'{}'", &**c),
+            chumsky::error::RichPattern::Token(c) => format!("'{}'", **c),
             chumsky::error::RichPattern::Label(l) => l.to_string(),
             chumsky::error::RichPattern::Identifier(id) => format!("`{id}`"),
             chumsky::error::RichPattern::Any => "any token".to_string(),
