@@ -19,7 +19,7 @@ use wasm_bindgen::JsCast;
 use crate::api;
 use crate::components::sparkline::Sparkline;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, Drawer, Size, TabItem, ToastBus, ToastKind, Variant};
 
 const RUNS_PAGE_SIZE: usize = 20;
 const RESULT_PREVIEW_ROWS: usize = 20;
@@ -75,43 +75,33 @@ pub fn NetDrawer(
         }
     };
 
-    let close = move || on_close.run(());
-    let close_key = close;
-    let close_scrim = close;
-    let close_x = close;
-
-    let on_keydown = move |e: web_sys::KeyboardEvent| {
-        if e.key() == "Escape" {
-            e.prevent_default();
+    // Escape cancels an in-flight rename before it closes the drawer —
+    // threaded into fleet_ui::Drawer's window-level listener.
+    let on_escape = {
+        let orig = original_name.clone();
+        Callback::new(move |()| {
             if editing_name.get_untracked() {
                 editing_name.set(false);
-                name_buf.set(original_name.clone());
+                name_buf.set(orig.clone());
             } else {
-                close_key();
+                on_close.run(());
             }
-        }
+        })
     };
 
-    let tab_click = move |t: &'static str| {
-        let cb = on_tab_change;
-        move |_| cb.run(t.to_string())
-    };
-    let tab_query_click = tab_click("query");
-    let tab_runs_click = tab_click("runs");
-
-    let is_tab = move |want: &'static str| -> bool {
+    // Drawer compares ids verbatim; map the URL signal's empty default.
+    let eff_tab = Signal::derive(move || {
         let t = tab.get();
-        let eff = if t.is_empty() { "query" } else { t.as_str() };
-        eff == want
-    };
+        if t.is_empty() { "query".to_string() } else { t }
+    });
 
     let on_run_click = {
         let q = query_for_run;
         let cb = on_search;
-        move |_| cb.run(q.clone())
+        Callback::new(move |()| cb.run(q.clone()))
     };
 
-    let on_trigger_click = move |_| {
+    let on_trigger_click = Callback::new(move |()| {
         let name = name_for_trigger.clone();
         let id = net_id_for_trigger;
         spawn_local(async move {
@@ -129,107 +119,90 @@ pub fn NetDrawer(
                 }
             }
         });
-    };
+    });
 
     view! {
-        <div
-            class="sd-scrim"
-            tabindex="-1"
-            on:mousedown=move |e: web_sys::MouseEvent| {
-                if let Some(target) = e.target()
-                    && let Some(el) = target.dyn_ref::<web_sys::Element>()
-                    && el.class_name().contains("sd-scrim")
-                {
-                    close_scrim();
-                }
-            }
-            on:keydown=on_keydown
-        >
-            <aside class="sd-drawer" role="dialog" aria-modal="true">
-                <div class="sd-hd">
-                    <div class="sd-ttl">
-                        <Show
-                            when=move || editing_name.get()
-                            fallback={
-                                let name = net.name.clone();
-                                move || view! {
-                                    <span
-                                        class="name"
-                                        title="Click to rename"
-                                        style="cursor:pointer"
-                                        on:click=move |_| editing_name.set(true)
-                                    >{name.clone()}</span>
-                                }
-                            }
-                        >
-                            {
-                                let do_rename = do_rename.clone();
-                                let do_rename_blur = do_rename.clone();
-                                view! {
-                                    <input
-                                        class="name-edit"
-                                        prop:value=move || name_buf.get()
-                                        on:input=move |e| name_buf.set(event_target_value(&e))
-                                        on:blur=move |_| do_rename_blur()
-                                        on:keydown=move |e: web_sys::KeyboardEvent| {
-                                            if e.key() == "Enter" {
-                                                e.prevent_default();
-                                                do_rename();
-                                            }
-                                        }
-                                    />
-                                }
-                            }
-                        </Show>
-                    </div>
-                    <div class="sd-actions">
-                        <button class="btn-sec" on:click=on_run_click title="Open query in search">
-                            "▶ Search"
-                        </button>
-                        <button class="btn-sec" on:click=on_trigger_click title="Trigger a scheduled run now">
-                            "⏱ Run"
-                        </button>
-                        <span class="sd-x" title="Close (Esc)" on:click=move |_| close_x()>
-                            <CloseIcon/>
-                        </span>
-                    </div>
-                </div>
-
-                <div class="sd-tabs">
-                    <span
-                        class=move || if is_tab("query") { "tb on" } else { "tb" }
-                        on:click=tab_query_click
-                    >"Query + Schedule"</span>
-                    <span
-                        class=move || if is_tab("runs") { "tb on" } else { "tb" }
-                        on:click=tab_runs_click
-                    >"Runs"</span>
-                    <span class="sp"></span>
-                </div>
-
-                <div class="sd-body">
-                    {move || {
-                        if is_tab("runs") {
-                            view! {
-                                <RunsPane
-                                    net_id=net_for_runs.id
-                                    bus=bus
-                                    on_search=on_search
-                                />
-                            }.into_any()
-                        } else {
-                            view! {
-                                <QuerySchedulePane
-                                    net=net_for_query.clone()
-                                    bus=bus
-                                    on_refresh=on_refresh
-                                />
-                            }.into_any()
+        <Drawer
+            tabs=vec![
+                TabItem::new("query", "Query + Schedule"),
+                TabItem::new("runs", "Runs"),
+            ]
+            active_tab=eff_tab
+            on_tab_change=on_tab_change
+            on_close=on_close
+            on_escape=on_escape
+            title=Box::new(move || view! {
+                <Show
+                    when=move || editing_name.get()
+                    fallback={
+                        let name = net.name.clone();
+                        move || view! {
+                            <span
+                                class="name"
+                                title="Click to rename"
+                                style="cursor:pointer"
+                                on:click=move |_| editing_name.set(true)
+                            >{name.clone()}</span>
                         }
-                    }}
-                </div>
-            </aside>
-        </div>
+                    }
+                >
+                    {
+                        let do_rename = do_rename.clone();
+                        let do_rename_blur = do_rename.clone();
+                        view! {
+                            <input
+                                class="name-edit"
+                                prop:value=move || name_buf.get()
+                                on:input=move |e| name_buf.set(event_target_value(&e))
+                                on:blur=move |_| do_rename_blur()
+                                on:keydown=move |e: web_sys::KeyboardEvent| {
+                                    if e.key() == "Enter" {
+                                        e.prevent_default();
+                                        do_rename();
+                                    }
+                                }
+                            />
+                        }
+                    }
+                </Show>
+            }.into_any())
+            actions=Box::new(move || view! {
+                <Btn
+                    variant=Variant::Secondary
+                    on_click=on_run_click
+                    attr:title="Open query in search"
+                >
+                    "▶ Search"
+                </Btn>
+                <Btn
+                    variant=Variant::Secondary
+                    on_click=on_trigger_click
+                    attr:title="Trigger a scheduled run now"
+                >
+                    "⏱ Run"
+                </Btn>
+            }.into_any())
+        >
+            {move || {
+                if eff_tab.get() == "runs" {
+                    view! {
+                        <RunsPane
+                            net_id=net_for_runs.id
+                            bus=bus
+                            on_search=on_search
+                        />
+                    }.into_any()
+                } else {
+                    view! {
+                        <QuerySchedulePane
+                            net=net_for_query.clone()
+                            bus=bus
+                            on_refresh=on_refresh
+                        />
+                    }.into_any()
+                }
+            }}
+        </Drawer>
     }
 }
 
@@ -334,7 +307,11 @@ fn QuerySchedulePane(
                 <div class="sd-card-hd">
                     <span class="ttl">"Query"</span>
                     <Show when=move || !editing.get()>
-                        <button class="btn-sec btn-xs" on:click=move |_| editing.set(true)>"Edit"</button>
+                        <Btn
+                            variant=Variant::Secondary
+                            size=Size::Xs
+                            on_click=Callback::new(move |()| editing.set(true))
+                        >"Edit"</Btn>
                     </Show>
                 </div>
                 <Show
@@ -352,18 +329,19 @@ fn QuerySchedulePane(
                         on:input=move |e| query_buf.set(event_target_value(&e))
                     ></textarea>
                     <div style="display:flex; gap:6px; margin-top:6px">
-                        <button
-                            class="btn-pri btn-xs"
-                            prop:disabled=move || saving_query.get()
-                            on:click=move |_| do_save_query()
-                        >{move || if saving_query.get() { "Saving…" } else { "Save" }}</button>
-                        <button class="btn-sec btn-xs" on:click={
+                        <Btn
+                            variant=Variant::Primary
+                            size=Size::Xs
+                            disabled=saving_query
+                            on_click=Callback::new(move |()| do_save_query())
+                        >{move || if saving_query.get() { "Saving…" } else { "Save" }}</Btn>
+                        <Btn variant=Variant::Secondary size=Size::Xs on_click={
                             let reset_q = original_query.clone();
-                            move |_| {
+                            Callback::new(move |()| {
                                 editing.set(false);
                                 query_buf.set(reset_q.clone());
-                            }
-                        }>"Cancel"</button>
+                            })
+                        }>"Cancel"</Btn>
                     </div>
                 </Show>
             </div>
@@ -377,11 +355,12 @@ fn QuerySchedulePane(
                     when=move || show_schedule_form.get()
                     fallback=move || view! {
                         <p style="color:var(--ink-3); font-size:12px; margin:0">"No schedule attached."</p>
-                        <button
-                            class="btn-sec btn-xs"
-                            style="margin-top:8px"
-                            on:click=move |_| show_schedule_form.set(true)
-                        >"+ Add Schedule"</button>
+                        <Btn
+                            variant=Variant::Secondary
+                            size=Size::Xs
+                            attr:style="margin-top:8px"
+                            on_click=Callback::new(move |()| show_schedule_form.set(true))
+                        >"+ Add Schedule"</Btn>
                     }
                 >
                     <div style="display:flex; flex-direction:column; gap:10px">
@@ -445,18 +424,20 @@ fn QuerySchedulePane(
 
                         // actions
                         <div style="display:flex; gap:6px; align-items:center">
-                            <button
-                                class="btn-pri btn-xs"
-                                prop:disabled=move || saving_schedule.get()
-                                on:click=move |_| do_save_schedule()
-                            >{move || if saving_schedule.get() { "Saving…" } else { "Save Schedule" }}</button>
+                            <Btn
+                                variant=Variant::Primary
+                                size=Size::Xs
+                                disabled=saving_schedule
+                                on_click=Callback::new(move |()| do_save_schedule())
+                            >{move || if saving_schedule.get() { "Saving…" } else { "Save Schedule" }}</Btn>
                             {has_schedule.then(|| {
                                 view! {
-                                    <button
-                                        class="btn-sec btn-xs"
-                                        style="color:var(--red)"
-                                        on:click=move |_| do_delete_schedule()
-                                    >"Remove Schedule"</button>
+                                    <Btn
+                                        variant=Variant::Secondary
+                                        size=Size::Xs
+                                        attr:style="color:var(--red)"
+                                        on_click=Callback::new(move |()| do_delete_schedule())
+                                    >"Remove Schedule"</Btn>
                                 }
                             })}
                         </div>
@@ -591,16 +572,20 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                 <div class="tbl-foot">
                                     <span>{format!("{first}–{last} of {total}")}</span>
                                     <span style="display:flex; gap:4px">
-                                        <button
-                                            class="btn-sec btn-xs"
-                                            prop:disabled=move || page.get() == 0
-                                            on:click=move |_| page.update(|p| *p = p.saturating_sub(1))
-                                        >"← prev"</button>
-                                        <button
-                                            class="btn-sec btn-xs"
-                                            prop:disabled=move || last >= total
-                                            on:click=move |_| page.update(|p| *p += 1)
-                                        >"next →"</button>
+                                        <Btn
+                                            variant=Variant::Secondary
+                                            size=Size::Xs
+                                            disabled=Signal::derive(move || page.get() == 0)
+                                            on_click=Callback::new(move |()| {
+                                                page.update(|p| *p = p.saturating_sub(1));
+                                            })
+                                        >"← prev"</Btn>
+                                        <Btn
+                                            variant=Variant::Secondary
+                                            size=Size::Xs
+                                            disabled=Signal::derive(move || last >= total)
+                                            on_click=Callback::new(move |()| page.update(|p| *p += 1))
+                                        >"next →"</Btn>
                                     </span>
                                 </div>
                             </div>
@@ -643,11 +628,12 @@ fn RunResultPreview(
                             let query = resp.summary.query.clone();
                             view! {
                                 <ResultPreviewTable result=qr/>
-                                <button
-                                    class="btn-sec btn-xs"
-                                    style="margin-top:6px"
-                                    on:click=move |_| on_search.run(query.clone())
-                                >"View full results →"</button>
+                                <Btn
+                                    variant=Variant::Secondary
+                                    size=Size::Xs
+                                    attr:style="margin-top:6px"
+                                    on_click=Callback::new(move |()| on_search.run(query.clone()))
+                                >"View full results →"</Btn>
                             }.into_any()
                         }
                     }
@@ -691,14 +677,5 @@ fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
                 {format!("showing {RESULT_PREVIEW_ROWS} of {total_rows} rows")}
             </div>
         })}
-    }
-}
-
-#[component]
-fn CloseIcon() -> impl IntoView {
-    view! {
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M4 4l8 8M12 4l-8 8"/>
-        </svg>
     }
 }

@@ -23,14 +23,12 @@
 use std::collections::HashMap;
 
 use leptos::prelude::*;
-use leptos::web_sys;
 use trawl_api::value::{QueryResult, Value};
 use trawl_api::{QueryResponse, ServiceColumnStats, ServiceSchema};
-use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, Drawer, Icon, IconView, TabItem, ToastBus, ToastKind, Variant};
 
 /// Display cap for the live-tail viewport — keeps the DOM snappy. The
 /// ring underneath still holds up to `LIVE_RING_CAPACITY` events.
@@ -68,24 +66,6 @@ pub fn ServiceDrawer(
                 .map(|r| r.clone().map_err(|e| e.to_string()))
         });
 
-    // Close helpers
-    let close = move || on_close.run(());
-    let close_key = close;
-    let close_scrim = close;
-    let close_x = close;
-
-    let on_keydown = move |e: web_sys::KeyboardEvent| {
-        if e.key() == "Escape" {
-            e.prevent_default();
-            close_key();
-        }
-    };
-
-    let tab_click = move |t: &'static str| {
-        let cb = on_tab_change;
-        move |_| cb.run(t.to_string())
-    };
-
     // Drawer header sub-text: show date range when available.
     let sub_text = match (svc.earliest_date.as_deref(), svc.latest_date.as_deref()) {
         (Some(a), Some(b)) if a == b => a.to_string(),
@@ -99,98 +79,70 @@ pub fn ServiceDrawer(
         svc.columns.len()
     );
 
-    let on_search_click = move |_| on_search.run(name_for_search.clone());
-    let on_tail_click = tab_click("tail");
-    let tab_over_click = tab_click("overview");
-    let tab_fields_click = tab_click("fields");
-    let tab_tail_click = tab_click("tail");
+    let on_search_click = Callback::new(move |()| on_search.run(name_for_search.clone()));
+    let on_tail_click = Callback::new(move |()| on_tab_change.run("tail".to_string()));
 
-    let is_tab = move |want: &'static str| -> bool {
+    // Drawer compares ids verbatim; map the URL signal's empty default.
+    let eff_tab = Signal::derive(move || {
         let t = tab.get();
-        let eff = if t.is_empty() { "overview" } else { t.as_str() };
-        eff == want
-    };
+        if t.is_empty() {
+            "overview".to_string()
+        } else {
+            t
+        }
+    });
 
     view! {
-        <div
-            class="sd-scrim"
-            tabindex="-1"
-            on:mousedown=move |e: web_sys::MouseEvent| {
-                if let Some(target) = e.target()
-                    && let Some(el) = target.dyn_ref::<web_sys::Element>()
-                    && el.class_name().contains("sd-scrim")
-                {
-                    close_scrim();
-                }
-            }
-            on:keydown=on_keydown
+        <Drawer
+            tabs=vec![
+                TabItem::new("overview", "Overview"),
+                TabItem::new("fields", "Fields"),
+                TabItem::new("tail", "Live tail"),
+            ]
+            active_tab=eff_tab
+            on_tab_change=on_tab_change
+            on_close=on_close
+            meta=meta_text
+            title=Box::new(move || view! {
+                <StatusDot svc=svc_for_head.clone()/>
+                <span class="name">{svc_for_head.name.clone()}</span>
+                {(!sub_text.is_empty()).then_some(view! {
+                    <span class="sub">{sub_text}</span>
+                })}
+            }.into_any())
+            actions=Box::new(move || view! {
+                <Btn variant=Variant::Secondary on_click=on_search_click>
+                    <IconView icon=Icon::Search size=11 stroke_width=1.5/> " Search this service"
+                </Btn>
+                <Btn variant=Variant::Secondary on_click=on_tail_click>
+                    <IconView icon=Icon::Zap size=11 stroke_width=1.5/> " Tail live"
+                </Btn>
+            }.into_any())
         >
-            <aside class="sd-drawer" role="dialog" aria-modal="true">
-                <div class="sd-hd">
-                    <div class="sd-ttl">
-                        <StatusDot svc=svc_for_head.clone()/>
-                        <span class="name">{svc_for_head.name.clone()}</span>
-                        {(!sub_text.is_empty()).then_some(view! {
-                            <span class="sub">{sub_text}</span>
-                        })}
-                    </div>
-                    <div class="sd-actions">
-                        <button class="btn-sec" on:click=on_search_click>
-                            <SearchIcon/> " Search this service"
-                        </button>
-                        <button class="btn-sec" on:click=on_tail_click>
-                            <ZapIcon/> " Tail live"
-                        </button>
-                        <span class="sd-x" title="Close (Esc)" on:click=move |_| close_x()>
-                            <CloseIcon/>
-                        </span>
-                    </div>
-                </div>
-
-                <div class="sd-tabs">
-                    <span
-                        class=move || if is_tab("overview") { "tb on" } else { "tb" }
-                        on:click=tab_over_click
-                    >"Overview"</span>
-                    <span
-                        class=move || if is_tab("fields") { "tb on" } else { "tb" }
-                        on:click=tab_fields_click
-                    >"Fields"</span>
-                    <span
-                        class=move || if is_tab("tail") { "tb on" } else { "tb" }
-                        on:click=tab_tail_click
-                    >"Live tail"</span>
-                    <span class="sp"></span>
-                    <span class="meta">{meta_text}</span>
-                </div>
-
-                <div class="sd-body">
-                    {move || {
-                        if is_tab("fields") {
-                            view! {
-                                <FieldsPane
-                                    svc=svc_for_fields.clone()
-                                    cardinality=cardinality_sig
-                                    on_use_field=on_use_field
-                                />
-                            }.into_any()
-                        } else if is_tab("tail") {
-                            view! {
-                                <TailPane svc=svc_for_tail.clone() bus=bus/>
-                            }.into_any()
-                        } else {
-                            view! {
-                                <OverviewPane
-                                    svc=svc_for_over.clone()
-                                    cardinality=cardinality_sig
-                                    on_use_field=on_use_field
-                                />
-                            }.into_any()
-                        }
-                    }}
-                </div>
-            </aside>
-        </div>
+            {move || {
+                if eff_tab.get() == "fields" {
+                    view! {
+                        <FieldsPane
+                            svc=svc_for_fields.clone()
+                            cardinality=cardinality_sig
+                            on_use_field=on_use_field
+                        />
+                    }.into_any()
+                } else if eff_tab.get() == "tail" {
+                    view! {
+                        <TailPane svc=svc_for_tail.clone() bus=bus/>
+                    }.into_any()
+                } else {
+                    view! {
+                        <OverviewPane
+                            svc=svc_for_over.clone()
+                            cardinality=cardinality_sig
+                            on_use_field=on_use_field
+                        />
+                    }.into_any()
+                }
+            }}
+        </Drawer>
     }
 }
 
@@ -500,9 +452,12 @@ fn FieldDetail(
                 <div class="sfd-kv"><span>"Storage"</span><span>{storage}</span></div>
                 <div class="sfd-kv"><span>"Range"</span><span>{range_label}</span></div>
                 <div class="sfd-actions">
-                    <button class="btn-sec" on:click=move |_| on_use_field.run(name_for_use.clone())>
+                    <Btn
+                        variant=Variant::Secondary
+                        on_click=Callback::new(move |()| on_use_field.run(name_for_use.clone()))
+                    >
                         "Use in query"
-                    </button>
+                    </Btn>
                 </div>
             </div>
         </div>
@@ -921,34 +876,4 @@ fn StatusDot(svc: ServiceSchema) -> impl IntoView {
         "sd-dot errors"
     };
     view! { <span class=class></span> }
-}
-
-// ───────────────────────── Icons ─────────────────────────
-
-#[component]
-fn SearchIcon() -> impl IntoView {
-    view! {
-        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="7" cy="7" r="4.5"/>
-            <path d="m10.5 10.5 3 3"/>
-        </svg>
-    }
-}
-
-#[component]
-fn ZapIcon() -> impl IntoView {
-    view! {
-        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
-            <path d="M9 1 3 9h5l-1 6 6-8h-5z"/>
-        </svg>
-    }
-}
-
-#[component]
-fn CloseIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="m4 4 8 8M12 4l-8 8"/>
-        </svg>
-    }
 }

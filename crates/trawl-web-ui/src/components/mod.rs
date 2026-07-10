@@ -32,4 +32,3 @@ pub mod service_card_fmt;
 pub mod service_drawer;
 pub mod sparkline;
 pub mod status_bar;
-pub mod tabs;
