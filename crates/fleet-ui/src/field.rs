@@ -51,7 +51,7 @@ pub enum Helper {
 /// label (it still namespaces the helper paragraph).
 #[component]
 pub fn Field(
-    #[prop(strip_option)] id: Option<&'static str>,
+    #[prop(into, optional)] id: Option<&'static str>,
     label: &'static str,
     #[prop(default = Helper::None)] helper: Helper,
     #[prop(default = false)] wrap: bool,

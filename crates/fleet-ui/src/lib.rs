@@ -57,7 +57,7 @@ pub use icon::IconView;
 #[cfg(target_arch = "wasm32")]
 pub use login::Login;
 #[cfg(target_arch = "wasm32")]
-pub use modal::ConfirmModal;
+pub use modal::{ConfirmModal, ConfirmWithReasonModal, Modal};
 #[cfg(target_arch = "wasm32")]
 pub use rail::{Rail, RailItem};
 #[cfg(target_arch = "wasm32")]

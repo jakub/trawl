@@ -33,7 +33,10 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 // TopBar and Rail are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
-use fleet_ui::{AppLink, Icon, Login, ModeTab, RailItem, Shell, ToastBus, UserInfo, install};
+use fleet_ui::{
+    AppLink, Btn, ConfirmWithReasonModal, Icon, Login, Modal, ModeTab, RailItem, Shell, Size,
+    ToastBus, UserInfo, Variant, install,
+};
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -138,7 +141,72 @@ fn ToastProbe() -> impl IntoView {
                     "fire error"
                 </button>
             </div>
+            <ModalProbe/>
         </div>
+    }
+}
+
+/// Mounts the issue-#28 modal family from a non-trawl consumer: the
+/// `Modal` shell with icon/footer/Cmd-Ctrl+Enter, and the promoted
+/// `ConfirmWithReasonModal`. Also exercises the `Btn` size axis.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn ModalProbe() -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
+    let show_modal = RwSignal::new(false);
+    let show_reason = RwSignal::new(false);
+
+    let submit = Callback::new(move |()| {
+        bus.push_success("Submitted", Some("modal primary action ran".into()));
+        show_modal.set(false);
+    });
+
+    view! {
+        <div style="display:flex;gap:8px">
+            <Btn variant=Variant::Secondary on_click=Callback::new(move |()| show_modal.set(true))>
+                "open modal"
+            </Btn>
+            <Btn
+                variant=Variant::Secondary
+                size=Size::Xs
+                on_click=Callback::new(move |()| show_reason.set(true))
+            >
+                "open reason modal"
+            </Btn>
+        </div>
+        {move || show_modal.get().then(|| view! {
+            <Modal
+                title="Demo dialog"
+                icon=Icon::Download
+                on_cancel=Callback::new(move |()| show_modal.set(false))
+                on_submit=submit
+                footer=Box::new(move || view! {
+                    <div></div>
+                    <Btn
+                        variant=Variant::Secondary
+                        on_click=Callback::new(move |()| show_modal.set(false))
+                    >
+                        "Cancel"
+                    </Btn>
+                    <Btn variant=Variant::Primary on_click=submit>"Submit"</Btn>
+                }.into_any())
+            >
+                <p style="margin:0">"Esc cancels · ⌘/Ctrl+Enter submits · scrim click dismisses."</p>
+            </Modal>
+        })}
+        {move || show_reason.get().then(|| view! {
+            <ConfirmWithReasonModal
+                title="Retract demo object"
+                message="Retract demo-1? This cascades.".to_string()
+                confirm_label="Retract"
+                reason_placeholder="Reason for retraction"
+                on_confirm=Callback::new(move |reason: String| {
+                    bus.push_success("Retracted", Some(format!("reason: {reason}")));
+                    show_reason.set(false);
+                })
+                on_cancel=Callback::new(move |()| show_reason.set(false))
+            />
+        })}
     }
 }
 

@@ -129,6 +129,35 @@ fn btn_size_classes_shipped_with_crate() {
 }
 
 #[test]
+fn modal_family_classes_shipped_with_crate() {
+    // Issue #28 M2: the Modal shell renders the header icon chip and
+    // the promoted ConfirmWithReasonModal emits .m-field/.reason-input,
+    // so their rules move from trawl's main.css into fleet-ui.css
+    // (coastwatch consumes the reason modal next — app-side CSS would
+    // leave it unstyled there). Bodies pinned to the moved values.
+    assert!(
+        rule_body(".modal .m-hd .ic").contains("background: var(--amber-wash)"),
+        ".modal .m-hd .ic (header icon chip) moved verbatim"
+    );
+    assert!(
+        rule_body(".modal .m-field").contains("flex-direction: column"),
+        ".modal .m-field wrapper moved verbatim"
+    );
+    assert!(
+        rule_body(".modal .m-field label").contains("text-transform: uppercase"),
+        ".modal .m-field label typography moved verbatim"
+    );
+    assert!(
+        rule_body(".modal .m-field input").contains("height: 30px"),
+        ".modal .m-field input moved verbatim"
+    );
+    assert!(
+        rule_body(".reason-input").contains("min-height: 60px"),
+        ".reason-input moved verbatim"
+    );
+}
+
+#[test]
 fn chrome_keyframes_present() {
     for name in [
         "blink",

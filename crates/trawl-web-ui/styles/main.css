@@ -1094,11 +1094,9 @@
  *  and keyboard hints.
  * ─────────────────────────────────────────────────────────────── */
 
-.modal .m-hd .ic {
-  width: 22px; height: 22px; display: grid; place-items: center;
-  color: var(--amber);
-  background: var(--amber-wash); border-radius: 3px;
-}
+/* .modal .m-hd .ic, .modal .m-field* and .reason-input* moved to
+ * fleet-ui.css (issue #28) — the Modal shell and
+ * ConfirmWithReasonModal emit them. */
 
 .modal .m-body .preview {
   background: var(--panel-2); border: 1px solid var(--line);
@@ -1106,20 +1104,6 @@
   font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-2);
   white-space: pre-wrap; word-break: break-all;
 }
-.modal .m-field { display: flex; flex-direction: column; gap: 4px; }
-.modal .m-field label {
-  font-family: var(--font-ui); font-size: 10.5px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
-}
-.modal .m-field input {
-  background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
-  padding: 6px 10px; font-family: var(--font-ui); font-size: 13px;
-  color: var(--ink); outline: none; height: 30px;
-}
-.modal .m-field input:focus {
-  border-color: var(--amber); box-shadow: 0 0 0 3px var(--amber-glow);
-}
-
 .modal .m-ft .hint {
   flex: 1; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3);
   display: flex; gap: 8px; align-items: center;
@@ -1681,19 +1665,6 @@
 .lineage-time {
   font-family: var(--font-mono); font-size: 10px;
   color: var(--ink-4); white-space: nowrap;
-}
-
-/* ── Reason textarea (confirm-with-reason modal) ─────────────── */
-.reason-input {
-  width: 100%; min-height: 60px; padding: 6px 8px;
-  background: var(--panel-2); color: var(--ink);
-  border: 1px solid var(--line); border-radius: 3px;
-  font-family: var(--font-mono); font-size: 12px;
-  resize: vertical;
-}
-.reason-input:focus {
-  outline: none; box-shadow: 0 0 0 3px var(--amber-glow);
-  border-color: var(--amber);
 }
 
 /* ── Story list: two-line card rows ─────────────────────────── */

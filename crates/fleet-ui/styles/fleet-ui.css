@@ -32,8 +32,9 @@
  *   - Base form/button: .field, .btn, .btn-full, .error
  *   - Variants: .btn-pri, .btn-sec, .btn-danger
  *   - Sizes: .btn-sm (standalone compact), .btn-xs (modifier)
- *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd,
- *     .m-body, .m-ft
+ *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd
+ *     (+ .ic icon chip), .m-body, .m-ft; modal fields: .m-field,
+ *     .reason-input (emitted by ConfirmWithReasonModal / Field)
  *   - Toast host + items: .toasts, .toast, .toast.{success,error,info}
  *   - Login page: .login-shell, .login-card
  *   - App chrome: .shell grid, .topbar (brand/modes/jump/env/user),
@@ -43,8 +44,8 @@
  *   - [data-rowstyle] selectors targeting .results-table (the enum is
  *     shared via fleet-ui, but the selector references trawl's table)
  *   - .btn-icon, .field-label and other extras
- *   - Trawl-specific modal sub-styles (.m-field, .m-body .preview,
- *     .m-ft .hint, .export-formats) and the status bar (.statusbar)
+ *   - Trawl-specific modal sub-styles (.m-body .preview, .m-ft .hint,
+ *     .export-formats) and the status bar (.statusbar)
  *   - Anything app-specific: facets, editor, histogram, drawers,
  *     schema cards.
  */
@@ -396,6 +397,13 @@ textarea:focus-visible,
   display: flex; align-items: center; gap: 10px;
   padding: 12px 16px; border-bottom: 1px solid var(--line);
 }
+/* Header icon chip — rendered by the Modal shell's optional `icon`
+ * prop (moved from trawl's main.css, issue #28). */
+.modal .m-hd .ic {
+  width: 22px; height: 22px; display: grid; place-items: center;
+  color: var(--amber);
+  background: var(--amber-wash); border-radius: 3px;
+}
 .modal .m-hd .t {
   flex: 1; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
   color: var(--ink); letter-spacing: -.1px;
@@ -413,6 +421,36 @@ textarea:focus-visible,
   padding: 12px 16px;
   background: var(--panel-2);
   border-top: 1px solid var(--line);
+}
+
+/* Modal field cluster + reason textarea — emitted by fleet-ui's
+ * ConfirmWithReasonModal (and by app modal bodies via
+ * `<Field class="m-field">`), so the rules ship with the crate
+ * (moved from trawl's main.css, issue #28). */
+.modal .m-field { display: flex; flex-direction: column; gap: 4px; }
+.modal .m-field label {
+  font-family: var(--font-ui); font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
+}
+.modal .m-field input {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+  padding: 6px 10px; font-family: var(--font-ui); font-size: 13px;
+  color: var(--ink); outline: none; height: 30px;
+}
+.modal .m-field input:focus {
+  border-color: var(--amber); box-shadow: 0 0 0 3px var(--amber-glow);
+}
+
+.reason-input {
+  width: 100%; min-height: 60px; padding: 6px 8px;
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 3px;
+  font-family: var(--font-mono); font-size: 12px;
+  resize: vertical;
+}
+.reason-input:focus {
+  outline: none; box-shadow: 0 0 0 3px var(--amber-glow);
+  border-color: var(--amber);
 }
 
 /* ─────────────────────────────────────────────────────────────────
