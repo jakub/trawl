@@ -42,6 +42,23 @@ impl<T> LoadState<T> {
             Some(Ok(v)) => Self::Ready(v),
         }
     }
+
+    /// Map a manually-tracked fetch — a `loading` flag, an
+    /// already-rendered `error` message, and a lazily-evaluated `ready`
+    /// value — onto the tri-state. Sites that keep loading/error/data in
+    /// separate signals (rather than one `LocalResource`) resolve those
+    /// signals, then call this; `error` wins over `loading`, `loading`
+    /// over ready. `ready` is only invoked in the ready branch, so stale
+    /// data isn't cloned while a fetch is in flight (callers gate
+    /// `loading` however they like — e.g. `loading && data.is_empty()` to
+    /// keep showing stale rows during a background refresh).
+    pub fn from_parts(loading: bool, error: Option<String>, ready: impl FnOnce() -> T) -> Self {
+        match error {
+            Some(msg) => Self::Error(msg),
+            None if loading => Self::Loading,
+            None => Self::Ready(ready()),
+        }
+    }
 }
 
 /// Canonical loading copy: `loading…`, or `loading nets…` with a label.
@@ -87,6 +104,22 @@ mod tests {
                 other => format!("error: {other}"),
             });
         assert_eq!(err, LoadState::Error("story not found".to_string()));
+    }
+
+    #[test]
+    fn from_parts_prioritizes_error_then_loading_then_ready() {
+        // error wins even while loading.
+        let err: LoadState<u32> =
+            LoadState::from_parts(true, Some("boom".to_string()), || unreachable!());
+        assert_eq!(err, LoadState::Error("boom".to_string()));
+
+        // loading with no error, ready closure left untouched.
+        let loading: LoadState<u32> = LoadState::from_parts(true, None, || unreachable!());
+        assert_eq!(loading, LoadState::Loading);
+
+        // ready only when neither error nor loading.
+        let ready: LoadState<u32> = LoadState::from_parts(false, None, || 7);
+        assert_eq!(ready, LoadState::Ready(7));
     }
 
     #[test]

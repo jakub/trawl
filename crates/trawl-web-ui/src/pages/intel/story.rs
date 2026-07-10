@@ -365,13 +365,9 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
             <div class="intel-section-hd" style="margin-top:0">"Timeline"</div>
             <Loaded
                 state=Signal::derive(move || {
-                    if let Some(e) = error.get() {
-                        return LoadState::Error(e);
-                    }
-                    if loading.get() && items.get().is_empty() {
-                        return LoadState::Loading;
-                    }
-                    LoadState::Ready(items.get())
+                    LoadState::from_parts(loading.get() && items.get().is_empty(), error.get(), || {
+                        items.get()
+                    })
                 })
                 label="timeline"
                 render=Box::new(move |rows: Vec<TimelineEventView>| {
@@ -481,13 +477,9 @@ fn StoryLineage(story_id: String, now_ms: i64) -> impl IntoView {
             <div class="intel-section-hd">"Lineage"</div>
             <Loaded
                 state=Signal::derive(move || {
-                    if let Some(e) = error.get() {
-                        return LoadState::Error(e);
-                    }
-                    if loading.get() {
-                        return LoadState::Loading;
-                    }
-                    LoadState::Ready((ancestors.get(), descendants.get()))
+                    LoadState::from_parts(loading.get(), error.get(), || {
+                        (ancestors.get(), descendants.get())
+                    })
                 })
                 label="lineage"
                 render=Box::new(move |(anc, desc): (Vec<LineageNode>, Vec<LineageNode>)| {
@@ -666,13 +658,9 @@ fn ClaimsSection(
             <div class="intel-section-hd">"Claims"</div>
             <Loaded
                 state=Signal::derive(move || {
-                    if let Some(e) = error.get() {
-                        return LoadState::Error(e);
-                    }
-                    if loading.get() && items.get().is_empty() {
-                        return LoadState::Loading;
-                    }
-                    LoadState::Ready(items.get())
+                    LoadState::from_parts(loading.get() && items.get().is_empty(), error.get(), || {
+                        items.get()
+                    })
                 })
                 label="claims"
                 render=Box::new(move |rows: Vec<StoryClaimView>| {

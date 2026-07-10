@@ -72,16 +72,13 @@ pub fn StoriesPage() -> impl IntoView {
 
             <Loaded
                 state=Signal::derive(move || {
-                    if let Some(e) = error.get() {
-                        return LoadState::Error(match e {
-                            ApiError::Status(503) => "intel service unavailable \u{2014} configure web.coastwatch_url in trawld.toml".to_string(),
-                            other => other.to_string(),
-                        });
-                    }
-                    if loading.get() && items.get().is_empty() {
-                        return LoadState::Loading;
-                    }
-                    LoadState::Ready(items.get())
+                    let error = error.get().map(|e| match e {
+                        ApiError::Status(503) => "intel service unavailable \u{2014} configure web.coastwatch_url in trawld.toml".to_string(),
+                        other => other.to_string(),
+                    });
+                    LoadState::from_parts(loading.get() && items.get().is_empty(), error, || {
+                        items.get()
+                    })
                 })
                 label="stories"
                 render=Box::new(move |rows: Vec<StoryView>| {
