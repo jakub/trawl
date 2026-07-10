@@ -20,8 +20,9 @@ use super::variant::Variant;
 /// need richer event data can wrap a raw `<button>` or extend this
 /// signature later.
 ///
-/// `disabled` is a reactive `Signal<bool>` (`#[prop(into)]`, so plain
-/// `disabled=true` still compiles); `full` opts into `btn-full`
+/// `disabled` is a reactive `Signal<bool>` (`#[prop(into, optional)]`, so
+/// plain `disabled=true` still compiles — or omit it entirely for an
+/// always-enabled button); `full` opts into `btn-full`
 /// (width: 100%), used on the login form's large submit button.
 #[component]
 pub fn Btn(
