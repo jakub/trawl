@@ -18,6 +18,8 @@ use leptos::prelude::*;
 
 use super::validate::{combined, validate_key};
 use crate::button::{Btn, Variant};
+use crate::error_banner::ErrorBanner;
+use crate::field::Field;
 
 #[component]
 pub fn Login(
@@ -54,10 +56,15 @@ pub fn Login(
                 </h1>
                 <p class="subtitle">"sign in with your API key"</p>
 
-                {move || combined_error.get().map(|msg| view! { <div class="error">{msg}</div> })}
+                // Dogfooding (issue #28): ErrorBanner absorbs the
+                // conditional error strip (adds role="alert" — the only
+                // DOM delta on this card) and Field's wrap mode renders
+                // the exact label.field > span > input markup this form
+                // always had (the unstyled <span> caption is the point:
+                // default Field's styled <label> would visibly restyle it).
+                <ErrorBanner error=combined_error/>
 
-                <label class="field">
-                    <span>"API key"</span>
+                <Field label="API key" wrap=true>
                     <input
                         type="password"
                         autocomplete="off"
@@ -65,7 +72,7 @@ pub fn Login(
                         prop:value=move || api_key.get()
                         on:input=move |ev| set_api_key.set(event_target_value(&ev))
                     />
-                </label>
+                </Field>
 
                 // Dogfooding: fleet-ui's own Btn, not raw class="btn btn-full"
                 // markup. No on_click — a <button> inside a <form> defaults to
