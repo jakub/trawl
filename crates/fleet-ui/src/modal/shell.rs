@@ -16,7 +16,10 @@
 //! - **Window-level Escape** — bound to `window` rather than the scrim
 //!   so it fires regardless of focus (the scrim-bound `on:keydown` the
 //!   trawl modals shipped only dispatched once focus was inside the
-//!   dialog subtree; on a freshly-opened modal Esc was a no-op).
+//!   dialog subtree; on a freshly-opened modal Esc was a no-op). Gated
+//!   on [`overlay`](crate::overlay) topmost-layer arbitration so a modal
+//!   opened over a live drawer takes Escape without the drawer also
+//!   closing.
 //! - **Window-level Cmd/Ctrl+Enter** — opt-in via `on_submit`, for
 //!   dialogs with a primary action (export, save-as-net).
 //!
@@ -52,23 +55,30 @@ pub fn Modal(
 ) -> impl IntoView {
     let scrim_ref = NodeRef::<Div>::new();
 
-    // Window-level keys: Escape always cancels; Cmd/Ctrl+Enter submits
-    // when the dialog has a primary action. use_event_listener registers
-    // an on_cleanup hook internally, so the listener disposes when the
+    // Window-level keys: Escape cancels; Cmd/Ctrl+Enter submits when the
+    // dialog has a primary action. use_event_listener registers an
+    // on_cleanup hook internally, so the listener disposes when the
     // component unmounts; the returned cleanup handle is discarded
-    // intentionally.
-    let _ = use_event_listener(use_window(), ev::keydown, move |e| match e.key().as_str() {
-        "Escape" => {
-            e.prevent_default();
-            on_cancel.run(());
+    // intentionally. The topmost-layer guard (see crate::overlay) keeps
+    // these keys from also firing on a drawer stacked beneath this modal.
+    let layer = crate::overlay::use_overlay_layer();
+    let _ = use_event_listener(use_window(), ev::keydown, move |e| {
+        if !layer.is_topmost() {
+            return;
         }
-        "Enter" if e.meta_key() || e.ctrl_key() => {
-            if let Some(submit) = on_submit {
+        match e.key().as_str() {
+            "Escape" => {
                 e.prevent_default();
-                submit.run(());
+                on_cancel.run(());
             }
+            "Enter" if e.meta_key() || e.ctrl_key() => {
+                if let Some(submit) = on_submit {
+                    e.prevent_default();
+                    submit.run(());
+                }
+            }
+            _ => {}
         }
-        _ => {}
     });
 
     let on_scrim_mousedown = move |e: web_sys::MouseEvent| {

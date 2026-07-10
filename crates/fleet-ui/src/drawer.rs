@@ -16,9 +16,12 @@
 //! **Escape** is bound at window level, so it fires regardless of
 //! focus (the scrim-bound `on:keydown` the trawl drawers shipped only
 //! dispatched once focus entered the drawer subtree — on a
-//! freshly-opened drawer Esc was a no-op). `on_escape` overrides the
-//! default close behaviour for drawers that need a pre-close step —
-//! trawl's net drawer cancels an in-flight inline rename first.
+//! freshly-opened drawer Esc was a no-op). It is gated on
+//! [`overlay`](crate::overlay) topmost-layer arbitration so a drawer
+//! sitting beneath an open modal ignores Escape (the modal owns it).
+//! `on_escape` overrides the default close behaviour for drawers that
+//! need a pre-close step — trawl's net drawer cancels an in-flight
+//! inline rename first.
 
 use leptos::ev;
 use leptos::html::Div;
@@ -51,10 +54,13 @@ pub fn Drawer(
 
     // Window-level Escape (see module docs). use_event_listener
     // registers an on_cleanup hook internally; the returned handle is
-    // discarded intentionally.
+    // discarded intentionally. The topmost-layer guard (see
+    // crate::overlay) makes a background drawer ignore Escape while a
+    // modal is stacked over it — otherwise one Escape closed both.
+    let layer = crate::overlay::use_overlay_layer();
     let escape = on_escape.unwrap_or(on_close);
     let _ = use_event_listener(use_window(), ev::keydown, move |e| {
-        if e.key() == "Escape" {
+        if e.key() == "Escape" && layer.is_topmost() {
             e.prevent_default();
             escape.run(());
         }

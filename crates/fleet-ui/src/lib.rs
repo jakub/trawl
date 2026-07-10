@@ -24,6 +24,7 @@
 
 pub mod button;
 pub mod login;
+pub mod overlay;
 pub mod theme;
 pub mod toast;
 
