@@ -43,7 +43,7 @@ pg_test!(
         assert!(
             created.plaintext_token.starts_with("flt_"),
             "expected flt_ prefix, got {:?}",
-            &*created.plaintext_token
+            *created.plaintext_token
         );
         assert!(created.info.active);
         assert!(created.info.revoked_at.is_none());

@@ -42,7 +42,7 @@ pub fn create(
         eprintln!("  expires: never");
     }
     eprintln!();
-    println!("{}", &*created.plaintext_token);
+    println!("{}", *created.plaintext_token);
     eprintln!();
     eprintln!("WARNING: this token will not be shown again. store it securely.");
 
