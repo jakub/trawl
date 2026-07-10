@@ -89,6 +89,46 @@ fn shell_grid_has_auto_footer_row() {
 }
 
 #[test]
+fn btn_size_classes_shipped_with_crate() {
+    // Issue #28: `<Btn size=…>` emits `btn-sm` / `btn-xs`, so the rules
+    // must ship in fleet-ui.css (every class a fleet-ui component emits
+    // exists in fleet-ui.css). Bodies pinned to the values moved verbatim
+    // from trawl's main.css.
+    let sm = rule_body(".btn-sm");
+    assert!(
+        sm.contains("padding: 3px 10px"),
+        ".btn-sm padding moved verbatim"
+    );
+    assert!(
+        sm.contains("background: var(--panel-2)"),
+        ".btn-sm is a self-contained style (own background), not a modifier"
+    );
+    assert!(
+        rule_body(".btn-sm:disabled").contains("opacity: 0.4"),
+        ".btn-sm:disabled keeps its 0.4 opacity (vs .btn-sec's .5)"
+    );
+
+    let xs = rule_body(".btn-xs");
+    assert!(
+        xs.contains("font-size: 11px") && xs.contains("padding: 3px 8px"),
+        ".btn-xs modifier body moved verbatim"
+    );
+    // .btn-xs must appear AFTER the variant rules: equal specificity, and
+    // its padding/font-size must win over .btn-pri/.btn-sec/.btn-danger
+    // exactly as it did when main.css loaded after fleet-ui.css.
+    let xs_pos = CSS.find("\n.btn-xs {").expect(".btn-xs rule present");
+    for variant in [".btn-pri {", ".btn-sec {", ".btn-danger {"] {
+        let vpos = CSS
+            .find(variant)
+            .unwrap_or_else(|| panic!("{variant} present"));
+        assert!(
+            xs_pos > vpos,
+            ".btn-xs must be declared after {variant} so the modifier wins the cascade"
+        );
+    }
+}
+
+#[test]
 fn chrome_keyframes_present() {
     for name in [
         "blink",

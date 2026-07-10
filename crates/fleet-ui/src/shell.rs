@@ -12,7 +12,7 @@
 //! `/me`, owns its `StatusBar`, passes that as the `footer` prop, and
 //! renders its router `<Outlet/>` as `children`.
 //!
-//! # ToastBus contract
+//! # `ToastBus` contract
 //!
 //! Shell is the single owner of the toast stack: one bus, one
 //! `<Toasts/>` host, provided via context. `children` and `footer`

@@ -15,10 +15,12 @@
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 
-/// Every icon shipped by fleet-ui. Used by the rail, the topbar, and
-/// the confirm modal. Variant order: shared chrome first, then rail
-/// glyphs in the original order they appeared in trawl-web-ui's
-/// `RailIcon` enum.
+/// Every icon shipped by fleet-ui. Used by the rail, the topbar, the
+/// modal family, and app content. Variant order: shared chrome first,
+/// then rail glyphs in the original order they appeared in
+/// trawl-web-ui's `RailIcon` enum, then the glyphs absorbed from
+/// trawl's per-file icon components in the issue-#28 sweep (Download,
+/// Pin, Calendar).
 ///
 /// The enum itself is a pure `&'static` descriptor that builds on every
 /// target (like [`crate::theme::prefs`] and [`crate::toast::kinds`]) so
@@ -43,6 +45,11 @@ pub enum Icon {
     User,
     Chart,
     Question,
+    // issue-#28 sweep (paths copied verbatim from trawl's per-file
+    // icon components)
+    Download,
+    Pin,
+    Calendar,
 }
 
 /// Renders an [`Icon`] as a 16×16 inline SVG. `stroke_width` defaults
@@ -72,6 +79,7 @@ pub fn IconView(
 }
 
 #[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_lines)] // flat glyph table — one match arm per icon
 fn icon_body(icon: Icon) -> AnyView {
     match icon {
         Icon::Search => view! {
@@ -160,6 +168,21 @@ fn icon_body(icon: Icon) -> AnyView {
                 <circle cx="8" cy="8" r="6"/>
                 <path d="M6 6.5c0-1.1.9-2 2-2s2 .9 2 2c0 1.5-2 1.5-2 3"/>
                 <path d="M8 11.5v.01" stroke-linecap="round"/>
+            </g>
+        }
+        .into_any(),
+        Icon::Download => view! {
+            <g><path d="M8 2v9M4 8l4 4 4-4M3 14h10"/></g>
+        }
+        .into_any(),
+        Icon::Pin => view! {
+            <g><path d="M8 1.5v4M5 5.5h6l-1 4H6zM8 9.5v5"/></g>
+        }
+        .into_any(),
+        Icon::Calendar => view! {
+            <g>
+                <rect x="2" y="3" width="12" height="11" rx="1"/>
+                <path d="M2 6h12M5 1.5v3M11 1.5v3"/>
             </g>
         }
         .into_any(),

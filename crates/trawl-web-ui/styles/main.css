@@ -163,24 +163,8 @@
   gap: 6px;
 }
 
-.btn-sm {
-  padding: 3px 10px;
-  background: var(--panel-2);
-  color: var(--ink-2);
-  border: 1px solid var(--line);
-  border-radius: 2px;
-  font-size: 11px;
-  font-family: var(--font-ui);
-  cursor: pointer;
-}
-.btn-sm:hover:not(:disabled) {
-  border-color: var(--amber);
-  color: var(--amber);
-}
-.btn-sm:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
+/* .btn-sm / .btn-xs moved to fleet-ui.css (issue #28) — <Btn size=…>
+ * emits them, so the rules ship with the crate. */
 
 /* ─────────────────────────────────────────────────────────────────
  *  Facets panel — 224px Splunk-style
@@ -1624,7 +1608,6 @@
 .toggle input:checked + .toggle-slider { background: var(--amber); }
 .toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
 
-.btn-xs { font-size: 11px; padding: 3px 8px; }
 .btn-icon {
   background: none; border: none; cursor: pointer;
   font-size: 16px; color: var(--ink-3); padding: 2px 6px;

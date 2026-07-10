@@ -28,6 +28,8 @@ pub mod theme;
 pub mod toast;
 
 #[cfg(target_arch = "wasm32")]
+pub mod error_banner;
+#[cfg(target_arch = "wasm32")]
 pub mod field;
 pub mod icon;
 #[cfg(target_arch = "wasm32")]
@@ -39,13 +41,15 @@ pub mod shell;
 #[cfg(target_arch = "wasm32")]
 pub mod topbar;
 
-pub use button::Variant;
+pub use button::{Size, Variant};
 pub use icon::Icon;
 pub use theme::{Density, RowStyle, Theme};
 pub use toast::{Toast, ToastKind, ToastStack};
 
 #[cfg(target_arch = "wasm32")]
 pub use button::Btn;
+#[cfg(target_arch = "wasm32")]
+pub use error_banner::ErrorBanner;
 #[cfg(target_arch = "wasm32")]
 pub use field::{Field, Helper};
 #[cfg(target_arch = "wasm32")]

@@ -20,7 +20,7 @@ pub mod variant;
 #[cfg(target_arch = "wasm32")]
 pub mod component;
 
-pub use variant::Variant;
+pub use variant::{Size, Variant, btn_class};
 
 #[cfg(target_arch = "wasm32")]
 pub use component::Btn;

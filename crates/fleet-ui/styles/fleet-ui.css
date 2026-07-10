@@ -31,6 +31,7 @@
  *     modalIn
  *   - Base form/button: .field, .btn, .btn-full, .error
  *   - Variants: .btn-pri, .btn-sec, .btn-danger
+ *   - Sizes: .btn-sm (standalone compact), .btn-xs (modifier)
  *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd,
  *     .m-body, .m-ft
  *   - Toast host + items: .toasts, .toast, .toast.{success,error,info}
@@ -41,7 +42,7 @@
  * What this file does NOT ship (stays in each app's own stylesheet):
  *   - [data-rowstyle] selectors targeting .results-table (the enum is
  *     shared via fleet-ui, but the selector references trawl's table)
- *   - .btn-sm, .btn-xs, .btn-icon, .field-label and other extras
+ *   - .btn-icon, .field-label and other extras
  *   - Trawl-specific modal sub-styles (.m-field, .m-body .preview,
  *     .m-ft .hint, .export-formats) and the status bar (.statusbar)
  *   - Anything app-specific: facets, editor, histogram, drawers,
@@ -328,6 +329,36 @@ textarea:focus-visible,
 .btn-danger:hover { background: var(--red-2); }
 .btn-danger:active:not(:disabled) { scale: 0.96; }
 .btn-danger:disabled { opacity: .5; cursor: not-allowed; }
+
+/* Size axis (issue #28) — moved verbatim from trawl's main.css when
+ * <Btn> grew the `size` prop.
+ * - .btn-sm is a SELF-CONTAINED compact style (own background/border/
+ *   hover), historically used standalone (`class="btn-sm"`); Btn's
+ *   Size::Sm therefore suppresses the variant class.
+ * - .btn-xs is a true modifier (font-size + padding only) composed
+ *   after a variant class (`btn-sec btn-xs`). It must stay AFTER the
+ *   variant rules so its padding/font-size win the cascade, exactly as
+ *   they did when main.css loaded after this file. */
+.btn-sm {
+  padding: 3px 10px;
+  background: var(--panel-2);
+  color: var(--ink-2);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  font-size: 11px;
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+.btn-sm:hover:not(:disabled) {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.btn-sm:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-xs { font-size: 11px; padding: 3px 8px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Modal scaffolding

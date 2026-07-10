@@ -8,7 +8,7 @@
 
 use leptos::prelude::*;
 
-use super::variant::Variant;
+use super::variant::{Size, Variant, btn_class};
 
 /// Typed button used in modal footers, toolbars, and forms.
 ///
@@ -24,25 +24,35 @@ use super::variant::Variant;
 /// plain `disabled=true` still compiles — or omit it entirely for an
 /// always-enabled button); `full` opts into `btn-full`
 /// (width: 100%), used on the login form's large submit button.
+///
+/// `size` selects the compact classes (`btn-sm` / `btn-xs`) — the
+/// composition rules, including `Size::Sm` rendering standalone, live in
+/// the natively-tested [`btn_class`].
+///
+/// `stop_propagation` stops the click from bubbling before `on_click`
+/// runs — for buttons nested inside clickable rows (results-table quick
+/// actions, lineage entries) where the raw markup called
+/// `e.stop_propagation()` by hand.
 #[component]
 pub fn Btn(
     variant: Variant,
+    #[prop(optional)] size: Size,
     #[prop(into, optional)] on_click: Option<Callback<()>>,
     #[prop(into, optional)] disabled: Signal<bool>,
     #[prop(default = false)] full: bool,
+    #[prop(default = false)] stop_propagation: bool,
     children: Children,
 ) -> impl IntoView {
-    let class = if full {
-        format!("{} btn-full", variant.css_class())
-    } else {
-        variant.css_class().to_string()
-    };
+    let class = btn_class(variant, size, full);
 
     view! {
         <button
             class=class
             disabled=move || disabled.get()
-            on:click=move |_| {
+            on:click=move |e: leptos::web_sys::MouseEvent| {
+                if stop_propagation {
+                    e.stop_propagation();
+                }
                 if let Some(cb) = on_click {
                     cb.run(());
                 }
