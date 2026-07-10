@@ -338,6 +338,12 @@ pub fn NetsPage() -> impl IntoView {
                                             <div style="flex:0 0 80px">{sched_badge}</div>
                                             <div style="flex:0 0 140px">{last_run_view}</div>
                                             <div style="flex:0 0 40px; position:relative">
+                                                // Sanctioned #28 sweep exclusion (AC C2): this
+                                                // overflow-menu trigger stays a raw <button> because
+                                                // no Btn variant emits the bespoke icon-only
+                                                // .btn-icon style — same custom-style rationale as
+                                                // the editor `run` button and the export `fmt-btn`
+                                                // tiles.
                                                 <button
                                                     class="btn-icon"
                                                     on:click=move |e: web_sys::MouseEvent| {
