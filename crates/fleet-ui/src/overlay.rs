@@ -60,8 +60,9 @@ impl OverlayLayer {
 }
 
 /// Push a new topmost overlay layer onto the arbitration stack.
+#[cfg(any(target_arch = "wasm32", test))]
 #[must_use]
-pub fn push_overlay() -> OverlayLayer {
+pub(crate) fn push_overlay() -> OverlayLayer {
     let id = NEXT_ID.with_borrow_mut(|n| {
         let id = *n;
         *n += 1;
