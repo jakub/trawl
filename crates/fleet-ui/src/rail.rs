@@ -22,7 +22,8 @@ fn item_class(active: bool) -> &'static str {
 ///
 /// `badge` is an optional count chip (unread stories, pending
 /// editions…). Like `ModeTab.active`, it's a plain value — callers
-/// rebuild the item Vec reactively when the count changes.
+/// rebuild the item Vec reactively when the count changes. Zero counts
+/// are hidden: `Some(0)` renders no chip, same as `None`.
 #[derive(Debug, Clone)]
 pub struct RailItem {
     pub id: String,
@@ -57,7 +58,7 @@ pub fn Rail(
                         >
                             <IconView icon=item.icon size=16 stroke_width=1.4/>
                             <span class="lb">{item.label}</span>
-                            {item.badge.map(|n| view! { <span class="badge">{n}</span> })}
+                            {item.badge.filter(|n| *n > 0).map(|n| view! { <span class="badge">{n}</span> })}
                         </A>
                     }
                 }).collect::<Vec<_>>()

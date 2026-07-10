@@ -104,7 +104,9 @@ pub fn AuthShell() -> impl IntoView {
 
     let on_logout = Callback::new(|()| {
         spawn_local(async move {
-            let _ = api::logout().await;
+            if let Err(e) = api::logout().await {
+                web_sys::console::warn_1(&format!("logout request failed: {e}").into());
+            }
             if let Some(win) = web_sys::window() {
                 let _ = win.location().set_href("/login");
             }
