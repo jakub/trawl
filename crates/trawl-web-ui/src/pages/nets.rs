@@ -21,7 +21,7 @@ use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{time_ago, time_until};
 use fleet_ui::{
-    Btn, ConfirmModal, Icon, IconView, LoadState, Loaded, Pager, StatusDot, ToastBus, ToastKind,
+    Btn, ConfirmModal, LoadState, Loaded, Pager, SearchInput, StatusDot, ToastBus, ToastKind,
     Variant,
 };
 
@@ -180,14 +180,7 @@ pub fn NetsPage() -> impl IntoView {
                     <p class="sub">"Manage saved queries, attach schedules, and inspect run history."</p>
                 </div>
                 <div class="actions">
-                    <div class="inp-wrap">
-                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                        <input
-                            placeholder="filter nets…"
-                            prop:value=move || filter.get()
-                            on:input=move |e| filter.set(event_target_value(&e))
-                        />
-                    </div>
+                    <SearchInput value=filter placeholder="filter nets…"/>
                     <select
                         class="sort-select"
                         on:change=move |e| {

@@ -25,7 +25,7 @@ use crate::components::service_card_fmt::today_yesterday_utc;
 use crate::components::service_drawer::ServiceDrawer;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use fleet_ui::{
-    Btn, Icon, IconView, LoadState, Loaded, Segmented, SegmentedOption, Size, ToastBus, ToastKind,
+    Btn, LoadState, Loaded, SearchInput, Segmented, SegmentedOption, Size, ToastBus, ToastKind,
     Variant,
 };
 
@@ -133,14 +133,7 @@ pub fn SchemaPage() -> impl IntoView {
                     <p class="sub">"Click a card to inspect fields, ingest rate, and tail live."</p>
                 </div>
                 <div class="actions">
-                    <div class="inp-wrap">
-                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                        <input
-                            placeholder="filter services…"
-                            prop:value=move || filter.get()
-                            on:input=move |e| filter.set(event_target_value(&e))
-                        />
-                    </div>
+                    <SearchInput value=filter placeholder="filter services…"/>
                     <Segmented
                         size=Size::Sm
                         options=vec![

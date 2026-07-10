@@ -942,15 +942,8 @@
 .page p.sub { margin: 4px 0 0; font-size: 13px; color: var(--ink-3); text-wrap: pretty; }
 .page-hd .actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 
-.inp-wrap {
-  display: flex; align-items: center; gap: 6px;
-  padding: 4px 10px; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 3px; color: var(--ink-3); min-width: 200px;
-}
-.inp-wrap input {
-  flex: 1; background: transparent; border: 0; outline: none;
-  font-family: var(--font-ui); font-size: 12px; color: var(--ink);
-}
+/* .inp-wrap moved to fleet-ui.css (issue #31) — fleet_ui::SearchInput
+ * emits it. */
 
 /* Generic list table for page-level views (no sort, no expand). */
 .tbl {

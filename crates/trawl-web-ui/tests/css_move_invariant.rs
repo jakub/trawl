@@ -121,6 +121,8 @@ const MOVED_SELECTORS: &[&str] = &[
     ".results-footer",
     ".results-summary",
     ".results-pager",
+    ".inp-wrap",
+    ".inp-wrap input",
 ];
 
 /// Selector families the issue #31 unification RETIRED outright: their

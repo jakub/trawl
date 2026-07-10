@@ -23,7 +23,7 @@ use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Icon, IconView, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind, Variant};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -123,14 +123,7 @@ pub fn HistoryPage() -> impl IntoView {
                     <p class="sub">"Every query you've cast. Re-run the net anytime."</p>
                 </div>
                 <div class="actions">
-                    <div class="inp-wrap">
-                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                        <input
-                            placeholder="filter history…"
-                            prop:value=move || filter.get()
-                            on:input=move |e| filter.set(event_target_value(&e))
-                        />
-                    </div>
+                    <SearchInput value=filter placeholder="filter history…"/>
                     <Btn variant=Variant::Secondary on_click=on_export>"Export"</Btn>
                     <Btn variant=Variant::Secondary on_click=on_clear>"Clear History"</Btn>
                 </div>

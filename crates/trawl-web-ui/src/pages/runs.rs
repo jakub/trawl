@@ -13,7 +13,7 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Icon, IconView, LoadState, Loaded, Pager, StatusDot};
+use fleet_ui::{LoadState, Loaded, Pager, SearchInput, StatusDot};
 
 const RUNS_PAGE_SIZE: usize = 20;
 
@@ -59,14 +59,7 @@ pub fn RunsPage() -> impl IntoView {
                     <p class="sub">"Recent scheduled runs across all nets."</p>
                 </div>
                 <div class="actions">
-                    <div class="inp-wrap">
-                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                        <input
-                            placeholder="filter by net…"
-                            prop:value=move || filter.get()
-                            on:input=move |e| filter.set(event_target_value(&e))
-                        />
-                    </div>
+                    <SearchInput value=filter placeholder="filter by net…"/>
                 </div>
             </div>
 
