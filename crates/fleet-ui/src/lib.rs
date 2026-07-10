@@ -13,22 +13,23 @@
 //!
 //! Most modules are wasm32-only — they pull leptos / web-sys / gloo
 //! and only make sense in a browser. The exceptions are [`theme::prefs`],
-//! [`toast::kinds`], [`toast::stack`], and [`button::variant`]: pure
-//! layers that build on every target so the `localStorage` JSON
-//! contract, the toast CSS-class contract, the toast push/dismiss state
-//! machine, and the button CSS-class contract can be exercised by
-//! native unit tests (and named by native consumer code).
+//! [`toast::kinds`], [`toast::stack`], [`button::variant`],
+//! [`login::validate`], and the [`icon::Icon`] enum: pure layers that
+//! build on every target so the `localStorage` JSON contract, the toast
+//! CSS-class contract, the toast push/dismiss state machine, the button
+//! CSS-class contract, the login key-validation + error-precedence
+//! contracts, and the icon descriptor can be exercised by native unit
+//! tests (and named by native consumer code). The `IconView` renderer
+//! itself stays wasm32-only.
 
 pub mod button;
+pub mod login;
 pub mod theme;
 pub mod toast;
 
 #[cfg(target_arch = "wasm32")]
 pub mod field;
-#[cfg(target_arch = "wasm32")]
 pub mod icon;
-#[cfg(target_arch = "wasm32")]
-pub mod login;
 #[cfg(target_arch = "wasm32")]
 pub mod modal;
 #[cfg(target_arch = "wasm32")]
@@ -39,6 +40,7 @@ pub mod shell;
 pub mod topbar;
 
 pub use button::Variant;
+pub use icon::Icon;
 pub use theme::{Density, RowStyle, Theme};
 pub use toast::{Toast, ToastKind, ToastStack};
 
@@ -47,7 +49,7 @@ pub use button::Btn;
 #[cfg(target_arch = "wasm32")]
 pub use field::{Field, Helper};
 #[cfg(target_arch = "wasm32")]
-pub use icon::{Icon, IconView};
+pub use icon::IconView;
 #[cfg(target_arch = "wasm32")]
 pub use login::Login;
 #[cfg(target_arch = "wasm32")]

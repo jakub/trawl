@@ -8,8 +8,15 @@
 //! executed-query state. The editor's in-progress text lives in a separate
 //! signal so typing doesn't spam the URL or trigger refetches.
 
+// `app_mode` + `section` carry pure `&'static` data (rail descriptors,
+// mode enum) that builds on every target so their contracts are
+// native-testable; the rest of `state` pulls leptos and is wasm32-only.
 pub mod app_mode;
-pub mod query;
-pub mod search_session;
 pub mod section;
+
+#[cfg(target_arch = "wasm32")]
+pub mod query;
+#[cfg(target_arch = "wasm32")]
+pub mod search_session;
+#[cfg(target_arch = "wasm32")]
 pub mod stream_session;

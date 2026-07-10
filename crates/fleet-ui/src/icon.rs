@@ -12,12 +12,18 @@
 //! escape hatch by design — ADR-0030 wants the fleet to share visual
 //! DNA, not let consumers smuggle arbitrary SVGs into the design system.
 
+#[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 
 /// Every icon shipped by fleet-ui. Used by the rail, the topbar, and
 /// the confirm modal. Variant order: shared chrome first, then rail
 /// glyphs in the original order they appeared in trawl-web-ui's
 /// `RailIcon` enum.
+///
+/// The enum itself is a pure `&'static` descriptor that builds on every
+/// target (like [`crate::theme::prefs`] and [`crate::toast::kinds`]) so
+/// native consumers — and their unit tests — can name icons without the
+/// leptos renderer. [`IconView`] (the SVG component) is wasm32-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     // shared chrome
@@ -43,6 +49,7 @@ pub enum Icon {
 /// to 1.4 (rail-tuned); `size` defaults to 16 so the SVG matches the
 /// viewBox 1:1 unless the caller wants something smaller (topbar uses
 /// 10–14, modal close uses 12).
+#[cfg(target_arch = "wasm32")]
 #[component]
 pub fn IconView(
     icon: Icon,
@@ -64,6 +71,7 @@ pub fn IconView(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn icon_body(icon: Icon) -> AnyView {
     match icon {
         Icon::Search => view! {
