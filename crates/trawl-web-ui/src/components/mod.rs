@@ -2,35 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// Map a saved-query run status string (trawl-api vocabulary) onto the
-/// fleet-ui status-dot tone. App-side on purpose (ADR-0002): the
-/// status vocabulary is trawl's, only the dot is generic.
-pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
-    match status {
-        "success" => fleet_ui::StatusTone::Success,
-        // `timeout` is a failed execution, not a soft warning — it shares the
-        // red `Error` tone, exactly as the pre-unification `"error" | "timeout"`
-        // match arms rendered it. Do not split it onto its own yellow tone.
-        "error" | "timeout" => fleet_ui::StatusTone::Error,
-        "running" => fleet_ui::StatusTone::Running,
-        _ => fleet_ui::StatusTone::Neutral,
-    }
-}
-
-/// Map the intel color-var vocabulary (`--green`, `--red`, …) that the
-/// badge helper fns share with non-badge accents (timeline dots, text
-/// colors) onto the closed fleet-ui badge [`fleet_ui::Tone`] set. Known
-/// visible narrowing (sanctioned by ADR-0003, flagged in the PR): teal →
-/// Info, ink-2/ink-3/ink-4 → Neutral.
-pub(crate) fn tone_for_var(var: &str) -> fleet_ui::Tone {
-    match var {
-        "--green" => fleet_ui::Tone::Success,
-        "--red" => fleet_ui::Tone::Danger,
-        "--amber" | "--yellow" => fleet_ui::Tone::Warn,
-        "--blue" | "--teal" => fleet_ui::Tone::Info,
-        _ => fleet_ui::Tone::Neutral,
-    }
-}
+// The pure tone-vocabulary mappers (`run_status_tone`, `tone_for_var`)
+// live in the ungated [`crate::tone_vocab`] module so native `cargo test`
+// exercises them; re-exported here so call sites keep their existing
+// `components::…` / `super::…` paths.
+pub(crate) use crate::tone_vocab::{run_status_tone, tone_for_var};
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
