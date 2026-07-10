@@ -135,6 +135,18 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".run .kbd-inline",
     ".results-loading",
     ".results-error",
+    ".export-formats",
+    ".export-formats .fmt-btn",
+    ".export-formats .fmt-btn:last-child",
+    ".export-formats .fmt-btn:hover",
+    ".export-formats .fmt-btn.active",
+    ".seg-mini",
+    ".seg-mini > span",
+    ".seg-mini > span:last-child",
+    ".seg-mini > span.on",
+    ".dr-pop .tabs",
+    ".dr-pop .tabs .t",
+    ".dr-pop .tabs .t.on",
 ];
 
 #[test]

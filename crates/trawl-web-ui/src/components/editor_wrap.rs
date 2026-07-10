@@ -16,7 +16,9 @@ use leptos::web_sys;
 use crate::clipboard::write_clipboard;
 use crate::components::editor::DslEditor;
 use crate::state::query::{QUICK_RANGES, RangeSpec};
-use fleet_ui::{Btn, Icon, IconView, Kbd, ToastBus, ToastKind, Variant};
+use fleet_ui::{
+    Btn, Icon, IconView, Kbd, Segmented, SegmentedOption, Size, ToastBus, ToastKind, Variant,
+};
 
 #[component]
 pub fn EditorWrap(
@@ -209,23 +211,18 @@ fn DateRangePopover(
             on:click=move |_| close()
         />
         <div class="dr-pop" on:click=|e: web_sys::MouseEvent| e.stop_propagation()>
-            <div class="tabs">
-                <div
-                    class="t"
-                    class:on=move || tab.get() == Tab::Relative
-                    on:click=move |_| tab.set(Tab::Relative)
-                >"Relative"</div>
-                <div
-                    class="t"
-                    class:on=move || tab.get() == Tab::Absolute
-                    on:click=move |_| tab.set(Tab::Absolute)
-                >"Absolute"</div>
-                <div
-                    class="t"
-                    class:on=move || tab.get() == Tab::RealTime
-                    on:click=move |_| tab.set(Tab::RealTime)
-                >"Real-time"</div>
-            </div>
+            // Popover shell stays app-side; the tab strip composes the
+            // fleet Segmented (issue #31) with a two-line id ↔ enum map.
+            <Segmented
+                size=Size::Sm
+                options=vec![
+                    SegmentedOption::new("relative", "Relative"),
+                    SegmentedOption::new("absolute", "Absolute"),
+                    SegmentedOption::new("realtime", "Real-time"),
+                ]
+                active=Signal::derive(move || tab.get().id().to_string())
+                on_change=Callback::new(move |id: String| tab.set(Tab::from_id(&id)))
+            />
             {move || match tab.get() {
                 Tab::Relative => view! {
                     <div class="grid">
@@ -290,4 +287,22 @@ enum Tab {
     Relative,
     Absolute,
     RealTime,
+}
+
+impl Tab {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Relative => "relative",
+            Self::Absolute => "absolute",
+            Self::RealTime => "realtime",
+        }
+    }
+
+    fn from_id(id: &str) -> Self {
+        match id {
+            "absolute" => Self::Absolute,
+            "realtime" => Self::RealTime,
+            _ => Self::Relative,
+        }
+    }
 }

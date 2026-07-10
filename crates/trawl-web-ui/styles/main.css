@@ -528,8 +528,8 @@
 
 /* ─────────────────────────────────────────────────────────────────
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
- *  fleet_ui::Tabs emits it). The .dr-pop .tabs overrides below stay:
- *  app-owned popover reskin of the shared strip.
+ *  fleet_ui::Tabs emits it). The old .dr-pop .tabs popover reskin was
+ *  retired in issue #31: that strip is fleet_ui::Segmented now.
  * ─────────────────────────────────────────────────────────────── */
 
 /* ─────────────────────────────────────────────────────────────────
@@ -843,27 +843,9 @@
   padding: 12px;
   animation: fadeIn 120ms;
 }
-.dr-pop .tabs {
-  display: flex;
-  gap: 0;
-  margin-bottom: 10px;
-  padding: 0;
-  border-bottom: 1px solid var(--line-2);
-  background: transparent;
-}
-.dr-pop .tabs .t {
-  padding: 6px 12px;
-  font-size: 12px;
-  color: var(--ink-3);
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  font-family: var(--font-ui);
-}
-.dr-pop .tabs .t.on {
-  color: var(--amber);
-  border-bottom-color: var(--amber);
-}
+/* .dr-pop .tabs reskin retired (issue #31): the popover's mode strip
+ * renders fleet_ui::Segmented; only the layout margin stays app-side. */
+.dr-pop .seg { margin-bottom: 10px; }
 .dr-pop .grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1044,33 +1026,8 @@
   color: var(--ink-3);
 }
 
-/* Export format selector — segmented pill row inside the modal. */
-.export-formats {
-  display: flex;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  overflow: hidden;
-}
-.export-formats .fmt-btn {
-  flex: 1;
-  padding: 6px 0;
-  font-family: var(--font-ui);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--ink-3);
-  background: var(--panel-2);
-  border: none;
-  border-right: 1px solid var(--line);
-  cursor: pointer;
-  transition: background 100ms, color 100ms;
-}
-.export-formats .fmt-btn:last-child { border-right: none; }
-.export-formats .fmt-btn:hover { color: var(--ink-2); }
-.export-formats .fmt-btn.active {
-  background: var(--amber-wash);
-  color: var(--amber);
-  font-weight: 600;
-}
+/* .export-formats / .fmt-btn retired (issue #31): the export modal's
+ * format row renders fleet_ui::Segmented (.seg family). */
 
 /* History-specific: footer with paginator (mirror of .results-footer). */
 .tbl-foot {
@@ -1192,18 +1149,8 @@
 .sc-quickact .qa:hover { color: var(--amber-2); border-color: var(--amber); background: var(--amber-wash); }
 .sc-card.compact .sc-quickact { margin: 4px -12px -6px; padding: 4px 10px; }
 
-/* Compact/comfy density toggle */
-.seg-mini {
-  display: inline-flex; background: var(--panel-2);
-  border: 1px solid var(--line); border-radius: 3px;
-  font-family: var(--font-ui); font-size: 11px; overflow: hidden;
-}
-.seg-mini > span {
-  padding: 4px 9px; cursor: pointer; color: var(--ink-3);
-  border-right: 1px solid var(--line);
-}
-.seg-mini > span:last-child { border-right: 0; }
-.seg-mini > span.on { background: var(--panel); color: var(--ink); font-weight: 600; }
+/* .seg-mini retired (issue #31): the density toggle renders
+ * fleet_ui::Segmented size=Sm (.seg.seg-sm family). */
 
 /* Drawer SHELL (.sd-scrim/.sd-drawer/.sd-hd/.sd-ttl/.sd-actions/.sd-x/
  * .sd-tabs/.sd-body + keyframes) moved to fleet-ui.css (issue #28,

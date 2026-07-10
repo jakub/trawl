@@ -15,7 +15,7 @@ use trawl_api::ExportFormat;
 
 use crate::api;
 use crate::download;
-use fleet_ui::{Btn, Icon, Kbd, Modal, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Icon, Kbd, Modal, Segmented, SegmentedOption, ToastBus, ToastKind, Variant};
 
 #[component]
 #[allow(clippy::needless_pass_by_value)]
@@ -90,31 +90,36 @@ pub fn ExportModal(
 
             <div class="m-field">
                 <label>"Format"</label>
-                <div class="export-formats">
-                    <FormatButton label="CSV" value=ExportFormat::Csv current=format/>
-                    <FormatButton label="JSON" value=ExportFormat::Json current=format/>
-                    <FormatButton label="Parquet" value=ExportFormat::Parquet current=format/>
-                </div>
+                <Segmented
+                    full=true
+                    options=vec![
+                        SegmentedOption::new("csv", "CSV"),
+                        SegmentedOption::new("json", "JSON"),
+                        SegmentedOption::new("parquet", "Parquet"),
+                    ]
+                    active=Signal::derive(move || format_id(&format.get()).to_string())
+                    on_change=Callback::new(move |id: String| format.set(format_from_id(&id)))
+                />
             </div>
         </Modal>
     }
 }
 
-#[component]
-fn FormatButton(
-    label: &'static str,
-    value: ExportFormat,
-    current: RwSignal<ExportFormat>,
-) -> impl IntoView {
-    let value_for_click = value.clone();
-    view! {
-        <button
-            class="fmt-btn"
-            class:active=move || current.get() == value
-            on:click=move |_| current.set(value_for_click.clone())
-        >
-            {label}
-        </button>
+/// Two-line id ↔ enum adapters (the fleet_ui::Segmented contract keeps
+/// typed option enums app-side, same as Tabs).
+fn format_id(fmt: &ExportFormat) -> &'static str {
+    match fmt {
+        ExportFormat::Csv => "csv",
+        ExportFormat::Json => "json",
+        ExportFormat::Parquet => "parquet",
+    }
+}
+
+fn format_from_id(id: &str) -> ExportFormat {
+    match id {
+        "json" => ExportFormat::Json,
+        "parquet" => ExportFormat::Parquet,
+        _ => ExportFormat::Csv,
     }
 }
 

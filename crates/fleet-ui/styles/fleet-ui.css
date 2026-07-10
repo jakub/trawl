@@ -463,8 +463,9 @@ textarea:focus-visible,
  *  - .tabs / .t / .active  — workspace strip (Events/Visualization)
  *  - .sd-tabs / .tb / .on  — drawer strip (weights differ on purpose:
  *    500 active vs 600 on; do not merge)
- *  Moved verbatim from trawl's main.css. Trawl's .dr-pop .tabs
- *  popover reskin stays app-side and overrides by cascade order.
+ *  Moved verbatim from trawl's main.css. (Trawl's old .dr-pop .tabs
+ *  popover reskin was retired in issue #31 — that strip is
+ *  fleet_ui::Segmented, the .seg family below.)
  * ─────────────────────────────────────────────────────────────── */
 .tabs {
   display: flex;
