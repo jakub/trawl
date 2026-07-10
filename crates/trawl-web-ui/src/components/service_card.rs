@@ -151,7 +151,7 @@ pub fn ServiceCard(
                         on_tail.run(name_tail.clone());
                     }
                 >
-                    <IconView icon=Icon::Zap size=11 stroke_width=1.5/>
+                    <IconView icon=Icon::Bolt size=11 stroke_width=1.5/>
                     "Tail"
                 </span>
             </div>

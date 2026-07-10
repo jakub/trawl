@@ -110,7 +110,7 @@ pub fn ServiceDrawer(
                     <IconView icon=Icon::Search size=11 stroke_width=1.5/> " Search this service"
                 </Btn>
                 <Btn variant=Variant::Secondary on_click=on_tail_click>
-                    <IconView icon=Icon::Zap size=11 stroke_width=1.5/> " Tail live"
+                    <IconView icon=Icon::Bolt size=11 stroke_width=1.5/> " Tail live"
                 </Btn>
             }.into_any())
         >

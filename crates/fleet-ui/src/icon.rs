@@ -20,7 +20,7 @@ use leptos::prelude::*;
 /// then rail glyphs in the original order they appeared in
 /// trawl-web-ui's `RailIcon` enum, then the glyphs absorbed from
 /// trawl's per-file icon components in the issue-#28 sweep (Download,
-/// Pin, Calendar).
+/// Pin, Calendar, Bolt).
 ///
 /// The enum itself is a pure `&'static` descriptor that builds on every
 /// target (like [`crate::theme::prefs`] and [`crate::toast::kinds`]) so
@@ -50,6 +50,10 @@ pub enum Icon {
     Download,
     Pin,
     Calendar,
+    /// Service card/drawer "Tail" bolt (round joins). Distinct from the
+    /// rail's [`Icon::Zap`] — trawl shipped two different bolt glyphs
+    /// pre-migration, and both shapes are preserved verbatim.
+    Bolt,
 }
 
 /// Renders an [`Icon`] as a 16×16 inline SVG. `stroke_width` defaults
@@ -184,6 +188,10 @@ fn icon_body(icon: Icon) -> AnyView {
                 <rect x="2" y="3" width="12" height="11" rx="1"/>
                 <path d="M2 6h12M5 1.5v3M11 1.5v3"/>
             </g>
+        }
+        .into_any(),
+        Icon::Bolt => view! {
+            <g stroke-linejoin="round"><path d="M9 1 3 9h5l-1 6 6-8h-5z"/></g>
         }
         .into_any(),
     }
