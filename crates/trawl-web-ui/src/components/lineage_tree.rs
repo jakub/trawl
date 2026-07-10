@@ -7,23 +7,8 @@ use leptos::prelude::*;
 
 use fleet_ui::{Badge, Btn, Size, Tone, Variant};
 
-use super::truncate;
+use super::{tone_for_var, truncate};
 use crate::time_fmt::time_ago;
-
-/// Map the intel color-var vocabulary (`--green`, `--red`, …) that the
-/// badge helper fns share with non-badge accents (timeline dots, text
-/// colors) onto the closed fleet-ui badge [`Tone`] set. Known visible
-/// narrowing (sanctioned by ADR-0003, flagged in the PR): teal → Info,
-/// ink-2/ink-3/ink-4 → Neutral.
-pub(crate) fn tone_for_var(var: &str) -> Tone {
-    match var {
-        "--green" => Tone::Success,
-        "--red" => Tone::Danger,
-        "--amber" | "--yellow" => Tone::Warn,
-        "--blue" | "--teal" => Tone::Info,
-        _ => Tone::Neutral,
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct LineageNode {

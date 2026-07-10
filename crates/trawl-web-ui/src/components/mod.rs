@@ -17,6 +17,21 @@ pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
     }
 }
 
+/// Map the intel color-var vocabulary (`--green`, `--red`, …) that the
+/// badge helper fns share with non-badge accents (timeline dots, text
+/// colors) onto the closed fleet-ui badge [`fleet_ui::Tone`] set. Known
+/// visible narrowing (sanctioned by ADR-0003, flagged in the PR): teal →
+/// Info, ink-2/ink-3/ink-4 → Neutral.
+pub(crate) fn tone_for_var(var: &str) -> fleet_ui::Tone {
+    match var {
+        "--green" => fleet_ui::Tone::Success,
+        "--red" => fleet_ui::Tone::Danger,
+        "--amber" | "--yellow" => fleet_ui::Tone::Warn,
+        "--blue" | "--teal" => fleet_ui::Tone::Info,
+        _ => fleet_ui::Tone::Neutral,
+    }
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()

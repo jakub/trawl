@@ -13,8 +13,9 @@ use crate::api;
 use crate::api::MeResponse;
 use crate::components::lineage_tree::{
     LineageNode, LineageTree, can_write_derivations, render_derivation_meta, render_marking_diff,
-    tone_for_var, transformation_color,
+    transformation_color,
 };
+use crate::components::tone_for_var;
 use crate::time_fmt::time_ago;
 use fleet_ui::{Badge, Btn, ConfirmWithReasonModal, Pager, ToastBus, ToastKind, Tone, Variant};
 

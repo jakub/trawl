@@ -13,7 +13,7 @@ use crate::api::ApiError;
 use crate::time_fmt::time_ago;
 use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Tone, Variant};
 
-use crate::components::lineage_tree::tone_for_var;
+use crate::components::tone_for_var;
 
 #[component]
 pub fn StoriesPage() -> impl IntoView {
