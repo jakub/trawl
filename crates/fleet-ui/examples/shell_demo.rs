@@ -3,7 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Minimal Shell composition demo — proves the public API can be
-//! wired by an app that isn't trawl. Builds under wasm32 via:
+//! wired by an app that isn't trawl, including the [`ToastBus`] context
+//! contract: a child inside `Shell` (see [`ToastProbe`]) reaches the
+//! Shell-owned bus via `expect_context` and fires both a success and an
+//! error toast. Builds under wasm32 via:
 //!
 //! ```sh
 //! cargo build -p fleet-ui --example shell_demo --target wasm32-unknown-unknown
@@ -23,7 +26,7 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 // TopBar and Rail are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
-use fleet_ui::{AppLink, Icon, Login, ModeTab, RailItem, Shell, UserInfo, install};
+use fleet_ui::{AppLink, Icon, Login, ModeTab, RailItem, Shell, ToastBus, UserInfo, install};
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -94,6 +97,44 @@ fn modes() -> Vec<ModeTab> {
     ]
 }
 
+/// Stands in for a page/modal rendered inside `Shell`: it reaches the
+/// Shell-owned [`ToastBus`] via `expect_context` (never constructing its
+/// own bus or `<Toasts/>` host) and fires both a success and an error
+/// toast. This is the "toasts fire via context" contract in miniature —
+/// verifiable with `trunk serve` alone, no backend or auth required. One
+/// of each fires on mount so a fresh load is self-evident; the buttons
+/// re-fire on demand.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn ToastProbe() -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
+
+    Effect::new(move |_| {
+        bus.push_success("Saved", Some("net created".into()));
+        bus.push_error("Export failed", Some("disk full".into()));
+    });
+
+    view! {
+        <div style="padding:16px;display:flex;flex-direction:column;gap:8px;align-items:flex-start">
+            <p>"hello from the demo shell"</p>
+            <div style="display:flex;gap:8px">
+                <button
+                    class="btn"
+                    on:click=move |_| bus.push_success("Saved", Some("net created".into()))
+                >
+                    "fire success"
+                </button>
+                <button
+                    class="btn"
+                    on:click=move |_| bus.push_error("Export failed", Some("disk full".into()))
+                >
+                    "fire error"
+                </button>
+            </div>
+        </div>
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn DemoApp() -> impl IntoView {
@@ -143,7 +184,10 @@ fn DemoApp() -> impl IntoView {
                             </div>
                         }.into_any())
                     >
-                        <p style="padding:16px">"hello from the demo shell"</p>
+                        // Child rendered inside Shell — reaches the
+                        // Shell-owned ToastBus via expect_context and fires
+                        // success + error toasts (AC5's context contract).
+                        <ToastProbe/>
                         // Hidden export sentinel — proves Icon is in scope
                         // without re-mounting TopBar/Rail (which Shell
                         // already renders internally).
