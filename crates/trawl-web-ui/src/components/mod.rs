@@ -8,8 +8,10 @@
 pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
     match status {
         "success" => fleet_ui::StatusTone::Success,
-        "error" => fleet_ui::StatusTone::Error,
-        "timeout" => fleet_ui::StatusTone::Timeout,
+        // `timeout` is a failed execution, not a soft warning — it shares the
+        // red `Error` tone, exactly as the pre-unification `"error" | "timeout"`
+        // match arms rendered it. Do not split it onto its own yellow tone.
+        "error" | "timeout" => fleet_ui::StatusTone::Error,
         "running" => fleet_ui::StatusTone::Running,
         _ => fleet_ui::StatusTone::Neutral,
     }

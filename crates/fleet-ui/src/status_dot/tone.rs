@@ -23,7 +23,6 @@ pub enum StatusTone {
     Success,
     Error,
     Running,
-    Timeout,
 }
 
 impl StatusTone {
@@ -36,7 +35,6 @@ impl StatusTone {
             Self::Success => Some("success"),
             Self::Error => Some("error"),
             Self::Running => Some("running"),
-            Self::Timeout => Some("timeout"),
         }
     }
 }
@@ -60,7 +58,6 @@ mod tests {
         assert_eq!(StatusTone::Success.css_suffix(), Some("success"));
         assert_eq!(StatusTone::Error.css_suffix(), Some("error"));
         assert_eq!(StatusTone::Running.css_suffix(), Some("running"));
-        assert_eq!(StatusTone::Timeout.css_suffix(), Some("timeout"));
     }
 
     #[test]
