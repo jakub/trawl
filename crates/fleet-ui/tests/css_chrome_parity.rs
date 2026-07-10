@@ -32,6 +32,12 @@
 
 const CSS: &str = include_str!("../styles/fleet-ui.css");
 
+/// The pre-migration bytes of every chrome rule issue #28 relocated out
+/// of trawl-web-ui's `main.css`, captured verbatim (provenance in the
+/// fixture header). `moved_chrome_is_byte_identical_to_premigration`
+/// asserts each still lives byte-for-byte in the shipped `fleet-ui.css`.
+const PREMIGRATION_CHROME: &str = include_str!("fixtures/premigration-chrome.css");
+
 /// Return the declaration body of a top-level rule, keyed on its exact
 /// selector. Anchored on a preceding newline so `.rail .it` does not
 /// match `.rail .it .lb` / `.rail .it:hover`, and the selector must be
@@ -47,6 +53,72 @@ fn rule_body(selector: &str) -> &'static str {
         .find('}')
         .unwrap_or_else(|| panic!("unterminated rule for `{selector}`"));
     &CSS[start..start + end]
+}
+
+/// Split a flat stylesheet into its individual top-level rules, dropping
+/// blank and comment lines between them. A rule runs from its selector
+/// line to the line where brace depth returns to zero, so single-line
+/// rules, multi-line rules, and `@keyframes` blocks each come out whole.
+/// The chrome CSS is un-nested, so this stays simple.
+fn rules(css: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    for line in css.lines() {
+        if depth == 0 {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with("/*") || t.starts_with('*') {
+                continue;
+            }
+        }
+        cur.push(line);
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth == 0 && !cur.is_empty() {
+            out.push(cur.join("\n"));
+            cur.clear();
+        }
+    }
+    out
+}
+
+#[test]
+fn moved_chrome_is_byte_identical_to_premigration() {
+    // C5 ("zero visual change") of issue #28 asks for a before/after pixel
+    // grid of every migrated surface in both themes — unobservable from a
+    // native test. For a *pure CSS relocation* it has an exact structural
+    // equivalent: every rule that moved must still render from byte-for-
+    // byte identical CSS, and the design tokens those rules reference are
+    // untouched by this slice (guarded by `css_move_invariant`), so both
+    // themes follow by construction. This turns the golden fixture's
+    // pre-migration bytes into that machine-checked guarantee — the
+    // exhaustive backstop behind the hand-picked delta assertions below.
+    let expected = rules(PREMIGRATION_CHROME);
+    // Vacuous-pass guard: the fixture is the full moved set (33 rules at
+    // capture). A splitter that stopped matching would pass silently.
+    assert!(
+        expected.len() >= 30,
+        "expected the full moved-chrome set (~33 rules), split {} — the \
+         fixture or the splitter regressed",
+        expected.len()
+    );
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|r| !CSS.contains(r.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these pre-migration chrome rules are no longer byte-identical in \
+         fleet-ui.css — a moved rule was altered, a C5 zero-visual-change \
+         regression. Restore the rule, or if the change is deliberate, pin \
+         it as a documented delta and re-capture the golden fixture: \
+         {missing:#?}"
+    );
 }
 
 #[test]
