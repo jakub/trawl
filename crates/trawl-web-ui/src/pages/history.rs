@@ -23,7 +23,7 @@ use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Icon, IconView, LoadState, Loaded, Size, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Icon, IconView, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -228,13 +228,13 @@ pub fn HistoryPage() -> impl IntoView {
                         format!("{first}–{last} of {total}")
                     };
                     view! {
-                        <div class="tbl-foot">
-                            <span>{summary}</span>
-                            <div class="pager">
-                                <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_prev on_click=on_prev>"← prev"</Btn>
-                                <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_next on_click=on_next>"next →"</Btn>
-                            </div>
-                        </div>
+                        <Pager
+                            summary=summary
+                            can_prev=Signal::from(can_prev)
+                            can_next=Signal::from(can_next)
+                            on_prev=on_prev
+                            on_next=on_next
+                        />
                     }.into_any()
                 }}
             </div>

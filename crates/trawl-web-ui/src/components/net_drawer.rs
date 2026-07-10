@@ -18,8 +18,8 @@ use trawl_api::value::QueryResult;
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
 use fleet_ui::{
-    Btn, Drawer, LoadState, Loaded, Size, Sparkline, StatusDot, TabItem, ToastBus, ToastKind,
-    Toggle, Variant, effective_active,
+    Btn, Drawer, LoadState, Loaded, Pager, Size, Sparkline, StatusDot, TabItem, ToastBus,
+    ToastKind, Toggle, Variant, effective_active,
 };
 
 const RUNS_PAGE_SIZE: usize = 20;
@@ -549,25 +549,15 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                 <div class="tbl-body">
                                     {rows}
                                 </div>
-                                <div class="tbl-foot">
-                                    <span>{format!("{first}–{last} of {total}")}</span>
-                                    <span style="display:flex; gap:4px">
-                                        <Btn
-                                            variant=Variant::Secondary
-                                            size=Size::Xs
-                                            disabled=Signal::derive(move || page.get() == 0)
-                                            on_click=Callback::new(move |()| {
-                                                page.update(|p| *p = p.saturating_sub(1));
-                                            })
-                                        >"← prev"</Btn>
-                                        <Btn
-                                            variant=Variant::Secondary
-                                            size=Size::Xs
-                                            disabled=Signal::derive(move || last >= total)
-                                            on_click=Callback::new(move |()| page.update(|p| *p += 1))
-                                        >"next →"</Btn>
-                                    </span>
-                                </div>
+                                <Pager
+                                    summary=format!("{first}–{last} of {total}")
+                                    can_prev=Signal::derive(move || page.get() != 0)
+                                    can_next=Signal::derive(move || last < total)
+                                    on_prev=Callback::new(move |()| {
+                                        page.update(|p| *p = p.saturating_sub(1));
+                                    })
+                                    on_next=Callback::new(move |()| page.update(|p| *p += 1))
+                                />
                             </div>
                         }.into_any()
                 })

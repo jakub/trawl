@@ -23,7 +23,7 @@ use crate::api::{ApiError, MeResponse};
 use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
 use crate::components::linkage_graph::LinkageGraph;
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, LoadState, Loaded, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, Pager, Variant};
 
 use super::stories::{class_label, state_badge};
 
@@ -785,8 +785,7 @@ fn ClaimsSection(
                         {has_more.then(|| {
                             let is_loading = loading.get();
                             view! {
-                                <div class="tbl-foot">
-                                    <span></span>
+                                <Pager summary=String::new()>
                                     <Btn
                                         variant=Variant::Secondary
                                         disabled=is_loading
@@ -794,7 +793,7 @@ fn ClaimsSection(
                                     >
                                         {if is_loading { "loading\u{2026}" } else { "load more" }}
                                     </Btn>
-                                </div>
+                                </Pager>
                             }
                         })}
                     </div>

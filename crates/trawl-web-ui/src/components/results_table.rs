@@ -13,7 +13,7 @@
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::clipboard::write_clipboard;
 use crate::state::query::{Filter, FilterOp};
-use fleet_ui::{Btn, LoadState, Loaded, Size, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::cmp::Ordering;
@@ -160,21 +160,19 @@ fn ResultsTableBody(
                     </tbody>
                 </table>
             </div>
-            <footer class="results-footer">
-                <span class="results-summary">
-                    {format!(
-                        "page {} · showing {} {}",
-                        cur_page + 1,
-                        returned,
-                        if returned == 1 { "row" } else { "rows" },
-                    )}
-                    {if truncated { " (truncated)" } else { "" }}
-                </span>
-                <div class="results-pager">
-                    <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_prev on_click=on_prev>"← prev"</Btn>
-                    <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_next on_click=on_next>"next →"</Btn>
-                </div>
-            </footer>
+            <Pager
+                summary=format!(
+                    "page {} · showing {} {}{}",
+                    cur_page + 1,
+                    returned,
+                    if returned == 1 { "row" } else { "rows" },
+                    if truncated { " (truncated)" } else { "" },
+                )
+                can_prev=Signal::from(can_prev)
+                can_next=Signal::from(can_next)
+                on_prev=on_prev
+                on_next=on_next
+            />
         </>
     }
     .into_any()

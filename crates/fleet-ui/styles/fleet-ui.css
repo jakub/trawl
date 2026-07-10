@@ -1055,3 +1055,25 @@ textarea:focus-visible,
   font-size: 11px;
   opacity: .6;
 }
+
+/* Pager — <Pager/> table footer (moved verbatim from trawl's main.css;
+ * the .tbl-foot mirror family was retired onto this one, ADR-0003). */
+.results-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  font-size: 11px;
+  color: var(--ink-3);
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.results-summary {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.results-pager {
+  display: flex;
+  gap: 6px;
+}

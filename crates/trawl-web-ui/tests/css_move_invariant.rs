@@ -118,6 +118,9 @@ const MOVED_SELECTORS: &[&str] = &[
     ".toggle input:checked + .toggle-slider::before",
     ".kbd",
     ".kbd-inline",
+    ".results-footer",
+    ".results-summary",
+    ".results-pager",
 ];
 
 /// Selector families the issue #31 unification RETIRED outright: their
@@ -147,6 +150,8 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".dr-pop .tabs",
     ".dr-pop .tabs .t",
     ".dr-pop .tabs .t.on",
+    ".tbl-foot",
+    ".tbl-foot .pager",
 ];
 
 #[test]

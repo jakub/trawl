@@ -16,7 +16,7 @@ use crate::components::lineage_tree::{
     transformation_color,
 };
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, ConfirmWithReasonModal, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, ConfirmWithReasonModal, Pager, ToastBus, ToastKind, Variant};
 
 const OBJECT_TYPES: &[&str] = &[
     "story",
@@ -325,8 +325,7 @@ pub fn DerivationsPage() -> impl IntoView {
                             {move || edges_cursor.get().map(|_| {
                                 let is_loading = loading.get();
                                 view! {
-                                    <div class="tbl-foot">
-                                        <span></span>
+                                    <Pager summary=String::new()>
                                         <Btn
                                             variant=Variant::Secondary
                                             disabled=is_loading
@@ -334,7 +333,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                         >
                                             {if is_loading { "loading\u{2026}" } else { "load more" }}
                                         </Btn>
-                                    </div>
+                                    </Pager>
                                 }
                             })}
                         </div>

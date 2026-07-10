@@ -11,7 +11,7 @@ use leptos_router::hooks::use_navigate;
 use crate::api;
 use crate::api::ApiError;
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, LoadState, Loaded, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
 
 #[component]
 pub fn StoriesPage() -> impl IntoView {
@@ -181,8 +181,7 @@ pub fn StoriesPage() -> impl IntoView {
                         {if has_more {
                             let is_loading = loading.get();
                             view! {
-                                <div class="tbl-foot">
-                                    <span></span>
+                                <Pager summary=String::new()>
                                     <Btn
                                         variant=Variant::Secondary
                                         disabled=is_loading
@@ -190,7 +189,7 @@ pub fn StoriesPage() -> impl IntoView {
                                     >
                                         {if is_loading { "loading\u{2026}" } else { "load more" }}
                                     </Btn>
-                                </div>
+                                </Pager>
                             }.into_any()
                         } else {
                             ().into_any()

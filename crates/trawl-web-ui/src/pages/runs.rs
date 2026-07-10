@@ -13,7 +13,7 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Icon, IconView, LoadState, Loaded, Size, StatusDot, Variant};
+use fleet_ui::{Icon, IconView, LoadState, Loaded, Pager, StatusDot};
 
 const RUNS_PAGE_SIZE: usize = 20;
 
@@ -173,25 +173,15 @@ pub fn RunsPage() -> impl IntoView {
 
                                 view! {
                                     {rows}
-                                    <div class="tbl-foot">
-                                        <span>{format!("{first}–{last} of {total}")}</span>
-                                        <span style="display:flex; gap:4px">
-                                            <Btn
-                                                variant=Variant::Secondary
-                                                size=Size::Xs
-                                                disabled=Signal::derive(move || page.get() == 0)
-                                                on_click=Callback::new(move |()| {
-                                                    page.update(|p| *p = p.saturating_sub(1));
-                                                })
-                                            >"← prev"</Btn>
-                                            <Btn
-                                                variant=Variant::Secondary
-                                                size=Size::Xs
-                                                disabled=Signal::derive(move || last >= total)
-                                                on_click=Callback::new(move |()| page.update(|p| *p += 1))
-                                            >"next →"</Btn>
-                                        </span>
-                                    </div>
+                                    <Pager
+                                        summary=format!("{first}–{last} of {total}")
+                                        can_prev=Signal::derive(move || page.get() != 0)
+                                        can_next=Signal::derive(move || last < total)
+                                        on_prev=Callback::new(move |()| {
+                                            page.update(|p| *p = p.saturating_sub(1));
+                                        })
+                                        on_next=Callback::new(move |()| page.update(|p| *p += 1))
+                                    />
                                 }.into_any()
                         })
                     />

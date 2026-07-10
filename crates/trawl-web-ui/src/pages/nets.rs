@@ -21,7 +21,8 @@ use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{time_ago, time_until};
 use fleet_ui::{
-    Btn, ConfirmModal, Icon, IconView, LoadState, Loaded, StatusDot, ToastBus, ToastKind, Variant,
+    Btn, ConfirmModal, Icon, IconView, LoadState, Loaded, Pager, StatusDot, ToastBus, ToastKind,
+    Variant,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -385,9 +386,9 @@ pub fn NetsPage() -> impl IntoView {
                                 }).collect_view();
                                 view! {
                                     {rows}
-                                    <div class="tbl-foot">
-                                        <span>{format!("{count} net{}", if count == 1 { "" } else { "s" })}</span>
-                                    </div>
+                                    // Summary-only Pager: this table is
+                                    // unpaginated, so no prev/next controls.
+                                    <Pager summary=format!("{count} net{}", if count == 1 { "" } else { "s" })/>
                                 }.into_any()
                         })
                     />

@@ -146,15 +146,8 @@
   font-style: italic;
 }
 
-.results-summary {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-}
-
-.results-pager {
-  display: flex;
-  gap: 6px;
-}
+/* .results-summary / .results-pager moved to fleet-ui.css (issue #31)
+ * — fleet_ui::Pager emits them. */
 
 /* .btn-sm / .btn-xs moved to fleet-ui.css (issue #28) — <Btn size=…>
  * emits them, so the rules ship with the crate. */
@@ -734,18 +727,8 @@
   gap: 8px;
 }
 
-/* Pager footer. */
-.results-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 14px;
-  font-size: 11px;
-  color: var(--ink-3);
-  background: var(--panel);
-  border-top: 1px solid var(--line);
-  flex-shrink: 0;
-}
+/* .results-footer moved to fleet-ui.css (issue #31) — fleet_ui::Pager
+ * emits it (and supersedes the .tbl-foot mirror). */
 
 /* ─────────────────────────────────────────────────────────────────
  *  Status bar (26px footer)
@@ -1029,15 +1012,8 @@
 /* .export-formats / .fmt-btn retired (issue #31): the export modal's
  * format row renders fleet_ui::Segmented (.seg family). */
 
-/* History-specific: footer with paginator (mirror of .results-footer). */
-.tbl-foot {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 10px 14px;
-  border-top: 1px solid var(--line);
-  background: var(--panel-2);
-  font-family: var(--font-ui); font-size: 11px; color: var(--ink-3);
-}
-.tbl-foot .pager { display: flex; gap: 6px; }
+/* .tbl-foot retired (issue #31): every table footer renders
+ * fleet_ui::Pager (.results-footer family, shipped with the crate). */
 
 /* ============================================================
    Schema page — service cards grid + slide-out drawer inspector.
