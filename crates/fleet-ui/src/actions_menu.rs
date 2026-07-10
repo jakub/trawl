@@ -19,9 +19,15 @@
 //!
 //! Clicks on the trigger and the items stop propagation: every current
 //! call site nests the menu inside a clickable table row.
+//!
+//! Keyboard: the trigger and every item are real `<button>` elements, so
+//! Tab/Enter/Space reach and invoke them natively. Opening the menu moves
+//! focus to the first item (`role="menu"` / `role="menuitem"`); Arrow
+//! Up/Down (with wrap) and Home/End walk the items; Escape closes the
+//! panel and restores focus to the trigger.
 
 use leptos::ev;
-use leptos::html::Div;
+use leptos::html::{Button, Div};
 use leptos::prelude::*;
 use leptos::web_sys;
 use leptos_use::{use_event_listener, use_window};
@@ -65,11 +71,16 @@ impl ActionItem {
 pub fn ActionsMenu(items: Vec<ActionItem>) -> impl IntoView {
     let open = RwSignal::new(false);
     let wrap_ref = NodeRef::<Div>::new();
+    let trigger_ref = NodeRef::<Button>::new();
 
     view! {
         <div class="actions-wrap" node_ref=wrap_ref>
             <button
                 class="btn-icon"
+                type="button"
+                node_ref=trigger_ref
+                aria-haspopup="menu"
+                aria-expanded=move || open.get().to_string()
                 on:click=move |e: web_sys::MouseEvent| {
                     // Don't bubble into the host row's click handler,
                     // and keep re-click a toggle.
@@ -78,7 +89,12 @@ pub fn ActionsMenu(items: Vec<ActionItem>) -> impl IntoView {
                 }
             >"⋯"</button>
             <Show when=move || open.get()>
-                <MenuPanel items=items.clone() open=open wrap_ref=wrap_ref/>
+                <MenuPanel
+                    items=items.clone()
+                    open=open
+                    wrap_ref=wrap_ref
+                    trigger_ref=trigger_ref
+                />
             </Show>
         </div>
     }
@@ -93,12 +109,30 @@ fn MenuPanel(
     items: Vec<ActionItem>,
     open: RwSignal<bool>,
     wrap_ref: NodeRef<Div>,
+    trigger_ref: NodeRef<Button>,
 ) -> impl IntoView {
     let layer = crate::overlay::use_overlay_layer();
+    let panel_ref = NodeRef::<Div>::new();
+
+    // Initial focus: land on the first item when the panel mounts, so a
+    // keyboard user who opened the menu is already inside its action
+    // surface (rather than stranded on the trigger).
+    Effect::new(move |_| {
+        if let Some(panel) = panel_ref.get()
+            && let Some(first) = panel
+                .query_selector(".item")
+                .ok()
+                .flatten()
+                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+        {
+            let _ = first.focus();
+        }
+    });
 
     // Window-level Escape, gated on topmost-layer arbitration (same
     // contract as Modal/Drawer): a ConfirmModal stacked above the menu
-    // takes Escape without the menu also closing.
+    // takes Escape without the menu also closing. On close we restore
+    // focus to the trigger so the tab order isn't lost to <body>.
     let _ = use_event_listener(use_window(), ev::keydown, move |e| {
         if !layer.is_topmost() {
             return;
@@ -106,6 +140,9 @@ fn MenuPanel(
         if e.key() == "Escape" {
             e.prevent_default();
             open.set(false);
+            if let Some(trigger) = trigger_ref.get_untracked() {
+                let _ = trigger.focus();
+            }
         }
     });
 
@@ -129,20 +166,57 @@ fn MenuPanel(
         },
     );
 
+    // Roving focus across the item buttons. Keydown bubbles from the
+    // focused item to this container; we walk element siblings (with
+    // wrap) so no per-item index bookkeeping is needed.
+    let on_keydown = move |e: web_sys::KeyboardEvent| {
+        let Some(current) = e
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        let next = match e.key().as_str() {
+            "ArrowDown" => current.next_element_sibling().or_else(|| {
+                current
+                    .parent_element()
+                    .and_then(|p| p.first_element_child())
+            }),
+            "ArrowUp" => current.previous_element_sibling().or_else(|| {
+                current
+                    .parent_element()
+                    .and_then(|p| p.last_element_child())
+            }),
+            "Home" => current
+                .parent_element()
+                .and_then(|p| p.first_element_child()),
+            "End" => current
+                .parent_element()
+                .and_then(|p| p.last_element_child()),
+            _ => return,
+        };
+        e.prevent_default();
+        if let Some(el) = next.and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok()) {
+            let _ = el.focus();
+        }
+    };
+
     view! {
-        <div class="actions-menu">
+        <div class="actions-menu" role="menu" node_ref=panel_ref on:keydown=on_keydown>
             {items.into_iter().map(|item| {
                 let class = if item.danger { "item danger" } else { "item" };
                 let cb = item.on_click;
                 view! {
-                    <div
+                    <button
                         class=class
+                        type="button"
+                        role="menuitem"
                         on:click=move |e: web_sys::MouseEvent| {
                             e.stop_propagation();
                             open.set(false);
                             cb.run(());
                         }
-                    >{item.label}</div>
+                    >{item.label}</button>
                 }
             }).collect_view()}
         </div>
