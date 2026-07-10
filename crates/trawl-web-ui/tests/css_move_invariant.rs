@@ -101,7 +101,19 @@ const MOVED_SELECTORS: &[&str] = &[
     ".sd-tabs .sp",
     ".sd-tabs .meta",
     ".sd-body",
+    // Issue #31 small-widget sweep — moved verbatim (or lightly
+    // generalized) into fleet-ui.css as each widget's consumers
+    // switched to the fleet component.
+    ".sc-spark",
 ];
+
+/// Selector families the issue #31 unification RETIRED outright: their
+/// markup now renders a fleet-ui component with a DIFFERENT canonical
+/// class (`.bdg`, `.seg`, `.results-footer`, `.status-dot`,
+/// `.load-hint`), or was dead (`.live-badge`). Unlike
+/// [`MOVED_SELECTORS`] these must not exist in EITHER stylesheet —
+/// reappearing anywhere means per-site drift is growing back.
+const RETIRED_SELECTORS: &[&str] = &[".live-badge", ".live-badge.live", ".live-badge.lagged"];
 
 #[test]
 fn moved_selectors_absent_from_app_css() {
@@ -115,6 +127,23 @@ fn moved_selectors_absent_from_app_css() {
         stray.is_empty(),
         "these moved selectors are still defined in main.css (must live only \
          in fleet-ui.css; more-specific app overrides are fine): {stray:?}"
+    );
+}
+
+#[test]
+fn retired_selectors_absent_from_both_stylesheets() {
+    let app = top_level_selectors(APP_CSS);
+    let fleet = top_level_selectors(FLEET_CSS);
+    let stray: Vec<&str> = RETIRED_SELECTORS
+        .iter()
+        .copied()
+        .filter(|sel| app.contains(*sel) || fleet.contains(*sel))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "these selectors were retired by the issue #31 unification (their \
+         surfaces render fleet-ui components with canonical classes) but \
+         are defined again: {stray:?}"
     );
 }
 

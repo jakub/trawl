@@ -17,9 +17,10 @@ use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::components::sparkline::Sparkline;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Drawer, Size, TabItem, ToastBus, ToastKind, Variant, effective_active};
+use fleet_ui::{
+    Btn, Drawer, Size, Sparkline, TabItem, ToastBus, ToastKind, Variant, effective_active,
+};
 
 const RUNS_PAGE_SIZE: usize = 20;
 const RESULT_PREVIEW_ROWS: usize = 20;

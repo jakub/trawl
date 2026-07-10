@@ -996,3 +996,6 @@ textarea:focus-visible,
  * trigger `.btn-icon` and panel `.actions-menu` rules move in with
  * the nets-page sweep commit). */
 .actions-wrap { position: relative; display: inline-block; }
+
+/* Sparkline — <Sparkline/> (moved verbatim from trawl's main.css). */
+.sc-spark { display: block; }

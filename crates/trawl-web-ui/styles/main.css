@@ -332,37 +332,6 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Live-tail status pill — provisional, becomes status-bar HAULING
- *  indicator in commit 4
- * ─────────────────────────────────────────────────────────────── */
-.live-badge {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: .06em;
-  padding: 2px 8px;
-  border-radius: 2px;
-  font-weight: 600;
-}
-
-.live-badge.live {
-  color: var(--green);
-  background: color-mix(in oklab, var(--green) 12%, var(--panel));
-  border: 1px solid var(--green);
-}
-
-.live-badge.lagged {
-  color: var(--yellow);
-  background: var(--yellow-wash);
-  border: 1px solid var(--yellow);
-  animation: live-badge-pulse 0.5s ease-out;
-}
-
-@keyframes live-badge-pulse {
-  from { transform: scale(1.1); }
-  to   { transform: scale(1); }
-}
-
-/* ─────────────────────────────────────────────────────────────────
  *  Editor wrap (header + DslEditor + date range + run button)
  * ─────────────────────────────────────────────────────────────── */
 .editor-wrap {
@@ -1224,8 +1193,8 @@
 .sd-dot.errors  { background: var(--red);    box-shadow: 0 0 0 2px color-mix(in oklab, var(--red) 25%, transparent); animation: dot-pulse 1.6s ease-in-out infinite; }
 @keyframes dot-pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
 
-/* Sparkline */
-.sc-spark { display: block; }
+/* Sparkline: .sc-spark moved to fleet-ui.css (issue #31) —
+ * fleet_ui::Sparkline emits it. */
 
 /* Quick action row (hover-revealed) */
 .sc-quickact {

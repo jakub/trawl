@@ -11,7 +11,7 @@
 //! `ServiceSchema` covers events, storage, column stats, and
 //! `daily_event_counts` for the sparkline.
 
-use fleet_ui::{Icon, IconView};
+use fleet_ui::{Icon, IconView, Sparkline};
 use leptos::prelude::*;
 use leptos::web_sys;
 use trawl_api::ServiceSchema;
@@ -19,7 +19,6 @@ use trawl_api::ServiceSchema;
 use super::service_card_fmt::{
     cov_pct, date_range, format_avg_coverage, format_bytes, format_count, is_healthy, type_pill,
 };
-use super::sparkline::Sparkline;
 
 /// Number of field rows shown on a card before the "+N more" row.
 const TOP_FIELDS: usize = 5;
