@@ -5,6 +5,8 @@
 use coastwatch_api_types::derivation::{AncestryView, DerivationView, DescendantView};
 use leptos::prelude::*;
 
+use fleet_ui::{Btn, Size, Variant};
+
 use super::truncate;
 use crate::time_fmt::time_ago;
 
@@ -296,28 +298,30 @@ pub fn LineageTree(
                             {show_invalidate.then(|| {
                                 let id = drv_id.clone();
                                 view! {
-                                    <button
-                                        class="btn-xs btn-sec"
-                                        on:click=move |e| {
-                                            e.stop_propagation();
+                                    <Btn
+                                        variant=Variant::Secondary
+                                        size=Size::Xs
+                                        stop_propagation=true
+                                        on_click=Callback::new(move |()| {
                                             if let Some(cb) = on_inv {
                                                 cb.run(id.clone());
                                             }
-                                        }
+                                        })
                                     >
                                         "invalidate"
-                                    </button>
+                                    </Btn>
                                 }
                             })}
                             {(!can_write && !is_invalidated && on_invalidate.is_some()).then(|| {
                                 view! {
-                                    <button
-                                        class="btn-xs btn-sec"
+                                    <Btn
+                                        variant=Variant::Secondary
+                                        size=Size::Xs
                                         disabled=true
-                                        title="requires DerivationWrite permission"
+                                        attr:title="requires DerivationWrite permission"
                                     >
                                         "invalidate"
-                                    </button>
+                                    </Btn>
                                 }
                             })}
                         </div>

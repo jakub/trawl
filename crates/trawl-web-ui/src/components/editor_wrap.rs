@@ -16,7 +16,7 @@ use leptos::web_sys;
 use crate::clipboard::write_clipboard;
 use crate::components::editor::DslEditor;
 use crate::state::query::{QUICK_RANGES, RangeSpec};
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, Icon, IconView, ToastBus, ToastKind, Variant};
 
 #[component]
 pub fn EditorWrap(
@@ -153,9 +153,9 @@ fn DateRange(
                 }).collect::<Vec<_>>()}
             </div>
             <div class="custom" on:click=move |_| open.update(|o| *o = !*o)>
-                <CalendarIcon/>
+                <IconView icon=Icon::Calendar size=11 stroke_width=1.5/>
                 <span>{move || value.get().label()}</span>
-                <ChevIcon/>
+                <IconView icon=Icon::Chevron size=10 stroke_width=1.5/>
             </div>
             <Show when=move || open.get()>
                 <DateRangePopover value=value on_change=on_change open=open/>
@@ -190,7 +190,7 @@ fn DateRangePopover(
         close();
     };
 
-    let apply_absolute = move |_| {
+    let apply_absolute = Callback::new(move |()| {
         let f = from.get();
         let t = to.get();
         if f.trim().is_empty() && t.trim().is_empty() {
@@ -199,7 +199,7 @@ fn DateRangePopover(
         }
         on_change.run(RangeSpec::Absolute { from: f, to: t });
         close();
-    };
+    });
 
     view! {
         // Fullscreen scrim captures outside clicks. Transparent — the
@@ -266,14 +266,11 @@ fn DateRangePopover(
                     <div class="foot">
                         <div class="summary">"bucket: " <span class="amber">"auto · 1m"</span></div>
                         <div class="btns">
-                            <button
-                                class="btn-sec"
-                                on:click=move |_| close()
-                            >"Cancel"</button>
-                            <button
-                                class="btn-pri"
-                                on:click=apply_absolute
-                            >"Apply"</button>
+                            <Btn
+                                variant=Variant::Secondary
+                                on_click=Callback::new(move |()| close())
+                            >"Cancel"</Btn>
+                            <Btn variant=Variant::Primary on_click=apply_absolute>"Apply"</Btn>
                         </div>
                     </div>
                 }.into_any(),
@@ -293,23 +290,4 @@ enum Tab {
     Relative,
     Absolute,
     RealTime,
-}
-
-#[component]
-fn CalendarIcon() -> impl IntoView {
-    view! {
-        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <rect x="2" y="3" width="12" height="11" rx="1"/>
-            <path d="M2 6h12M5 1.5v3M11 1.5v3"/>
-        </svg>
-    }
-}
-
-#[component]
-fn ChevIcon() -> impl IntoView {
-    view! {
-        <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="m4 6 4 4 4-4"/>
-        </svg>
-    }
 }

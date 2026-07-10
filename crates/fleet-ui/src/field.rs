@@ -5,12 +5,31 @@
 //! `<Field/>` — labelled form wrapper around an `<input>`/`<select>`/
 //! `<textarea>` slot.
 //!
-//! Owns the `.field` wrapper, the `<label>` text, and an optional
-//! single helper paragraph (hint OR error — not both, by type
-//! construction). The actual control is passed via `children` so the
-//! caller controls `type`, `value`, and event handlers; the caller
-//! MUST thread the `id` prop onto their inner control element so the
-//! emitted `<label for=id>` and `aria-describedby` wiring resolve.
+//! Owns the wrapper element (`.field` by default — see `class`), the
+//! label text, and an optional single helper paragraph (hint OR error —
+//! not both, by type construction). The actual control is passed via
+//! `children` so the caller controls `type`, `value`, and event
+//! handlers.
+//!
+//! Two shapes:
+//!
+//! * **default** — `<div class><label for=id>…</label>{control}</div>`.
+//!   Explicit association: the caller SHOULD pass `id` and MUST thread
+//!   it onto the inner control so `<label for=id>` and
+//!   `aria-describedby` resolve. `id` is optional only for wrapper
+//!   parity with pre-extraction markup that had a bare `<label>` (e.g.
+//!   trawl's `.m-field` clusters) — omit it and no `for` is emitted.
+//! * **wrap** (`wrap=true`) — `<label class><span>{label}</span>
+//!   {control}</label>`. Implicit association by nesting; no `for`/`id`
+//!   wiring, and the caption `<span>` stays unstyled (exactly the login
+//!   card's markup, which dogfoods this mode).
+//!
+//! `class` overrides the wrapper class (default `"field"`). Trawl's
+//! modal field clusters pass `class="m-field"` so migrating them onto
+//! `Field` moves zero pixels — `.modal .m-field` styling differs from
+//! `.field` on purpose. An override class is caller-supplied and
+//! therefore caller-styled: it lives in the app's stylesheet, not
+//! fleet-ui.css.
 
 use leptos::prelude::*;
 
@@ -26,16 +45,20 @@ pub enum Helper {
 }
 
 /// Form-field wrapper. `children` is the underlying input/select/
-/// textarea. The caller MUST set `id` on that control element so the
-/// emitted `<label for=id>` actually associates.
+/// textarea. In default mode the caller SHOULD set `id` on that control
+/// element so the emitted `<label for=id>` actually associates; in
+/// `wrap` mode nesting associates implicitly and `id` is unused for the
+/// label (it still namespaces the helper paragraph).
 #[component]
 pub fn Field(
-    id: &'static str,
+    #[prop(into, optional)] id: Option<&'static str>,
     label: &'static str,
     #[prop(default = Helper::None)] helper: Helper,
+    #[prop(default = false)] wrap: bool,
+    #[prop(default = "field")] class: &'static str,
     children: Children,
 ) -> impl IntoView {
-    let helper_id = format!("{id}-help");
+    let helper_id = format!("{}-help", id.unwrap_or("field"));
     let described_by =
         matches!(helper, Helper::Hint(_) | Helper::Error(_)).then(|| helper_id.clone());
 
@@ -49,11 +72,23 @@ pub fn Field(
         }
     };
 
-    view! {
-        <div class="field" aria-describedby=described_by>
-            <label for=id>{label}</label>
-            {children()}
-            {helper_view}
-        </div>
+    if wrap {
+        view! {
+            <label class=class aria-describedby=described_by>
+                <span>{label}</span>
+                {children()}
+                {helper_view}
+            </label>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class=class aria-describedby=described_by>
+                <label for=id>{label}</label>
+                {children()}
+                {helper_view}
+            </div>
+        }
+        .into_any()
     }
 }

@@ -24,9 +24,14 @@
 
 pub mod button;
 pub mod login;
+pub mod overlay;
 pub mod theme;
 pub mod toast;
 
+#[cfg(target_arch = "wasm32")]
+pub mod drawer;
+#[cfg(target_arch = "wasm32")]
+pub mod error_banner;
 #[cfg(target_arch = "wasm32")]
 pub mod field;
 pub mod icon;
@@ -37,9 +42,11 @@ pub mod rail;
 #[cfg(target_arch = "wasm32")]
 pub mod shell;
 #[cfg(target_arch = "wasm32")]
+pub mod tabs;
+#[cfg(target_arch = "wasm32")]
 pub mod topbar;
 
-pub use button::Variant;
+pub use button::{Size, Variant};
 pub use icon::Icon;
 pub use theme::{Density, RowStyle, Theme};
 pub use toast::{Toast, ToastKind, ToastStack};
@@ -47,17 +54,23 @@ pub use toast::{Toast, ToastKind, ToastStack};
 #[cfg(target_arch = "wasm32")]
 pub use button::Btn;
 #[cfg(target_arch = "wasm32")]
+pub use drawer::Drawer;
+#[cfg(target_arch = "wasm32")]
+pub use error_banner::ErrorBanner;
+#[cfg(target_arch = "wasm32")]
 pub use field::{Field, Helper};
 #[cfg(target_arch = "wasm32")]
 pub use icon::IconView;
 #[cfg(target_arch = "wasm32")]
 pub use login::Login;
 #[cfg(target_arch = "wasm32")]
-pub use modal::ConfirmModal;
+pub use modal::{ConfirmModal, ConfirmWithReasonModal, Modal};
 #[cfg(target_arch = "wasm32")]
 pub use rail::{Rail, RailItem};
 #[cfg(target_arch = "wasm32")]
 pub use shell::Shell;
+#[cfg(target_arch = "wasm32")]
+pub use tabs::{TabItem, Tabs, TabsStyle, effective_active};
 #[cfg(target_arch = "wasm32")]
 pub use theme::{UiPrefs, install};
 #[cfg(target_arch = "wasm32")]

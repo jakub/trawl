@@ -29,15 +29,45 @@ use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::status_bar::StatusKind;
-use crate::components::tabs::{ResultsTab, Tabs};
 use crate::pages::layout::ShellStatus;
 use crate::state::query::{
     Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, url_signals,
 };
 use crate::state::search_session::rows_resource;
+use fleet_ui::{TabItem, Tabs};
+
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
 };
+
+/// Results-area tab. Moved here from the deleted `components/tabs.rs`
+/// when the strip itself became `fleet_ui::Tabs` (issue #28) — the
+/// typed enum is search-page semantics, not design-system chrome.
+///
+/// Patterns and Statistics from the design are deferred — we don't
+/// have pattern detection or pre-aggregated stats yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultsTab {
+    Events,
+    Visualization,
+}
+
+impl ResultsTab {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Events => "events",
+            Self::Visualization => "viz",
+        }
+    }
+
+    fn from_id(id: &str) -> Self {
+        if id == "viz" {
+            Self::Visualization
+        } else {
+            Self::Events
+        }
+    }
+}
 
 #[component]
 pub fn Search() -> impl IntoView {
@@ -212,6 +242,10 @@ pub fn Search() -> impl IntoView {
 
     // --- sync search status to shell status bar -----------------------
     let active_tab = RwSignal::new(ResultsTab::Events);
+    // fleet_ui::Tabs speaks &'static str ids; the typed ResultsTab enum
+    // stays app-side (ADR-0002) with a two-line id <-> enum map here.
+    let tabs_active = Signal::derive(move || active_tab.get().id().to_string());
+    let on_tab_change = Callback::new(move |id: String| active_tab.set(ResultsTab::from_id(&id)));
 
     let is_chart_query = Memo::new(move |_| {
         let q = effective_q.get();
@@ -296,7 +330,14 @@ pub fn Search() -> impl IntoView {
                     on_remove=on_remove_filter
                     on_export=on_export
                 />
-                <Tabs active=active_tab count=last_count/>
+                <Tabs
+                    items=vec![
+                        TabItem::with_count(ResultsTab::Events.id(), "Events", last_count),
+                        TabItem::new(ResultsTab::Visualization.id(), "Visualization"),
+                    ]
+                    active=tabs_active
+                    on_change=on_tab_change
+                />
                 {move || match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>

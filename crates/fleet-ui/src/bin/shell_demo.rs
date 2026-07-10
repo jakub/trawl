@@ -33,7 +33,10 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 // TopBar and Rail are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
-use fleet_ui::{AppLink, Icon, Login, ModeTab, RailItem, Shell, ToastBus, UserInfo, install};
+use fleet_ui::{
+    AppLink, Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal, ModeTab,
+    RailItem, Shell, Size, TabItem, Tabs, ToastBus, UserInfo, Variant, install,
+};
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -138,7 +141,126 @@ fn ToastProbe() -> impl IntoView {
                     "fire error"
                 </button>
             </div>
+            <ModalProbe/>
+            <DrawerProbe/>
+            <ErrorBanner error=Signal::derive(|| Some("demo error banner (role=alert)".to_string()))/>
         </div>
+    }
+}
+
+/// Mounts the issue-#28 Drawer + Tabs from a non-trawl consumer: a
+/// standalone workspace-style strip with a count chip, and a drawer
+/// composing the drawer-style strip, title/actions slots, and body
+/// panes switched by the active tab.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn DrawerProbe() -> impl IntoView {
+    let show_drawer = RwSignal::new(false);
+    let workspace_tab = RwSignal::new("events".to_string());
+    let drawer_tab = RwSignal::new("overview".to_string());
+
+    view! {
+        <Btn variant=Variant::Secondary on_click=Callback::new(move |()| show_drawer.set(true))>
+            "open drawer"
+        </Btn>
+        <div style="width:420px;border:1px solid var(--line)">
+            <Tabs
+                items=vec![
+                    TabItem::with_count("events", "Events", Signal::derive(|| Some(1287))),
+                    TabItem::new("viz", "Visualization"),
+                ]
+                active=workspace_tab
+                on_change=Callback::new(move |id: String| workspace_tab.set(id))
+            />
+        </div>
+        {move || show_drawer.get().then(|| view! {
+            <Drawer
+                tabs=vec![
+                    TabItem::new("overview", "Overview"),
+                    TabItem::new("fields", "Fields"),
+                ]
+                active_tab=drawer_tab
+                on_tab_change=Callback::new(move |id: String| drawer_tab.set(id))
+                on_close=Callback::new(move |()| show_drawer.set(false))
+                meta="1.2k events · 3.4 MB · 12 fields".to_string()
+                title=Box::new(|| view! { <span class="name">"demo-service"</span> }.into_any())
+                actions=Box::new(move || view! {
+                    <Btn variant=Variant::Secondary on_click=Callback::new(|()| {})>
+                        "Search this service"
+                    </Btn>
+                }.into_any())
+            >
+                {move || if drawer_tab.get() == "fields" {
+                    view! { <p>"fields pane"</p> }.into_any()
+                } else {
+                    view! { <p>"overview pane — Esc or scrim click closes"</p> }.into_any()
+                }}
+            </Drawer>
+        })}
+    }
+}
+
+/// Mounts the issue-#28 modal family from a non-trawl consumer: the
+/// `Modal` shell with icon/footer/Cmd-Ctrl+Enter, and the promoted
+/// `ConfirmWithReasonModal`. Also exercises the `Btn` size axis.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn ModalProbe() -> impl IntoView {
+    let bus = expect_context::<ToastBus>();
+    let show_modal = RwSignal::new(false);
+    let show_reason = RwSignal::new(false);
+
+    let submit = Callback::new(move |()| {
+        bus.push_success("Submitted", Some("modal primary action ran".into()));
+        show_modal.set(false);
+    });
+
+    view! {
+        <div style="display:flex;gap:8px">
+            <Btn variant=Variant::Secondary on_click=Callback::new(move |()| show_modal.set(true))>
+                "open modal"
+            </Btn>
+            <Btn
+                variant=Variant::Secondary
+                size=Size::Xs
+                on_click=Callback::new(move |()| show_reason.set(true))
+            >
+                "open reason modal"
+            </Btn>
+        </div>
+        {move || show_modal.get().then(|| view! {
+            <Modal
+                title="Demo dialog"
+                icon=Icon::Download
+                on_cancel=Callback::new(move |()| show_modal.set(false))
+                on_submit=submit
+                footer=Box::new(move || view! {
+                    <div></div>
+                    <Btn
+                        variant=Variant::Secondary
+                        on_click=Callback::new(move |()| show_modal.set(false))
+                    >
+                        "Cancel"
+                    </Btn>
+                    <Btn variant=Variant::Primary on_click=submit>"Submit"</Btn>
+                }.into_any())
+            >
+                <p style="margin:0">"Esc cancels · ⌘/Ctrl+Enter submits · scrim click dismisses."</p>
+            </Modal>
+        })}
+        {move || show_reason.get().then(|| view! {
+            <ConfirmWithReasonModal
+                title="Retract demo object"
+                message="Retract demo-1? This cascades.".to_string()
+                confirm_label="Retract"
+                reason_placeholder="Reason for retraction"
+                on_confirm=Callback::new(move |reason: String| {
+                    bus.push_success("Retracted", Some(format!("reason: {reason}")));
+                    show_reason.set(false);
+                })
+                on_cancel=Callback::new(move |()| show_reason.set(false))
+            />
+        })}
     }
 }
 

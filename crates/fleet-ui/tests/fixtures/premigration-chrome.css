@@ -1,0 +1,168 @@
+/* GOLDEN FIXTURE — DO NOT EDIT to make a test pass.
+ *
+ * The pre-migration bytes of every chrome rule that issue #28 moved
+ * out of trawl-web-ui/styles/main.css and into fleet-ui.css. Captured
+ * verbatim from `git show f4a3b45^:crates/trawl-web-ui/styles/main.css`
+ * (the commit before slice B). This is the observable substitute for
+ * the C5 before/after pixel grid: for a pure CSS relocation, if every
+ * one of these rule bodies still exists byte-for-byte in the shipped
+ * fleet-ui.css — and the tokens they reference are untouched by this
+ * slice (guarded by css_move_invariant) — the migrated surfaces render
+ * identically in BOTH themes by construction. css_chrome_parity's
+ * `moved_chrome_is_byte_identical_to_premigration` asserts exactly that.
+ *
+ * The four DELIBERATE deltas (rail/mode anchor underline suppression,
+ * .login-card .error respacing, .shell auto footer row) are NOT here —
+ * they changed on purpose and are pinned individually in the same test
+ * module. Everything in this file moved unchanged.
+ */
+
+.btn-sm {
+  padding: 3px 10px;
+  background: var(--panel-2);
+  color: var(--ink-2);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  font-size: 11px;
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+
+.btn-sm:hover:not(:disabled) {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.btn-sm:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.tabs {
+  display: flex;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 0 12px;
+  flex-shrink: 0;
+}
+
+.tabs .t {
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-ui);
+}
+
+.tabs .t:hover { color: var(--ink-2); }
+
+.tabs .t.active { color: var(--ink); border-bottom-color: var(--amber); font-weight: 500; }
+
+.tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: 11px; }
+
+.tabs .sp { flex: 1; }
+
+.modal .m-hd .ic {
+  width: 22px; height: 22px; display: grid; place-items: center;
+  color: var(--amber);
+  background: var(--amber-wash); border-radius: 3px;
+}
+
+.modal .m-field { display: flex; flex-direction: column; gap: 4px; }
+
+.modal .m-field label {
+  font-family: var(--font-ui); font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
+}
+
+.modal .m-field input {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+  padding: 6px 10px; font-family: var(--font-ui); font-size: 13px;
+  color: var(--ink); outline: none; height: 30px;
+}
+
+.modal .m-field input:focus {
+  border-color: var(--amber); box-shadow: 0 0 0 3px var(--amber-glow);
+}
+
+.sd-scrim {
+  position: fixed; inset: 0; background: rgba(20,15,5,.18);
+  z-index: 50; animation: sd-fade-in 140ms ease-out;
+  backdrop-filter: blur(1px);
+}
+
+.sd-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(720px, 92vw);
+  background: var(--panel); border-left: 1px solid var(--line);
+  box-shadow: -8px 0 32px -10px rgba(0,0,0,.25);
+  z-index: 51;
+  display: flex; flex-direction: column;
+  animation: sd-slide-in 200ms cubic-bezier(.2,.8,.3,1);
+}
+
+@keyframes sd-fade-in { from { opacity: 0 } to { opacity: 1 } }
+
+@keyframes sd-slide-in { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+.sd-hd {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; border-bottom: 1px solid var(--line);
+  gap: 16px; background: var(--panel-2);
+}
+
+.sd-ttl { display: flex; align-items: center; gap: 8px; min-width: 0; }
+
+.sd-actions { display: flex; align-items: center; gap: 8px; }
+
+.sd-x {
+  background: none; border: 1px solid transparent; cursor: pointer;
+  width: 28px; height: 28px; border-radius: 3px;
+  font-size: 18px; color: var(--ink-3); line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+
+.sd-x:hover { background: var(--panel-3); color: var(--ink); border-color: var(--line); }
+
+.sd-tabs {
+  display: flex; align-items: center; gap: 4px;
+  padding: 0 14px; border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.sd-tabs .tb {
+  font-family: var(--font-ui); font-size: 12px; font-weight: 500;
+  color: var(--ink-3); padding: 9px 12px; cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  transition: color 100ms, border-color 100ms;
+}
+
+.sd-tabs .tb:hover { color: var(--ink-2); }
+
+.sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--amber); font-weight: 600; }
+
+.sd-tabs .sp { flex: 1; }
+
+.sd-tabs .meta { font-size: 11px; color: var(--ink-3); padding-right: 4px; }
+
+.sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
+
+.btn-xs { font-size: 11px; padding: 3px 8px; }
+
+.reason-input {
+  width: 100%; min-height: 60px; padding: 6px 8px;
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 3px;
+  font-family: var(--font-mono); font-size: 12px;
+  resize: vertical;
+}
+
+.reason-input:focus {
+  outline: none; box-shadow: 0 0 0 3px var(--amber-glow);
+  border-color: var(--amber);
+}

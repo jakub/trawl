@@ -1,0 +1,129 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! The *component* half of issue #28's C5 ("zero visual change") contract.
+//!
+//! `css_chrome_parity` proves every relocated chrome rule still lives
+//! byte-for-byte in `fleet-ui.css`, and `css_move_invariant` proves the
+//! design tokens those rules reference are untouched — so a class hook,
+//! *if emitted*, paints exactly as it did pre-migration. That is the
+//! **necessary** leg. It is not **sufficient**: those tests never observe
+//! that the migrated fleet-ui primitives actually *emit* the class hooks
+//! their CSS styles. A primitive renamed to `class="modal-overlay"` would
+//! leave the byte-identical `.modal-scrim` rule green while silently
+//! dropping every pixel it painted — a C5 regression invisible to compile,
+//! to clippy, and to the CSS parity tests.
+//!
+//! The reviewer's residual C5 gap is that the pixel-level claim rests on a
+//! before/after screenshot grid that needs a live server + browser + open
+//! PR — unobservable from `cargo nextest`. fleet-ui compiles leptos only
+//! under `cfg(target_arch = "wasm32")` (natively it is just `serde_json`),
+//! so no native test can *render* these components. What a native test
+//! *can* do — the same `include_str!`-and-scan trick `css_chrome_parity`
+//! uses on the stylesheet — is read each primitive's source and assert the
+//! class hooks are present in the emitted markup. Pairing every hook with
+//! the CSS rule it must match closes the loop: pre-migration markup used
+//! class X, the byte-identical rule for X still ships (CSS test), and the
+//! fleet-ui component still emits X (this test) => the surface renders
+//! identically. That is C5 machine-checked to the maximum degree
+//! observable without a renderer; the screenshot grid remains the PR-time
+//! deliverable for the truly-rendered residual.
+
+const MODAL_SHELL: &str = include_str!("../src/modal/shell.rs");
+const CONFIRM_REASON: &str = include_str!("../src/modal/confirm_reason.rs");
+const DRAWER: &str = include_str!("../src/drawer.rs");
+const TABS: &str = include_str!("../src/tabs.rs");
+const ERROR_BANNER: &str = include_str!("../src/error_banner.rs");
+
+/// Assert `src` contains `hook` (a class literal or class-idiom substring),
+/// blaming the CSS rule that hook must line up with.
+fn emits(src: &str, hook: &str, styled_by: &str) {
+    assert!(
+        src.contains(hook),
+        "class hook `{hook}` is no longer emitted — its byte-identical CSS \
+         rule `{styled_by}` (pinned in css_chrome_parity) would then style \
+         nothing, a C5 zero-visual-change regression invisible to compile \
+         and to the CSS parity tests. Restore the hook, or if the markup \
+         change is deliberate re-pin both sides."
+    );
+}
+
+#[test]
+fn modal_shell_emits_the_hooks_its_css_styles() {
+    // `.modal-scrim > .modal[.modal-sm] > .m-hd(.ic/.t/.x) / .m-body / .m-ft`
+    // — the frame slice A moved into fleet-ui.css and css_chrome_parity's
+    // `modal_family_classes_shipped_with_crate` pins.
+    emits(MODAL_SHELL, r#"class="modal-scrim""#, ".modal-scrim");
+    // narrow => `modal modal-sm`, else `modal`; both selectors are styled.
+    emits(MODAL_SHELL, r#""modal modal-sm""#, ".modal-sm");
+    emits(MODAL_SHELL, r#""modal""#, ".modal");
+    emits(MODAL_SHELL, r#"class="m-hd""#, ".modal .m-hd");
+    emits(MODAL_SHELL, r#"class="ic""#, ".modal .m-hd .ic");
+    emits(MODAL_SHELL, r#"class="m-body""#, ".modal .m-body");
+    emits(MODAL_SHELL, r#"class="m-ft""#, ".modal .m-ft");
+}
+
+#[test]
+fn confirm_reason_emits_field_and_reason_input() {
+    // Promoted ConfirmWithReasonModal: `.m-field` wrapper (via Field's
+    // class override) + `.reason-input` textarea, both pinned in the CSS
+    // parity test's `modal_family_classes_shipped_with_crate`.
+    emits(CONFIRM_REASON, r#"class="m-field""#, ".modal .m-field");
+    emits(CONFIRM_REASON, r#"class="reason-input""#, ".reason-input");
+}
+
+#[test]
+fn drawer_emits_the_sd_shell_hooks_its_css_styles() {
+    // The `sd-*` shell css_chrome_parity's `drawer_shell_classes_shipped_
+    // with_crate` pins: scrim, panel, header (title + actions + close),
+    // body.
+    emits(DRAWER, r#"class="sd-scrim""#, ".sd-scrim");
+    emits(DRAWER, r#"class="sd-drawer""#, ".sd-drawer");
+    emits(DRAWER, r#"class="sd-hd""#, ".sd-hd");
+    emits(DRAWER, r#"class="sd-ttl""#, ".sd-ttl");
+    emits(DRAWER, r#"class="sd-actions""#, ".sd-actions");
+    emits(DRAWER, r#"class="sd-x""#, ".sd-x");
+    emits(DRAWER, r#"class="sd-body""#, ".sd-body");
+}
+
+#[test]
+fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
+    // Workspace family: `.tabs > div.t.active > span.c`. The active
+    // modifier MUST be `active` (weight-500 `.tabs .t.active`) and the
+    // count chip `.c` — both pinned in the CSS test.
+    emits(TABS, r#"class="tabs""#, ".tabs");
+    emits(TABS, r#"class="t""#, ".tabs .t");
+    emits(TABS, "class:active", ".tabs .t.active");
+    emits(TABS, r#"class="c""#, ".tabs .t .c");
+
+    // Drawer family: `.sd-tabs > span.tb.on`. The active modifier here is
+    // `on` (weight-600 `.sd-tabs .tb.on`) — a DIFFERENT idiom from the
+    // workspace `active`. `tab_strip_families_stay_distinct` pins the two
+    // weights apart on the CSS side; pin the two active-class idioms apart
+    // on the emission side so a "unify the tab strips" refactor can't
+    // collapse one family onto the other's class and shift its weight.
+    emits(TABS, r#"class="sd-tabs""#, ".sd-tabs");
+    emits(TABS, r#""tb on""#, ".sd-tabs .tb.on");
+    assert!(
+        !TABS.contains(r#""tb active""#) && !TABS.contains("class:on"),
+        "the drawer strip's active idiom must stay `\"tb on\"` and the \
+         workspace strip's `class:active` — merging them (e.g. `class:on` \
+         on the workspace tab, or `\"tb active\"` on the drawer tab) points \
+         a strip at the other family's font-weight rule, a C5 regression"
+    );
+}
+
+#[test]
+fn error_banner_emits_error_class_with_alert_role() {
+    // ErrorBanner reuses the moved `.error` class (byte-identical CSS) and
+    // adds the sole sanctioned DOM delta of the whole migration:
+    // role="alert". Pin both — the class so it paints, the role so the
+    // sanctioned a11y delta isn't silently dropped.
+    emits(ERROR_BANNER, r#"class="error""#, ".error");
+    assert!(
+        ERROR_BANNER.contains(r#"role="alert""#),
+        "ErrorBanner must keep role=\"alert\" — the one sanctioned DOM \
+         delta of the issue #28 migration (attribute-only, zero pixels)"
+    );
+}

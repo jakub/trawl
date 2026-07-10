@@ -11,14 +11,12 @@
 //! schedule-after-save, but the backend's `CreateSavedRequest` only
 //! carries `{ name, query }` — wiring the extra fields would mean
 //! growing the API first. Skeleton is structured so those fields can
-//! drop in next to `<NameField/>` when that work lands.
+//! drop in next to the name `<Field>` when that work lands.
 //!
-//! Behaviour:
-//! - Scrim click closes.
-//! - `Esc` closes. `Cmd/Ctrl + Enter` saves (if name non-empty).
-//! - Name input is autofocused + pre-selected on mount.
-//! - Default name derived from the query (first field=value token, or
-//!   "untitled").
+//! Built on `fleet_ui::Modal` (issue #28): the shell owns the scrim,
+//! Escape, and Cmd/Ctrl+Enter save; this component owns the name field
+//! (autofocused + pre-selected on mount, default derived from the
+//! query) and the footer hint/buttons.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -26,10 +24,9 @@ use leptos::web_sys;
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, Field, Icon, Modal, ToastBus, ToastKind, Variant};
 
 #[component]
-#[allow(clippy::too_many_lines)] // single-component dialog tree, not worth splitting further
 #[allow(clippy::needless_pass_by_value)] // Leptos component props: easier to pass owned
 pub fn SaveAsNetModal(
     /// The DSL query to save. Shown read-only in the preview strip.
@@ -57,7 +54,7 @@ pub fn SaveAsNetModal(
     });
 
     let q_for_submit = query.clone();
-    let do_save = move || {
+    let do_save = Callback::new(move |()| {
         let n = name.get_untracked().trim().to_string();
         if n.is_empty() || submitting.get_untracked() {
             return;
@@ -82,86 +79,46 @@ pub fn SaveAsNetModal(
                 }
             }
         });
-    };
-    let do_save_click = do_save.clone();
-    let do_save_key = do_save.clone();
+    });
 
-    let cancel = move || on_close.run(false);
-
-    let on_keydown = move |e: web_sys::KeyboardEvent| match e.key().as_str() {
-        "Escape" => {
-            e.prevent_default();
-            cancel();
-        }
-        "Enter" if e.meta_key() || e.ctrl_key() => {
-            e.prevent_default();
-            do_save_key();
-        }
-        _ => {}
-    };
+    let cancel = Callback::new(move |()| on_close.run(false));
+    let save_disabled = Signal::derive(move || name.get().trim().is_empty() || submitting.get());
 
     view! {
-        <div
-            class="modal-scrim"
-            on:mousedown=move |e: web_sys::MouseEvent| {
-                // Only close when the click target is the scrim itself,
-                // not a descendant — matches the mockup's behaviour and
-                // keeps drag-selecting text inside the modal from closing it.
-                if let Some(target) = e.target()
-                    && let Some(el) = target.dyn_ref::<web_sys::Element>()
-                    && el.class_name().contains("modal-scrim")
-                {
-                    cancel();
-                }
-            }
-            on:keydown=on_keydown
+        <Modal
+            title="Save query as net"
+            icon=Icon::Pin
+            on_cancel=cancel
+            on_submit=do_save
+            footer=Box::new(move || view! {
+                <div class="hint">
+                    <span class="kbd">"⏎"</span>
+                    " save"
+                    <span style="opacity:.5">"·"</span>
+                    <span class="kbd">"Esc"</span>
+                    " cancel"
+                </div>
+                <Btn variant=Variant::Secondary on_click=cancel>"Cancel"</Btn>
+                <Btn variant=Variant::Primary disabled=save_disabled on_click=do_save>
+                    {move || if submitting.get() { "Saving…" } else { "Save Net" }}
+                </Btn>
+            }.into_any())
         >
-            <div class="modal" role="dialog" aria-modal="true">
-                <div class="m-hd">
-                    <span class="ic"><PinIcon/></span>
-                    <span class="t">"Save query as net"</span>
-                    <span class="x" title="Close (Esc)" on:click=move |_| cancel()>
-                        <CloseIcon/>
-                    </span>
-                </div>
-
-                <div class="m-body">
-                    <div class="m-field">
-                        <label>"Query"</label>
-                        <div class="preview" title=query.clone()>{query.clone()}</div>
-                    </div>
-
-                    <div class="m-field">
-                        <label for="netName">"Name"</label>
-                        <input
-                            id="netName"
-                            node_ref=input_ref
-                            prop:value=move || name.get()
-                            on:input=move |e| name.set(event_target_value(&e))
-                            placeholder="e.g. nginx 5xx by host"
-                        />
-                    </div>
-                </div>
-
-                <div class="m-ft">
-                    <div class="hint">
-                        <span class="kbd">"⏎"</span>
-                        " save"
-                        <span style="opacity:.5">"·"</span>
-                        <span class="kbd">"Esc"</span>
-                        " cancel"
-                    </div>
-                    <button class="btn-sec" on:click=move |_| cancel()>"Cancel"</button>
-                    <button
-                        class="btn-pri"
-                        disabled=move || name.get().trim().is_empty() || submitting.get()
-                        on:click=move |_| do_save_click()
-                    >
-                        {move || if submitting.get() { "Saving…" } else { "Save Net" }}
-                    </button>
-                </div>
+            <div class="m-field">
+                <label>"Query"</label>
+                <div class="preview" title=query.clone()>{query.clone()}</div>
             </div>
-        </div>
+
+            <Field id="netName" label="Name" class="m-field">
+                <input
+                    id="netName"
+                    node_ref=input_ref
+                    prop:value=move || name.get()
+                    on:input=move |e| name.set(event_target_value(&e))
+                    placeholder="e.g. nginx 5xx by host"
+                />
+            </Field>
+        </Modal>
     }
 }
 
@@ -213,22 +170,4 @@ fn tokenize(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
-}
-
-#[component]
-fn PinIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M8 1.5v4M5 5.5h6l-1 4H6zM8 9.5v5"/>
-        </svg>
-    }
-}
-
-#[component]
-fn CloseIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="m4 4 8 8M12 4l-8 8"/>
-        </svg>
-    }
 }

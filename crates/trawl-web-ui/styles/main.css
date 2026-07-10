@@ -163,24 +163,8 @@
   gap: 6px;
 }
 
-.btn-sm {
-  padding: 3px 10px;
-  background: var(--panel-2);
-  color: var(--ink-2);
-  border: 1px solid var(--line);
-  border-radius: 2px;
-  font-size: 11px;
-  font-family: var(--font-ui);
-  cursor: pointer;
-}
-.btn-sm:hover:not(:disabled) {
-  border-color: var(--amber);
-  color: var(--amber);
-}
-.btn-sm:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
+/* .btn-sm / .btn-xs moved to fleet-ui.css (issue #28) — <Btn size=…>
+ * emits them, so the rules ship with the crate. */
 
 /* ─────────────────────────────────────────────────────────────────
  *  Facets panel — 224px Splunk-style
@@ -584,31 +568,10 @@
 .meta .chip.excl .x:hover { background: var(--red); color: #fff; }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Tabs (Events / Visualization)
+ *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
+ *  fleet_ui::Tabs emits it). The .dr-pop .tabs overrides below stay:
+ *  app-owned popover reskin of the shared strip.
  * ─────────────────────────────────────────────────────────────── */
-.tabs {
-  display: flex;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
-  padding: 0 12px;
-  flex-shrink: 0;
-}
-.tabs .t {
-  padding: 8px 12px;
-  font-size: 12.5px;
-  color: var(--ink-3);
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-family: var(--font-ui);
-}
-.tabs .t:hover { color: var(--ink-2); }
-.tabs .t.active { color: var(--ink); border-bottom-color: var(--amber); font-weight: 500; }
-.tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: 11px; }
-.tabs .sp { flex: 1; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Histogram — 78px strip on Events
@@ -1110,11 +1073,9 @@
  *  and keyboard hints.
  * ─────────────────────────────────────────────────────────────── */
 
-.modal .m-hd .ic {
-  width: 22px; height: 22px; display: grid; place-items: center;
-  color: var(--amber);
-  background: var(--amber-wash); border-radius: 3px;
-}
+/* .modal .m-hd .ic, .modal .m-field* and .reason-input* moved to
+ * fleet-ui.css (issue #28) — the Modal shell and
+ * ConfirmWithReasonModal emit them. */
 
 .modal .m-body .preview {
   background: var(--panel-2); border: 1px solid var(--line);
@@ -1122,20 +1083,6 @@
   font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-2);
   white-space: pre-wrap; word-break: break-all;
 }
-.modal .m-field { display: flex; flex-direction: column; gap: 4px; }
-.modal .m-field label {
-  font-family: var(--font-ui); font-size: 10.5px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
-}
-.modal .m-field input {
-  background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
-  padding: 6px 10px; font-family: var(--font-ui); font-size: 13px;
-  color: var(--ink); outline: none; height: 30px;
-}
-.modal .m-field input:focus {
-  border-color: var(--amber); box-shadow: 0 0 0 3px var(--amber-glow);
-}
-
 .modal .m-ft .hint {
   flex: 1; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3);
   display: flex; gap: 8px; align-items: center;
@@ -1314,60 +1261,12 @@
 .seg-mini > span:last-child { border-right: 0; }
 .seg-mini > span.on { background: var(--panel); color: var(--ink); font-weight: 600; }
 
-/* Drawer + scrim */
-.sd-scrim {
-  position: fixed; inset: 0; background: rgba(20,15,5,.18);
-  z-index: 50; animation: sd-fade-in 140ms ease-out;
-  backdrop-filter: blur(1px);
-}
-.sd-drawer {
-  position: fixed; top: 0; right: 0; bottom: 0;
-  width: min(720px, 92vw);
-  background: var(--panel); border-left: 1px solid var(--line);
-  box-shadow: -8px 0 32px -10px rgba(0,0,0,.25);
-  z-index: 51;
-  display: flex; flex-direction: column;
-  animation: sd-slide-in 200ms cubic-bezier(.2,.8,.3,1);
-}
-@keyframes sd-fade-in { from { opacity: 0 } to { opacity: 1 } }
-@keyframes sd-slide-in { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
-
-/* Drawer header */
-.sd-hd {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 18px; border-bottom: 1px solid var(--line);
-  gap: 16px; background: var(--panel-2);
-}
-.sd-ttl { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* Drawer SHELL (.sd-scrim/.sd-drawer/.sd-hd/.sd-ttl/.sd-actions/.sd-x/
+ * .sd-tabs/.sd-body + keyframes) moved to fleet-ui.css (issue #28,
+ * fleet_ui::Drawer emits it). Title-slot CONTENT below stays app-side:
+ * the .name/.sub spans are rendered by trawl's drawer call sites. */
 .sd-ttl .name { font-family: var(--font-mono); font-size: 16px; font-weight: 600; color: var(--ink); letter-spacing: -.2px; }
 .sd-ttl .sub { font-size: 12px; color: var(--ink-3); }
-.sd-actions { display: flex; align-items: center; gap: 8px; }
-.sd-x {
-  background: none; border: 1px solid transparent; cursor: pointer;
-  width: 28px; height: 28px; border-radius: 3px;
-  font-size: 18px; color: var(--ink-3); line-height: 1;
-  display: inline-flex; align-items: center; justify-content: center;
-}
-.sd-x:hover { background: var(--panel-3); color: var(--ink); border-color: var(--line); }
-
-/* Drawer tabs */
-.sd-tabs {
-  display: flex; align-items: center; gap: 4px;
-  padding: 0 14px; border-bottom: 1px solid var(--line);
-  background: var(--panel);
-}
-.sd-tabs .tb {
-  font-family: var(--font-ui); font-size: 12px; font-weight: 500;
-  color: var(--ink-3); padding: 9px 12px; cursor: pointer;
-  border-bottom: 2px solid transparent; margin-bottom: -1px;
-  transition: color 100ms, border-color 100ms;
-}
-.sd-tabs .tb:hover { color: var(--ink-2); }
-.sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--amber); font-weight: 600; }
-.sd-tabs .sp { flex: 1; }
-.sd-tabs .meta { font-size: 11px; color: var(--ink-3); padding-right: 4px; }
-
-.sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
 
 /* Overview tab */
 .sd-overview {
@@ -1624,7 +1523,6 @@
 .toggle input:checked + .toggle-slider { background: var(--amber); }
 .toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
 
-.btn-xs { font-size: 11px; padding: 3px 8px; }
 .btn-icon {
   background: none; border: none; cursor: pointer;
   font-size: 16px; color: var(--ink-3); padding: 2px 6px;
@@ -1698,19 +1596,6 @@
 .lineage-time {
   font-family: var(--font-mono); font-size: 10px;
   color: var(--ink-4); white-space: nowrap;
-}
-
-/* ── Reason textarea (confirm-with-reason modal) ─────────────── */
-.reason-input {
-  width: 100%; min-height: 60px; padding: 6px 8px;
-  background: var(--panel-2); color: var(--ink);
-  border: 1px solid var(--line); border-radius: 3px;
-  font-family: var(--font-mono); font-size: 12px;
-  resize: vertical;
-}
-.reason-input:focus {
-  outline: none; box-shadow: 0 0 0 3px var(--amber-glow);
-  border-color: var(--amber);
 }
 
 /* ── Story list: two-line card rows ─────────────────────────── */

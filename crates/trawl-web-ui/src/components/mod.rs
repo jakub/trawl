@@ -15,7 +15,6 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 }
 
 pub mod chart;
-pub mod confirm_with_reason_modal;
 pub mod editor;
 pub mod editor_wrap;
 pub mod export_modal;
@@ -33,4 +32,3 @@ pub mod service_card_fmt;
 pub mod service_drawer;
 pub mod sparkline;
 pub mod status_bar;
-pub mod tabs;

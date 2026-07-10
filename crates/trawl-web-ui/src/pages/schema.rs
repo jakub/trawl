@@ -24,7 +24,7 @@ use crate::components::service_card::ServiceCard;
 use crate::components::service_card_fmt::today_yesterday_utc;
 use crate::components::service_drawer::ServiceDrawer;
 use crate::state::query::{Mode, RangeSpec, navigator};
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, Icon, IconView, ToastBus, ToastKind, Variant};
 
 #[component]
 #[allow(clippy::too_many_lines)]
@@ -112,13 +112,13 @@ pub fn SchemaPage() -> impl IntoView {
         })
     };
 
-    let on_new_extractor = move |_| {
+    let on_new_extractor = Callback::new(move |()| {
         bus.push(
             ToastKind::Info,
             "New extractor",
             Some("Field extractor authoring is landing soon.".into()),
         );
-    };
+    });
 
     let toggle_compact = move |val: bool| move |_| compact.set(val);
 
@@ -133,7 +133,7 @@ pub fn SchemaPage() -> impl IntoView {
                 </div>
                 <div class="actions">
                     <div class="inp-wrap">
-                        <SearchIcon/>
+                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
                         <input
                             placeholder="filter services…"
                             prop:value=move || filter.get()
@@ -150,7 +150,7 @@ pub fn SchemaPage() -> impl IntoView {
                             on:click=toggle_compact(true)
                         >"Compact"</span>
                     </div>
-                    <button class="btn-pri" on:click=on_new_extractor>"+ New extractor"</button>
+                    <Btn variant=Variant::Primary on_click=on_new_extractor>"+ New extractor"</Btn>
                 </div>
             </div>
 
@@ -233,15 +233,5 @@ pub fn SchemaPage() -> impl IntoView {
                 }.into_any()
             }}
         </div>
-    }
-}
-
-#[component]
-fn SearchIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="7" cy="7" r="4.5"/>
-            <path d="m10.5 10.5 3 3"/>
-        </svg>
     }
 }

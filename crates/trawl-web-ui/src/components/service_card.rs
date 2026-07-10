@@ -11,6 +11,7 @@
 //! `ServiceSchema` covers events, storage, column stats, and
 //! `daily_event_counts` for the sparkline.
 
+use fleet_ui::{Icon, IconView};
 use leptos::prelude::*;
 use leptos::web_sys;
 use trawl_api::ServiceSchema;
@@ -139,7 +140,7 @@ pub fn ServiceCard(
                         on_search.run(name_search.clone());
                     }
                 >
-                    <SearchIcon/>
+                    <IconView icon=Icon::Search size=11 stroke_width=1.5/>
                     "Search"
                 </span>
                 <span
@@ -150,29 +151,10 @@ pub fn ServiceCard(
                         on_tail.run(name_tail.clone());
                     }
                 >
-                    <ZapIcon/>
+                    <IconView icon=Icon::Bolt size=11 stroke_width=1.5/>
                     "Tail"
                 </span>
             </div>
         </div>
-    }
-}
-
-#[component]
-fn SearchIcon() -> impl IntoView {
-    view! {
-        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="7" cy="7" r="4.5"/>
-            <path d="m10.5 10.5 3 3"/>
-        </svg>
-    }
-}
-
-#[component]
-fn ZapIcon() -> impl IntoView {
-    view! {
-        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
-            <path d="M9 1 3 9h5l-1 6 6-8h-5z"/>
-        </svg>
     }
 }
