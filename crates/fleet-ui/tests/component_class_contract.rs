@@ -37,14 +37,16 @@ const TABS: &str = include_str!("../src/tabs.rs");
 const ERROR_BANNER: &str = include_str!("../src/error_banner.rs");
 
 // Issue #31 small widgets. Their tone/class *composition* is pinned by
-// native unit tests in the pure layers (badge::tone, status_dot::tone);
-// these source scans pin the base class hooks the wasm components emit.
+// native unit tests in the pure layers (badge::tone, status_dot::tone,
+// segmented::class); these source scans pin the base class hooks the
+// wasm components emit.
 const BADGE: &str = include_str!("../src/badge/component.rs");
 const BADGE_TONE: &str = include_str!("../src/badge/tone.rs");
 const STATUS_DOT_TONE: &str = include_str!("../src/status_dot/tone.rs");
 const SPARKLINE: &str = include_str!("../src/sparkline/component.rs");
 const LOADED: &str = include_str!("../src/loaded/component.rs");
-const SEGMENTED: &str = include_str!("../src/segmented.rs");
+const SEGMENTED: &str = include_str!("../src/segmented/component.rs");
+const SEGMENTED_CLASS: &str = include_str!("../src/segmented/class.rs");
 const PAGER: &str = include_str!("../src/pager.rs");
 const SEARCH_INPUT: &str = include_str!("../src/search_input.rs");
 const TOGGLE: &str = include_str!("../src/toggle.rs");
@@ -168,7 +170,11 @@ fn loaded_emits_the_tri_state_hint_hooks() {
 
 #[test]
 fn segmented_emits_one_strip_family_with_a_single_active_treatment() {
-    emits(SEGMENTED, r#"String::from("seg")"#, ".seg");
+    // <Segmented> composes the container class via the natively-tested
+    // segmented_class (Default/Sm/Xs x full table in segmented::class);
+    // the pure layer owns the `seg`/`seg-sm`/`seg-full` fragment.
+    emits(SEGMENTED, "segmented_class(size, full)", ".seg");
+    emits(SEGMENTED_CLASS, r#"String::from("seg")"#, ".seg");
     emits(SEGMENTED, r#"class="seg-opt""#, ".seg .seg-opt");
     emits(SEGMENTED, "class:on", ".seg .seg-opt.on");
     // ADR-0003: ONE amber-wash active treatment. The size axis must not

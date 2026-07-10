@@ -32,6 +32,7 @@ pub mod loaded;
 pub mod login;
 pub mod modal;
 pub mod overlay;
+pub mod segmented;
 pub mod sparkline;
 pub mod status_dot;
 pub mod theme;
@@ -55,8 +56,6 @@ pub mod rail;
 #[cfg(target_arch = "wasm32")]
 pub mod search_input;
 #[cfg(target_arch = "wasm32")]
-pub mod segmented;
-#[cfg(target_arch = "wasm32")]
 pub mod shell;
 #[cfg(target_arch = "wasm32")]
 pub mod tabs;
@@ -70,6 +69,7 @@ pub use button::{Size, Variant};
 pub use icon::Icon;
 pub use loaded::LoadState;
 pub use modal::ConfirmState;
+pub use segmented::{SegmentedOption, segmented_class};
 pub use sparkline::SparkPath;
 pub use status_dot::StatusTone;
 pub use theme::{Density, RowStyle, Theme};
@@ -104,7 +104,7 @@ pub use rail::{Rail, RailItem};
 #[cfg(target_arch = "wasm32")]
 pub use search_input::SearchInput;
 #[cfg(target_arch = "wasm32")]
-pub use segmented::{Segmented, SegmentedOption};
+pub use segmented::Segmented;
 #[cfg(target_arch = "wasm32")]
 pub use shell::Shell;
 #[cfg(target_arch = "wasm32")]
