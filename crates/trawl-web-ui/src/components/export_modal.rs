@@ -3,19 +3,22 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<ExportModal/>` — download query results as CSV, JSON, or Parquet.
+//!
+//! Built on `fleet_ui::Modal` (issue #28): the shell owns the scrim,
+//! Escape, Cmd/Ctrl+Enter submit, and the header (Download icon chip +
+//! close); this component owns the format picker, the download flow,
+//! and the footer hint/buttons.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos::web_sys;
 use trawl_api::ExportFormat;
-use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::download;
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, Icon, Modal, ToastBus, ToastKind, Variant};
 
 #[component]
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
 pub fn ExportModal(
     /// The DSL query to export. Shown read-only in the preview strip.
     query: String,
@@ -27,7 +30,7 @@ pub fn ExportModal(
     let downloading = RwSignal::new(false);
 
     let q_for_submit = query.clone();
-    let do_download = move || {
+    let do_download = Callback::new(move |()| {
         if downloading.get_untracked() {
             return;
         }
@@ -56,81 +59,44 @@ pub fn ExportModal(
                 }
             }
         });
-    };
-    let do_download_click = do_download.clone();
-    let do_download_key = do_download.clone();
+    });
 
-    let cancel = move || on_close.run(false);
-
-    let on_keydown = move |e: web_sys::KeyboardEvent| match e.key().as_str() {
-        "Escape" => {
-            e.prevent_default();
-            cancel();
-        }
-        "Enter" if e.meta_key() || e.ctrl_key() => {
-            e.prevent_default();
-            do_download_key();
-        }
-        _ => {}
-    };
+    let cancel = Callback::new(move |()| on_close.run(false));
 
     view! {
-        <div
-            class="modal-scrim"
-            on:mousedown=move |e: web_sys::MouseEvent| {
-                if let Some(target) = e.target()
-                    && let Some(el) = target.dyn_ref::<web_sys::Element>()
-                    && el.class_name().contains("modal-scrim")
-                {
-                    cancel();
-                }
-            }
-            on:keydown=on_keydown
+        <Modal
+            title="Export results"
+            icon=Icon::Download
+            on_cancel=cancel
+            on_submit=do_download
+            footer=Box::new(move || view! {
+                <div class="hint">
+                    <span class="kbd">"⌘⏎"</span>
+                    " download"
+                    <span style="opacity:.5">"·"</span>
+                    <span class="kbd">"Esc"</span>
+                    " cancel"
+                </div>
+                <Btn variant=Variant::Secondary on_click=cancel>"Cancel"</Btn>
+                <Btn variant=Variant::Primary disabled=downloading on_click=do_download>
+                    {move || if downloading.get() { "Downloading…" } else { "Download" }}
+                </Btn>
+            }.into_any())
         >
-            <div class="modal" role="dialog" aria-modal="true">
-                <div class="m-hd">
-                    <span class="ic"><DownloadIcon/></span>
-                    <span class="t">"Export results"</span>
-                    <span class="x" title="Close (Esc)" on:click=move |_| cancel()>
-                        <CloseIcon/>
-                    </span>
-                </div>
+            <div class="m-field">
+                <label>"Query"</label>
+                <div class="preview" title=query.clone()>{query.clone()}</div>
+            </div>
 
-                <div class="m-body">
-                    <div class="m-field">
-                        <label>"Query"</label>
-                        <div class="preview" title=query.clone()>{query.clone()}</div>
-                    </div>
-
-                    <div class="m-field">
-                        <label>"Format"</label>
-                        <div class="export-formats">
-                            <FormatButton label="CSV" value=ExportFormat::Csv current=format/>
-                            <FormatButton label="JSON" value=ExportFormat::Json current=format/>
-                            <FormatButton label="Parquet" value=ExportFormat::Parquet current=format/>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="m-ft">
-                    <div class="hint">
-                        <span class="kbd">"⌘⏎"</span>
-                        " download"
-                        <span style="opacity:.5">"·"</span>
-                        <span class="kbd">"Esc"</span>
-                        " cancel"
-                    </div>
-                    <button class="btn-sec" on:click=move |_| cancel()>"Cancel"</button>
-                    <button
-                        class="btn-pri"
-                        disabled=move || downloading.get()
-                        on:click=move |_| do_download_click()
-                    >
-                        {move || if downloading.get() { "Downloading…" } else { "Download" }}
-                    </button>
+            <div class="m-field">
+                <label>"Format"</label>
+                <div class="export-formats">
+                    <FormatButton label="CSV" value=ExportFormat::Csv current=format/>
+                    <FormatButton label="JSON" value=ExportFormat::Json current=format/>
+                    <FormatButton label="Parquet" value=ExportFormat::Parquet current=format/>
                 </div>
             </div>
-        </div>
+        </Modal>
     }
 }
 
@@ -157,23 +123,5 @@ fn mime_for_format(fmt: &ExportFormat) -> &'static str {
         ExportFormat::Csv => "text/csv",
         ExportFormat::Json => "application/x-ndjson",
         ExportFormat::Parquet => "application/vnd.apache.parquet",
-    }
-}
-
-#[component]
-fn DownloadIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M8 2v9M4 8l4 4 4-4M3 14h10"/>
-        </svg>
-    }
-}
-
-#[component]
-fn CloseIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="m4 4 8 8M12 4l-8 8"/>
-        </svg>
     }
 }

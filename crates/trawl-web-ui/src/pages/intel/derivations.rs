@@ -11,13 +11,12 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 
 use crate::api;
 use crate::api::MeResponse;
-use crate::components::confirm_with_reason_modal::ConfirmWithReasonModal;
 use crate::components::lineage_tree::{
     LineageNode, LineageTree, can_write_derivations, render_derivation_meta, render_marking_diff,
     transformation_color,
 };
 use crate::time_fmt::time_ago;
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{ConfirmWithReasonModal, ToastBus, ToastKind};
 
 const OBJECT_TYPES: &[&str] = &[
     "story",
