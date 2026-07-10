@@ -38,7 +38,9 @@ pub fn Rail(
     #[prop(into)] active: Signal<String>,
     /// Bottom-pinned slot rendered inside `<div class="bot">` (trawl's
     /// inert "Help — coming soon" stub). Omitted → no `.bot` div.
-    #[prop(optional)]
+    /// `optional_no_strip` keeps the `Option` wrapper so `Shell` can
+    /// forward its own `Option<Children>` straight through.
+    #[prop(optional_no_strip)]
     bottom: Option<Children>,
 ) -> impl IntoView {
     view! {
