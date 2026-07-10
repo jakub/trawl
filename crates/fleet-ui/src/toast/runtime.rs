@@ -47,14 +47,20 @@ impl ToastBus {
         // concurrent push to observe the same counter and produce a duplicate
         // key in `<For key=|t| t.id>`. Wasm is single-threaded today; this is
         // insurance against future `spawn_local` interleaving.
-        let id = self
-            .stack
-            .try_update(|s| s.push(kind, title, detail))
-            .unwrap_or(0);
-        spawn_local(async move {
-            TimeoutFuture::new(4500).await;
-            self.stack.update(|s| s.dismiss(id));
-        });
+        //
+        // `try_update` returns `None` only if the signal was disposed. In that
+        // case no toast was appended, so we skip scheduling a dismiss entirely
+        // and log the swallow — toasts are the app's error-surfacing primitive,
+        // so a silently-dropped push (especially an error toast) would leave the
+        // failure with zero trace.
+        if let Some(id) = self.stack.try_update(|s| s.push(kind, title, detail)) {
+            spawn_local(async move {
+                TimeoutFuture::new(4500).await;
+                self.stack.update(|s| s.dismiss(id));
+            });
+        } else {
+            web_sys::console::warn_1(&"toast dropped: bus signal disposed".into());
+        }
     }
 
     /// Variant-encoded sugar over [`Self::push`]. Use these at call
