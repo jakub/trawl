@@ -70,7 +70,7 @@ pub use rail::{Rail, RailItem};
 #[cfg(target_arch = "wasm32")]
 pub use shell::Shell;
 #[cfg(target_arch = "wasm32")]
-pub use tabs::{TabItem, Tabs, TabsStyle};
+pub use tabs::{TabItem, Tabs, TabsStyle, effective_active};
 #[cfg(target_arch = "wasm32")]
 pub use theme::{UiPrefs, install};
 #[cfg(target_arch = "wasm32")]

@@ -19,7 +19,7 @@ use wasm_bindgen::JsCast;
 use crate::api;
 use crate::components::sparkline::Sparkline;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Drawer, Size, TabItem, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Drawer, Size, TabItem, ToastBus, ToastKind, Variant, effective_active};
 
 const RUNS_PAGE_SIZE: usize = 20;
 const RESULT_PREVIEW_ROWS: usize = 20;
@@ -90,10 +90,7 @@ pub fn NetDrawer(
     };
 
     // Drawer compares ids verbatim; map the URL signal's empty default.
-    let eff_tab = Signal::derive(move || {
-        let t = tab.get();
-        if t.is_empty() { "query".to_string() } else { t }
-    });
+    let eff_tab = effective_active(tab, "query");
 
     let on_run_click = {
         let q = query_for_run;

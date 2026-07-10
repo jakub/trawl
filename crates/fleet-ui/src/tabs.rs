@@ -121,3 +121,21 @@ pub fn Tabs(
         .into_any(),
     }
 }
+
+/// Map a URL-backed tab signal's empty default to a concrete tab id.
+///
+/// URL-synced tab signals (trawl's `?ntab=…` / `?stab=…`) read back
+/// the empty string before the user touches the strip. [`Tabs`] and
+/// [`Drawer`](crate::Drawer) compare ids verbatim, so that initial
+/// empty value matches no tab. This derives the effective id — the
+/// raw value, or `default` while it is empty — for use as both the
+/// strip's `active` and the app's pane switch, keeping the
+/// empty→default mapping (generic tab-strip behaviour) out of every
+/// call site.
+#[must_use]
+pub fn effective_active(active: Signal<String>, default: &'static str) -> Signal<String> {
+    Signal::derive(move || {
+        let t = active.get();
+        if t.is_empty() { default.to_string() } else { t }
+    })
+}

@@ -28,7 +28,9 @@ use trawl_api::{QueryResponse, ServiceColumnStats, ServiceSchema};
 
 use crate::api;
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
-use fleet_ui::{Btn, Drawer, Icon, IconView, TabItem, ToastBus, ToastKind, Variant};
+use fleet_ui::{
+    Btn, Drawer, Icon, IconView, TabItem, ToastBus, ToastKind, Variant, effective_active,
+};
 
 /// Display cap for the live-tail viewport — keeps the DOM snappy. The
 /// ring underneath still holds up to `LIVE_RING_CAPACITY` events.
@@ -83,14 +85,7 @@ pub fn ServiceDrawer(
     let on_tail_click = Callback::new(move |()| on_tab_change.run("tail".to_string()));
 
     // Drawer compares ids verbatim; map the URL signal's empty default.
-    let eff_tab = Signal::derive(move || {
-        let t = tab.get();
-        if t.is_empty() {
-            "overview".to_string()
-        } else {
-            t
-        }
-    });
+    let eff_tab = effective_active(tab, "overview");
 
     view! {
         <Drawer
