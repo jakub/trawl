@@ -16,7 +16,7 @@ use crate::components::lineage_tree::{
     transformation_color,
 };
 use crate::time_fmt::time_ago;
-use fleet_ui::{ConfirmWithReasonModal, ToastBus, ToastKind};
+use fleet_ui::{Btn, ConfirmWithReasonModal, ToastBus, ToastKind, Variant};
 
 const OBJECT_TYPES: &[&str] = &[
     "story",
@@ -213,7 +213,7 @@ pub fn DerivationsPage() -> impl IntoView {
                         on:keydown=on_submit_key
                     />
                 </div>
-                <button class="btn-pri" on:click=move |_| on_submit_click(())>"Load lineage"</button>
+                <Btn variant=Variant::Primary on_click=Callback::new(on_submit_click)>"Load lineage"</Btn>
             </div>
 
             // Loading / error
@@ -324,9 +324,13 @@ pub fn DerivationsPage() -> impl IntoView {
                                 view! {
                                     <div class="tbl-foot">
                                         <span></span>
-                                        <button class="btn-sec" disabled=is_loading on:click=on_load_more_edges>
+                                        <Btn
+                                            variant=Variant::Secondary
+                                            disabled=is_loading
+                                            on_click=Callback::new(on_load_more_edges)
+                                        >
                                             {if is_loading { "loading\u{2026}" } else { "load more" }}
-                                        </button>
+                                        </Btn>
                                     </div>
                                 }
                             })}
@@ -351,19 +355,22 @@ pub fn DerivationsPage() -> impl IntoView {
                         </p>
                         {if can_write.get() {
                             view! {
-                                <button class="btn-danger" on:click=move |_| retract_modal.set(true)>
+                                <Btn
+                                    variant=Variant::Danger
+                                    on_click=Callback::new(move |()| retract_modal.set(true))
+                                >
                                     "Retract source object"
-                                </button>
+                                </Btn>
                             }.into_any()
                         } else {
                             view! {
-                                <button
-                                    class="btn-danger"
+                                <Btn
+                                    variant=Variant::Danger
                                     disabled=true
-                                    title="requires DerivationWrite permission"
+                                    attr:title="requires DerivationWrite permission"
                                 >
                                     "Retract source object"
-                                </button>
+                                </Btn>
                             }.into_any()
                         }}
                     </div>

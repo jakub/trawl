@@ -13,6 +13,7 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
+use fleet_ui::{Btn, Icon, IconView, Size, Variant};
 
 const RUNS_PAGE_SIZE: usize = 20;
 
@@ -59,7 +60,7 @@ pub fn RunsPage() -> impl IntoView {
                 </div>
                 <div class="actions">
                     <div class="inp-wrap">
-                        <SearchIcon/>
+                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
                         <input
                             placeholder="filter by net…"
                             prop:value=move || filter.get()
@@ -190,16 +191,20 @@ pub fn RunsPage() -> impl IntoView {
                                     <div class="tbl-foot">
                                         <span>{format!("{first}–{last} of {total}")}</span>
                                         <span style="display:flex; gap:4px">
-                                            <button
-                                                class="btn-sec btn-xs"
-                                                prop:disabled=move || page.get() == 0
-                                                on:click=move |_| page.update(|p| *p = p.saturating_sub(1))
-                                            >"← prev"</button>
-                                            <button
-                                                class="btn-sec btn-xs"
-                                                prop:disabled=move || last >= total
-                                                on:click=move |_| page.update(|p| *p += 1)
-                                            >"next →"</button>
+                                            <Btn
+                                                variant=Variant::Secondary
+                                                size=Size::Xs
+                                                disabled=Signal::derive(move || page.get() == 0)
+                                                on_click=Callback::new(move |()| {
+                                                    page.update(|p| *p = p.saturating_sub(1));
+                                                })
+                                            >"← prev"</Btn>
+                                            <Btn
+                                                variant=Variant::Secondary
+                                                size=Size::Xs
+                                                disabled=Signal::derive(move || last >= total)
+                                                on_click=Callback::new(move |()| page.update(|p| *p += 1))
+                                            >"next →"</Btn>
                                         </span>
                                     </div>
                                 }.into_any()
@@ -209,15 +214,5 @@ pub fn RunsPage() -> impl IntoView {
                 </div>
             </div>
         </div>
-    }
-}
-
-#[component]
-fn SearchIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="7" cy="7" r="4.5"/>
-            <path d="m10.5 10.5 3 3"/>
-        </svg>
     }
 }

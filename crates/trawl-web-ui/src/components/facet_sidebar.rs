@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use fleet_ui::{Icon, IconView};
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
 
@@ -51,7 +52,7 @@ pub fn FacetSidebar(
                 </Show>
             </div>
             <div class="fsearch">
-                <FsearchIcon/>
+                <IconView icon=Icon::Search size=11 stroke_width=1.5/>
                 <input
                     placeholder="filter field values"
                     on:input=move |e| needle.set(event_target_value(&e))
@@ -97,7 +98,7 @@ pub fn FacetSidebar(
                                         c.insert(field_for_toggle.clone(), !cur);
                                     })
                                 >
-                                    <span class="chev"><ChevIcon/></span>
+                                    <span class="chev"><IconView icon=Icon::Chevron size=10 stroke_width=1.5/></span>
                                     <span class="name">{field.clone()}</span>
                                     <span class="cnt">{total}</span>
                                 </div>
@@ -188,23 +189,4 @@ fn match_filter_state(active: &[Filter], field: &str, value: &str) -> FilterStat
         }
     }
     FilterState::None
-}
-
-#[component]
-fn FsearchIcon() -> impl IntoView {
-    view! {
-        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="7" cy="7" r="4.5"/>
-            <path d="m10.5 10.5 3 3"/>
-        </svg>
-    }
-}
-
-#[component]
-fn ChevIcon() -> impl IntoView {
-    view! {
-        <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="m4 6 4 4 4-4"/>
-        </svg>
-    }
 }

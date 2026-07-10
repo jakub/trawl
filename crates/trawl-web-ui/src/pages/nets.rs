@@ -20,8 +20,7 @@ use crate::components::net_drawer::NetDrawer;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{time_ago, time_until};
-use fleet_ui::ConfirmModal;
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, ConfirmModal, Icon, IconView, ToastBus, ToastKind, Variant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetSort {
@@ -179,7 +178,7 @@ pub fn NetsPage() -> impl IntoView {
                 </div>
                 <div class="actions">
                     <div class="inp-wrap">
-                        <SearchIcon/>
+                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
                         <input
                             placeholder="filter nets…"
                             prop:value=move || filter.get()
@@ -201,9 +200,12 @@ pub fn NetsPage() -> impl IntoView {
                         <option value="last_run" selected=move || sort.get() == NetSort::LastRun>"Sort: Last Run"</option>
                         <option value="created" selected=move || sort.get() == NetSort::Created>"Sort: Created"</option>
                     </select>
-                    <button class="btn-pri" on:click=move |_| show_create_modal.set(true)>
+                    <Btn
+                        variant=Variant::Primary
+                        on_click=Callback::new(move |()| show_create_modal.set(true))
+                    >
                         "+ New Net"
-                    </button>
+                    </Btn>
                 </div>
             </div>
 
@@ -453,15 +455,5 @@ pub fn NetsPage() -> impl IntoView {
                 }}
             </Show>
         </div>
-    }
-}
-
-#[component]
-fn SearchIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="7" cy="7" r="4.5"/>
-            <path d="m10.5 10.5 3 3"/>
-        </svg>
     }
 }

@@ -13,7 +13,7 @@
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::clipboard::write_clipboard;
 use crate::state::query::{Filter, FilterOp};
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, Size, ToastBus, ToastKind, Variant};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::cmp::Ordering;
@@ -118,16 +118,16 @@ fn ResultsTableBody(
     let can_prev = cur_page > 0;
     let can_next = returned == PAGE_SIZE;
 
-    let on_prev = move |_| {
+    let on_prev = Callback::new(move |()| {
         if can_prev {
             on_paginate.run(cur_page - 1);
         }
-    };
-    let on_next = move |_| {
+    });
+    let on_next = Callback::new(move |()| {
         if can_next {
             on_paginate.run(cur_page + 1);
         }
-    };
+    });
 
     view! {
         <>
@@ -175,8 +175,8 @@ fn ResultsTableBody(
                     {if truncated { " (truncated)" } else { "" }}
                 </span>
                 <div class="results-pager">
-                    <button class="btn-sm" disabled=!can_prev on:click=on_prev>"← prev"</button>
-                    <button class="btn-sm" disabled=!can_next on:click=on_next>"next →"</button>
+                    <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_prev on_click=on_prev>"← prev"</Btn>
+                    <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_next on_click=on_next>"next →"</Btn>
                 </div>
             </footer>
         </>
@@ -340,8 +340,7 @@ fn RowFragment(
 
 #[component]
 fn CopyRawButton(row: Vec<Value>, columns: Vec<String>, bus: ToastBus) -> impl IntoView {
-    let on_click = move |e: leptos::web_sys::MouseEvent| {
-        e.stop_propagation();
+    let on_click = Callback::new(move |()| {
         let text = raw_or_synthesized(&row, &columns);
         let bus_ok = bus;
         let bus_err = bus;
@@ -355,9 +354,9 @@ fn CopyRawButton(row: Vec<Value>, columns: Vec<String>, bus: ToastBus) -> impl I
                 Err(msg) => bus_err.push(ToastKind::Error, "Copy failed", Some(msg)),
             }
         });
-    };
+    });
     view! {
-        <button class="btn-sec" on:click=on_click>"Copy _raw"</button>
+        <Btn variant=Variant::Secondary stop_propagation=true on_click=on_click>"Copy _raw"</Btn>
     }
 }
 
@@ -368,19 +367,16 @@ fn ShowContextButton(
     on_navigate: Callback<String>,
     bus: ToastBus,
 ) -> impl IntoView {
-    let on_click = move |e: leptos::web_sys::MouseEvent| {
-        e.stop_propagation();
-        match build_context_query(&row, &columns) {
-            Some(q) => on_navigate.run(q),
-            None => bus.push(
-                ToastKind::Info,
-                "Show context",
-                Some("Need a timestamp column to build a context window.".into()),
-            ),
-        }
-    };
+    let on_click = Callback::new(move |()| match build_context_query(&row, &columns) {
+        Some(q) => on_navigate.run(q),
+        None => bus.push(
+            ToastKind::Info,
+            "Show context",
+            Some("Need a timestamp column to build a context window.".into()),
+        ),
+    });
     view! {
-        <button class="btn-sec" on:click=on_click>"Show context"</button>
+        <Btn variant=Variant::Secondary stop_propagation=true on_click=on_click>"Show context"</Btn>
     }
 }
 
@@ -391,19 +387,16 @@ fn FindSimilarButton(
     on_navigate: Callback<String>,
     bus: ToastBus,
 ) -> impl IntoView {
-    let on_click = move |e: leptos::web_sys::MouseEvent| {
-        e.stop_propagation();
-        match build_similar_query(&row, &columns) {
-            Some(q) => on_navigate.run(q),
-            None => bus.push(
-                ToastKind::Info,
-                "Find similar",
-                Some("Need a message column to find similar events.".into()),
-            ),
-        }
-    };
+    let on_click = Callback::new(move |()| match build_similar_query(&row, &columns) {
+        Some(q) => on_navigate.run(q),
+        None => bus.push(
+            ToastKind::Info,
+            "Find similar",
+            Some("Need a message column to find similar events.".into()),
+        ),
+    });
     view! {
-        <button class="btn-sec" on:click=on_click>"Find similar"</button>
+        <Btn variant=Variant::Secondary stop_propagation=true on_click=on_click>"Find similar"</Btn>
     }
 }
 

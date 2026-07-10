@@ -22,6 +22,7 @@ use crate::api::{ApiError, MeResponse};
 use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
 use crate::components::linkage_graph::LinkageGraph;
 use crate::time_fmt::time_ago;
+use fleet_ui::{Btn, Variant};
 
 use super::stories::{class_label, state_badge};
 
@@ -428,14 +429,14 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                     {has_more.then(|| {
                         let is_loading = loading.get();
                         view! {
-                            <button
-                                class="btn-sec"
-                                style="margin-top:8px;width:100%"
+                            <Btn
+                                variant=Variant::Secondary
+                                attr:style="margin-top:8px;width:100%"
                                 disabled=is_loading
-                                on:click=on_load_more
+                                on_click=Callback::new(on_load_more)
                             >
                                 {if is_loading { "loading\u{2026}" } else { "load older" }}
-                            </button>
+                            </Btn>
                         }
                     })}
                 }.into_any()
@@ -798,9 +799,13 @@ fn ClaimsSection(
                             view! {
                                 <div class="tbl-foot">
                                     <span></span>
-                                    <button class="btn-sec" disabled=is_loading on:click=on_load_more>
+                                    <Btn
+                                        variant=Variant::Secondary
+                                        disabled=is_loading
+                                        on_click=Callback::new(on_load_more)
+                                    >
                                         {if is_loading { "loading\u{2026}" } else { "load more" }}
-                                    </button>
+                                    </Btn>
                                 </div>
                             }
                         })}

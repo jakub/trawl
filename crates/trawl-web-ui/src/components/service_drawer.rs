@@ -524,12 +524,12 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
                 {move || lagged_label().map(|l| view! {
                     <span class="lbl" style="color:var(--yellow)">{l}</span>
                 })}
-                <button
-                    class="btn-sec"
-                    on:click=move |_| paused.update(|p| *p = !*p)
+                <Btn
+                    variant=Variant::Secondary
+                    on_click=Callback::new(move |()| paused.update(|p| *p = !*p))
                 >
                     {move || if paused.get() { "Resume" } else { "Pause" }}
-                </button>
+                </Btn>
             </div>
 
             <div class="tl-stream">

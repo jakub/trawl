@@ -23,7 +23,7 @@ use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{ToastBus, ToastKind};
+use fleet_ui::{Btn, Icon, IconView, Size, ToastBus, ToastKind, Variant};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -64,20 +64,20 @@ pub fn HistoryPage() -> impl IntoView {
     let on_save_as_net = move |q: String| save_target.set(Some(q));
     let on_modal_close: Callback<bool> = Callback::new(move |_saved| save_target.set(None));
 
-    let on_export = move |_| {
+    let on_export = Callback::new(move |()| {
         bus.push(
             ToastKind::Info,
             "Export",
             Some("History export is landing soon.".into()),
         );
-    };
-    let on_clear = move |_| {
+    });
+    let on_clear = Callback::new(move |()| {
         bus.push(
             ToastKind::Info,
             "Clear History",
             Some("Server-side history clearing is landing soon.".into()),
         );
-    };
+    });
 
     // Browser clock snapshot at render time — used by every row's
     // time_ago label. `Date::get_time()` returns ms since epoch as f64;
@@ -88,7 +88,7 @@ pub fn HistoryPage() -> impl IntoView {
 
     let on_prev = {
         let goto_hpage = goto_hpage.clone();
-        move |_| {
+        Callback::new(move |()| {
             let cur = hpage.get_untracked();
             if cur > 0 {
                 goto_hpage(
@@ -99,11 +99,11 @@ pub fn HistoryPage() -> impl IntoView {
                     },
                 );
             }
-        }
+        })
     };
     let on_next = {
         let goto_hpage = goto_hpage.clone();
-        move |_| {
+        Callback::new(move |()| {
             let cur = hpage.get_untracked();
             goto_hpage(
                 &format!("/search/history?hpage={}", cur + 1),
@@ -112,7 +112,7 @@ pub fn HistoryPage() -> impl IntoView {
                     ..Default::default()
                 },
             );
-        }
+        })
     };
 
     view! {
@@ -124,15 +124,15 @@ pub fn HistoryPage() -> impl IntoView {
                 </div>
                 <div class="actions">
                     <div class="inp-wrap">
-                        <FilterIcon/>
+                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
                         <input
                             placeholder="filter history…"
                             prop:value=move || filter.get()
                             on:input=move |e| filter.set(event_target_value(&e))
                         />
                     </div>
-                    <button class="btn-sec" on:click=on_export>"Export"</button>
-                    <button class="btn-sec danger" on:click=on_clear>"Clear History"</button>
+                    <Btn variant=Variant::Secondary on_click=on_export>"Export"</Btn>
+                    <Btn variant=Variant::Secondary on_click=on_clear>"Clear History"</Btn>
                 </div>
             </div>
 
@@ -240,14 +240,12 @@ pub fn HistoryPage() -> impl IntoView {
                         let last = (cur * PAGE_SIZE + resp.entries.len()).min(total);
                         format!("{first}–{last} of {total}")
                     };
-                    let on_prev = on_prev.clone();
-                    let on_next = on_next.clone();
                     view! {
                         <div class="tbl-foot">
                             <span>{summary}</span>
                             <div class="pager">
-                                <button class="btn-sm" disabled=!can_prev on:click=on_prev>"← prev"</button>
-                                <button class="btn-sm" disabled=!can_next on:click=on_next>"next →"</button>
+                                <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_prev on_click=on_prev>"← prev"</Btn>
+                                <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_next on_click=on_next>"next →"</Btn>
                             </div>
                         </div>
                     }.into_any()
@@ -272,14 +270,4 @@ fn format_with_commas(n: u64) -> String {
         out.push(*b as char);
     }
     out
-}
-
-#[component]
-fn FilterIcon() -> impl IntoView {
-    view! {
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="7" cy="7" r="4.5"/>
-            <path d="m10.5 10.5 3 3"/>
-        </svg>
-    }
 }
