@@ -45,27 +45,16 @@ jobs:
           DUCKDB_DOWNLOAD_LIB: "1"
 
   test:
+    # The single workspace test job (ADR-0004 slice 1 consolidated the old
+    # dedicated fleet-auth-tests job into it). Postgres backs the pg-based
+    # integration tests in fleet-auth AND trawl-server: each test creates
+    # and drops an ephemeral per-test database, so the role must have
+    # CREATEDB. CI uses a throwaway postgres:18 container (the default
+    # `postgres` superuser has CREATEDB); local-dev and the homelab
+    # dev/prod environments use CNPG. Schema migrations are applied
+    # per-test by the shared PgFixture (fleet_auth::test_support) — there
+    # is no separate migration step to run against the service container.
     name: test
-    runs-on: k8s-big
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: test
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
-      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
-      - run: cargo nextest run --workspace --no-default-features
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
-
-  fleet-auth-tests:
-    # Postgres-backed integration tests for fleet-auth's KeyStore.
-    # Each test creates and drops an ephemeral per-test database, so the
-    # role must have CREATEDB. CI uses a throwaway postgres:18 container
-    # (the default `postgres` superuser has CREATEDB); local-dev and the
-    # homelab dev/prod environments use CNPG.
-    name: fleet-auth (postgres)
     runs-on: k8s-big
     services:
       postgres:
@@ -85,15 +74,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: fleet-auth-tests
+          shared-key: test
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
-        with:
-          tool: nextest
-      - run: cargo nextest run -p fleet-auth --features "fast-hash,axum"
+      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
+      # FEATURE TRAP: --no-default-features also strips fleet-auth's default
+      # `keystore`/`test-support` features when it is built as a selected
+      # workspace package, silently compiling out its pg test files. The
+      # explicit fleet-auth/* features below re-enable them deterministically.
+      # Do NOT drop them, and do NOT relax FLEET_TESTS_REQUIRED — it is the
+      # hard-fail backstop that turns "pg tests silently skipped" into a red
+      # job.
+      - run: >-
+          cargo nextest run --workspace --no-default-features
+          --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash,fleet-auth/test-support
         env:
+          DUCKDB_DOWNLOAD_LIB: "1"
           FLEET_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
           # Hard-fail if the env var didn't inject — otherwise the per-test
-          # PgFixture would skip every integration test and the job would
+          # PgFixture would skip every pg integration test and the job would
           # report a misleading green.
           FLEET_TESTS_REQUIRED: "1"
 
