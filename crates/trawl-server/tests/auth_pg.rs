@@ -720,25 +720,16 @@ async fn ac6_scheduler_skips_analyst_downgraded_to_ingest() {
 
 #[tokio::test]
 async fn ac7_legacy_auth_db_quarantined_with_colliding_ids() {
-    // Seed a populated legacy sqlite auth.db whose key ids WILL collide with
-    // the fresh pg sequence (both start at 1).
+    // Seed a populated legacy sqlite auth.db whose owner key id (1) WILL
+    // collide with the fresh pg sequence: the first key trawld mints in
+    // postgres is the analyst below, which also lands on id 1. The legacy
+    // keystore tables no longer exist as a crate type (the sqlite keystore
+    // died in slice 1 — keys now live in postgres), so the fixture seeds the
+    // history/saved/schedule rows trawld still keeps in sqlite directly,
+    // keyed to the colliding owner id.
     let tmp = tempfile::tempdir().unwrap();
     let legacy_db = tmp.path().join("auth.db");
     {
-        let mut legacy_keys = trawl_auth::KeyStore::open(&legacy_db).unwrap();
-        let legacy_key = legacy_keys
-            .create_key(
-                "legacy-key",
-                trawl_auth::assignments::PrincipalKind::Service,
-                &[trawl_auth::assignments::RoleAssignment {
-                    app: "trawl".into(),
-                    role: "analyst".into(),
-                }],
-                None,
-            )
-            .unwrap();
-        assert_eq!(legacy_key.info.id, 1, "collision precondition");
-
         let history = trawl_auth::HistoryStore::open(&legacy_db).unwrap();
         history
             .record_query(1, "* | stats count()", 5, 42, "success")

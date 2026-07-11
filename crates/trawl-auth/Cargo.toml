@@ -8,19 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-trawl-api = { workspace = true }
-argon2 = { workspace = true }
-base64ct = { workspace = true }
 chrono = { workspace = true }
-rand = { workspace = true }
 rusqlite = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-zeroize = { workspace = true }
-
-[features]
-fast-hash = []
 
 [dev-dependencies]
 insta = { workspace = true }

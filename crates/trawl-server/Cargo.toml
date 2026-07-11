@@ -69,7 +69,7 @@ default = ["bundled"]
 bundled = ["duckdb/bundled", "trawl-engine/bundled"]
 
 [dev-dependencies]
-trawl-auth = { workspace = true, features = ["fast-hash"] }
+trawl-auth = { workspace = true }
 fleet-auth = { workspace = true, features = ["axum", "fast-hash", "test-support"] }
 trawl-client = { workspace = true }
 insta = { workspace = true }

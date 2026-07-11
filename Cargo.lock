@@ -6212,18 +6212,12 @@ dependencies = [
 name = "trawl-auth"
 version = "0.3.3"
 dependencies = [
- "argon2",
- "base64ct",
  "chrono",
  "insta",
- "rand 0.8.6",
  "rusqlite",
- "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
- "trawl-api",
- "zeroize",
 ]
 
 [[package]]
