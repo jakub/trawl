@@ -131,19 +131,8 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
     eprintln!("  grants:  {}", format_assignments(&info.assignments));
     eprintln!("  created: {}", format_timestamp(&info.created_at));
 
-    if !yes {
-        use std::io::IsTerminal as _;
-        let stdin = std::io::stdin();
-        let stderr = std::io::stderr();
-        if !stdin.is_terminal() || !stderr.is_terminal() {
-            return Err(AdminError::NonInteractive);
-        }
-
-        let mut writer = stderr.lock();
-        let mut reader = stdin.lock();
-        if !confirm_prompt("revoke this key?", &mut reader, &mut writer)? {
-            return Ok(());
-        }
+    if !yes && !confirm_or_refuse("revoke this key?")? {
+        return Ok(());
     }
 
     let revoked = store.revoke_key(prefix.as_str()).await?;
@@ -180,6 +169,27 @@ pub fn confirm_prompt<R: BufRead, W: Write>(
     }
 }
 
+/// TTY-gated `[y/N]` confirmation shared by confirmable subcommands.
+///
+/// Refuses with [`AdminError::NonInteractive`] unless both stdin and stderr
+/// are TTYs, so a piped `keys revoke`/`revoke-grant` never proceeds without an
+/// explicit `--yes`. Otherwise locks the descriptors and defers to
+/// [`confirm_prompt`], returning whether the operator confirmed. Centralizes
+/// the non-interactive-refusal invariant so new confirmable subcommands don't
+/// hand-roll their own copy.
+fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
+    use std::io::IsTerminal as _;
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    if !stdin.is_terminal() || !stderr.is_terminal() {
+        return Err(AdminError::NonInteractive);
+    }
+
+    let mut writer = stderr.lock();
+    let mut reader = stdin.lock();
+    confirm_prompt(question, &mut reader, &mut writer).map_err(Into::into)
+}
+
 /// Revoke a key's grant on an app, with `[y/N]` confirmation unless `--yes`.
 ///
 /// Same interactivity contract as [`revoke`]: refuses to proceed when stdin
@@ -193,17 +203,8 @@ pub async fn revoke_grant(
     yes: bool,
 ) -> Result<(), AdminError> {
     if !yes {
-        use std::io::IsTerminal as _;
-        let stdin = std::io::stdin();
-        let stderr = std::io::stderr();
-        if !stdin.is_terminal() || !stderr.is_terminal() {
-            return Err(AdminError::NonInteractive);
-        }
-
         let question = format!("revoke grant for app {app} on key {prefix}?");
-        let mut writer = stderr.lock();
-        let mut reader = stdin.lock();
-        if !confirm_prompt(&question, &mut reader, &mut writer)? {
+        if !confirm_or_refuse(&question)? {
             return Ok(());
         }
     }
