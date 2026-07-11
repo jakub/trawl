@@ -1095,6 +1095,11 @@ impl Config {
         // queries, and auto-executing schedules. Deb upgrades preserve the
         // old trawld.toml (conffile semantics), so without this guard the
         // quarantine silently fails on every real upgrade.
+        //
+        // This is a naming-convention check only — a legacy keystore renamed
+        // to anything else sails past it. The real, content-based control is
+        // `trawl_auth::reject_legacy_keystore`, run at store-open in trawld
+        // (trawl-config is a pure no-I/O crate and can't inspect the file).
         if self
             .auth
             .db_path

@@ -359,6 +359,12 @@ async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::Se
     )
     .map_err(crate::error::ServerError::from)?;
 
+    // Legacy-db quarantine (ADR-0004): the transitional app-state store keys
+    // its rows on postgres key ids, which are unrelated to the old sqlite
+    // keystore's. Refuse to open a pre-cutover keystore file (under any name)
+    // so a fresh pg key can't inherit a legacy sqlite key's rows. The config
+    // basename guard only catches the default `auth.db`; this catches renames.
+    trawl_auth::reject_legacy_keystore(&config.auth.db_path)?;
     let history = HistoryStore::open(&config.auth.db_path)?;
     let saved = SavedQueryStore::open(&config.auth.db_path)?;
     let schedule = ScheduleStore::open(&config.auth.db_path)?;

@@ -13,6 +13,9 @@
 /// Error types for the authentication subsystem.
 pub mod error;
 
+/// Legacy-db quarantine guard (ADR-0004).
+pub mod guard;
+
 /// `SQLite`-backed query history storage.
 pub mod history;
 
@@ -23,6 +26,7 @@ pub mod saved;
 pub mod schedule;
 
 pub use error::AuthError;
+pub use guard::reject_legacy_keystore;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use saved::{SavedQuery, SavedQueryStore};
 pub use schedule::{ReportRun, Schedule, ScheduleStore};
