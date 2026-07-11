@@ -26,9 +26,9 @@ fleet-admin keys revoke <key-prefix>
 
 | Role | Permissions |
 |------|------------|
-| `admin` | Full access including dashboard, key management |
+| `admin` | Full API access including dashboard (key management via fleet-admin) |
 | `analyst` | Query, validate, schema, history, saved queries, export |
-| `reader` | Query and validate only |
+| `reader` | Query, schema read, cancel own queries |
 | `ingest` | Ingest endpoint only |
 
 ## Endpoints
