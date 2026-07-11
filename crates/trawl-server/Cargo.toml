@@ -67,8 +67,16 @@ metrics-process = { workspace = true }
 [features]
 default = ["bundled"]
 bundled = ["duckdb/bundled", "trawl-engine/bundled"]
+# Exposes the pool's query-delay hook (`pool::TEST_QUERY_DELAY_MS`) to this
+# crate's own integration tests via the self-dev-dependency below. No
+# production consumer enables it, so release builds never carry the hook.
+test-support = []
 
 [dev-dependencies]
+# Self-dependency: enables the test-support hook for this crate's own
+# integration tests. default-features = false so it cannot re-enable
+# `bundled` under CI's --no-default-features run (DUCKDB_DOWNLOAD_LIB).
+trawl-server = { path = ".", default-features = false, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 trawl-auth = { workspace = true }
 fleet-auth = { workspace = true, features = ["axum", "fast-hash", "test-support"] }

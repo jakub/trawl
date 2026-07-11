@@ -263,66 +263,6 @@ pub async fn setup_in_dir(
     dir: &std::path::Path,
     rate_limit: RateLimitConfig,
 ) -> Option<TestServer> {
-    setup_in_dir_with_glob(dir, rate_limit, ensure_fixtures()).await
-}
-
-/// Generate a large single-file parquet dataset under `dir` and return a glob
-/// matching it. Used by tests that need a query slow enough to stay in-flight
-/// (e.g. the cancellation-ownership test), which the tiny standard fixtures
-/// can't provide. `rows` controls the scan cost.
-///
-/// Columns mirror the standard log schema plus a high-range numeric `id` and a
-/// low-cardinality `grp`, so a percentile-by-group query does real work.
-pub fn write_big_parquet(dir: &std::path::Path, rows: u64) -> String {
-    let data_dir = dir.join("bigdata");
-    std::fs::create_dir_all(&data_dir).unwrap();
-    let pq = data_dir.join("big.parquet");
-
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    conn.execute_batch(&format!(
-        "COPY (
-            SELECT
-                TIMESTAMP '2024-01-01 00:00:00' + (i * INTERVAL 1 SECOND) AS timestamp,
-                'host01' AS host,
-                'bulk' AS service,
-                'info' AS level,
-                ('event ' || i) AS message,
-                i AS id,
-                (i % 1000) AS grp
-            FROM range({rows}) t(i)
-        ) TO '{}' (FORMAT PARQUET)",
-        pq.display()
-    ))
-    .unwrap();
-
-    format!("{}/**/*.parquet", data_dir.display())
-}
-
-/// Set up a test server backed by a large generated dataset, so a single query
-/// takes long enough to observe and cancel while it is still in-flight. Uses
-/// permissive rate limits (the test issues polls + cancels in a tight window).
-pub async fn setup_big_data(rows: u64) -> Option<TestServer> {
-    let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let data_glob = write_big_parquet(tmp.path(), rows);
-    let permissive = RateLimitConfig {
-        admin: 1_000_000,
-        analyst: 1_000_000,
-        reader: 1_000_000,
-        ingest: 1_000_000,
-    };
-    let server = setup_in_dir_with_glob(tmp.path(), permissive, data_glob).await;
-    // Leak the tempdir so it (and the dataset) survives the test.
-    std::mem::forget(tmp);
-    server
-}
-
-/// Shared server-spin used by [`setup_in_dir`] and [`setup_big_data`]: identical
-/// except the caller supplies the parquet data glob.
-async fn setup_in_dir_with_glob(
-    dir: &std::path::Path,
-    rate_limit: RateLimitConfig,
-    data_glob: String,
-) -> Option<TestServer> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let fx = pg_fixture_or_skip().await?;
     // Transitional sqlite app-state store — FRESH file, never auth.db.
@@ -369,7 +309,9 @@ async fn setup_in_dir_with_glob(
             rate_limit,
             monitor_refresh_ms: 1000,
         },
-        data: DataConfig { path: data_glob },
+        data: DataConfig {
+            path: ensure_fixtures(),
+        },
         auth: AuthConfig {
             db_path: store_db,
             database_url: Some(fx.database_url()),

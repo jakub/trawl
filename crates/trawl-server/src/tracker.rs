@@ -6,7 +6,6 @@
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -16,11 +15,14 @@ use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
 use crate::policy::TrawlAuthz as _;
 
 /// Tracks active and recently completed queries.
+///
+/// Query ids are allocated by `ExecutorPool::allocate_query_id` — a single
+/// id space shared with the pool's interrupt map, so an id listed by
+/// `/queries` is the same id `cancel_by_id` interrupts.
 #[derive(Debug)]
 pub struct QueryTracker {
     active: DashMap<u64, ActiveQuery>,
     history: Mutex<VecDeque<CompletedQuerySnapshot>>,
-    next_id: AtomicU64,
     max_history: usize,
 }
 
@@ -68,14 +70,13 @@ impl QueryTracker {
         Self {
             active: DashMap::new(),
             history: Mutex::new(VecDeque::with_capacity(max_history)),
-            next_id: AtomicU64::new(1),
             max_history,
         }
     }
 
-    /// Record the start of a query. Returns a query ID for later completion.
-    pub fn start(&self, verified: &VerifiedKey, query: &str) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    /// Record the start of a query under a pool-allocated id
+    /// (`ExecutorPool::allocate_query_id`).
+    pub fn start(&self, id: u64, verified: &VerifiedKey, query: &str) {
         self.active.insert(
             id,
             ActiveQuery {
@@ -89,7 +90,6 @@ impl QueryTracker {
                 started_at: Instant::now(),
             },
         );
-        id
     }
 
     /// Record successful completion of a query.
@@ -202,7 +202,8 @@ mod tests {
         let tracker = QueryTracker::new();
         let key = test_key();
 
-        let id = tracker.start(&key, "* | stats count()");
+        let id = 7;
+        tracker.start(id, &key, "* | stats count()");
         assert_eq!(tracker.active().len(), 1);
 
         tracker.complete(id, 42);
@@ -219,7 +220,8 @@ mod tests {
         let tracker = QueryTracker::new();
         let key = test_key();
 
-        let id = tracker.start(&key, "bad query");
+        let id = 7;
+        tracker.start(id, &key, "bad query");
         tracker.fail(id, "parse error");
 
         let recent = tracker.recent();
@@ -232,7 +234,8 @@ mod tests {
         let tracker = QueryTracker::new();
         let key = test_key();
 
-        let id = tracker.start(&key, "slow query");
+        let id = 7;
+        tracker.start(id, &key, "slow query");
         tracker.timeout(id);
 
         let recent = tracker.recent();
@@ -246,13 +249,15 @@ mod tests {
         let mut key = test_key();
         key.id = 42;
 
-        let qid = tracker.start(&key, "*");
+        let qid = 1;
+        tracker.start(qid, &key, "*");
         assert_eq!(tracker.owner_key_id(qid), Some(42));
 
         // A different key id is not the owner — same name is irrelevant.
         let mut other = test_key();
         other.id = 43;
-        let other_qid = tracker.start(&other, "*");
+        let other_qid = 2;
+        tracker.start(other_qid, &other, "*");
         assert_eq!(tracker.owner_key_id(other_qid), Some(43));
 
         // Finished or unknown queries have no owner.
@@ -266,13 +271,12 @@ mod tests {
         let tracker = QueryTracker {
             active: DashMap::new(),
             history: Mutex::new(VecDeque::with_capacity(3)),
-            next_id: AtomicU64::new(1),
             max_history: 3,
         };
         let key = test_key();
 
-        for _ in 0..5 {
-            let id = tracker.start(&key, "*");
+        for id in 1..=5 {
+            tracker.start(id, &key, "*");
             tracker.complete(id, 1);
         }
 

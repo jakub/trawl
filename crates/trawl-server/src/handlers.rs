@@ -81,7 +81,10 @@ pub async fn query(
         "executing query"
     );
 
-    let query_id = state.query.tracker.start(&verified, &req.query);
+    // One id from the pool's counter keys the tracker entry AND the pool's
+    // interrupt map, so cancel-by-id interrupts the query the client sees.
+    let query_id = state.query.pool.allocate_query_id();
+    state.query.tracker.start(query_id, &verified, &req.query);
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
     // Resolve timezone from request (default to UTC when absent).
@@ -107,6 +110,7 @@ pub async fn query(
             .query
             .pool
             .execute_with_source(
+                query_id,
                 &resolved.remaining_dsl,
                 &resolved.source,
                 timeout,
@@ -118,7 +122,13 @@ pub async fn query(
         state
             .query
             .pool
-            .execute(&req.query, timeout, capture_debug, utc_offset_secs)
+            .execute(
+                query_id,
+                &req.query,
+                timeout,
+                capture_debug,
+                utc_offset_secs,
+            )
             .await
     };
 
@@ -1625,7 +1635,12 @@ pub async fn export(
         let bytes = state
             .query
             .pool
-            .export_parquet(&req.query, limit, timeout)
+            .export_parquet(
+                state.query.pool.allocate_query_id(),
+                &req.query,
+                limit,
+                timeout,
+            )
             .await?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -1661,7 +1676,13 @@ pub async fn export(
     let outcome = state
         .query
         .pool
-        .execute(&req.query, timeout, capture_debug, 0)
+        .execute(
+            state.query.pool.allocate_query_id(),
+            &req.query,
+            timeout,
+            capture_debug,
+            0,
+        )
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 

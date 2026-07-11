@@ -9,9 +9,10 @@
 
 mod common;
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{setup, setup_big_data, setup_with_rate_limit, trawl_only};
+use common::{setup, setup_with_rate_limit, trawl_only};
 use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
@@ -390,22 +391,35 @@ async fn cancel_query_rejects_ingest_role() {
 
 /// Non-admin cancellation is authorized by exact keystore id, not display
 /// name. Two `QueryCancel` keys sharing a name ("twin") must stay isolated:
-/// key B cannot cancel key A's in-flight query, while owner A passes the gate.
+/// key B cannot cancel key A's in-flight query, while owner A passes the gate
+/// and actually interrupts the query.
 ///
 /// A revert to name-matching would let B (same name) through, so this test
 /// guards that regression. It needs a genuinely *active* query — a completed
 /// one has no tracked owner under either scheme, so only a live entry can tell
 /// id-matching from name-matching apart.
 ///
-/// A percentile-by-group query over a large generated dataset runs long enough
-/// (hundreds of ms) to observe via `/queries` and cancel while still in-flight,
-/// with only one query in flight so the two cancel round-trips stay fast.
+/// The pool's `TEST_QUERY_DELAY_MS` hook (via the crate's `test-support`
+/// feature) holds the query in-flight deterministically — no dataset-size
+/// timing bets against fast CI runners.
 #[tokio::test]
 async fn cancel_query_isolated_by_key_id_not_name() {
-    // Large enough that the query below stays in-flight across the cancels.
-    let Some(server) = setup_big_data(600_000).await else {
+    // Permissive rate limits: the observe/cancel polls below run in a tight
+    // window and must not trip the per-minute buckets.
+    let permissive = RateLimitConfig {
+        admin: 1_000_000,
+        analyst: 1_000_000,
+        reader: 1_000_000,
+        ingest: 1_000_000,
+    };
+    let Some(server) = setup_with_rate_limit(permissive).await else {
         return;
     };
+
+    // Hold every pool query open long enough to observe and cancel it.
+    // nextest runs each test in its own process, so the global is private
+    // to this test; reset at the end regardless.
+    trawl_server::pool::TEST_QUERY_DELAY_MS.store(3_000, Ordering::Relaxed);
 
     // Two analyst keys with the SAME display name but distinct keystore ids.
     let store = KeyStore::from_pool(server.fx.pool());
@@ -435,14 +449,11 @@ async fn cancel_query_isolated_by_key_id_not_name() {
     let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
     let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
 
-    // Fire one deliberately slow query as key A in the background. It is tracked
-    // active for its whole (multi-hundred-ms) duration.
+    // Fire a query as key A in the background; the injected delay keeps it
+    // tracked as active until we are done asserting.
     let slow = {
         let a = a.clone();
-        tokio::spawn(async move {
-            a.query_paginated("* | stats p99(id) by grp", None, None)
-                .await
-        })
+        tokio::spawn(async move { a.query_paginated("* | stats count()", None, None).await })
     };
 
     // Wait until A's query shows up as active, capturing its id.
@@ -463,8 +474,8 @@ async fn cancel_query_isolated_by_key_id_not_name() {
     }
     let target = target.expect("key A should have an active query");
 
-    // Key B (same name, QueryCancel, different id) is rejected by the ownership
-    // gate — which runs before any cancel is attempted.
+    // Key B (same name, QueryCancel, different id) is rejected by the
+    // ownership gate — the query is guaranteed still in-flight here.
     let denied = b.cancel_query(target).await;
     match denied {
         Err(trawl_client::ClientError::Server { status, .. }) => {
@@ -473,16 +484,31 @@ async fn cancel_query_isolated_by_key_id_not_name() {
         other => panic!("expected 401 for non-owner cancel, got: {other:?}"),
     }
 
-    // Owner A passes the ownership gate.
-    let allowed = a.cancel_query(target).await;
+    // Owner A passes the ownership gate AND interrupts the tracked query:
+    // `cancelled == true` proves the tracker id and the pool's interrupt-map
+    // id are the same id space. The interrupt handle is registered by the
+    // pool task shortly after the tracker entry appears, so retry briefly.
+    let mut cancelled = false;
+    for _ in 0..500 {
+        let resp = a
+            .cancel_query(target)
+            .await
+            .expect("owner key A must pass the ownership gate");
+        if resp.cancelled {
+            cancelled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
     assert!(
-        allowed.is_ok(),
-        "owner key A must pass the ownership gate, got: {allowed:?}"
+        cancelled,
+        "owner cancel must interrupt the in-flight query (shared id space)"
     );
 
-    // Assertions are done; drop the background query task (the server-side
-    // scan finishes on its own — we don't need its result).
-    slow.abort();
+    trawl_server::pool::TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
+
+    // The interrupted query surfaces an error to its submitter.
+    let _ = slow.await;
 }
 
 #[tokio::test]

@@ -6381,6 +6381,7 @@ dependencies = [
  "trawl-crashdump",
  "trawl-dashboard",
  "trawl-engine",
+ "trawl-server",
  "ulid",
  "x509-parser",
  "zstd",

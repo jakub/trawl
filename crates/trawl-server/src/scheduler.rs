@@ -308,7 +308,9 @@ pub(crate) async fn execute_scheduled_query(
     let timeout = Duration::from_secs(timeout_secs);
 
     // Execute the query on the pool (no debug capture, UTC timestamps).
-    let outcome = pool.execute(query, timeout, false, 0).await;
+    let outcome = pool
+        .execute(pool.allocate_query_id(), query, timeout, false, 0)
+        .await;
 
     #[allow(clippy::cast_possible_truncation)]
     let duration_ms = start.elapsed().as_millis() as u64;
