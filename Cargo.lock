@@ -6193,14 +6193,10 @@ dependencies = [
 name = "trawl-admin"
 version = "0.3.3"
 dependencies = [
- "chrono",
  "clap",
- "comfy-table",
- "insta",
  "rcgen",
  "shellexpand",
  "time",
- "trawl-auth",
  "trawl-core",
 ]
 
