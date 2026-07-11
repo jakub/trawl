@@ -81,6 +81,27 @@ enum KeysAction {
         #[arg(value_parser = commands::keys::parse_grant)]
         grant: RoleAssignment,
     },
+    /// Remove a key's grant on an app.
+    RevokeGrant {
+        /// The key prefix (shown in `keys list`).
+        #[arg(value_parser = KeyPrefix::parse)]
+        prefix: KeyPrefix,
+        /// The app to revoke, as `app` or `app:role` — the role half is
+        /// ignored (grants are keyed by app, whatever role is stored).
+        #[arg(value_name = "APP", value_parser = commands::keys::parse_revoke_grant_app)]
+        app: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Change a key's kind (human <-> service).
+    Retype {
+        /// The key prefix (shown in `keys list`).
+        #[arg(value_parser = KeyPrefix::parse)]
+        prefix: KeyPrefix,
+        /// The new principal kind.
+        kind: CliKind,
+    },
 }
 
 /// CLI-side mirror of [`PrincipalKind`] — `clap` requires the type to live
@@ -139,6 +160,12 @@ async fn dispatch_keys(store: KeyStore, action: KeysAction) -> Result<(), AdminE
         KeysAction::List { all } => commands::keys::list(&store, all).await,
         KeysAction::Revoke { prefix, yes } => commands::keys::revoke(&store, &prefix, yes).await,
         KeysAction::Grant { prefix, grant } => commands::keys::grant(&store, &prefix, &grant).await,
+        KeysAction::RevokeGrant { prefix, app, yes } => {
+            commands::keys::revoke_grant(&store, &prefix, &app, yes).await
+        }
+        KeysAction::Retype { prefix, kind } => {
+            commands::keys::retype(&store, &prefix, kind.into()).await
+        }
     }
 }
 

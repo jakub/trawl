@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `fleet-admin keys revoke-grant <prefix> <app>` and `fleet-admin keys retype <prefix> <kind>`, completing key-lifecycle parity with trawl-admin ahead of the trawld keystore cutover (ADR-0004 slice 0). `revoke-grant` follows the `keys revoke` confirmation convention (`--yes`/`-y`, `[y/N]` prompt, non-TTY refusal without `--yes`) and accepts `app` or `app:role` (role half ignored); a missing grant errors with `GrantNotFound` rather than silently succeeding. `retype` flips a key between `human` and `service` and refuses revoked keys (#35).
+
 ### Fixed
 - Streaming `strptime` now fills the components a partial format omits from a `1900-01-01 00:00:00` base exactly like the batch (DuckDB) path: year-only (`%Y`), year-month (`%Y-%m`), bare month-day (`%m-%d`), and a date paired with an incomplete time (`%Y-%m-%d %H`) all resolve to the same timestamp in live and compacted queries. The last case previously returned a wrong value (the stray hour was dropped to midnight); the others returned `null`. Closes the residual divergence left by #24 (#25).
 

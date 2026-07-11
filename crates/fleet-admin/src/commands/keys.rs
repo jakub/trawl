@@ -112,9 +112,9 @@ pub async fn list(store: &KeyStore, all: bool) -> Result<(), AdminError> {
 
 /// Revoke a key by prefix, with `[y/N]` confirmation unless `--yes`.
 ///
-/// Refuses to revoke when stdin is not a TTY and `--yes` was not passed —
-/// scripts must opt in explicitly so an accidental `keys revoke <prefix>`
-/// in a pipeline never silently nukes a key.
+/// Refuses to revoke unless both stdin and stderr are TTYs or `--yes` was
+/// passed — scripts must opt in explicitly so an accidental
+/// `keys revoke <prefix>` in a pipeline never silently nukes a key.
 pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(), AdminError> {
     let info = store.get_key_by_prefix(prefix.as_str()).await?;
 
@@ -131,19 +131,8 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
     eprintln!("  grants:  {}", format_assignments(&info.assignments));
     eprintln!("  created: {}", format_timestamp(&info.created_at));
 
-    if !yes {
-        use std::io::IsTerminal as _;
-        let stdin = std::io::stdin();
-        let stderr = std::io::stderr();
-        if !stdin.is_terminal() || !stderr.is_terminal() {
-            return Err(AdminError::NonInteractive);
-        }
-
-        let mut writer = stderr.lock();
-        let mut reader = stdin.lock();
-        if !revoke_prompt(&mut reader, &mut writer)? {
-            return Ok(());
-        }
+    if !yes && !confirm_or_refuse("revoke this key?")? {
+        return Ok(());
     }
 
     let revoked = store.revoke_key(prefix.as_str()).await?;
@@ -151,17 +140,18 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
     Ok(())
 }
 
-/// Pure prompt loop, factored out for unit testing.
+/// Pure `[y/N]` prompt loop, factored out for unit testing.
 ///
-/// Writes `"revoke this key? [y/N] "` and reads one line. Returns `Ok(true)`
+/// Writes `"\n{question} [y/N] "` and reads one line. Returns `Ok(true)`
 /// only for `y`/`yes` (case-insensitive). EOF (a zero-byte read) is reported
 /// to the operator before falling through to `Ok(false)` — without that,
 /// "stdin closed mid-prompt" looks identical to "user typed n" in logs.
-pub fn revoke_prompt<R: BufRead, W: Write>(
+pub fn confirm_prompt<R: BufRead, W: Write>(
+    question: &str,
     reader: &mut R,
     writer: &mut W,
 ) -> std::io::Result<bool> {
-    write!(writer, "\nrevoke this key? [y/N] ")?;
+    write!(writer, "\n{question} [y/N] ")?;
     writer.flush()?;
 
     let mut answer = String::new();
@@ -171,12 +161,94 @@ pub fn revoke_prompt<R: BufRead, W: Write>(
         return Ok(false);
     }
 
-    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
         Ok(true)
     } else {
         writeln!(writer, "aborted")?;
         Ok(false)
     }
+}
+
+/// TTY-gated `[y/N]` confirmation shared by confirmable subcommands.
+///
+/// Refuses with [`AdminError::NonInteractive`] unless both stdin and stderr
+/// are TTYs, so a piped `keys revoke`/`revoke-grant` never proceeds without an
+/// explicit `--yes`. Otherwise locks the descriptors and defers to
+/// [`confirm_prompt`], returning whether the operator confirmed. Centralizes
+/// the non-interactive-refusal invariant so new confirmable subcommands don't
+/// hand-roll their own copy.
+fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
+    use std::io::IsTerminal as _;
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    if !stdin.is_terminal() || !stderr.is_terminal() {
+        return Err(AdminError::NonInteractive);
+    }
+
+    let mut writer = stderr.lock();
+    let mut reader = stdin.lock();
+    confirm_prompt(question, &mut reader, &mut writer).map_err(Into::into)
+}
+
+/// Revoke a key's grant on an app, with `[y/N]` confirmation unless `--yes`.
+///
+/// Same interactivity contract as [`revoke`]: refuses to proceed unless both
+/// stdin and stderr are TTYs or `--yes` was passed. No preflight read — the prompt
+/// is built from the arguments, and a missing grant surfaces as the store's
+/// `GrantNotFound` after confirmation (no read-then-delete race).
+pub async fn revoke_grant(
+    store: &KeyStore,
+    prefix: &KeyPrefix,
+    app: &str,
+    yes: bool,
+) -> Result<(), AdminError> {
+    if !yes {
+        let question = format!("revoke grant for app {app} on key {prefix}?");
+        if !confirm_or_refuse(&question)? {
+            return Ok(());
+        }
+    }
+
+    store.revoke_assignment(prefix.as_str(), app).await?;
+    eprintln!("revoked grant for app {app} on key {prefix}");
+    Ok(())
+}
+
+/// Change a key's kind (human <-> service).
+///
+/// Non-interactive — the change is reversible and the result is
+/// self-reported. Revoked keys are refused store-side
+/// (`AuthError::KeyRevoked`).
+pub async fn retype(
+    store: &KeyStore,
+    prefix: &KeyPrefix,
+    kind: PrincipalKind,
+) -> Result<(), AdminError> {
+    let info = store.retype_key(prefix.as_str(), kind).await?;
+    eprintln!(
+        "retyped key {} ({}) as {}",
+        info.prefix, info.name, info.kind
+    );
+    Ok(())
+}
+
+/// Parse a `revoke-grant` app argument, extracting the app half.
+///
+/// Accepts either a bare `app` or the `app:role` form `keys grant` takes —
+/// the role half is ignored, since grants are keyed by `(key, app)`. First
+/// colon wins, mirroring trawl-admin (`foo:super:admin` → `foo`). An empty
+/// app (from `""` or `:role`) is rejected at the clap boundary rather than
+/// surviving to the store and garbling the confirmation prompt.
+pub fn parse_revoke_grant_app(s: &str) -> Result<String, AdminError> {
+    let app = s.split_once(':').map_or(s, |(app, _)| app);
+    if app.is_empty() {
+        return Err(AdminError::InvalidGrant {
+            input: s.to_owned(),
+            reason: "empty app",
+        });
+    }
+    Ok(app.to_owned())
 }
 
 /// Add a grant to an existing key.
@@ -353,6 +425,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_revoke_grant_app_bare_app() {
+        assert_eq!(parse_revoke_grant_app("trawl").unwrap(), "trawl");
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_strips_role() {
+        assert_eq!(parse_revoke_grant_app("trawl:admin").unwrap(), "trawl");
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_first_colon_semantics() {
+        assert_eq!(
+            parse_revoke_grant_app("trawl:super:admin").unwrap(),
+            "trawl"
+        );
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_rejects_empty_input() {
+        assert!(parse_revoke_grant_app("").is_err());
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_rejects_empty_app_before_colon() {
+        assert!(parse_revoke_grant_app(":admin").is_err());
+    }
+
+    #[test]
     fn parse_duration_days() {
         assert_eq!(
             parse_duration("90d").unwrap(),
@@ -502,25 +602,25 @@ mod tests {
         assert_eq!(format_timestamp(&ts), "2026-02-10 12:00:00");
     }
 
-    fn run_prompt(input: &str) -> (bool, String) {
+    fn run_prompt(question: &str, input: &str) -> (bool, String) {
         let mut reader = std::io::BufReader::new(input.as_bytes());
         let mut writer: Vec<u8> = Vec::new();
-        let result = revoke_prompt(&mut reader, &mut writer).expect("prompt io");
+        let result = confirm_prompt(question, &mut reader, &mut writer).expect("prompt io");
         (result, String::from_utf8(writer).expect("utf8"))
     }
 
     #[test]
-    fn revoke_prompt_accepts_y_variants() {
-        for ans in ["y\n", "Y\n", "yes\n", "YES\n", "  y  \n"] {
-            let (accepted, _) = run_prompt(ans);
+    fn confirm_prompt_accepts_y_variants() {
+        for ans in ["y\n", "Y\n", "yes\n", "YES\n", "Yes\n", "  y  \n"] {
+            let (accepted, _) = run_prompt("revoke this key?", ans);
             assert!(accepted, "{ans:?} should accept");
         }
     }
 
     #[test]
-    fn revoke_prompt_rejects_n_and_blank() {
+    fn confirm_prompt_rejects_n_and_blank() {
         for ans in ["n\n", "N\n", "no\n", "\n", "  \n", "maybe\n"] {
-            let (accepted, out) = run_prompt(ans);
+            let (accepted, out) = run_prompt("revoke this key?", ans);
             assert!(!accepted, "{ans:?} should reject");
             assert!(out.contains("aborted"), "expected 'aborted' in {out:?}");
             assert!(
@@ -531,8 +631,8 @@ mod tests {
     }
 
     #[test]
-    fn revoke_prompt_eof_is_distinguishable_from_no() {
-        let (accepted, out) = run_prompt("");
+    fn confirm_prompt_eof_is_distinguishable_from_no() {
+        let (accepted, out) = run_prompt("revoke this key?", "");
         assert!(!accepted);
         assert!(
             out.contains("stdin closed before answer"),
@@ -541,11 +641,16 @@ mod tests {
     }
 
     #[test]
-    fn revoke_prompt_writes_question_before_reading() {
-        let (_, out) = run_prompt("n\n");
+    fn confirm_prompt_writes_caller_question_before_reading() {
+        let (_, out) = run_prompt("revoke this key?", "n\n");
         assert!(
             out.contains("revoke this key? [y/N]"),
             "missing prompt text in {out:?}"
+        );
+        let (_, out) = run_prompt("revoke grant for app trawl on key aaaabbbb?", "n\n");
+        assert!(
+            out.contains("revoke grant for app trawl on key aaaabbbb? [y/N]"),
+            "question must come from the caller, got {out:?}"
         );
     }
 
