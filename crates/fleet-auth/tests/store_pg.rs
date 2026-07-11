@@ -470,6 +470,138 @@ pg_test!(ping_succeeds, |store: KeyStore| async move {
     store.ping().await.expect("ping");
 });
 
+// ---------------------------------------------------------------------------
+// live-key lookup (ADR-0004: scheduler gating)
+// ---------------------------------------------------------------------------
+
+pg_test!(live_key_by_id_active, |store: KeyStore| async move {
+    let created = store
+        .create_key("live", PrincipalKind::Service, &trawl_admin(), None)
+        .await
+        .unwrap();
+
+    let live = store
+        .get_live_key_by_id(created.info.id)
+        .await
+        .expect("lookup")
+        .expect("active key must be live");
+    assert_eq!(live.id, created.info.id);
+    assert_eq!(live.name, "live");
+    assert_eq!(live.role_for("trawl"), Some("admin"));
+});
+
+pg_test!(
+    live_key_by_id_revoked_is_none,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("revoked", PrincipalKind::Service, &trawl_admin(), None)
+            .await
+            .unwrap();
+        store.revoke_key(&created.info.prefix).await.unwrap();
+
+        let live = store.get_live_key_by_id(created.info.id).await.unwrap();
+        assert!(live.is_none(), "revoked key must not be live");
+    }
+);
+
+pg_test!(
+    live_key_by_id_expired_is_none,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key(
+                "expiring-live",
+                PrincipalKind::Service,
+                &trawl_admin(),
+                Some(Duration::from_millis(50)),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let live = store.get_live_key_by_id(created.info.id).await.unwrap();
+        assert!(live.is_none(), "expired key must not be live");
+    }
+);
+
+pg_test!(
+    live_key_by_id_unknown_is_none,
+    |store: KeyStore| async move {
+        let live = store.get_live_key_by_id(999_999).await.unwrap();
+        assert!(live.is_none(), "unknown id must not be live");
+    }
+);
+
+pg_test!(
+    live_key_by_id_reflects_grant_changes,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("regrant", PrincipalKind::Service, &trawl_admin(), None)
+            .await
+            .unwrap();
+
+        // Strip the trawl grant out-of-band — the live lookup must observe it.
+        store
+            .revoke_assignment(&created.info.prefix, "trawl")
+            .await
+            .unwrap();
+        let live = store
+            .get_live_key_by_id(created.info.id)
+            .await
+            .unwrap()
+            .expect("still active");
+        assert_eq!(live.role_for("trawl"), None, "assignments must be fresh");
+
+        // Re-grant with a different role — fresh again.
+        store
+            .grant_assignment(
+                &created.info.prefix,
+                &RoleAssignment {
+                    app: "trawl".into(),
+                    role: "reader".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let live = store
+            .get_live_key_by_id(created.info.id)
+            .await
+            .unwrap()
+            .expect("still active");
+        assert_eq!(live.role_for("trawl"), Some("reader"));
+    }
+);
+
+// ---------------------------------------------------------------------------
+// connect() — URL-based construction for daemon consumers (ADR-0004)
+// ---------------------------------------------------------------------------
+
+/// `KeyStore::connect` establishes a pool from a database URL and validates
+/// connectivity eagerly (trawld fails fast at startup on a dead backend).
+#[tokio::test]
+async fn connect_and_ping_via_url() {
+    let Some(url) = common::base_database_url() else {
+        assert!(
+            !common::require_database(),
+            "FLEET_DATABASE_URL not set but FLEET_TESTS_REQUIRED is"
+        );
+        eprintln!("connect_and_ping_via_url skipped: FLEET_DATABASE_URL not set");
+        return;
+    };
+    let store = KeyStore::connect(&url).await.expect("connect");
+    store.ping().await.expect("ping");
+    // Close eagerly so nextest doesn't flag the lazy pool teardown as a leak.
+    store.pool().close().await;
+}
+
+#[tokio::test]
+async fn connect_malformed_url_errors() {
+    // Malformed URL fails at parse time — no network round-trip, no timeout.
+    let err = KeyStore::connect("not-a-postgres-url")
+        .await
+        .expect_err("must fail");
+    assert!(matches!(err, AuthError::Database(_)), "got: {err:?}");
+}
+
 // One sync sanity test to confirm imports compile without DB.
 #[test]
 fn validation_reexported_works() {
