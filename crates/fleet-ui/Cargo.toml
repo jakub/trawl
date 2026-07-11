@@ -25,12 +25,17 @@ leptos        = { version = "0.8", features = ["csr"] }
 leptos_router = { version = "0.8" }
 leptos-use    = { version = "0.18", default-features = false, features = ["use_event_listener", "use_window"] }
 wasm-bindgen  = "0.2"
+wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+    "Clipboard",
     "Document",
     "Element",
     "HtmlElement",
     "KeyboardEvent",
     "MouseEvent",
+    "Navigator",
+    "Node",
+    "NodeList",
     "Storage",
     "Window",
 ] }

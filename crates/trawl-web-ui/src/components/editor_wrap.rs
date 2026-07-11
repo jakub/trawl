@@ -10,14 +10,13 @@
 //! callback.
 
 use leptos::prelude::*;
-use leptos::task::spawn_local;
 use leptos::web_sys;
 
-use crate::clipboard::write_clipboard;
 use crate::components::editor::DslEditor;
 use crate::state::query::{QUICK_RANGES, RangeSpec};
 use fleet_ui::{
-    Btn, Icon, IconView, Kbd, Segmented, SegmentedOption, Size, ToastBus, ToastKind, Variant,
+    Btn, CopyButton, Icon, IconView, Kbd, Segmented, SegmentedOption, Size, ToastBus, ToastKind,
+    Variant,
 };
 
 #[component]
@@ -44,22 +43,13 @@ pub fn EditorWrap(
     let on_run = on_submit;
     let format_trigger = RwSignal::new(0_u64);
 
-    let do_share = move |_| {
-        let Some(win) = web_sys::window() else { return };
-        let Ok(href) = win.location().href() else {
-            return;
-        };
-        spawn_local(async move {
-            match write_clipboard(&href).await {
-                Ok(()) => bus.push(
-                    ToastKind::Success,
-                    "Copied",
-                    Some("Search URL copied to clipboard.".into()),
-                ),
-                Err(e) => bus.push(ToastKind::Error, "Copy failed", Some(e)),
-            }
-        });
-    };
+    // Current-URL text for the share <CopyButton> — derived so the
+    // href resolves at click time, not at render time.
+    let share_text = Signal::derive(move || {
+        web_sys::window()
+            .and_then(|w| w.location().href().ok())
+            .unwrap_or_default()
+    });
 
     let do_format = move |_| {
         let text = query.get_untracked();
@@ -93,10 +83,11 @@ pub fn EditorWrap(
                     class="tool"
                     on:click=move |_| on_save.run(())
                 >"save"</span>
-                <span
+                <CopyButton
                     class="tool"
-                    on:click=do_share
-                >"share"</span>
+                    text=share_text
+                    success_detail="Search URL copied to clipboard."
+                >"share"</CopyButton>
                 <span
                     class="tool"
                     on:click=do_format

@@ -52,6 +52,7 @@ const SEARCH_INPUT: &str = include_str!("../src/search_input.rs");
 const TOGGLE: &str = include_str!("../src/toggle.rs");
 const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
+const COPY_BUTTON: &str = include_str!("../src/copy_button.rs");
 const LOAD_MORE: &str = include_str!("../src/load_more.rs");
 const WHEN: &str = include_str!("../src/time/when.rs");
 const CLOCK: &str = include_str!("../src/time/clock.rs");
@@ -300,6 +301,27 @@ fn drawer_is_an_honest_non_modal_dialog() {
         DRAWER.contains(r#"tabindex="-1""#),
         "the drawer panel needs tabindex=\"-1\" so the initial-focus \
          fallback can land on the panel itself"
+    );
+}
+
+#[test]
+fn copy_button_reports_through_the_shared_toast_bus() {
+    // Issue #33 D6: one click-to-copy component, wired to the Shell's
+    // ToastBus (never a second bus), with the canonical "Copied" /
+    // "Copy failed" toast titles.
+    assert!(
+        COPY_BUTTON.contains("expect_context::<ToastBus>()"),
+        "CopyButton must resolve the Shell-owned ToastBus from context"
+    );
+    assert!(
+        COPY_BUTTON.contains(r#""Copied""#) && COPY_BUTTON.contains(r#""Copy failed""#),
+        "the toast titles are canonical copy — apps customize only the \
+         success detail line"
+    );
+    assert!(
+        COPY_BUTTON.contains("stop_propagation"),
+        "copy triggers sit inside clickable rows — the click must not \
+         bubble into the host row handler"
     );
 }
 

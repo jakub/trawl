@@ -43,6 +43,10 @@ pub mod toast;
 #[cfg(target_arch = "wasm32")]
 pub mod actions_menu;
 #[cfg(target_arch = "wasm32")]
+pub mod clipboard;
+#[cfg(target_arch = "wasm32")]
+pub mod copy_button;
+#[cfg(target_arch = "wasm32")]
 pub mod drawer;
 #[cfg(target_arch = "wasm32")]
 pub mod error_banner;
@@ -84,6 +88,10 @@ pub use actions_menu::{ActionItem, ActionsMenu};
 pub use badge::Badge;
 #[cfg(target_arch = "wasm32")]
 pub use button::Btn;
+#[cfg(target_arch = "wasm32")]
+pub use clipboard::write_clipboard;
+#[cfg(target_arch = "wasm32")]
+pub use copy_button::CopyButton;
 #[cfg(target_arch = "wasm32")]
 pub use drawer::Drawer;
 #[cfg(target_arch = "wasm32")]

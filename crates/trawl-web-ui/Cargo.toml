@@ -48,7 +48,6 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "Blob",
     "BlobPropertyBag",
-    "Clipboard",
     "CloseEvent",
     "Document",
     "Element",
@@ -59,7 +58,6 @@ web-sys = { version = "0.3", features = [
     "Location",
     "MessageEvent",
     "MouseEvent",
-    "Navigator",
     "Storage",
     "ScrollBehavior",
     "ScrollIntoViewOptions",

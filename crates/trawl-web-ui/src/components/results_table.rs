@@ -11,11 +11,9 @@
 //! through a parent-supplied callback.
 
 use crate::api::{ApiError, PAGE_SIZE};
-use crate::clipboard::write_clipboard;
 use crate::state::query::{Filter, FilterOp};
-use fleet_ui::{Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, CopyButton, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
 use leptos::prelude::*;
-use leptos::task::spawn_local;
 use std::cmp::Ordering;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
@@ -310,7 +308,6 @@ fn RowFragment(
                             <CopyRawButton
                                 row=row_for_actions.clone()
                                 columns=columns_for_actions.clone()
-                                bus=bus
                             />
                             <ShowContextButton
                                 row=row_for_actions.clone()
@@ -333,24 +330,15 @@ fn RowFragment(
 }
 
 #[component]
-fn CopyRawButton(row: Vec<Value>, columns: Vec<String>, bus: ToastBus) -> impl IntoView {
-    let on_click = Callback::new(move |()| {
-        let text = raw_or_synthesized(&row, &columns);
-        let bus_ok = bus;
-        let bus_err = bus;
-        spawn_local(async move {
-            match write_clipboard(&text).await {
-                Ok(()) => bus_ok.push(
-                    ToastKind::Success,
-                    "Copied",
-                    Some("Raw event copied to clipboard.".into()),
-                ),
-                Err(msg) => bus_err.push(ToastKind::Error, "Copy failed", Some(msg)),
-            }
-        });
-    });
+fn CopyRawButton(row: Vec<Value>, columns: Vec<String>) -> impl IntoView {
+    // fleet-ui's <CopyButton> owns the clipboard write + toast wiring;
+    // the derived signal keeps raw_or_synthesized lazy (evaluated at
+    // click time, like the hand-rolled version).
+    let text = Signal::derive(move || raw_or_synthesized(&row, &columns));
     view! {
-        <Btn variant=Variant::Secondary stop_propagation=true on_click=on_click>"Copy _raw"</Btn>
+        <CopyButton text=text success_detail="Raw event copied to clipboard.">
+            "Copy _raw"
+        </CopyButton>
     }
 }
 
