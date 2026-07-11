@@ -31,7 +31,9 @@ use super::state::{LoadState, error_copy, loading_copy, missing_copy};
 /// default renders the canonical "not found" copy on the NEUTRAL
 /// `.load-hint` tone (a missing resource is not a failure), with
 /// `missing_subtitle` as an optional explanatory second line (issue
-/// #33 D5 — the story-404 shape).
+/// #33 D5 — the story-404 shape). `missing_subtitle` decorates ONLY
+/// that default arm: pass a custom `missing` closure and the subtitle
+/// is ignored (render it yourself inside the closure).
 #[component]
 pub fn Loaded<T>(
     #[prop(into)] state: Signal<LoadState<T>>,
@@ -39,7 +41,10 @@ pub fn Loaded<T>(
     render: Box<dyn Fn(T) -> AnyView + Send + Sync>,
     #[prop(optional)] error: Option<Box<dyn Fn(String) -> AnyView + Send + Sync>>,
     #[prop(optional)] missing: Option<Box<dyn Fn() -> AnyView + Send + Sync>>,
-    #[prop(optional, into)] missing_subtitle: Option<String>,
+    /// Optional second line under the default "not found" copy;
+    /// ignored when a custom `missing` closure is supplied.
+    #[prop(optional, into)]
+    missing_subtitle: Option<String>,
 ) -> impl IntoView
 where
     T: Clone + Send + Sync + 'static,
