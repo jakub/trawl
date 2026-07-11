@@ -19,7 +19,7 @@ use fleet_auth::KeyStore;
 use trawl_auth::schedule::ScheduleStore;
 
 use crate::config::SchedulerConfig;
-use crate::policy::TrawlAuthz as _;
+use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
 
 /// Spawn the scheduler background task.
@@ -238,9 +238,13 @@ async fn poll_and_execute(
 
 /// Whether the schedule's owning key may still run scheduled queries: it
 /// must be live in the fleet keystore (active + unexpired) AND hold a trawl
-/// grant with a role trawl recognizes. Revocation, expiry, and
-/// grant-stripping all stop scheduled execution (AC6). Lookup failures skip
-/// conservatively.
+/// grant whose role still carries both [`Permission::Query`] and
+/// [`Permission::SavedQuery`] — the two authorities a scheduled saved-query
+/// run exercises. Revocation, expiry, grant-stripping, AND role downgrades
+/// (analyst → reader/ingest) all stop scheduled execution (AC6): a role that
+/// lacks either permission can no longer create or run saved queries
+/// interactively, so it must not keep running them on a schedule. Lookup
+/// failures skip conservatively.
 async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> bool {
     let live = match key_store.get_live_key_by_id(key_id).await {
         Ok(live) => live,
@@ -255,13 +259,15 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
             return false;
         }
     };
-    let usable = live.is_some_and(|k| k.trawl_role().is_some());
+    let usable = live.is_some_and(|k| {
+        k.has_permission(Permission::Query) && k.has_permission(Permission::SavedQuery)
+    });
     if !usable {
         tracing::info!(
             event_type = "scheduler_skip",
             schedule_id,
             key_id,
-            "skipping schedule: owning key is revoked, expired, or has no usable trawl grant"
+            "skipping schedule: owning key is revoked, expired, or lacks query/saved-query permission"
         );
     }
     usable

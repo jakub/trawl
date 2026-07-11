@@ -669,6 +669,51 @@ async fn ac6_scheduler_skips_grant_stripped_key() {
     assert_eq!(runs, 0, "grant-stripped key must not execute schedules");
 }
 
+/// A live key whose trawl grant is downgraded from analyst to a role lacking
+/// saved-query authority must stop running its schedules — otherwise removing
+/// a role leaves durable execution privilege behind.
+async fn assert_downgrade_stops_schedules(new_role: &str) {
+    let Some(runs) = scheduler_runs_after(
+        async move |store: &KeyStore, key: &fleet_auth::CreatedKey| {
+            store
+                .revoke_assignment(&key.info.prefix, "trawl")
+                .await
+                .unwrap();
+            store
+                .grant_assignment(
+                    &key.info.prefix,
+                    &fleet_auth::RoleAssignment {
+                        app: "trawl".into(),
+                        role: new_role.into(),
+                    },
+                )
+                .await
+                .unwrap();
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        runs, 0,
+        "key downgraded to {new_role} must not execute schedules"
+    );
+}
+
+#[tokio::test]
+async fn ac6_scheduler_skips_analyst_downgraded_to_reader() {
+    // Reader holds Query but not SavedQuery: it cannot manage saved queries
+    // interactively, so it must not keep running them on a schedule.
+    assert_downgrade_stops_schedules("reader").await;
+}
+
+#[tokio::test]
+async fn ac6_scheduler_skips_analyst_downgraded_to_ingest() {
+    // Ingest holds neither Query nor SavedQuery.
+    assert_downgrade_stops_schedules("ingest").await;
+}
+
 // ---------------------------------------------------------------------------
 // AC7: legacy auth.db quarantine
 // ---------------------------------------------------------------------------
