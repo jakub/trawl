@@ -142,7 +142,7 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
 
 /// Pure `[y/N]` prompt loop, factored out for unit testing.
 ///
-/// Writes `"{question} [y/N] "` and reads one line. Returns `Ok(true)`
+/// Writes `"\n{question} [y/N] "` and reads one line. Returns `Ok(true)`
 /// only for `y`/`yes` (case-insensitive). EOF (a zero-byte read) is reported
 /// to the operator before falling through to `Ok(false)` — without that,
 /// "stdin closed mid-prompt" looks identical to "user typed n" in logs.
@@ -161,7 +161,8 @@ pub fn confirm_prompt<R: BufRead, W: Write>(
         return Ok(false);
     }
 
-    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
         Ok(true)
     } else {
         writeln!(writer, "aborted")?;
@@ -610,7 +611,7 @@ mod tests {
 
     #[test]
     fn confirm_prompt_accepts_y_variants() {
-        for ans in ["y\n", "Y\n", "yes\n", "YES\n", "  y  \n"] {
+        for ans in ["y\n", "Y\n", "yes\n", "YES\n", "Yes\n", "  y  \n"] {
             let (accepted, _) = run_prompt("revoke this key?", ans);
             assert!(accepted, "{ans:?} should accept");
         }
