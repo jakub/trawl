@@ -234,6 +234,63 @@ fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
 }
 
 #[test]
+fn modal_family_traps_focus_and_keeps_aria_modal() {
+    // Issue #33 D2: the modal family renders aria-modal="true" and now
+    // EARNS it — the shell registers FocusPolicy::Trap with the overlay
+    // stack (initial focus, Tab/Shift+Tab cycle, restore-to-opener) and
+    // hands the glue its panel element with a tabindex="-1" fallback.
+    assert!(
+        MODAL_SHELL.contains(r#"aria-modal="true""#),
+        "the modal shell must keep aria-modal=\"true\" — it traps focus, \
+         so the semantics are honest"
+    );
+    assert!(
+        MODAL_SHELL.contains("FocusPolicy::Trap") && MODAL_SHELL.contains("use_overlay_layer_with"),
+        "the modal shell must register FocusPolicy::Trap via \
+         use_overlay_layer_with — dropping it reopens the issue #33 \
+         defect (aria-modal with zero focus management)"
+    );
+    assert!(
+        MODAL_SHELL.contains(r#"tabindex="-1""#),
+        "the modal panel needs tabindex=\"-1\" so the initial-focus \
+         fallback can land on the panel itself"
+    );
+}
+
+#[test]
+fn drawer_is_an_honest_non_modal_dialog() {
+    // Issue #33 D2: the drawer is non-modal BY DESIGN (background stays
+    // interactive; modal-over-live-drawer is a supported stack), so it
+    // must NOT claim aria-modal. It keeps role="dialog" and registers
+    // FocusPolicy::Capture (initial focus + restore, no trap). This is
+    // the slice's single sanctioned semantic markup delta.
+    assert!(
+        DRAWER.contains(r#"role="dialog""#),
+        "the drawer keeps role=\"dialog\""
+    );
+    // Scan for the attribute form (`aria-modal=`) rather than the bare
+    // token: the drawer's comments legitimately explain WHY the
+    // attribute is absent.
+    assert!(
+        !DRAWER.contains("aria-modal="),
+        "the drawer must not render an aria-modal attribute — screen \
+         readers would be told the background is gone while keyboard \
+         users tab straight out (the issue #33 defect)"
+    );
+    assert!(
+        DRAWER.contains("FocusPolicy::Capture") && DRAWER.contains("use_overlay_layer_with"),
+        "the drawer must register FocusPolicy::Capture via \
+         use_overlay_layer_with — initial focus on open, restore on \
+         close, and no Tab trap"
+    );
+    assert!(
+        DRAWER.contains(r#"tabindex="-1""#),
+        "the drawer panel needs tabindex=\"-1\" so the initial-focus \
+         fallback can land on the panel itself"
+    );
+}
+
+#[test]
 fn error_banner_emits_error_class_with_alert_role() {
     // ErrorBanner reuses the moved `.error` class (byte-identical CSS) and
     // adds the sole sanctioned DOM delta of the whole migration:
