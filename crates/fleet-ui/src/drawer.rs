@@ -45,7 +45,7 @@ pub fn Drawer(
     on_tab_change: Callback<String>,
     on_close: Callback<()>,
     #[prop(optional, into)] on_escape: Option<Callback<()>>,
-    #[prop(into, optional)] meta: Option<String>,
+    #[prop(into, optional)] meta: MaybeProp<String>,
     /// Close-glyph size in px. Exists because trawl's drawers drifted
     /// pre-migration: the service drawer's close X was 12px, the net
     /// drawer's 14px, and the zero-visual-change contract preserves

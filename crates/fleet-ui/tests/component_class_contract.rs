@@ -305,6 +305,23 @@ fn drawer_is_an_honest_non_modal_dialog() {
 }
 
 #[test]
+fn drawer_and_tabs_meta_is_reactive() {
+    // Issue #33 D7: `meta` is a reactive optional (MaybeProp) on both
+    // Tabs and the Drawer that forwards to it — live counts must tick.
+    // Static Strings still convert via `into`, so call sites with
+    // snapshot copy compile unchanged.
+    assert!(
+        TABS.contains("MaybeProp<String>"),
+        "Tabs meta must be a reactive MaybeProp<String>"
+    );
+    assert!(
+        DRAWER.contains("MaybeProp<String>"),
+        "Drawer meta must stay a reactive MaybeProp<String> forwarded \
+         to Tabs"
+    );
+}
+
+#[test]
 fn copy_button_reports_through_the_shared_toast_bus() {
     // Issue #33 D6: one click-to-copy component, wired to the Shell's
     // ToastBus (never a second bus), with the canonical "Copied" /

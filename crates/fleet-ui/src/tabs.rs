@@ -76,8 +76,9 @@ pub enum TabsStyle {
 /// `on_change` fires with the clicked tab's id. `meta` renders the
 /// drawer strip's trailing `.meta` text (service drawer's
 /// "N events · size · M fields"); ignored by the workspace family.
-/// (`meta` is a plain `Option` prop — not `#[prop(optional)]` — so
-/// [`Drawer`](crate::Drawer) can forward its own optional straight
+/// (`meta` is a reactive optional — `MaybeProp` — so live counts tick
+/// (issue #33 D7) while static Strings still convert via `into`, and
+/// [`Drawer`](crate::Drawer) forwards its own optional straight
 /// through.)
 #[component]
 pub fn Tabs(
@@ -85,7 +86,7 @@ pub fn Tabs(
     items: Vec<TabItem>,
     #[prop(into)] active: Signal<String>,
     on_change: Callback<String>,
-    #[prop(default = None)] meta: Option<String>,
+    #[prop(into, optional)] meta: MaybeProp<String>,
 ) -> impl IntoView {
     match style {
         TabsStyle::Workspace => view! {
@@ -119,7 +120,7 @@ pub fn Tabs(
                     }
                 }).collect_view()}
                 <span class="sp"></span>
-                {meta.map(|m| view! { <span class="meta">{m}</span> })}
+                {move || meta.get().map(|m| view! { <span class="meta">{m}</span> })}
             </div>
         }
         .into_any(),
