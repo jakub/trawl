@@ -37,7 +37,9 @@ use crate::error::ServerError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// Full access — key management, server config, queries, schema.
+    /// Full access — server config, queries, schema, and every other
+    /// trawld capability. Note trawld exposes no key-management endpoint;
+    /// key lifecycle lives in `fleet-admin` against the postgres keystore.
     Admin,
     /// Power user — query execution, schema, saved queries, export, streaming.
     Analyst,
@@ -64,7 +66,10 @@ pub enum Permission {
     Stream,
     /// Cancel running queries (own queries; admin can cancel any via `ServerManage`).
     QueryCancel,
-    /// Manage API keys (create, list, revoke).
+    /// Historical key-management grant, retained for grant-string and role
+    /// parity. trawld exposes no key-management endpoint — key lifecycle
+    /// (create, list, revoke) lives in `fleet-admin` against the postgres
+    /// keystore, so no handler or route checks this permission.
     KeyManage,
     /// Manage server configuration and view stats.
     ServerManage,
