@@ -27,7 +27,8 @@
 //! [`toast::kinds`], [`toast::stack`], [`button::variant`],
 //! [`login::validate`], [`badge::tone`], [`status_dot::tone`],
 //! [`sparkline::geometry`], [`loaded::state`], [`load_more`]'s phase
-//! resolution, [`modal::confirm_state`], the [`overlay`] stack, the
+//! resolution, [`copy_button`]'s toast decision,
+//! [`modal::confirm_state`], the [`overlay`] stack, the
 //! [`time`] formatters, and the [`icon::Icon`] enum — so their
 //! contracts (localStorage JSON, CSS-class composition, state
 //! machines, canonical copy, focus ownership, timestamp buckets) are
