@@ -69,6 +69,7 @@ default = ["bundled"]
 bundled = ["duckdb/bundled", "trawl-engine/bundled"]
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 trawl-auth = { workspace = true }
 fleet-auth = { workspace = true, features = ["axum", "fast-hash", "test-support"] }
 trawl-client = { workspace = true }
