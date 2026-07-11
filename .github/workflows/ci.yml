@@ -51,9 +51,12 @@ jobs:
     # and drops an ephemeral per-test database, so the role must have
     # CREATEDB. CI uses a throwaway postgres:18 container (the default
     # `postgres` superuser has CREATEDB); local-dev and the homelab
-    # dev/prod environments use CNPG. Schema migrations are applied
-    # per-test by the shared PgFixture (fleet_auth::test_support) — there
-    # is no separate migration step to run against the service container.
+    # dev/prod environments use CNPG. An explicit `fleet-admin migrate`
+    # step (below) applies the embedded schema to the service container —
+    # this spells out the migration step and exercises the exact
+    # deploy-time command the helm init container runs against a live
+    # postgres. The per-test PgFixture (fleet_auth::test_support) then
+    # migrates each ephemeral database independently.
     name: test
     runs-on: k8s-big
     services:
@@ -77,6 +80,15 @@ jobs:
           shared-key: test
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
       - run: cargo clean -p libduckdb-sys 2>/dev/null || true
+      # Explicit migration step: run the operational `fleet-admin migrate`
+      # command against the service container. Spells out AC10's migration
+      # step and exercises the exact deploy-time command the helm init
+      # container runs (AC11) against a live postgres. fleet-admin has no
+      # duckdb dependency, so no DUCKDB_DOWNLOAD_LIB is needed here.
+      - name: Apply fleet-auth schema migrations
+        run: cargo run -p fleet-admin -- migrate
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # FEATURE TRAP: --no-default-features also strips fleet-auth's default
       # `keystore`/`test-support` features when it is built as a selected
       # workspace package, silently compiling out its pg test files. The
