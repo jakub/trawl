@@ -109,9 +109,9 @@ pub struct AuthState {
 #[derive(Debug, Clone)]
 pub struct CachedAuthPing {
     /// Ping outcome: `Ok(())` on success, `Err(msg)` on failure/timeout.
-    pub result: Result<(), String>,
+    result: Result<(), String>,
     /// When this ping was performed.
-    pub checked_at: Instant,
+    checked_at: Instant,
 }
 
 impl AuthState {
