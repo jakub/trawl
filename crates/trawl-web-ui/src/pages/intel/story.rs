@@ -9,9 +9,10 @@ use coastwatch_api_types::enums::{
     Modality, Polarity, SourceClass, StoryClaimRelationship, StoryRelation,
 };
 use coastwatch_api_types::marking::MarkingView;
+use coastwatch_api_types::pagination::ItemBody;
 use coastwatch_api_types::pagination::PaginatedBody;
 use coastwatch_api_types::story::{
-    StoryClaimView, StoryRelationView, TimeRange, TimelineEventView,
+    StoryClaimView, StoryRelationView, StoryView, TimeRange, TimelineEventView,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -21,10 +22,11 @@ use crate::api;
 use crate::api::{ApiError, MeResponse};
 use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
 use crate::components::linkage_graph::LinkageGraph;
+use crate::components::tone_for_var;
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, Variant};
+use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, Tone, Variant};
 
-use super::stories::{class_label, state_badge};
+use super::stories::{class_label, marking_tone, state_badge};
 
 #[derive(Clone, PartialEq)]
 struct HeaderMeta {
@@ -72,28 +74,16 @@ pub fn StoryPage() -> impl IntoView {
 
     view! {
         <div class="page">
-            {move || match story_resource.get() {
-                None => view! {
-                    <div class="page-hd compact">
-                        <div><h1 class="mono" style="color:var(--ink-3)">"loading\u{2026}"</h1></div>
-                    </div>
-                }.into_any(),
-                Some(Err(ref e)) => {
-                    let msg = match e {
+            <Loaded
+                state=Signal::derive(move || {
+                    LoadState::from_resource_with(story_resource.get(), |e| match e {
                         ApiError::Status(404) => "story not found".to_string(),
                         ApiError::Status(503) => "intel service unavailable".to_string(),
-                        other => format!("error: {other}"),
-                    };
-                    view! {
-                        <div class="page-hd compact">
-                            <div>
-                                <h1 style="color:var(--red)">{msg}</h1>
-                                <p class="sub">"The story may not exist or you may not have permission to view it."</p>
-                            </div>
-                        </div>
-                    }.into_any()
-                }
-                Some(Ok(ref body)) => {
+                        other => other.to_string(),
+                    })
+                })
+                label="story"
+                render=Box::new(move |body: ItemBody<StoryView>| {
                     let story = &body.data;
                     let (state_label, state_color) = state_badge(&story.state);
                     let cls = class_label(&story.story_class);
@@ -147,8 +137,8 @@ pub fn StoryPage() -> impl IntoView {
                             relations=Signal::derive(move || relations_for_graph.get())
                         />
                     }.into_any()
-                }
-            }}
+                })
+            />
         </div>
     }
 }
@@ -179,22 +169,17 @@ fn StoryHeader(
             <div style="display:flex;flex-direction:column;gap:6px">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                     <h1 style="margin:0">{title}</h1>
-                    <span
-                        class="intel-badge"
-                        style=format!("background:var({state_color}-wash,var(--panel-2));color:var({state_color})")
-                    >{state_label}</span>
-                    <span class="intel-badge" style="background:var(--panel-2);color:var(--blue)">{class_label}</span>
+                    <Badge tone=tone_for_var(state_color)>{state_label}</Badge>
+                    <Badge tone=Tone::Info>{class_label}</Badge>
                     {markings.into_iter().map(|m| {
-                        let (bg, fg) = marking_colors(&m);
+                        let tone = marking_tone(&m);
                         let label = if m.scheme.eq_ignore_ascii_case("TLP") {
                             format!("TLP:{}", m.value.to_uppercase())
                         } else {
                             format!("{}:{}", m.scheme, m.value)
                         };
                         view! {
-                            <span class="intel-badge" style=format!("background:{bg};color:{fg};font-weight:600")>
-                                {label}
-                            </span>
+                            <Badge tone=tone>{label}</Badge>
                         }
                     }).collect::<Vec<_>>()}
                     {(!score.is_empty()).then(|| view! {
@@ -377,18 +362,14 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
     view! {
         <div>
             <div class="intel-section-hd" style="margin-top:0">"Timeline"</div>
-            {move || {
-                if loading.get() && items.get().is_empty() {
-                    return view! {
-                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
-                    }.into_any();
-                }
-                if let Some(ref e) = error.get() {
-                    return view! {
-                        <p class="mono" style="color:var(--red);font-size:var(--table-fs)">{e.clone()}</p>
-                    }.into_any();
-                }
-                let rows = items.get();
+            <Loaded
+                state=Signal::derive(move || {
+                    LoadState::from_parts(loading.get() && items.get().is_empty(), error.get(), || {
+                        items.get()
+                    })
+                })
+                label="timeline"
+                render=Box::new(move |rows: Vec<TimelineEventView>| {
                 if rows.is_empty() {
                     return view! {
                         <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no timeline events yet"</p>
@@ -413,9 +394,7 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                                         style=format!("background:var({delta_color})")
                                     />
                                     <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
-                                        <span class="intel-badge"
-                                            style=format!("background:var({delta_color}-wash,var(--panel-2));color:var({delta_color})")
-                                        >{delta_label}</span>
+                                        <Badge tone=tone_for_var(delta_color)>{delta_label}</Badge>
                                         <span class="v-timeline-when" title=ev.occurred_at.clone()>{when}</span>
                                     </div>
                                     <div class="v-timeline-summary">{ev.summary}</div>
@@ -440,7 +419,8 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                         }
                     })}
                 }.into_any()
-            }}
+            })
+            />
         </div>
     }
 }
@@ -493,42 +473,36 @@ fn StoryLineage(story_id: String, now_ms: i64) -> impl IntoView {
 
     view! {
         <div style="margin-top:12px">
-            {move || {
-                if loading.get() {
-                    return view! {
-                        <div class="intel-section-hd">"Lineage"</div>
-                        <span class="mono" style="font-size:11px;color:var(--ink-3)">"loading\u{2026}"</span>
-                    }.into_any();
-                }
-                if let Some(ref e) = error.get() {
-                    return view! {
-                        <div class="intel-section-hd">"Lineage"</div>
-                        <span class="mono" style="font-size:11px;color:var(--red)">{format!("error: {e}")}</span>
-                    }.into_any();
-                }
-                let anc = ancestors.get();
-                let desc = descendants.get();
-                if anc.is_empty() && desc.is_empty() {
-                    return view! {
-                        <div class="intel-section-hd">"Lineage"</div>
-                        <p class="mono" style="font-size:11px;color:var(--ink-3);margin:4px 0">"no derivation history"</p>
-                    }.into_any();
-                }
-                view! {
-                    <LineageTree
-                        label="Sources"
-                        nodes=anc
-                        can_write=can_write.get()
-                        now_ms=now_ms
-                    />
-                    <LineageTree
-                        label="Derived"
-                        nodes=desc
-                        can_write=can_write.get()
-                        now_ms=now_ms
-                    />
-                }.into_any()
-            }}
+            <div class="intel-section-hd">"Lineage"</div>
+            <Loaded
+                state=Signal::derive(move || {
+                    LoadState::from_parts(loading.get(), error.get(), || {
+                        (ancestors.get(), descendants.get())
+                    })
+                })
+                label="lineage"
+                render=Box::new(move |(anc, desc): (Vec<LineageNode>, Vec<LineageNode>)| {
+                    if anc.is_empty() && desc.is_empty() {
+                        return view! {
+                            <p class="mono" style="font-size:11px;color:var(--ink-3);margin:4px 0">"no derivation history"</p>
+                        }.into_any();
+                    }
+                    view! {
+                        <LineageTree
+                            label="Sources"
+                            nodes=anc
+                            can_write=can_write.get()
+                            now_ms=now_ms
+                        />
+                        <LineageTree
+                            label="Derived"
+                            nodes=desc
+                            can_write=can_write.get()
+                            now_ms=now_ms
+                        />
+                    }.into_any()
+                })
+            />
         </div>
     }
 }
@@ -595,9 +569,7 @@ fn AffectedProductsSection(claims: RwSignal<Vec<StoryClaimView>>, now_ms: i64) -
                                     <div class=format!("tbl-row {row_class}") style="cursor:default">
                                         <div style="flex:2;font-weight:500">{product}</div>
                                         <div style="flex:0 0 80px">
-                                            <span class="intel-badge"
-                                                style=format!("background:var({sev_color}-wash,var(--panel-2));color:var({sev_color})")
-                                            >{sev_label}</span>
+                                            <Badge tone=tone_for_var(sev_color)>{sev_label}</Badge>
                                         </div>
                                         <div style="flex:1;color:var(--ink-2)" class="mono">{versions}</div>
                                         <div style="flex:1">
@@ -683,18 +655,14 @@ fn ClaimsSection(
     view! {
         <div>
             <div class="intel-section-hd">"Claims"</div>
-            {move || {
-                if loading.get() && items.get().is_empty() {
-                    return view! {
-                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
-                    }.into_any();
-                }
-                if let Some(ref e) = error.get() {
-                    return view! {
-                        <p class="mono" style="color:var(--red);font-size:var(--table-fs)">{e.clone()}</p>
-                    }.into_any();
-                }
-                let rows = items.get();
+            <Loaded
+                state=Signal::derive(move || {
+                    LoadState::from_parts(loading.get() && items.get().is_empty(), error.get(), || {
+                        items.get()
+                    })
+                })
+                label="claims"
+                render=Box::new(move |rows: Vec<StoryClaimView>| {
                 if rows.is_empty() {
                     return view! {
                         <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no claims yet"</p>
@@ -749,13 +717,9 @@ fn ClaimsSection(
                                     <div>
                                         <div class="source-group-hd" on:click=on_toggle_source>
                                             <span style="font-weight:600">{display_name}</span>
-                                            <span class="intel-badge" style="background:var(--panel-2);color:var(--ink-3)">
-                                                {sc_display}
-                                            </span>
+                                            <Badge>{sc_display}</Badge>
                                             {(!role_label.is_empty()).then(|| view! {
-                                                <span class="intel-badge"
-                                                    style=format!("background:var({role_color}-wash,var(--panel-2));color:var({role_color})")
-                                                >{role_label}</span>
+                                                <Badge tone=tone_for_var(role_color)>{role_label}</Badge>
                                             })}
                                             <span class="source-group-summary">{type_summary}</span>
                                         </div>
@@ -797,8 +761,7 @@ fn ClaimsSection(
                         {has_more.then(|| {
                             let is_loading = loading.get();
                             view! {
-                                <div class="tbl-foot">
-                                    <span></span>
+                                <Pager summary=String::new()>
                                     <Btn
                                         variant=Variant::Secondary
                                         disabled=is_loading
@@ -806,12 +769,13 @@ fn ClaimsSection(
                                     >
                                         {if is_loading { "loading\u{2026}" } else { "load more" }}
                                     </Btn>
-                                </div>
+                                </Pager>
                             }
                         })}
                     </div>
                 }.into_any()
-            }}
+            })
+            />
         </div>
     }
 }
@@ -904,14 +868,10 @@ fn claim_row(
         <div data-claim-id=data_id>
             <div class=dim_class style=row_style on:click=on_toggle>
                 <div style="flex:0 0 88px">
-                    <span class="intel-badge" style=format!("background:var({rel_color}-wash,var(--panel-2));color:var({rel_color})")>
-                        {rel_label}
-                    </span>
+                    <Badge tone=tone_for_var(rel_color)>{rel_label}</Badge>
                 </div>
                 <div style="flex:0 0 64px">
-                    <span class="intel-badge" style=format!("background:var({pol_color}-wash,var(--panel-2));color:var({pol_color})")>
-                        {pol_label}
-                    </span>
+                    <Badge tone=tone_for_var(pol_color)>{pol_label}</Badge>
                 </div>
                 <div style="flex:2;min-width:0">{claim_type}</div>
                 <div style="flex:0 0 32px;text-align:center">
@@ -941,16 +901,14 @@ fn claim_row(
                             }
                         }).collect::<Vec<_>>()}
                         {claim_markings.into_iter().map(|m| {
-                            let (bg, fg) = marking_colors(&m);
+                            let tone = marking_tone(&m);
                             let label = if m.scheme.eq_ignore_ascii_case("TLP") {
                                 format!("TLP:{}", m.value.to_uppercase())
                             } else {
                                 format!("{}:{}", m.scheme, m.value)
                             };
                             view! {
-                                <span class="intel-badge" style=format!("background:{bg};color:{fg};font-size:9px")>
-                                    {label}
-                                </span>
+                                <Badge tone=tone>{label}</Badge>
                             }
                         }).collect::<Vec<_>>()}
                     </div>
@@ -961,26 +919,23 @@ fn claim_row(
                 if exp.as_deref() != Some(&evidence_id) {
                     return ().into_any();
                 }
-                let cached = evidence_cache.get();
-                match cached.get(&evidence_id) {
-                    None => view! {
-                        <div class="evidence-panel">
-                            <span class="mono" style="color:var(--ink-3)">"loading evidence\u{2026}"</span>
-                        </div>
-                    }.into_any(),
-                    Some(Err(msg)) => view! {
-                        <div class="evidence-panel">
-                            <span class="mono" style="color:var(--red)">{format!("error: {msg}")}</span>
-                        </div>
-                    }.into_any(),
-                    Some(Ok(evs)) if evs.is_empty() => view! {
-                        <div class="evidence-panel">
+                let eid_state = evidence_id.clone();
+                let eid_render = evidence_id.clone();
+                view! {
+                    <div class="evidence-panel">
+                        <Loaded
+                            state=Signal::derive(move || {
+                                LoadState::from_resource(evidence_cache.get().get(&eid_state).cloned())
+                            })
+                            label="evidence"
+                            render=Box::new(move |evs: Vec<ClaimEvidenceView>| {
+                    if evs.is_empty() {
+                        return view! {
                             <span class="mono" style="color:var(--ink-3)">"no evidence records"</span>
-                        </div>
-                    }.into_any(),
-                    Some(Ok(evs)) => {
+                        }.into_any();
+                    }
                         let lineage = lineage_cache.get();
-                        let lineage_view = match lineage.get(&evidence_id) {
+                        let lineage_view = match lineage.get(&eid_render) {
                             Some(Ok((anc, desc))) if !anc.is_empty() || !desc.is_empty() => {
                                 view! {
                                     <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line)">
@@ -1002,7 +957,7 @@ fn claim_row(
                             _ => ().into_any(),
                         };
                         view! {
-                            <div class="evidence-panel">
+                            <div>
                                 {evs.iter().map(|ev| {
                                     let factual = ev.factual_summary.clone()
                                         .unwrap_or_else(|| "\u{2014}".into());
@@ -1028,8 +983,10 @@ fn claim_row(
                                 {lineage_view}
                             </div>
                         }.into_any()
-                    },
-                }
+                            })
+                        />
+                    </div>
+                }.into_any()
             }}
         </div>
     }
@@ -1046,17 +1003,15 @@ fn RelationsSection(
     view! {
         <div>
             <div class="intel-section-hd">"Related stories"</div>
-            {move || match relations.get() {
-                None => view! {
-                    <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"loading\u{2026}"</p>
-                }.into_any(),
-                Some(Err(ref e)) => view! {
-                    <p class="mono" style="color:var(--red);font-size:var(--table-fs)">{e.to_string()}</p>
-                }.into_any(),
-                Some(Ok(ref body)) if body.items.is_empty() => view! {
-                    <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no related stories"</p>
-                }.into_any(),
-                Some(Ok(ref body)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(relations.get()))
+                label="related stories"
+                render=Box::new(move |body: PaginatedBody<StoryRelationView>| {
+                    if body.items.is_empty() {
+                        return view! {
+                            <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no related stories"</p>
+                        }.into_any();
+                    }
                     let current_id = story_id.clone();
                     view! {
                         <div class="tbl" style="margin-bottom:16px">
@@ -1078,9 +1033,7 @@ fn RelationsSection(
                                     view! {
                                         <div class="tbl-row" style="cursor:default">
                                             <div style="flex:0 0 100px">
-                                                <span class="intel-badge" style="background:var(--panel-2);color:var(--ink-2)">
-                                                    {rel_label}
-                                                </span>
+                                                <Badge>{rel_label}</Badge>
                                             </div>
                                             <div style="flex:1">
                                                 <a class="link" href=href>{other_id.clone()}</a>
@@ -1097,8 +1050,8 @@ fn RelationsSection(
                             </div>
                         </div>
                     }.into_any()
-                }
-            }}
+                })
+            />
         </div>
     }
 }
@@ -1413,19 +1366,6 @@ fn summarize_claim_types(claims: &[StoryClaimView]) -> String {
         .map(|(t, n)| format!("{n}\u{00d7} {}", t.replace('_', " ")))
         .collect::<Vec<_>>()
         .join(" \u{00b7} ")
-}
-
-fn marking_colors(m: &MarkingView) -> (&'static str, &'static str) {
-    if m.scheme.eq_ignore_ascii_case("TLP") {
-        match m.value.to_uppercase().as_str() {
-            "RED" => ("var(--red-wash)", "var(--red)"),
-            "AMBER" | "AMBER+STRICT" => ("var(--amber-wash)", "var(--amber)"),
-            "GREEN" => ("rgba(74,125,63,.10)", "var(--green)"),
-            _ => ("var(--panel-2)", "var(--ink-3)"),
-        }
-    } else {
-        ("var(--panel-2)", "var(--ink-2)")
-    }
 }
 
 fn relationship_badge(s: &str) -> (&'static str, &'static str) {

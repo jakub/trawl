@@ -76,8 +76,11 @@ fn custom_properties(css: &str) -> BTreeSet<String> {
 }
 
 /// The class families fleet-ui components render, which moved out of
-/// `main.css`. Kept in sync with `css_chrome_parity.rs`'s fleet-side
-/// presence assertions; here we assert their app-side absence.
+/// `main.css`; here we assert their app-side absence. The fleet-side
+/// presence guards live in two places: the issue #28 chrome rows are
+/// covered by `css_chrome_parity.rs`, and the issue #31 small-widget
+/// rows by `fleet-ui/tests/component_class_contract.rs`'s `emits(...)`
+/// assertions.
 const MOVED_SELECTORS: &[&str] = &[
     ".btn-sm",
     ".btn-xs",
@@ -101,6 +104,70 @@ const MOVED_SELECTORS: &[&str] = &[
     ".sd-tabs .sp",
     ".sd-tabs .meta",
     ".sd-body",
+    // Issue #31 small-widget sweep — moved verbatim (or lightly
+    // generalized) into fleet-ui.css as each widget's consumers
+    // switched to the fleet component.
+    ".sc-spark",
+    ".status-dot",
+    ".status-dot.success",
+    ".status-dot.error",
+    ".status-dot.running",
+    ".toggle",
+    ".toggle input",
+    ".toggle-slider",
+    ".toggle-slider::before",
+    ".toggle input:checked + .toggle-slider",
+    ".toggle input:checked + .toggle-slider::before",
+    ".kbd",
+    ".kbd-inline",
+    ".results-footer",
+    ".results-summary",
+    ".results-pager",
+    ".inp-wrap",
+    ".inp-wrap input",
+    ".btn-icon",
+    ".btn-icon:hover",
+    ".actions-menu",
+    ".actions-menu .item",
+    ".actions-menu .item:hover",
+    ".actions-menu .item.danger",
+    ".actions-menu .item.danger:hover",
+];
+
+/// Selector families the issue #31 unification RETIRED outright: their
+/// markup now renders a fleet-ui component with a DIFFERENT canonical
+/// class (`.bdg`, `.seg`, `.results-footer`, `.status-dot`,
+/// `.load-hint`), or was dead (`.live-badge`). Unlike
+/// [`MOVED_SELECTORS`] these must not exist in EITHER stylesheet —
+/// reappearing anywhere means per-site drift is growing back.
+const RETIRED_SELECTORS: &[&str] = &[
+    ".live-badge",
+    ".live-badge.live",
+    ".live-badge.lagged",
+    ".sd-dot",
+    ".sd-dot.errors",
+    // No timeout tone survived unification: `run_status_tone` folds
+    // timeout into `StatusTone::Error`, so `.status-dot.timeout` renders
+    // nothing and must not creep back into either stylesheet.
+    ".status-dot.timeout",
+    ".run .kbd-inline",
+    ".results-loading",
+    ".results-error",
+    ".export-formats",
+    ".export-formats .fmt-btn",
+    ".export-formats .fmt-btn:last-child",
+    ".export-formats .fmt-btn:hover",
+    ".export-formats .fmt-btn.active",
+    ".seg-mini",
+    ".seg-mini > span",
+    ".seg-mini > span:last-child",
+    ".seg-mini > span.on",
+    ".dr-pop .tabs",
+    ".dr-pop .tabs .t",
+    ".dr-pop .tabs .t.on",
+    ".tbl-foot",
+    ".tbl-foot .pager",
+    ".intel-badge",
 ];
 
 #[test]
@@ -115,6 +182,23 @@ fn moved_selectors_absent_from_app_css() {
         stray.is_empty(),
         "these moved selectors are still defined in main.css (must live only \
          in fleet-ui.css; more-specific app overrides are fine): {stray:?}"
+    );
+}
+
+#[test]
+fn retired_selectors_absent_from_both_stylesheets() {
+    let app = top_level_selectors(APP_CSS);
+    let fleet = top_level_selectors(FLEET_CSS);
+    let stray: Vec<&str> = RETIRED_SELECTORS
+        .iter()
+        .copied()
+        .filter(|sel| app.contains(*sel) || fleet.contains(*sel))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "these selectors were retired by the issue #31 unification (their \
+         surfaces render fleet-ui components with canonical classes) but \
+         are defined again: {stray:?}"
     );
 }
 

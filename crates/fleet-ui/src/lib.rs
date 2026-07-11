@@ -14,20 +14,32 @@
 //! Most modules are wasm32-only — they pull leptos / web-sys / gloo
 //! and only make sense in a browser. The exceptions are [`theme::prefs`],
 //! [`toast::kinds`], [`toast::stack`], [`button::variant`],
-//! [`login::validate`], and the [`icon::Icon`] enum: pure layers that
-//! build on every target so the `localStorage` JSON contract, the toast
-//! CSS-class contract, the toast push/dismiss state machine, the button
-//! CSS-class contract, the login key-validation + error-precedence
-//! contracts, and the icon descriptor can be exercised by native unit
-//! tests (and named by native consumer code). The `IconView` renderer
-//! itself stays wasm32-only.
+//! [`login::validate`], [`badge::tone`], [`status_dot::tone`],
+//! [`sparkline::geometry`], [`loaded::state`],
+//! [`modal::confirm_state`], and the [`icon::Icon`] enum: pure layers
+//! that build on every target so the `localStorage` JSON contract, the
+//! toast CSS-class contract, the toast push/dismiss state machine, the
+//! button/badge/status-dot CSS-class contracts, the login
+//! key-validation + error-precedence contracts, the sparkline scale
+//! math, the tri-state load mapping + canonical copy, the
+//! confirm-dialog lifecycle, and the icon descriptor can be exercised
+//! by native unit tests (and named by native consumer code). The
+//! renderers themselves stay wasm32-only.
 
+pub mod badge;
 pub mod button;
+pub mod loaded;
 pub mod login;
+pub mod modal;
 pub mod overlay;
+pub mod segmented;
+pub mod sparkline;
+pub mod status_dot;
 pub mod theme;
 pub mod toast;
 
+#[cfg(target_arch = "wasm32")]
+pub mod actions_menu;
 #[cfg(target_arch = "wasm32")]
 pub mod drawer;
 #[cfg(target_arch = "wasm32")]
@@ -36,21 +48,37 @@ pub mod error_banner;
 pub mod field;
 pub mod icon;
 #[cfg(target_arch = "wasm32")]
-pub mod modal;
+pub mod kbd;
+#[cfg(target_arch = "wasm32")]
+pub mod pager;
 #[cfg(target_arch = "wasm32")]
 pub mod rail;
+#[cfg(target_arch = "wasm32")]
+pub mod search_input;
 #[cfg(target_arch = "wasm32")]
 pub mod shell;
 #[cfg(target_arch = "wasm32")]
 pub mod tabs;
 #[cfg(target_arch = "wasm32")]
+pub mod toggle;
+#[cfg(target_arch = "wasm32")]
 pub mod topbar;
 
+pub use badge::Tone;
 pub use button::{Size, Variant};
 pub use icon::Icon;
+pub use loaded::LoadState;
+pub use modal::ConfirmState;
+pub use segmented::{SegmentedOption, segmented_class};
+pub use sparkline::SparkPath;
+pub use status_dot::StatusTone;
 pub use theme::{Density, RowStyle, Theme};
 pub use toast::{Toast, ToastKind, ToastStack};
 
+#[cfg(target_arch = "wasm32")]
+pub use actions_menu::{ActionItem, ActionsMenu};
+#[cfg(target_arch = "wasm32")]
+pub use badge::Badge;
 #[cfg(target_arch = "wasm32")]
 pub use button::Btn;
 #[cfg(target_arch = "wasm32")]
@@ -62,18 +90,34 @@ pub use field::{Field, Helper};
 #[cfg(target_arch = "wasm32")]
 pub use icon::IconView;
 #[cfg(target_arch = "wasm32")]
+pub use kbd::Kbd;
+#[cfg(target_arch = "wasm32")]
+pub use loaded::Loaded;
+#[cfg(target_arch = "wasm32")]
 pub use login::Login;
 #[cfg(target_arch = "wasm32")]
 pub use modal::{ConfirmModal, ConfirmWithReasonModal, Modal};
 #[cfg(target_arch = "wasm32")]
+pub use pager::Pager;
+#[cfg(target_arch = "wasm32")]
 pub use rail::{Rail, RailItem};
 #[cfg(target_arch = "wasm32")]
+pub use search_input::SearchInput;
+#[cfg(target_arch = "wasm32")]
+pub use segmented::Segmented;
+#[cfg(target_arch = "wasm32")]
 pub use shell::Shell;
+#[cfg(target_arch = "wasm32")]
+pub use sparkline::Sparkline;
+#[cfg(target_arch = "wasm32")]
+pub use status_dot::StatusDot;
 #[cfg(target_arch = "wasm32")]
 pub use tabs::{TabItem, Tabs, TabsStyle, effective_active};
 #[cfg(target_arch = "wasm32")]
 pub use theme::{UiPrefs, install};
 #[cfg(target_arch = "wasm32")]
 pub use toast::{ToastBus, Toasts};
+#[cfg(target_arch = "wasm32")]
+pub use toggle::Toggle;
 #[cfg(target_arch = "wasm32")]
 pub use topbar::{AppLink, ModeTab, TopBar, UserInfo};

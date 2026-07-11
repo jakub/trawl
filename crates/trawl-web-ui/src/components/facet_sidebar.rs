@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use fleet_ui::{Icon, IconView};
+use fleet_ui::{Icon, IconView, LoadState, Loaded};
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
 
@@ -58,10 +58,13 @@ pub fn FacetSidebar(
                     on:input=move |e| needle.set(event_target_value(&e))
                 />
             </div>
-            {move || match rows.get() {
-                None => view! { <p class="facets-hint">"loading…"</p> }.into_any(),
-                Some(Err(_)) => view! { <p class="facets-hint">"—"</p> }.into_any(),
-                Some(Ok(resp)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(rows.get()))
+                // Deliberate quiet-error override (issue #31 C4): the
+                // results table already surfaces the query failure;
+                // repeating it in the facet rail is noise.
+                error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
+                render=Box::new(move |resp: QueryResponse| {
                     let facets = compute_facets(&resp.result);
                     if facets.is_empty() {
                         return ().into_any();
@@ -166,8 +169,8 @@ pub fn FacetSidebar(
                             </div>
                         }
                     }).collect::<Vec<_>>().into_any()
-                }
-            }}
+                })
+            />
         </aside>
     }
 }

@@ -13,7 +13,7 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Icon, IconView, Size, Variant};
+use fleet_ui::{LoadState, Loaded, Pager, SearchInput, StatusDot};
 
 const RUNS_PAGE_SIZE: usize = 20;
 
@@ -59,14 +59,7 @@ pub fn RunsPage() -> impl IntoView {
                     <p class="sub">"Recent scheduled runs across all nets."</p>
                 </div>
                 <div class="actions">
-                    <div class="inp-wrap">
-                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                        <input
-                            placeholder="filter by net…"
-                            prop:value=move || filter.get()
-                            on:input=move |e| filter.set(event_target_value(&e))
-                        />
-                    </div>
+                    <SearchInput value=filter placeholder="filter by net…"/>
                 </div>
             </div>
 
@@ -122,21 +115,11 @@ pub fn RunsPage() -> impl IntoView {
                     <div style="flex:0 0 50px; text-align:right">"Rows"</div>
                 </div>
                 <div class="tbl-body">
-                    {move || {
-                        let now = now_ms();
-                        match runs.get() {
-                            None => view! {
-                                <div class="tbl-empty">"loading runs…"</div>
-                            }.into_any(),
-                            Some(Err(e)) => {
-                                let msg = e.to_string();
-                                view! {
-                                    <div class="tbl-empty" style="color:var(--red)">
-                                        {format!("couldn't load runs: {msg}")}
-                                    </div>
-                                }.into_any()
-                            }
-                            Some(Ok(resp)) => {
+                    <Loaded
+                        state=Signal::derive(move || LoadState::from_resource(runs.get()))
+                        label="runs"
+                        render=Box::new(move |resp: trawl_api::ListAllRunsResponse| {
+                                let now = now_ms();
                                 if resp.runs.is_empty() {
                                     return view! {
                                         <div class="tbl-empty">
@@ -163,19 +146,14 @@ pub fn RunsPage() -> impl IntoView {
                                     let dur = gr.run.duration_ms.map_or_else(|| "—".to_string(), format_duration);
                                     let row_ct = gr.run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string());
                                     let status = gr.run.status.clone();
-                                    let dot_class = match status.as_str() {
-                                        "success" => "status-dot success",
-                                        "error" | "timeout" => "status-dot error",
-                                        "running" => "status-dot running",
-                                        _ => "status-dot",
-                                    };
+                                    let tone = crate::components::run_status_tone(&status);
                                     let goto = goto.clone();
 
                                     view! {
                                         <div class="tbl-row" on:click=move |_| goto(net_id)>
                                             <div style="flex:1" class="mono">{net_name}</div>
                                             <div style="flex:0 0 70px">
-                                                <span class=dot_class></span>
+                                                <StatusDot tone=tone/>
                                                 " "
                                                 <span style="font-size:11px">{status}</span>
                                             </div>
@@ -188,29 +166,18 @@ pub fn RunsPage() -> impl IntoView {
 
                                 view! {
                                     {rows}
-                                    <div class="tbl-foot">
-                                        <span>{format!("{first}–{last} of {total}")}</span>
-                                        <span style="display:flex; gap:4px">
-                                            <Btn
-                                                variant=Variant::Secondary
-                                                size=Size::Xs
-                                                disabled=Signal::derive(move || page.get() == 0)
-                                                on_click=Callback::new(move |()| {
-                                                    page.update(|p| *p = p.saturating_sub(1));
-                                                })
-                                            >"← prev"</Btn>
-                                            <Btn
-                                                variant=Variant::Secondary
-                                                size=Size::Xs
-                                                disabled=Signal::derive(move || last >= total)
-                                                on_click=Callback::new(move |()| page.update(|p| *p += 1))
-                                            >"next →"</Btn>
-                                        </span>
-                                    </div>
+                                    <Pager
+                                        summary=format!("{first}–{last} of {total}")
+                                        can_prev=Signal::derive(move || page.get() != 0)
+                                        can_next=Signal::derive(move || last < total)
+                                        on_prev=Callback::new(move |()| {
+                                            page.update(|p| *p = p.saturating_sub(1));
+                                        })
+                                        on_next=Callback::new(move |()| page.update(|p| *p += 1))
+                                    />
                                 }.into_any()
-                            }
-                        }
-                    }}
+                        })
+                    />
                 </div>
             </div>
         </div>

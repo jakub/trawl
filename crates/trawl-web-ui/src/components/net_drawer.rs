@@ -14,12 +14,13 @@ use leptos::task::spawn_local;
 use leptos::web_sys;
 use trawl_api::SavedQueryResponse;
 use trawl_api::value::QueryResult;
-use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::components::sparkline::Sparkline;
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Drawer, Size, TabItem, ToastBus, ToastKind, Variant, effective_active};
+use fleet_ui::{
+    Btn, Drawer, LoadState, Loaded, Pager, Size, Sparkline, StatusDot, TabItem, ToastBus,
+    ToastKind, Toggle, Variant, effective_active,
+};
 
 const RUNS_PAGE_SIZE: usize = 20;
 const RESULT_PREVIEW_ROWS: usize = 20;
@@ -403,17 +404,10 @@ fn QuerySchedulePane(
 
                         // enabled toggle
                         <div style="display:flex; align-items:center; gap:8px">
-                            <label class="toggle">
-                                <input
-                                    type="checkbox"
-                                    prop:checked=move || enabled_buf.get()
-                                    on:change=move |e| {
-                                        let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
-                                        enabled_buf.set(el.checked());
-                                    }
-                                />
-                                <span class="toggle-slider"></span>
-                            </label>
+                            <Toggle
+                                checked=enabled_buf
+                                on_change=Callback::new(move |v| enabled_buf.set(v))
+                            />
                             <span style="font-size:12px; color:var(--ink-2)">
                                 {move || if enabled_buf.get() { "Active" } else { "Paused" }}
                             </span>
@@ -488,17 +482,11 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                 }
             }}
 
-            {move || {
-                let now = now_ms();
-                match runs.get() {
-                    None => view! { <div style="padding:12px; color:var(--ink-3)">"loading runs…"</div> }.into_any(),
-                    Some(Err(e)) => {
-                        let msg = e.to_string();
-                        view! {
-                            <div style="padding:12px; color:var(--red)">{format!("couldn't load runs: {msg}")}</div>
-                        }.into_any()
-                    }
-                    Some(Ok(resp)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(runs.get()))
+                label="runs"
+                render=Box::new(move |resp: trawl_api::ListReportRunsResponse| {
+                        let now = now_ms();
                         if resp.runs.is_empty() {
                             return view! {
                                 <div style="padding:12px; color:var(--ink-3)">"no runs yet — attach a schedule to start."</div>
@@ -515,12 +503,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                             let dur = run.duration_ms.map_or_else(|| "—".to_string(), format_duration);
                             let row_ct = run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string());
                             let status = run.status.clone();
-                            let dot_class = match status.as_str() {
-                                "success" => "status-dot success",
-                                "error" | "timeout" => "status-dot error",
-                                "running" => "status-dot running",
-                                _ => "status-dot",
-                            };
+                            let tone = super::run_status_tone(&status);
                             let err_msg = run.error_message.clone().unwrap_or_default();
                             let is_expanded = move || expanded_run.get() == Some(run_id);
 
@@ -535,7 +518,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                 >
                                     <div style="flex:0 0 80px" class="mono">{when}</div>
                                     <div style="flex:0 0 70px">
-                                        <span class=dot_class></span>
+                                        <StatusDot tone=tone/>
                                         " "
                                         <span style="font-size:11px">{status}</span>
                                     </div>
@@ -566,30 +549,19 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                 <div class="tbl-body">
                                     {rows}
                                 </div>
-                                <div class="tbl-foot">
-                                    <span>{format!("{first}–{last} of {total}")}</span>
-                                    <span style="display:flex; gap:4px">
-                                        <Btn
-                                            variant=Variant::Secondary
-                                            size=Size::Xs
-                                            disabled=Signal::derive(move || page.get() == 0)
-                                            on_click=Callback::new(move |()| {
-                                                page.update(|p| *p = p.saturating_sub(1));
-                                            })
-                                        >"← prev"</Btn>
-                                        <Btn
-                                            variant=Variant::Secondary
-                                            size=Size::Xs
-                                            disabled=Signal::derive(move || last >= total)
-                                            on_click=Callback::new(move |()| page.update(|p| *p += 1))
-                                        >"next →"</Btn>
-                                    </span>
-                                </div>
+                                <Pager
+                                    summary=format!("{first}–{last} of {total}")
+                                    can_prev=Signal::derive(move || page.get() != 0)
+                                    can_next=Signal::derive(move || last < total)
+                                    on_prev=Callback::new(move |()| {
+                                        page.update(|p| *p = p.saturating_sub(1));
+                                    })
+                                    on_next=Callback::new(move |()| page.update(|p| *p += 1))
+                                />
                             </div>
                         }.into_any()
-                    }
-                }
-            }}
+                })
+            />
         </div>
     }
 }
@@ -610,13 +582,10 @@ fn RunResultPreview(
 
     view! {
         <div class="run-preview">
-            {move || match result.get() {
-                None => view! { <span style="color:var(--ink-3)">"loading result…"</span> }.into_any(),
-                Some(Err(e)) => {
-                    let msg = e.to_string();
-                    view! { <span style="color:var(--red)">{msg}</span> }.into_any()
-                }
-                Some(Ok(resp)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(result.get()))
+                label="result"
+                render=Box::new(move |resp: trawl_api::ReportRunResponse| {
                     match resp.result {
                         None => view! {
                             <span style="color:var(--ink-3)">"no result data (error or still running)"</span>
@@ -634,8 +603,8 @@ fn RunResultPreview(
                             }.into_any()
                         }
                     }
-                }
-            }}
+                })
+            />
         </div>
     }
 }

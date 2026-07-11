@@ -18,6 +18,10 @@
 //! and the class-toggle idioms. Tab identity is a `&'static str` id;
 //! apps with typed tab enums adapt at the call site (a two-line
 //! id ↔ enum map), keeping app semantics in the app (ADR-0002).
+//!
+//! For exclusive-choice pill strips that aren't view tabs (format
+//! pickers, density toggles), use [`Segmented`](crate::segmented)
+//! instead — a third strip idiom with its own `.seg` family.
 
 use leptos::prelude::*;
 

@@ -24,7 +24,10 @@ use crate::components::service_card::ServiceCard;
 use crate::components::service_card_fmt::today_yesterday_utc;
 use crate::components::service_drawer::ServiceDrawer;
 use crate::state::query::{Mode, RangeSpec, navigator};
-use fleet_ui::{Btn, Icon, IconView, ToastBus, ToastKind, Variant};
+use fleet_ui::{
+    Btn, LoadState, Loaded, SearchInput, Segmented, SegmentedOption, Size, ToastBus, ToastKind,
+    Variant,
+};
 
 #[component]
 #[allow(clippy::too_many_lines)]
@@ -120,8 +123,6 @@ pub fn SchemaPage() -> impl IntoView {
         );
     });
 
-    let toggle_compact = move |val: bool| move |_| compact.set(val);
-
     let (today, yesterday) = today_yesterday_utc();
 
     view! {
@@ -132,42 +133,28 @@ pub fn SchemaPage() -> impl IntoView {
                     <p class="sub">"Click a card to inspect fields, ingest rate, and tail live."</p>
                 </div>
                 <div class="actions">
-                    <div class="inp-wrap">
-                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                        <input
-                            placeholder="filter services…"
-                            prop:value=move || filter.get()
-                            on:input=move |e| filter.set(event_target_value(&e))
-                        />
-                    </div>
-                    <div class="seg-mini" title="Card density">
-                        <span
-                            class=move || if compact.get() { "" } else { "on" }
-                            on:click=toggle_compact(false)
-                        >"Comfy"</span>
-                        <span
-                            class=move || if compact.get() { "on" } else { "" }
-                            on:click=toggle_compact(true)
-                        >"Compact"</span>
-                    </div>
+                    <SearchInput value=filter placeholder="filter services…"/>
+                    <Segmented
+                        size=Size::Sm
+                        options=vec![
+                            SegmentedOption::new("comfy", "Comfy"),
+                            SegmentedOption::new("compact", "Compact"),
+                        ]
+                        active=Signal::derive(move || {
+                            if compact.get() { "compact" } else { "comfy" }.to_string()
+                        })
+                        on_change=Callback::new(move |id: String| compact.set(id == "compact"))
+                        attr:title="Card density"
+                    />
                     <Btn variant=Variant::Primary on_click=on_new_extractor>"+ New extractor"</Btn>
                 </div>
             </div>
 
             <div class=move || if compact.get() { "sc-grid compact" } else { "sc-grid" }>
-                {move || match services.get() {
-                    None => view! {
-                        <div class="sc-more" style="padding:24px">"loading schema…"</div>
-                    }.into_any(),
-                    Some(Err(e)) => {
-                        let msg = e.to_string();
-                        view! {
-                            <div class="sc-more" style="padding:24px; color:var(--red)">
-                                {format!("couldn't load schema: {msg}")}
-                            </div>
-                        }.into_any()
-                    }
-                    Some(Ok(resp)) => {
+                <Loaded
+                    state=Signal::derive(move || LoadState::from_resource(services.get()))
+                    label="schema"
+                    render=Box::new(move |resp: trawl_api::ServiceSchemaResponse| {
                         let needle = filter.get().to_lowercase();
                         let visible: Vec<ServiceSchema> = resp.services.iter()
                             .filter(|s| {
@@ -208,8 +195,8 @@ pub fn SchemaPage() -> impl IntoView {
                                 />
                             }
                         }).collect::<Vec<_>>().into_any()
-                    }
-                }}
+                    })
+                />
             </div>
 
             {move || {

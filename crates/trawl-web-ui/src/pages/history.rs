@@ -23,7 +23,7 @@ use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, Icon, IconView, Size, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind, Variant};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -123,14 +123,7 @@ pub fn HistoryPage() -> impl IntoView {
                     <p class="sub">"Every query you've cast. Re-run the net anytime."</p>
                 </div>
                 <div class="actions">
-                    <div class="inp-wrap">
-                        <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                        <input
-                            placeholder="filter history…"
-                            prop:value=move || filter.get()
-                            on:input=move |e| filter.set(event_target_value(&e))
-                        />
-                    </div>
+                    <SearchInput value=filter placeholder="filter history…"/>
                     <Btn variant=Variant::Secondary on_click=on_export>"Export"</Btn>
                     <Btn variant=Variant::Secondary on_click=on_clear>"Clear History"</Btn>
                 </div>
@@ -145,23 +138,10 @@ pub fn HistoryPage() -> impl IntoView {
                     <div style="flex:0 0 72px; text-align:right"></div>
                 </div>
                 <div class="tbl-body">
-                {move || match resource.get() {
-                    None => view! {
-                        <div class="tbl-row" style="cursor:default">
-                            <span class="mono" style="color:var(--ink-3)">"loading…"</span>
-                        </div>
-                    }.into_any(),
-                    Some(Err(e)) => {
-                        let msg = e.to_string();
-                        view! {
-                            <div class="tbl-row" style="cursor:default">
-                                <span class="mono" style="color:var(--red)">
-                                    {format!("couldn't load history: {msg}")}
-                                </span>
-                            </div>
-                        }.into_any()
-                    }
-                    Some(Ok(resp)) => {
+                <Loaded
+                    state=Signal::derive(move || LoadState::from_resource(resource.get()))
+                    label="history"
+                    render=Box::new(move |resp: trawl_api::HistoryResponse| {
                         let needle = filter.get().to_lowercase();
                         let filtered: Vec<HistoryEntryResponse> = resp
                             .entries
@@ -220,8 +200,8 @@ pub fn HistoryPage() -> impl IntoView {
                                 </div>
                             }
                         }).collect::<Vec<_>>().into_any()
-                    }
-                }}
+                    })
+                />
                 </div>
 
                 {move || {
@@ -241,13 +221,13 @@ pub fn HistoryPage() -> impl IntoView {
                         format!("{first}–{last} of {total}")
                     };
                     view! {
-                        <div class="tbl-foot">
-                            <span>{summary}</span>
-                            <div class="pager">
-                                <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_prev on_click=on_prev>"← prev"</Btn>
-                                <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_next on_click=on_next>"next →"</Btn>
-                            </div>
-                        </div>
+                        <Pager
+                            summary=summary
+                            can_prev=Signal::from(can_prev)
+                            can_next=Signal::from(can_next)
+                            on_prev=on_prev
+                            on_next=on_next
+                        />
                     }.into_any()
                 }}
             </div>

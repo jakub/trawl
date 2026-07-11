@@ -13,7 +13,7 @@
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::clipboard::write_clipboard;
 use crate::state::query::{Filter, FilterOp};
-use fleet_ui::{Btn, Size, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::cmp::Ordering;
@@ -38,9 +38,10 @@ pub fn ResultsTable(
     let bus = expect_context::<ToastBus>();
     view! {
         <div class="results">
-            {move || match rows.get() {
-                None => view! { <div class="results-loading">"loading…"</div> }.into_any(),
-                Some(Ok(resp)) => view! {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(rows.get()))
+                label="results"
+                render=Box::new(move |resp: QueryResponse| view! {
                     <ResultsTableBody
                         resp=resp
                         page=page
@@ -49,13 +50,8 @@ pub fn ResultsTable(
                         on_navigate=on_navigate
                         bus=bus
                     />
-                }.into_any(),
-                Some(Err(err)) => view! {
-                    <div class="results-error">
-                        {format!("query failed: {err}")}
-                    </div>
-                }.into_any(),
-            }}
+                }.into_any())
+            />
         </div>
     }
 }
@@ -164,21 +160,19 @@ fn ResultsTableBody(
                     </tbody>
                 </table>
             </div>
-            <footer class="results-footer">
-                <span class="results-summary">
-                    {format!(
-                        "page {} · showing {} {}",
-                        cur_page + 1,
-                        returned,
-                        if returned == 1 { "row" } else { "rows" },
-                    )}
-                    {if truncated { " (truncated)" } else { "" }}
-                </span>
-                <div class="results-pager">
-                    <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_prev on_click=on_prev>"← prev"</Btn>
-                    <Btn variant=Variant::Secondary size=Size::Sm disabled=!can_next on_click=on_next>"next →"</Btn>
-                </div>
-            </footer>
+            <Pager
+                summary=format!(
+                    "page {} · showing {} {}{}",
+                    cur_page + 1,
+                    returned,
+                    if returned == 1 { "row" } else { "rows" },
+                    if truncated { " (truncated)" } else { "" },
+                )
+                can_prev=Signal::from(can_prev)
+                can_next=Signal::from(can_next)
+                on_prev=on_prev
+                on_next=on_next
+            />
         </>
     }
     .into_any()

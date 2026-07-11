@@ -24,7 +24,7 @@ use leptos::web_sys;
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use fleet_ui::{Btn, Field, Icon, Modal, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Field, Icon, Kbd, Modal, ToastBus, ToastKind, Variant};
 
 #[component]
 #[allow(clippy::needless_pass_by_value)] // Leptos component props: easier to pass owned
@@ -92,10 +92,10 @@ pub fn SaveAsNetModal(
             on_submit=do_save
             footer=Box::new(move || view! {
                 <div class="hint">
-                    <span class="kbd">"⏎"</span>
+                    <Kbd>"⏎"</Kbd>
                     " save"
                     <span style="opacity:.5">"·"</span>
-                    <span class="kbd">"Esc"</span>
+                    <Kbd>"Esc"</Kbd>
                     " cancel"
                 </div>
                 <Btn variant=Variant::Secondary on_click=cancel>"Cancel"</Btn>

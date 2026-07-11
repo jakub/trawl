@@ -29,7 +29,8 @@ use trawl_api::{QueryResponse, ServiceColumnStats, ServiceSchema};
 use crate::api;
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
 use fleet_ui::{
-    Btn, Drawer, Icon, IconView, TabItem, ToastBus, ToastKind, Variant, effective_active,
+    Btn, Drawer, Icon, IconView, LoadState, Loaded, TabItem, ToastBus, ToastKind, Variant,
+    effective_active,
 };
 
 /// Display cap for the live-tail viewport — keeps the DOM snappy. The
@@ -102,7 +103,7 @@ pub fn ServiceDrawer(
             close_size=12
             meta=meta_text
             title=Box::new(move || view! {
-                <StatusDot svc=svc_for_head.clone()/>
+                <HealthDot svc=svc_for_head.clone()/>
                 <span class="name">{svc_for_head.name.clone()}</span>
                 {(!sub_text.is_empty()).then_some(view! {
                     <span class="sub">{sub_text}</span>
@@ -182,16 +183,10 @@ fn OverviewPane(
 
             <div class="sd-card top">
                 <div class="ttl">"Top fields by cardinality"</div>
-                {move || match cardinality.get() {
-                    None => view! {
-                        <div class="sc-more">"computing…"</div>
-                    }.into_any(),
-                    Some(Err(msg)) => view! {
-                        <div class="sc-more" style="color:var(--red)">
-                            {format!("couldn't compute cardinality: {msg}")}
-                        </div>
-                    }.into_any(),
-                    Some(Ok(card_map)) => {
+                <Loaded
+                    state=Signal::derive(move || LoadState::from_resource(cardinality.get()))
+                    label="cardinality"
+                    render=Box::new(move |card_map: HashMap<String, u64>| {
                         let rows = top_cardinality_rows(&columns_for_top, &card_map, TOP_CARDINALITY_ROWS);
                         if rows.is_empty() {
                             return view! {
@@ -216,8 +211,8 @@ fn OverviewPane(
                                 </div>
                             }
                         }).collect::<Vec<_>>().into_any()
-                    }
-                }}
+                    })
+                />
             </div>
         </div>
     }
@@ -408,16 +403,10 @@ fn FieldDetail(
         <div class="sf-detail">
             <div class="sfd-col">
                 <div class="lb">"Top values"</div>
-                {move || match top.get() {
-                    None => view! {
-                        <div class="sc-more">"sampling…"</div>
-                    }.into_any(),
-                    Some(Err(e)) => view! {
-                        <div class="sc-more" style="color:var(--red)">
-                            {format!("couldn't sample: {e}")}
-                        </div>
-                    }.into_any(),
-                    Some(Ok(resp)) => {
+                <Loaded
+                    state=Signal::derive(move || LoadState::from_resource(top.get()))
+                    label="values"
+                    render=Box::new(move |resp: QueryResponse| {
                         let rows = parse_top_values(&resp, &field_name);
                         if rows.is_empty() {
                             return view! {
@@ -439,8 +428,8 @@ fn FieldDetail(
                                 </div>
                             }
                         }).collect::<Vec<_>>().into_any()
-                    }
-                }}
+                    })
+                />
             </div>
 
             <div class="sfd-col">
@@ -712,16 +701,10 @@ fn top_cardinality_rows(
 fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>) -> impl IntoView {
     view! {
         <div class="ig-chart">
-            {move || match resource.get() {
-                None => view! {
-                    <div class="sc-more">"loading…"</div>
-                }.into_any(),
-                Some(Err(e)) => view! {
-                    <div class="sc-more" style="color:var(--red)">
-                        {format!("couldn't load histogram: {e}")}
-                    </div>
-                }.into_any(),
-                Some(Ok(resp)) => {
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(resource.get()))
+                label="histogram"
+                render=Box::new(move |resp: QueryResponse| {
                     let bars = build_histogram(&resp);
                     if bars.is_empty() {
                         return view! {
@@ -751,8 +734,8 @@ fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>)
                             </div>
                         </>
                     }.into_any()
-                }
-            }}
+                })
+            />
         </div>
     }
 }
@@ -866,12 +849,12 @@ fn FieldTypeDonut(segments: Vec<DonutSegment>, total: usize) -> impl IntoView {
 
 #[component]
 #[allow(clippy::needless_pass_by_value)]
-fn StatusDot(svc: ServiceSchema) -> impl IntoView {
+fn HealthDot(svc: ServiceSchema) -> impl IntoView {
     let (today, yesterday) = super::service_card_fmt::today_yesterday_utc();
-    let class = if super::service_card_fmt::is_healthy(&svc, &today, &yesterday) {
-        "sd-dot"
+    let tone = if super::service_card_fmt::is_healthy(&svc, &today, &yesterday) {
+        fleet_ui::StatusTone::Success
     } else {
-        "sd-dot errors"
+        fleet_ui::StatusTone::Error
     };
-    view! { <span class=class></span> }
+    view! { <fleet_ui::StatusDot tone=tone/> }
 }

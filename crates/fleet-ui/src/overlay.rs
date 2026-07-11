@@ -60,8 +60,9 @@ impl OverlayLayer {
 }
 
 /// Push a new topmost overlay layer onto the arbitration stack.
+#[cfg(any(target_arch = "wasm32", test))]
 #[must_use]
-pub fn push_overlay() -> OverlayLayer {
+pub(crate) fn push_overlay() -> OverlayLayer {
     let id = NEXT_ID.with_borrow_mut(|n| {
         let id = *n;
         *n += 1;
@@ -101,6 +102,22 @@ mod tests {
         b.release();
         assert!(a.is_topmost(), "release exposes the layer beneath");
         a.release();
+    }
+
+    #[test]
+    fn menu_under_modal_yields_escape_to_the_modal_only() {
+        // Issue #31 C5: an open ActionsMenu is an overlay layer like any
+        // other. When a ConfirmModal (or Drawer) stacks above it, only
+        // the modal is Escape-eligible; when the modal closes, the menu
+        // becomes topmost again and takes the next Escape.
+        let menu = push_overlay();
+        let modal = push_overlay();
+        assert!(modal.is_topmost(), "stacked modal takes Escape");
+        assert!(!menu.is_topmost(), "shadowed menu must not also close");
+
+        modal.release();
+        assert!(menu.is_topmost(), "menu regains Escape after the modal");
+        menu.release();
     }
 
     #[test]

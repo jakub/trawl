@@ -15,8 +15,11 @@ use crate::components::lineage_tree::{
     LineageNode, LineageTree, can_write_derivations, render_derivation_meta, render_marking_diff,
     transformation_color,
 };
+use crate::components::tone_for_var;
 use crate::time_fmt::time_ago;
-use fleet_ui::{Btn, ConfirmWithReasonModal, ToastBus, ToastKind, Variant};
+use fleet_ui::{
+    Badge, Btn, ConfirmState, ConfirmWithReasonModal, Pager, ToastBus, ToastKind, Tone, Variant,
+};
 
 const OBJECT_TYPES: &[&str] = &[
     "story",
@@ -53,8 +56,11 @@ pub fn DerivationsPage() -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let loaded_object = RwSignal::new(None::<(String, String)>);
 
-    let invalidate_target = RwSignal::new(None::<String>);
-    let retract_modal = RwSignal::new(false);
+    // Open/close plumbing via the natively-tested fleet_ui::ConfirmState
+    // (issue #31); the ConfirmWithReasonModal composition stays app-side
+    // (ADR-0002). Payloads carry exactly what each confirm needs.
+    let invalidate_target = RwSignal::new(ConfirmState::<String>::default());
+    let retract_confirm = RwSignal::new(ConfirmState::<(String, String)>::default());
     let refresh = RwSignal::new(0u64);
 
     #[allow(clippy::cast_possible_truncation)]
@@ -156,7 +162,7 @@ pub fn DerivationsPage() -> impl IntoView {
     };
 
     let on_invalidate = Callback::new(move |drv_id: String| {
-        invalidate_target.set(Some(drv_id));
+        invalidate_target.update(|c| c.request(drv_id));
     });
 
     let on_load_more_edges = move |_| {
@@ -216,15 +222,18 @@ pub fn DerivationsPage() -> impl IntoView {
                 <Btn variant=Variant::Primary on_click=Callback::new(on_submit_click)>"Load lineage"</Btn>
             </div>
 
-            // Loading / error
+            // Loading / error — the canonical fleet-ui hint class + copy,
+            // rendered directly (not via <Loaded/>) because this page
+            // shows the indicators ABOVE content that stays visible
+            // while a reload is in flight.
             {move || loading.get().then(|| view! {
                 <div style="padding:0 var(--pad)">
-                    <span class="mono" style="color:var(--ink-3)">"loading\u{2026}"</span>
+                    <div class="load-hint">{fleet_ui::loaded::loading_copy(Some("lineage"))}</div>
                 </div>
             })}
             {move || error.get().map(|e| view! {
                 <div style="padding:0 var(--pad)">
-                    <span class="mono" style="color:var(--red)">{format!("error: {e}")}</span>
+                    <div class="load-hint error">{fleet_ui::loaded::error_copy(Some("lineage"), &e)}</div>
                 </div>
             })}
 
@@ -289,14 +298,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                     view! {
                                         <div class="tbl-row" style=row_style title=inv_reason>
                                             <div style="flex:0 0 100px">
-                                                <span
-                                                    class="intel-badge"
-                                                    style=format!(
-                                                        "background:var({t_color}-wash,var(--panel-2));color:var({t_color})"
-                                                    )
-                                                >
-                                                    {t_label}
-                                                </span>
+                                                <Badge tone=tone_for_var(t_color)>{t_label}</Badge>
                                             </div>
                                             <div class="mono" style="flex:1;font-size:10px;color:var(--ink-2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
                                                 {source}" \u{2192} "{derived}
@@ -310,9 +312,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                             </div>
                                             {is_inv.then(|| view! {
                                                 <div style="flex:0 0 70px;text-align:right">
-                                                    <span class="intel-badge" style="background:var(--red-wash);color:var(--red)">
-                                                        "invalidated"
-                                                    </span>
+                                                    <Badge tone=Tone::Danger>"invalidated"</Badge>
                                                 </div>
                                             })}
                                         </div>
@@ -322,8 +322,7 @@ pub fn DerivationsPage() -> impl IntoView {
                             {move || edges_cursor.get().map(|_| {
                                 let is_loading = loading.get();
                                 view! {
-                                    <div class="tbl-foot">
-                                        <span></span>
+                                    <Pager summary=String::new()>
                                         <Btn
                                             variant=Variant::Secondary
                                             disabled=is_loading
@@ -331,7 +330,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                         >
                                             {if is_loading { "loading\u{2026}" } else { "load more" }}
                                         </Btn>
-                                    </div>
+                                    </Pager>
                                 }
                             })}
                         </div>
@@ -342,7 +341,7 @@ pub fn DerivationsPage() -> impl IntoView {
             // Retraction section
             {move || {
                 let obj = loaded_object.get();
-                let _obj = obj.as_ref()?;
+                let (ot, oid) = obj.as_ref()?.clone();
                 let desc_count = descendants.get().len();
                 Some(view! {
                     <div style="padding:0 var(--pad);margin-top:16px">
@@ -357,7 +356,9 @@ pub fn DerivationsPage() -> impl IntoView {
                             view! {
                                 <Btn
                                     variant=Variant::Danger
-                                    on_click=Callback::new(move |()| retract_modal.set(true))
+                                    on_click=Callback::new(move |()| {
+                                        retract_confirm.update(|c| c.request((ot.clone(), oid.clone())));
+                                    })
                                 >
                                     "Retract source object"
                                 </Btn>
@@ -378,9 +379,8 @@ pub fn DerivationsPage() -> impl IntoView {
             }}
 
             // Invalidation confirm modal
-            {move || invalidate_target.get().map(|drv_id| {
+            {move || invalidate_target.get().pending().cloned().map(|drv_id| {
                 let bus = bus.clone();
-                let id_for_confirm = drv_id.clone();
                 view! {
                     <ConfirmWithReasonModal
                         title="Invalidate derivation"
@@ -388,29 +388,30 @@ pub fn DerivationsPage() -> impl IntoView {
                         confirm_label="Invalidate"
                         reason_placeholder="Reason for invalidation"
                         on_confirm=Callback::new(move |reason: String| {
-                            let id = id_for_confirm.clone();
                             let bus = bus.clone();
-                            invalidate_target.set(None);
-                            spawn_local(async move {
-                                match api::intel::invalidate_derivation(&id, &reason).await {
-                                    Ok(()) => {
-                                        bus.push(ToastKind::Success, format!("invalidated {id}"), None);
-                                        refresh.update(|r| *r += 1);
+                            // take() closes the dialog and yields the payload once.
+                            if let Some(id) =
+                                invalidate_target.try_update(|c| c.take()).flatten()
+                            {
+                                spawn_local(async move {
+                                    match api::intel::invalidate_derivation(&id, &reason).await {
+                                        Ok(()) => {
+                                            bus.push(ToastKind::Success, format!("invalidated {id}"), None);
+                                            refresh.update(|r| *r += 1);
+                                        }
+                                        Err(e) => bus.push(ToastKind::Error, e.to_string(), None),
                                     }
-                                    Err(e) => bus.push(ToastKind::Error, e.to_string(), None),
-                                }
-                            });
+                                });
+                            }
                         })
-                        on_cancel=Callback::new(move |()| invalidate_target.set(None))
+                        on_cancel=Callback::new(move |()| invalidate_target.update(|c| c.cancel()))
                     />
                 }
             })}
 
             // Retraction confirm modal
-            {move || retract_modal.get().then(|| {
+            {move || retract_confirm.get().pending().cloned().map(|(ot, oid)| {
                 let bus = bus.clone();
-                let obj = loaded_object.get_untracked();
-                let (ot, oid) = obj.unwrap_or_default();
                 view! {
                     <ConfirmWithReasonModal
                         title="Retract source"
@@ -420,27 +421,29 @@ pub fn DerivationsPage() -> impl IntoView {
                         confirm_label="Confirm retraction"
                         reason_placeholder="Reason for retraction"
                         on_confirm=Callback::new(move |reason: String| {
-                            let ot = ot.clone();
-                            let oid = oid.clone();
                             let bus = bus.clone();
-                            retract_modal.set(false);
-                            spawn_local(async move {
-                                match api::intel::retract_source(&ot, &oid, &reason).await {
-                                    Ok(body) => {
-                                        let inv = body.data.invalidated_ids.len();
-                                        let rev = body.data.requires_review_ids.len();
-                                        bus.push(
-                                            ToastKind::Success,
-                                            format!("retracted: {inv} invalidated, {rev} for review"),
-                                            None,
-                                        );
-                                        refresh.update(|r| *r += 1);
+                            // take() closes the dialog and yields the payload once.
+                            if let Some((ot, oid)) =
+                                retract_confirm.try_update(|c| c.take()).flatten()
+                            {
+                                spawn_local(async move {
+                                    match api::intel::retract_source(&ot, &oid, &reason).await {
+                                        Ok(body) => {
+                                            let inv = body.data.invalidated_ids.len();
+                                            let rev = body.data.requires_review_ids.len();
+                                            bus.push(
+                                                ToastKind::Success,
+                                                format!("retracted: {inv} invalidated, {rev} for review"),
+                                                None,
+                                            );
+                                            refresh.update(|r| *r += 1);
+                                        }
+                                        Err(e) => bus.push(ToastKind::Error, e.to_string(), None),
                                     }
-                                    Err(e) => bus.push(ToastKind::Error, e.to_string(), None),
-                                }
-                            });
+                                });
+                            }
                         })
-                        on_cancel=Callback::new(move |()| retract_modal.set(false))
+                        on_cancel=Callback::new(move |()| retract_confirm.update(|c| c.cancel()))
                     />
                 }
             })}

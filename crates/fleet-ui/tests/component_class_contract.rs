@@ -36,6 +36,24 @@ const DRAWER: &str = include_str!("../src/drawer.rs");
 const TABS: &str = include_str!("../src/tabs.rs");
 const ERROR_BANNER: &str = include_str!("../src/error_banner.rs");
 
+// Issue #31 small widgets. Their tone/class *composition* is pinned by
+// native unit tests in the pure layers (badge::tone, status_dot::tone,
+// segmented::class); these source scans pin the base class hooks the
+// wasm components emit.
+const BADGE: &str = include_str!("../src/badge/component.rs");
+const BADGE_TONE: &str = include_str!("../src/badge/tone.rs");
+const STATUS_DOT_TONE: &str = include_str!("../src/status_dot/tone.rs");
+const SPARKLINE: &str = include_str!("../src/sparkline/component.rs");
+const LOADED: &str = include_str!("../src/loaded/component.rs");
+const SEGMENTED: &str = include_str!("../src/segmented/component.rs");
+const SEGMENTED_CLASS: &str = include_str!("../src/segmented/class.rs");
+const PAGER: &str = include_str!("../src/pager.rs");
+const SEARCH_INPUT: &str = include_str!("../src/search_input.rs");
+const TOGGLE: &str = include_str!("../src/toggle.rs");
+const KBD: &str = include_str!("../src/kbd.rs");
+const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
+const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
+
 /// Assert `src` contains `hook` (a class literal or class-idiom substring),
 /// blaming the CSS rule that hook must line up with.
 fn emits(src: &str, hook: &str, styled_by: &str) {
@@ -111,6 +129,107 @@ fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
          workspace strip's `class:active` — merging them (e.g. `class:on` \
          on the workspace tab, or `\"tb active\"` on the drawer tab) points \
          a strip at the other family's font-weight rule, a C5 regression"
+    );
+}
+
+#[test]
+fn badge_emits_the_bdg_class_and_not_the_rail_chip_class() {
+    // <Badge> composes `bdg {tone}` via the natively-tested badge_class.
+    emits(BADGE, "badge_class(tone)", ".bdg");
+    emits(BADGE_TONE, r#"format!("bdg {}""#, ".bdg");
+    // The base class must stay `bdg`: a top-level `.badge` rule would
+    // leak display/text-transform into the rail count chip, which owns
+    // `.rail .it .badge` in the same stylesheet.
+    assert!(
+        !BADGE_TONE.contains(r#""badge {}""#),
+        "Badge must not adopt the `badge` base class — it collides with \
+         the rail count chip's `.rail .it .badge` family"
+    );
+}
+
+#[test]
+fn status_dot_emits_the_status_dot_class() {
+    emits(STATUS_DOT_TONE, r#""status-dot""#, ".status-dot");
+    emits(
+        STATUS_DOT_TONE,
+        r#"format!("status-dot {suffix}")"#,
+        ".status-dot.success",
+    );
+}
+
+#[test]
+fn sparkline_emits_the_spark_class() {
+    emits(SPARKLINE, r#"class="sc-spark""#, ".sc-spark");
+}
+
+#[test]
+fn loaded_emits_the_tri_state_hint_hooks() {
+    emits(LOADED, r#"class="load-hint""#, ".load-hint");
+    emits(LOADED, r#"class="load-hint error""#, ".load-hint.error");
+}
+
+#[test]
+fn segmented_emits_one_strip_family_with_a_single_active_treatment() {
+    // <Segmented> composes the container class via the natively-tested
+    // segmented_class (Default/Sm/Xs x full table in segmented::class);
+    // the pure layer owns the `seg`/`seg-sm`/`seg-full` fragment.
+    emits(SEGMENTED, "segmented_class(size, full)", ".seg");
+    emits(SEGMENTED_CLASS, r#"String::from("seg")"#, ".seg");
+    emits(SEGMENTED, r#"class="seg-opt""#, ".seg .seg-opt");
+    emits(SEGMENTED, "class:on", ".seg .seg-opt.on");
+    // ADR-0003: ONE amber-wash active treatment. The size axis must not
+    // grow its own active rule — exactly one `.seg-opt.on` declaration
+    // ships in the stylesheet.
+    let active_rules = FLEET_CSS.matches(".seg-opt.on").count();
+    assert_eq!(
+        active_rules, 1,
+        "expected exactly one `.seg-opt.on` active rule in fleet-ui.css \
+         (single amber-wash treatment across sizes), found {active_rules}"
+    );
+}
+
+#[test]
+fn pager_emits_the_results_footer_family() {
+    emits(PAGER, r#"class="results-footer""#, ".results-footer");
+    emits(PAGER, r#"class="results-summary""#, ".results-summary");
+    emits(PAGER, r#"class="results-pager""#, ".results-pager");
+}
+
+#[test]
+fn search_input_emits_the_inp_wrap_hook() {
+    emits(SEARCH_INPUT, r#"class="inp-wrap""#, ".inp-wrap");
+}
+
+#[test]
+fn toggle_emits_the_switch_hooks() {
+    emits(TOGGLE, r#"class="toggle""#, ".toggle");
+    emits(TOGGLE, r#"class="toggle-slider""#, ".toggle-slider");
+}
+
+#[test]
+fn kbd_emits_both_chip_treatments() {
+    emits(KBD, r#""kbd-inline""#, ".kbd-inline");
+    emits(KBD, r#""kbd""#, ".kbd");
+}
+
+#[test]
+fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
+    emits(ACTIONS_MENU, r#"class="actions-wrap""#, ".actions-wrap");
+    emits(ACTIONS_MENU, r#"class="btn-icon""#, ".btn-icon");
+    emits(ACTIONS_MENU, r#"class="actions-menu""#, ".actions-menu");
+    emits(
+        ACTIONS_MENU,
+        r#""item danger""#,
+        ".actions-menu .item.danger",
+    );
+    // C5: the open panel must arbitrate Escape through the overlay
+    // stack (topmost-only), like Modal and Drawer.
+    assert!(
+        ACTIONS_MENU.contains("use_overlay_layer()") && ACTIONS_MENU.contains("is_topmost()"),
+        "ActionsMenu's open panel must register an overlay layer and \
+         gate its window Escape on is_topmost() — otherwise Escape \
+         under a stacked ConfirmModal closes both (the issue #28 bug \
+         class the overlay stack exists to prevent)"
     );
 }
 

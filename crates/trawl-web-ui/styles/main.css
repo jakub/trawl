@@ -88,20 +88,13 @@
  *  Results table — base styles (augmented by v2 block below)
  * ─────────────────────────────────────────────────────────────── */
 
-.results-loading,
-.results-empty,
-.results-error {
+/* .results-loading / .results-error retired (issue #31): the results
+ * pane renders fleet_ui::Loaded (.load-hint family). */
+.results-empty {
   padding: 12px 16px;
   color: var(--ink-3);
   font-size: 12px;
   font-family: var(--font-mono);
-}
-
-.results-error {
-  color: var(--red);
-  background: var(--red-wash);
-  border: 1px solid var(--red);
-  border-radius: 3px;
 }
 
 .results-table-wrap {
@@ -153,15 +146,8 @@
   font-style: italic;
 }
 
-.results-summary {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-}
-
-.results-pager {
-  display: flex;
-  gap: 6px;
-}
+/* .results-summary / .results-pager moved to fleet-ui.css (issue #31)
+ * — fleet_ui::Pager emits them. */
 
 /* .btn-sm / .btn-xs moved to fleet-ui.css (issue #28) — <Btn size=…>
  * emits them, so the rules ship with the crate. */
@@ -332,37 +318,6 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Live-tail status pill — provisional, becomes status-bar HAULING
- *  indicator in commit 4
- * ─────────────────────────────────────────────────────────────── */
-.live-badge {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: .06em;
-  padding: 2px 8px;
-  border-radius: 2px;
-  font-weight: 600;
-}
-
-.live-badge.live {
-  color: var(--green);
-  background: color-mix(in oklab, var(--green) 12%, var(--panel));
-  border: 1px solid var(--green);
-}
-
-.live-badge.lagged {
-  color: var(--yellow);
-  background: var(--yellow-wash);
-  border: 1px solid var(--yellow);
-  animation: live-badge-pulse 0.5s ease-out;
-}
-
-@keyframes live-badge-pulse {
-  from { transform: scale(1.1); }
-  to   { transform: scale(1); }
-}
-
-/* ─────────────────────────────────────────────────────────────────
  *  Editor wrap (header + DslEditor + date range + run button)
  * ─────────────────────────────────────────────────────────────── */
 .editor-wrap {
@@ -500,11 +455,8 @@
   border-color: var(--line);
   cursor: wait;
 }
-.run .kbd-inline {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  opacity: .6;
-}
+/* .kbd-inline moved to fleet-ui.css (issue #31) — <Kbd inline=true>
+ * emits it; the .run scoping was dropped with the generalization. */
 
 /* ─────────────────────────────────────────────────────────────────
  *  Meta strip — under the editor
@@ -569,8 +521,8 @@
 
 /* ─────────────────────────────────────────────────────────────────
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
- *  fleet_ui::Tabs emits it). The .dr-pop .tabs overrides below stay:
- *  app-owned popover reskin of the shared strip.
+ *  fleet_ui::Tabs emits it). The old .dr-pop .tabs popover reskin was
+ *  retired in issue #31: that strip is fleet_ui::Segmented now.
  * ─────────────────────────────────────────────────────────────── */
 
 /* ─────────────────────────────────────────────────────────────────
@@ -775,18 +727,8 @@
   gap: 8px;
 }
 
-/* Pager footer. */
-.results-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 14px;
-  font-size: 11px;
-  color: var(--ink-3);
-  background: var(--panel);
-  border-top: 1px solid var(--line);
-  flex-shrink: 0;
-}
+/* .results-footer moved to fleet-ui.css (issue #31) — fleet_ui::Pager
+ * emits it (and supersedes the .tbl-foot mirror). */
 
 /* ─────────────────────────────────────────────────────────────────
  *  Status bar (26px footer)
@@ -838,15 +780,7 @@
  *  Common utility bits
  * ─────────────────────────────────────────────────────────────── */
 .mono { font-family: var(--font-mono); }
-.kbd {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  padding: 1px 5px;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 2px;
-  color: var(--ink-3);
-}
+/* .kbd moved to fleet-ui.css (issue #31) — fleet_ui::Kbd emits it. */
 .divider { color: var(--ink-4); }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -892,27 +826,9 @@
   padding: 12px;
   animation: fadeIn 120ms;
 }
-.dr-pop .tabs {
-  display: flex;
-  gap: 0;
-  margin-bottom: 10px;
-  padding: 0;
-  border-bottom: 1px solid var(--line-2);
-  background: transparent;
-}
-.dr-pop .tabs .t {
-  padding: 6px 12px;
-  font-size: 12px;
-  color: var(--ink-3);
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  font-family: var(--font-ui);
-}
-.dr-pop .tabs .t.on {
-  color: var(--amber);
-  border-bottom-color: var(--amber);
-}
+/* .dr-pop .tabs reskin retired (issue #31): the popover's mode strip
+ * renders fleet_ui::Segmented; only the layout margin stays app-side. */
+.dr-pop .seg { margin-bottom: 10px; }
 .dr-pop .grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1026,15 +942,8 @@
 .page p.sub { margin: 4px 0 0; font-size: 13px; color: var(--ink-3); text-wrap: pretty; }
 .page-hd .actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 
-.inp-wrap {
-  display: flex; align-items: center; gap: 6px;
-  padding: 4px 10px; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 3px; color: var(--ink-3); min-width: 200px;
-}
-.inp-wrap input {
-  flex: 1; background: transparent; border: 0; outline: none;
-  font-family: var(--font-ui); font-size: 12px; color: var(--ink);
-}
+/* .inp-wrap moved to fleet-ui.css (issue #31) — fleet_ui::SearchInput
+ * emits it. */
 
 /* Generic list table for page-level views (no sort, no expand). */
 .tbl {
@@ -1093,43 +1002,11 @@
   color: var(--ink-3);
 }
 
-/* Export format selector — segmented pill row inside the modal. */
-.export-formats {
-  display: flex;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  overflow: hidden;
-}
-.export-formats .fmt-btn {
-  flex: 1;
-  padding: 6px 0;
-  font-family: var(--font-ui);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--ink-3);
-  background: var(--panel-2);
-  border: none;
-  border-right: 1px solid var(--line);
-  cursor: pointer;
-  transition: background 100ms, color 100ms;
-}
-.export-formats .fmt-btn:last-child { border-right: none; }
-.export-formats .fmt-btn:hover { color: var(--ink-2); }
-.export-formats .fmt-btn.active {
-  background: var(--amber-wash);
-  color: var(--amber);
-  font-weight: 600;
-}
+/* .export-formats / .fmt-btn retired (issue #31): the export modal's
+ * format row renders fleet_ui::Segmented (.seg family). */
 
-/* History-specific: footer with paginator (mirror of .results-footer). */
-.tbl-foot {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 10px 14px;
-  border-top: 1px solid var(--line);
-  background: var(--panel-2);
-  font-family: var(--font-ui); font-size: 11px; color: var(--ink-3);
-}
-.tbl-foot .pager { display: flex; gap: 6px; }
+/* .tbl-foot retired (issue #31): every table footer renders
+ * fleet_ui::Pager (.results-footer family, shipped with the crate). */
 
 /* ============================================================
    Schema page — service cards grid + slide-out drawer inspector.
@@ -1214,18 +1091,11 @@
 .cov-mini { display: block; height: 4px; background: var(--panel-3); border-radius: 1px; overflow: hidden; }
 .cov-mini > span { display: block; height: 100%; background: var(--amber); }
 
-/* Status dot — used on cards and drawer header. */
-.sd-dot {
-  width: 7px; height: 7px; border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 0 2px color-mix(in oklab, var(--green) 25%, transparent);
-  flex-shrink: 0;
-}
-.sd-dot.errors  { background: var(--red);    box-shadow: 0 0 0 2px color-mix(in oklab, var(--red) 25%, transparent); animation: dot-pulse 1.6s ease-in-out infinite; }
-@keyframes dot-pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
+/* .sd-dot retired (issue #31): cards and drawer headers render
+ * fleet_ui::StatusDot (.status-dot family, shipped with the crate). */
 
-/* Sparkline */
-.sc-spark { display: block; }
+/* Sparkline: .sc-spark moved to fleet-ui.css (issue #31) —
+ * fleet_ui::Sparkline emits it. */
 
 /* Quick action row (hover-revealed) */
 .sc-quickact {
@@ -1248,18 +1118,8 @@
 .sc-quickact .qa:hover { color: var(--amber-2); border-color: var(--amber); background: var(--amber-wash); }
 .sc-card.compact .sc-quickact { margin: 4px -12px -6px; padding: 4px 10px; }
 
-/* Compact/comfy density toggle */
-.seg-mini {
-  display: inline-flex; background: var(--panel-2);
-  border: 1px solid var(--line); border-radius: 3px;
-  font-family: var(--font-ui); font-size: 11px; overflow: hidden;
-}
-.seg-mini > span {
-  padding: 4px 9px; cursor: pointer; color: var(--ink-3);
-  border-right: 1px solid var(--line);
-}
-.seg-mini > span:last-child { border-right: 0; }
-.seg-mini > span.on { background: var(--panel); color: var(--ink); font-weight: 600; }
+/* .seg-mini retired (issue #31): the density toggle renders
+ * fleet_ui::Segmented size=Sm (.seg.seg-sm family). */
 
 /* Drawer SHELL (.sd-scrim/.sd-drawer/.sd-hd/.sd-ttl/.sd-actions/.sd-x/
  * .sd-tabs/.sd-body + keyframes) moved to fleet-ui.css (issue #28,
@@ -1451,14 +1311,8 @@
   color: var(--amber); font-weight: 600;
 }
 
-.status-dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  display: inline-block; vertical-align: middle;
-}
-.status-dot.success { background: var(--green); }
-.status-dot.error { background: var(--red); }
-.status-dot.running { background: var(--amber); animation: dot-pulse 1.6s ease-in-out infinite; }
-.status-dot.timeout { background: var(--yellow, var(--amber)); }
+/* .status-dot moved to fleet-ui.css (issue #31) — fleet_ui::StatusDot
+ * emits it (unified with the retired .sd-dot ring treatment). */
 
 .sched-badge {
   font-family: var(--font-mono); font-size: 11px;
@@ -1492,53 +1346,20 @@
 .run-preview th { text-align: left; color: var(--ink-3); padding: 2px 6px; border-bottom: 1px solid var(--line); }
 .run-preview td { padding: 2px 6px; color: var(--ink-2); }
 
-.actions-menu {
-  position: absolute; right: 0; top: 100%;
-  background: var(--panel); border: 1px solid var(--line);
-  border-radius: 3px; box-shadow: 0 4px 12px rgba(0,0,0,.15);
-  z-index: 10; min-width: 140px;
-}
-.actions-menu .item {
-  padding: 6px 12px; font-size: 12px; cursor: pointer;
-  color: var(--ink-2);
-}
-.actions-menu .item:hover { background: var(--panel-2); color: var(--ink); }
-.actions-menu .item.danger { color: var(--red); }
-.actions-menu .item.danger:hover { background: color-mix(in oklab, var(--red) 10%, var(--panel-2)); }
+/* .actions-menu moved to fleet-ui.css (issue #31) —
+ * fleet_ui::ActionsMenu emits it. */
 
-.toggle {
-  position: relative; display: inline-block; width: 32px; height: 18px;
-}
-.toggle input { opacity: 0; width: 0; height: 0; }
-.toggle-slider {
-  position: absolute; inset: 0; cursor: pointer;
-  background: var(--line); border-radius: 9px;
-  transition: background 200ms;
-}
-.toggle-slider::before {
-  content: ""; position: absolute; left: 2px; top: 2px;
-  width: 14px; height: 14px; border-radius: 50%;
-  background: var(--panel); transition: transform 200ms;
-}
-.toggle input:checked + .toggle-slider { background: var(--amber); }
-.toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
+/* .toggle / .toggle-slider moved to fleet-ui.css (issue #31) —
+ * fleet_ui::Toggle emits them. */
 
-.btn-icon {
-  background: none; border: none; cursor: pointer;
-  font-size: 16px; color: var(--ink-3); padding: 2px 6px;
-  border-radius: 3px;
-}
-.btn-icon:hover { background: var(--panel-2); color: var(--ink); }
+/* .btn-icon moved to fleet-ui.css (issue #31) — the
+ * fleet_ui::ActionsMenu trigger emits it (its sole user). */
 .tbl-empty { padding: 24px 16px; color: var(--ink-3); text-align: center; }
 .preview { background: var(--panel-2); padding: 8px 10px; border-radius: 3px; font-size: 12px; color: var(--ink); white-space: pre-wrap; word-break: break-all; margin: 0; }
 
 /* ── Intel ────────────────────────────────────────────────────── */
-.intel-badge {
-  display: inline-flex; align-items: center;
-  font-size: 10px; font-weight: 600; letter-spacing: .04em;
-  padding: 1px 6px; border-radius: 3px;
-  white-space: nowrap; text-transform: uppercase;
-}
+/* .intel-badge retired (issue #31): all 22 sites render
+ * fleet_ui::Badge (.bdg tone family, shipped with the crate). */
 .intel-section-hd {
   font-size: 11px; font-weight: 600; text-transform: uppercase;
   letter-spacing: .06em; color: var(--ink-2);

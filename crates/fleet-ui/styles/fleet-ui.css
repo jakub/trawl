@@ -42,15 +42,19 @@
  *   - Login page: .login-shell, .login-card
  *   - App chrome: .shell grid, .topbar (brand/modes/jump/env/user),
  *     .user-menu, .body, .main, .rail (+ .badge chip, .bot slot)
+ *   - Small widgets (issue #31): .bdg tones, .seg strip, .load-hint,
+ *     .status-dot tones, .sc-spark, .toggle, .kbd/.kbd-inline,
+ *     .results-footer pager family, .inp-wrap, .actions-wrap/
+ *     .actions-menu/.btn-icon
  *
  * What this file does NOT ship (stays in each app's own stylesheet):
  *   - [data-rowstyle] selectors targeting .results-table (the enum is
  *     shared via fleet-ui, but the selector references trawl's table)
- *   - .btn-icon, .field-label and other extras
- *   - Trawl-specific modal sub-styles (.m-body .preview, .m-ft .hint,
- *     .export-formats) and the status bar (.statusbar)
+ *   - .field-label and other extras
+ *   - Trawl-specific modal sub-styles (.m-body .preview, .m-ft .hint)
+ *     and the status bar (.statusbar)
  *   - Drawer CONTENT (app-owned panes + title-slot content):
- *     .sd-overview, .sd-card, .sd-fields, .sd-tail, .sd-dot, .sf-*,
+ *     .sd-overview, .sd-card, .sd-fields, .sd-tail, .sf-*,
  *     .sd-ttl .name / .sub, .name-edit
  *   - Anything app-specific: facets, editor, histogram, schema cards.
  */
@@ -463,8 +467,9 @@ textarea:focus-visible,
  *  - .tabs / .t / .active  — workspace strip (Events/Visualization)
  *  - .sd-tabs / .tb / .on  — drawer strip (weights differ on purpose:
  *    500 active vs 600 on; do not merge)
- *  Moved verbatim from trawl's main.css. Trawl's .dr-pop .tabs
- *  popover reskin stays app-side and overrides by cascade order.
+ *  Moved verbatim from trawl's main.css. (Trawl's old .dr-pop .tabs
+ *  popover reskin was retired in issue #31 — that strip is
+ *  fleet_ui::Segmented, the .seg family below.)
  * ─────────────────────────────────────────────────────────────── */
 .tabs {
   display: flex;
@@ -932,3 +937,185 @@ textarea:focus-visible,
   gap: 2px;
   align-items: center;
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Small widgets (issue #31, ADR-0003 unification)
+ *
+ *  One canonical treatment per widget. New families first (.bdg,
+ *  .seg, .load-hint, .actions-wrap — these REPLACE app-side
+ *  .intel-badge / .fmt-btn / .seg-mini / bespoke loading markup);
+ *  the verbatim moves (.kbd, .inp-wrap, .toggle, .status-dot, …)
+ *  are appended by the per-family sweep commits so the move-not-copy
+ *  invariant in trawl's css_move_invariant stays green per commit.
+ * ─────────────────────────────────────────────────────────────── */
+
+/* Badge — <Badge tone=…>. `.bdg`, not `.badge`: the rail count chip
+ * above already owns `.rail .it .badge`, and a top-level `.badge`
+ * rule would leak display/text-transform into it via the cascade. */
+.bdg {
+  display: inline-flex; align-items: center;
+  font-size: 10px; font-weight: 600; letter-spacing: .04em;
+  padding: 1px 6px; border-radius: 3px;
+  white-space: nowrap; text-transform: uppercase;
+}
+.bdg.neutral { background: var(--panel-2);   color: var(--ink-3); }
+.bdg.info    { background: var(--panel-2);   color: var(--blue); }
+.bdg.success { background: var(--green-wash);color: var(--green); }
+.bdg.warn    { background: var(--amber-wash);color: var(--amber); }
+.bdg.danger  { background: var(--red-wash);  color: var(--red); }
+
+/* Segmented — <Segmented/>. One active treatment: amber wash. */
+.seg {
+  display: inline-flex; background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 4px;
+  font-family: var(--font-ui); overflow: hidden;
+}
+.seg-full { display: flex; }
+.seg-full .seg-opt { flex: 1; }
+.seg .seg-opt {
+  padding: 6px 10px; font-size: 12px; font-weight: 500;
+  color: var(--ink-3); background: transparent;
+  border: none; border-right: 1px solid var(--line);
+  cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.seg .seg-opt:last-child { border-right: none; }
+.seg .seg-opt:hover { color: var(--ink-2); }
+.seg .seg-opt.on {
+  background: var(--amber-wash);
+  color: var(--amber);
+  font-weight: 600;
+}
+.seg-sm .seg-opt { padding: 4px 9px; font-size: 11px; }
+
+/* Loaded — <Loaded/> tri-state hints (canonical copy tested natively). */
+.load-hint {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--ink-3);
+  font-family: var(--font-ui);
+}
+.load-hint.error { color: var(--red); }
+
+/* ActionsMenu — positioning context owned by the component (the
+ * trigger `.btn-icon` and panel `.actions-menu` rules move in with
+ * the nets-page sweep commit). */
+.actions-wrap { position: relative; display: inline-block; }
+
+/* Sparkline — <Sparkline/> (moved verbatim from trawl's main.css). */
+.sc-spark { display: block; }
+
+/* StatusDot — <StatusDot tone=…>. Unified canonical dot (issue #31):
+ * trawl's 6px flat `.status-dot` run dots and the 7px ringed
+ * `.sd-dot` schema-health dots fold onto ONE treatment — 7px with the
+ * ring, pulse reserved for the in-flight (running) tone. Bare
+ * `.status-dot` (Neutral) stays an invisible spacer, matching the
+ * pre-unification unknown-status arm. */
+.status-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  display: inline-block; vertical-align: middle;
+  flex-shrink: 0;
+}
+.status-dot.success { background: var(--green);  box-shadow: 0 0 0 2px color-mix(in oklab, var(--green) 25%, transparent); }
+.status-dot.error   { background: var(--red);    box-shadow: 0 0 0 2px color-mix(in oklab, var(--red) 25%, transparent); }
+.status-dot.running { background: var(--amber);  box-shadow: 0 0 0 2px color-mix(in oklab, var(--amber) 25%, transparent); animation: dot-pulse 1.6s ease-in-out infinite; }
+@keyframes dot-pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
+
+/* Toggle — <Toggle/> (moved verbatim from trawl's main.css). */
+.toggle {
+  position: relative; display: inline-block; width: 32px; height: 18px;
+}
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+  position: absolute; inset: 0; cursor: pointer;
+  background: var(--line); border-radius: 9px;
+  transition: background 200ms;
+}
+.toggle-slider::before {
+  content: ""; position: absolute; left: 2px; top: 2px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--panel); transition: transform 200ms;
+}
+.toggle input:checked + .toggle-slider { background: var(--amber); }
+.toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
+
+/* Kbd — <Kbd/>. `.kbd` moved verbatim from trawl's main.css (the
+ * topbar user-menu shortcut chips were already emitting it from
+ * fleet-ui, styled across the crate boundary — this closes that gap).
+ * `.kbd-inline` generalizes trawl's `.run .kbd-inline`: the borderless
+ * dimmed treatment for shortcuts inside colored buttons. */
+.kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-3);
+}
+.kbd-inline {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: .6;
+}
+
+/* Pager — <Pager/> table footer (moved verbatim from trawl's main.css;
+ * the .tbl-foot mirror family was retired onto this one, ADR-0003). */
+.results-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  font-size: 11px;
+  color: var(--ink-3);
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.results-summary {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.results-pager {
+  display: flex;
+  gap: 6px;
+}
+
+/* SearchInput — <SearchInput/> toolbar filter (moved verbatim from
+ * trawl's main.css). */
+.inp-wrap {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 3px; color: var(--ink-3); min-width: 200px;
+}
+.inp-wrap input {
+  flex: 1; background: transparent; border: 0; outline: none;
+  font-family: var(--font-ui); font-size: 12px; color: var(--ink);
+}
+
+/* ActionsMenu trigger + panel (moved verbatim from trawl's main.css;
+ * the trigger's sole user was the nets-page overflow menu, so the
+ * .btn-icon rule graduated with the component). */
+.btn-icon {
+  background: none; border: none; cursor: pointer;
+  font-size: 16px; color: var(--ink-3); padding: 2px 6px;
+  border-radius: 3px;
+}
+.btn-icon:hover { background: var(--panel-2); color: var(--ink); }
+.actions-menu {
+  position: absolute; right: 0; top: 100%;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 3px; box-shadow: 0 4px 12px rgba(0,0,0,.15);
+  z-index: 10; min-width: 140px;
+}
+.actions-menu .item {
+  display: block; width: 100%; text-align: left;
+  background: none; border: none; font-family: inherit;
+  padding: 6px 12px; font-size: 12px; cursor: pointer;
+  color: var(--ink-2);
+}
+.actions-menu .item:hover,
+.actions-menu .item:focus-visible { background: var(--panel-2); color: var(--ink); outline: none; }
+.actions-menu .item.danger { color: var(--red); }
+.actions-menu .item.danger:hover,
+.actions-menu .item.danger:focus-visible { background: color-mix(in oklab, var(--red) 10%, var(--panel-2)); }
