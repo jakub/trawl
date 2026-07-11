@@ -94,6 +94,14 @@ enum KeysAction {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Change a key's kind (human <-> service).
+    Retype {
+        /// The key prefix (shown in `keys list`).
+        #[arg(value_parser = KeyPrefix::parse)]
+        prefix: KeyPrefix,
+        /// The new principal kind.
+        kind: CliKind,
+    },
 }
 
 /// CLI-side mirror of [`PrincipalKind`] — `clap` requires the type to live
@@ -155,6 +163,9 @@ async fn dispatch_keys(store: KeyStore, action: KeysAction) -> Result<(), AdminE
         KeysAction::RevokeGrant { prefix, grant, yes } => {
             let app = commands::keys::parse_revoke_grant_app(&grant);
             commands::keys::revoke_grant(&store, &prefix, app, yes).await
+        }
+        KeysAction::Retype { prefix, kind } => {
+            commands::keys::retype(&store, &prefix, kind.into()).await
         }
     }
 }

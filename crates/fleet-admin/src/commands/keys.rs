@@ -213,6 +213,24 @@ pub async fn revoke_grant(
     Ok(())
 }
 
+/// Change a key's kind (human <-> service).
+///
+/// Non-interactive — the change is reversible and the result is
+/// self-reported. Revoked keys are refused store-side
+/// (`AuthError::KeyRevoked`).
+pub async fn retype(
+    store: &KeyStore,
+    prefix: &KeyPrefix,
+    kind: PrincipalKind,
+) -> Result<(), AdminError> {
+    let info = store.retype_key(prefix.as_str(), kind).await?;
+    eprintln!(
+        "retyped key {} ({}) as {}",
+        info.prefix, info.name, info.kind
+    );
+    Ok(())
+}
+
 /// Extract the app half of a `revoke-grant` grant argument.
 ///
 /// Accepts either a bare `app` or the `app:role` form `keys grant` takes —
