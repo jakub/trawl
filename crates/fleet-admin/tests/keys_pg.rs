@@ -212,6 +212,137 @@ pg_test!(
 );
 
 pg_test!(
+    revoke_grant_removes_only_named_app,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key(
+                "multi",
+                PrincipalKind::Service,
+                &[trawl_admin(), coastwatch_consumer()],
+                None,
+            )
+            .await
+            .unwrap();
+        let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
+
+        keys::revoke_grant(&store, &prefix, "trawl", true)
+            .await
+            .expect("revoke grant");
+
+        let info = store.get_key_by_prefix(&created.info.prefix).await.unwrap();
+        assert_eq!(info.assignments.len(), 1, "other grant must survive");
+        assert_eq!(info.assignments[0].app, "coastwatch");
+    }
+);
+
+pg_test!(
+    revoke_grant_missing_app_returns_grant_not_found,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key(
+                "bare",
+                PrincipalKind::Service,
+                &[coastwatch_consumer()],
+                None,
+            )
+            .await
+            .unwrap();
+        let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
+
+        let err = keys::revoke_grant(&store, &prefix, "trawl", true)
+            .await
+            .expect_err("missing grant must error, not silently succeed");
+        assert!(
+            matches!(
+                err,
+                AdminError::Auth(AuthError::GrantNotFound { ref app, .. }) if app == "trawl"
+            ),
+            "expected GrantNotFound for app=trawl, got {err:?}"
+        );
+    }
+);
+
+pg_test!(
+    revoke_grant_unknown_prefix_returns_key_not_found,
+    |store: KeyStore| async move {
+        let prefix = KeyPrefix::parse("ghostpfx").expect("parse prefix");
+        let err = keys::revoke_grant(&store, &prefix, "trawl", true)
+            .await
+            .expect_err("unknown prefix must error");
+        assert!(
+            matches!(
+                err,
+                AdminError::Auth(AuthError::KeyNotFound { ref prefix }) if prefix == "ghostpfx"
+            ),
+            "expected KeyNotFound, got {err:?}"
+        );
+    }
+);
+
+pg_test!(
+    retype_flips_kind_both_directions,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("flip", PrincipalKind::Human, &[trawl_admin()], None)
+            .await
+            .unwrap();
+        let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
+
+        keys::retype(&store, &prefix, PrincipalKind::Service)
+            .await
+            .expect("human -> service");
+        let info = store.get_key_by_prefix(&created.info.prefix).await.unwrap();
+        assert_eq!(info.kind, PrincipalKind::Service, "must persist");
+
+        keys::retype(&store, &prefix, PrincipalKind::Human)
+            .await
+            .expect("service -> human");
+        let info = store.get_key_by_prefix(&created.info.prefix).await.unwrap();
+        assert_eq!(info.kind, PrincipalKind::Human, "must flip back");
+    }
+);
+
+pg_test!(
+    retype_revoked_key_returns_key_revoked,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("dead", PrincipalKind::Human, &[], None)
+            .await
+            .unwrap();
+        store.revoke_key(&created.info.prefix).await.unwrap();
+        let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
+
+        let err = keys::retype(&store, &prefix, PrincipalKind::Service)
+            .await
+            .expect_err("revoked key must be refused");
+        assert!(
+            matches!(
+                err,
+                AdminError::Auth(AuthError::KeyRevoked { ref prefix }) if prefix == &created.info.prefix
+            ),
+            "expected KeyRevoked, got {err:?}"
+        );
+    }
+);
+
+pg_test!(
+    retype_unknown_prefix_returns_key_not_found,
+    |store: KeyStore| async move {
+        let prefix = KeyPrefix::parse("ghostpfx").expect("parse prefix");
+        let err = keys::retype(&store, &prefix, PrincipalKind::Service)
+            .await
+            .expect_err("unknown prefix must error");
+        assert!(
+            matches!(
+                err,
+                AdminError::Auth(AuthError::KeyNotFound { ref prefix }) if prefix == "ghostpfx"
+            ),
+            "expected KeyNotFound, got {err:?}"
+        );
+    }
+);
+
+pg_test!(
     create_duplicate_name_is_allowed,
     |store: KeyStore| async move {
         // Pin the schema contract — name is NOT unique, two keys can share
