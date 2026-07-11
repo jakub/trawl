@@ -88,8 +88,8 @@ enum KeysAction {
         prefix: KeyPrefix,
         /// The app to revoke, as `app` or `app:role` — the role half is
         /// ignored (grants are keyed by app, whatever role is stored).
-        #[arg(value_name = "APP")]
-        grant: String,
+        #[arg(value_name = "APP", value_parser = commands::keys::parse_revoke_grant_app)]
+        app: String,
         /// Skip the interactive confirmation prompt.
         #[arg(long, short)]
         yes: bool,
@@ -160,9 +160,8 @@ async fn dispatch_keys(store: KeyStore, action: KeysAction) -> Result<(), AdminE
         KeysAction::List { all } => commands::keys::list(&store, all).await,
         KeysAction::Revoke { prefix, yes } => commands::keys::revoke(&store, &prefix, yes).await,
         KeysAction::Grant { prefix, grant } => commands::keys::grant(&store, &prefix, &grant).await,
-        KeysAction::RevokeGrant { prefix, grant, yes } => {
-            let app = commands::keys::parse_revoke_grant_app(&grant);
-            commands::keys::revoke_grant(&store, &prefix, app, yes).await
+        KeysAction::RevokeGrant { prefix, app, yes } => {
+            commands::keys::revoke_grant(&store, &prefix, &app, yes).await
         }
         KeysAction::Retype { prefix, kind } => {
             commands::keys::retype(&store, &prefix, kind.into()).await

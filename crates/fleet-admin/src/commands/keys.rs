@@ -232,13 +232,22 @@ pub async fn retype(
     Ok(())
 }
 
-/// Extract the app half of a `revoke-grant` grant argument.
+/// Parse a `revoke-grant` app argument, extracting the app half.
 ///
 /// Accepts either a bare `app` or the `app:role` form `keys grant` takes —
 /// the role half is ignored, since grants are keyed by `(key, app)`. First
-/// colon wins, mirroring trawl-admin (`foo:super:admin` → `foo`).
-pub fn parse_revoke_grant_app(s: &str) -> &str {
-    s.split_once(':').map_or(s, |(app, _)| app)
+/// colon wins, mirroring trawl-admin (`foo:super:admin` → `foo`). An empty
+/// app (from `""` or `:role`) is rejected at the clap boundary rather than
+/// surviving to the store and garbling the confirmation prompt.
+pub fn parse_revoke_grant_app(s: &str) -> Result<String, AdminError> {
+    let app = s.split_once(':').map_or(s, |(app, _)| app);
+    if app.is_empty() {
+        return Err(AdminError::InvalidGrant {
+            input: s.to_owned(),
+            reason: "empty app",
+        });
+    }
+    Ok(app.to_owned())
 }
 
 /// Add a grant to an existing key.
@@ -416,17 +425,30 @@ mod tests {
 
     #[test]
     fn parse_revoke_grant_app_bare_app() {
-        assert_eq!(parse_revoke_grant_app("trawl"), "trawl");
+        assert_eq!(parse_revoke_grant_app("trawl").unwrap(), "trawl");
     }
 
     #[test]
     fn parse_revoke_grant_app_strips_role() {
-        assert_eq!(parse_revoke_grant_app("trawl:admin"), "trawl");
+        assert_eq!(parse_revoke_grant_app("trawl:admin").unwrap(), "trawl");
     }
 
     #[test]
     fn parse_revoke_grant_app_first_colon_semantics() {
-        assert_eq!(parse_revoke_grant_app("trawl:super:admin"), "trawl");
+        assert_eq!(
+            parse_revoke_grant_app("trawl:super:admin").unwrap(),
+            "trawl"
+        );
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_rejects_empty_input() {
+        assert!(parse_revoke_grant_app("").is_err());
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_rejects_empty_app_before_colon() {
+        assert!(parse_revoke_grant_app(":admin").is_err());
     }
 
     #[test]
