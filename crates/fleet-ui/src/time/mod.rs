@@ -6,10 +6,10 @@
 //!
 //! Seeded from trawl's `time_fmt.rs` (tests migrated verbatim) —
 //! coastwatch carried six byte-identical `relative_age()` copies of
-//! the same idea, so the shared implementation lives here now. All
-//! functions take `now_ms` as a parameter (no clock dependency): they
-//! are pure and native-tested, matching the
-//! [`theme::prefs`](crate::theme::prefs) template.
+//! the same idea, so the shared implementation lives here now. The
+//! relative-time functions take `now_ms` as a parameter (no clock
+//! dependency); all functions here are pure and native-tested,
+//! matching the [`theme::prefs`](crate::theme::prefs) template.
 //!
 //! The wasm half: [`clock`] owns the single shared 30-second tick
 //! every relative label subscribes to (never per-instance timers),
