@@ -256,10 +256,27 @@ fn should_restore(owned: bool, policy: FocusPolicy, opener_connected: bool) -> b
 
 /// Selector for tabbable descendants. Re-queried per use — a cached
 /// `NodeList` goes stale the moment the panel re-renders (drawer tab
-/// switches swap the whole body).
+/// switches swap the whole body). Selectors can't see rendering, so
+/// candidates hidden via `display:none` (a drawer's inactive tab pane,
+/// a collapsed section) still match — [`focusable_descendants`] drops
+/// them with the [`is_rendered`] box-metric filter, otherwise Tab-wrap
+/// could park focus on an invisible element and it would silently vanish.
 #[cfg(target_arch = "wasm32")]
 const FOCUSABLE: &str = "a[href], button:not([disabled]), input:not([disabled]), \
      select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+
+/// Whether an element's box metrics say it is actually rendered — the
+/// pure predicate behind [`focusable_descendants`]'s visibility filter.
+/// An element inside a `display:none` subtree has zero offset box AND
+/// zero client rects; the rects leg keeps rendered zero-box elements
+/// (inline links, `display:contents` hosts) in the tab order. Deliberate
+/// boundary: `visibility:hidden` elements still have boxes and pass —
+/// catching those needs a per-candidate computed-style read, not worth
+/// it until a real layout uses `visibility` to hide focusables.
+#[cfg(any(target_arch = "wasm32", test))]
+fn is_rendered(offset_width: i32, offset_height: i32, client_rect_count: u32) -> bool {
+    offset_width > 0 || offset_height > 0 || client_rect_count > 0
+}
 
 #[cfg(target_arch = "wasm32")]
 fn focusable_descendants(panel: &web_sys::Element) -> Vec<web_sys::HtmlElement> {
@@ -270,6 +287,11 @@ fn focusable_descendants(panel: &web_sys::Element) -> Vec<web_sys::HtmlElement> 
             if let Some(el) = list
                 .get(i)
                 .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+                && is_rendered(
+                    el.offset_width(),
+                    el.offset_height(),
+                    el.get_client_rects().length(),
+                )
             {
                 out.push(el);
             }
@@ -728,5 +750,31 @@ mod tests {
         // ActionsMenu (None) manages its own restore-to-trigger; the
         // overlay layer must not double-restore on its behalf.
         assert!(!should_restore(true, FocusPolicy::None, true));
+    }
+
+    // ── rendered-candidate filter ──────────────────────────────────
+    // `focusable_descendants` drops selector matches that aren't
+    // rendered, so Tab-wrap can't park focus on a `display:none`
+    // element (hidden tab pane, collapsed section) where it would
+    // silently vanish; `is_rendered` is that filter's pure predicate.
+
+    #[test]
+    fn display_none_candidates_are_not_rendered() {
+        // display:none (self or ancestor) zeroes the offset box and
+        // yields no client rects.
+        assert!(!is_rendered(0, 0, 0));
+    }
+
+    #[test]
+    fn boxed_candidates_are_rendered() {
+        assert!(is_rendered(120, 32, 1));
+    }
+
+    #[test]
+    fn zero_box_but_rect_bearing_candidates_stay_tabbable() {
+        // Inline links and display:contents hosts can report a zero
+        // offset box while still painting client rects — they are
+        // visible and must stay in the tab order.
+        assert!(is_rendered(0, 0, 2));
     }
 }
