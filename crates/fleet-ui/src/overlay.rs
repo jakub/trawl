@@ -358,6 +358,30 @@ enum FocusPos {
     Interior,
 }
 
+/// Classify the DOM focus state [`cycle_tab`] reads into a [`FocusPos`].
+/// Precedence matters: an empty panel is `Empty` whatever else holds, and
+/// focus that escaped the panel is `Outside` before the edge bits are even
+/// consulted. Inside the panel, the `(at_first, at_last)` pair maps to the
+/// sole/first/last/interior positions.
+#[cfg(any(target_arch = "wasm32", test))]
+// The four booleans are exactly the DOM facts `cycle_tab` reads off the
+// document; folding them into enums here would only re-inflate the caller.
+#[allow(clippy::fn_params_excessive_bools)]
+fn focus_pos(empty: bool, inside: bool, at_first: bool, at_last: bool) -> FocusPos {
+    if empty {
+        FocusPos::Empty
+    } else if !inside {
+        FocusPos::Outside
+    } else {
+        match (at_first, at_last) {
+            (true, true) => FocusPos::Only,
+            (true, false) => FocusPos::First,
+            (false, true) => FocusPos::Last,
+            (false, false) => FocusPos::Interior,
+        }
+    }
+}
+
 /// Resolve a Tab keypress against panel state. Mirrors [`cycle_tab`]'s
 /// branches exactly: an empty panel parks; focus that escaped the panel
 /// is pulled back to the first focusable; Shift+Tab at the first wraps to
@@ -396,20 +420,9 @@ fn cycle_tab(panel: &web_sys::Element, e: &web_sys::KeyboardEvent) {
             .is_some_and(|a| a.is_same_node(Some(edge.unchecked_ref::<web_sys::Node>())))
     };
 
-    let pos = if focusables.is_empty() {
-        FocusPos::Empty
-    } else if !inside {
-        FocusPos::Outside
-    } else {
-        let at_first = matches!(focusables.first(), Some(f) if is_active(f));
-        let at_last = matches!(focusables.last(), Some(l) if is_active(l));
-        match (at_first, at_last) {
-            (true, true) => FocusPos::Only,
-            (true, false) => FocusPos::First,
-            (false, true) => FocusPos::Last,
-            (false, false) => FocusPos::Interior,
-        }
-    };
+    let at_first = matches!(focusables.first(), Some(f) if is_active(f));
+    let at_last = matches!(focusables.last(), Some(l) if is_active(l));
+    let pos = focus_pos(focusables.is_empty(), inside, at_first, at_last);
 
     let Some(wrap) = tab_wrap(pos, e.shift_key()) else {
         // Interior move: let the browser shift focus naturally.
@@ -569,6 +582,38 @@ mod tests {
             !drawer.owns_focus(),
             "a released layer no longer owns focus"
         );
+    }
+
+    // ── focus classification (issue #33 D2) ────────────────────────
+    // `cycle_tab`'s DOM shell reads four booleans off the document and
+    // hands them to `focus_pos`; these pin the empty/outside precedence
+    // and the 2×2 edge mapping natively so the classification feeding
+    // `tab_wrap` is no longer untested wasm-only glue.
+
+    #[test]
+    fn focus_pos_empty_wins_over_every_other_bit() {
+        // An empty panel is `Empty` regardless of inside/edge bits — the
+        // first branch short-circuits before they are consulted.
+        assert_eq!(focus_pos(true, false, false, false), FocusPos::Empty);
+        assert_eq!(focus_pos(true, true, true, true), FocusPos::Empty);
+    }
+
+    #[test]
+    fn focus_pos_escaped_focus_is_outside_before_edges() {
+        // Not empty and not inside → `Outside`, whatever the edge bits
+        // (stale from a previous position) happen to say.
+        assert_eq!(focus_pos(false, false, false, false), FocusPos::Outside);
+        assert_eq!(focus_pos(false, false, true, true), FocusPos::Outside);
+    }
+
+    #[test]
+    fn focus_pos_maps_the_inside_edge_pairs() {
+        // Inside the panel, the (at_first, at_last) 2×2 selects the sole,
+        // first, last, and interior positions.
+        assert_eq!(focus_pos(false, true, true, true), FocusPos::Only);
+        assert_eq!(focus_pos(false, true, true, false), FocusPos::First);
+        assert_eq!(focus_pos(false, true, false, true), FocusPos::Last);
+        assert_eq!(focus_pos(false, true, false, false), FocusPos::Interior);
     }
 
     // ── Tab-cycle edge arithmetic (issue #33 D2) ───────────────────
