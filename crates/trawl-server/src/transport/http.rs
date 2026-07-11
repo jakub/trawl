@@ -53,10 +53,10 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let cors_origins = &http.cors_allowed_origins;
     let ingest_enabled = state.ingest.wal_writer.is_some();
     let rate_state = RateLimitState::from_config(&http.rate_limit);
-    let session_state = state.auth.session_state.clone();
+    let bearer_state = state.auth.bearer_state.clone();
 
     // Query routes. Onion (first .layer() = innermost): body limit →
-    // envelope normalization → require_bearer (fleet-auth authn) →
+    // envelope normalization → require_bearer_only (fleet-auth authn) →
     // require_trawl_grant (mandatory trawl policy) → rate limit → handler.
     let authenticated = Router::new()
         .route("/query", post(handlers::query))
@@ -94,8 +94,8 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .layer(middleware::from_fn(rate_limit_middleware))
         .layer(middleware::from_fn(require_trawl_grant))
         .layer(middleware::from_fn_with_state(
-            session_state.clone(),
-            fleet_auth::require_bearer,
+            bearer_state.clone(),
+            fleet_auth::require_bearer_only,
         ))
         .layer(middleware::from_fn(normalize_auth_errors))
         .layer(RequestBodyLimitLayer::new(max_body));
@@ -110,8 +110,8 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             .layer(middleware::from_fn(rate_limit_middleware))
             .layer(middleware::from_fn(require_trawl_grant))
             .layer(middleware::from_fn_with_state(
-                session_state,
-                fleet_auth::require_bearer,
+                bearer_state,
+                fleet_auth::require_bearer_only,
             ))
             .layer(middleware::from_fn(normalize_auth_errors))
             .layer(RequestBodyLimitLayer::new(ingest_body_limit))

@@ -84,12 +84,12 @@ pub struct AuthState {
     /// Fleet-auth Postgres keystore. Cheap to clone (Arc-backed pool +
     /// verification cache live inside).
     pub key_store: fleet_auth::KeyStore,
-    /// State for `fleet_auth::require_bearer`. trawld never reads session
-    /// cookies (that's trawl-web's job in slice 2), so the embedded session
-    /// key is a generated throwaway — mirrors fleet-auth's own bearer-only
-    /// test wiring. A KeyStore-only bearer state is a parked fleet-auth
-    /// follow-up.
-    pub session_state: fleet_auth::SessionState,
+    /// State for `fleet_auth::require_bearer_only`. trawld never reads session
+    /// cookies (that's trawl-web's job in slice 2), so it holds a
+    /// keystore-only [`fleet_auth::BearerState`] with no session key/cookie
+    /// config at all — the type forbids ever mounting `require_session`
+    /// against a meaningless key.
+    pub bearer_state: fleet_auth::BearerState,
     /// Shared `HistoryStore` connection for query history persistence.
     pub history: Arc<Mutex<HistoryStore>>,
     /// Shared `SavedQueryStore` connection for saved queries.
@@ -99,7 +99,7 @@ pub struct AuthState {
     /// Memoised keystore liveness ping, shared by every `/health` probe.
     ///
     /// `/health` is unauthenticated and unthrottled (it sits outside
-    /// `require_bearer` and `rate_limit_middleware`), so a burst of probes must
+    /// `require_bearer_only` and `rate_limit_middleware`), so a burst of probes must
     /// not stampede the small, shared keystore connection pool that bearer
     /// verification depends on. See [`AuthState::ping_cached`].
     pub auth_ping: Arc<tokio::sync::Mutex<Option<CachedAuthPing>>>,
@@ -350,8 +350,8 @@ pub struct CachedServiceSchema {
     pub cached_at: Instant,
 }
 
-/// Build [`AuthState`]: connect the fleet keystore (eagerly), derive the
-/// bearer-only [`fleet_auth::SessionState`], and open the transitional
+/// Build [`AuthState`]: connect the fleet keystore (eagerly), wrap it as a
+/// bearer-only [`fleet_auth::BearerState`], and open the transitional
 /// `SQLite` app-state stores.
 async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::ServerError> {
     let database_url = config
@@ -375,17 +375,10 @@ async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::Se
         ))
     })?;
 
-    // trawld only ever runs require_bearer; the session key is a
-    // throwaway (see AuthState::session_state).
-    let session_state = fleet_auth::SessionState::new(
-        key_store.clone(),
-        Arc::new(fleet_auth::SessionKey::generate()),
-        Arc::new(
-            fleet_auth::SessionConfig::new("fleet_session", "trawl")
-                .map_err(crate::error::ServerError::from)?,
-        ),
-    )
-    .map_err(crate::error::ServerError::from)?;
+    // trawld only ever runs require_bearer_only: it verifies bearer tokens and
+    // never touches session cookies, so it carries just the keystore — no
+    // fabricated session key/config (see AuthState::bearer_state).
+    let bearer_state = fleet_auth::BearerState::new(key_store.clone());
 
     // Legacy-db quarantine (ADR-0004): the transitional app-state store keys
     // its rows on postgres key ids, which are unrelated to the old sqlite
@@ -399,7 +392,7 @@ async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::Se
 
     Ok(AuthState {
         key_store,
-        session_state,
+        bearer_state,
         history: Arc::new(Mutex::new(history)),
         saved: Arc::new(Mutex::new(saved)),
         schedule: Arc::new(Mutex::new(schedule)),

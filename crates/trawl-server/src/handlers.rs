@@ -310,7 +310,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     // Run duckdb and fleet keystore pings concurrently.
     //
     // `/health` is unauthenticated and unthrottled — it sits outside
-    // `require_bearer` and `rate_limit_middleware` — so it must not amplify a
+    // `require_bearer_only` and `rate_limit_middleware` — so it must not amplify a
     // burst of probes onto the small, shared keystore pool that bearer
     // verification depends on. `AuthState::ping_cached` memoises the ping for a
     // few seconds and serialises refreshes, collapsing any burst into at most

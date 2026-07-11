@@ -241,13 +241,13 @@ pub struct TrawlPolicyApplied;
 /// an opaque 403 — before the rate limiter, `/whoami`, or any handler sees
 /// them.
 ///
-/// Must run AFTER `fleet_auth::require_bearer` (needs [`VerifiedKey`] in
+/// Must run AFTER `fleet_auth::require_bearer_only` (needs [`VerifiedKey`] in
 /// request extensions). Mounted on BOTH authenticated sub-routers (`/api/v1`
 /// tree and `/ingest`), so it is a mandatory layer, not a per-handler
 /// convention.
 pub async fn require_trawl_grant(req: Request, next: Next) -> Response {
     let Some(verified) = req.extensions().get::<VerifiedKey>() else {
-        // require_bearer always inserts the key; missing means mis-mounted
+        // require_bearer_only always inserts the key; missing means mis-mounted
         // middleware — fail closed and loudly.
         tracing::error!("policy: VerifiedKey missing from request extensions (mis-mounted layer?)");
         return mark(
@@ -279,7 +279,7 @@ fn mark(mut resp: Response) -> Response {
 /// Axum middleware: keep trawl's [`trawl_api::ErrorResponse`] envelope at the
 /// trust boundary (ADR-0004 AC5).
 ///
-/// Mounted directly OUTSIDE `fleet_auth::require_bearer`. Responses that
+/// Mounted directly OUTSIDE `fleet_auth::require_bearer_only`. Responses that
 /// carry the [`TrawlPolicyApplied`] marker passed authn and are already
 /// trawl-shaped; anything else with an auth-relevant status was
 /// short-circuited by the bearer shell (fleet-auth's flat

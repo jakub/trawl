@@ -54,7 +54,9 @@ pub use cookie::SameSite;
 #[cfg(feature = "axum")]
 pub use handlers::{LoginRequest, LoginResponse, login, logout};
 #[cfg(feature = "axum")]
-pub use middleware::{SessionState, require_bearer, require_session};
+pub use middleware::{
+    BearerState, SessionState, require_bearer, require_bearer_only, require_session,
+};
 
 pub use error::AuthError;
 pub use types::{
