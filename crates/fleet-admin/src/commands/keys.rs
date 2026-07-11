@@ -112,9 +112,9 @@ pub async fn list(store: &KeyStore, all: bool) -> Result<(), AdminError> {
 
 /// Revoke a key by prefix, with `[y/N]` confirmation unless `--yes`.
 ///
-/// Refuses to revoke when stdin is not a TTY and `--yes` was not passed —
-/// scripts must opt in explicitly so an accidental `keys revoke <prefix>`
-/// in a pipeline never silently nukes a key.
+/// Refuses to revoke unless both stdin and stderr are TTYs or `--yes` was
+/// passed — scripts must opt in explicitly so an accidental
+/// `keys revoke <prefix>` in a pipeline never silently nukes a key.
 pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(), AdminError> {
     let info = store.get_key_by_prefix(prefix.as_str()).await?;
 
@@ -193,8 +193,8 @@ fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
 
 /// Revoke a key's grant on an app, with `[y/N]` confirmation unless `--yes`.
 ///
-/// Same interactivity contract as [`revoke`]: refuses to proceed when stdin
-/// is not a TTY and `--yes` was not passed. No preflight read — the prompt
+/// Same interactivity contract as [`revoke`]: refuses to proceed unless both
+/// stdin and stderr are TTYs or `--yes` was passed. No preflight read — the prompt
 /// is built from the arguments, and a missing grant surfaces as the store's
 /// `GrantNotFound` after confirmation (no read-then-delete race).
 pub async fn revoke_grant(
