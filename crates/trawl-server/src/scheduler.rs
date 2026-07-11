@@ -157,7 +157,18 @@ async fn poll_and_execute(
     for (schedule, saved_query) in schedules {
         // Check if max_runs reached.
         if let Some(max) = schedule.max_runs {
-            let count = schedule_store.lock().count_runs(schedule.id).unwrap_or(0);
+            let count = match schedule_store.lock().count_runs(schedule.id) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        event_type = "scheduler_error",
+                        schedule_id = schedule.id,
+                        error = %e,
+                        "failed to count runs; skipping tick to honour max_runs cap"
+                    );
+                    continue;
+                }
+            };
             if count >= max {
                 continue;
             }
