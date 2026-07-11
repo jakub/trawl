@@ -135,14 +135,23 @@ pub async fn query(
             state.query.tracker.complete(query_id, total);
 
             // Auto-save successful queries to history (per user preference).
-            // verified.id is the authoritative fleet keystore id.
-            let _ = state.auth.history.lock().record_query(
+            // verified.id is the authoritative fleet keystore id. Best-effort:
+            // a history-store write failure must not fail the query, but log it
+            // so a broken store (disk-full, SQLITE_BUSY, corruption) is visible.
+            if let Err(e) = state.auth.history.lock().record_query(
                 verified.id,
                 &req.query,
                 duration_ms,
                 total,
                 "success",
-            );
+            ) {
+                tracing::warn!(
+                    event_type = "history_error",
+                    key_id = verified.id,
+                    error = %e,
+                    "failed to record query in history store"
+                );
+            }
 
             tracing::info!(
                 event_type = "query_complete",
