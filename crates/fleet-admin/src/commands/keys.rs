@@ -141,7 +141,7 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
 
         let mut writer = stderr.lock();
         let mut reader = stdin.lock();
-        if !revoke_prompt(&mut reader, &mut writer)? {
+        if !confirm_prompt("revoke this key?", &mut reader, &mut writer)? {
             return Ok(());
         }
     }
@@ -151,17 +151,18 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
     Ok(())
 }
 
-/// Pure prompt loop, factored out for unit testing.
+/// Pure `[y/N]` prompt loop, factored out for unit testing.
 ///
-/// Writes `"revoke this key? [y/N] "` and reads one line. Returns `Ok(true)`
+/// Writes `"{question} [y/N] "` and reads one line. Returns `Ok(true)`
 /// only for `y`/`yes` (case-insensitive). EOF (a zero-byte read) is reported
 /// to the operator before falling through to `Ok(false)` — without that,
 /// "stdin closed mid-prompt" looks identical to "user typed n" in logs.
-pub fn revoke_prompt<R: BufRead, W: Write>(
+pub fn confirm_prompt<R: BufRead, W: Write>(
+    question: &str,
     reader: &mut R,
     writer: &mut W,
 ) -> std::io::Result<bool> {
-    write!(writer, "\nrevoke this key? [y/N] ")?;
+    write!(writer, "\n{question} [y/N] ")?;
     writer.flush()?;
 
     let mut answer = String::new();
@@ -502,25 +503,25 @@ mod tests {
         assert_eq!(format_timestamp(&ts), "2026-02-10 12:00:00");
     }
 
-    fn run_prompt(input: &str) -> (bool, String) {
+    fn run_prompt(question: &str, input: &str) -> (bool, String) {
         let mut reader = std::io::BufReader::new(input.as_bytes());
         let mut writer: Vec<u8> = Vec::new();
-        let result = revoke_prompt(&mut reader, &mut writer).expect("prompt io");
+        let result = confirm_prompt(question, &mut reader, &mut writer).expect("prompt io");
         (result, String::from_utf8(writer).expect("utf8"))
     }
 
     #[test]
-    fn revoke_prompt_accepts_y_variants() {
+    fn confirm_prompt_accepts_y_variants() {
         for ans in ["y\n", "Y\n", "yes\n", "YES\n", "  y  \n"] {
-            let (accepted, _) = run_prompt(ans);
+            let (accepted, _) = run_prompt("revoke this key?", ans);
             assert!(accepted, "{ans:?} should accept");
         }
     }
 
     #[test]
-    fn revoke_prompt_rejects_n_and_blank() {
+    fn confirm_prompt_rejects_n_and_blank() {
         for ans in ["n\n", "N\n", "no\n", "\n", "  \n", "maybe\n"] {
-            let (accepted, out) = run_prompt(ans);
+            let (accepted, out) = run_prompt("revoke this key?", ans);
             assert!(!accepted, "{ans:?} should reject");
             assert!(out.contains("aborted"), "expected 'aborted' in {out:?}");
             assert!(
@@ -531,8 +532,8 @@ mod tests {
     }
 
     #[test]
-    fn revoke_prompt_eof_is_distinguishable_from_no() {
-        let (accepted, out) = run_prompt("");
+    fn confirm_prompt_eof_is_distinguishable_from_no() {
+        let (accepted, out) = run_prompt("revoke this key?", "");
         assert!(!accepted);
         assert!(
             out.contains("stdin closed before answer"),
@@ -541,11 +542,16 @@ mod tests {
     }
 
     #[test]
-    fn revoke_prompt_writes_question_before_reading() {
-        let (_, out) = run_prompt("n\n");
+    fn confirm_prompt_writes_caller_question_before_reading() {
+        let (_, out) = run_prompt("revoke this key?", "n\n");
         assert!(
             out.contains("revoke this key? [y/N]"),
             "missing prompt text in {out:?}"
+        );
+        let (_, out) = run_prompt("revoke grant for app trawl on key aaaabbbb?", "n\n");
+        assert!(
+            out.contains("revoke grant for app trawl on key aaaabbbb? [y/N]"),
+            "question must come from the caller, got {out:?}"
         );
     }
 
