@@ -766,10 +766,6 @@ fn default_telemetry_flush_interval_secs() -> u64 {
 /// Default key audit polling interval (seconds).
 pub const DEFAULT_AUDIT_INTERVAL_SECS: u64 = 30;
 
-/// Default auth cache TTL (seconds). Only consumed by trawld's transitional
-/// `AuthCache`, which dies with the fleet-auth cutover (ADR-0004 slice 1).
-pub const DEFAULT_AUTH_CACHE_TTL_SECS: u64 = 300;
-
 /// Authentication settings.
 ///
 /// API keys live in the fleet-auth Postgres keystore (`database_url`);
