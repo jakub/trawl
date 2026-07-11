@@ -328,6 +328,8 @@ pub fn DerivationsPage() -> impl IntoView {
                                 <LoadMore
                                     has_more=Signal::derive(move || edges_cursor.get().is_some())
                                     busy=loading
+                                    empty=Signal::derive(move || edges.get().is_empty())
+                                    empty_text="no derivation edges yet"
                                     on_load=Callback::new(on_load_more_edges)
                                 />
                             </Pager>
