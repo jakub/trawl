@@ -93,8 +93,11 @@ assets = [
     ["target/release/trawl-admin", "usr/bin/", "755"],
     ["target/release/fleet-admin", "usr/bin/", "755"],
     ["target/release/trawl-web", "usr/bin/", "755"],
-    ["debian/trawld.toml", "etc/trawl/", "644"],
-    ["debian/trawld.default", "etc/default/trawld", "644"],
+    # 0640: these two carry the fleet-auth Postgres DSN (keystore credential).
+    # postinst chowns them root:trawl so trawld (User/Group=trawl) can read them
+    # while unprivileged local users cannot. See debian/postinst.
+    ["debian/trawld.toml", "etc/trawl/", "640"],
+    ["debian/trawld.default", "etc/default/trawld", "640"],
     ["debian/trawl-web.default", "etc/default/trawl-web", "644"],
     ["debian/trawl.sysusers.conf", "usr/lib/sysusers.d/trawl.conf", "644"],
 ]
