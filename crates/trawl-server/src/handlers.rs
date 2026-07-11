@@ -300,26 +300,19 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
     // Run duckdb and fleet keystore pings concurrently.
     //
-    // The keystore ping is a network round-trip to the fleet-auth Postgres
-    // pool. A slow/partitioned keystore (or a saturated pool) could block for
-    // sqlx's full connect/acquire timeout (~30s), stalling this unauthenticated
-    // endpoint far past the k8s probe timeout (default 1s) and crashlooping an
-    // otherwise-serving trawld. Bound the ping: a timeout is reported as an
-    // unhealthy auth subsystem, which is non-critical → `Degraded` → HTTP 200,
-    // so a downstream dependency blip never fails liveness.
-    const AUTH_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    // `/health` is unauthenticated and unthrottled — it sits outside
+    // `require_bearer` and `rate_limit_middleware` — so it must not amplify a
+    // burst of probes onto the small, shared keystore pool that bearer
+    // verification depends on. `AuthState::ping_cached` memoises the ping for a
+    // few seconds and serialises refreshes, collapsing any burst into at most
+    // one in-flight connection. It is also timeout-bounded, so a slow/downed
+    // keystore reports an unhealthy auth subsystem (non-critical → `Degraded` →
+    // HTTP 200) instead of stalling this liveness path.
     let pool = state.query.pool.clone();
-    let key_store = state.auth.key_store.clone();
-    let (duckdb_join, auth_result) =
-        tokio::join!(tokio::spawn(async move { pool.ping().await }), async move {
-            match tokio::time::timeout(AUTH_PING_TIMEOUT, key_store.ping()).await {
-                Ok(res) => res.map_err(|e| e.to_string()),
-                Err(_) => Err(format!(
-                    "keystore ping timed out after {}s",
-                    AUTH_PING_TIMEOUT.as_secs()
-                )),
-            }
-        });
+    let (duckdb_join, auth_result) = tokio::join!(
+        tokio::spawn(async move { pool.ping().await }),
+        state.auth.ping_cached(),
+    );
 
     // Data path: check that the base directory exists and is readable.
     let base_dir = state.query.pool.base_dir().to_owned();

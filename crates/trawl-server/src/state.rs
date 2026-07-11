@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use trawl_api::{DashboardSnapshot, ServiceSchema};
@@ -96,6 +96,72 @@ pub struct AuthState {
     pub saved: Arc<Mutex<SavedQueryStore>>,
     /// Shared `ScheduleStore` connection for scheduled queries and report runs.
     pub schedule: Arc<Mutex<ScheduleStore>>,
+    /// Memoised keystore liveness ping, shared by every `/health` probe.
+    ///
+    /// `/health` is unauthenticated and unthrottled (it sits outside
+    /// `require_bearer` and `rate_limit_middleware`), so a burst of probes must
+    /// not stampede the small, shared keystore connection pool that bearer
+    /// verification depends on. See [`AuthState::ping_cached`].
+    pub auth_ping: Arc<tokio::sync::Mutex<Option<CachedAuthPing>>>,
+}
+
+/// A cached keystore liveness-ping outcome with an expiry timestamp.
+#[derive(Debug, Clone)]
+pub struct CachedAuthPing {
+    /// Ping outcome: `Ok(())` on success, `Err(msg)` on failure/timeout.
+    pub result: Result<(), String>,
+    /// When this ping was performed.
+    pub checked_at: Instant,
+}
+
+impl AuthState {
+    /// Liveness ping against the fleet keystore, memoised to protect the pool.
+    ///
+    /// The result is cached for [`Self::PING_CACHE_TTL`]; within a window every
+    /// probe reuses the last outcome and touches no connection, collapsing any
+    /// burst of unauthenticated `/health` requests into at most one ping per
+    /// window. The `tokio::sync::Mutex` also serialises refreshes, so at most
+    /// one in-flight ping holds a keystore connection at any instant (mirrors
+    /// the thundering-herd guard on the schema cache).
+    ///
+    /// The ping is bounded by [`Self::PING_TIMEOUT`]: a slow/partitioned
+    /// keystore reports a timeout error rather than blocking on sqlx's full
+    /// connect/acquire deadline. Failed and timed-out pings are cached too, so
+    /// a downed keystore cannot turn every probe into a fresh stall.
+    ///
+    /// Returns `Ok(())` when the keystore answered, or `Err(msg)` describing the
+    /// failure or timeout.
+    pub async fn ping_cached(&self) -> Result<(), String> {
+        let mut guard = self.auth_ping.lock().await;
+        if let Some(cached) = guard.as_ref()
+            && cached.checked_at.elapsed() < Self::PING_CACHE_TTL
+        {
+            return cached.result.clone();
+        }
+
+        let result = match tokio::time::timeout(Self::PING_TIMEOUT, self.key_store.ping()).await {
+            Ok(res) => res.map_err(|e| e.to_string()),
+            Err(_) => Err(format!(
+                "keystore ping timed out after {}s",
+                Self::PING_TIMEOUT.as_secs()
+            )),
+        };
+        *guard = Some(CachedAuthPing {
+            result: result.clone(),
+            checked_at: Instant::now(),
+        });
+        result
+    }
+
+    /// Upper bound on a single keystore liveness ping.
+    ///
+    /// Chosen well under the k8s probe timeout (default 1s is exceeded, but the
+    /// auth check is non-critical → `Degraded` → HTTP 200, so a slow keystore
+    /// never fails liveness) and far under sqlx's ~30s connect/acquire deadline.
+    const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// How long a keystore ping outcome is reused before a fresh probe.
+    const PING_CACHE_TTL: Duration = Duration::from_secs(5);
 }
 
 /// Ingest pipeline state.
@@ -303,6 +369,7 @@ async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::Se
         history: Arc::new(Mutex::new(history)),
         saved: Arc::new(Mutex::new(saved)),
         schedule: Arc::new(Mutex::new(schedule)),
+        auth_ping: Arc::new(tokio::sync::Mutex::new(None)),
     })
 }
 
