@@ -45,5 +45,14 @@ pub fn install() {
 pub fn now_ms() -> Signal<i64> {
     NOW_MS
         .with_borrow(|slot| slot.map(|sig| sig.read_only()))
-        .map_or_else(|| Signal::derive(current_ms), Signal::from)
+        .map_or_else(
+            || {
+                #[cfg(debug_assertions)]
+                leptos::logging::warn!(
+                    "fleet-ui: time::clock::install() was never called — relative timestamps will not tick"
+                );
+                Signal::derive(current_ms)
+            },
+            Signal::from,
+        )
 }
