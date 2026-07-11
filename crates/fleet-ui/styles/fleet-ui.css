@@ -1129,3 +1129,11 @@ textarea:focus-visible,
 
 /* When — <When/> canonical timestamp label (issue #33). */
 .when { white-space: nowrap; }
+
+/* LoadMore — <LoadMore/> cursor-driven list footer (issue #33). */
+.load-more { display: flex; align-items: center; gap: 6px; }
+.load-more .load-more-end {
+  font-size: 11px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+}

@@ -28,6 +28,7 @@
 
 pub mod badge;
 pub mod button;
+pub mod load_more;
 pub mod loaded;
 pub mod login;
 pub mod modal;
@@ -68,6 +69,7 @@ pub mod topbar;
 pub use badge::Tone;
 pub use button::{Size, Variant};
 pub use icon::Icon;
+pub use load_more::LoadMorePhase;
 pub use loaded::LoadState;
 pub use modal::ConfirmState;
 pub use segmented::{SegmentedOption, segmented_class};
@@ -92,6 +94,8 @@ pub use field::{Field, Helper};
 pub use icon::IconView;
 #[cfg(target_arch = "wasm32")]
 pub use kbd::Kbd;
+#[cfg(target_arch = "wasm32")]
+pub use load_more::LoadMore;
 #[cfg(target_arch = "wasm32")]
 pub use loaded::Loaded;
 #[cfg(target_arch = "wasm32")]

@@ -11,7 +11,7 @@ use leptos_router::hooks::use_navigate;
 use crate::api;
 use crate::api::ApiError;
 use fleet_ui::time::time_ago;
-use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Tone, Variant};
+use fleet_ui::{Badge, LoadMore, LoadState, Loaded, Pager, ToastBus, ToastKind, Tone};
 
 use crate::components::tone_for_var;
 
@@ -168,22 +168,16 @@ pub fn StoriesPage() -> impl IntoView {
                                 }
                             }).collect::<Vec<_>>()}
                         </div>
-                        {if has_more {
-                            let is_loading = loading.get();
-                            view! {
-                                <Pager summary=String::new()>
-                                    <Btn
-                                        variant=Variant::Secondary
-                                        disabled=is_loading
-                                        on_click=Callback::new(on_load_more)
-                                    >
-                                        {if is_loading { "loading\u{2026}" } else { "load more" }}
-                                    </Btn>
-                                </Pager>
-                            }.into_any()
-                        } else {
-                            ().into_any()
-                        }}
+                        // <LoadMore> owns the three-state footer; the
+                        // canonical "end of list" line on exhausted
+                        // lists is the sanctioned visual delta (#33 D3).
+                        <Pager summary=String::new()>
+                            <LoadMore
+                                has_more=has_more
+                                busy=loading
+                                on_load=Callback::new(on_load_more)
+                            />
+                        </Pager>
                     </div>
                 }.into_any()
             })

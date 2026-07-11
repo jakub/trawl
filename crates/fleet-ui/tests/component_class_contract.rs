@@ -52,6 +52,7 @@ const SEARCH_INPUT: &str = include_str!("../src/search_input.rs");
 const TOGGLE: &str = include_str!("../src/toggle.rs");
 const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
+const LOAD_MORE: &str = include_str!("../src/load_more.rs");
 const WHEN: &str = include_str!("../src/time/when.rs");
 const CLOCK: &str = include_str!("../src/time/clock.rs");
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
@@ -299,6 +300,25 @@ fn drawer_is_an_honest_non_modal_dialog() {
         DRAWER.contains(r#"tabindex="-1""#),
         "the drawer panel needs tabindex=\"-1\" so the initial-focus \
          fallback can land on the panel itself"
+    );
+}
+
+#[test]
+fn load_more_emits_its_hooks_and_the_canonical_busy_label() {
+    // Issue #33 D3: cursor-driven list footer. The three terminal
+    // states (button / end-of-list / empty) are pinned natively in
+    // load_more::phase tests; these pin the class hooks and that the
+    // busy label is the CANONICAL loading copy, not a bespoke string.
+    emits(LOAD_MORE, r#"class="load-more""#, ".load-more");
+    emits(
+        LOAD_MORE,
+        r#"class="load-more-end""#,
+        ".load-more .load-more-end",
+    );
+    assert!(
+        LOAD_MORE.contains("loading_copy(None)"),
+        "the busy label must be the canonical loading_copy — slice C \
+         normalized generic status copy, LoadMore must not fork it"
     );
 }
 

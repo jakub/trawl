@@ -24,7 +24,7 @@ use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_deriva
 use crate::components::linkage_graph::LinkageGraph;
 use crate::components::tone_for_var;
 use fleet_ui::time::time_ago;
-use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, Tone, Variant};
+use fleet_ui::{Badge, LoadMore, LoadState, Loaded, Pager, Tone};
 
 use super::stories::{class_label, marking_tone, state_badge};
 
@@ -412,19 +412,18 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                             }
                         }).collect::<Vec<_>>()}
                     </div>
-                    {has_more.then(|| {
-                        let is_loading = loading.get();
-                        view! {
-                            <Btn
-                                variant=Variant::Secondary
-                                attr:style="margin-top:8px;width:100%"
-                                disabled=is_loading
-                                on_click=Callback::new(on_load_more)
-                            >
-                                {if is_loading { "loading\u{2026}" } else { "load older" }}
-                            </Btn>
-                        }
-                    })}
+                    // Bare <LoadMore> (no Pager — this is the timeline
+                    // column, not a table footer); "load older" stays
+                    // the idle label, exhaustion now shows the
+                    // canonical "end of list" line (#33 D3).
+                    <LoadMore
+                        has_more=has_more
+                        busy=loading
+                        on_load=Callback::new(on_load_more)
+                        label="load older"
+                        full=true
+                        attr:style="margin-top:8px"
+                    />
                 }.into_any()
             })
             />
@@ -765,20 +764,16 @@ fn ClaimsSection(
                                 }
                             }).collect::<Vec<_>>()}
                         </div>
-                        {has_more.then(|| {
-                            let is_loading = loading.get();
-                            view! {
-                                <Pager summary=String::new()>
-                                    <Btn
-                                        variant=Variant::Secondary
-                                        disabled=is_loading
-                                        on_click=Callback::new(on_load_more)
-                                    >
-                                        {if is_loading { "loading\u{2026}" } else { "load more" }}
-                                    </Btn>
-                                </Pager>
-                            }
-                        })}
+                        // <LoadMore> owns the three-state footer; the
+                        // canonical "end of list" line on exhausted
+                        // lists is the sanctioned visual delta (#33 D3).
+                        <Pager summary=String::new()>
+                            <LoadMore
+                                has_more=has_more
+                                busy=loading
+                                on_load=Callback::new(on_load_more)
+                            />
+                        </Pager>
                     </div>
                 }.into_any()
             })
