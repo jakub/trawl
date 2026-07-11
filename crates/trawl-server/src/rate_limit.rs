@@ -14,15 +14,15 @@ use std::sync::Arc;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
+use fleet_auth::VerifiedKey;
 use governor::Quota;
 use governor::RateLimiter;
 use governor::clock::DefaultClock;
 use governor::state::keyed::DashMapStateStore;
-use trawl_auth::keys::VerifiedKey;
-use trawl_auth::roles::Role;
 
 use crate::config::RateLimitConfig;
 use crate::error::ServerError;
+use crate::policy::{Role, TrawlAuthz as _};
 
 /// A keyed rate limiter: one bucket per API key prefix within a role.
 type KeyedLimiter = RateLimiter<String, DashMapStateStore<String>, DefaultClock>;
@@ -82,9 +82,11 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
         .get::<VerifiedKey>()
         .ok_or_else(|| ServerError::Internal("verified key not in extensions".into()))?;
 
-    // Per-role rate limiting is gated on the trawl-app role; keys without
-    // a trawl grant bypass the buckets here entirely (per-handler permission
-    // checks will 403 them on any trawl endpoint they actually try to hit).
+    // Per-role rate limiting is gated on the trawl-app role. Keys without
+    // a trawl grant can no longer reach this middleware — the mandatory
+    // `require_trawl_grant` policy layer 403s them first — but the bypass
+    // branch stays as belt-and-suspenders (AC3 asserts grantless keys never
+    // get here).
     if let Some(trawl_role) = verified.trawl_role() {
         if let Some(limiter) = rate_state.limiter_for_role(trawl_role)
             && limiter.check_key(&verified.prefix).is_err()

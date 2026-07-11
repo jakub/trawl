@@ -8,7 +8,6 @@
 //! authenticates clients, executes queries, and streams results.
 
 pub mod audit;
-pub mod auth;
 pub mod bus;
 pub mod config;
 pub mod error;
@@ -18,6 +17,7 @@ pub mod hot_buffer;
 pub mod ingest;
 pub mod metrics;
 pub mod monitor;
+pub mod policy;
 pub mod pool;
 pub mod query_log;
 pub mod rate_limit;

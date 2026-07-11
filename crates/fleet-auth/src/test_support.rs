@@ -52,6 +52,7 @@ pub fn require_database() -> bool {
 /// RAII fixture: create + migrate a fresh per-test database, hand out a
 /// pool, drop the database on `Drop`.
 pub struct PgFixture {
+    admin_url: String,
     admin_opts: PgConnectOptions,
     test_db: String,
     pool: Option<PgPool>,
@@ -103,10 +104,19 @@ impl PgFixture {
         MIGRATOR.run(&pool).await.expect("apply migrations");
 
         Some(Self {
+            admin_url,
             admin_opts,
             test_db,
             pool: Some(pool),
         })
+    }
+
+    /// URL of the ephemeral per-test database, for consumers that construct
+    /// their own connection from configuration (e.g. trawld's
+    /// `[auth] database_url` boot path).
+    #[must_use]
+    pub fn database_url(&self) -> String {
+        swap_database(&self.admin_url, &self.test_db)
     }
 
     /// A pool connected to the ephemeral per-test database.
@@ -148,6 +158,21 @@ impl Drop for PgFixture {
     }
 }
 
+/// Replace the database path of a postgres URL, preserving any query string.
+fn swap_database(url: &str, db: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    let authority = base[after_scheme..]
+        .find('/')
+        .map_or(base, |i| &base[..after_scheme + i]);
+    match query {
+        Some(q) => format!("{authority}/{db}?{q}"),
+        None => format!("{authority}/{db}"),
+    }
+}
+
 fn random_db_suffix() -> String {
     use rand::Rng as _;
     let mut rng = rand::thread_rng();
@@ -157,4 +182,22 @@ fn random_db_suffix() -> String {
             (b'a' + n) as char
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::swap_database;
+
+    #[test]
+    fn swap_database_replaces_path_and_keeps_query() {
+        assert_eq!(
+            swap_database("postgres://u:p@h:5432/olddb", "newdb"),
+            "postgres://u:p@h:5432/newdb"
+        );
+        assert_eq!(
+            swap_database("postgres://u:p@h:5432/olddb?sslmode=require", "newdb"),
+            "postgres://u:p@h:5432/newdb?sslmode=require"
+        );
+        assert_eq!(swap_database("postgres://h", "newdb"), "postgres://h/newdb");
+    }
 }

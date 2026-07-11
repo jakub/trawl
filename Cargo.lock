@@ -6350,6 +6350,7 @@ dependencies = [
  "dashmap",
  "duckdb",
  "flate2",
+ "fleet-auth",
  "fs4",
  "governor",
  "hostname",

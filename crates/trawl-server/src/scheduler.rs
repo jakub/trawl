@@ -15,10 +15,11 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use trawl_auth::KeyStore;
+use fleet_auth::KeyStore;
 use trawl_auth::schedule::ScheduleStore;
 
 use crate::config::SchedulerConfig;
+use crate::policy::TrawlAuthz as _;
 use crate::pool::ExecutorPool;
 
 /// Spawn the scheduler background task.
@@ -27,7 +28,7 @@ use crate::pool::ExecutorPool;
 /// sending `true` signals the task to exit.
 pub fn spawn_scheduler(
     schedule_store: Arc<Mutex<ScheduleStore>>,
-    key_store: Arc<Mutex<KeyStore>>,
+    key_store: KeyStore,
     pool: ExecutorPool,
     config: SchedulerConfig,
     timeout_secs: u64,
@@ -45,7 +46,7 @@ pub fn spawn_scheduler(
 
 async fn scheduler_loop(
     schedule_store: Arc<Mutex<ScheduleStore>>,
-    key_store: Arc<Mutex<KeyStore>>,
+    key_store: KeyStore,
     pool: ExecutorPool,
     config: SchedulerConfig,
     timeout_secs: u64,
@@ -93,7 +94,7 @@ async fn scheduler_loop(
             }
         }
 
-        poll_and_execute(&schedule_store, &key_store, &pool, &config, timeout_secs);
+        poll_and_execute(&schedule_store, &key_store, &pool, &config, timeout_secs).await;
 
         // Periodic retention cleanup.
         retention_counter += 1;
@@ -131,9 +132,9 @@ async fn scheduler_loop(
     }
 }
 
-fn poll_and_execute(
+async fn poll_and_execute(
     schedule_store: &Arc<Mutex<ScheduleStore>>,
-    key_store: &Arc<Mutex<KeyStore>>,
+    key_store: &KeyStore,
     pool: &ExecutorPool,
     config: &SchedulerConfig,
     timeout_secs: u64,
@@ -190,18 +191,8 @@ fn poll_and_execute(
             continue;
         }
 
-        // Verify the owning API key is still active.
-        let key_active = {
-            let ks = key_store.lock();
-            ks.is_key_active(schedule.key_id).unwrap_or(false)
-        };
-        if !key_active {
-            tracing::debug!(
-                event_type = "scheduler_skip",
-                schedule_id = schedule.id,
-                key_id = schedule.key_id,
-                "skipping schedule: owning key is inactive"
-            );
+        // Gate on key liveness in the fleet keystore (AC6).
+        if !owning_key_is_usable(key_store, schedule.id, schedule.key_id).await {
             continue;
         }
 
@@ -243,6 +234,37 @@ fn poll_and_execute(
             .await;
         });
     }
+}
+
+/// Whether the schedule's owning key may still run scheduled queries: it
+/// must be live in the fleet keystore (active + unexpired) AND hold a trawl
+/// grant with a role trawl recognizes. Revocation, expiry, and
+/// grant-stripping all stop scheduled execution (AC6). Lookup failures skip
+/// conservatively.
+async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> bool {
+    let live = match key_store.get_live_key_by_id(key_id).await {
+        Ok(live) => live,
+        Err(e) => {
+            tracing::warn!(
+                event_type = "scheduler_error",
+                schedule_id,
+                key_id,
+                error = %e,
+                "failed to check key liveness; skipping schedule this tick"
+            );
+            return false;
+        }
+    };
+    let usable = live.is_some_and(|k| k.trawl_role().is_some());
+    if !usable {
+        tracing::info!(
+            event_type = "scheduler_skip",
+            schedule_id,
+            key_id,
+            "skipping schedule: owning key is revoked, expired, or has no usable trawl grant"
+        );
+    }
+    usable
 }
 
 pub(crate) async fn execute_scheduled_query(

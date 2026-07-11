@@ -5,7 +5,6 @@
 //! Shared application state for axum handlers.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,10 +13,9 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 
 use trawl_api::{DashboardSnapshot, ServiceSchema};
-use trawl_auth::{HistoryStore, KeyStore, SavedQueryStore, ScheduleStore};
+use trawl_auth::{HistoryStore, SavedQueryStore, ScheduleStore};
 use trawl_engine::value::SchemaResult;
 
-use crate::auth::AuthCache;
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
 use crate::hot_buffer::{HotBuffer, HotBufferConfig};
@@ -78,21 +76,26 @@ pub struct QueryState {
     pub query_log: Option<Arc<QueryLog>>,
 }
 
-/// Authentication state: key store, history store, saved queries, and database path.
+/// Authentication state: fleet keystore plus the transitional `SQLite`
+/// app-state stores (history, saved queries, schedules — ADR-0004 slice 3
+/// moves these to postgres).
 #[derive(Debug, Clone)]
 pub struct AuthState {
-    /// Shared `KeyStore` connection, opened once at startup.
-    pub key_store: Arc<Mutex<KeyStore>>,
+    /// Fleet-auth Postgres keystore. Cheap to clone (Arc-backed pool +
+    /// verification cache live inside).
+    pub key_store: fleet_auth::KeyStore,
+    /// State for `fleet_auth::require_bearer`. trawld never reads session
+    /// cookies (that's trawl-web's job in slice 2), so the embedded session
+    /// key is a generated throwaway — mirrors fleet-auth's own bearer-only
+    /// test wiring. A KeyStore-only bearer state is a parked fleet-auth
+    /// follow-up.
+    pub session_state: fleet_auth::SessionState,
     /// Shared `HistoryStore` connection for query history persistence.
     pub history: Arc<Mutex<HistoryStore>>,
     /// Shared `SavedQueryStore` connection for saved queries.
     pub saved: Arc<Mutex<SavedQueryStore>>,
     /// Shared `ScheduleStore` connection for scheduled queries and report runs.
     pub schedule: Arc<Mutex<ScheduleStore>>,
-    /// Path to the `SQLite` auth database (kept for admin commands).
-    pub db_path: Arc<PathBuf>,
-    /// In-memory auth token cache (skips argon2id on hits).
-    pub auth_cache: Arc<AuthCache>,
 }
 
 /// Ingest pipeline state.
@@ -253,19 +256,67 @@ pub struct CachedServiceSchema {
     pub cached_at: Instant,
 }
 
+/// Build [`AuthState`]: connect the fleet keystore (eagerly), derive the
+/// bearer-only [`fleet_auth::SessionState`], and open the transitional
+/// `SQLite` app-state stores.
+async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::ServerError> {
+    let database_url = config
+        .auth
+        .resolve_database_url()
+        .map_err(|e| crate::error::ServerError::Internal(e.to_string()))?;
+
+    // Eager connect + ping: a dead backend is a distinct, loud startup
+    // error — trawld cannot authenticate anyone without it.
+    let key_store = fleet_auth::KeyStore::connect(&database_url)
+        .await
+        .map_err(|e| {
+            crate::error::ServerError::ServiceUnavailable(format!(
+                "fleet auth backend unreachable at startup (is postgres up and migrated via \
+                 `fleet-admin migrate`?): {e}"
+            ))
+        })?;
+    key_store.ping().await.map_err(|e| {
+        crate::error::ServerError::ServiceUnavailable(format!(
+            "fleet auth backend failed ping at startup: {e}"
+        ))
+    })?;
+
+    // trawld only ever runs require_bearer; the session key is a
+    // throwaway (see AuthState::session_state).
+    let session_state = fleet_auth::SessionState::new(
+        key_store.clone(),
+        Arc::new(fleet_auth::SessionKey::generate()),
+        Arc::new(
+            fleet_auth::SessionConfig::new("fleet_session", "trawl")
+                .map_err(crate::error::ServerError::from)?,
+        ),
+    )
+    .map_err(crate::error::ServerError::from)?;
+
+    let history = HistoryStore::open(&config.auth.db_path)?;
+    let saved = SavedQueryStore::open(&config.auth.db_path)?;
+    let schedule = ScheduleStore::open(&config.auth.db_path)?;
+
+    Ok(AuthState {
+        key_store,
+        session_state,
+        history: Arc::new(Mutex::new(history)),
+        saved: Arc::new(Mutex::new(saved)),
+        schedule: Arc::new(Mutex::new(schedule)),
+    })
+}
+
 impl AppState {
     /// Construct app state from a validated [`Config`].
     ///
-    /// Opens the auth database once at startup. Returns an error if the
-    /// database cannot be opened or initialized.
-    pub fn from_config(
+    /// Connects to the fleet-auth Postgres keystore (eagerly — trawld fails
+    /// fast at startup when the auth backend is unreachable) and opens the
+    /// transitional `SQLite` app-state stores.
+    pub async fn from_config(
         config: &Config,
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-    ) -> Result<(Self, HttpConfig), trawl_auth::AuthError> {
-        let key_store = KeyStore::open(&config.auth.db_path)?;
-        let history = HistoryStore::open(&config.auth.db_path)?;
-        let saved = SavedQueryStore::open(&config.auth.db_path)?;
-        let schedule = ScheduleStore::open(&config.auth.db_path)?;
+    ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
+        let auth = build_auth_state(config).await?;
 
         let (wal_writer, event_bus, hot_buffer, pipeline) = if config.ingest.enabled {
             let writer = Arc::new(WalWriter::new(config.wal_dir()));
@@ -283,12 +334,6 @@ impl AppState {
         } else {
             (None, None, None, None)
         };
-
-        // Fixed TTL: the config knob died with the fleet-auth cutover and
-        // this whole cache dies with auth.rs in the same slice.
-        let auth_cache = Arc::new(AuthCache::new(std::time::Duration::from_secs(
-            crate::config::DEFAULT_AUTH_CACHE_TTL_SECS,
-        )));
 
         let state = Self {
             query: QueryState {
@@ -309,14 +354,7 @@ impl AppState {
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
                 query_log: None,
             },
-            auth: AuthState {
-                key_store: Arc::new(Mutex::new(key_store)),
-                history: Arc::new(Mutex::new(history)),
-                saved: Arc::new(Mutex::new(saved)),
-                schedule: Arc::new(Mutex::new(schedule)),
-                db_path: Arc::new(config.auth.db_path.clone()),
-                auth_cache,
-            },
+            auth,
             ingest: IngestState {
                 wal_writer,
                 pipeline,

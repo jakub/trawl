@@ -36,10 +36,10 @@ use ulid::Ulid;
 #[derive(Clone, Debug)]
 struct RequestId(String);
 
-use crate::auth::auth_middleware;
 use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};
 use crate::handlers;
 use crate::ingest;
+use crate::policy::{normalize_auth_errors, require_trawl_grant};
 use crate::rate_limit::{RateLimitState, rate_limit_middleware};
 use crate::shutdown::shutdown_signal;
 use crate::state::{AppState, HttpConfig};
@@ -53,8 +53,11 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let cors_origins = &http.cors_allowed_origins;
     let ingest_enabled = state.ingest.wal_writer.is_some();
     let rate_state = RateLimitState::from_config(&http.rate_limit);
+    let session_state = state.auth.session_state.clone();
 
-    // Query routes: body limit → auth → rate limit (axum onion: first layer = innermost).
+    // Query routes. Onion (first .layer() = innermost): body limit →
+    // envelope normalization → require_bearer (fleet-auth authn) →
+    // require_trawl_grant (mandatory trawl policy) → rate limit → handler.
     let authenticated = Router::new()
         .route("/query", post(handlers::query))
         .route("/validate", post(handlers::validate_query))
@@ -89,14 +92,15 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/export", post(handlers::export))
         .route("/stream", get(handlers::stream_query))
         .layer(middleware::from_fn(rate_limit_middleware))
-        .layer(middleware::from_fn(auth_middleware))
+        .layer(middleware::from_fn(require_trawl_grant))
+        .layer(middleware::from_fn_with_state(
+            session_state.clone(),
+            fleet_auth::require_bearer,
+        ))
+        .layer(middleware::from_fn(normalize_auth_errors))
         .layer(RequestBodyLimitLayer::new(max_body));
 
-    // Shared key store and auth cache injected into extensions for the auth middleware.
-    let key_store = Arc::clone(&state.auth.key_store);
-    let auth_cache = Arc::clone(&state.auth.auth_cache);
-
-    // Ingest route: body limit → auth → rate limit.
+    // Ingest route: same auth stack, separate (larger) body limit.
     let ingest_routes = if ingest_enabled {
         let ingest_body_limit = http
             .ingest_max_body_bytes
@@ -104,7 +108,12 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         Router::new()
             .route("/ingest", post(ingest::handler::ingest))
             .layer(middleware::from_fn(rate_limit_middleware))
-            .layer(middleware::from_fn(auth_middleware))
+            .layer(middleware::from_fn(require_trawl_grant))
+            .layer(middleware::from_fn_with_state(
+                session_state,
+                fleet_auth::require_bearer,
+            ))
+            .layer(middleware::from_fn(normalize_auth_errors))
             .layer(RequestBodyLimitLayer::new(ingest_body_limit))
     } else {
         Router::new()
@@ -192,8 +201,6 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     .layer(middleware::from_fn(request_id_middleware))
     .layer(middleware::from_fn(connection_gauge_middleware))
     .layer(axum::Extension(rate_state))
-    .layer(axum::Extension(auth_cache))
-    .layer(axum::Extension(key_store))
     .with_state(state)
 }
 

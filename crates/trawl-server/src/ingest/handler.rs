@@ -15,13 +15,13 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use fleet_auth::VerifiedKey;
 use indexmap::IndexMap;
 use serde_json::json;
-use trawl_auth::keys::VerifiedKey;
-use trawl_auth::roles::Permission;
 
 use crate::error::ServerError;
 use crate::ingest::pipeline::{self, ServiceBatch};
+use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
 use trawl_api::{IngestEventError, IngestResponse};
 

@@ -10,8 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
+use fleet_auth::VerifiedKey;
 use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
-use trawl_auth::keys::VerifiedKey;
+
+use crate::policy::TrawlAuthz as _;
 
 /// Tracks active and recently completed queries.
 #[derive(Debug)]
@@ -27,7 +29,10 @@ pub struct QueryTracker {
 pub struct ActiveQuery {
     /// Monotonic query ID.
     pub id: u64,
-    /// Authenticated user name.
+    /// Fleet keystore id of the submitting key — the authorization anchor
+    /// for non-admin cancellation (names are mutable and non-unique).
+    pub key_id: i64,
+    /// Authenticated user name (display only).
     pub user: String,
     /// User's role.
     pub role: String,
@@ -75,6 +80,7 @@ impl QueryTracker {
             id,
             ActiveQuery {
                 id,
+                key_id: verified.id,
                 user: verified.name.clone(),
                 role: verified
                     .trawl_role()
@@ -131,6 +137,14 @@ impl QueryTracker {
         }
     }
 
+    /// Fleet keystore id of the key that started the given active query.
+    ///
+    /// `None` when the query is unknown or already finished — callers treat
+    /// that as "not yours" (no information disclosure about live query ids).
+    pub fn owner_key_id(&self, id: u64) -> Option<i64> {
+        self.active.get(&id).map(|q| q.key_id)
+    }
+
     /// Snapshot of all currently active queries.
     pub fn active(&self) -> Vec<ActiveQuerySnapshot> {
         self.active
@@ -166,7 +180,7 @@ impl QueryTracker {
 
 #[cfg(test)]
 mod tests {
-    use trawl_auth::assignments::{PrincipalKind, RoleAssignment};
+    use fleet_auth::{PrincipalKind, RoleAssignment};
 
     use super::*;
 
@@ -224,6 +238,27 @@ mod tests {
         let recent = tracker.recent();
         assert_eq!(recent.len(), 1);
         assert!(recent[0].timed_out);
+    }
+
+    #[test]
+    fn owner_key_id_tracks_submitting_key() {
+        let tracker = QueryTracker::new();
+        let mut key = test_key();
+        key.id = 42;
+
+        let qid = tracker.start(&key, "*");
+        assert_eq!(tracker.owner_key_id(qid), Some(42));
+
+        // A different key id is not the owner — same name is irrelevant.
+        let mut other = test_key();
+        other.id = 43;
+        let other_qid = tracker.start(&other, "*");
+        assert_eq!(tracker.owner_key_id(other_qid), Some(43));
+
+        // Finished or unknown queries have no owner.
+        tracker.complete(qid, 0);
+        assert_eq!(tracker.owner_key_id(qid), None);
+        assert_eq!(tracker.owner_key_id(9999), None);
     }
 
     #[test]

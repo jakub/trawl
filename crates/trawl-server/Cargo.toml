@@ -18,6 +18,7 @@ trawl-core = { workspace = true }
 trawl-engine = { workspace = true }
 trawl-auth = { workspace = true }
 trawl-dashboard = { workspace = true }
+fleet-auth = { workspace = true, features = ["axum"] }
 trawl-crashdump = { workspace = true }
 
 async-stream = { workspace = true }
@@ -69,6 +70,7 @@ bundled = ["duckdb/bundled", "trawl-engine/bundled"]
 
 [dev-dependencies]
 trawl-auth = { workspace = true, features = ["fast-hash"] }
+fleet-auth = { workspace = true, features = ["axum", "fast-hash", "test-support"] }
 trawl-client = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true }

@@ -4,30 +4,27 @@
 
 //! Key audit polling task.
 //!
-//! Periodically polls the `SQLite` auth database for key changes made by
-//! trawl-admin (which writes directly to the same `auth.db`). Emits
-//! `key_created` / `key_revoked` tracing events that flow through the
-//! [`WalLayer`] into parquet, providing an audit trail even though
-//! trawl-admin has no WAL subscriber.
+//! Periodically polls the fleet-auth Postgres keystore for key changes made
+//! out-of-process by fleet-admin. Emits `key_created` / `key_revoked`
+//! tracing events that flow through the [`WalLayer`] into parquet,
+//! providing an audit trail even though fleet-admin has no WAL subscriber.
 //!
 //! The task snapshots all key states on startup and only emits events for
 //! *changes* detected on subsequent polls (no replay of historical keys).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use fleet_auth::KeyStore;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use trawl_auth::KeyStore;
 
 /// Spawn the key audit polling task.
 ///
 /// Polls the `KeyStore` every `interval` for new or revoked keys and emits
 /// tracing events. Returns a `JoinHandle` for shutdown coordination.
 pub fn spawn_audit_task(
-    key_store: Arc<Mutex<KeyStore>>,
+    key_store: KeyStore,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -85,39 +82,27 @@ struct KeySnapshot {
     active: bool,
 }
 
-/// Build the initial snapshot from the current database state.
-async fn initial_snapshot(
-    key_store: &Arc<Mutex<KeyStore>>,
-) -> Result<HashMap<i64, KeySnapshot>, String> {
-    let store = Arc::clone(key_store);
-    tokio::task::spawn_blocking(move || {
-        let guard = store.lock();
-        let keys = guard
-            .list_keys(false)
-            .map_err(|e| format!("list_keys failed: {e}"))?;
-        Ok(keys
-            .into_iter()
-            .map(|k| (k.id, KeySnapshot { active: k.active }))
-            .collect())
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking panicked: {e}"))?
+/// Build the initial snapshot from the current keystore state.
+async fn initial_snapshot(key_store: &KeyStore) -> Result<HashMap<i64, KeySnapshot>, String> {
+    let keys = key_store
+        .list_keys(false)
+        .await
+        .map_err(|e| format!("list_keys failed: {e}"))?;
+    Ok(keys
+        .into_iter()
+        .map(|k| (k.id, KeySnapshot { active: k.active }))
+        .collect())
 }
 
-/// Poll the database and emit events for any changes since the last snapshot.
+/// Poll the keystore and emit events for any changes since the last snapshot.
 async fn poll_changes(
-    key_store: &Arc<Mutex<KeyStore>>,
+    key_store: &KeyStore,
     snapshot: &mut HashMap<i64, KeySnapshot>,
 ) -> Result<(), String> {
-    let store = Arc::clone(key_store);
-    let current = tokio::task::spawn_blocking(move || {
-        let guard = store.lock();
-        guard
-            .list_keys(false)
-            .map_err(|e| format!("list_keys failed: {e}"))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking panicked: {e}"))??;
+    let current = key_store
+        .list_keys(false)
+        .await
+        .map_err(|e| format!("list_keys failed: {e}"))?;
 
     for key in &current {
         match snapshot.get(&key.id) {
@@ -130,13 +115,16 @@ async fn poll_changes(
                     name = %key.name,
                     kind = %key.kind,
                     assignments = ?key.assignments,
-                    occurred_at = %key.created_at,
+                    occurred_at = %key.created_at.to_rfc3339(),
                     "API key created (detected by audit)"
                 );
             }
             Some(prev) if prev.active && !key.active => {
-                // Key was revoked since last poll.
-                let occurred_at = key.revoked_at.as_deref().unwrap_or("unknown");
+                // Key was revoked since last poll. fleet-auth timestamps are
+                // typed DateTime<Utc>; render rfc3339 for the audit trail.
+                let occurred_at = key
+                    .revoked_at
+                    .map_or_else(|| "unknown".to_owned(), |t| t.to_rfc3339());
                 tracing::info!(
                     event_type = "key_revoked",
                     key_id = key.id,
