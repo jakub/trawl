@@ -58,7 +58,14 @@ the helm chart.
 3. app stores → postgres (`trawl` database); `trawl-auth` crate deleted.
 
 Transitional state between slices 1 and 3: history/saved/schedule stores remain
-on sqlite at `[auth] db_path`, holding postgres key ids as plain i64s.
+on sqlite, holding postgres key ids as plain i64s — but in a **fresh database
+file**, not the legacy `auth.db`. Postgres and sqlite key ids are unrelated
+sequences; reusing the legacy file would let a newly minted postgres key with id
+*n* silently inherit sqlite key *n*'s history, saved queries, and schedules
+(which would then auto-execute under the new identity) — cross-principal
+disclosure, found in the codex design review. The legacy `auth.db` is
+quarantined on disk at cutover and never read again; slice 3 deletes the
+transitional file along with the crate.
 
 ## Consequences
 
@@ -70,5 +77,14 @@ on sqlite at `[auth] db_path`, holding postgres key ids as plain i64s.
   (fleet-auth's KDF cache has no TTL and revocation is checked per-request).
 - All existing `flt_` tokens stop working at cutover; the token format itself
   is unchanged.
-- fleet-auth gains a small substrate addition: a key-liveness check by id for
-  trawld's scheduler.
+- fleet-auth gains a small substrate addition for trawld's scheduler: a
+  live-key lookup by id returning active + unexpired state and fresh
+  assignments (a bare `is_key_active` boolean is too weak — scheduled
+  execution authority must also respect expiry and the current trawl grant).
+- trawld's policy layer is mandatory middleware directly behind
+  `require_bearer`, not per-handler convention: `require_bearer`
+  deliberately authenticates keys from any fleet app, so grantless keys must
+  be rejected before the rate limiter and `/whoami` see them.
+- fleet-admin ships in the runtime docker image and the .deb (it is the
+  migration/provisioning tool the helm init container and operators invoke;
+  as of this ADR the Dockerfile does not install it).
