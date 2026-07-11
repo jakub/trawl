@@ -36,6 +36,7 @@
 
 pub mod badge;
 pub mod button;
+pub mod copy_button;
 pub mod load_more;
 pub mod loaded;
 pub mod login;
@@ -52,8 +53,6 @@ pub mod toast;
 pub mod actions_menu;
 #[cfg(target_arch = "wasm32")]
 pub mod clipboard;
-#[cfg(target_arch = "wasm32")]
-pub mod copy_button;
 #[cfg(target_arch = "wasm32")]
 pub mod drawer;
 #[cfg(target_arch = "wasm32")]
