@@ -79,14 +79,14 @@ jobs:
       - name: Build
         run: cargo zigbuild --release --workspace --exclude trawl-web-ui --target aarch64-unknown-linux-gnu.2.31
 
-      # Stage exactly the three binaries the Dockerfile COPYs into
+      # Stage exactly the four binaries the Dockerfile COPYs into
       # docker-ctx/arm64/ (buildx sets TARGETARCH=arm64 for linux/arm64).
       - name: Stage binaries for the image
         run: |
           mkdir -p docker-ctx/arm64
           bindir="target/aarch64-unknown-linux-gnu/release"
-          cp "${bindir}/trawld" "${bindir}/trawl-admin" "${bindir}/trawl-web" docker-ctx/arm64/
-          chmod +x docker-ctx/arm64/trawld docker-ctx/arm64/trawl-admin docker-ctx/arm64/trawl-web
+          cp "${bindir}/trawld" "${bindir}/trawl-admin" "${bindir}/fleet-admin" "${bindir}/trawl-web" docker-ctx/arm64/
+          chmod +x docker-ctx/arm64/trawld docker-ctx/arm64/trawl-admin docker-ctx/arm64/fleet-admin docker-ctx/arm64/trawl-web
 
       # QEMU is needed: the Dockerfile's apt-get/groupadd RUN steps execute in
       # the arm64 target context on this x86_64 host.
