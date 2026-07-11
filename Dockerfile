@@ -12,7 +12,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY docker-ctx/${TARGETARCH}/trawld docker-ctx/${TARGETARCH}/trawl-admin docker-ctx/${TARGETARCH}/trawl-web /usr/bin/
+COPY docker-ctx/${TARGETARCH}/trawld docker-ctx/${TARGETARCH}/trawl-admin docker-ctx/${TARGETARCH}/fleet-admin docker-ctx/${TARGETARCH}/trawl-web /usr/bin/
 
 RUN groupadd -r trawl \
     && useradd -r -g trawl -s /usr/sbin/nologin -d /var/lib/trawl trawl \

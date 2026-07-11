@@ -1,7 +1,10 @@
 # trawl helm chart values
 #
 # trawl is single-node only — replicas are hardcoded to 1.
-# multiple replicas would corrupt the SQLite auth database.
+# multiple replicas would corrupt the transitional SQLite app-state store
+# (query history, saved queries, schedules — moves to postgres in a later
+# ADR-0004 slice). API keys already live in the external fleet-auth
+# postgres keystore.
 
 image:
   repository: ghcr.io/jakub/trawl
@@ -64,7 +67,8 @@ httpRoute:
   hostnames: []
 
 # -- Persistent storage
-# Single PVC for parquet data, WAL, auth database, and auto-generated TLS certs.
+# Single PVC for parquet data, WAL, the transitional app-state store, and
+# auto-generated TLS certs.
 persistence:
   enabled: true
   storageClass: ""
@@ -131,9 +135,11 @@ config:
     path: "/var/lib/trawl/data"
 
   auth:
-    dbPath: "/var/lib/trawl/auth.db"
+    # Transitional SQLite app-state store (history/saved/schedules). Must be
+    # a FRESH file at cutover — trawld refuses to start on the legacy
+    # auth.db, which stays quarantined on the PVC.
+    dbPath: "/var/lib/trawl/store.db"
     auditIntervalSecs: 30
-    authCacheTtlSecs: 300
 
   ingest:
     enabled: true
@@ -198,16 +204,28 @@ tls:
       name: ""
       kind: ClusterIssuer
 
-# -- Auth bootstrap
-# On first install, an init container creates the SQLite auth database
-# and generates an initial admin API key. Retrieve the token with:
-#   kubectl logs <pod> -c init-auth
+# -- Fleet-auth postgres keystore (ADR-0004)
+# API keys are verified against an EXTERNAL postgres database shared across
+# fleet apps. The connection string is injected as DATABASE_URL from an
+# existing Secret into both the init-auth container and trawld — it is
+# never rendered into the ConfigMap or config.raw. Provision keys with
+# fleet-admin (see the cutover runbook); expect vector ingest to buffer to
+# disk during the cutover window (size buffers accordingly, e.g. 1 GiB).
+auth:
+  database:
+    # Name of an existing Secret holding the postgres URL. REQUIRED.
+    existingSecret: ""
+    # Key within that Secret.
+    existingSecretKey: "DATABASE_URL"
+
+# -- Auth schema migration
+# An init container runs `fleet-admin migrate` against the fleet keystore
+# on every pod start (idempotent by construction — sqlx tracks applied
+# migrations). Key minting moved to the cutover runbook: with a shared
+# fleet keystore, keys may already exist from sibling-app provisioning, so
+# the chart no longer auto-mints per-install tokens.
 initAuth:
   enabled: true
-  keyName: "helm-bootstrap"
-  # Also create an ingest-role key for immediate log ingestion.
-  createIngestKey: true
-  ingestKeyName: "helm-ingest"
   resources:
     requests:
       cpu: 50m

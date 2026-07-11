@@ -5,6 +5,13 @@ if [ "$1" = "configure" ]; then
   # create trawl system user/group from sysusers.d config
   systemd-sysusers trawl.conf 2>/dev/null || true
 
+  # NOTE (ADR-0004 fleet-auth cutover): a legacy pre-cutover
+  # /var/lib/trawl/auth.db is deliberately PRESERVED in place, quarantined —
+  # never read, migrated, or deleted. trawld now keeps history/saved/
+  # schedules in a fresh store.db and refuses to start if [auth] db_path
+  # still points at auth.db (conffile upgrades keep the old trawld.toml —
+  # follow the cutover runbook in the docs).
+
   # Bootstrap the trawl-web session cookie key (32 random bytes).
   # Idempotent: only generated on first install; preserved across upgrades
   # so existing browser sessions survive. Stored on the trawl-owned state

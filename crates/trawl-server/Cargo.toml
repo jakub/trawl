@@ -91,6 +91,7 @@ systemd-units = [
 assets = [
     ["target/release/trawld", "usr/bin/", "755"],
     ["target/release/trawl-admin", "usr/bin/", "755"],
+    ["target/release/fleet-admin", "usr/bin/", "755"],
     ["target/release/trawl-web", "usr/bin/", "755"],
     ["debian/trawld.toml", "etc/trawl/", "644"],
     ["debian/trawld.default", "etc/default/trawld", "644"],
