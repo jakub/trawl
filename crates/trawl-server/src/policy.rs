@@ -587,6 +587,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normalizer_rewrites_unmarked_403_to_trawl_envelope() {
+        let resp = run_normalizer(StatusCode::FORBIDDEN, false).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["code"], "forbidden");
+        assert_eq!(json["error"]["message"], "forbidden");
+        assert!(json.get("detail").is_none(), "flat body must be gone");
+    }
+
+    #[tokio::test]
+    async fn normalizer_rewrites_unmarked_500_to_trawl_envelope() {
+        let resp = run_normalizer(StatusCode::INTERNAL_SERVER_ERROR, false).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["code"], "internal_error");
+        assert_eq!(json["error"]["message"], "internal server error");
+        assert!(json.get("detail").is_none(), "flat body must be gone");
+    }
+
+    #[tokio::test]
     async fn normalizer_leaves_marked_responses_alone() {
         let resp = run_normalizer(StatusCode::UNAUTHORIZED, true).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
