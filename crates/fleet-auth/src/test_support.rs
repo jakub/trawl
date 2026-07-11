@@ -127,6 +127,24 @@ impl PgFixture {
     pub fn pool(&self) -> PgPool {
         self.pool.as_ref().expect("fixture live").clone()
     }
+
+    /// Forcibly drop the ephemeral database NOW, terminating every live
+    /// connection — simulates the auth backend dying under a running
+    /// consumer (e.g. trawld's pg-down → 503 contract tests). The fixture's
+    /// `Drop` re-drops harmlessly (`IF EXISTS`).
+    ///
+    /// # Panics
+    /// Panics when the admin connection or the drop itself fails.
+    pub async fn kill_database(&self) {
+        use sqlx_core::connection::Connection as _;
+        let mut admin = PgConnection::connect_with(&self.admin_opts)
+            .await
+            .expect("connect to admin DB");
+        admin
+            .execute(format!(r#"DROP DATABASE IF EXISTS "{}" WITH (FORCE)"#, self.test_db).as_str())
+            .await
+            .expect("force-drop test database");
+    }
 }
 
 impl Drop for PgFixture {
