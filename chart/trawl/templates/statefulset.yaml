@@ -95,18 +95,21 @@ spec:
               scheme: HTTPS
             failureThreshold: 30
             periodSeconds: 2
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /api/v1/health
               port: https
               scheme: HTTPS
             periodSeconds: 30
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /api/v1/health
               port: https
               scheme: HTTPS
             periodSeconds: 10
+            timeoutSeconds: 5
           securityContext:
             {{- include "trawl.trawldSecurityContext" . | nindent 12 }}
           resources:
