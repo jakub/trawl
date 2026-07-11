@@ -23,7 +23,7 @@ use crate::api::{ApiError, MeResponse};
 use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
 use crate::components::linkage_graph::LinkageGraph;
 use crate::components::tone_for_var;
-use crate::time_fmt::time_ago;
+use fleet_ui::time::time_ago;
 use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, Tone, Variant};
 
 use super::stories::{class_label, marking_tone, state_badge};

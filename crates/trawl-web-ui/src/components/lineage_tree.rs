@@ -8,7 +8,7 @@ use leptos::prelude::*;
 use fleet_ui::{Badge, Btn, Size, Tone, Variant};
 
 use super::{tone_for_var, truncate};
-use crate::time_fmt::time_ago;
+use fleet_ui::time::time_ago;
 
 #[derive(Debug, Clone)]
 pub struct LineageNode {

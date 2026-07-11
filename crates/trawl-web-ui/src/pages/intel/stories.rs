@@ -10,7 +10,7 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::api::ApiError;
-use crate::time_fmt::time_ago;
+use fleet_ui::time::time_ago;
 use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, ToastBus, ToastKind, Tone, Variant};
 
 use crate::components::tone_for_var;

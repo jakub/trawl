@@ -16,7 +16,7 @@ use trawl_api::SavedQueryResponse;
 use trawl_api::value::QueryResult;
 
 use crate::api;
-use crate::time_fmt::{format_duration, time_ago};
+use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
     Btn, Drawer, LoadState, Loaded, Pager, Size, Sparkline, StatusDot, TabItem, ToastBus,
     ToastKind, Toggle, Variant, effective_active,

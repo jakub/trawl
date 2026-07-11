@@ -13,6 +13,10 @@ publish.workspace = true
 # parser that builds and tests natively, so the localStorage JSON contract
 # is exercised by `cargo nextest run --workspace`.
 [dependencies]
+# chrono backs the native-tested `time` module; `wasmbind` only kicks in
+# on wasm32, where Utc::now (the calendar fallback + shared clock tick)
+# needs the js Date bridge (same shape as trawl-web-ui's dep).
+chrono = { workspace = true, features = ["wasmbind"] }
 serde_json = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

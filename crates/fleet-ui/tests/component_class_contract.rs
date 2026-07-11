@@ -52,6 +52,8 @@ const SEARCH_INPUT: &str = include_str!("../src/search_input.rs");
 const TOGGLE: &str = include_str!("../src/toggle.rs");
 const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
+const WHEN: &str = include_str!("../src/time/when.rs");
+const CLOCK: &str = include_str!("../src/time/clock.rs");
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
 
 /// Assert `src` contains `hook` (a class literal or class-idiom substring),
@@ -287,6 +289,35 @@ fn drawer_is_an_honest_non_modal_dialog() {
         DRAWER.contains(r#"tabindex="-1""#),
         "the drawer panel needs tabindex=\"-1\" so the initial-focus \
          fallback can land on the panel itself"
+    );
+}
+
+#[test]
+fn when_renders_both_modes_off_the_shared_clock() {
+    // Issue #33 D4: <When> renders relative (time_ago buckets) and
+    // absolute ("%Y-%m-%d %H:%M UTC" — explicit zone marker) modes,
+    // always with the full RFC 3339 form in the title attr.
+    emits(WHEN, r#"class="when""#, ".when");
+    assert!(
+        WHEN.contains("title=") && WHEN.contains("to_rfc3339"),
+        "<When> must carry the full RFC 3339 timestamp in its title attr"
+    );
+    assert!(
+        WHEN.contains("%Y-%m-%d %H:%M UTC"),
+        "absolute mode renders \"%Y-%m-%d %H:%M UTC\" — nothing else in \
+         the app signals timezone, the explicit marker is the point"
+    );
+    // Exactly ONE shared tick drives every instance: <When> subscribes
+    // to clock::now_ms and must never own a timer of its own.
+    assert!(
+        WHEN.contains("clock::now_ms") && !WHEN.contains("Interval"),
+        "<When> must subscribe to the shared clock tick, never a \
+         per-instance interval"
+    );
+    assert!(
+        CLOCK.contains("Interval::new(30_000") && CLOCK.contains("is_some"),
+        "the shared clock is a single 30s interval installed once \
+         (install() re-entry is a no-op)"
     );
 }
 

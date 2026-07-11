@@ -424,7 +424,7 @@ fn find_col(columns: &[String], names: &[&str]) -> Option<usize> {
 fn build_context_query(row: &[Value], columns: &[String]) -> Option<String> {
     let ti = find_col(columns, &["_time", "time", "timestamp", "@timestamp"])?;
     let ts_raw = value_to_string(row.get(ti)?);
-    let ts = crate::time_fmt::parse_timestamp(&ts_raw)?;
+    let ts = fleet_ui::time::parse_timestamp(&ts_raw)?;
     let from = ts - chrono::Duration::seconds(30);
     let to = ts + chrono::Duration::seconds(30);
 

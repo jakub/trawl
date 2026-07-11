@@ -1878,6 +1878,7 @@ dependencies = [
 name = "fleet-ui"
 version = "0.3.3"
 dependencies = [
+ "chrono",
  "gloo-timers",
  "leptos",
  "leptos-use",

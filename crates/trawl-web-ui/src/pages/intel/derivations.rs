@@ -16,7 +16,7 @@ use crate::components::lineage_tree::{
     transformation_color,
 };
 use crate::components::tone_for_var;
-use crate::time_fmt::time_ago;
+use fleet_ui::time::time_ago;
 use fleet_ui::{
     Badge, Btn, ConfirmState, ConfirmWithReasonModal, Pager, ToastBus, ToastKind, Tone, Variant,
 };

@@ -36,6 +36,7 @@ pub mod segmented;
 pub mod sparkline;
 pub mod status_dot;
 pub mod theme;
+pub mod time;
 pub mod toast;
 
 #[cfg(target_arch = "wasm32")]
@@ -115,6 +116,8 @@ pub use status_dot::StatusDot;
 pub use tabs::{TabItem, Tabs, TabsStyle, effective_active};
 #[cfg(target_arch = "wasm32")]
 pub use theme::{UiPrefs, install};
+#[cfg(target_arch = "wasm32")]
+pub use time::when::{When, WhenMode};
 #[cfg(target_arch = "wasm32")]
 pub use toast::{ToastBus, Toasts};
 #[cfg(target_arch = "wasm32")]

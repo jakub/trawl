@@ -2,13 +2,24 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Short relative-time labels for history rows and similar lists.
+//! Canonical timestamp presentation for fleet apps (issue #33 D4).
 //!
-//! Pure function so native `cargo test` exercises the buckets. Only
-//! consumer is the wasm `HistoryPage`, so we silence the dead-code
-//! warning on native targets the same way `query_merge.rs` does.
+//! Seeded from trawl's `time_fmt.rs` (tests migrated verbatim) —
+//! coastwatch carried six byte-identical `relative_age()` copies of
+//! the same idea, so the shared implementation lives here now. All
+//! functions take `now_ms` as a parameter (no clock dependency): they
+//! are pure and native-tested, matching the
+//! [`theme::prefs`](crate::theme::prefs) template.
+//!
+//! The wasm half: [`clock`] owns the single shared 30-second tick
+//! every relative label subscribes to (never per-instance timers),
+//! and [`when::When`] renders a timestamp in relative or absolute
+//! mode with the full RFC 3339 form in its `title` attribute.
 
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(target_arch = "wasm32")]
+pub mod clock;
+#[cfg(target_arch = "wasm32")]
+pub mod when;
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 
