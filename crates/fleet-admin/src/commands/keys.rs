@@ -180,6 +180,48 @@ pub fn confirm_prompt<R: BufRead, W: Write>(
     }
 }
 
+/// Revoke a key's grant on an app, with `[y/N]` confirmation unless `--yes`.
+///
+/// Same interactivity contract as [`revoke`]: refuses to proceed when stdin
+/// is not a TTY and `--yes` was not passed. No preflight read — the prompt
+/// is built from the arguments, and a missing grant surfaces as the store's
+/// `GrantNotFound` after confirmation (no read-then-delete race).
+pub async fn revoke_grant(
+    store: &KeyStore,
+    prefix: &KeyPrefix,
+    app: &str,
+    yes: bool,
+) -> Result<(), AdminError> {
+    if !yes {
+        use std::io::IsTerminal as _;
+        let stdin = std::io::stdin();
+        let stderr = std::io::stderr();
+        if !stdin.is_terminal() || !stderr.is_terminal() {
+            return Err(AdminError::NonInteractive);
+        }
+
+        let question = format!("revoke grant for app {app} on key {prefix}?");
+        let mut writer = stderr.lock();
+        let mut reader = stdin.lock();
+        if !confirm_prompt(&question, &mut reader, &mut writer)? {
+            return Ok(());
+        }
+    }
+
+    store.revoke_assignment(prefix.as_str(), app).await?;
+    eprintln!("revoked grant for app {app} on key {prefix}");
+    Ok(())
+}
+
+/// Extract the app half of a `revoke-grant` grant argument.
+///
+/// Accepts either a bare `app` or the `app:role` form `keys grant` takes —
+/// the role half is ignored, since grants are keyed by `(key, app)`. First
+/// colon wins, mirroring trawl-admin (`foo:super:admin` → `foo`).
+pub fn parse_revoke_grant_app(s: &str) -> &str {
+    s.split_once(':').map_or(s, |(app, _)| app)
+}
+
 /// Add a grant to an existing key.
 pub async fn grant(
     store: &KeyStore,
@@ -351,6 +393,21 @@ mod tests {
         let g = parse_grant("trawl:super:admin").unwrap();
         assert_eq!(g.app, "trawl");
         assert_eq!(g.role, "super:admin");
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_bare_app() {
+        assert_eq!(parse_revoke_grant_app("trawl"), "trawl");
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_strips_role() {
+        assert_eq!(parse_revoke_grant_app("trawl:admin"), "trawl");
+    }
+
+    #[test]
+    fn parse_revoke_grant_app_first_colon_semantics() {
+        assert_eq!(parse_revoke_grant_app("trawl:super:admin"), "trawl");
     }
 
     #[test]
