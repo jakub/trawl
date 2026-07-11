@@ -132,6 +132,7 @@ async fn scheduler_loop(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn poll_and_execute(
     schedule_store: &Arc<Mutex<ScheduleStore>>,
     key_store: &KeyStore,
@@ -178,13 +179,23 @@ async fn poll_and_execute(
         let should_run = {
             let store = schedule_store.lock();
             match store.latest_run(schedule.id) {
-                Ok(Some(last)) => {
-                    let last_started = chrono::DateTime::parse_from_rfc3339(&last.started_at)
-                        .map_or(0, |dt| dt.timestamp());
-                    let now = chrono::Utc::now().timestamp();
-                    let elapsed = (now - last_started).unsigned_abs();
-                    elapsed >= schedule.interval_secs
-                }
+                Ok(Some(last)) => match chrono::DateTime::parse_from_rfc3339(&last.started_at) {
+                    Ok(dt) => {
+                        let now = chrono::Utc::now().timestamp();
+                        let elapsed = (now - dt.timestamp()).unsigned_abs();
+                        elapsed >= schedule.interval_secs
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            event_type = "scheduler_error",
+                            schedule_id = schedule.id,
+                            started_at = %last.started_at,
+                            error = %e,
+                            "unparseable last-run timestamp; skipping tick conservatively"
+                        );
+                        false
+                    }
+                },
                 Ok(None) => true, // Never run before.
                 Err(e) => {
                     tracing::warn!(
