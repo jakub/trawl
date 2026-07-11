@@ -7,21 +7,31 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 - **core**: rust workspace — parser, SQL emitter, DuckDB executor, daemon, CLI, TUI
 - **ingestion**: vector → parquet (columnar, compressed, partitioned by hour)
 - **query engine**: custom DSL → AST → DuckDB SQL (parameterized)
-- **web ui** (planned): rails 8 (thin proxy over trawld HTTP API) — not yet started
+- **web ui**: leptos 0.8 CSR SPA (`trawl-web-ui`) served by the `trawl-web` session proxy (cookie sessions → bearer tokens)
+- **shared fleet substrate** (ADR-0030, consumed by coastwatch via sibling path deps): `fleet-auth` (postgres keystore + session AEAD), `fleet-ui` (leptos design system), `fleet-admin` (ops CLI)
 - **agent** (v2 scope): signed-template execution on managed endpoints, mTLS, ed25519 signing — not yet started
 
 ## workspace layout
 
 ```
 crates/
-  trawl-core/     # DSL parser, AST, SQL emitter (pure, no I/O)
-  trawl-engine/   # DuckDB integration, query execution
-  trawl-auth/     # API keys, roles, schedules, SQLite-backed
-  trawl-api/      # shared wire types (request/response structs)
-  trawl-server/   # daemon (axum, HTTPS via tokio-rustls)
-  trawl-client/   # typed async HTTP client library
-  trawl-cli/      # unified CLI + TUI binary
-  trawl-admin/    # admin CLI (key mgmt, TLS cert generation)
+  trawl-core/            # DSL parser, AST, SQL emitter (pure, no I/O)
+  trawl-engine/          # DuckDB integration, query execution
+  trawl-auth/            # API keys, roles, schedules, SQLite-backed (legacy — ADR-0030 step 4 migrates trawld onto fleet-auth)
+  trawl-api/             # shared wire types (request/response structs)
+  trawl-config/          # shared config.toml types (no I/O)
+  trawl-server/          # daemon (axum, HTTPS via tokio-rustls)
+  trawl-client/          # typed async HTTP client library
+  trawl-cli/             # unified CLI + TUI binary
+  trawl-admin/           # admin CLI (key mgmt, TLS cert generation)
+  trawl-web/             # browser-facing session proxy (serves SPA, cookie → bearer)
+  trawl-web-ui/          # leptos 0.8 CSR SPA (wasm32)
+  trawl-dashboard/       # shared ratatui dashboard rendering
+  trawl-crashdump/       # minidump capture for trawld (linux fatal-signal handler)
+  fleet-auth/            # postgres-backed keystore + session cookie AEAD + axum middleware (ADR-0030)
+  fleet-ui/              # shared leptos design tokens + components for fleet apps (wasm32)
+  fleet-admin/           # fleet keystore ops CLI (migrations, session keys, key lifecycle)
+  coastwatch-api-types/  # vendored coastwatch API wire types
 ```
 
 ## key design decisions
