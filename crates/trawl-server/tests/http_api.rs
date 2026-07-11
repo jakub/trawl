@@ -9,9 +9,13 @@
 
 mod common;
 
-use common::{setup, setup_with_rate_limit};
+use std::time::Duration;
+
+use common::{setup, setup_big_data, setup_with_rate_limit, trawl_only};
+use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::policy::Role;
 
 #[tokio::test]
 async fn health_returns_ok() {
@@ -382,6 +386,103 @@ async fn cancel_query_rejects_ingest_role() {
         }
         other => panic!("expected 401 for ingest role, got: {other:?}"),
     }
+}
+
+/// Non-admin cancellation is authorized by exact keystore id, not display
+/// name. Two `QueryCancel` keys sharing a name ("twin") must stay isolated:
+/// key B cannot cancel key A's in-flight query, while owner A passes the gate.
+///
+/// A revert to name-matching would let B (same name) through, so this test
+/// guards that regression. It needs a genuinely *active* query — a completed
+/// one has no tracked owner under either scheme, so only a live entry can tell
+/// id-matching from name-matching apart.
+///
+/// A percentile-by-group query over a large generated dataset runs long enough
+/// (hundreds of ms) to observe via `/queries` and cancel while still in-flight,
+/// with only one query in flight so the two cancel round-trips stay fast.
+#[tokio::test]
+async fn cancel_query_isolated_by_key_id_not_name() {
+    // Large enough that the query below stays in-flight across the cancels.
+    let Some(server) = setup_big_data(600_000).await else {
+        return;
+    };
+
+    // Two analyst keys with the SAME display name but distinct keystore ids.
+    let store = KeyStore::from_pool(server.fx.pool());
+    let key_a = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .await
+        .unwrap();
+    let key_b = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        key_a.info.id, key_b.info.id,
+        "twin keys must have distinct keystore ids"
+    );
+
+    let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
+    let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
+
+    // Fire one deliberately slow query as key A in the background. It is tracked
+    // active for its whole (multi-hundred-ms) duration.
+    let slow = {
+        let a = a.clone();
+        tokio::spawn(async move {
+            a.query_paginated("* | stats p99(id) by grp", None, None)
+                .await
+        })
+    };
+
+    // Wait until A's query shows up as active, capturing its id.
+    let mut target = None;
+    for _ in 0..500 {
+        if let Ok(resp) = a.queries().await
+            && let Some(id) = resp
+                .active
+                .iter()
+                .filter(|q| q.user == "twin")
+                .map(|q| q.id)
+                .max()
+        {
+            target = Some(id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let target = target.expect("key A should have an active query");
+
+    // Key B (same name, QueryCancel, different id) is rejected by the ownership
+    // gate — which runs before any cancel is attempted.
+    let denied = b.cancel_query(target).await;
+    match denied {
+        Err(trawl_client::ClientError::Server { status, .. }) => {
+            assert_eq!(status, 401, "twin key B must not cancel key A's query");
+        }
+        other => panic!("expected 401 for non-owner cancel, got: {other:?}"),
+    }
+
+    // Owner A passes the ownership gate.
+    let allowed = a.cancel_query(target).await;
+    assert!(
+        allowed.is_ok(),
+        "owner key A must pass the ownership gate, got: {allowed:?}"
+    );
+
+    // Assertions are done; drop the background query task (the server-side
+    // scan finishes on its own — we don't need its result).
+    slow.abort();
 }
 
 #[tokio::test]
