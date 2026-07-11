@@ -38,8 +38,12 @@
 //! ([`OverlayLayer::should_trap`]); [`FocusPolicy::Capture`] (Drawer)
 //! deliberately never traps — the drawer is non-modal and the
 //! background stays tabbable. The ownership queries are pure and
-//! native-tested; the DOM glue (element capture, `.focus()`, Tab
-//! cycling) lives in [`use_overlay_layer_with`].
+//! native-tested; so are the two runtime *decisions* the glue used to
+//! bury inline — where initial focus lands ([`initial_focus`]) and
+//! whether a closing layer restores to its opener ([`should_restore`]).
+//! Only the irreducible platform calls (element capture, `.focus()`,
+//! `query_selector_all`) stay wasm-only, inside
+//! [`use_overlay_layer_with`].
 
 use std::cell::RefCell;
 
@@ -223,18 +227,31 @@ pub fn use_overlay_layer_with(
     on_cleanup(move || {
         // Ownership must be read BEFORE release: a drawer unmounting
         // beneath a live modal doesn't own focus and must not restore.
+        // The restore predicate itself is the native-tested
+        // `should_restore`; only `.focus()` stays glue.
         let owned = layer.owns_focus();
         layer.release();
-        if owned
-            && policy != FocusPolicy::None
-            && let Some(t) = &trigger
-            && t.is_connected()
+        if let Some(t) = &trigger
+            && should_restore(owned, policy, t.is_connected())
         {
             let _ = t.focus();
         }
     });
 
     layer
+}
+
+/// Whether a closing overlay should restore focus to its captured
+/// opener — the pure predicate lifted out of [`use_overlay_layer_with`]'s
+/// `on_cleanup` so the restore contract is native-tested rather than
+/// buried in wasm-only glue. Restore only when this layer still **owned**
+/// focus at cleanup (a drawer closing beneath a live modal did not —
+/// restoring would yank focus out of the modal), its policy participates
+/// in focus ([`FocusPolicy::None`] layers never restore), and the opener
+/// is still connected to the document.
+#[cfg(any(target_arch = "wasm32", test))]
+fn should_restore(owned: bool, policy: FocusPolicy, opener_connected: bool) -> bool {
+    owned && policy != FocusPolicy::None && opener_connected
 }
 
 /// Selector for tabbable descendants. Re-queried per use — a cached
@@ -261,16 +278,47 @@ fn focusable_descendants(panel: &web_sys::Element) -> Vec<web_sys::HtmlElement> 
     out
 }
 
-/// Move focus to the panel's first focusable descendant, falling back
-/// to the panel itself (callers set `tabindex="-1"` so it accepts
+/// Where an owning overlay's initial focus should land — the pure
+/// decision split out of [`focus_initial`] so it is native-tested: the
+/// first focusable descendant if the panel has any, else the panel
+/// itself (which callers give `tabindex="-1"`, so it accepts
 /// programmatic focus without joining the tab order).
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitialFocus {
+    /// Focus the panel's first focusable descendant.
+    First,
+    /// No focusable descendants — park focus on the panel itself.
+    Panel,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn initial_focus(has_focusable: bool) -> InitialFocus {
+    if has_focusable {
+        InitialFocus::First
+    } else {
+        InitialFocus::Panel
+    }
+}
+
+/// Move focus to the panel's first focusable descendant, falling back
+/// to the panel itself. The target decision is the native-tested
+/// [`initial_focus`]; this shell only reads the DOM and applies it.
 #[cfg(target_arch = "wasm32")]
 fn focus_initial(panel: &web_sys::Element) {
     use wasm_bindgen::JsCast;
-    if let Some(first) = focusable_descendants(panel).into_iter().next() {
-        let _ = first.focus();
-    } else if let Some(el) = panel.dyn_ref::<web_sys::HtmlElement>() {
-        let _ = el.focus();
+    let focusables = focusable_descendants(panel);
+    match initial_focus(!focusables.is_empty()) {
+        InitialFocus::First => {
+            if let Some(first) = focusables.into_iter().next() {
+                let _ = first.focus();
+            }
+        }
+        InitialFocus::Panel => {
+            if let Some(el) = panel.dyn_ref::<web_sys::HtmlElement>() {
+                let _ = el.focus();
+            }
+        }
     }
 }
 
@@ -580,5 +628,60 @@ mod tests {
         // to the same node in `cycle_tab`).
         assert_eq!(tab_wrap(FocusPos::Only, false), Some(TabWrap::First));
         assert_eq!(tab_wrap(FocusPos::Only, true), Some(TabWrap::Last));
+    }
+
+    // ── initial-focus target (issue #33 D2) ────────────────────────
+    // `focus_initial`'s DOM shell queries focusable descendants and then
+    // defers *where focus lands* to `initial_focus`; these pin that
+    // decision natively so "takes initial focus on open" is no longer an
+    // untested wasm-only claim.
+
+    #[test]
+    fn initial_focus_prefers_the_first_focusable() {
+        assert_eq!(initial_focus(true), InitialFocus::First);
+    }
+
+    #[test]
+    fn initial_focus_falls_back_to_the_panel_when_empty() {
+        // Nothing tabbable inside → park on the panel itself (tabindex=-1).
+        assert_eq!(initial_focus(false), InitialFocus::Panel);
+    }
+
+    // ── restore-to-opener predicate (issue #33 D2) ─────────────────
+    // `use_overlay_layer_with`'s on_cleanup reads DOM connectivity and
+    // ownership, then defers the restore decision to `should_restore`;
+    // these pin the "restores focus to the opener on close" guarantee —
+    // and, critically, the negative case that keeps a drawer closing
+    // beneath a live modal from stealing focus.
+
+    #[test]
+    fn owner_with_a_connected_opener_restores() {
+        // Both focus-participating policies restore when they still own
+        // focus and the opener is live — the modal-closes and
+        // drawer-closes-alone happy paths.
+        assert!(should_restore(true, FocusPolicy::Trap, true));
+        assert!(should_restore(true, FocusPolicy::Capture, true));
+    }
+
+    #[test]
+    fn shadowed_layer_does_not_restore() {
+        // A drawer unmounting beneath a live modal no longer owns focus;
+        // restoring to its opener would yank focus out of the modal.
+        assert!(!should_restore(false, FocusPolicy::Capture, true));
+        assert!(!should_restore(false, FocusPolicy::Trap, true));
+    }
+
+    #[test]
+    fn a_disconnected_opener_is_not_refocused() {
+        // The opener left the document while the overlay was open —
+        // focusing a detached node is a no-op at best, so skip it.
+        assert!(!should_restore(true, FocusPolicy::Trap, false));
+    }
+
+    #[test]
+    fn none_policy_never_restores() {
+        // ActionsMenu (None) manages its own restore-to-trigger; the
+        // overlay layer must not double-restore on its behalf.
+        assert!(!should_restore(true, FocusPolicy::None, true));
     }
 }
