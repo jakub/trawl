@@ -168,6 +168,16 @@ fn sparkline_emits_the_spark_class() {
 fn loaded_emits_the_tri_state_hint_hooks() {
     emits(LOADED, r#"class="load-hint""#, ".load-hint");
     emits(LOADED, r#"class="load-hint error""#, ".load-hint.error");
+    // Issue #33 D5: the Missing arm renders on the NEUTRAL hint tone
+    // (a missing resource is not a failure — no `.error` modifier),
+    // with the subtitle hook for the explanatory second line.
+    emits(LOADED, "missing_copy(label)", ".load-hint");
+    emits(LOADED, r#"class="load-sub""#, ".load-hint .load-sub");
+    assert!(
+        !LOADED.contains(r#"<div class="load-hint error">{missing"#),
+        "the Missing arm must stay on the neutral .load-hint tone, not \
+         the red .load-hint.error treatment"
+    );
 }
 
 #[test]

@@ -76,13 +76,20 @@ pub fn StoryPage() -> impl IntoView {
         <div class="page">
             <Loaded
                 state=Signal::derive(move || {
-                    LoadState::from_resource_with(story_resource.get(), |e| match e {
-                        ApiError::Status(404) => "story not found".to_string(),
-                        ApiError::Status(503) => "intel service unavailable".to_string(),
-                        other => other.to_string(),
-                    })
+                    // 404 is Missing (the story doesn't exist — neutral
+                    // "story not found" + subtitle), not an error; 503
+                    // and friends keep their error copy (issue #33 D5).
+                    LoadState::from_resource_with_missing(
+                        story_resource.get(),
+                        |e| matches!(e, ApiError::Status(404)),
+                        |e| match e {
+                            ApiError::Status(503) => "intel service unavailable".to_string(),
+                            other => other.to_string(),
+                        },
+                    )
                 })
                 label="story"
+                missing_subtitle="The story may not exist or you may not have permission to view it."
                 render=Box::new(move |body: ItemBody<StoryView>| {
                     let story = &body.data;
                     let (state_label, state_color) = state_badge(&story.state);

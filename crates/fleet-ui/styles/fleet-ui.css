@@ -996,6 +996,13 @@ textarea:focus-visible,
   font-family: var(--font-ui);
 }
 .load-hint.error { color: var(--red); }
+/* Missing-state explanatory second line (issue #33 D5) — stays on the
+ * neutral hint tone, slightly dimmer than the headline copy. */
+.load-hint .load-sub {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ink-4);
+}
 
 /* ActionsMenu — positioning context owned by the component (the
  * trigger `.btn-icon` and panel `.actions-menu` rules move in with
