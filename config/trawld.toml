@@ -82,19 +82,22 @@
 path = "~/.trawl/data"
 
 [auth]
-# Path to the SQLite auth database (API keys and roles).
-db_path = "~/.trawl/auth.db"
+# Fleet-auth Postgres keystore URL (API keys and roles live here since the
+# ADR-0004 cutover). The DATABASE_URL environment variable takes precedence.
+# trawld will NOT start until this database is reachable and migrated
+# (`fleet-admin migrate`) — see the cutover runbook in the docs.
+database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 
-# How often to poll the auth database for key changes (seconds).
-# Detects keys created/revoked by trawl-admin and emits audit events.
-# Decrease for faster key revocation propagation. 0 = disabled.
+# Path to the transitional SQLite app-state database (query history, saved
+# queries, schedules — moves to postgres in a later slice). Must be a FRESH
+# file at cutover: never point this at the legacy pre-cutover auth.db, which
+# stays quarantined on disk. trawld refuses to start on an auth.db path.
+db_path = "~/.trawl/store.db"
+
+# How often to poll the fleet keystore for key changes (seconds).
+# Detects keys created/revoked by fleet-admin and emits audit events.
+# Decrease for faster detection. 0 = disabled.
 # audit_interval_secs = 30
-
-# TTL for the in-memory auth token cache (seconds). Verified tokens
-# skip argon2id on cache hits, improving throughput. Revoked keys
-# stay valid for up to this duration before eviction.
-# Decrease for tighter revocation windows. 0 = disabled (always verify).
-# auth_cache_ttl_secs = 300
 
 [ingest]
 # Whether the ingest endpoint (POST /api/v1/ingest) is enabled.

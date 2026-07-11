@@ -284,8 +284,10 @@ impl AppState {
             (None, None, None, None)
         };
 
+        // Fixed TTL: the config knob died with the fleet-auth cutover and
+        // this whole cache dies with auth.rs in the same slice.
         let auth_cache = Arc::new(AuthCache::new(std::time::Duration::from_secs(
-            config.auth.auth_cache_ttl_secs,
+            crate::config::DEFAULT_AUTH_CACHE_TTL_SECS,
         )));
 
         let state = Self {

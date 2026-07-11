@@ -249,8 +249,8 @@ async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
         data: DataConfig { path: data_glob },
         auth: AuthConfig {
             db_path: auth_db,
+            database_url: None,
             audit_interval_secs: 0,
-            auth_cache_ttl_secs: 300,
         },
         ingest: {
             let wal_dir = tmp.path().join("wal");
@@ -373,8 +373,8 @@ async fn setup() -> TestServer {
         data: DataConfig { path: data_glob },
         auth: AuthConfig {
             db_path: auth_db,
+            database_url: None,
             audit_interval_secs: 0,
-            auth_cache_ttl_secs: 300,
         },
         ingest: {
             let wal_dir = tmp.path().join("wal");
