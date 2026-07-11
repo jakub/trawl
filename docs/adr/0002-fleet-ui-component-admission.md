@@ -54,6 +54,10 @@ absorb it on their next rev bump.
 
 ## Pending coastwatch compile-fix (as of the #28 fleet-ui rev)
 
+**Resolved 2026-07-11** — applied in coastwatch commit `c0d7856` when the
+break surfaced on a dev-server build against the current fleet-ui. Kept for
+the record as the template for lockstep compile-fix handling.
+
 The lockstep model means a fleet-ui API change can leave the sibling consumer
 temporarily uncompilable until its next `TRAWL_REV` bump. One such fix is
 outstanding and is recorded here so it rides the next coastwatch bump — the
