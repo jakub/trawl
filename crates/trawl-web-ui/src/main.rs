@@ -16,7 +16,6 @@ mod tone_vocab;
 mod api;
 
 #[cfg(target_arch = "wasm32")]
-#[cfg(target_arch = "wasm32")]
 mod download;
 
 #[cfg(target_arch = "wasm32")]
