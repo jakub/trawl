@@ -53,6 +53,8 @@ const TOGGLE: &str = include_str!("../src/toggle.rs");
 const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
 const COPY_BUTTON: &str = include_str!("../src/copy_button.rs");
+const ICON: &str = include_str!("../src/icon.rs");
+const LIB: &str = include_str!("../src/lib.rs");
 const LOAD_MORE: &str = include_str!("../src/load_more.rs");
 const WHEN: &str = include_str!("../src/time/when.rs");
 const CLOCK: &str = include_str!("../src/time/clock.rs");
@@ -301,6 +303,25 @@ fn drawer_is_an_honest_non_modal_dialog() {
         DRAWER.contains(r#"tabindex="-1""#),
         "the drawer panel needs tabindex=\"-1\" so the initial-focus \
          fallback can land on the panel itself"
+    );
+}
+
+#[test]
+fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
+    // Issue #33 D8: Document / Upload / Copy join the closed enum, each
+    // with an icon_body arm in house style.
+    for glyph in ["Document", "Upload", "Copy"] {
+        assert!(
+            ICON.contains(&format!("    {glyph},\n"))
+                && ICON.contains(&format!("Icon::{glyph} =>")),
+            "Icon::{glyph} must exist as a variant with an icon_body arm"
+        );
+    }
+    // The lib.rs crate doc claimed "four typed components" while
+    // exporting ~25 — describe the surface by category, never by count.
+    assert!(
+        !LIB.contains("four typed components"),
+        "lib.rs crate doc must not hard-code a component count (doc rot)"
     );
 }
 
