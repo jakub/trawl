@@ -10,13 +10,20 @@
 
 use std::fmt::Display;
 
-/// The three states every async-fetched surface passes through.
+/// The states every async-fetched surface passes through.
 /// Trawl's 22 hand-rolled `match resource.get()` blocks collapse onto
 /// this enum; `LocalResource::get()`'s `Option<Result<T, E>>` maps via
 /// [`LoadState::from_resource`].
+///
+/// [`LoadState::Missing`] (issue #33 D5) models "the resource does not
+/// exist" — a 404 detail page — as its own state rather than an error:
+/// detail pages render it as a neutral hint with explanatory copy, not
+/// a failure. Sites opt in via [`LoadState::from_resource_with_missing`];
+/// everything else compiles unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadState<T> {
     Loading,
+    Missing,
     Error(String),
     Ready(T),
 }
@@ -38,6 +45,24 @@ impl<T> LoadState<T> {
     ) -> Self {
         match snapshot {
             None => Self::Loading,
+            Some(Err(e)) => Self::Error(render_err(&e)),
+            Some(Ok(v)) => Self::Ready(v),
+        }
+    }
+
+    /// [`LoadState::from_resource_with`] plus a missing-classifier:
+    /// errors for which `is_missing` returns true map to
+    /// [`LoadState::Missing`] (the resource doesn't exist — e.g.
+    /// `ApiError::Status(404)`), everything else goes through
+    /// `render_err` as usual.
+    pub fn from_resource_with_missing<E>(
+        snapshot: Option<Result<T, E>>,
+        is_missing: impl FnOnce(&E) -> bool,
+        render_err: impl FnOnce(&E) -> String,
+    ) -> Self {
+        match snapshot {
+            None => Self::Loading,
+            Some(Err(e)) if is_missing(&e) => Self::Missing,
             Some(Err(e)) => Self::Error(render_err(&e)),
             Some(Ok(v)) => Self::Ready(v),
         }
@@ -80,9 +105,19 @@ pub fn error_copy(label: Option<&str>, msg: &str) -> String {
     }
 }
 
+/// Canonical missing copy: `not found`, or `story not found` with a
+/// label.
+#[must_use]
+pub fn missing_copy(label: Option<&str>) -> String {
+    match label {
+        Some(what) => format!("{what} not found"),
+        None => "not found".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LoadState, error_copy, loading_copy};
+    use super::{LoadState, error_copy, loading_copy, missing_copy};
 
     #[test]
     fn from_resource_maps_the_three_states() {
@@ -128,5 +163,33 @@ mod tests {
         assert_eq!(loading_copy(Some("nets")), "loading nets\u{2026}");
         assert_eq!(error_copy(None, "boom"), "couldn't load: boom");
         assert_eq!(error_copy(Some("nets"), "boom"), "couldn't load nets: boom");
+    }
+
+    #[test]
+    fn from_resource_with_missing_classifies_the_four_states() {
+        // The story-404 shape (issue #33 D5): a classifier splits the
+        // error domain into "the resource does not exist" (Missing) and
+        // real failures (Error, still through the custom renderer).
+        let map = |snapshot: Option<Result<u32, u16>>| {
+            LoadState::from_resource_with_missing(
+                snapshot,
+                |&code| code == 404,
+                |code| format!("status {code}"),
+            )
+        };
+
+        assert_eq!(map(None), LoadState::Loading);
+        assert_eq!(map(Some(Err(404))), LoadState::Missing);
+        assert_eq!(
+            map(Some(Err(503))),
+            LoadState::Error("status 503".to_string())
+        );
+        assert_eq!(map(Some(Ok(7))), LoadState::Ready(7));
+    }
+
+    #[test]
+    fn missing_copy_strings() {
+        assert_eq!(missing_copy(None), "not found");
+        assert_eq!(missing_copy(Some("story")), "story not found");
     }
 }

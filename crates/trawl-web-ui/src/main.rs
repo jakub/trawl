@@ -10,14 +10,10 @@ mod facets;
 mod histogram;
 mod offset;
 mod query_merge;
-mod time_fmt;
 mod tone_vocab;
 
 #[cfg(target_arch = "wasm32")]
 mod api;
-
-#[cfg(target_arch = "wasm32")]
-mod clipboard;
 
 #[cfg(target_arch = "wasm32")]
 mod download;

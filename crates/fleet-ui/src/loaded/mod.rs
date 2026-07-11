@@ -17,7 +17,7 @@ pub mod state;
 #[cfg(target_arch = "wasm32")]
 pub mod component;
 
-pub use state::{LoadState, error_copy, loading_copy};
+pub use state::{LoadState, error_copy, loading_copy, missing_copy};
 
 #[cfg(target_arch = "wasm32")]
 pub use component::Loaded;

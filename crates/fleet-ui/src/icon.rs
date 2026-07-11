@@ -54,6 +54,11 @@ pub enum Icon {
     /// rail's [`Icon::Zap`] — trawl shipped two different bolt glyphs
     /// pre-migration, and both shapes are preserved verbatim.
     Bolt,
+    // issue-#33 additions (no in-repo SVG to lift — authored fresh to
+    // house style: 16×16 viewBox, currentColor, stroke 1.4–1.5)
+    Document,
+    Upload,
+    Copy,
 }
 
 /// Renders an [`Icon`] as a 16×16 inline SVG. `stroke_width` defaults
@@ -192,6 +197,25 @@ fn icon_body(icon: Icon) -> AnyView {
         .into_any(),
         Icon::Bolt => view! {
             <g stroke-linejoin="round"><path d="M9 1 3 9h5l-1 6 6-8h-5z"/></g>
+        }
+        .into_any(),
+        Icon::Document => view! {
+            <g>
+                <path d="M4.5 1.5h5L13 5v9.5H4.5z"/>
+                <path d="M9.5 1.5V5H13"/>
+                <path d="M6.5 8.5h4M6.5 11h4"/>
+            </g>
+        }
+        .into_any(),
+        Icon::Upload => view! {
+            <g><path d="M8 11V2M4 6l4-4 4 4M3 14h10"/></g>
+        }
+        .into_any(),
+        Icon::Copy => view! {
+            <g>
+                <rect x="6" y="6" width="8" height="8" rx="1"/>
+                <path d="M10 2.5H3.5a1 1 0 0 0-1 1V10"/>
+            </g>
         }
         .into_any(),
     }

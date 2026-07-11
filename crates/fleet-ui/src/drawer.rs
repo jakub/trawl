@@ -24,7 +24,7 @@
 //! inline rename first.
 
 use leptos::ev;
-use leptos::html::Div;
+use leptos::html::{Aside, Div};
 use leptos::prelude::*;
 use leptos::web_sys;
 use leptos_use::{use_event_listener, use_window};
@@ -45,7 +45,7 @@ pub fn Drawer(
     on_tab_change: Callback<String>,
     on_close: Callback<()>,
     #[prop(optional, into)] on_escape: Option<Callback<()>>,
-    #[prop(into, optional)] meta: Option<String>,
+    #[prop(into, optional)] meta: MaybeProp<String>,
     /// Close-glyph size in px. Exists because trawl's drawers drifted
     /// pre-migration: the service drawer's close X was 12px, the net
     /// drawer's 14px, and the zero-visual-change contract preserves
@@ -59,13 +59,23 @@ pub fn Drawer(
     children: Children,
 ) -> impl IntoView {
     let scrim_ref = NodeRef::<Div>::new();
+    let panel_ref = NodeRef::<Aside>::new();
 
     // Window-level Escape (see module docs). use_event_listener
     // registers an on_cleanup hook internally; the returned handle is
     // discarded intentionally. The topmost-layer guard (see
     // crate::overlay) makes a background drawer ignore Escape while a
     // modal is stacked over it — otherwise one Escape closed both.
-    let layer = crate::overlay::use_overlay_layer();
+    //
+    // FocusPolicy::Capture: the drawer takes initial focus on open and
+    // restores the opener on close, but never Tab-traps — it is
+    // non-modal by design (the background stays interactive, and a
+    // modal may stack over a live drawer), which is also why the aside
+    // below renders role="dialog" WITHOUT aria-modal (issue #33 D2).
+    let layer =
+        crate::overlay::use_overlay_layer_with(crate::overlay::FocusPolicy::Capture, move || {
+            panel_ref.get().map(web_sys::Element::from)
+        });
     let escape = on_escape.unwrap_or(on_close);
     let _ = use_event_listener(use_window(), ev::keydown, move |e| {
         if e.key() == "Escape" && layer.is_topmost() {
@@ -95,7 +105,7 @@ pub fn Drawer(
             node_ref=scrim_ref
             on:mousedown=on_scrim_mousedown
         >
-            <aside class="sd-drawer" role="dialog" aria-modal="true">
+            <aside class="sd-drawer" role="dialog" tabindex="-1" node_ref=panel_ref>
                 <div class="sd-hd">
                     <div class="sd-ttl">{title()}</div>
                     <div class="sd-actions">

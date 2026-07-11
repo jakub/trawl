@@ -27,6 +27,10 @@ pub fn App() -> impl IntoView {
     let prefs = fleet_ui::install("trawl.ui");
     provide_context(prefs);
 
+    // Shared 30s "now" tick for every <When> relative label — installed
+    // once here, never per-instance (issue #33 D4).
+    fleet_ui::time::clock::install();
+
     view! {
         <Router>
             <Routes fallback=|| view! { <NotFound/> }>

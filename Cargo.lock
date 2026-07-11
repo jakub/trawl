@@ -1878,12 +1878,14 @@ dependencies = [
 name = "fleet-ui"
 version = "0.3.3"
 dependencies = [
+ "chrono",
  "gloo-timers",
  "leptos",
  "leptos-use",
  "leptos_router",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

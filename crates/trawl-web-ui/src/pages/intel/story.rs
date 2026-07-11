@@ -23,8 +23,8 @@ use crate::api::{ApiError, MeResponse};
 use crate::components::lineage_tree::{LineageNode, LineageTree, can_write_derivations};
 use crate::components::linkage_graph::LinkageGraph;
 use crate::components::tone_for_var;
-use crate::time_fmt::time_ago;
-use fleet_ui::{Badge, Btn, LoadState, Loaded, Pager, Tone, Variant};
+use fleet_ui::time::time_ago;
+use fleet_ui::{Badge, LoadMore, LoadState, Loaded, Pager, Tone};
 
 use super::stories::{class_label, marking_tone, state_badge};
 
@@ -76,13 +76,20 @@ pub fn StoryPage() -> impl IntoView {
         <div class="page">
             <Loaded
                 state=Signal::derive(move || {
-                    LoadState::from_resource_with(story_resource.get(), |e| match e {
-                        ApiError::Status(404) => "story not found".to_string(),
-                        ApiError::Status(503) => "intel service unavailable".to_string(),
-                        other => other.to_string(),
-                    })
+                    // 404 is Missing (the story doesn't exist — neutral
+                    // "story not found" + subtitle), not an error; 503
+                    // and friends keep their error copy (issue #33 D5).
+                    LoadState::from_resource_with_missing(
+                        story_resource.get(),
+                        |e| matches!(e, ApiError::Status(404)),
+                        |e| match e {
+                            ApiError::Status(503) => "intel service unavailable".to_string(),
+                            other => other.to_string(),
+                        },
+                    )
                 })
                 label="story"
+                missing_subtitle="The story may not exist or you may not have permission to view it."
                 render=Box::new(move |body: ItemBody<StoryView>| {
                     let story = &body.data;
                     let (state_label, state_color) = state_badge(&story.state);
@@ -405,19 +412,18 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                             }
                         }).collect::<Vec<_>>()}
                     </div>
-                    {has_more.then(|| {
-                        let is_loading = loading.get();
-                        view! {
-                            <Btn
-                                variant=Variant::Secondary
-                                attr:style="margin-top:8px;width:100%"
-                                disabled=is_loading
-                                on_click=Callback::new(on_load_more)
-                            >
-                                {if is_loading { "loading\u{2026}" } else { "load older" }}
-                            </Btn>
-                        }
-                    })}
+                    // Bare <LoadMore> (no Pager — this is the timeline
+                    // column, not a table footer); "load older" stays
+                    // the idle label, exhaustion now shows the
+                    // canonical "end of list" line (#33 D3).
+                    <LoadMore
+                        has_more=has_more
+                        busy=loading
+                        on_load=Callback::new(on_load_more)
+                        label="load older"
+                        full=true
+                        attr:style="margin-top:8px"
+                    />
                 }.into_any()
             })
             />
@@ -758,20 +764,16 @@ fn ClaimsSection(
                                 }
                             }).collect::<Vec<_>>()}
                         </div>
-                        {has_more.then(|| {
-                            let is_loading = loading.get();
-                            view! {
-                                <Pager summary=String::new()>
-                                    <Btn
-                                        variant=Variant::Secondary
-                                        disabled=is_loading
-                                        on_click=Callback::new(on_load_more)
-                                    >
-                                        {if is_loading { "loading\u{2026}" } else { "load more" }}
-                                    </Btn>
-                                </Pager>
-                            }
-                        })}
+                        // <LoadMore> owns the three-state footer; the
+                        // canonical "end of list" line on exhausted
+                        // lists is the sanctioned visual delta (#33 D3).
+                        <Pager summary=String::new()>
+                            <LoadMore
+                                has_more=has_more
+                                busy=loading
+                                on_load=Callback::new(on_load_more)
+                            />
+                        </Pager>
                     </div>
                 }.into_any()
             })

@@ -996,6 +996,13 @@ textarea:focus-visible,
   font-family: var(--font-ui);
 }
 .load-hint.error { color: var(--red); }
+/* Missing-state explanatory second line (issue #33 D5) — stays on the
+ * neutral hint tone, slightly dimmer than the headline copy. */
+.load-hint .load-sub {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ink-4);
+}
 
 /* ActionsMenu — positioning context owned by the component (the
  * trigger `.btn-icon` and panel `.actions-menu` rules move in with
@@ -1119,3 +1126,14 @@ textarea:focus-visible,
 .actions-menu .item.danger { color: var(--red); }
 .actions-menu .item.danger:hover,
 .actions-menu .item.danger:focus-visible { background: color-mix(in oklab, var(--red) 10%, var(--panel-2)); }
+
+/* When — <When/> canonical timestamp label (issue #33). */
+.when { white-space: nowrap; }
+
+/* LoadMore — <LoadMore/> cursor-driven list footer (issue #33). */
+.load-more { display: flex; align-items: center; gap: 6px; }
+.load-more .load-more-end {
+  font-size: 11px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+}

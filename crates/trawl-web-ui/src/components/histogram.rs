@@ -127,7 +127,7 @@ fn value_to_seconds(v: &Value) -> Option<f64> {
             if let Ok(n) = s.parse::<f64>() {
                 return Some(n);
             }
-            crate::time_fmt::parse_timestamp(s).map(|dt| dt.timestamp() as f64)
+            fleet_ui::time::parse_timestamp(s).map(|dt| dt.timestamp() as f64)
         }
         _ => None,
     }

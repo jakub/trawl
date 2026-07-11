@@ -54,6 +54,7 @@ pub fn Modal(
     children: Children,
 ) -> impl IntoView {
     let scrim_ref = NodeRef::<Div>::new();
+    let panel_ref = NodeRef::<Div>::new();
 
     // Window-level keys: Escape cancels; Cmd/Ctrl+Enter submits when the
     // dialog has a primary action. use_event_listener registers an
@@ -61,7 +62,14 @@ pub fn Modal(
     // component unmounts; the returned cleanup handle is discarded
     // intentionally. The topmost-layer guard (see crate::overlay) keeps
     // these keys from also firing on a drawer stacked beneath this modal.
-    let layer = crate::overlay::use_overlay_layer();
+    //
+    // FocusPolicy::Trap earns the aria-modal="true" below: initial focus
+    // lands inside the panel, Tab/Shift+Tab cycle within it, and focus
+    // restores to the opener on close (issue #33 D2).
+    let layer =
+        crate::overlay::use_overlay_layer_with(crate::overlay::FocusPolicy::Trap, move || {
+            panel_ref.get().map(web_sys::Element::from)
+        });
     let _ = use_event_listener(use_window(), ev::keydown, move |e| {
         if !layer.is_topmost() {
             return;
@@ -106,7 +114,7 @@ pub fn Modal(
             node_ref=scrim_ref
             on:mousedown=on_scrim_mousedown
         >
-            <div class=panel_class role=role aria-modal="true">
+            <div class=panel_class role=role aria-modal="true" tabindex="-1" node_ref=panel_ref>
                 <div class="m-hd">
                     {icon.map(|ic| view! {
                         <span class="ic"><IconView icon=ic size=12 stroke_width=1.5/></span>

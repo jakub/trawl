@@ -52,6 +52,12 @@ const SEARCH_INPUT: &str = include_str!("../src/search_input.rs");
 const TOGGLE: &str = include_str!("../src/toggle.rs");
 const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
+const COPY_BUTTON: &str = include_str!("../src/copy_button.rs");
+const ICON: &str = include_str!("../src/icon.rs");
+const LIB: &str = include_str!("../src/lib.rs");
+const LOAD_MORE: &str = include_str!("../src/load_more.rs");
+const WHEN: &str = include_str!("../src/time/when.rs");
+const CLOCK: &str = include_str!("../src/time/clock.rs");
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
 
 /// Assert `src` contains `hook` (a class literal or class-idiom substring),
@@ -166,6 +172,16 @@ fn sparkline_emits_the_spark_class() {
 fn loaded_emits_the_tri_state_hint_hooks() {
     emits(LOADED, r#"class="load-hint""#, ".load-hint");
     emits(LOADED, r#"class="load-hint error""#, ".load-hint.error");
+    // Issue #33 D5: the Missing arm renders on the NEUTRAL hint tone
+    // (a missing resource is not a failure — no `.error` modifier),
+    // with the subtitle hook for the explanatory second line.
+    emits(LOADED, "missing_copy(label)", ".load-hint");
+    emits(LOADED, r#"class="load-sub""#, ".load-hint .load-sub");
+    assert!(
+        !LOADED.contains(r#"<div class="load-hint error">{missing"#),
+        "the Missing arm must stay on the neutral .load-hint tone, not \
+         the red .load-hint.error treatment"
+    );
 }
 
 #[test]
@@ -230,6 +246,168 @@ fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
          gate its window Escape on is_topmost() — otherwise Escape \
          under a stacked ConfirmModal closes both (the issue #28 bug \
          class the overlay stack exists to prevent)"
+    );
+}
+
+#[test]
+fn modal_family_traps_focus_and_keeps_aria_modal() {
+    // Issue #33 D2: the modal family renders aria-modal="true" and now
+    // EARNS it — the shell registers FocusPolicy::Trap with the overlay
+    // stack (initial focus, Tab/Shift+Tab cycle, restore-to-opener) and
+    // hands the glue its panel element with a tabindex="-1" fallback.
+    assert!(
+        MODAL_SHELL.contains(r#"aria-modal="true""#),
+        "the modal shell must keep aria-modal=\"true\" — it traps focus, \
+         so the semantics are honest"
+    );
+    assert!(
+        MODAL_SHELL.contains("FocusPolicy::Trap") && MODAL_SHELL.contains("use_overlay_layer_with"),
+        "the modal shell must register FocusPolicy::Trap via \
+         use_overlay_layer_with — dropping it reopens the issue #33 \
+         defect (aria-modal with zero focus management)"
+    );
+    assert!(
+        MODAL_SHELL.contains(r#"tabindex="-1""#),
+        "the modal panel needs tabindex=\"-1\" so the initial-focus \
+         fallback can land on the panel itself"
+    );
+}
+
+#[test]
+fn drawer_is_an_honest_non_modal_dialog() {
+    // Issue #33 D2: the drawer is non-modal BY DESIGN (background stays
+    // interactive; modal-over-live-drawer is a supported stack), so it
+    // must NOT claim aria-modal. It keeps role="dialog" and registers
+    // FocusPolicy::Capture (initial focus + restore, no trap). This is
+    // the slice's single sanctioned semantic markup delta.
+    assert!(
+        DRAWER.contains(r#"role="dialog""#),
+        "the drawer keeps role=\"dialog\""
+    );
+    // Scan for the attribute form (`aria-modal=`) rather than the bare
+    // token: the drawer's comments legitimately explain WHY the
+    // attribute is absent.
+    assert!(
+        !DRAWER.contains("aria-modal="),
+        "the drawer must not render an aria-modal attribute — screen \
+         readers would be told the background is gone while keyboard \
+         users tab straight out (the issue #33 defect)"
+    );
+    assert!(
+        DRAWER.contains("FocusPolicy::Capture") && DRAWER.contains("use_overlay_layer_with"),
+        "the drawer must register FocusPolicy::Capture via \
+         use_overlay_layer_with — initial focus on open, restore on \
+         close, and no Tab trap"
+    );
+    assert!(
+        DRAWER.contains(r#"tabindex="-1""#),
+        "the drawer panel needs tabindex=\"-1\" so the initial-focus \
+         fallback can land on the panel itself"
+    );
+}
+
+#[test]
+fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
+    // Issue #33 D8: Document / Upload / Copy join the closed enum, each
+    // with an icon_body arm in house style.
+    for glyph in ["Document", "Upload", "Copy"] {
+        assert!(
+            ICON.contains(&format!("    {glyph},\n"))
+                && ICON.contains(&format!("Icon::{glyph} =>")),
+            "Icon::{glyph} must exist as a variant with an icon_body arm"
+        );
+    }
+    // The lib.rs crate doc claimed "four typed components" while
+    // exporting ~25 — describe the surface by category, never by count.
+    assert!(
+        !LIB.contains("four typed components"),
+        "lib.rs crate doc must not hard-code a component count (doc rot)"
+    );
+}
+
+#[test]
+fn drawer_and_tabs_meta_is_reactive() {
+    // Issue #33 D7: `meta` is a reactive optional (MaybeProp) on both
+    // Tabs and the Drawer that forwards to it — live counts must tick.
+    // Static Strings still convert via `into`, so call sites with
+    // snapshot copy compile unchanged.
+    assert!(
+        TABS.contains("MaybeProp<String>"),
+        "Tabs meta must be a reactive MaybeProp<String>"
+    );
+    assert!(
+        DRAWER.contains("MaybeProp<String>"),
+        "Drawer meta must stay a reactive MaybeProp<String> forwarded \
+         to Tabs"
+    );
+}
+
+#[test]
+fn copy_button_reports_through_the_shared_toast_bus() {
+    // Issue #33 D6: one click-to-copy component, wired to the Shell's
+    // ToastBus (never a second bus), with the canonical "Copied" /
+    // "Copy failed" toast titles.
+    assert!(
+        COPY_BUTTON.contains("expect_context::<ToastBus>()"),
+        "CopyButton must resolve the Shell-owned ToastBus from context"
+    );
+    assert!(
+        COPY_BUTTON.contains(r#""Copied""#) && COPY_BUTTON.contains(r#""Copy failed""#),
+        "the toast titles are canonical copy — apps customize only the \
+         success detail line"
+    );
+    assert!(
+        COPY_BUTTON.contains("stop_propagation"),
+        "copy triggers sit inside clickable rows — the click must not \
+         bubble into the host row handler"
+    );
+}
+
+#[test]
+fn load_more_emits_its_hooks_and_the_canonical_busy_label() {
+    // Issue #33 D3: cursor-driven list footer. The three terminal
+    // states (button / end-of-list / empty) are pinned natively in
+    // load_more::phase tests; these pin the class hooks and that the
+    // busy label is the CANONICAL loading copy, not a bespoke string.
+    emits(LOAD_MORE, r#"class="load-more""#, ".load-more");
+    emits(
+        LOAD_MORE,
+        r#"class="load-more-end""#,
+        ".load-more .load-more-end",
+    );
+    assert!(
+        LOAD_MORE.contains("loading_copy(None)"),
+        "the busy label must be the canonical loading_copy — slice C \
+         normalized generic status copy, LoadMore must not fork it"
+    );
+}
+
+#[test]
+fn when_renders_both_modes_off_the_shared_clock() {
+    // Issue #33 D4: <When> renders relative (time_ago buckets) and
+    // absolute ("%Y-%m-%d %H:%M UTC" — explicit zone marker) modes,
+    // always with the full RFC 3339 form in the title attr.
+    emits(WHEN, r#"class="when""#, ".when");
+    assert!(
+        WHEN.contains("title=") && WHEN.contains("to_rfc3339"),
+        "<When> must carry the full RFC 3339 timestamp in its title attr"
+    );
+    assert!(
+        WHEN.contains("%Y-%m-%d %H:%M UTC"),
+        "absolute mode renders \"%Y-%m-%d %H:%M UTC\" — nothing else in \
+         the app signals timezone, the explicit marker is the point"
+    );
+    // Exactly ONE shared tick drives every instance: <When> subscribes
+    // to clock::now_ms and must never own a timer of its own.
+    assert!(
+        WHEN.contains("clock::now_ms") && !WHEN.contains("Interval"),
+        "<When> must subscribe to the shared clock tick, never a \
+         per-instance interval"
+    );
+    assert!(
+        CLOCK.contains("Interval::new(30_000") && CLOCK.contains("is_some"),
+        "the shared clock is a single 30s interval installed once \
+         (install() re-entry is a no-op)"
     );
 }
 

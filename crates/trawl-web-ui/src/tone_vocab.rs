@@ -5,7 +5,7 @@
 //! App-side mapping of trawl's domain vocabularies onto fleet-ui's
 //! generic tone enums. Pure (no `leptos`/`web_sys`), so it lives ungated
 //! and its contract is exercised by native `cargo test` — mirroring the
-//! sibling helper modules (`facets`, `time_fmt`) and fleet-ui's own
+//! sibling helper module (`facets`) and fleet-ui's own
 //! `status_dot::tone`. Keeping the string→tone mapping app-side is
 //! deliberate (ADR-0002): the status/color vocabularies are trawl's, only
 //! the rendered dot/badge is generic.

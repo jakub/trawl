@@ -22,8 +22,8 @@ use trawl_api::HistoryEntryResponse;
 use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
-use crate::time_fmt::{format_duration, time_ago};
-use fleet_ui::{Btn, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind, Variant};
+use fleet_ui::time::format_duration;
+use fleet_ui::{Btn, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind, Variant, When};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -78,13 +78,6 @@ pub fn HistoryPage() -> impl IntoView {
             Some("Server-side history clearing is landing soon.".into()),
         );
     });
-
-    // Browser clock snapshot at render time — used by every row's
-    // time_ago label. `Date::get_time()` returns ms since epoch as f64;
-    // the cast is lossless at any realistic wall-clock (~1.7e12), which
-    // is why we silence the truncation lint inline.
-    #[allow(clippy::cast_possible_truncation)]
-    let now_ms = js_sys::Date::new_0().get_time() as i64;
 
     let on_prev = {
         let goto_hpage = goto_hpage.clone();
@@ -168,16 +161,19 @@ pub fn HistoryPage() -> impl IntoView {
                             let q_for_row = h.query.clone();
                             let q_for_save = h.query.clone();
                             let on_rerun = on_rerun.clone();
-                            let when = time_ago(&h.executed_at, now_ms);
                             let events = format_with_commas(h.row_count as u64);
                             let duration = format_duration(h.duration_ms);
+                            // <When> replaces the render-time snapshot:
+                            // the label ticks off fleet-ui's shared 30s
+                            // clock instead of freezing at page load.
+                            let executed_at = h.executed_at.clone();
                             view! {
                                 <div
                                     class="tbl-row"
                                     on:click=move |_| on_rerun(q_for_row.clone())
                                 >
                                     <div style="flex:0 0 72px; color:var(--ink-3)" class="mono">
-                                        {when}
+                                        <When ts=executed_at/>
                                     </div>
                                     <div style="flex:3; min-width:0" class="mono path">
                                         {h.query.clone()}

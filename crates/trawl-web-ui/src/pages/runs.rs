@@ -12,7 +12,7 @@ use leptos_router::NavigateOptions;
 use leptos_router::hooks::use_navigate;
 
 use crate::api;
-use crate::time_fmt::{format_duration, time_ago};
+use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{LoadState, Loaded, Pager, SearchInput, StatusDot};
 
 const RUNS_PAGE_SIZE: usize = 20;

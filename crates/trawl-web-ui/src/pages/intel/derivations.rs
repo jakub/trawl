@@ -16,9 +16,10 @@ use crate::components::lineage_tree::{
     transformation_color,
 };
 use crate::components::tone_for_var;
-use crate::time_fmt::time_ago;
+use fleet_ui::time::time_ago;
 use fleet_ui::{
-    Badge, Btn, ConfirmState, ConfirmWithReasonModal, Pager, ToastBus, ToastKind, Tone, Variant,
+    Badge, Btn, ConfirmState, ConfirmWithReasonModal, LoadMore, Pager, ToastBus, ToastKind, Tone,
+    Variant,
 };
 
 const OBJECT_TYPES: &[&str] = &[
@@ -319,20 +320,19 @@ pub fn DerivationsPage() -> impl IntoView {
                                     }
                                 }).collect::<Vec<_>>()}
                             </div>
-                            {move || edges_cursor.get().map(|_| {
-                                let is_loading = loading.get();
-                                view! {
-                                    <Pager summary=String::new()>
-                                        <Btn
-                                            variant=Variant::Secondary
-                                            disabled=is_loading
-                                            on_click=Callback::new(on_load_more_edges)
-                                        >
-                                            {if is_loading { "loading\u{2026}" } else { "load more" }}
-                                        </Btn>
-                                    </Pager>
-                                }
-                            })}
+                            // <LoadMore> owns the three-state footer;
+                            // the canonical "end of list" line on an
+                            // exhausted cursor is the sanctioned visual
+                            // delta (#33 D3).
+                            <Pager summary=String::new()>
+                                <LoadMore
+                                    has_more=Signal::derive(move || edges_cursor.get().is_some())
+                                    busy=loading
+                                    empty=Signal::derive(move || edges.get().is_empty())
+                                    empty_text="no derivation edges yet"
+                                    on_load=Callback::new(on_load_more_edges)
+                                />
+                            </Pager>
                         </div>
                     </div>
                 }.into_any()

@@ -5,29 +5,40 @@
 //! Shared Leptos 0.8 design system for fleet apps (ADR-0030, step 2).
 //!
 //! Ships design tokens, reset + base styles, the theme preference
-//! system, and four typed components (`Btn`, `Field`, `ConfirmModal`,
-//! `Toasts`). Consumed by trawl-web-ui and the future coastwatch-web
-//! via workspace path deps; CSS is consumed via Trunk's `data-trunk
+//! system, and the typed component surface, by category:
+//!
+//! - **chrome** — `Shell`, `TopBar`, `Rail`, `Login`, `Toasts`;
+//! - **overlays** — the `Modal` family, `Drawer`, `ActionsMenu`, all
+//!   arbitrated by the [`overlay`] stack (topmost-only Escape + focus
+//!   ownership);
+//! - **form & actions** — `Btn`, `Field`, `Toggle`, `Segmented`,
+//!   `SearchInput`, `CopyButton`, `Kbd`;
+//! - **content & data** — `Badge`, `StatusDot`, `Sparkline`, `Tabs`,
+//!   `Loaded`, `Pager`, `LoadMore`, `When`, `ErrorBanner`, `IconView`.
+//!
+//! Consumed by trawl-web-ui and the future coastwatch-web via
+//! workspace path deps; CSS is consumed via Trunk's `data-trunk
 //! rel="css"` directive pointing at `styles/fleet-ui.css` in this
 //! crate's directory.
 //!
 //! Most modules are wasm32-only — they pull leptos / web-sys / gloo
-//! and only make sense in a browser. The exceptions are [`theme::prefs`],
+//! and only make sense in a browser. The exceptions are the pure
+//! layers that build on every target — [`theme::prefs`],
 //! [`toast::kinds`], [`toast::stack`], [`button::variant`],
 //! [`login::validate`], [`badge::tone`], [`status_dot::tone`],
-//! [`sparkline::geometry`], [`loaded::state`],
-//! [`modal::confirm_state`], and the [`icon::Icon`] enum: pure layers
-//! that build on every target so the `localStorage` JSON contract, the
-//! toast CSS-class contract, the toast push/dismiss state machine, the
-//! button/badge/status-dot CSS-class contracts, the login
-//! key-validation + error-precedence contracts, the sparkline scale
-//! math, the tri-state load mapping + canonical copy, the
-//! confirm-dialog lifecycle, and the icon descriptor can be exercised
-//! by native unit tests (and named by native consumer code). The
-//! renderers themselves stay wasm32-only.
+//! [`sparkline::geometry`], [`loaded::state`], [`load_more`]'s phase
+//! resolution, [`copy_button`]'s toast decision,
+//! [`modal::confirm_state`], the [`overlay`] stack, the
+//! [`time`] formatters, and the [`icon::Icon`] enum — so their
+//! contracts (localStorage JSON, CSS-class composition, state
+//! machines, canonical copy, focus ownership, timestamp buckets) are
+//! exercised by native unit tests and nameable by native consumer
+//! code. The renderers themselves stay wasm32-only.
 
 pub mod badge;
 pub mod button;
+pub mod copy_button;
+pub mod load_more;
 pub mod loaded;
 pub mod login;
 pub mod modal;
@@ -36,10 +47,13 @@ pub mod segmented;
 pub mod sparkline;
 pub mod status_dot;
 pub mod theme;
+pub mod time;
 pub mod toast;
 
 #[cfg(target_arch = "wasm32")]
 pub mod actions_menu;
+#[cfg(target_arch = "wasm32")]
+pub mod clipboard;
 #[cfg(target_arch = "wasm32")]
 pub mod drawer;
 #[cfg(target_arch = "wasm32")]
@@ -67,6 +81,7 @@ pub mod topbar;
 pub use badge::Tone;
 pub use button::{Size, Variant};
 pub use icon::Icon;
+pub use load_more::LoadMorePhase;
 pub use loaded::LoadState;
 pub use modal::ConfirmState;
 pub use segmented::{SegmentedOption, segmented_class};
@@ -82,6 +97,10 @@ pub use badge::Badge;
 #[cfg(target_arch = "wasm32")]
 pub use button::Btn;
 #[cfg(target_arch = "wasm32")]
+pub use clipboard::write_clipboard;
+#[cfg(target_arch = "wasm32")]
+pub use copy_button::CopyButton;
+#[cfg(target_arch = "wasm32")]
 pub use drawer::Drawer;
 #[cfg(target_arch = "wasm32")]
 pub use error_banner::ErrorBanner;
@@ -91,6 +110,8 @@ pub use field::{Field, Helper};
 pub use icon::IconView;
 #[cfg(target_arch = "wasm32")]
 pub use kbd::Kbd;
+#[cfg(target_arch = "wasm32")]
+pub use load_more::LoadMore;
 #[cfg(target_arch = "wasm32")]
 pub use loaded::Loaded;
 #[cfg(target_arch = "wasm32")]
@@ -115,6 +136,8 @@ pub use status_dot::StatusDot;
 pub use tabs::{TabItem, Tabs, TabsStyle, effective_active};
 #[cfg(target_arch = "wasm32")]
 pub use theme::{UiPrefs, install};
+#[cfg(target_arch = "wasm32")]
+pub use time::when::{When, WhenMode};
 #[cfg(target_arch = "wasm32")]
 pub use toast::{ToastBus, Toasts};
 #[cfg(target_arch = "wasm32")]

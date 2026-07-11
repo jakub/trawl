@@ -18,7 +18,7 @@ use crate::api;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::state::query::{Mode, RangeSpec, navigator};
-use crate::time_fmt::{time_ago, time_until};
+use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
     ActionItem, ActionsMenu, Btn, ConfirmModal, ConfirmState, LoadState, Loaded, Pager,
     SearchInput, StatusDot, ToastBus, ToastKind, Variant,

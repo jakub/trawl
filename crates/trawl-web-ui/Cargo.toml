@@ -15,13 +15,9 @@ path = "src/main.rs"
 # shared display helpers) that compile on both targets so their tests run
 # under plain `cargo test`. It's a zero-dep-beyond-serde workspace crate,
 # so importing it on native costs nothing.
-#
-# chrono is pulled into the native build for the `time_fmt` unit tests.
-# The `wasmbind` feature only kicks in on wasm32.
 [dependencies]
 trawl-api = { workspace = true }
 coastwatch-api-types = { workspace = true }
-chrono = { workspace = true, features = ["wasmbind"] }
 # Unconditional (like coastwatch): fleet-ui's pure-native modules
 # (theme::prefs, toast::kinds) ride along for host builds; the leptos
 # component surface only enters the graph on wasm32.
@@ -31,6 +27,7 @@ fleet-ui = { workspace = true }
 # on native skips these entirely, but the binary compiles against them when
 # `trunk build` sets the wasm32 target.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono = { workspace = true, features = ["wasmbind"] }
 leptos = { version = "0.8", features = ["csr"] }
 leptos_router = { version = "0.8" }
 leptos_meta = "0.8"
@@ -48,7 +45,6 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "Blob",
     "BlobPropertyBag",
-    "Clipboard",
     "CloseEvent",
     "Document",
     "Element",
@@ -59,7 +55,6 @@ web-sys = { version = "0.3", features = [
     "Location",
     "MessageEvent",
     "MouseEvent",
-    "Navigator",
     "Storage",
     "ScrollBehavior",
     "ScrollIntoViewOptions",
