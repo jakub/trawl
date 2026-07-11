@@ -1861,6 +1861,7 @@ dependencies = [
  "chrono",
  "cookie",
  "dashmap",
+ "fleet-auth",
  "rand 0.8.6",
  "serde",
  "serde_json",
