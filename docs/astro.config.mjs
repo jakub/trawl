@@ -35,6 +35,7 @@ export default defineConfig({
             { slug: 'reference/cli' },
             { slug: 'reference/api' },
             { slug: 'reference/configuration' },
+            { slug: 'reference/fleet-auth-cutover' },
           ],
         },
         {

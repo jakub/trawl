@@ -30,7 +30,7 @@ trawl is implemented as a Rust workspace with clean crate boundaries:
 | `trawl-server` | Daemon (axum, HTTPS via tokio-rustls) |
 | `trawl-client` | Typed async HTTP client library |
 | `trawl-cli` | Unified CLI + TUI binary |
-| `trawl-admin` | Admin CLI (key management, TLS certs) |
+| `trawl-admin` | Admin CLI (TLS certs; keys live in `fleet-admin`) |
 
 The parser and emitter in `trawl-core` are pure logic with no I/O dependencies — testable in isolation and potentially compilable to WASM.
 

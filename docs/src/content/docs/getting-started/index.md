@@ -42,7 +42,7 @@ curl -fsSL https://github.com/jakub/trawl/releases/latest/download/trawl-v0.1.8-
 The tarball contains three binaries:
 - `trawl` — CLI and TUI
 - `trawld` — server daemon
-- `trawl-admin` — admin tool for API key management and TLS cert generation
+- `trawl-admin` — TLS certificate generation (API keys are managed by `fleet-admin`)
 
 Move them somewhere in your `$PATH`:
 

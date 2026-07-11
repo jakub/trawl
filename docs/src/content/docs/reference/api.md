@@ -13,12 +13,13 @@ Include your API token in the `Authorization` header:
 Authorization: Bearer flt_your_token_here
 ```
 
-API keys are managed with `trawl-admin`:
+API keys are managed with `fleet-admin` against the fleet postgres
+keystore (`DATABASE_URL`):
 
 ```bash
-trawl-admin key create --role analyst --name "my-key"
-trawl-admin key list
-trawl-admin key revoke <key-prefix>
+fleet-admin keys create --name "my-key" --kind human --grant trawl:analyst
+fleet-admin keys list
+fleet-admin keys revoke <key-prefix>
 ```
 
 ### Roles
