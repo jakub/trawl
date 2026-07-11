@@ -242,4 +242,15 @@ mod tests {
         let now = now();
         assert_eq!(time_until(now, now), "overdue");
     }
+
+    #[test]
+    fn format_duration_contract() {
+        // sub-10ms passthrough
+        assert_eq!(format_duration(9), "9ms");
+        // boundary: first second-formatted value, zero-padded frac
+        assert_eq!(format_duration(10), "0.010s");
+        // frac zero-pad above the seconds place
+        assert_eq!(format_duration(1005), "1.005s");
+        assert_eq!(format_duration(482), "0.482s");
+    }
 }
