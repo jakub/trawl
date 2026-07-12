@@ -1,6 +1,6 @@
 ---
 title: Fleet-Auth Cutover Runbook
-description: Migrating a trawld deployment from the sqlite keystore to the fleet-auth postgres keystore (ADR-0004 slice 1).
+description: Migrating a trawld deployment from the sqlite keystore to the fleet-auth postgres keystore (ADR-0004 slice 1), plus fleet SSO key provisioning (slice 2).
 ---
 
 Since ADR-0004 slice 1, trawld verifies API keys against **fleet-auth's
@@ -102,6 +102,108 @@ kubectl create secret generic trawl-fleet-db \
   --from-literal=DATABASE_URL='postgres://fleet:…@cnpg-rw:5432/fleet'
 helm upgrade trawl chart/trawl --set auth.database.existingSecret=trawl-fleet-db
 ```
+
+## Fleet SSO (`fleet_session` cookie)
+
+Since ADR-0004 slice 2 trawl-web issues the fleet-wide `fleet_session`
+cookie (`SameSite=Lax`, app-agnostic `{token, name, exp}` payload). SSO —
+one login shared with coastwatch-web — is **opt-in** and needs two things
+in every participating app: the same `shared_domain` and the same session
+key. Standalone installs need none of this; both channels keep
+self-generating an app-local key.
+
+### 1. Mint and stash the shared key (once per fleet)
+
+```bash
+fleet-admin generate-session-key
+# prints a base64url key — never recoverable, store it immediately
+op item create --category=password --title='Fleet session key' \
+  --vault=Homelab credential='<the printed key>'
+```
+
+The canonical reference is `op://Homelab/Fleet session key/credential`.
+Per coastwatch ADR-0038 the key stays an `op://` runtime reference — it is
+cross-repo shared, so never commit it as ciphertext anywhere.
+
+### 2. DNS / ingress
+
+Fleet apps live under one parent domain; the cookie's `Domain=` attribute
+is scoped to it:
+
+- `trawl.fleet.lab.ktle.net` → trawl-web
+- `coastwatch.fleet.lab.ktle.net` → coastwatch-web
+- `shared_domain = ".fleet.lab.ktle.net"` in **both** apps
+
+`trawl-01.lab.ktle.net` stays the direct trawld API endpoint for CLI and
+vector bearer clients — cookie-free, unaffected. If a reverse proxy
+terminates TLS in front of trawl-web, it must forward the original `Host`
+header: login/logout validate the `Origin` header against `Host` and
+`shared_domain`, and a rewritten `Host` makes legitimate logins 403.
+
+### 3. Debian channel
+
+The postinst-generated key at `/var/lib/trawl/web.cookie` must be replaced
+with the shared one. **`cookie_secret_path` expects RAW 32 bytes, not
+base64** — the `op://` item is base64url without padding (43 chars), so
+re-pad and decode while writing:
+
+```bash
+printf '%s=' "$(op read 'op://Homelab/Fleet session key/credential')" \
+  | basenc --base64url -d > /var/lib/trawl/web.cookie   # raw 32 bytes
+chmod 600 /var/lib/trawl/web.cookie
+```
+
+Then in `/etc/trawl/trawld.toml`:
+
+```toml
+[web]
+shared_domain = ".fleet.lab.ktle.net"
+```
+
+```bash
+systemctl restart trawl-web
+```
+
+If trawl-web fails to start complaining the key file "must contain exactly
+32 bytes", you wrote the base64 text instead of decoding it.
+
+### 4. Kubernetes (helm)
+
+The Secret must hold the RAW key bytes under `cookie.key` (kubernetes
+`data` values are *standard* base64 — the `op://` item's url-safe unpadded
+form does NOT drop in as-is). Decode first and let kubectl do its own
+encoding:
+
+```bash
+printf '%s=' "$(op read 'op://Homelab/Fleet session key/credential')" \
+  | basenc --base64url -d \
+  | kubectl create secret generic fleet-session-key \
+      --from-file=cookie.key=/dev/stdin
+
+helm upgrade trawl chart/trawl \
+  --set web.cookieSecret.existingSecret=fleet-session-key \
+  --set web.sharedDomain=.fleet.lab.ktle.net
+```
+
+### 5. Coastwatch side
+
+Set the same two values in the coastwatch repo. **Note:** coastwatch's
+committed prod config predates the DNS decision and still carries
+`session.shared_domain = ".fleet.home.lan"` — it must become
+`".fleet.lab.ktle.net"` or SSO silently breaks (a mismatched `Domain=`
+means each app sets a cookie the other never sees). Coastwatch also picks
+up the default-on login/logout Origin validation on its next rebuild
+against fleet-auth.
+
+### Behavior notes
+
+- Sessions minted before the key swap die at the swap (AEAD key change);
+  users log in once more.
+- Legacy `trawl_session` cookies are ignored and expire at their TTL — no
+  cleanup needed.
+- Upstream mapping: trawld 401 (key revoked/expired fleet-wide) clears the
+  shared cookie everywhere; trawld 403 (valid key, no trawl grant) keeps
+  the cookie so the user stays signed in to sibling apps.
 
 ## What changed in enforcement
 
