@@ -717,6 +717,27 @@ pub fn check_origin(
     Err(OriginRejected)
 }
 
+/// Derive the request authority (host[:port]) for the Origin check, preferring
+/// the `Host` header and falling back to the URI's `:authority` pseudo-header.
+///
+/// HTTP/1.1 carries the target host in the `Host` header (the URI is
+/// origin-form, so `uri.authority()` is `None`); HTTP/2 carries it in the
+/// `:authority` pseudo-header, which hyper parks in the request URI while
+/// leaving `Host` absent. Consulting both keeps the same-host Origin guard
+/// working on either protocol.
+///
+/// This is the one host-derivation used by *both* fleet-auth's own axum
+/// handlers and thin session-only proxies (trawl-web), so the two `check_origin`
+/// call sites can't silently diverge on this CSRF-relevant surface. Feed the
+/// result straight into [`check_origin`].
+#[must_use]
+pub fn request_host<'a>(headers: &'a http::HeaderMap, uri: &'a http::Uri) -> Option<&'a str> {
+    headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.authority().map(http::uri::Authority::as_str))
+}
+
 /// Extract the host component from an `Origin` header value
 /// (`scheme "://" host [":" port]`). Returns `None` for anything that
 /// doesn't parse as a serialized origin — including the opaque `"null"`
@@ -1270,6 +1291,41 @@ mod tests {
             Some("https://trawl.example.com@evil.com"),
             Some("trawl.example.com")
         ));
+    }
+
+    // -- request_host Host-header / :authority fallback -----------------
+
+    #[test]
+    fn request_host_prefers_host_header() {
+        // HTTP/1.1: Host header present, URI is origin-form (no authority).
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, "trawl.example.com".parse().unwrap());
+        let uri: http::Uri = "/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_falls_back_to_uri_authority() {
+        // HTTP/2: no Host header; hyper parks `:authority` in the request URI.
+        let headers = http::HeaderMap::new();
+        let uri: http::Uri = "https://trawl.example.com/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_prefers_host_over_authority() {
+        // If both are present the Host header wins (matches HTTP/1.1 posture).
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, "trawl.example.com".parse().unwrap());
+        let uri: http::Uri = "https://other.example.com/x".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_none_when_neither_present() {
+        let headers = http::HeaderMap::new();
+        let uri: http::Uri = "/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), None);
     }
 
     #[test]

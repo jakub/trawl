@@ -23,7 +23,6 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::uri::Authority;
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use fleet_auth::{SessionExpiry, SessionPayload, session};
@@ -62,20 +61,17 @@ pub struct LoginResponse {
 /// requests — this is the only thing standing between a compromised sibling
 /// app and a forged state-changing request carrying the victim's session.
 ///
-/// The request host is read from the `Host` header, falling back to the URI's
-/// `:authority` — under HTTP/2 browsers send `:authority` instead of a `Host`
-/// header, and a Host-only lookup would be `None`, so a present-Origin
-/// same-origin request would be wrongly rejected (403, no `Set-Cookie`).
+/// The request host is derived by the shared [`fleet_auth::request_host`]
+/// (`Host` header, falling back to the URI's `:authority`) — the one
+/// host-derivation fleet-auth's own handlers use too, so the HTTP/2
+/// `:authority` handling can't drift between the two origin guards.
 pub(crate) fn check_origin(
     headers: &HeaderMap,
     uri: &Uri,
     handler: &str,
 ) -> Result<(), ProxyError> {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| uri.authority().map(Authority::as_str));
+    let host = session::request_host(headers, uri);
     session::check_origin(origin, host, handler).map_err(|_| ProxyError::OriginMismatch)
 }
 

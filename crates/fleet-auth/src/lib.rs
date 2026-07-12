@@ -45,7 +45,7 @@ pub use session::{
     DEFAULT_COOKIE_NAME, DEFAULT_TTL_SECS, KEY_LEN, NONCE_LEN, OriginRejected, SessionConfig,
     SessionConfigBuilder, SessionError, SessionExpiry, SessionKey, SessionPayload,
     build_clear_cookie_header, build_session_cookie_header, check_origin, decrypt, encrypt,
-    is_expired, origin_allowed,
+    is_expired, origin_allowed, request_host,
 };
 // Re-export `cookie::SameSite` so consumers don't need to add `cookie` as a
 // direct dep just to populate `SessionConfig.same_site`.
