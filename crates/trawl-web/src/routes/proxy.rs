@@ -113,21 +113,17 @@ async fn do_forward(
     let out_headers = out.headers_mut().expect("fresh response has headers map");
     copy_response_headers(&upstream_headers, out_headers);
 
-    // Upstream auth mapping (ADR-0004 slice 2): a 401 for a session-authed
-    // request means the key is dead fleet-wide (revoked/expired) — tell
-    // the browser to drop the cookie so it stops re-sending it on every
-    // request. Bearer clients hold no cookie, so no clear for them. A 403
-    // (valid key, no trawl grant) deliberately passes through WITHOUT
-    // touching the cookie: the shared fleet_session may still carry
-    // grants for sibling apps, and clearing it would log the user out of
-    // those too. (`copy_response_headers` strips upstream Set-Cookie, so
-    // this insert can't collide.)
-    if status == StatusCode::UNAUTHORIZED
-        && matches!(auth, Auth::Session(_))
-        && let Ok(v) = state.build_clear_cookie().parse()
-    {
-        out_headers.insert(header::SET_COOKIE, v);
-    }
+    // Deliberately NO cookie clearing here (ADR-0004 slice 2). trawld
+    // returns an opaque 401 for BOTH classes of failure — a dead key
+    // (revoked/expired fleet-wide) AND a live key that merely lacks the
+    // permission grant for this one endpoint (e.g. a non-admin whose SPA
+    // hits an admin-only route). The two are indistinguishable at this
+    // layer, so clearing on any proxied 401 would log valid users out of
+    // the entire fleet (shared `fleet_session`) on a routine authz denial.
+    // Cookie lifecycle is owned solely by `auth::me`, which decides against
+    // the PERMISSION-FREE upstream `/whoami`: a 401 there is unambiguously
+    // a dead key. The session extractor's local expiry check plus that
+    // `/me` path are the only safe places to drop the shared cookie.
 
     out.body(Body::from_stream(body_stream))
         .map_err(|e| ProxyError::Internal(format!("response build: {e}")))
@@ -402,10 +398,14 @@ mod tests {
     // -- upstream auth mapping (AC #5) -------------------------------------
 
     #[tokio::test]
-    async fn forward_upstream_401_with_session_clears_cookie() {
-        // Key revoked fleet-wide: EVERY proxied route must tell the browser
-        // to drop the dead cookie, not just /me — otherwise the SPA keeps
-        // re-sending it forever.
+    async fn forward_upstream_401_with_session_preserves_cookie() {
+        // trawld returns an opaque 401 for BOTH a dead key and a live key
+        // that merely lacks the permission grant for one endpoint (e.g. a
+        // non-admin whose SPA hits an admin-only route). The proxy can't
+        // tell them apart, so it must NOT clear the shared cookie on any
+        // proxied 401 — doing so would log valid users out of the entire
+        // fleet on a routine authz denial. Cookie lifecycle is owned by
+        // `auth::me`, which decides against the permission-free /whoami.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -426,21 +426,11 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        let set_cookie = resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("session-authed upstream 401 must clear the cookie")
-            .to_str()
-            .unwrap();
         assert!(
-            set_cookie.starts_with("fleet_session=;"),
-            "got: {set_cookie}"
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a proxied 401 (possibly a mere authz denial) must NOT clear the \
+             shared fleet_session cookie"
         );
-        assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
-        assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
-        assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
-        assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
     }
 
     #[tokio::test]
@@ -503,9 +493,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_intel_upstream_401_with_session_clears_cookie() {
-        // The coastwatch intel path is a proxied route like any other —
-        // same fleet-wide 401 mapping applies.
+    async fn forward_intel_upstream_401_with_session_preserves_cookie() {
+        // The coastwatch intel path is a proxied route like any other — its
+        // 401 is equally ambiguous (dead key vs. authz denial), so it must
+        // not clear the shared cookie either.
         let trawld = MockServer::start().await;
         let coastwatch = MockServer::start().await;
         let state = state_with_intel(&trawld, &coastwatch);
@@ -527,15 +518,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let set_cookie = resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("intel 401 must clear the cookie too")
-            .to_str()
-            .unwrap();
         assert!(
-            set_cookie.starts_with("fleet_session=;"),
-            "got: {set_cookie}"
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a proxied intel 401 must NOT clear the shared fleet_session cookie"
         );
     }
 

@@ -87,7 +87,7 @@ pub async fn forward(
         upstream_ct.unwrap_or_else(|| "application/json".to_string())
     };
 
-    let mut builder = Response::builder()
+    let builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
@@ -96,13 +96,14 @@ pub async fn forward(
         // intermediate proxies when trawl-web is fronted by another one.
         .header("X-Accel-Buffering", "no");
 
-    // Upstream auth mapping (ADR-0004 slice 2), mirroring `proxy::do_forward`:
-    // session-authed 401 → clear the dead cookie (EventSource auto-reconnects,
-    // so without this the browser would re-send it forever); 403 → cookie
-    // preserved (grant may exist in sibling apps).
-    if status == StatusCode::UNAUTHORIZED && matches!(auth, Auth::Session(_)) {
-        builder = builder.header(header::SET_COOKIE, state.build_clear_cookie());
-    }
+    // Deliberately NO cookie clearing here, mirroring `proxy::do_forward`
+    // (ADR-0004 slice 2). trawld's 401 is opaque across both a dead key and
+    // a live key lacking the `stream` permission, so clearing on any 401
+    // would sign valid users out of the whole fleet on a routine authz
+    // denial. Cookie lifecycle is owned by `auth::me` alone, which decides
+    // against the permission-free upstream `/whoami`. EventSource reconnects
+    // will keep 401ing until the SPA's next `/me` poll clears the dead
+    // cookie — the correct, permission-aware place to make that call.
 
     builder
         .body(Body::from_stream(capped_stream))
@@ -261,10 +262,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_upstream_401_with_session_clears_cookie() {
-        // Fleet-wide dead key must clear the cookie on the SSE path too —
-        // EventSource auto-reconnects, so without the clear the browser
-        // would hammer the endpoint with a dead cookie forever.
+    async fn stream_upstream_401_with_session_preserves_cookie() {
+        // trawld's 401 on the SSE path is just as ambiguous as on any other
+        // proxied route — it covers both a dead key and a live key lacking
+        // the `stream` permission. Clearing on it would sign valid users out
+        // of the whole fleet on a routine authz denial, so the stream path
+        // must NOT touch the shared cookie. `auth::me` (permission-free
+        // /whoami) remains the sole authority for the cookie lifecycle.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
@@ -285,17 +289,10 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let set_cookie = resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("stream upstream 401 must clear the session cookie")
-            .to_str()
-            .unwrap();
         assert!(
-            set_cookie.starts_with("fleet_session=;"),
-            "got: {set_cookie}"
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a proxied SSE 401 must NOT clear the shared fleet_session cookie"
         );
-        assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
     }
 
     #[tokio::test]
