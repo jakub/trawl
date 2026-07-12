@@ -131,8 +131,11 @@ Browser-facing session proxy (`trawl-web` binary). Reads the same `trawld.toml` 
 | `cookie_secret_env` | string | (none) | Env var holding the base64-encoded key. Takes precedence over `cookie_secret_path` |
 | `session_ttl_secs` | integer | `86400` | Browser session lifetime (24h default) |
 | `allow_insecure_cookies` | bool | `false` | Drop `Secure` flag on session cookies. Set true **only** when the proxy sits behind a TLS-terminating reverse proxy |
+| `shared_domain` | string | (none) | Parent domain for the shared `fleet_session` SSO cookie, e.g. `".fleet.lab.ktle.net"`. Mirrors coastwatch's `session.shared_domain` — set the same value in both apps. Unset/empty → origin-scoped cookie (standalone mode) |
 
 If neither `cookie_secret_path` nor `cookie_secret_env` is set, the proxy generates an ephemeral key on each startup — sessions won't survive restart. The Debian `trawld` package generates a persistent key at `/var/lib/trawl/web.cookie` automatically via its `postinst` script.
+
+Setting `shared_domain` enables fleet-wide single sign-on: the session cookie is scoped to the parent domain and every fleet app under it accepts it, provided all apps share the same session key (see the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for key provisioning). Login and logout validate the `Origin` request header against the request `Host` and `shared_domain`; a mismatched Origin is rejected with 403. **The origin check trusts the request `Host` header** — a reverse proxy in front of `trawl-web` must forward the original `Host`, or legitimate same-origin logins will be rejected.
 
 API clients using bearer tokens (the CLI, `trawl-client`, vector) talk to trawld directly on port 5514 — the proxy only handles cookie-authed browser traffic and blocks `/api/v1/ingest` outright.
 

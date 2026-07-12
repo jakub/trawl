@@ -856,6 +856,17 @@ pub struct WebConfig {
     /// URL for the coastwatch intel daemon. Optional — intel features are
     /// disabled when absent. Example: `"https://coastwatch.internal:7700"`.
     pub coastwatch_url: Option<String>,
+
+    /// Parent domain for the shared `fleet_session` SSO cookie — the SSO
+    /// knob, named to mirror coastwatch's `session.shared_domain` so operator
+    /// docs can say "set the same value in both apps" (ADR-0004 slice 2).
+    ///
+    /// When set (e.g. `".fleet.lab.ktle.net"`), the session cookie carries a
+    /// `Domain=` attribute scoping it to the parent domain, so one login is
+    /// shared across every fleet app under it (requires the same session key
+    /// in all apps). Unset or empty → no `Domain=` attribute; the cookie is
+    /// origin-scoped (standalone mode).
+    pub shared_domain: Option<String>,
 }
 
 fn default_audit_interval_secs() -> u64 {
@@ -1916,5 +1927,40 @@ allow_insecure_cookies = true
         );
         assert_eq!(config.web.session_ttl_secs, Some(3600));
         assert!(config.web.allow_insecure_cookies);
+        // no shared_domain in this config → standalone mode
+        assert!(config.web.shared_domain.is_none());
+    }
+
+    #[test]
+    fn web_shared_domain_parses_from_toml() {
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/store.db"
+[web]
+shared_domain = ".fleet.lab.ktle.net"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.web.shared_domain.as_deref(),
+            Some(".fleet.lab.ktle.net")
+        );
+    }
+
+    #[test]
+    fn web_shared_domain_absent_is_none() {
+        // Absent → standalone mode (origin-scoped cookie, no Domain attr).
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+db_path = "/tmp/store.db"
+[web]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.web.shared_domain.is_none());
     }
 }
