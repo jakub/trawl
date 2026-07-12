@@ -87,14 +87,24 @@ pub async fn forward(
         upstream_ct.unwrap_or_else(|| "application/json".to_string())
     };
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
         // Disable proxy buffering (e.g. nginx) upstream of us. Trawld sets
         // this too but we re-set it to be resilient to misconfigured
         // intermediate proxies when trawl-web is fronted by another one.
-        .header("X-Accel-Buffering", "no")
+        .header("X-Accel-Buffering", "no");
+
+    // Upstream auth mapping (ADR-0004 slice 2), mirroring `proxy::do_forward`:
+    // session-authed 401 → clear the dead cookie (EventSource auto-reconnects,
+    // so without this the browser would re-send it forever); 403 → cookie
+    // preserved (grant may exist in sibling apps).
+    if status == StatusCode::UNAUTHORIZED && matches!(auth, Auth::Session(_)) {
+        builder = builder.header(header::SET_COOKIE, state.build_clear_cookie());
+    }
+
+    builder
         .body(Body::from_stream(capped_stream))
         .map_err(|e| ProxyError::Internal(format!("SSE response build: {e}")))
 }
@@ -248,6 +258,72 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_401_with_session_clears_cookie() {
+        // Fleet-wide dead key must clear the cookie on the SSE path too —
+        // EventSource auto-reconnects, so without the clear the browser
+        // would hammer the endpoint with a dead cookie forever.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=*")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("stream upstream 401 must clear the session cookie")
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.starts_with("fleet_session=;"),
+            "got: {set_cookie}"
+        );
+        assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_403_preserves_cookie() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=*")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "stream upstream 403 must NOT clear the shared cookie"
+        );
     }
 
     #[tokio::test]

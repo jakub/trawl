@@ -53,7 +53,7 @@ pub async fn forward(
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
-    do_forward(state.upstream_url(), "", state.http(), auth, req).await
+    do_forward(&state, state.upstream_url(), "", auth, req).await
 }
 
 pub async fn forward_intel(
@@ -64,16 +64,17 @@ pub async fn forward_intel(
     let base = state.coastwatch_url().ok_or_else(|| {
         ProxyError::ServiceUnavailable("coastwatch upstream not configured".into())
     })?;
-    do_forward(base, "/api/intel", state.http(), auth, req).await
+    do_forward(&state, base, "/api/intel", auth, req).await
 }
 
 async fn do_forward(
+    state: &AppState,
     base: &str,
     strip_prefix: &str,
-    http: &reqwest::Client,
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
+    let http = state.http();
     let (parts, body) = req.into_parts();
 
     let upstream_uri = build_upstream_uri(base, &parts.uri, strip_prefix)?;
@@ -111,6 +112,22 @@ async fn do_forward(
     let mut out = Response::builder().status(status);
     let out_headers = out.headers_mut().expect("fresh response has headers map");
     copy_response_headers(&upstream_headers, out_headers);
+
+    // Upstream auth mapping (ADR-0004 slice 2): a 401 for a session-authed
+    // request means the key is dead fleet-wide (revoked/expired) — tell
+    // the browser to drop the cookie so it stops re-sending it on every
+    // request. Bearer clients hold no cookie, so no clear for them. A 403
+    // (valid key, no trawl grant) deliberately passes through WITHOUT
+    // touching the cookie: the shared fleet_session may still carry
+    // grants for sibling apps, and clearing it would log the user out of
+    // those too. (`copy_response_headers` strips upstream Set-Cookie, so
+    // this insert can't collide.)
+    if status == StatusCode::UNAUTHORIZED
+        && matches!(auth, Auth::Session(_))
+        && let Ok(v) = state.build_clear_cookie().parse()
+    {
+        out_headers.insert(header::SET_COOKIE, v);
+    }
 
     out.body(Body::from_stream(body_stream))
         .map_err(|e| ProxyError::Internal(format!("response build: {e}")))
@@ -380,6 +397,146 @@ mod tests {
         let orig: Uri = "/api/intel/v1/stories/sto_abc123".parse().unwrap();
         let built = build_upstream_uri("https://coastwatch:7700", &orig, "/api/intel").unwrap();
         assert_eq!(built, "https://coastwatch:7700/v1/stories/sto_abc123");
+    }
+
+    // -- upstream auth mapping (AC #5) -------------------------------------
+
+    #[tokio::test]
+    async fn forward_upstream_401_with_session_clears_cookie() {
+        // Key revoked fleet-wide: EVERY proxied route must tell the browser
+        // to drop the dead cookie, not just /me — otherwise the SPA keeps
+        // re-sending it forever.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schema"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("session-authed upstream 401 must clear the cookie")
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.starts_with("fleet_session=;"),
+            "got: {set_cookie}"
+        );
+        assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
+        assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
+        assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
+        assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
+    }
+
+    #[tokio::test]
+    async fn forward_upstream_403_preserves_cookie() {
+        // Valid key, no trawl grant: the shared fleet_session cookie may
+        // still hold grants for sibling apps — clearing it would log the
+        // user out of coastwatch. 403 passes through with NO Set-Cookie.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schema"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "upstream 403 must NOT clear the shared cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_upstream_401_with_bearer_does_not_clear() {
+        // Bearer clients hold no cookie — a clear directive would be
+        // meaningless noise (and confusing for API clients).
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schema"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("authorization", "Bearer flt_dead")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "bearer-authed 401 must not emit a cookie clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_intel_upstream_401_with_session_clears_cookie() {
+        // The coastwatch intel path is a proxied route like any other —
+        // same fleet-wide 401 mapping applies.
+        let trawld = MockServer::start().await;
+        let coastwatch = MockServer::start().await;
+        let state = state_with_intel(&trawld, &coastwatch);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &trawld).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/stories"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&coastwatch)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/intel/v1/stories")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("intel 401 must clear the cookie too")
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.starts_with("fleet_session=;"),
+            "got: {set_cookie}"
+        );
     }
 
     #[tokio::test]
