@@ -717,3 +717,38 @@ mod pg_tests {
         assert_eq!(run.row_count, Some(7));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::remove_result_file;
+
+    /// An existing file is unlinked and the removal reports `true`.
+    #[test]
+    fn remove_result_file_removes_existing_and_returns_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Trailing slash on base_dir exercises the trim_end_matches join.
+        let base = format!("{}/", tmp.path().to_str().unwrap());
+        let rel = "scheduled/foo/run_1.parquet";
+        let full = format!("{base}{rel}");
+        std::fs::create_dir_all(std::path::Path::new(&full).parent().unwrap()).unwrap();
+        std::fs::write(&full, b"parquet").unwrap();
+
+        assert!(
+            remove_result_file(&base, rel),
+            "existing file must report true"
+        );
+        assert!(!std::path::Path::new(&full).exists(), "file must be gone");
+    }
+
+    /// A missing file is a no-op that reports `false` (gates orphan logging).
+    #[test]
+    fn remove_result_file_returns_false_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+
+        assert!(
+            !remove_result_file(base, "scheduled/foo/does_not_exist.parquet"),
+            "missing file must report false"
+        );
+    }
+}
