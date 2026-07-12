@@ -50,7 +50,7 @@ export TRAWL_COOKIE_SECRET
 # (`CNPG fleet_dev`, `CNPG trawl_dev`, same convention as coastwatch's
 # config registry). op-generated passwords carry URL-hostile symbols, so
 # both userinfo parts are percent-encoded via jq before entering the DSN.
-cnpg_host="10.0.100.89:5432"
+cnpg_host="postgres.lab.ktle.net:5432"
 
 dsn_from_op() {
     local item="$1" db="$2" user pass
