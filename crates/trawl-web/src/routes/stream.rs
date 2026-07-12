@@ -369,7 +369,7 @@ mod tests {
         // End-to-end smoke: session with exp ~1s in the future, upstream
         // returns a body that would otherwise stream indefinitely. The
         // response body must EOF before ~2s elapse.
-        use crate::session::{SessionPayload, encrypt};
+        use fleet_auth::{SessionExpiry, SessionPayload, encrypt};
         use zeroize::Zeroizing;
 
         let upstream = MockServer::start().await;
@@ -394,11 +394,10 @@ mod tests {
         let payload = SessionPayload {
             token: Zeroizing::new("flt_test".to_string()),
             name: "test".into(),
-            role: "admin".into(),
-            exp: now + 1,
+            exp: SessionExpiry::from_unix_seconds(now + 1),
         };
         let cookie_value = encrypt(state.cookie_key(), &payload).unwrap();
-        let cookie = format!("trawl_session={cookie_value}");
+        let cookie = format!("fleet_session={cookie_value}");
 
         let req = Request::builder()
             .method("GET")

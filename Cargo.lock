@@ -6392,14 +6392,11 @@ name = "trawl-web"
 version = "0.3.3"
 dependencies = [
  "axum",
- "base64ct",
- "chacha20poly1305",
  "chrono",
  "clap",
- "cookie",
+ "fleet-auth",
  "futures",
  "mime_guess",
- "rand 0.8.6",
  "reqwest 0.13.2",
  "rust-embed",
  "rustls",

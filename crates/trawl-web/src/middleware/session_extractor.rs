@@ -9,9 +9,9 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, header};
+use fleet_auth::{SessionPayload, session};
 
 use crate::error::ProxyError;
-use crate::session::{self, SESSION_COOKIE, SessionPayload};
 use crate::state::AppState;
 
 /// A decrypted, non-expired session, injected into handlers.
@@ -35,7 +35,7 @@ impl Session {
     /// stream alive indefinitely.
     #[must_use]
     pub fn exp(&self) -> i64 {
-        self.0.exp
+        self.0.exp.as_unix_seconds()
     }
 }
 
@@ -53,7 +53,7 @@ impl FromRequestParts<AppState> for Session {
             .ok_or(ProxyError::Unauthorized)?;
 
         let cookie_value =
-            find_cookie(cookie_header, SESSION_COOKIE).ok_or(ProxyError::Unauthorized)?;
+            find_cookie(cookie_header, state.cookie_name()).ok_or(ProxyError::Unauthorized)?;
 
         let payload = session::decrypt(state.cookie_key(), cookie_value)
             .map_err(|_| ProxyError::Unauthorized)?;
@@ -65,7 +65,7 @@ impl FromRequestParts<AppState> for Session {
             // it to drop the cookie so subsequent requests don't keep
             // sending a token we'll always reject.
             return Err(ProxyError::ExpiredSession {
-                secure_cookie: !state.allow_insecure_cookies(),
+                clear_cookie: state.build_clear_cookie(),
             });
         }
 
@@ -144,23 +144,33 @@ mod tests {
     #[test]
     fn find_cookie_picks_named_pair() {
         assert_eq!(
-            find_cookie("foo=bar; trawl_session=abc; baz=qux", "trawl_session"),
+            find_cookie("foo=bar; fleet_session=abc; baz=qux", "fleet_session"),
             Some("abc")
         );
         assert_eq!(
-            find_cookie("trawl_session=xyz", "trawl_session"),
+            find_cookie("fleet_session=xyz", "fleet_session"),
             Some("xyz")
         );
-        assert_eq!(find_cookie("x=1;y=2", "trawl_session"), None);
-        assert_eq!(find_cookie("", "trawl_session"), None);
+        assert_eq!(find_cookie("x=1;y=2", "fleet_session"), None);
+        assert_eq!(find_cookie("", "fleet_session"), None);
     }
 
     #[test]
     fn find_cookie_handles_whitespace() {
         assert_eq!(
-            find_cookie("  foo=bar ; trawl_session=value  ;  x=y", "trawl_session"),
+            find_cookie("  foo=bar ; fleet_session=value  ;  x=y", "fleet_session"),
             Some("value"),
             "leading/trailing whitespace around pairs should be tolerated"
+        );
+    }
+
+    #[test]
+    fn find_cookie_ignores_legacy_trawl_session() {
+        // Browsers may keep sending the dead trawl_session cookie until it
+        // expires at TTL — it must never be picked up as a fleet_session.
+        assert_eq!(
+            find_cookie("trawl_session=old; fleet_session=new", "fleet_session"),
+            Some("new")
         );
     }
 
