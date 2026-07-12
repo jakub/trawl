@@ -35,6 +35,8 @@ pub struct Config {
     pub syslog: SyslogConfig,
     #[serde(default)]
     pub web: WebConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 /// HTTPS listener settings.
@@ -793,15 +795,20 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Resolve the fleet keystore URL: `DATABASE_URL` env var first (matches
-    /// fleet-admin's handling), then `[auth] database_url` from the config
-    /// file. Empty values count as unset.
+    /// Resolve the fleet keystore URL: `FLEET_DATABASE_URL` env var first
+    /// (what coastwatch prod already reads), then `[auth] database_url` from
+    /// the config file. Empty values count as unset.
+    ///
+    /// The bare `DATABASE_URL` override was removed in ADR-0004 slice 3:
+    /// that variable is ceded to the sqlx test harness (`#[sqlx::test]`
+    /// hardwires it), and a process-wide `DATABASE_URL` must never silently
+    /// repoint trawld's keystore.
     ///
     /// # Errors
     /// Returns [`ConfigError::Validation`] when neither source is set.
     pub fn resolve_database_url(&self) -> Result<String, ConfigError> {
         Self::resolve_database_url_from(
-            std::env::var("DATABASE_URL").ok().as_deref(),
+            std::env::var("FLEET_DATABASE_URL").ok().as_deref(),
             self.database_url.as_deref(),
         )
     }
@@ -816,7 +823,55 @@ impl AuthConfig {
         pick(env_value).or_else(|| pick(configured)).ok_or_else(|| {
             ConfigError::Validation(
                 "fleet keystore URL required: set [auth] database_url in trawld.toml \
-                 or the DATABASE_URL environment variable"
+                 or the FLEET_DATABASE_URL environment variable"
+                    .into(),
+            )
+        })
+    }
+}
+
+/// Storage settings for trawl's own app-state database (query history,
+/// saved queries, schedules, report runs — ADR-0004 slice 3).
+///
+/// This is a dedicated `trawl` postgres database owned by trawl-server
+/// (boot-time migrated, advisory-locked sole writer). Deliberately separate
+/// from `[auth]`: the stores are app state, not auth, and there is NO
+/// fallback from one URL to the other.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StorageConfig {
+    /// Postgres URL of the dedicated `trawl` app-state database (e.g.
+    /// `postgres://trawl:pass@host:5432/trawl`). The `TRAWL_DATABASE_URL`
+    /// environment variable takes precedence. trawld refuses to start when
+    /// neither is set.
+    #[serde(default)]
+    pub database_url: Option<String>,
+}
+
+impl StorageConfig {
+    /// Resolve the app-state database URL: `TRAWL_DATABASE_URL` env var
+    /// first, then `[storage] database_url` from the config file. Empty
+    /// values count as unset. No fallback to the `[auth]` URL.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Validation`] when neither source is set.
+    pub fn resolve_database_url(&self) -> Result<String, ConfigError> {
+        Self::resolve_database_url_from(
+            std::env::var("TRAWL_DATABASE_URL").ok().as_deref(),
+            self.database_url.as_deref(),
+        )
+    }
+
+    /// Pure resolution core, split out for testability (mutating process
+    /// env in tests is forbidden under `unsafe_code = "forbid"`).
+    fn resolve_database_url_from(
+        env_value: Option<&str>,
+        configured: Option<&str>,
+    ) -> Result<String, ConfigError> {
+        let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
+        pick(env_value).or_else(|| pick(configured)).ok_or_else(|| {
+            ConfigError::Validation(
+                "trawl app-state database URL required: set [storage] database_url in \
+                 trawld.toml or the TRAWL_DATABASE_URL environment variable"
                     .into(),
             )
         })
@@ -1898,6 +1953,126 @@ auth_cache_ttl_secs = 300
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.auth.db_path, PathBuf::from("/tmp/store.db"));
+    }
+
+    // -- [storage] database_url (ADR-0004 slice 3) ----------------------------
+
+    #[test]
+    fn storage_database_url_parses_from_toml() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/store.db"
+[storage]
+database_url = "postgres://trawl:trawl@localhost:5433/trawl"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.storage.database_url.as_deref(),
+            Some("postgres://trawl:trawl@localhost:5433/trawl")
+        );
+    }
+
+    #[test]
+    fn storage_section_optional_in_toml() {
+        // Old configs without [storage] must still parse; resolution is what
+        // fails loudly (at boot), not deserialization.
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/store.db"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.storage.database_url.is_none());
+    }
+
+    #[test]
+    fn storage_resolve_env_wins() {
+        let url = StorageConfig::resolve_database_url_from(
+            Some("postgres://env/trawl"),
+            Some("postgres://toml/trawl"),
+        )
+        .unwrap();
+        assert_eq!(url, "postgres://env/trawl");
+    }
+
+    #[test]
+    fn storage_resolve_falls_back_to_toml() {
+        let url =
+            StorageConfig::resolve_database_url_from(None, Some("postgres://toml/trawl")).unwrap();
+        assert_eq!(url, "postgres://toml/trawl");
+
+        // Empty env values are unset — a secret that fails to inject must not
+        // shadow the configured value.
+        let url = StorageConfig::resolve_database_url_from(Some(""), Some("postgres://toml/trawl"))
+            .unwrap();
+        assert_eq!(url, "postgres://toml/trawl");
+    }
+
+    #[test]
+    fn storage_resolve_neither_is_a_descriptive_error() {
+        let err = StorageConfig::resolve_database_url_from(None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[storage]"), "got: {msg}");
+        assert!(msg.contains("TRAWL_DATABASE_URL"), "got: {msg}");
+    }
+
+    #[test]
+    fn storage_resolve_never_falls_back_to_auth_url() {
+        // The stores are app state, not auth: a configured [auth] database_url
+        // must not leak into storage resolution. The resolver's signature
+        // admits no auth input; this pins the end-to-end behaviour on a config
+        // carrying ONLY the auth URL.
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+db_path = "/tmp/store.db"
+database_url = "postgres://fleet:fleet@localhost:5433/fleet"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.storage.database_url.is_none());
+        // With TRAWL_DATABASE_URL unset in the environment this must error,
+        // never borrow the auth URL. (CI never sets TRAWL_DATABASE_URL.)
+        if std::env::var("TRAWL_DATABASE_URL").is_err() {
+            let err = config.storage.resolve_database_url().unwrap_err();
+            assert!(err.to_string().contains("[storage]"), "got: {err}");
+        }
+    }
+
+    // -- [auth] env contract: FLEET_DATABASE_URL, not DATABASE_URL -----------
+
+    #[test]
+    fn auth_resolve_ignores_bare_database_url() {
+        // DATABASE_URL is ceded to the sqlx test harness (#[sqlx::test]
+        // hardwires it). trawld's [auth] resolution reads FLEET_DATABASE_URL
+        // only. Canary: with a toml value configured and FLEET_DATABASE_URL
+        // unset, resolution returns the toml value even when the process has
+        // DATABASE_URL set (CI sets it for the whole test job — this test
+        // fails there if the bare override ever creeps back in).
+        let auth = AuthConfig {
+            db_path: PathBuf::from("/tmp/store.db"),
+            database_url: Some("postgres://toml/fleet".into()),
+            audit_interval_secs: 30,
+        };
+        if std::env::var("FLEET_DATABASE_URL").is_err() {
+            assert_eq!(
+                auth.resolve_database_url().unwrap(),
+                "postgres://toml/fleet"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_resolve_error_names_fleet_database_url() {
+        let err = AuthConfig::resolve_database_url_from(None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("FLEET_DATABASE_URL"), "got: {msg}");
     }
 
     #[test]

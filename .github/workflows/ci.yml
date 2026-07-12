@@ -101,7 +101,13 @@ jobs:
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash,fleet-auth/test-support
         env:
           DUCKDB_DOWNLOAD_LIB: "1"
-          FLEET_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          # DATABASE_URL, not FLEET_DATABASE_URL: trawld's [auth] resolution
+          # now treats FLEET_DATABASE_URL as its highest-precedence keystore
+          # override (ADR-0004 slice 3), so setting it process-wide would
+          # silently repoint every fixture's per-test keystore DSN at the
+          # shared service container. The PgFixture falls back to
+          # DATABASE_URL, and the #[sqlx::test] harness hardwires it.
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
           # Hard-fail if the env var didn't inject — otherwise the per-test
           # PgFixture would skip every pg integration test and the job would
           # report a misleading green.

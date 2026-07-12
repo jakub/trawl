@@ -27,7 +27,7 @@ pub fn trawl_only(role: Role) -> Vec<RoleAssignment> {
 }
 use trawl_server::config::{
     AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig,
-    SchedulerConfig, ServerConfig, SyslogConfig, WebConfig,
+    SchedulerConfig, ServerConfig, StorageConfig, SyslogConfig, WebConfig,
 };
 use trawl_server::state::AppState;
 use trawl_server::transport::http;
@@ -329,6 +329,7 @@ pub async fn setup_in_dir(
         scheduler: SchedulerConfig::default(),
         syslog: SyslogConfig::default(),
         web: WebConfig::default(),
+        storage: StorageConfig::default(),
     };
 
     let (state, http_config) = AppState::from_config(&config, test_metrics_handle())
