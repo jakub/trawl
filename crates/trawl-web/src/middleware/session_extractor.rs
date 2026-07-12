@@ -16,9 +16,11 @@ use crate::state::AppState;
 
 /// A decrypted, non-expired session, injected into handlers.
 ///
-/// The inner `SessionPayload` carries the bearer token (already unwrapped
-/// from `Zeroizing` at handler time — still scrubbed on drop) plus the
-/// identity fields needed for `/me` responses and authorization checks.
+/// The inner `SessionPayload` carries just two things handlers consume: the
+/// bearer token (already unwrapped from `Zeroizing` at handler time — still
+/// scrubbed on drop) for authenticating upstream calls, and `exp` for capping
+/// SSE stream duration. Identity for `/me` is fetched live from upstream
+/// `/whoami`, not read from cookie contents.
 #[derive(Debug)]
 pub struct Session(pub SessionPayload);
 
