@@ -83,7 +83,7 @@ pub fn spawn_snapshot_collector(
                     Ok(count) => {
                         monitor.set_schedule_count(usize::try_from(count).unwrap_or_default());
                     }
-                    Err(e) => tracing::debug!(
+                    Err(e) => tracing::warn!(
                         event_type = "monitor_schedule_count_error",
                         error = %e,
                         "failed to refresh enabled-schedule count"
