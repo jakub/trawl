@@ -18,7 +18,8 @@ mod common;
 
 use sqlx::PgPool;
 use trawl_server::store::{
-    HistoryStore, RunClaim, RunStatus, SavedQueryStore, ScheduleStore, StorageState, StoreError,
+    FinishOutcome, FlipOutcome, HistoryStore, RunClaim, RunStatus, SavedQueryStore, ScheduleStore,
+    StorageState, StoreError,
 };
 
 fn history(pool: &PgPool) -> HistoryStore {
@@ -357,11 +358,12 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
             .await
             .unwrap()
             .unwrap();
-        assert!(
+        assert_eq!(
             schedule_store
                 .finish_run(rid, RunStatus::Success, 100 + i, Some(5), None, None, None)
                 .await
-                .unwrap()
+                .unwrap(),
+            FinishOutcome::Persisted
         );
     }
 
@@ -540,7 +542,7 @@ async fn cascade_on_saved_query_delete(pool: PgPool) {
         .await
         .unwrap()
         .unwrap();
-    assert!(
+    assert_eq!(
         store
             .finish_run(
                 run_id,
@@ -552,7 +554,8 @@ async fn cascade_on_saved_query_delete(pool: PgPool) {
                 Some("scheduled/test/run_1.parquet"),
             )
             .await
-            .unwrap()
+            .unwrap(),
+        FinishOutcome::Persisted
     );
 
     let paths = saved_store.delete(sq.id, 1).await.unwrap();
@@ -615,7 +618,7 @@ async fn start_and_finish_run(pool: PgPool) {
     let run = store.get_run(run_id, 1).await.unwrap().unwrap();
     assert_eq!(run.status, RunStatus::Running);
 
-    assert!(
+    assert_eq!(
         store
             .finish_run(
                 run_id,
@@ -627,7 +630,8 @@ async fn start_and_finish_run(pool: PgPool) {
                 None,
             )
             .await
-            .unwrap()
+            .unwrap(),
+        FinishOutcome::Persisted
     );
 
     let finished = store.get_run(run_id, 1).await.unwrap().unwrap();
@@ -1092,8 +1096,9 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert!(
-        !updated,
+    assert_eq!(
+        updated,
+        FinishOutcome::RunDeleted,
         "zero-row finish must be reported so the orphan file gets removed"
     );
 }
@@ -1116,11 +1121,12 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
         .unwrap()
         .unwrap();
 
-    assert!(
+    assert_eq!(
         store
             .fail_run_if_running(rid, 5, "result persistence failed")
             .await
             .unwrap(),
+        FlipOutcome::FlippedToError,
         "a running row must be flipped to error"
     );
     let run = store.get_run(rid, 1).await.unwrap().unwrap();
@@ -1136,7 +1142,7 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
         .await
         .unwrap()
         .unwrap();
-    assert!(
+    assert_eq!(
         store
             .finish_run(
                 rid2,
@@ -1148,14 +1154,16 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
                 Some("scheduled/committed/run.parquet"),
             )
             .await
-            .unwrap()
+            .unwrap(),
+        FinishOutcome::Persisted
     );
 
-    assert!(
-        !store
+    assert_eq!(
+        store
             .fail_run_if_running(rid2, 5, "result persistence failed")
             .await
             .unwrap(),
+        FlipOutcome::NotRunning,
         "a committed success must NOT be flipped (guard matches zero rows)"
     );
     let survived = store.get_run(rid2, 1).await.unwrap().unwrap();
@@ -1224,13 +1232,14 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     blocker.rollback().await.unwrap();
     let delete_paths = delete_task.await.unwrap().unwrap();
 
-    assert!(
+    assert_eq!(
         finished,
+        FinishOutcome::Persisted,
         "finish_run committed its path before the cascade — it must report success"
     );
     assert_eq!(
         delete_paths.contains(&PATH.to_string()),
-        finished,
+        finished == FinishOutcome::Persisted,
         "exactly one side must own the parquet cleanup: delete returned {delete_paths:?}"
     );
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
@@ -1278,13 +1287,14 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
     blocker.rollback().await.unwrap();
     let delete_paths = delete_task.await.unwrap().unwrap();
 
-    assert!(
+    assert_eq!(
         finished,
+        FinishOutcome::Persisted,
         "finish_run committed its path before the cascade — it must report success"
     );
     assert_eq!(
         delete_paths.contains(&PATH.to_string()),
-        finished,
+        finished == FinishOutcome::Persisted,
         "exactly one side must own the parquet cleanup: delete_schedule returned {delete_paths:?}"
     );
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);

@@ -75,6 +75,35 @@ pub enum RunClaim {
     MaxRunsReached,
 }
 
+/// Outcome of [`ScheduleStore::finish_run`], naming the file-cleanup obligation
+/// the caller inherits (so match arms are self-documenting rather than
+/// depending on prose to decode a bare `bool`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishOutcome {
+    /// The run row was updated; any result file it points at must be kept.
+    Persisted,
+    /// Zero rows updated — the run was cascade-deleted mid-flight (its saved
+    /// query or schedule is gone); the caller must remove any result file it
+    /// just wrote.
+    RunDeleted,
+}
+
+/// Outcome of [`ScheduleStore::fail_run_if_running`]'s guarded flip. Note the
+/// file-cleanup obligation is *inverted* relative to [`FinishOutcome`]: here the
+/// successful flip (`FlippedToError`) is the one that orphans a file, because it
+/// means the earlier success never committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlipOutcome {
+    /// A still-`running` row was flipped to `error`: the earlier success never
+    /// committed, so any parquet the caller wrote is orphaned and should be
+    /// removed.
+    FlippedToError,
+    /// No `running` row matched — either the ambiguous success actually
+    /// committed (its result must be preserved) or the run was cascade-deleted.
+    /// Either way, leave the file alone.
+    NotRunning,
+}
+
 /// Parse a duration string (same syntax as the DSL `last:` filter) into seconds.
 ///
 /// Supported units: `s`, `m`, `h`, `d`, `w`. Minimum interval is 60 seconds.
@@ -596,9 +625,10 @@ impl ScheduleStore {
 
     /// Finish a run with status, timing, and optional result path or blob.
     ///
-    /// Returns `Ok(false)` when zero rows were updated — the run was
-    /// cascade-deleted mid-flight (its saved query or schedule is gone), and
-    /// the caller must remove any result file it just wrote.
+    /// Returns [`FinishOutcome::RunDeleted`] when zero rows were updated — the
+    /// run was cascade-deleted mid-flight (its saved query or schedule is gone),
+    /// and the caller must remove any result file it just wrote — otherwise
+    /// [`FinishOutcome::Persisted`].
     #[allow(clippy::too_many_arguments)]
     pub async fn finish_run(
         &self,
@@ -609,7 +639,7 @@ impl ScheduleStore {
         error_message: Option<&str>,
         result_data: Option<&[u8]>,
         result_path: Option<&str>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<FinishOutcome, StoreError> {
         let updated = sqlx::query(
             "UPDATE report_runs
              SET status = $1, finished_at = now(), duration_ms = $2, row_count = $3,
@@ -644,7 +674,11 @@ impl ScheduleStore {
             "Report run finished"
         );
 
-        Ok(updated > 0)
+        Ok(if updated > 0 {
+            FinishOutcome::Persisted
+        } else {
+            FinishOutcome::RunDeleted
+        })
     }
 
     /// Flip a run to `error`, but only while it is still `running`.
@@ -658,17 +692,17 @@ impl ScheduleStore {
     /// `status = 'running'` makes completion a state transition: the flip lands
     /// only if the success did NOT commit.
     ///
-    /// Returns `Ok(true)` when a running row was flipped (the earlier success
-    /// never committed, so any parquet the caller wrote is now orphaned and
-    /// should be removed), `Ok(false)` when no running row matched — either the
-    /// ambiguous success actually committed (its result must be preserved) or
-    /// the run was cascade-deleted.
+    /// Returns [`FlipOutcome::FlippedToError`] when a running row was flipped
+    /// (the earlier success never committed, so any parquet the caller wrote is
+    /// now orphaned and should be removed), [`FlipOutcome::NotRunning`] when no
+    /// running row matched — either the ambiguous success actually committed (its
+    /// result must be preserved) or the run was cascade-deleted.
     pub async fn fail_run_if_running(
         &self,
         run_id: i64,
         duration_ms: u64,
         error_message: &str,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<FlipOutcome, StoreError> {
         let updated = sqlx::query(
             "UPDATE report_runs
              SET status = 'error', finished_at = now(), duration_ms = $1,
@@ -690,7 +724,11 @@ impl ScheduleStore {
             "Guarded run failure applied"
         );
 
-        Ok(updated > 0)
+        Ok(if updated > 0 {
+            FlipOutcome::FlippedToError
+        } else {
+            FlipOutcome::NotRunning
+        })
     }
 
     /// List runs for a saved query, paginated. Excludes result blobs.

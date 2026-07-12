@@ -19,7 +19,7 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
-use crate::store::{RunStatus, ScheduleStore};
+use crate::store::{FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
 
 /// Spawn the scheduler background task.
 ///
@@ -351,9 +351,11 @@ pub(crate) async fn execute_scheduled_query(
 /// with whatever the store actually committed.
 ///
 /// Owns the unlink-vs-preserve decision for the success outcome:
-/// - `Ok(true)`  — the run row was updated; the file it points at stays.
-/// - `Ok(false)` — the row was cascade-deleted mid-flight (its saved query or
-///   schedule is gone); the file we just wrote is orphaned, so remove it.
+/// - [`FinishOutcome::Persisted`]  — the run row was updated; the file it points
+///   at stays.
+/// - [`FinishOutcome::RunDeleted`] — the row was cascade-deleted mid-flight (its
+///   saved query or schedule is gone); the file we just wrote is orphaned, so
+///   remove it.
 /// - `Err(_)`    — an ambiguous commit; recovery is delegated to
 ///   [`recover_ambiguous_finish`].
 #[allow(clippy::too_many_arguments)]
@@ -378,8 +380,8 @@ pub(crate) async fn finish_run_or_recover(
         )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(FinishOutcome::Persisted) => {}
+        Ok(FinishOutcome::RunDeleted) => {
             // The run row was cascade-deleted mid-flight: the file we just
             // wrote is orphaned — remove it.
             if let Some(relative) = result_path
@@ -430,11 +432,11 @@ pub(crate) async fn finish_run_or_recover(
 /// also fails and boot-time `cleanup_stale_runs` is the backstop.
 ///
 /// Owns the unlink-vs-preserve decision for the recovery outcome:
-/// - `Ok(true)`  — the success never committed (row was `running`); the parquet
-///   we wrote is now orphaned — remove it.
-/// - `Ok(false)` — no running row matched: either the ambiguous success
-///   committed (its `result_path` is live) or the run was cascade-deleted (a
-///   bounded on-disk leak). Either way, leave the file.
+/// - [`FlipOutcome::FlippedToError`] — the success never committed (row was
+///   `running`); the parquet we wrote is now orphaned — remove it.
+/// - [`FlipOutcome::NotRunning`]     — no running row matched: either the
+///   ambiguous success committed (its `result_path` is live) or the run was
+///   cascade-deleted (a bounded on-disk leak). Either way, leave the file.
 /// - `Err(_)`    — the flip itself failed (DB still down); the run stays wedged
 ///   until restart and the file is left in place.
 pub(crate) async fn recover_ambiguous_finish(
@@ -453,7 +455,7 @@ pub(crate) async fn recover_ambiguous_finish(
         )
         .await
     {
-        Ok(true) => {
+        Ok(FlipOutcome::FlippedToError) => {
             if let Some(relative) = result_path
                 && remove_result_file(base_dir, relative)
             {
@@ -465,7 +467,7 @@ pub(crate) async fn recover_ambiguous_finish(
                 );
             }
         }
-        Ok(false) => {}
+        Ok(FlipOutcome::NotRunning) => {}
         Err(e2) => {
             tracing::error!(
                 event_type = "scheduler_error",
@@ -582,7 +584,7 @@ fn zstd_fallback(result: &trawl_api::value::QueryResult) -> (Option<String>, Opt
 /// orchestration that pairs each store outcome with an unlink-or-preserve file
 /// action. The store primitives (`finish_run`, `fail_run_if_running`) are unit
 /// tested in `tests/store_pg.rs`; these tests pin the file-cleanup decision the
-/// bool return alone doesn't prove (swapping the arms would leak files or
+/// store outcome alone doesn't prove (swapping the arms would leak files or
 /// destroy committed results with the store tests still green). The Err/Err
 /// double-fault arm needs fault injection and stays uncovered.
 #[cfg(test)]
