@@ -353,11 +353,7 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
 
     // Two finished runs on alpha.
     for i in 0..2 {
-        let rid = schedule_store
-            .start_run(sched_a.id, a.id, "q1")
-            .await
-            .unwrap()
-            .unwrap();
+        let rid = seed_run(&schedule_store, sched_a.id, a.id, "q1").await;
         assert_eq!(
             schedule_store
                 .finish_run(rid, RunStatus::Success, 100 + i, Some(5), None, None, None)
@@ -395,6 +391,25 @@ async fn seed_saved(pool: &PgPool, key_id: i64, name: &str) -> i64 {
         .await
         .unwrap()
         .id
+}
+
+/// Claim a `running` report run and return its id, asserting the claim
+/// started (no `max_runs` cap). Seeds runs for the schedule/run lifecycle
+/// tests without the concurrency guards those tests set up explicitly.
+async fn seed_run(
+    store: &ScheduleStore,
+    schedule_id: i64,
+    saved_query_id: i64,
+    query: &str,
+) -> i64 {
+    match store
+        .claim_run(schedule_id, saved_query_id, query, None)
+        .await
+        .unwrap()
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    }
 }
 
 #[sqlx::test]
@@ -537,11 +552,7 @@ async fn cascade_on_saved_query_delete(pool: PgPool) {
     let sq = saved_store.create(1, "test", "level=error").await.unwrap();
     let schedule = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
 
-    let run_id = store
-        .start_run(schedule.id, sq.id, "level=error")
-        .await
-        .unwrap()
-        .unwrap();
+    let run_id = seed_run(&store, schedule.id, sq.id, "level=error").await;
     assert_eq!(
         store
             .finish_run(
@@ -577,11 +588,7 @@ async fn schedule_delete_collects_run_paths(pool: PgPool) {
     let sq_id = seed_saved(&pool, 1, "test").await;
     let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
-    let run_id = store
-        .start_run(schedule.id, sq_id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let run_id = seed_run(&store, schedule.id, sq_id, "q").await;
     store
         .finish_run(
             run_id,
@@ -609,11 +616,7 @@ async fn start_and_finish_run(pool: PgPool) {
     let sq_id = seed_saved(&pool, 1, "test").await;
     let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
-    let run_id = store
-        .start_run(schedule.id, sq_id, "level=error")
-        .await
-        .unwrap()
-        .expect("should start run");
+    let run_id = seed_run(&store, schedule.id, sq_id, "level=error").await;
 
     let run = store.get_run(run_id, 1).await.unwrap().unwrap();
     assert_eq!(run.status, RunStatus::Running);
@@ -649,28 +652,31 @@ async fn sequential_run_prevention(pool: PgPool) {
     let sq_id = seed_saved(&pool, 1, "test").await;
     let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
-    let first = store.start_run(schedule.id, sq_id, "q").await.unwrap();
-    assert!(first.is_some());
+    let first = store
+        .claim_run(schedule.id, sq_id, "q", None)
+        .await
+        .unwrap();
+    let RunClaim::Started(first_id) = first else {
+        panic!("first claim must start a run, got {first:?}");
+    };
 
-    // Second start returns None (already running) via the named 23505.
-    let second = store.start_run(schedule.id, sq_id, "q").await.unwrap();
-    assert!(second.is_none());
+    // Second claim is refused (already running) via the named 23505.
+    let second = store
+        .claim_run(schedule.id, sq_id, "q", None)
+        .await
+        .unwrap();
+    assert!(matches!(second, RunClaim::AlreadyRunning), "got {second:?}");
 
     // After finishing, a new run can start.
     store
-        .finish_run(
-            first.unwrap(),
-            RunStatus::Success,
-            100,
-            None,
-            None,
-            None,
-            None,
-        )
+        .finish_run(first_id, RunStatus::Success, 100, None, None, None, None)
         .await
         .unwrap();
-    let third = store.start_run(schedule.id, sq_id, "q").await.unwrap();
-    assert!(third.is_some());
+    let third = store
+        .claim_run(schedule.id, sq_id, "q", None)
+        .await
+        .unwrap();
+    assert!(matches!(third, RunClaim::Started(_)), "got {third:?}");
 }
 
 #[sqlx::test]
@@ -680,11 +686,7 @@ async fn list_runs_paginated_and_isolated(pool: PgPool) {
     let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
     for i in 0usize..5 {
-        let run_id = store
-            .start_run(schedule.id, sq_id, "q")
-            .await
-            .unwrap()
-            .unwrap();
+        let run_id = seed_run(&store, schedule.id, sq_id, "q").await;
         store
             .finish_run(
                 run_id,
@@ -718,7 +720,7 @@ async fn cleanup_stale_runs_marks_error(pool: PgPool) {
     let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
     // Start a run but don't finish it (simulates crash).
-    store.start_run(schedule.id, sq_id, "q").await.unwrap();
+    seed_run(&store, schedule.id, sq_id, "q").await;
 
     let cleaned = store.cleanup_stale_runs().await.unwrap();
     assert_eq!(cleaned, 1);
@@ -739,21 +741,13 @@ async fn latest_run_returns_newest(pool: PgPool) {
 
     assert!(store.latest_run(schedule.id).await.unwrap().is_none());
 
-    let run_id = store
-        .start_run(schedule.id, sq_id, "q1")
-        .await
-        .unwrap()
-        .unwrap();
+    let run_id = seed_run(&store, schedule.id, sq_id, "q1").await;
     store
         .finish_run(run_id, RunStatus::Success, 100, None, None, None, None)
         .await
         .unwrap();
 
-    let run_id = store
-        .start_run(schedule.id, sq_id, "q2")
-        .await
-        .unwrap()
-        .unwrap();
+    let run_id = seed_run(&store, schedule.id, sq_id, "q2").await;
     store
         .finish_run(run_id, RunStatus::Error, 50, None, Some("boom"), None, None)
         .await
@@ -794,32 +788,20 @@ async fn list_all_runs_paginated_and_isolated(pool: PgPool) {
     let sched3 = store.create_schedule(sq3, 2, 300, None).await.unwrap();
 
     for _ in 0..3 {
-        let rid = store
-            .start_run(sched1.id, sq1, "q1")
-            .await
-            .unwrap()
-            .unwrap();
+        let rid = seed_run(&store, sched1.id, sq1, "q1").await;
         store
             .finish_run(rid, RunStatus::Success, 50, None, None, None, None)
             .await
             .unwrap();
     }
     for _ in 0..2 {
-        let rid = store
-            .start_run(sched2.id, sq2, "q2")
-            .await
-            .unwrap()
-            .unwrap();
+        let rid = seed_run(&store, sched2.id, sq2, "q2").await;
         store
             .finish_run(rid, RunStatus::Success, 80, None, None, None, None)
             .await
             .unwrap();
     }
-    let rid = store
-        .start_run(sched3.id, sq3, "q3")
-        .await
-        .unwrap()
-        .unwrap();
+    let rid = seed_run(&store, sched3.id, sq3, "q3").await;
     store
         .finish_run(rid, RunStatus::Success, 10, None, None, None, None)
         .await
@@ -855,11 +837,7 @@ async fn runs_stats_counts_by_status(pool: PgPool) {
         (RunStatus::Error, 50, Some("boom")),
         (RunStatus::Timeout, 300, Some("timed out")),
     ] {
-        let rid = store
-            .start_run(sched.id, sq_id, "q")
-            .await
-            .unwrap()
-            .unwrap();
+        let rid = seed_run(&store, sched.id, sq_id, "q").await;
         store
             .finish_run(rid, status, ms, None, err, None, None)
             .await
@@ -890,11 +868,7 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
     // Four finished runs with paths; backdate the first two beyond the cutoff.
     let mut run_ids = Vec::new();
     for i in 0..4 {
-        let rid = store
-            .start_run(sched.id, sq_id, "q")
-            .await
-            .unwrap()
-            .unwrap();
+        let rid = seed_run(&store, sched.id, sq_id, "q").await;
         store
             .finish_run(
                 rid,
@@ -945,20 +919,12 @@ async fn successful_run_selectors(pool: PgPool) {
     let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
     // error run (no path), success with path, success without path.
-    let r1 = store
-        .start_run(sched.id, sq_id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let r1 = seed_run(&store, sched.id, sq_id, "q").await;
     store
         .finish_run(r1, RunStatus::Error, 10, None, Some("x"), None, None)
         .await
         .unwrap();
-    let r2 = store
-        .start_run(sched.id, sq_id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let r2 = seed_run(&store, sched.id, sq_id, "q").await;
     store
         .finish_run(
             r2,
@@ -971,11 +937,7 @@ async fn successful_run_selectors(pool: PgPool) {
         )
         .await
         .unwrap();
-    let r3 = store
-        .start_run(sched.id, sq_id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let r3 = seed_run(&store, sched.id, sq_id, "q").await;
     store
         .finish_run(
             r3,
@@ -1002,7 +964,7 @@ async fn successful_run_selectors(pool: PgPool) {
 // an accident of the process-wide mutex, pg must prove it.
 // ---------------------------------------------------------------------------
 
-/// Two connections racing `start_run` on one schedule: exactly one claims
+/// Two connections racing `claim_run` on one schedule: exactly one claims
 /// (the partial unique index `report_runs_one_running` decides).
 #[sqlx::test]
 async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
@@ -1013,14 +975,16 @@ async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
     let s1 = store.clone();
     let s2 = store.clone();
     let (a, b) = tokio::join!(
-        tokio::spawn(async move { s1.start_run(sched.id, sq_id, "q").await }),
-        tokio::spawn(async move { s2.start_run(sched.id, sq_id, "q").await }),
+        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", None).await }),
+        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", None).await }),
     );
     let a = a.unwrap().unwrap();
     let b = b.unwrap().unwrap();
 
+    let a_started = matches!(a, RunClaim::Started(_));
+    let b_started = matches!(b, RunClaim::Started(_));
     assert!(
-        a.is_some() ^ b.is_some(),
+        a_started ^ b_started,
         "exactly one racer must claim the run: got {a:?} / {b:?}"
     );
     assert_eq!(store.count_runs(sched.id).await.unwrap(), 1);
@@ -1035,11 +999,7 @@ async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     let sched = store.create_schedule(sq_id, 1, 300, Some(2)).await.unwrap();
 
     // One finished run: exactly one claim slot remains under max_runs = 2.
-    let rid = store
-        .start_run(sched.id, sq_id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let rid = seed_run(&store, sched.id, sq_id, "q").await;
     store
         .finish_run(rid, RunStatus::Success, 10, None, None, None, None)
         .await
@@ -1075,11 +1035,7 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
     let sq = saved_store.create(1, "midflight", "q").await.unwrap();
     let sched = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
 
-    let rid = store
-        .start_run(sched.id, sq.id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let rid = seed_run(&store, sched.id, sq.id, "q").await;
 
     // Cascade-delete the run mid-flight.
     saved_store.delete(sq.id, 1).await.unwrap();
@@ -1115,11 +1071,7 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     // A still-running run flips to error and the result path is cleared.
     let sq = saved_store.create(1, "running", "q").await.unwrap();
     let sched = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
-    let rid = store
-        .start_run(sched.id, sq.id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let rid = seed_run(&store, sched.id, sq.id, "q").await;
 
     assert_eq!(
         store
@@ -1137,11 +1089,7 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     // the ambiguous-commit case where the first finish_run's COMMIT landed.
     let sq2 = saved_store.create(1, "committed", "q").await.unwrap();
     let sched2 = store.create_schedule(sq2.id, 1, 300, None).await.unwrap();
-    let rid2 = store
-        .start_run(sched2.id, sq2.id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let rid2 = seed_run(&store, sched2.id, sq2.id, "q").await;
     assert_eq!(
         store
             .finish_run(
@@ -1200,11 +1148,7 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
         .create_schedule(sq.id, 1, 300, None)
         .await
         .unwrap();
-    let rid = sched_store
-        .start_run(sched.id, sq.id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let rid = seed_run(&sched_store, sched.id, sq.id, "q").await;
 
     // Hold the parent row so `delete` stalls at the spot the race needs: the
     // fixed code blocks on its parent `FOR UPDATE`; the pre-fix code blocks on
@@ -1258,11 +1202,7 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
         .create_schedule(sq_id, 1, 300, None)
         .await
         .unwrap();
-    let rid = sched_store
-        .start_run(sched.id, sq_id, "q")
-        .await
-        .unwrap()
-        .unwrap();
+    let rid = seed_run(&sched_store, sched.id, sq_id, "q").await;
 
     let mut blocker = pool.begin().await.unwrap();
     sqlx::query_scalar::<_, i64>(

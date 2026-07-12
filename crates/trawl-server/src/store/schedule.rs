@@ -8,8 +8,8 @@
 //! (whose stores were atomic by accident of a process-wide mutex):
 //!
 //! - the no-concurrent-run guard is the partial unique index
-//!   `report_runs_one_running`; [`ScheduleStore::start_run`] INSERTs directly
-//!   and maps the named 23505 to `Ok(None)`;
+//!   `report_runs_one_running`; [`ScheduleStore::claim_run`] maps the named
+//!   23505 to [`RunClaim::AlreadyRunning`];
 //! - the manual-trigger path's `max_runs` check joins the run claim in one
 //!   transaction ([`ScheduleStore::claim_run`], `FOR UPDATE` on the schedule
 //!   row);
@@ -507,48 +507,6 @@ impl ScheduleStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(u64::try_from(count).unwrap_or_default())
-    }
-
-    /// Start a new run. Returns `Ok(None)` if a run with status `running`
-    /// already exists for this schedule — the partial unique index
-    /// `report_runs_one_running` is the guard, mapped from its named 23505.
-    pub async fn start_run(
-        &self,
-        schedule_id: i64,
-        saved_query_id: i64,
-        query: &str,
-    ) -> Result<Option<i64>, StoreError> {
-        let result = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO report_runs (schedule_id, saved_query_id, query, status, started_at)
-             VALUES ($1, $2, $3, 'running', now())
-             RETURNING id",
-        )
-        .bind(schedule_id)
-        .bind(saved_query_id)
-        .bind(query)
-        .fetch_one(&self.pool)
-        .await;
-
-        match result {
-            Ok(id) => {
-                tracing::info!(
-                    event_type = "report_run_started",
-                    run_id = id,
-                    schedule_id,
-                    saved_query_id,
-                    "Report run started"
-                );
-                Ok(Some(id))
-            }
-            Err(e) => match classify_violation(&e) {
-                Some(PgViolation::RunAlreadyRunning) => Ok(None),
-                Some(PgViolation::ForeignKey) => Err(StoreError::NotFound {
-                    id: schedule_id,
-                    resource: "schedule",
-                }),
-                _ => Err(e.into()),
-            },
-        }
     }
 
     /// Claim a run transactionally: lock the schedule row, enforce

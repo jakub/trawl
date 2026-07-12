@@ -592,7 +592,7 @@ mod pg_tests {
     use sqlx::PgPool;
 
     use super::{finish_run_or_recover, recover_ambiguous_finish};
-    use crate::store::{RunStatus, SavedQueryStore, ScheduleStore, StoreError};
+    use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore, StoreError};
 
     /// Seed a saved query + schedule + started (`running`) run, returning the
     /// schedule store, the owning saved-query id, and the run id.
@@ -604,11 +604,14 @@ mod pg_tests {
             .create_schedule(saved.id, 1, 300, None)
             .await
             .unwrap();
-        let rid = sched_store
-            .start_run(sched.id, saved.id, "q")
+        let rid = match sched_store
+            .claim_run(sched.id, saved.id, "q", None)
             .await
             .unwrap()
-            .unwrap();
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
         (sched_store, saved.id, rid)
     }
 

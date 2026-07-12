@@ -207,7 +207,7 @@ mod pg_tests {
         ResolvedFromSaved, parquet_source, resolve, resolve_all, resolve_latest, resolve_specific,
     };
     use crate::error::ServerError;
-    use crate::store::{RunStatus, SavedQueryStore, ScheduleStore};
+    use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore};
 
     /// Create a saved query and its schedule, returning both ids.
     async fn seed(pool: &PgPool, key_id: i64, name: &str) -> (i64, ScheduleStore, SavedQueryStore) {
@@ -233,11 +233,14 @@ mod pg_tests {
         status: RunStatus,
         path: Option<&str>,
     ) -> i64 {
-        let rid = store
-            .start_run(schedule_id, saved_id, "q")
+        let rid = match store
+            .claim_run(schedule_id, saved_id, "q", None)
             .await
             .unwrap()
-            .unwrap();
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
         store
             .finish_run(rid, status, 10, Some(1), None, None, path)
             .await

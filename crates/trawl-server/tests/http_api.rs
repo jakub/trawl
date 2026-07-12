@@ -930,7 +930,7 @@ async fn trigger_run_rejects_reader(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn trigger_run_rejects_when_max_runs_reached(pool: sqlx::PgPool) {
-    use trawl_server::store::schedule::ScheduleStore;
+    use trawl_server::store::schedule::{RunClaim, ScheduleStore};
 
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -947,11 +947,14 @@ async fn trigger_run_rejects_when_max_runs_reached(pool: sqlx::PgPool) {
     // Seed a run directly so the schedule is already at its max_runs=1 cap;
     // count(*) >= max_runs short-circuits the claim before the insert.
     let store = ScheduleStore::new(sqlx::PgPool::connect(&server.app_db_url).await.unwrap());
-    store
-        .start_run(schedule.id, saved.id, "* | head 3")
+    let seeded = store
+        .claim_run(schedule.id, saved.id, "* | head 3", None)
         .await
-        .unwrap()
-        .expect("seeded run id");
+        .unwrap();
+    assert!(
+        matches!(seeded, RunClaim::Started(_)),
+        "seeding the cap must start a run, got {seeded:?}"
+    );
 
     // Triggering again exceeds the cap -> 400 "max runs reached".
     let err = client
@@ -973,7 +976,7 @@ async fn trigger_run_rejects_when_max_runs_reached(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn trigger_run_rejects_when_already_running(pool: sqlx::PgPool) {
-    use trawl_server::store::schedule::ScheduleStore;
+    use trawl_server::store::schedule::{RunClaim, ScheduleStore};
 
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -991,11 +994,14 @@ async fn trigger_run_rejects_when_already_running(pool: sqlx::PgPool) {
     // Seed an in-progress run directly, avoiding a race with the background
     // task the happy-path trigger spawns.
     let store = ScheduleStore::new(sqlx::PgPool::connect(&server.app_db_url).await.unwrap());
-    store
-        .start_run(schedule.id, saved.id, "* | head 3")
+    let seeded = store
+        .claim_run(schedule.id, saved.id, "* | head 3", None)
         .await
-        .unwrap()
-        .expect("seeded running run id");
+        .unwrap();
+    assert!(
+        matches!(seeded, RunClaim::Started(_)),
+        "seeding an in-progress run must start it, got {seeded:?}"
+    );
 
     // Triggering while a run is in progress -> 400 "already in progress".
     let err = client
