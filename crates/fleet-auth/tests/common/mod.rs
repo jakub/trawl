@@ -4,136 +4,17 @@
 
 //! Shared Postgres test fixture for fleet-auth integration tests.
 //!
-//! Each integration test file (`tests/store_pg.rs`, `tests/middleware_pg.rs`,
-//! `tests/handlers_pg.rs`) declares `mod common;` to pull in this module.
-//! Cargo's per-target compilation discovers it via the directory layout, so
-//! no `[[test]]` registration is needed.
-//!
-//! Requires a reachable Postgres at `$FLEET_DATABASE_URL` (or `$DATABASE_URL`
-//! as a fallback) with `CREATEDB` privilege. Each test gets a fresh
-//! ephemeral database — created with the schema migration applied, used,
-//! then dropped on `Drop`. Skipped (with a clear message) when no DB URL is
-//! set, unless `FLEET_TESTS_REQUIRED=1` flips skip into hard-fail (CI
-//! invariant — protects against silent green no-ops).
-//!
-//! We hand-roll the fixture instead of using `#[sqlx::test]` because
-//! `sqlx-macros` transitively triggers a cargo links-uniqueness conflict
-//! with the workspace's rusqlite (see `migrations.rs` for context).
+//! The fixture itself lives in the library as `fleet_auth::test_support`
+//! (behind the `test-support` feature) so sibling crates — e.g.
+//! trawl-server's pg-backed router tests — can reuse it. This module
+//! re-exports it and carries the `pg_test!` macro. Running fleet-auth's
+//! own integration tests therefore requires `--features test-support`
+//! (a missing feature is a loud compile error, never a silent skip).
 
 #![allow(dead_code)] // each test binary uses a subset of these items
+#![allow(unused_imports)] // ditto for the re-exports below
 
-use fleet_auth::MIGRATOR;
-use sqlx_core::executor::Executor as _;
-use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
-
-/// Reads the base database URL from the environment.
-///
-/// Empty values are treated as unset — important so a CI secret that fails
-/// to inject (lands as empty string) doesn't silently become "no DB", which
-/// in turn would make `FLEET_TESTS_REQUIRED=1` mis-fire.
-pub fn base_database_url() -> Option<String> {
-    for var in ["FLEET_DATABASE_URL", "DATABASE_URL"] {
-        if let Ok(v) = std::env::var(var)
-            && !v.is_empty()
-        {
-            return Some(v);
-        }
-    }
-    None
-}
-
-/// If set, missing/unreachable Postgres is a hard failure instead of a skip.
-pub fn require_database() -> bool {
-    std::env::var("FLEET_TESTS_REQUIRED").is_ok_and(|v| !v.is_empty())
-}
-
-/// RAII fixture: create + migrate a fresh per-test database, hand out a
-/// pool, drop the database on `Drop`.
-pub struct PgFixture {
-    admin_opts: PgConnectOptions,
-    test_db: String,
-    pool: Option<PgPool>,
-}
-
-impl PgFixture {
-    pub async fn setup() -> Option<Self> {
-        use sqlx_core::connection::Connection as _;
-
-        let admin_url = base_database_url()?;
-        let admin_opts: PgConnectOptions = admin_url
-            .parse()
-            .expect("FLEET_DATABASE_URL is not a valid Postgres URL");
-        let test_db = format!("fleet_auth_test_{}", random_db_suffix());
-
-        let mut admin: PgConnection = PgConnection::connect_with(&admin_opts)
-            .await
-            .expect("connect to admin DB (requires reachable Postgres + CREATEDB)");
-
-        admin
-            .execute(format!(r#"CREATE DATABASE "{test_db}""#).as_str())
-            .await
-            .expect("CREATE DATABASE — does the role have CREATEDB?");
-
-        let test_opts = admin_opts.clone().database(&test_db);
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect_with(test_opts)
-            .await
-            .expect("connect to per-test DB");
-
-        MIGRATOR.run(&pool).await.expect("apply migrations");
-
-        Some(Self {
-            admin_opts,
-            test_db,
-            pool: Some(pool),
-        })
-    }
-
-    pub fn pool(&self) -> PgPool {
-        self.pool.as_ref().expect("fixture live").clone()
-    }
-}
-
-impl Drop for PgFixture {
-    fn drop(&mut self) {
-        // Teardown on a dedicated OS thread so we never start a nested
-        // runtime inside the test's own tokio runtime. `DROP DATABASE ...
-        // WITH (FORCE)` terminates any lingering connections from the per-
-        // test pool (its own Drop closes them lazily).
-        self.pool.take(); // release our handle so WITH (FORCE) can reclaim
-        let admin_opts = self.admin_opts.clone();
-        let test_db = self.test_db.clone();
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("teardown runtime");
-            rt.block_on(async move {
-                use sqlx_core::connection::Connection as _;
-                if let Ok(mut admin) = PgConnection::connect_with(&admin_opts).await {
-                    let _ = admin
-                        .execute(
-                            format!(r#"DROP DATABASE IF EXISTS "{test_db}" WITH (FORCE)"#).as_str(),
-                        )
-                        .await;
-                }
-            });
-        });
-        let _ = handle.join();
-    }
-}
-
-fn random_db_suffix() -> String {
-    use rand::Rng as _;
-    let mut rng = rand::thread_rng();
-    (0..12)
-        .map(|_| {
-            let n: u8 = rng.gen_range(0..26);
-            (b'a' + n) as char
-        })
-        .collect()
-}
+pub use fleet_auth::test_support::{PgFixture, base_database_url, require_database};
 
 /// Skip-or-fail wrapper for an integration test that needs Postgres.
 ///

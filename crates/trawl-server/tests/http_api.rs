@@ -7,419 +7,20 @@
 //! Starts a real TLS server on a random port with a self-signed cert,
 //! creates API keys, and verifies the full request lifecycle.
 
-use std::net::TcpListener;
-use std::path::PathBuf;
+mod common;
 
-use trawl_auth::assignments::{PrincipalKind, RoleAssignment};
-use trawl_auth::roles::Role;
-use trawl_auth::store::KeyStore;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use common::{setup, setup_with_rate_limit, trawl_only};
+use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
-
-/// Helper: build a single-grant `trawl:<role>` assignment vector for tests.
-fn trawl_only(role: Role) -> Vec<RoleAssignment> {
-    vec![RoleAssignment {
-        app: "trawl".into(),
-        role: role.as_str().into(),
-    }]
-}
-use trawl_server::config::{
-    AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig,
-    SchedulerConfig, ServerConfig, SyslogConfig, WebConfig,
-};
-use trawl_server::state::AppState;
-use trawl_server::transport::http;
-
-/// Create a `PrometheusHandle` for test contexts.
-///
-/// Uses `PrometheusBuilder` with a noop recorder since tests don't scrape
-/// the endpoint. Each call creates an independent recorder which is NOT
-/// installed globally (the handle is self-contained).
-fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
-    metrics_exporter_prometheus::PrometheusBuilder::new()
-        .build_recorder()
-        .handle()
-}
-
-/// Find an available port by binding to :0 and reading back the assigned port.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-    listener.local_addr().unwrap().port()
-}
-
-/// Generate test parquet fixtures using `DuckDB`.
-///
-/// Writes fixtures to a stable path under `CARGO_MANIFEST_DIR` so all
-/// nextest processes share the same files. Uses PID-unique temp files
-/// and atomic rename for race-free coordination.
-fn ensure_fixtures() -> String {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("parquet");
-    let nginx_path = dir.join("nginx.parquet");
-
-    // Remove stale scheduled-run results from prior test invocations —
-    // the `**/*.parquet` glob would otherwise include them as log data.
-    let scheduled_dir = dir.join("scheduled");
-    if scheduled_dir.exists() {
-        let _ = std::fs::remove_dir_all(&scheduled_dir);
-    }
-
-    if !nginx_path.exists() {
-        std::fs::create_dir_all(&dir).unwrap();
-        let suffix = format!("_{}", std::process::id());
-
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-
-        conn.execute_batch(
-            "CREATE TABLE logs (
-                timestamp TIMESTAMP,
-                host VARCHAR,
-                service VARCHAR,
-                level VARCHAR,
-                message VARCHAR
-            )",
-        )
-        .unwrap();
-
-        conn.execute_batch(
-            "INSERT INTO logs VALUES
-            ('2024-01-15 10:00:00', 'web01', 'nginx', 'info', 'request ok'),
-            ('2024-01-15 10:00:01', 'web01', 'nginx', 'error', 'upstream timeout'),
-            ('2024-01-15 10:00:02', 'db01', 'postgres', 'info', 'checkpoint complete')",
-        )
-        .unwrap();
-
-        // Write per-service parquet files to match compaction naming convention.
-        let nginx_tmp = dir.join(format!("nginx{suffix}.parquet"));
-        let postgres_tmp = dir.join(format!("postgres{suffix}.parquet"));
-
-        conn.execute_batch(&format!(
-            "COPY (SELECT * FROM logs WHERE service = 'nginx') TO '{}' (FORMAT PARQUET)",
-            nginx_tmp.display()
-        ))
-        .unwrap();
-        conn.execute_batch(&format!(
-            "COPY (SELECT * FROM logs WHERE service = 'postgres') TO '{}' (FORMAT PARQUET)",
-            postgres_tmp.display()
-        ))
-        .unwrap();
-
-        // Atomic rename — loser's rename fails harmlessly if winner already placed the file.
-        let _ = std::fs::rename(&nginx_tmp, nginx_path);
-        let _ = std::fs::rename(&postgres_tmp, dir.join("postgres.parquet"));
-        // Clean up if we lost the race.
-        let _ = std::fs::remove_file(&nginx_tmp);
-        let _ = std::fs::remove_file(&postgres_tmp);
-    }
-
-    format!("{}/**/*.parquet", dir.display())
-}
-
-/// Return a shared self-signed cert/key pair, generating on first call.
-///
-/// Uses the same PID-unique temp + atomic rename pattern as fixtures
-/// for race-free coordination across nextest processes.
-fn ensure_test_cert() -> (PathBuf, PathBuf) {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("tls");
-    let cert_path = dir.join("cert.pem");
-    let key_path = dir.join("key.pem");
-
-    if !cert_path.exists() {
-        std::fs::create_dir_all(&dir).unwrap();
-        let suffix = format!("_{}", std::process::id());
-
-        let san = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(san).unwrap();
-
-        let cert_tmp = dir.join(format!("cert{suffix}.pem"));
-        let key_tmp = dir.join(format!("key{suffix}.pem"));
-        std::fs::write(&cert_tmp, cert.pem()).unwrap();
-        std::fs::write(&key_tmp, signing_key.serialize_pem()).unwrap();
-
-        let _ = std::fs::rename(&cert_tmp, &cert_path);
-        let _ = std::fs::rename(&key_tmp, &key_path);
-        // Clean up if we lost the race.
-        let _ = std::fs::remove_file(&cert_tmp);
-        let _ = std::fs::remove_file(&key_tmp);
-    }
-
-    (cert_path, key_path)
-}
-
-/// Test server handle with analyst, admin, and ingest tokens.
-struct TestServer {
-    url: String,
-    analyst_token: String,
-    admin_token: String,
-    reader_token: String,
-    ingest_token: String,
-    coastwatch_only_token: String,
-}
-
-/// Poll the health endpoint until the server is ready (up to 1s).
-async fn wait_for_ready(addr: &str) {
-    let poll_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let health_url = format!("https://{addr}/api/v1/health");
-    for _ in 0..100 {
-        if poll_client.get(&health_url).send().await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("test server failed to become ready within 1s");
-}
-
-/// Set up a test server with custom rate limiting for rate limit tests.
-#[allow(clippy::too_many_lines)]
-async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let data_glob = ensure_fixtures();
-    let auth_db = tmp.path().join("auth.db");
-
-    let mut store = KeyStore::open(&auth_db).unwrap();
-    let analyst = store
-        .create_key(
-            "test-key",
-            PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
-            None,
-        )
-        .unwrap();
-    let admin = store
-        .create_key(
-            "admin-key",
-            PrincipalKind::Service,
-            &trawl_only(Role::Admin),
-            None,
-        )
-        .unwrap();
-    let reader = store
-        .create_key(
-            "reader-key",
-            PrincipalKind::Service,
-            &trawl_only(Role::Reader),
-            None,
-        )
-        .unwrap();
-    let ingest = store
-        .create_key(
-            "ingest-key",
-            PrincipalKind::Service,
-            &trawl_only(Role::Ingest),
-            None,
-        )
-        .unwrap();
-    drop(store);
-
-    let (cert_path, key_path) = ensure_test_cert();
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
-    let config = Config {
-        server: ServerConfig {
-            http_addr: addr.clone(),
-            timeout_secs: 10,
-            max_concurrent_queries: 2,
-            max_result_rows: 100_000,
-            max_export_rows: 1_000_000,
-            max_request_body_bytes: 128 * 1024,
-            max_concurrent_requests: 256,
-            shutdown_drain_secs: 5,
-            log_file: None,
-            tls_cert_path: Some(cert_path),
-            tls_key_path: Some(key_path),
-            tls_reload_interval_secs: 0,
-            cors_allowed_origins: vec![],
-            schema_cache_ttl_secs: 60,
-            max_query_history: 1000,
-            max_sse_connections: 32,
-            query_log: None,
-            rate_limit,
-            monitor_refresh_ms: 1000,
-        },
-        data: DataConfig { path: data_glob },
-        auth: AuthConfig {
-            db_path: auth_db,
-            audit_interval_secs: 0,
-            auth_cache_ttl_secs: 300,
-        },
-        ingest: {
-            let wal_dir = tmp.path().join("wal");
-            std::fs::create_dir_all(&wal_dir).unwrap();
-            IngestConfig {
-                wal_dir: Some(wal_dir),
-                ..IngestConfig::default()
-            }
-        },
-        retention: RetentionConfig::default(),
-        scheduler: SchedulerConfig::default(),
-        syslog: SyslogConfig::default(),
-        web: WebConfig::default(),
-    };
-
-    let (state, http_config) =
-        AppState::from_config(&config, test_metrics_handle()).expect("failed to create app state");
-    let server_config = config.server.clone();
-    let state_dir = config.state_dir();
-    tokio::spawn(async move {
-        http::serve(state, &http_config, &server_config, &state_dir, None)
-            .await
-            .unwrap();
-    });
-    wait_for_ready(&addr).await;
-    std::mem::forget(tmp);
-
-    TestServer {
-        url: format!("https://{addr}"),
-        analyst_token: analyst.plaintext_token.to_string(),
-        admin_token: admin.plaintext_token.to_string(),
-        reader_token: reader.plaintext_token.to_string(),
-        ingest_token: ingest.plaintext_token.to_string(),
-        coastwatch_only_token: String::new(),
-    }
-}
-
-/// Set up a test server with fixtures and return a `TestServer` handle.
-#[allow(clippy::too_many_lines)]
-async fn setup() -> TestServer {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let data_glob = ensure_fixtures();
-    let auth_db = tmp.path().join("auth.db");
-
-    // Create API keys for all test roles.
-    let mut store = KeyStore::open(&auth_db).unwrap();
-    let analyst = store
-        .create_key(
-            "test-key",
-            PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
-            None,
-        )
-        .unwrap();
-    let admin = store
-        .create_key(
-            "admin-key",
-            PrincipalKind::Service,
-            &trawl_only(Role::Admin),
-            None,
-        )
-        .unwrap();
-    let reader = store
-        .create_key(
-            "reader-key",
-            PrincipalKind::Service,
-            &trawl_only(Role::Reader),
-            None,
-        )
-        .unwrap();
-    let ingest = store
-        .create_key(
-            "ingest-key",
-            PrincipalKind::Service,
-            &trawl_only(Role::Ingest),
-            None,
-        )
-        .unwrap();
-    let coastwatch_only = store
-        .create_key(
-            "coastwatch-only",
-            PrincipalKind::Service,
-            &[RoleAssignment {
-                app: "coastwatch".into(),
-                role: "viewer".into(),
-            }],
-            None,
-        )
-        .unwrap();
-    drop(store);
-
-    let (cert_path, key_path) = ensure_test_cert();
-
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
-    let config = Config {
-        server: ServerConfig {
-            http_addr: addr.clone(),
-            timeout_secs: 10,
-            max_concurrent_queries: 2,
-            max_result_rows: 100_000,
-            max_export_rows: 1_000_000,
-            max_request_body_bytes: 128 * 1024,
-            max_concurrent_requests: 256,
-            shutdown_drain_secs: 5,
-            log_file: None,
-            tls_cert_path: Some(cert_path),
-            tls_key_path: Some(key_path),
-            tls_reload_interval_secs: 0,
-            cors_allowed_origins: vec![],
-            schema_cache_ttl_secs: 60,
-            max_query_history: 1000,
-            max_sse_connections: 32,
-            query_log: None,
-            rate_limit: RateLimitConfig::default(),
-            monitor_refresh_ms: 1000,
-        },
-        data: DataConfig { path: data_glob },
-        auth: AuthConfig {
-            db_path: auth_db,
-            audit_interval_secs: 0,
-            auth_cache_ttl_secs: 300,
-        },
-        ingest: {
-            let wal_dir = tmp.path().join("wal");
-            std::fs::create_dir_all(&wal_dir).unwrap();
-            IngestConfig {
-                wal_dir: Some(wal_dir),
-                ..IngestConfig::default()
-            }
-        },
-        retention: RetentionConfig::default(),
-        scheduler: SchedulerConfig::default(),
-        syslog: SyslogConfig::default(),
-        web: WebConfig::default(),
-    };
-
-    let (state, http_config) =
-        AppState::from_config(&config, test_metrics_handle()).expect("failed to create app state");
-
-    // Spawn the HTTPS server in a background task.
-    let server_config = config.server.clone();
-    let state_dir = config.state_dir();
-    tokio::spawn(async move {
-        http::serve(state, &http_config, &server_config, &state_dir, None)
-            .await
-            .unwrap();
-    });
-
-    wait_for_ready(&addr).await;
-
-    // Leak the tempdir so it survives the test (cleaned up by OS).
-    std::mem::forget(tmp);
-
-    TestServer {
-        url: format!("https://{addr}"),
-        analyst_token: analyst.plaintext_token.to_string(),
-        admin_token: admin.plaintext_token.to_string(),
-        coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
-        reader_token: reader.plaintext_token.to_string(),
-        ingest_token: ingest.plaintext_token.to_string(),
-    }
-}
+use trawl_server::config::RateLimitConfig;
+use trawl_server::policy::Role;
 
 #[tokio::test]
 async fn health_returns_ok() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, "unused").unwrap();
     let health = client.health().await.unwrap();
     assert_eq!(health.status, trawl_api::HealthStatus::Ok);
@@ -427,7 +28,7 @@ async fn health_returns_ok() {
 
 #[tokio::test]
 async fn query_returns_results() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client.query_paginated("*", None, None).await.unwrap();
     assert_eq!(result.result.row_count(), 3);
@@ -435,7 +36,7 @@ async fn query_returns_results() {
 
 #[tokio::test]
 async fn query_with_filter() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client
         .query_paginated("service=nginx", None, None)
@@ -446,7 +47,7 @@ async fn query_with_filter() {
 
 #[tokio::test]
 async fn query_with_stats_pipeline() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client
         .query_paginated("* | stats count() by service", None, None)
@@ -458,7 +59,7 @@ async fn query_with_stats_pipeline() {
 
 #[tokio::test]
 async fn query_rejects_missing_auth() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, "").unwrap();
 
     let result = client.query_paginated("*", None, None).await;
@@ -474,7 +75,7 @@ async fn query_rejects_missing_auth() {
 
 #[tokio::test]
 async fn query_rejects_invalid_token() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client =
         HttpClient::new_insecure(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234").unwrap();
 
@@ -491,7 +92,7 @@ async fn query_rejects_invalid_token() {
 
 #[tokio::test]
 async fn query_rejects_bad_dsl() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = client.query_paginated("| | | broken {{{", None, None).await;
@@ -509,7 +110,7 @@ async fn query_rejects_bad_dsl() {
 
 #[tokio::test]
 async fn schema_returns_columns() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let schema = client.schema().await.unwrap();
@@ -527,7 +128,7 @@ async fn schema_returns_columns() {
 
 #[tokio::test]
 async fn schema_caching_works() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let first = client.schema().await.unwrap();
@@ -541,7 +142,7 @@ async fn schema_caching_works() {
 
 #[tokio::test]
 async fn queries_shows_history() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
@@ -559,7 +160,7 @@ async fn queries_shows_history() {
 
 #[tokio::test]
 async fn queries_accessible_by_analyst_and_reader() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
@@ -570,7 +171,7 @@ async fn queries_accessible_by_analyst_and_reader() {
 
 #[tokio::test]
 async fn queries_rejects_ingest_role() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let result = client.queries().await;
@@ -596,7 +197,7 @@ fn raw_client() -> reqwest::Client {
 
 #[tokio::test]
 async fn ingest_accepts_ndjson() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let records = vec![
@@ -610,7 +211,7 @@ async fn ingest_accepts_ndjson() {
 
 #[tokio::test]
 async fn ingest_rejects_missing_auth() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = raw_client();
 
     let resp = client
@@ -626,7 +227,7 @@ async fn ingest_rejects_missing_auth() {
 
 #[tokio::test]
 async fn ingest_rejects_analyst_role() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = raw_client();
 
     let resp = client
@@ -643,7 +244,7 @@ async fn ingest_rejects_analyst_role() {
 
 #[tokio::test]
 async fn ingest_partial_success() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = raw_client();
 
     // 3 ndjson events: good, bad json, good
@@ -668,7 +269,7 @@ async fn ingest_partial_success() {
 
 #[tokio::test]
 async fn ingest_all_rejected_per_event() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = raw_client();
 
     // All 3 events are bad (no service field)
@@ -695,13 +296,16 @@ async fn ingest_all_rejected_per_event() {
 
 #[tokio::test]
 async fn rate_limit_returns_429() {
-    let server = setup_with_rate_limit(RateLimitConfig {
+    let Some(server) = setup_with_rate_limit(RateLimitConfig {
         admin: 0,
         analyst: 2, // burst of 2
         reader: 0,
         ingest: 0,
     })
-    .await;
+    .await
+    else {
+        return;
+    };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // First 2 should succeed (burst capacity).
@@ -724,7 +328,7 @@ async fn rate_limit_returns_429() {
 
 #[tokio::test]
 async fn cancel_query_by_admin() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
@@ -750,7 +354,7 @@ async fn cancel_query_by_admin() {
 
 #[tokio::test]
 async fn cancel_query_nonexistent_returns_false() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let resp = admin.cancel_query(9999).await.unwrap();
@@ -760,7 +364,7 @@ async fn cancel_query_nonexistent_returns_false() {
 
 #[tokio::test]
 async fn cancel_query_by_analyst_for_nonexistent() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Analyst gets "cannot cancel" for non-existent queries — no information
@@ -771,7 +375,7 @@ async fn cancel_query_by_analyst_for_nonexistent() {
 
 #[tokio::test]
 async fn cancel_query_rejects_ingest_role() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let result = ingest.cancel_query(1).await;
@@ -785,9 +389,131 @@ async fn cancel_query_rejects_ingest_role() {
     }
 }
 
+/// Non-admin cancellation is authorized by exact keystore id, not display
+/// name. Two `QueryCancel` keys sharing a name ("twin") must stay isolated:
+/// key B cannot cancel key A's in-flight query, while owner A passes the gate
+/// and actually interrupts the query.
+///
+/// A revert to name-matching would let B (same name) through, so this test
+/// guards that regression. It needs a genuinely *active* query — a completed
+/// one has no tracked owner under either scheme, so only a live entry can tell
+/// id-matching from name-matching apart.
+///
+/// The pool's `TEST_QUERY_DELAY_MS` hook (via the crate's `test-support`
+/// feature) holds the query in-flight deterministically — no dataset-size
+/// timing bets against fast CI runners.
+#[tokio::test]
+async fn cancel_query_isolated_by_key_id_not_name() {
+    // Permissive rate limits: the observe/cancel polls below run in a tight
+    // window and must not trip the per-minute buckets.
+    let permissive = RateLimitConfig {
+        admin: 1_000_000,
+        analyst: 1_000_000,
+        reader: 1_000_000,
+        ingest: 1_000_000,
+    };
+    let Some(server) = setup_with_rate_limit(permissive).await else {
+        return;
+    };
+
+    // Hold every pool query open long enough to observe and cancel it.
+    // nextest runs each test in its own process, so the global is private
+    // to this test; reset at the end regardless.
+    trawl_server::pool::TEST_QUERY_DELAY_MS.store(3_000, Ordering::Relaxed);
+
+    // Two analyst keys with the SAME display name but distinct keystore ids.
+    let store = KeyStore::from_pool(server.fx.pool());
+    let key_a = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .await
+        .unwrap();
+    let key_b = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        key_a.info.id, key_b.info.id,
+        "twin keys must have distinct keystore ids"
+    );
+
+    let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
+    let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
+
+    // Fire a query as key A in the background; the injected delay keeps it
+    // tracked as active until we are done asserting.
+    let slow = {
+        let a = a.clone();
+        tokio::spawn(async move { a.query_paginated("* | stats count()", None, None).await })
+    };
+
+    // Wait until A's query shows up as active, capturing its id.
+    let mut target = None;
+    for _ in 0..500 {
+        if let Ok(resp) = a.queries().await
+            && let Some(id) = resp
+                .active
+                .iter()
+                .filter(|q| q.user == "twin")
+                .map(|q| q.id)
+                .max()
+        {
+            target = Some(id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let target = target.expect("key A should have an active query");
+
+    // Key B (same name, QueryCancel, different id) is rejected by the
+    // ownership gate — the query is guaranteed still in-flight here.
+    let denied = b.cancel_query(target).await;
+    match denied {
+        Err(trawl_client::ClientError::Server { status, .. }) => {
+            assert_eq!(status, 401, "twin key B must not cancel key A's query");
+        }
+        other => panic!("expected 401 for non-owner cancel, got: {other:?}"),
+    }
+
+    // Owner A passes the ownership gate AND interrupts the tracked query:
+    // `cancelled == true` proves the tracker id and the pool's interrupt-map
+    // id are the same id space. The interrupt handle is registered by the
+    // pool task shortly after the tracker entry appears, so retry briefly.
+    let mut cancelled = false;
+    for _ in 0..500 {
+        let resp = a
+            .cancel_query(target)
+            .await
+            .expect("owner key A must pass the ownership gate");
+        if resp.cancelled {
+            cancelled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(
+        cancelled,
+        "owner cancel must interrupt the in-flight query (shared id space)"
+    );
+
+    trawl_server::pool::TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
+
+    // The interrupted query surfaces an error to its submitter.
+    let _ = slow.await;
+}
+
 #[tokio::test]
 async fn validate_query_valid() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -800,7 +526,7 @@ async fn validate_query_valid() {
 
 #[tokio::test]
 async fn validate_query_syntax_error() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -813,7 +539,7 @@ async fn validate_query_syntax_error() {
 
 #[tokio::test]
 async fn validate_query_unknown_function() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client.validate("* | stats unknown_func()").await.unwrap();
@@ -823,7 +549,7 @@ async fn validate_query_unknown_function() {
 
 #[tokio::test]
 async fn query_pagination_limit_offset() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // We have 3 rows total. Request 2 rows starting at offset 1.
@@ -836,7 +562,7 @@ async fn query_pagination_limit_offset() {
 
 #[tokio::test]
 async fn query_pagination_offset_beyond_results() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -850,7 +576,7 @@ async fn query_pagination_offset_beyond_results() {
 
 #[tokio::test]
 async fn query_pagination_defaults() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // No limit/offset specified — defaults should apply.
@@ -861,7 +587,7 @@ async fn query_pagination_defaults() {
 
 #[tokio::test]
 async fn stats_endpoint_admin_only() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let stats = admin.stats().await.unwrap();
@@ -870,7 +596,7 @@ async fn stats_endpoint_admin_only() {
 
 #[tokio::test]
 async fn stats_endpoint_analyst_forbidden() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = analyst.stats().await;
@@ -883,7 +609,7 @@ async fn stats_endpoint_analyst_forbidden() {
 
 #[tokio::test]
 async fn dashboard_rejects_analyst() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = analyst.dashboard().await;
@@ -898,7 +624,7 @@ async fn dashboard_rejects_analyst() {
 async fn dashboard_returns_503_before_collector_runs() {
     // Test harness doesn't spawn the snapshot collector, so the endpoint
     // returns 503 Service Unavailable (snapshot is None).
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let result = admin.dashboard().await;
@@ -911,7 +637,7 @@ async fn dashboard_returns_503_before_collector_runs() {
 
 #[tokio::test]
 async fn whoami_admin_has_server_manage() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let resp = admin.whoami().await.unwrap();
@@ -933,7 +659,7 @@ async fn whoami_admin_has_server_manage() {
 
 #[tokio::test]
 async fn whoami_reader_lacks_server_manage() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     let resp = reader.whoami().await.unwrap();
@@ -944,7 +670,7 @@ async fn whoami_reader_lacks_server_manage() {
 
 #[tokio::test]
 async fn whoami_rejects_missing_auth() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, "invalid-token").unwrap();
 
     let result = client.whoami().await;
@@ -952,19 +678,24 @@ async fn whoami_rejects_missing_auth() {
 }
 
 #[tokio::test]
-async fn whoami_no_trawl_grant_returns_empty_permissions() {
-    let server = setup().await;
+async fn whoami_no_trawl_grant_is_403() {
+    // Policy change with the fleet-auth cutover (ADR-0004): a foreign-app-only
+    // key is rejected by the mandatory trawl policy layer on EVERY
+    // authenticated route — including /whoami, which previously leaked
+    // cross-app assignments to grantless keys.
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.coastwatch_only_token).unwrap();
 
-    let resp = client.whoami().await.unwrap();
-    assert_eq!(resp.role_for("trawl"), None);
-    assert_eq!(resp.role_for("coastwatch"), Some("viewer"));
-    assert!(resp.permissions.is_empty());
+    let result = client.whoami().await;
+    match result.unwrap_err() {
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 403),
+        other => panic!("expected 403, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
 async fn field_values_endpoint() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client.field_values("service", Some(5), None).await.unwrap();
@@ -975,7 +706,7 @@ async fn field_values_endpoint() {
 
 #[tokio::test]
 async fn field_values_cached() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // First request should populate cache.
@@ -989,7 +720,7 @@ async fn field_values_cached() {
 
 #[tokio::test]
 async fn field_values_invalid_field_name() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = client.field_values("bad;name", None, None).await;
@@ -1004,7 +735,7 @@ async fn field_values_invalid_field_name() {
 
 #[tokio::test]
 async fn response_includes_ulid_request_id() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = raw_client();
 
     let resp = client
@@ -1040,7 +771,7 @@ fn assert_401<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) 
 
 #[tokio::test]
 async fn validate_rejects_reader() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.validate("* | head 1").await);
@@ -1048,7 +779,7 @@ async fn validate_rejects_reader() {
 
 #[tokio::test]
 async fn saved_queries_reject_reader() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.list_saved().await);
@@ -1059,7 +790,7 @@ async fn saved_queries_reject_reader() {
 
 #[tokio::test]
 async fn export_rejects_reader() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(
@@ -1071,7 +802,7 @@ async fn export_rejects_reader() {
 
 #[tokio::test]
 async fn reader_can_query_and_view_history() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     // Reader can execute queries.
@@ -1094,7 +825,7 @@ async fn reader_can_query_and_view_history() {
 
 #[tokio::test]
 async fn runs_stats_empty() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let stats = client.runs_stats().await.unwrap();
@@ -1107,7 +838,7 @@ async fn runs_stats_empty() {
 
 #[tokio::test]
 async fn runs_stats_rejects_reader() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.runs_stats().await);
@@ -1119,7 +850,7 @@ async fn runs_stats_rejects_reader() {
 
 #[tokio::test]
 async fn trigger_run_requires_schedule() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Create a net without a schedule.
@@ -1143,7 +874,7 @@ async fn trigger_run_requires_schedule() {
 
 #[tokio::test]
 async fn trigger_run_starts_execution() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Create net + attach schedule.
@@ -1181,7 +912,7 @@ async fn trigger_run_starts_execution() {
 
 #[tokio::test]
 async fn trigger_run_rejects_reader() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.trigger_run(1).await);
@@ -1193,7 +924,7 @@ async fn trigger_run_rejects_reader() {
 
 #[tokio::test]
 async fn rename_saved_query() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let saved = client.create_saved("old-name", "* | head 1").await.unwrap();
@@ -1214,7 +945,7 @@ async fn rename_saved_query() {
 
 #[tokio::test]
 async fn rename_to_duplicate_fails() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     client
@@ -1245,7 +976,7 @@ async fn rename_to_duplicate_fails() {
 
 #[tokio::test]
 async fn list_all_runs_paginated() {
-    let server = setup().await;
+    let Some(server) = setup().await else { return };
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Empty initially.

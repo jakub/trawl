@@ -5,19 +5,17 @@
 //! Shared application state for axum handlers.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use trawl_api::{DashboardSnapshot, ServiceSchema};
-use trawl_auth::{HistoryStore, KeyStore, SavedQueryStore, ScheduleStore};
+use trawl_auth::{HistoryStore, SavedQueryStore, ScheduleStore};
 use trawl_engine::value::SchemaResult;
 
-use crate::auth::AuthCache;
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
 use crate::hot_buffer::{HotBuffer, HotBufferConfig};
@@ -78,21 +76,120 @@ pub struct QueryState {
     pub query_log: Option<Arc<QueryLog>>,
 }
 
-/// Authentication state: key store, history store, saved queries, and database path.
+/// Authentication state: fleet keystore plus the transitional `SQLite`
+/// app-state stores (history, saved queries, schedules — ADR-0004 slice 3
+/// moves these to postgres).
 #[derive(Debug, Clone)]
 pub struct AuthState {
-    /// Shared `KeyStore` connection, opened once at startup.
-    pub key_store: Arc<Mutex<KeyStore>>,
+    /// Fleet-auth Postgres keystore. Cheap to clone (Arc-backed pool +
+    /// verification cache live inside).
+    pub key_store: fleet_auth::KeyStore,
+    /// State for `fleet_auth::require_bearer_only`. trawld never reads session
+    /// cookies (that's trawl-web's job in slice 2), so it holds a
+    /// keystore-only [`fleet_auth::BearerState`] with no session key/cookie
+    /// config at all — the type forbids ever mounting `require_session`
+    /// against a meaningless key.
+    pub bearer_state: fleet_auth::BearerState,
     /// Shared `HistoryStore` connection for query history persistence.
     pub history: Arc<Mutex<HistoryStore>>,
     /// Shared `SavedQueryStore` connection for saved queries.
     pub saved: Arc<Mutex<SavedQueryStore>>,
     /// Shared `ScheduleStore` connection for scheduled queries and report runs.
     pub schedule: Arc<Mutex<ScheduleStore>>,
-    /// Path to the `SQLite` auth database (kept for admin commands).
-    pub db_path: Arc<PathBuf>,
-    /// In-memory auth token cache (skips argon2id on hits).
-    pub auth_cache: Arc<AuthCache>,
+    /// Memoised keystore liveness ping, shared by every `/health` probe.
+    ///
+    /// `/health` is unauthenticated and unthrottled (it sits outside
+    /// `require_bearer_only` and `rate_limit_middleware`), so a burst of probes must
+    /// not stampede the small, shared keystore connection pool that bearer
+    /// verification depends on. See [`AuthState::ping_cached`].
+    pub auth_ping: Arc<tokio::sync::Mutex<Option<CachedAuthPing>>>,
+}
+
+/// A cached keystore liveness-ping outcome with an expiry timestamp.
+#[derive(Debug, Clone)]
+pub struct CachedAuthPing {
+    /// Ping outcome: `Ok(())` on success, `Err(msg)` on failure/timeout.
+    result: Result<(), String>,
+    /// When this ping was performed.
+    checked_at: Instant,
+}
+
+impl AuthState {
+    /// Liveness ping against the fleet keystore, memoised to protect the pool.
+    ///
+    /// The result is cached for [`Self::PING_CACHE_TTL`]; within a window every
+    /// probe reuses the last outcome and touches no connection, collapsing any
+    /// burst of unauthenticated `/health` requests into at most one ping per
+    /// window. The `tokio::sync::Mutex` also serialises refreshes, so at most
+    /// one in-flight ping holds a keystore connection at any instant (mirrors
+    /// the thundering-herd guard on the schema cache).
+    ///
+    /// The ping is bounded by [`Self::PING_TIMEOUT`]: a slow/partitioned
+    /// keystore reports a timeout error rather than blocking on sqlx's full
+    /// connect/acquire deadline. Failed and timed-out pings are cached too, so
+    /// a downed keystore cannot turn every probe into a fresh stall.
+    ///
+    /// Returns `Ok(())` when the keystore answered, or `Err(msg)` describing the
+    /// failure or timeout.
+    pub async fn ping_cached(&self) -> Result<(), String> {
+        ping_cached_with(
+            &self.auth_ping,
+            Self::PING_CACHE_TTL,
+            Self::PING_TIMEOUT,
+            || self.key_store.ping(),
+        )
+        .await
+    }
+
+    /// Upper bound on a single keystore liveness ping.
+    ///
+    /// Chosen well under the k8s probe timeout (default 1s is exceeded, but the
+    /// auth check is non-critical → `Degraded` → HTTP 200, so a slow keystore
+    /// never fails liveness) and far under sqlx's ~30s connect/acquire deadline.
+    const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// How long a keystore ping outcome is reused before a fresh probe.
+    const PING_CACHE_TTL: Duration = Duration::from_secs(5);
+}
+
+/// Memoise a liveness ping behind a TTL and a timeout bound.
+///
+/// Extracted from [`AuthState::ping_cached`] so the TTL, timeout, and
+/// error-caching behaviour can be exercised with a controllable pinger (see the
+/// module tests) rather than only against a live keystore. Within `ttl` of the
+/// last probe the cached outcome (success *or* failure) is returned and `ping`
+/// is never invoked; otherwise `ping` runs under a `timeout` bound and its
+/// result — including a timeout mapped to `Err` — is cached before returning.
+async fn ping_cached_with<F, Fut, E>(
+    cache: &tokio::sync::Mutex<Option<CachedAuthPing>>,
+    ttl: Duration,
+    timeout: Duration,
+    ping: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut guard = cache.lock().await;
+    if let Some(cached) = guard.as_ref()
+        && cached.checked_at.elapsed() < ttl
+    {
+        return cached.result.clone();
+    }
+
+    let result = match tokio::time::timeout(timeout, ping()).await {
+        Ok(res) => res.map_err(|e| e.to_string()),
+        Err(_) => Err(format!(
+            "keystore ping timed out after {}s",
+            timeout.as_secs()
+        )),
+    };
+    *guard = Some(CachedAuthPing {
+        result: result.clone(),
+        checked_at: Instant::now(),
+    });
+    result
 }
 
 /// Ingest pipeline state.
@@ -253,19 +350,67 @@ pub struct CachedServiceSchema {
     pub cached_at: Instant,
 }
 
+/// Build [`AuthState`]: connect the fleet keystore (eagerly), wrap it as a
+/// bearer-only [`fleet_auth::BearerState`], and open the transitional
+/// `SQLite` app-state stores.
+async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::ServerError> {
+    let database_url = config
+        .auth
+        .resolve_database_url()
+        .map_err(|e| crate::error::ServerError::Internal(e.to_string()))?;
+
+    // Eager connect + ping: a dead backend is a distinct, loud startup
+    // error — trawld cannot authenticate anyone without it.
+    let key_store = fleet_auth::KeyStore::connect(&database_url)
+        .await
+        .map_err(|e| {
+            crate::error::ServerError::ServiceUnavailable(format!(
+                "fleet auth backend unreachable at startup (is postgres up and migrated via \
+                 `fleet-admin migrate`?): {e}"
+            ))
+        })?;
+    key_store.ping().await.map_err(|e| {
+        crate::error::ServerError::ServiceUnavailable(format!(
+            "fleet auth backend failed ping at startup: {e}"
+        ))
+    })?;
+
+    // trawld only ever runs require_bearer_only: it verifies bearer tokens and
+    // never touches session cookies, so it carries just the keystore — no
+    // fabricated session key/config (see AuthState::bearer_state).
+    let bearer_state = fleet_auth::BearerState::new(key_store.clone());
+
+    // Legacy-db quarantine (ADR-0004): the transitional app-state store keys
+    // its rows on postgres key ids, which are unrelated to the old sqlite
+    // keystore's. Refuse to open a pre-cutover keystore file (under any name)
+    // so a fresh pg key can't inherit a legacy sqlite key's rows. The config
+    // basename guard only catches the default `auth.db`; this catches renames.
+    trawl_auth::reject_legacy_keystore(&config.auth.db_path)?;
+    let history = HistoryStore::open(&config.auth.db_path)?;
+    let saved = SavedQueryStore::open(&config.auth.db_path)?;
+    let schedule = ScheduleStore::open(&config.auth.db_path)?;
+
+    Ok(AuthState {
+        key_store,
+        bearer_state,
+        history: Arc::new(Mutex::new(history)),
+        saved: Arc::new(Mutex::new(saved)),
+        schedule: Arc::new(Mutex::new(schedule)),
+        auth_ping: Arc::new(tokio::sync::Mutex::new(None)),
+    })
+}
+
 impl AppState {
     /// Construct app state from a validated [`Config`].
     ///
-    /// Opens the auth database once at startup. Returns an error if the
-    /// database cannot be opened or initialized.
-    pub fn from_config(
+    /// Connects to the fleet-auth Postgres keystore (eagerly — trawld fails
+    /// fast at startup when the auth backend is unreachable) and opens the
+    /// transitional `SQLite` app-state stores.
+    pub async fn from_config(
         config: &Config,
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-    ) -> Result<(Self, HttpConfig), trawl_auth::AuthError> {
-        let key_store = KeyStore::open(&config.auth.db_path)?;
-        let history = HistoryStore::open(&config.auth.db_path)?;
-        let saved = SavedQueryStore::open(&config.auth.db_path)?;
-        let schedule = ScheduleStore::open(&config.auth.db_path)?;
+    ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
+        let auth = build_auth_state(config).await?;
 
         let (wal_writer, event_bus, hot_buffer, pipeline) = if config.ingest.enabled {
             let writer = Arc::new(WalWriter::new(config.wal_dir()));
@@ -283,10 +428,6 @@ impl AppState {
         } else {
             (None, None, None, None)
         };
-
-        let auth_cache = Arc::new(AuthCache::new(std::time::Duration::from_secs(
-            config.auth.auth_cache_ttl_secs,
-        )));
 
         let state = Self {
             query: QueryState {
@@ -307,14 +448,7 @@ impl AppState {
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
                 query_log: None,
             },
-            auth: AuthState {
-                key_store: Arc::new(Mutex::new(key_store)),
-                history: Arc::new(Mutex::new(history)),
-                saved: Arc::new(Mutex::new(saved)),
-                schedule: Arc::new(Mutex::new(schedule)),
-                db_path: Arc::new(config.auth.db_path.clone()),
-                auth_cache,
-            },
+            auth,
             ingest: IngestState {
                 wal_writer,
                 pipeline,
@@ -352,5 +486,112 @@ impl AppState {
         };
 
         Ok((state, http))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CachedAuthPing, ping_cached_with};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Mutex as TokioMutex;
+
+    const LONG_TTL: Duration = Duration::from_secs(3600);
+    const LONG_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// A successful ping is cached: within the TTL a second probe returns the
+    /// stored `Ok` without re-invoking the pinger.
+    #[tokio::test]
+    async fn caches_ok_within_ttl() {
+        let cache: TokioMutex<Option<CachedAuthPing>> = TokioMutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let ping = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), String>(())
+        };
+
+        assert_eq!(
+            ping_cached_with(&cache, LONG_TTL, LONG_TIMEOUT, ping).await,
+            Ok(())
+        );
+        assert_eq!(
+            ping_cached_with(&cache, LONG_TTL, LONG_TIMEOUT, ping).await,
+            Ok(())
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second probe must reuse the cache"
+        );
+    }
+
+    /// A failed ping is cached too: within the TTL the downed-keystore error is
+    /// replayed without touching the pinger, so a burst cannot stampede a dead
+    /// backend.
+    #[tokio::test]
+    async fn caches_err_within_ttl() {
+        let cache: TokioMutex<Option<CachedAuthPing>> = TokioMutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let ping = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), String>("backend down".to_string())
+        };
+
+        let first = ping_cached_with(&cache, LONG_TTL, LONG_TIMEOUT, ping).await;
+        let second = ping_cached_with(&cache, LONG_TTL, LONG_TIMEOUT, ping).await;
+        assert_eq!(first, Err("backend down".to_string()));
+        assert_eq!(second, Err("backend down".to_string()));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "errors must be cached, not retried"
+        );
+    }
+
+    /// Once the TTL has elapsed the cache is bypassed and the pinger runs again.
+    /// A zero TTL makes every probe expired, so each call re-probes.
+    #[tokio::test]
+    async fn refreshes_after_ttl_expiry() {
+        let cache: TokioMutex<Option<CachedAuthPing>> = TokioMutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let ping = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), String>(())
+        };
+
+        ping_cached_with(&cache, Duration::ZERO, LONG_TIMEOUT, ping)
+            .await
+            .unwrap();
+        ping_cached_with(&cache, Duration::ZERO, LONG_TIMEOUT, ping)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "expired cache must re-probe"
+        );
+    }
+
+    /// A ping that outlives the timeout bound is mapped to a timeout `Err`
+    /// rather than blocking, and that error is cached like any other outcome.
+    #[tokio::test(start_paused = true)]
+    async fn maps_timeout_to_err() {
+        let cache: TokioMutex<Option<CachedAuthPing>> = TokioMutex::new(None);
+        let timeout = Duration::from_secs(2);
+        let ping = || async {
+            // Far outlives the 2s bound; paused-clock auto-advance fires the
+            // timeout first, so the test itself never really waits.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok::<(), String>(())
+        };
+
+        let result = ping_cached_with(&cache, LONG_TTL, timeout, ping).await;
+        assert_eq!(result, Err("keystore ping timed out after 2s".to_string()));
+
+        // The timeout error is now cached: a probe within the TTL replays it
+        // without invoking a (this time instant) pinger.
+        let cached =
+            ping_cached_with(&cache, LONG_TTL, timeout, || async { Ok::<(), String>(()) }).await;
+        assert_eq!(cached, Err("keystore ping timed out after 2s".to_string()));
     }
 }

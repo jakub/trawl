@@ -1861,6 +1861,7 @@ dependencies = [
  "chrono",
  "cookie",
  "dashmap",
+ "fleet-auth",
  "rand 0.8.6",
  "serde",
  "serde_json",
@@ -6193,14 +6194,10 @@ dependencies = [
 name = "trawl-admin"
 version = "0.3.3"
 dependencies = [
- "chrono",
  "clap",
- "comfy-table",
- "insta",
  "rcgen",
  "shellexpand",
  "time",
- "trawl-auth",
  "trawl-core",
 ]
 
@@ -6216,18 +6213,12 @@ dependencies = [
 name = "trawl-auth"
 version = "0.3.3"
 dependencies = [
- "argon2",
- "base64ct",
  "chrono",
  "insta",
- "rand 0.8.6",
  "rusqlite",
- "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
- "trawl-api",
- "zeroize",
 ]
 
 [[package]]
@@ -6350,6 +6341,7 @@ dependencies = [
  "dashmap",
  "duckdb",
  "flate2",
+ "fleet-auth",
  "fs4",
  "governor",
  "hostname",
@@ -6389,6 +6381,7 @@ dependencies = [
  "trawl-crashdump",
  "trawl-dashboard",
  "trawl-engine",
+ "trawl-server",
  "ulid",
  "x509-parser",
  "zstd",

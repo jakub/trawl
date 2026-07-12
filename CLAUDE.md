@@ -17,13 +17,13 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 crates/
   trawl-core/            # DSL parser, AST, SQL emitter (pure, no I/O)
   trawl-engine/          # DuckDB integration, query execution
-  trawl-auth/            # API keys, roles, schedules, SQLite-backed (legacy — ADR-0030 step 4 migrates trawld onto fleet-auth)
+  trawl-auth/            # history/saved/schedule stores, SQLite-backed (keystore half retired — trawld verifies keys against fleet-auth postgres since ADR-0004 slice 1; crate dies in slice 3)
   trawl-api/             # shared wire types (request/response structs)
   trawl-config/          # shared config.toml types (no I/O)
   trawl-server/          # daemon (axum, HTTPS via tokio-rustls)
   trawl-client/          # typed async HTTP client library
   trawl-cli/             # unified CLI + TUI binary
-  trawl-admin/           # admin CLI (key mgmt, TLS cert generation)
+  trawl-admin/           # admin CLI (TLS cert generation only — key mgmt lives in fleet-admin)
   trawl-web/             # browser-facing session proxy (serves SPA, cookie → bearer)
   trawl-web-ui/          # leptos 0.8 CSR SPA (wasm32)
   trawl-dashboard/       # shared ratatui dashboard rendering

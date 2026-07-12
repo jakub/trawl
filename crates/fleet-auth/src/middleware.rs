@@ -187,15 +187,81 @@ pub async fn require_session(
 /// `bearer_does_not_enforce_namespace` locks this behaviour in.
 pub async fn require_bearer(
     State(state): State<SessionState>,
-    mut req: Request,
+    req: Request,
     next: Next,
 ) -> Response {
+    verify_bearer(&state.store, req, next).await
+}
+
+/// Keystore-only auth state for [`require_bearer_only`].
+///
+/// Unlike [`SessionState`] it carries no session key or cookie config — just
+/// the [`KeyStore`]. That is deliberate: a bearer-only service (a daemon that
+/// authenticates *only* `Authorization: Bearer flt_...` and never reads
+/// session cookies, e.g. trawld) has no cookie secret to embed, and this type
+/// makes that impossible to fake. Because `BearerState` has no session key,
+/// it *cannot* be handed to [`require_session`] — the type system forbids
+/// wiring cookie auth against a service that has no cookie material, so a
+/// future edit can't accidentally mount `require_session` on a meaningless
+/// key and have it type-check.
+#[derive(Clone)]
+pub struct BearerState {
+    store: KeyStore,
+}
+
+impl BearerState {
+    /// Wrap a [`KeyStore`] as bearer-only auth state.
+    #[must_use]
+    pub fn new(store: KeyStore) -> Self {
+        Self { store }
+    }
+
+    /// Borrow the underlying [`KeyStore`].
+    #[must_use]
+    pub fn store(&self) -> &KeyStore {
+        &self.store
+    }
+}
+
+impl std::fmt::Debug for BearerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerState")
+            .field("store", &"<KeyStore>")
+            .finish()
+    }
+}
+
+/// Axum middleware: identical to [`require_bearer`] but backed by a
+/// keystore-only [`BearerState`] instead of a full [`SessionState`].
+///
+/// Use this on daemons that only ever verify bearer tokens and never read
+/// session cookies — it lets them hold just a [`KeyStore`] rather than
+/// fabricating a throwaway session key to satisfy [`SessionState`].
+///
+/// # Important — does NOT check the app namespace grant
+///
+/// Like [`require_bearer`], this authenticates but does not authorise: it
+/// accepts *any* verified key regardless of app grants. Every consumer MUST
+/// still gate the route with its own role guard. See [`require_bearer`] for
+/// the full rationale.
+pub async fn require_bearer_only(
+    State(state): State<BearerState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    verify_bearer(&state.store, req, next).await
+}
+
+/// Shared body for [`require_bearer`] and [`require_bearer_only`]: extract the
+/// bearer token, verify it against the [`KeyStore`], and insert the resulting
+/// [`VerifiedKey`] into request extensions before calling the inner service.
+async fn verify_bearer(store: &KeyStore, mut req: Request, next: Next) -> Response {
     let Some(token) = extract_bearer(req.headers()) else {
         tracing::warn!("auth: missing or malformed bearer header");
         return unauthorized_json("missing or malformed bearer token");
     };
 
-    let verified = match state.store.verify_key(token).await {
+    let verified = match store.verify_key(token).await {
         Ok(v) => v,
         Err(err) => return classify_verify_error(err, "bearer"),
     };

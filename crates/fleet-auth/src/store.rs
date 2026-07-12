@@ -75,6 +75,30 @@ impl KeyStore {
         }
     }
 
+    /// Connect to Postgres from a database URL and construct a store.
+    ///
+    /// Establishes the pool eagerly (the first connection is opened before
+    /// this returns), so daemon consumers fail fast at startup when the
+    /// auth backend is unreachable instead of on the first request.
+    ///
+    /// Does NOT run migrations — apply them via [`crate::MIGRATOR`] from the
+    /// operational tool that owns deploys (e.g. `fleet-admin migrate`).
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Database`] when the URL is malformed or the
+    /// database is unreachable.
+    pub async fn connect(database_url: &str) -> Result<Self, AuthError> {
+        /// Upper bound on pooled connections. Sized for a single daemon's
+        /// request path plus background pollers — not a tunable yet.
+        const MAX_CONNECTIONS: u32 = 8;
+
+        let pool = sqlx_postgres::PgPoolOptions::new()
+            .max_connections(MAX_CONNECTIONS)
+            .connect(database_url)
+            .await?;
+        Ok(Self::from_pool(pool))
+    }
+
     /// Borrow the underlying pool (e.g. for higher-level layers that need to
     /// run their own queries against the same connection budget).
     pub fn pool(&self) -> &PgPool {
@@ -323,6 +347,49 @@ impl KeyStore {
             kind,
             assignments,
         })
+    }
+
+    /// Look up a key by database id and return it only if it is *live*:
+    /// active (not revoked) AND unexpired. Assignments are loaded fresh from
+    /// the database on every call — never cached.
+    ///
+    /// This is the substrate hook for consumers that gate background work on
+    /// key liveness (e.g. trawl's scheduler skipping runs whose owning key
+    /// was revoked, expired, or stripped of its app grant — ADR-0004).
+    /// Returns `Ok(None)` for unknown ids, revoked keys, and expired keys;
+    /// callers cannot distinguish those cases (they all mean "don't run").
+    ///
+    /// Unlike [`verify_key`], this does NOT update `last_used` — liveness
+    /// polling is not a use of the credential.
+    ///
+    /// [`verify_key`]: Self::verify_key
+    pub async fn get_live_key_by_id(&self, id: i64) -> Result<Option<VerifiedKey>, AuthError> {
+        let row_opt: Option<PgRow> = sqlx_core::query::query(
+            "SELECT id, prefix, name, kind
+             FROM api_keys
+             WHERE id = $1
+               AND active = TRUE
+               AND (expires_at IS NULL OR expires_at > NOW())",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+
+        let kind_str: String = row.try_get("kind")?;
+        let kind: PrincipalKind = kind_str.parse()?;
+        let assignments = self.load_assignments(id).await?;
+
+        Ok(Some(VerifiedKey {
+            id,
+            prefix: row.try_get("prefix")?,
+            name: row.try_get("name")?,
+            kind,
+            assignments,
+        }))
     }
 
     /// Load all `(app, role)` grants for a key, ordered by app.

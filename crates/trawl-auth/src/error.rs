@@ -114,4 +114,23 @@ pub enum AuthError {
         /// The rejected name.
         name: String,
     },
+
+    /// The transitional app-state file is actually a pre-cutover keystore.
+    ///
+    /// Postgres and `SQLite` key ids are unrelated sequences, so reusing an
+    /// old `auth.db` (under any filename) would let a fresh postgres key with
+    /// id N inherit the legacy sqlite key N's history, saved queries, and
+    /// auto-executing schedules (ADR-0004 legacy-db quarantine).
+    #[error(
+        "app-state database {path} still contains a legacy API-key keystore \
+         (table '{table}'); the fleet-auth cutover requires a FRESH store file. \
+         Leave the legacy keystore quarantined and repoint auth.db_path — see \
+         the fleet-auth cutover runbook"
+    )]
+    LegacyKeystore {
+        /// The offending database path.
+        path: String,
+        /// The legacy keystore table that was detected.
+        table: String,
+    },
 }

@@ -24,6 +24,11 @@ pub enum ServerError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// Authenticated but not authorized for trawl (no trawl grant / unknown
+    /// trawl role). Produced by the mandatory policy middleware.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// Bad request (invalid input, duplicate name, etc.).
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -69,10 +74,40 @@ impl ServerError {
             Self::Ingest(_) => "ingest error".to_owned(),
             Self::BadRequest(_) => "bad request".to_owned(),
             Self::NotFound(_) => "not found".to_owned(),
+            Self::Forbidden(_) => "forbidden".to_owned(),
             Self::RateLimited => "rate limit exceeded".to_owned(),
             Self::TooManyStreams => "too many concurrent streams".to_owned(),
             Self::ServiceUnavailable(_) => "service unavailable".to_owned(),
             other => other.to_string(),
+        }
+    }
+}
+
+impl From<fleet_auth::AuthError> for ServerError {
+    /// Map fleet-auth keystore failures onto trawl's error contract.
+    ///
+    /// Backend trouble (pg down, migration state, hash-worker panics) is a
+    /// 503 without postgres detail; credential failures stay an opaque 401.
+    /// Anything else in this path is a bug — surface as 500.
+    fn from(err: fleet_auth::AuthError) -> Self {
+        use fleet_auth::AuthError as E;
+        match err {
+            E::Database(e) => {
+                tracing::error!(target: "auth.backend", error = %e, "fleet auth backend error");
+                Self::ServiceUnavailable("auth backend unavailable".into())
+            }
+            E::Migration(e) => {
+                tracing::error!(target: "auth.backend", error = %e, "fleet auth migration error");
+                Self::ServiceUnavailable("auth backend unavailable".into())
+            }
+            E::Hash(e) | E::TokenGeneration(e) => {
+                tracing::error!(target: "auth.backend", error = %e, "fleet auth worker error");
+                Self::ServiceUnavailable("auth backend unavailable".into())
+            }
+            E::InvalidKey(_) | E::MalformedToken(_) => {
+                Self::Unauthorized("authentication failed".into())
+            }
+            other => Self::Internal(format!("unexpected fleet-auth error: {other}")),
         }
     }
 }
@@ -133,6 +168,10 @@ impl IntoResponse for ServerError {
             Self::Unauthorized(msg) => (
                 StatusCode::UNAUTHORIZED,
                 ErrorEnvelope::simple(ErrorCode::Unauthorized, msg.clone()),
+            ),
+            Self::Forbidden(msg) => (
+                StatusCode::FORBIDDEN,
+                ErrorEnvelope::simple(ErrorCode::Forbidden, msg.clone()),
             ),
             Self::Ingest(msg) => (
                 StatusCode::BAD_REQUEST,

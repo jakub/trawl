@@ -1,6 +1,6 @@
 [package]
 name = "trawl-admin"
-description = "Admin CLI for trawl — key management, enrollment, templates"
+description = "Admin CLI for trawl — local TLS certificate tooling (keys live in fleet-admin)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,17 +12,11 @@ name = "trawl-admin"
 path = "src/main.rs"
 
 [dependencies]
-trawl-auth = { workspace = true }
 trawl-core = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true }
-comfy-table = { workspace = true }
 rcgen = { workspace = true }
 shellexpand = { workspace = true }
 time = { workspace = true }
-
-[dev-dependencies]
-insta = { workspace = true }
 
 [lints]
 workspace = true

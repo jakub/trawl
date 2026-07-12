@@ -102,7 +102,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let (mut state, http_config) = AppState::from_config(&config, metrics_handle)?;
+    let (mut state, http_config) = AppState::from_config(&config, metrics_handle).await?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
@@ -173,7 +173,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let interval = std::time::Duration::from_secs(config.auth.audit_interval_secs);
         let handle = trawl_server::audit::spawn_audit_task(
-            Arc::clone(&state.auth.key_store),
+            state.auth.key_store.clone(),
             interval,
             shutdown_rx,
         );
@@ -204,7 +204,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = trawl_server::scheduler::spawn_scheduler(
             Arc::clone(&state.auth.schedule),
-            Arc::clone(&state.auth.key_store),
+            state.auth.key_store.clone(),
             state.query.pool.clone(),
             config.scheduler.clone(),
             config.server.timeout_secs,

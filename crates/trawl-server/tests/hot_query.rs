@@ -89,7 +89,13 @@ async fn hot_buffer_makes_events_immediately_queryable() {
     // --- query BEFORE compaction → events should be visible from hot buffer ---
 
     let result = pool
-        .execute("* | head 100", Duration::from_secs(10), false, 0)
+        .execute(
+            pool.allocate_query_id(),
+            "* | head 100",
+            Duration::from_secs(10),
+            false,
+            0,
+        )
         .await;
 
     let query_result = result.result.expect("query should succeed");
@@ -130,7 +136,13 @@ async fn hot_buffer_makes_events_immediately_queryable() {
     // --- query AFTER compaction → same events now from parquet ---
 
     let result_after = pool
-        .execute("* | head 100", Duration::from_secs(10), false, 0)
+        .execute(
+            pool.allocate_query_id(),
+            "* | head 100",
+            Duration::from_secs(10),
+            false,
+            0,
+        )
         .await;
 
     let query_result_after = result_after
@@ -214,7 +226,13 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     // --- query → should see both batches without duplicates ---
 
     let result = pool
-        .execute("* | head 100", Duration::from_secs(10), false, 0)
+        .execute(
+            pool.allocate_query_id(),
+            "* | head 100",
+            Duration::from_secs(10),
+            false,
+            0,
+        )
         .await;
 
     let query_result = result.result.expect("mixed query should succeed");
@@ -258,7 +276,13 @@ async fn query_works_without_hot_buffer() {
     .expect("compaction without hot buffer should succeed");
 
     let result = pool
-        .execute("* | head 100", Duration::from_secs(10), false, 0)
+        .execute(
+            pool.allocate_query_id(),
+            "* | head 100",
+            Duration::from_secs(10),
+            false,
+            0,
+        )
         .await;
 
     let query_result = result

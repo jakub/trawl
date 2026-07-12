@@ -15,10 +15,11 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use trawl_auth::KeyStore;
+use fleet_auth::KeyStore;
 use trawl_auth::schedule::ScheduleStore;
 
 use crate::config::SchedulerConfig;
+use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
 
 /// Spawn the scheduler background task.
@@ -27,7 +28,7 @@ use crate::pool::ExecutorPool;
 /// sending `true` signals the task to exit.
 pub fn spawn_scheduler(
     schedule_store: Arc<Mutex<ScheduleStore>>,
-    key_store: Arc<Mutex<KeyStore>>,
+    key_store: KeyStore,
     pool: ExecutorPool,
     config: SchedulerConfig,
     timeout_secs: u64,
@@ -45,7 +46,7 @@ pub fn spawn_scheduler(
 
 async fn scheduler_loop(
     schedule_store: Arc<Mutex<ScheduleStore>>,
-    key_store: Arc<Mutex<KeyStore>>,
+    key_store: KeyStore,
     pool: ExecutorPool,
     config: SchedulerConfig,
     timeout_secs: u64,
@@ -93,7 +94,7 @@ async fn scheduler_loop(
             }
         }
 
-        poll_and_execute(&schedule_store, &key_store, &pool, &config, timeout_secs);
+        poll_and_execute(&schedule_store, &key_store, &pool, &config, timeout_secs).await;
 
         // Periodic retention cleanup.
         retention_counter += 1;
@@ -131,9 +132,10 @@ async fn scheduler_loop(
     }
 }
 
-fn poll_and_execute(
+#[allow(clippy::too_many_lines)]
+async fn poll_and_execute(
     schedule_store: &Arc<Mutex<ScheduleStore>>,
-    key_store: &Arc<Mutex<KeyStore>>,
+    key_store: &KeyStore,
     pool: &ExecutorPool,
     config: &SchedulerConfig,
     timeout_secs: u64,
@@ -156,7 +158,18 @@ fn poll_and_execute(
     for (schedule, saved_query) in schedules {
         // Check if max_runs reached.
         if let Some(max) = schedule.max_runs {
-            let count = schedule_store.lock().count_runs(schedule.id).unwrap_or(0);
+            let count = match schedule_store.lock().count_runs(schedule.id) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        event_type = "scheduler_error",
+                        schedule_id = schedule.id,
+                        error = %e,
+                        "failed to count runs; skipping tick to honour max_runs cap"
+                    );
+                    continue;
+                }
+            };
             if count >= max {
                 continue;
             }
@@ -166,13 +179,23 @@ fn poll_and_execute(
         let should_run = {
             let store = schedule_store.lock();
             match store.latest_run(schedule.id) {
-                Ok(Some(last)) => {
-                    let last_started = chrono::DateTime::parse_from_rfc3339(&last.started_at)
-                        .map_or(0, |dt| dt.timestamp());
-                    let now = chrono::Utc::now().timestamp();
-                    let elapsed = (now - last_started).unsigned_abs();
-                    elapsed >= schedule.interval_secs
-                }
+                Ok(Some(last)) => match chrono::DateTime::parse_from_rfc3339(&last.started_at) {
+                    Ok(dt) => {
+                        let now = chrono::Utc::now().timestamp();
+                        let elapsed = (now - dt.timestamp()).unsigned_abs();
+                        elapsed >= schedule.interval_secs
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            event_type = "scheduler_error",
+                            schedule_id = schedule.id,
+                            started_at = %last.started_at,
+                            error = %e,
+                            "unparseable last-run timestamp; skipping tick conservatively"
+                        );
+                        false
+                    }
+                },
                 Ok(None) => true, // Never run before.
                 Err(e) => {
                     tracing::warn!(
@@ -190,18 +213,8 @@ fn poll_and_execute(
             continue;
         }
 
-        // Verify the owning API key is still active.
-        let key_active = {
-            let ks = key_store.lock();
-            ks.is_key_active(schedule.key_id).unwrap_or(false)
-        };
-        if !key_active {
-            tracing::debug!(
-                event_type = "scheduler_skip",
-                schedule_id = schedule.id,
-                key_id = schedule.key_id,
-                "skipping schedule: owning key is inactive"
-            );
+        // Gate on key liveness in the fleet keystore (AC6).
+        if !owning_key_is_usable(key_store, schedule.id, schedule.key_id).await {
             continue;
         }
 
@@ -245,6 +258,43 @@ fn poll_and_execute(
     }
 }
 
+/// Whether the schedule's owning key may still run scheduled queries: it
+/// must be live in the fleet keystore (active + unexpired) AND hold a trawl
+/// grant whose role still carries both [`Permission::Query`] and
+/// [`Permission::SavedQuery`] — the two authorities a scheduled saved-query
+/// run exercises. Revocation, expiry, grant-stripping, AND role downgrades
+/// (analyst → reader/ingest) all stop scheduled execution (AC6): a role that
+/// lacks either permission can no longer create or run saved queries
+/// interactively, so it must not keep running them on a schedule. Lookup
+/// failures skip conservatively.
+async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> bool {
+    let live = match key_store.get_live_key_by_id(key_id).await {
+        Ok(live) => live,
+        Err(e) => {
+            tracing::warn!(
+                event_type = "scheduler_error",
+                schedule_id,
+                key_id,
+                error = %e,
+                "failed to check key liveness; skipping schedule this tick"
+            );
+            return false;
+        }
+    };
+    let usable = live.is_some_and(|k| {
+        k.has_permission(Permission::Query) && k.has_permission(Permission::SavedQuery)
+    });
+    if !usable {
+        tracing::info!(
+            event_type = "scheduler_skip",
+            schedule_id,
+            key_id,
+            "skipping schedule: owning key is revoked, expired, or lacks query/saved-query permission"
+        );
+    }
+    usable
+}
+
 pub(crate) async fn execute_scheduled_query(
     schedule_store: Arc<Mutex<ScheduleStore>>,
     pool: ExecutorPool,
@@ -258,7 +308,9 @@ pub(crate) async fn execute_scheduled_query(
     let timeout = Duration::from_secs(timeout_secs);
 
     // Execute the query on the pool (no debug capture, UTC timestamps).
-    let outcome = pool.execute(query, timeout, false, 0).await;
+    let outcome = pool
+        .execute(pool.allocate_query_id(), query, timeout, false, 0)
+        .await;
 
     #[allow(clippy::cast_possible_truncation)]
     let duration_ms = start.elapsed().as_millis() as u64;

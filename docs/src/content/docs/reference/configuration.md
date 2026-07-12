@@ -77,12 +77,12 @@ The `tls_reload_interval_secs` setting polls the cert/key files for content chan
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `db_path` | path | *(required)* | SQLite database for API keys and roles |
-| `audit_interval_secs` | integer | `30` | Poll for key changes from `trawl-admin`; `0` disables |
-| `auth_cache_ttl_secs` | integer | `300` | In-memory token cache TTL; verified tokens skip argon2id |
+| `database_url` | string | *(required unless `DATABASE_URL` is set)* | Fleet-auth postgres keystore URL — API keys and roles live here. The `DATABASE_URL` environment variable takes precedence |
+| `db_path` | path | *(required)* | Transitional SQLite store for query history, saved queries, and schedules. Must be a fresh file (e.g. `store.db`) — trawld refuses to start on the legacy `auth.db` |
+| `audit_interval_secs` | integer | `30` | Poll the fleet keystore for key changes from `fleet-admin`; `0` disables |
 
 :::note
-Revoked keys remain valid for up to `auth_cache_ttl_secs` (default 5 minutes) on cache hits. For security-sensitive deployments, reduce this value. Setting it to `0` disables the cache entirely but increases CPU load from argon2id hashing on every request.
+trawld will not start until the fleet database is reachable and migrated (`fleet-admin migrate`). Key revocation takes effect immediately — liveness is checked in postgres on every request (the old `auth_cache_ttl_secs` token cache is gone). See the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for migrating an existing deployment.
 :::
 
 ### `[ingest]`
@@ -197,7 +197,8 @@ ingest = 1000
 path = "/var/lib/trawl/data"
 
 [auth]
-db_path = "/var/lib/trawl/auth.db"
+database_url = "postgres://fleet:CHANGE_ME@db.internal:5432/fleet"
+db_path = "/var/lib/trawl/store.db"
 
 [ingest]
 enabled = true

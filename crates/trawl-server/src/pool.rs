@@ -29,11 +29,13 @@ use crate::error::ServerError;
 use crate::hot_buffer::HotBuffer;
 use crate::source::compute_source;
 
-/// Test-only delay injected into the blocking query task so timeout tests
-/// can reliably win the `select!` race. Zero means no delay. Only compiled
-/// in test builds.
-#[cfg(test)]
-pub(crate) static TEST_QUERY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+/// Test-only delay injected into the blocking query task so timeout and
+/// cancellation tests can reliably win the `select!`/cancel race. Zero means
+/// no delay. Compiled for unit tests and, via the `test-support` feature,
+/// for this crate's own integration tests — no production consumer enables
+/// that feature, so release builds never carry it.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_QUERY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Type-erased interrupt callback, keyed by monotonic query ID.
 type InterruptMap = HashMap<u64, Box<dyn Fn() + Send + Sync>>;
@@ -344,7 +346,21 @@ impl ExecutorPool {
         self.idle.lock().push(executor);
     }
 
+    /// Allocate a query id from the pool's counter.
+    ///
+    /// This is the single id authority: callers pass the returned id to
+    /// [`execute`](Self::execute) / [`execute_with_source`](Self::execute_with_source) /
+    /// [`export_parquet`](Self::export_parquet), and — when the query is
+    /// user-visible — to `QueryTracker::start`, so `/queries` listings and
+    /// [`cancel_by_id`](Self::cancel_by_id) speak the same id space.
+    pub fn allocate_query_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Execute a DSL query, blocking on semaphore acquisition if at capacity.
+    ///
+    /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id);
+    /// it keys the interrupt handle for [`cancel_by_id`](Self::cancel_by_id).
     ///
     /// If the query exceeds `timeout`, the `DuckDB` connection is interrupted
     /// and the query is aborted. The executor is reclaimed asynchronously
@@ -357,6 +373,7 @@ impl ExecutorPool {
     #[allow(clippy::too_many_lines)]
     pub async fn execute(
         &self,
+        query_id: u64,
         dsl: &str,
         timeout: Duration,
         capture_debug: bool,
@@ -407,9 +424,9 @@ impl ExecutorPool {
             // Send interrupt handle to async side before running the query.
             let _ = interrupt_tx.send(executor.interrupt_handle());
 
-            // Test-only: sleep before the query so timeout tests can
-            // reliably win the select! race against spawn_blocking.
-            #[cfg(test)]
+            // Test-only: sleep before the query so timeout/cancellation tests
+            // can reliably win the race against spawn_blocking.
+            #[cfg(any(test, feature = "test-support"))]
             {
                 let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
                 if delay > 0 {
@@ -446,8 +463,7 @@ impl ExecutorPool {
         // Receive interrupt handle (may fail if the task panics before sending).
         let interrupt = interrupt_rx.await.ok();
 
-        // Register the interrupt handle for shutdown cancellation.
-        let query_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Register the interrupt handle for shutdown/API cancellation.
         if let Some(ref handle) = interrupt {
             let h = Arc::clone(handle);
             self.active_interrupts
@@ -503,6 +519,8 @@ impl ExecutorPool {
 
     /// Execute a DSL query with a pre-computed source, skipping glob computation.
     ///
+    /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id).
+    ///
     /// Used for `| from saved` queries where the source is a `read_parquet()`
     /// expression pointing at scheduled result files, not the normal data dir.
     /// The hot buffer is intentionally skipped — saved query results are
@@ -510,6 +528,7 @@ impl ExecutorPool {
     #[allow(clippy::too_many_lines)]
     pub async fn execute_with_source(
         &self,
+        query_id: u64,
         dsl: &str,
         source: &str,
         timeout: Duration,
@@ -557,7 +576,7 @@ impl ExecutorPool {
             let _permit = permit;
             let _ = interrupt_tx.send(executor.interrupt_handle());
 
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
                 if delay > 0 {
@@ -587,7 +606,6 @@ impl ExecutorPool {
 
         let interrupt = interrupt_rx.await.ok();
 
-        let query_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Some(ref handle) = interrupt {
             let h = Arc::clone(handle);
             self.active_interrupts
@@ -722,10 +740,13 @@ impl ExecutorPool {
 
     /// Export query results to Parquet via `DuckDB` `COPY TO`.
     ///
+    /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id).
+    ///
     /// Acquires a pool executor, writes to a temp file, and returns the
     /// raw bytes. Respects the hot buffer for fresh event visibility.
     pub async fn export_parquet(
         &self,
+        query_id: u64,
         dsl: &str,
         max_rows: usize,
         timeout: Duration,
@@ -794,7 +815,6 @@ impl ExecutorPool {
 
         let interrupt = interrupt_rx.await.ok();
 
-        let query_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Some(ref handle) = interrupt {
             let h = Arc::clone(handle);
             self.active_interrupts
@@ -857,7 +877,13 @@ mod tests {
         let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
         // Must start with `|` to trigger a parse error — bare text is valid DSL.
         let outcome = pool
-            .execute("| | invalid", Duration::from_secs(10), false, 0)
+            .execute(
+                pool.allocate_query_id(),
+                "| | invalid",
+                Duration::from_secs(10),
+                false,
+                0,
+            )
             .await;
         assert!(outcome.result.is_err());
     }
@@ -867,7 +893,13 @@ mod tests {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // just verifying it doesn't panic with a single permit
         let _ = pool
-            .execute("service:test", Duration::from_secs(10), false, 0)
+            .execute(
+                pool.allocate_query_id(),
+                "service:test",
+                Duration::from_secs(10),
+                false,
+                0,
+            )
             .await;
     }
 
@@ -879,10 +911,22 @@ mod tests {
         // should have the same number of idle executors before and after.
         let idle_before = pool.idle.lock().len();
         let _ = pool
-            .execute("service:test", Duration::from_secs(10), false, 0)
+            .execute(
+                pool.allocate_query_id(),
+                "service:test",
+                Duration::from_secs(10),
+                false,
+                0,
+            )
             .await;
         let _ = pool
-            .execute("service:test", Duration::from_secs(10), false, 0)
+            .execute(
+                pool.allocate_query_id(),
+                "service:test",
+                Duration::from_secs(10),
+                false,
+                0,
+            )
             .await;
         let idle_after = pool.idle.lock().len();
 
@@ -909,7 +953,15 @@ mod tests {
         // Make the blocking task sleep so the timeout reliably fires first.
         TEST_QUERY_DELAY_MS.store(200, Ordering::Relaxed);
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
-        let outcome = pool.execute("*", Duration::from_millis(10), false, 0).await;
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "*",
+                Duration::from_millis(10),
+                false,
+                0,
+            )
+            .await;
         TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
         assert!(
             matches!(outcome.result, Err(ServerError::Timeout)),
@@ -926,7 +978,15 @@ mod tests {
         let idle_before = pool.idle.lock().len();
 
         // Trigger a timeout.
-        let _ = pool.execute("*", Duration::from_millis(10), false, 0).await;
+        let _ = pool
+            .execute(
+                pool.allocate_query_id(),
+                "*",
+                Duration::from_millis(10),
+                false,
+                0,
+            )
+            .await;
 
         // Wait for the blocking task to finish (200ms delay) + margin
         // for the async reclamation task to push the executor back.

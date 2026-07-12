@@ -46,9 +46,10 @@ data:
     path = {{ .Values.config.data.path | quote }}
 
     [auth]
+    # database_url deliberately absent: the fleet keystore DSN is injected
+    # as the DATABASE_URL env var from a Secret (never rendered here).
     db_path = {{ .Values.config.auth.dbPath | quote }}
     audit_interval_secs = {{ .Values.config.auth.auditIntervalSecs | int }}
-    auth_cache_ttl_secs = {{ .Values.config.auth.authCacheTtlSecs | int }}
 
     [ingest]
     enabled = {{ .Values.config.ingest.enabled }}

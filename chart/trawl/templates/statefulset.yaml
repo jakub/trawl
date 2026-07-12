@@ -5,7 +5,8 @@ metadata:
   labels:
     {{- include "trawl.labels" . | nindent 4 }}
 spec:
-  # Single-node only — multiple replicas would corrupt the SQLite auth database.
+  # Single-node only — multiple replicas would corrupt the transitional
+  # SQLite app-state store (history/saved/schedules).
   replicas: 1
   serviceName: {{ include "trawl.fullname" . }}
   selector:
@@ -31,38 +32,24 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.config.server.shutdownDrainSecs }}
       {{- if .Values.initAuth.enabled }}
       initContainers:
+        # Apply fleet-auth keystore schema migrations. Idempotent by
+        # construction (sqlx tracks applied migrations), so it runs on every
+        # pod start — no sentinel file. Key minting moved to the cutover
+        # runbook (fleet-admin against the shared keystore).
         - name: init-auth
           image: {{ include "trawl.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["sh", "-c"]
-          args:
-            - |
-              if [ -f /var/lib/trawl/auth.db ]; then
-                echo "auth.db already exists, skipping bootstrap"
-                exit 0
-              fi
-              echo "=== bootstrapping auth database ==="
-              echo ""
-              echo "--- admin token ---"
-              trawl-admin --db /var/lib/trawl/auth.db keys create \
-                --role admin --name {{ .Values.initAuth.keyName | quote }}
-              echo ""
-              {{- if .Values.initAuth.createIngestKey }}
-              echo "--- ingest token ---"
-              trawl-admin --db /var/lib/trawl/auth.db keys create \
-                --role ingest --name {{ .Values.initAuth.ingestKeyName | quote }}
-              echo ""
-              {{- end }}
-              echo "=== retrieve tokens with: kubectl logs {{ include "trawl.fullname" . }}-0 -c init-auth ==="
+          command: ["fleet-admin", "migrate"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.database.existingSecret is required (Secret holding the fleet keystore DATABASE_URL)" .Values.auth.database.existingSecret }}
+                  key: {{ .Values.auth.database.existingSecretKey }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.initAuth.resources | nindent 12 }}
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/trawl
-            - name: tmp
-              mountPath: /tmp
       {{- end }}
       containers:
         - name: trawld
@@ -84,6 +71,12 @@ spec:
           env:
             - name: HOME
               value: /var/lib/trawl
+            # Fleet keystore DSN — from the Secret, never the ConfigMap.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.database.existingSecret is required (Secret holding the fleet keystore DATABASE_URL)" .Values.auth.database.existingSecret }}
+                  key: {{ .Values.auth.database.existingSecretKey }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- if .Values.crashDump.enabled }}
@@ -102,18 +95,21 @@ spec:
               scheme: HTTPS
             failureThreshold: 30
             periodSeconds: 2
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /api/v1/health
               port: https
               scheme: HTTPS
             periodSeconds: 30
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /api/v1/health
               port: https
               scheme: HTTPS
             periodSeconds: 10
+            timeoutSeconds: 5
           securityContext:
             {{- include "trawl.trawldSecurityContext" . | nindent 12 }}
           resources:

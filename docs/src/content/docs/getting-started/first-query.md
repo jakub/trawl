@@ -38,7 +38,9 @@ See the [configuration reference](/reference/configuration/) for all available o
 In a separate terminal, create a key for yourself:
 
 ```bash
-trawl-admin keys create --role admin --name "my-key"
+# key management lives in fleet-admin (requires DATABASE_URL pointing at
+# the fleet postgres keystore — see the configuration reference)
+fleet-admin keys create --name "my-key" --kind human --grant trawl:admin
 ```
 
 This prints the token once:

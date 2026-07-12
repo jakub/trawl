@@ -107,6 +107,9 @@ pub enum ErrorCode {
     AuthError,
     /// Insufficient permissions.
     Unauthorized,
+    /// Authenticated but not authorized for this app (403) — e.g. a fleet
+    /// key with no trawl grant.
+    Forbidden,
     /// Generic malformed input.
     BadRequest,
     /// Resource not found.

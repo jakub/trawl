@@ -11,6 +11,7 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::{Extension, Json};
+use fleet_auth::VerifiedKey;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
@@ -23,8 +24,6 @@ use trawl_api::{
     SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest,
     StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
-use trawl_auth::keys::VerifiedKey;
-use trawl_auth::roles::Permission;
 use trawl_auth::schedule::{ReportRun, format_interval, parse_interval};
 use trawl_auth::{HistoryEntry, SavedQuery};
 use trawl_engine::value::{QueryResult, Value};
@@ -35,6 +34,7 @@ use std::sync::Arc;
 
 use crate::bus::{EventBus, EventSubscriber as _};
 use crate::error::ServerError;
+use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
 use crate::scheduler::execute_scheduled_query;
@@ -81,7 +81,10 @@ pub async fn query(
         "executing query"
     );
 
-    let query_id = state.query.tracker.start(&verified, &req.query);
+    // One id from the pool's counter keys the tracker entry AND the pool's
+    // interrupt map, so cancel-by-id interrupts the query the client sees.
+    let query_id = state.query.pool.allocate_query_id();
+    state.query.tracker.start(query_id, &verified, &req.query);
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
     // Resolve timezone from request (default to UTC when absent).
@@ -95,7 +98,7 @@ pub async fn query(
 
     let role_str = verified
         .trawl_role()
-        .map_or("none", trawl_auth::roles::Role::as_str)
+        .map_or("none", crate::policy::Role::as_str)
         .to_owned();
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
@@ -107,6 +110,7 @@ pub async fn query(
             .query
             .pool
             .execute_with_source(
+                query_id,
                 &resolved.remaining_dsl,
                 &resolved.source,
                 timeout,
@@ -118,7 +122,13 @@ pub async fn query(
         state
             .query
             .pool
-            .execute(&req.query, timeout, capture_debug, utc_offset_secs)
+            .execute(
+                query_id,
+                &req.query,
+                timeout,
+                capture_debug,
+                utc_offset_secs,
+            )
             .await
     };
 
@@ -135,18 +145,21 @@ pub async fn query(
             state.query.tracker.complete(query_id, total);
 
             // Auto-save successful queries to history (per user preference).
-            if let Ok(key_id) = state
-                .auth
-                .key_store
-                .lock()
-                .get_key_id_by_prefix(&verified.prefix)
-            {
-                let _ = state.auth.history.lock().record_query(
-                    key_id,
-                    &req.query,
-                    duration_ms,
-                    total,
-                    "success",
+            // verified.id is the authoritative fleet keystore id. Best-effort:
+            // a history-store write failure must not fail the query, but log it
+            // so a broken store (disk-full, SQLITE_BUSY, corruption) is visible.
+            if let Err(e) = state.auth.history.lock().record_query(
+                verified.id,
+                &req.query,
+                duration_ms,
+                total,
+                "success",
+            ) {
+                tracing::warn!(
+                    event_type = "history_error",
+                    key_id = verified.id,
+                    error = %e,
+                    "failed to record query in history store"
                 );
             }
 
@@ -304,12 +317,21 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
 
 /// `GET /api/v1/health` — unauthenticated health check with subsystem probes.
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
-    // Run duckdb ping (async) concurrently with synchronous checks.
+    // Run duckdb and fleet keystore pings concurrently.
+    //
+    // `/health` is unauthenticated and unthrottled — it sits outside
+    // `require_bearer_only` and `rate_limit_middleware` — so it must not amplify a
+    // burst of probes onto the small, shared keystore pool that bearer
+    // verification depends on. `AuthState::ping_cached` memoises the ping for a
+    // few seconds and serialises refreshes, collapsing any burst into at most
+    // one in-flight connection. It is also timeout-bounded, so a slow/downed
+    // keystore reports an unhealthy auth subsystem (non-critical → `Degraded` →
+    // HTTP 200) instead of stalling this liveness path.
     let pool = state.query.pool.clone();
-    let duckdb_result = tokio::spawn(async move { pool.ping().await });
-
-    // Auth db: synchronous, runs under the parking_lot mutex.
-    let auth_result = state.auth.key_store.lock().ping();
+    let (duckdb_join, auth_result) = tokio::join!(
+        tokio::spawn(async move { pool.ping().await }),
+        state.auth.ping_cached(),
+    );
 
     // Data path: check that the base directory exists and is readable.
     let base_dir = state.query.pool.base_dir().to_owned();
@@ -327,9 +349,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
             |_| Ok(()),
         );
 
-    // Await duckdb result.
-    let duckdb_ok = duckdb_result
-        .await
+    let duckdb_ok = duckdb_join
         .map_err(|e| format!("task join error: {e}"))
         .and_then(|r| r.map_err(|e| e.to_string()));
 
@@ -592,17 +612,14 @@ pub async fn cancel_query(
     Extension(verified): Extension<VerifiedKey>,
     Path(query_id): Path<u64>,
 ) -> Result<Json<CancelResponse>, ServerError> {
-    // admin can cancel any query, QueryCancel holders can cancel their own
+    // Admin can cancel any query; QueryCancel holders can cancel their own.
+    // Ownership is authorized by exact key id — names are mutable and
+    // non-unique, so two keys sharing a name must NOT be able to cancel
+    // each other's queries (`user` stays display-only).
     let can_cancel = if verified.has_permission(Permission::ServerManage) {
         true
     } else if verified.has_permission(Permission::QueryCancel) {
-        state
-            .query
-            .tracker
-            .active()
-            .iter()
-            .find(|q| q.id == query_id)
-            .is_some_and(|q| q.user == verified.name)
+        state.query.tracker.owner_key_id(query_id) == Some(verified.id)
     } else {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     };
@@ -711,8 +728,8 @@ pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIR
     Json(WhoAmIResponse {
         prefix: verified.prefix.clone(),
         name: verified.name.clone(),
-        kind: verified.kind,
-        assignments: verified.assignments.clone(),
+        kind: crate::policy::wire_kind(verified.kind),
+        assignments: crate::policy::wire_assignments(&verified.assignments),
         permissions,
     })
 }
@@ -883,13 +900,8 @@ pub async fn history(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    // Get the key_id for this user's prefix.
-    let key_id = state
-        .auth
-        .key_store
-        .lock()
-        .get_key_id_by_prefix(&verified.prefix)
-        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+    // The verified key carries the authoritative fleet keystore id.
+    let key_id = verified.id;
 
     let limit = params.limit.unwrap_or(100).min(1000);
     let offset = params.offset.unwrap_or(0);
@@ -942,12 +954,7 @@ pub async fn list_saved(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = state
-        .auth
-        .key_store
-        .lock()
-        .get_key_id_by_prefix(&verified.prefix)
-        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+    let key_id = verified.id;
 
     let queries = state
         .auth
@@ -991,12 +998,7 @@ pub async fn create_saved(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = state
-        .auth
-        .key_store
-        .lock()
-        .get_key_id_by_prefix(&verified.prefix)
-        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+    let key_id = verified.id;
 
     let saved = state
         .auth
@@ -1024,12 +1026,7 @@ pub async fn update_saved(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = state
-        .auth
-        .key_store
-        .lock()
-        .get_key_id_by_prefix(&verified.prefix)
-        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+    let key_id = verified.id;
 
     let saved = state
         .auth
@@ -1062,12 +1059,7 @@ pub async fn delete_saved(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = state
-        .auth
-        .key_store
-        .lock()
-        .get_key_id_by_prefix(&verified.prefix)
-        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))?;
+    let key_id = verified.id;
 
     // Collect parquet file paths before deletion (FK CASCADE will wipe run rows).
     let run_paths = state
@@ -1149,16 +1141,6 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
 
 // -- schedule handlers -------------------------------------------------------
 
-/// Resolve `key_id` from verified token prefix.
-fn resolve_key_id(state: &AppState, verified: &VerifiedKey) -> Result<i64, ServerError> {
-    state
-        .auth
-        .key_store
-        .lock()
-        .get_key_id_by_prefix(&verified.prefix)
-        .map_err(|e| ServerError::Internal(format!("failed to lookup key_id: {e}")))
-}
-
 /// Remove parquet files for deleted report runs (best-effort, logs warnings on failure).
 fn cleanup_run_parquet_files(state: &AppState, relative_paths: &[String]) {
     if relative_paths.is_empty() {
@@ -1199,7 +1181,7 @@ fn try_resolve_from_saved(
         return Ok(None);
     };
 
-    let key_id = resolve_key_id(state, verified)?;
+    let key_id = verified.id;
 
     // Lock both stores for the duration of resolution.
     let saved_store = state.auth.saved.lock();
@@ -1233,7 +1215,7 @@ pub async fn set_schedule(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = resolve_key_id(&state, &verified)?;
+    let key_id = verified.id;
     let interval_secs = parse_interval(&req.interval)
         .map_err(|e| ServerError::BadRequest(format!("invalid interval: {e}")))?;
 
@@ -1287,7 +1269,7 @@ pub async fn get_schedule(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = resolve_key_id(&state, &verified)?;
+    let key_id = verified.id;
     let schedule_store = state.auth.schedule.lock();
 
     let schedule = schedule_store
@@ -1311,7 +1293,7 @@ pub async fn delete_schedule(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = resolve_key_id(&state, &verified)?;
+    let key_id = verified.id;
 
     // Collect parquet file paths before deletion (FK CASCADE will wipe the rows).
     let run_paths = {
@@ -1359,7 +1341,7 @@ pub async fn list_report_runs(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = resolve_key_id(&state, &verified)?;
+    let key_id = verified.id;
     let schedule_store = state.auth.schedule.lock();
 
     let runs = schedule_store
@@ -1388,7 +1370,7 @@ pub async fn list_all_runs(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = resolve_key_id(&state, &verified)?;
+    let key_id = verified.id;
     let schedule_store = state.auth.schedule.lock();
 
     let runs = schedule_store
@@ -1423,7 +1405,7 @@ pub async fn runs_stats(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = resolve_key_id(&state, &verified)?;
+    let key_id = verified.id;
     let schedule_store = state.auth.schedule.lock();
 
     let (total_runs, success_count, error_count, timeout_count, avg_duration_ms) = schedule_store
@@ -1453,7 +1435,7 @@ pub async fn trigger_run(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = resolve_key_id(&state, &verified)?;
+    let key_id = verified.id;
 
     // Look up the saved query.
     let saved = state
@@ -1540,7 +1522,7 @@ pub async fn get_report_run(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let key_id = resolve_key_id(&state, &verified)?;
+    let key_id = verified.id;
 
     // Fetch run metadata and legacy blob under one lock, then release
     // before any async work (parking_lot guards are not Send).
@@ -1653,7 +1635,12 @@ pub async fn export(
         let bytes = state
             .query
             .pool
-            .export_parquet(&req.query, limit, timeout)
+            .export_parquet(
+                state.query.pool.allocate_query_id(),
+                &req.query,
+                limit,
+                timeout,
+            )
             .await?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -1689,7 +1676,13 @@ pub async fn export(
     let outcome = state
         .query
         .pool
-        .execute(&req.query, timeout, capture_debug, 0)
+        .execute(
+            state.query.pool.allocate_query_id(),
+            &req.query,
+            timeout,
+            capture_debug,
+            0,
+        )
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
