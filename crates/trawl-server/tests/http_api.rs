@@ -619,17 +619,29 @@ async fn dashboard_rejects_analyst(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn dashboard_returns_503_before_collector_runs(pool: sqlx::PgPool) {
-    // Test harness doesn't spawn the snapshot collector, so the endpoint
-    // returns 503 Service Unavailable (snapshot is None).
+async fn dashboard_becomes_available_once_collector_ticks(pool: sqlx::PgPool) {
+    // The harness spawns the snapshot collector (same as trawld's main());
+    // before its first tick the endpoint is 503 (snapshot is None), after
+    // it the snapshot serves. Poll briefly.
     let server = setup(pool).await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
-    let result = admin.dashboard().await;
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 503),
-        other => panic!("expected 503, got: {other:?}"),
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match admin.dashboard().await {
+            Ok(snapshot) => {
+                assert!(snapshot.pool_capacity > 0);
+                return;
+            }
+            Err(trawl_client::ClientError::Server { status: 503, .. }) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "dashboard never became available"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
     }
 }
 

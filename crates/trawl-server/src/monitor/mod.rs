@@ -59,11 +59,6 @@ pub fn spawn_snapshot_collector(
     scheduler_enabled: bool,
     syslog_enabled: bool,
 ) -> tokio::task::JoinHandle<()> {
-    // The enabled-schedule count lives in postgres now; the async collector
-    // loop owns that (store) access and pushes the value into the sync
-    // MonitorState. Refreshed every ~30s — it changes rarely.
-    const SCHEDULE_COUNT_REFRESH_TICKS: u32 = 30;
-
     tokio::spawn(async move {
         let mut monitor = state::from_app_state(
             app_state.clone(),
@@ -75,25 +70,24 @@ pub fn spawn_snapshot_collector(
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut schedule_count_counter = SCHEDULE_COUNT_REFRESH_TICKS; // fetch on first tick
-
         loop {
             interval.tick().await;
 
+            // The enabled-schedule count lives in postgres now; the async
+            // collector loop owns that (store) access and pushes the value
+            // into the sync MonitorState. One indexed COUNT(*) per second
+            // on a tiny table is negligible, and per-tick refresh keeps the
+            // dashboard (and its tests) current.
             if monitor.scheduler_enabled() {
-                schedule_count_counter += 1;
-                if schedule_count_counter >= SCHEDULE_COUNT_REFRESH_TICKS {
-                    schedule_count_counter = 0;
-                    match app_state.storage.schedule.count_enabled_schedules().await {
-                        Ok(count) => {
-                            monitor.set_schedule_count(usize::try_from(count).unwrap_or_default());
-                        }
-                        Err(e) => tracing::debug!(
-                            event_type = "monitor_schedule_count_error",
-                            error = %e,
-                            "failed to refresh enabled-schedule count"
-                        ),
+                match app_state.storage.schedule.count_enabled_schedules().await {
+                    Ok(count) => {
+                        monitor.set_schedule_count(usize::try_from(count).unwrap_or_default());
                     }
+                    Err(e) => tracing::debug!(
+                        event_type = "monitor_schedule_count_error",
+                        error = %e,
+                        "failed to refresh enabled-schedule count"
+                    ),
                 }
             }
 

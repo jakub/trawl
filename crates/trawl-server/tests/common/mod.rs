@@ -108,10 +108,11 @@ pub fn fleet_database_url(pool: &PgPool) -> String {
 /// return its DSN. trawld's real boot path migrates it (AC5).
 pub async fn create_app_database(pool: &PgPool) -> String {
     sweep_stale_app_databases(pool).await;
-    // The pid is encoded in the name so future runs can tell an abandoned
-    // database (owner process gone) from a live sibling's.
+    // The run marker + owner pid are encoded in the name so future runs can
+    // tell an abandoned database from a live sibling's (see the sweep).
     let name = format!(
-        "trawl_app_test_{}_{}",
+        "trawl_app_test_{}_{}_{}",
+        run_marker(),
         std::process::id(),
         random_db_suffix()
     );
@@ -119,6 +120,19 @@ pub async fn create_app_database(pool: &PgPool) -> String {
         .await
         .expect("CREATE DATABASE for app store — does the role have CREATEDB?");
     swap_database(&admin_database_url(), &name)
+}
+
+/// A marker shared by every test process of THIS nextest run (nextest
+/// exposes `NEXTEST_RUN_ID`; plain `cargo test` shares one process, so the
+/// pid suffices as fallback). Only alphanumerics survive, for db-name
+/// safety.
+fn run_marker() -> String {
+    std::env::var("NEXTEST_RUN_ID")
+        .unwrap_or_else(|_| std::process::id().to_string())
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect()
 }
 
 /// Best-effort sweep of sibling app databases leaked by earlier runs.
@@ -479,6 +493,17 @@ pub async fn setup_in_dir(
     let (state, http_config) = AppState::from_config(&config, test_metrics_handle())
         .await
         .expect("failed to create app state");
+
+    // Snapshot collector: makes GET /api/v1/dashboard live in tests, same
+    // as trawld's main() does in production.
+    let _collector = trawl_server::monitor::spawn_snapshot_collector(
+        state.clone(),
+        addr.clone(),
+        config.server.max_sse_connections,
+        config.scheduler.enabled,
+        false,
+    );
+
     let server_config = config.server.clone();
     let state_dir = config.state_dir();
     tokio::spawn(async move {

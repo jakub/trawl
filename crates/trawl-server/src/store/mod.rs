@@ -44,6 +44,9 @@ const ADVISORY_LOCK_KEY: i64 = 0x0074_7261_776c_2131; // "trawl!1"
 /// the sole writer and the workload is light CRUD.
 const MAX_CONNECTIONS: u32 = 8;
 
+/// Bound on the boot-time connection attempt (see `connect`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// App-state storage: one shared pool, three store facades, and the session
 /// connection holding the sole-writer advisory lock. Cheap to clone.
 #[derive(Debug, Clone)]
@@ -73,6 +76,11 @@ impl StorageState {
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
+            // Boot fails fast on an unreachable database instead of
+            // spinning inside sqlx's default 30s acquire deadline — the
+            // supervisor (systemd/k8s) owns retry policy, and the startup
+            // error names the provisioning runbook.
+            .acquire_timeout(CONNECT_TIMEOUT)
             .connect(database_url)
             .await
             .map_err(StoreError::Unavailable)?;

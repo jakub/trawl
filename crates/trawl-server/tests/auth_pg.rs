@@ -799,3 +799,119 @@ async fn sse_stream_rejects_revoked_key_at_handshake(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 401);
 }
+
+// ---------------------------------------------------------------------------
+// AC9 (slice 3): storage-loss observability + redacted store errors
+// ---------------------------------------------------------------------------
+
+/// Killing the app-state database under a running server degrades /health
+/// (HTTP 200 — queries still serve) and turns store-backed endpoints into
+/// redacted 503s. Never a pg diagnostic on the wire.
+#[sqlx::test(migrations = false)]
+async fn storage_loss_degrades_health_and_503s_store_endpoints(pool: PgPool) {
+    let server = setup(pool).await;
+    let client = raw_client();
+
+    server.kill_app_database().await;
+
+    // The storage ping is memoised (~5s TTL) — poll until degradation
+    // propagates. The HTTP status must stay 200 throughout: app-state loss
+    // is non-critical (degraded), never a liveness failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let resp = client
+            .get(format!("{}/api/v1/health", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "storage loss must be Degraded + HTTP 200"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        if body["status"] == "degraded" {
+            let storage = body["checks"]["storage_db"].as_str().unwrap_or_default();
+            assert!(storage.starts_with("error:"), "got: {body}");
+            assert_eq!(body["checks"]["duckdb"], "ok", "got: {body}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "health never degraded: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Store-backed endpoint: 503 with the fixed redacted envelope.
+    let (status, body) = request(
+        &server.url,
+        reqwest::Method::GET,
+        "/api/v1/history",
+        Some(&server.analyst_token),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": {
+                "code": "service_unavailable",
+                "message": "app-state store unavailable"
+            }
+        }),
+        "503 must not leak postgres details"
+    );
+}
+
+/// `/api/v1/dashboard` reports the enabled-schedule count from postgres:
+/// the async snapshot collector polls the store and the sync snapshot
+/// carries it onto the wire.
+#[sqlx::test(migrations = false)]
+async fn dashboard_reports_schedule_count_from_pg(pool: PgPool) {
+    let server = setup(pool).await;
+    let client = raw_client();
+
+    // Create a saved query + schedule through the API.
+    let resp = client
+        .post(format!("{}/api/v1/saved", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({"name": "dash-net", "query": "* | head 1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let saved: serde_json::Value = resp.json().await.unwrap();
+    let saved_id = saved["id"].as_i64().unwrap();
+
+    let resp = client
+        .put(format!("{}/api/v1/saved/{saved_id}/schedule", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({"interval": "1h"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // The collector ticks every second; poll the dashboard until the count
+    // lands.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = request(
+            &server.url,
+            reqwest::Method::GET,
+            "/api/v1/dashboard",
+            Some(&server.admin_token),
+        )
+        .await;
+        if status == 200 && body["scheduler_schedules"] == 1 {
+            assert_eq!(body["scheduler_enabled"], true, "got: {body}");
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dashboard never showed the schedule: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
