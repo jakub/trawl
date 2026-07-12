@@ -47,18 +47,30 @@ pub struct LoginResponse {
     pub role: String,
 }
 
-/// Reject cross-origin browser requests to state-changing auth endpoints.
+/// Reject cross-origin browser requests to cookie-authed, state-changing
+/// endpoints.
 ///
 /// Delegates to the shared [`fleet_auth::check_origin`] — the same
 /// present-only decision, log fields, and message that the fleet-auth
 /// substrate handlers use (ADR-0004 slice 2) — and maps its rejection onto
 /// this proxy's [`ProxyError::OriginMismatch`].
 ///
+/// Used by the auth endpoints (`login`/`logout`) AND by the cookie-authed
+/// branch of the generic proxy forwarder (`routes::proxy`): the shared
+/// `fleet_session` cookie is `SameSite=Lax` and (in SSO mode) scoped to the
+/// parent domain, so the browser attaches it to same-site *sibling*-origin
+/// requests — this is the only thing standing between a compromised sibling
+/// app and a forged state-changing request carrying the victim's session.
+///
 /// The request host is read from the `Host` header, falling back to the URI's
 /// `:authority` — under HTTP/2 browsers send `:authority` instead of a `Host`
 /// header, and a Host-only lookup would be `None`, so a present-Origin
-/// same-origin login/logout would be wrongly rejected (403, no `Set-Cookie`).
-fn check_origin(headers: &HeaderMap, uri: &Uri, handler: &str) -> Result<(), ProxyError> {
+/// same-origin request would be wrongly rejected (403, no `Set-Cookie`).
+pub(crate) fn check_origin(
+    headers: &HeaderMap,
+    uri: &Uri,
+    handler: &str,
+) -> Result<(), ProxyError> {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers
         .get(header::HOST)

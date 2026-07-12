@@ -77,6 +77,21 @@ async fn do_forward(
     let http = state.http();
     let (parts, body) = req.into_parts();
 
+    // CSRF defense for cookie-authed requests. The shared `fleet_session`
+    // cookie is `SameSite=Lax` and (in SSO mode) scoped to the parent domain,
+    // so the browser attaches it to same-site *sibling*-origin requests
+    // (`coastwatch.fleet…` → `trawl.fleet…`) — including mutating POST/PUT/
+    // DELETE. Without this check a victim loading attacker content on any
+    // sibling origin could forge state-changing calls carrying their session
+    // (delete/create saved queries, cancel queries, trigger exports). Reuse
+    // the same present-only Origin guard the auth endpoints use, before the
+    // victim's bearer token is ever forwarded upstream. Bearer clients
+    // (CLI/API) hold no cookie, send no `Origin`, and are not CSRF targets —
+    // so the guard applies only to the `Session` branch.
+    if matches!(auth, Auth::Session(_)) {
+        crate::routes::auth::check_origin(&parts.headers, &parts.uri, "proxy")?;
+    }
+
     let upstream_uri = build_upstream_uri(base, &parts.uri, strip_prefix)?;
 
     let mut upstream_req = http
@@ -683,5 +698,148 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -- CSRF / origin validation on mutating proxy routes ----------------
+
+    #[tokio::test]
+    async fn forward_rejects_cookie_authed_sibling_origin_mutation() {
+        // The shared `fleet_session` cookie is SameSite=Lax, so the browser
+        // attaches it to same-site *sibling*-origin POSTs (a compromised
+        // coastwatch.fleet… forging a write to trawl.fleet…). Present-only
+        // Origin validation must reject it BEFORE the victim's bearer token
+        // reaches trawld. No upstream mock is mounted for the route: a 403
+        // (not a forwarded 404) proves the request was blocked at the proxy.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("cookie", &cookie)
+            .header("origin", "https://coastwatch.fleet.test")
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"x","dsl":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a rejected cross-origin mutation must not touch the cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_allows_cookie_authed_same_origin_mutation() {
+        // Same-origin POST from the SPA carries a matching Origin and must
+        // pass through to upstream.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/saved"))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("cookie", &cookie)
+            .header("origin", "https://trawl.fleet.test")
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"x","dsl":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn forward_allows_cookie_authed_mutation_without_origin() {
+        // Present-only semantics: a request carrying no Origin header (some
+        // same-origin navigations, non-browser cookie clients) is allowed —
+        // the Session extractor still validates the cookie itself.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/saved"))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"x","dsl":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn forward_bearer_cross_origin_mutation_is_allowed() {
+        // Bearer clients (CLI/API) hold no cookie and are not CSRF targets —
+        // the origin guard must not apply to them even on a "cross-origin"
+        // (irrelevant, header-set) POST.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/saved"))
+            .and(bearer_token("flt_direct"))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("authorization", "Bearer flt_direct")
+            .header("origin", "https://evil.example.com")
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"x","dsl":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn forward_intel_rejects_cookie_authed_sibling_origin_mutation() {
+        // The coastwatch intel path shares `do_forward`, so its cookie-authed
+        // mutations get the same CSRF guard.
+        let trawld = MockServer::start().await;
+        let coastwatch = MockServer::start().await;
+        let state = state_with_intel(&trawld, &coastwatch);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &trawld).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/intel/v1/stories")
+            .header("cookie", &cookie)
+            .header("origin", "https://coastwatch.fleet.test")
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
