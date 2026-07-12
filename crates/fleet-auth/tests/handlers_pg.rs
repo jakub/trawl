@@ -325,7 +325,7 @@ pg_test!(
 );
 
 pg_test!(
-    login_allows_subdomain_of_configured_domain,
+    login_rejects_sibling_under_shared_domain,
     |store: KeyStore| async move {
         let created = store
             .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
@@ -343,8 +343,11 @@ pg_test!(
         let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
         let app = router_with_state(state);
 
-        // Origin is a sibling app under the shared domain — allowed even
-        // though it doesn't match this request's Host.
+        // Origin is a sibling app under the shared cookie domain. A
+        // parent-domain cookie is NOT an origin allowlist: origin
+        // validation stays strictly same-host, so a compromised sibling
+        // can't forge auth requests against trawl's endpoints (ADR-0004
+        // slice 2, commit a527ccbf).
         let response = app
             .oneshot(login_request_with_origin(
                 &created.plaintext_token,
@@ -354,8 +357,11 @@ pg_test!(
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FOUND);
-        assert!(response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "sibling-origin login under shared domain must not set a cookie"
+        );
     }
 );
 
