@@ -23,6 +23,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Auth;
+use crate::routes::proxy::clear_cookie_for_proxied_response;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +88,7 @@ pub async fn forward(
         upstream_ct.unwrap_or_else(|| "application/json".to_string())
     };
 
-    let builder = Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
@@ -96,14 +97,13 @@ pub async fn forward(
         // intermediate proxies when trawl-web is fronted by another one.
         .header("X-Accel-Buffering", "no");
 
-    // Deliberately NO cookie clearing here, mirroring `proxy::do_forward`
-    // (ADR-0004 slice 2). trawld's 401 is opaque across both a dead key and
-    // a live key lacking the `stream` permission, so clearing on any 401
-    // would sign valid users out of the whole fleet on a routine authz
-    // denial. Cookie lifecycle is owned by `auth::me` alone, which decides
-    // against the permission-free upstream `/whoami`. EventSource reconnects
-    // will keep 401ing until the SPA's next `/me` poll clears the dead
-    // cookie — the correct, permission-aware place to make that call.
+    // The SSE path shares the proxy-wide 401/403 cookie rule; see
+    // `clear_cookie_for_proxied_response`. (Today it never clears — an
+    // EventSource reconnect keeps 401ing until the SPA's next `/me` poll
+    // drops the dead cookie, the permission-aware place to make that call.)
+    if let Some(clear) = clear_cookie_for_proxied_response(status, &auth) {
+        builder = builder.header(header::SET_COOKIE, clear);
+    }
 
     builder
         .body(Body::from_stream(capped_stream))

@@ -113,20 +113,40 @@ async fn do_forward(
     let out_headers = out.headers_mut().expect("fresh response has headers map");
     copy_response_headers(&upstream_headers, out_headers);
 
-    // Deliberately NO cookie clearing here (ADR-0004 slice 2). trawld
-    // returns an opaque 401 for BOTH classes of failure — a dead key
-    // (revoked/expired fleet-wide) AND a live key that merely lacks the
-    // permission grant for this one endpoint (e.g. a non-admin whose SPA
-    // hits an admin-only route). The two are indistinguishable at this
-    // layer, so clearing on any proxied 401 would log valid users out of
-    // the entire fleet (shared `fleet_session`) on a routine authz denial.
-    // Cookie lifecycle is owned solely by `auth::me`, which decides against
-    // the PERMISSION-FREE upstream `/whoami`: a 401 there is unambiguously
-    // a dead key. The session extractor's local expiry check plus that
-    // `/me` path are the only safe places to drop the shared cookie.
+    if let Some(clear) = clear_cookie_for_proxied_response(status, &auth) {
+        out_headers.insert(header::SET_COOKIE, clear);
+    }
 
     out.body(Body::from_stream(body_stream))
         .map_err(|e| ProxyError::Internal(format!("response build: {e}")))
+}
+
+/// Whether — and how — a *proxied* upstream response should clear the
+/// shared `fleet_session` cookie; `None` leaves the cookie untouched.
+///
+/// The single home for the proxy-path 401/403 cookie rule (ADR-0004
+/// slice 2), consulted identically by the generic forwarder, the
+/// `/api/intel` forwarder, and the SSE handler so a newly added proxied
+/// path can't silently diverge.
+///
+/// Always `None` today: trawld returns an opaque `401` for BOTH classes of
+/// failure — a dead key (revoked/expired fleet-wide) AND a live key that
+/// merely lacks the permission grant for one endpoint (e.g. a non-admin
+/// whose SPA hits an admin-only route). The two are indistinguishable at
+/// this layer, so clearing on any proxied `401` would log valid users out
+/// of the entire fleet (shared `fleet_session`) on a routine authz denial;
+/// a `403` may likewise still carry grants for sibling apps. Cookie
+/// lifecycle is therefore owned solely by `auth::me`, which decides against
+/// the permission-free upstream `/whoami` — the only place a `401` is
+/// unambiguously a dead key. `_status`/`_auth` are the signals a future
+/// clear-on-`<status>` policy would key on (and where `AppState`'s
+/// `build_clear_cookie` would be invoked to mint the directive).
+#[must_use]
+pub(crate) fn clear_cookie_for_proxied_response(
+    _status: StatusCode,
+    _auth: &Auth,
+) -> Option<HeaderValue> {
+    None
 }
 
 const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
