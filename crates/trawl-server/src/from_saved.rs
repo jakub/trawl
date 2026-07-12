@@ -15,6 +15,7 @@ use crate::error::ServerError;
 use crate::store::{SavedQueryStore, ScheduleStore};
 
 /// Result of resolving a `from saved` stage.
+#[derive(Debug)]
 pub(crate) struct ResolvedFromSaved {
     /// The `DuckDB` source expression (e.g. `read_parquet('...')` or a `UNION ALL` subquery).
     pub source: String,
@@ -188,5 +189,347 @@ mod tests {
             src,
             "read_parquet('/data/scheduled/it''s/run.parquet', union_by_name=true)"
         );
+    }
+}
+
+/// Store-backed coverage for the run-selector resolution path (ADR-0004
+/// slice 3 ported it to the async pg stores). These exercise the branch
+/// logic against a real `#[sqlx::test]` database and, for `run=all`, run the
+/// emitted UNION subquery through `DuckDB` so the `TIMESTAMP '<offset>'`
+/// synthetic-column literal is proven to parse (guarding the offset-literal
+/// contract the pg `started_at` round-trip depends on).
+#[cfg(test)]
+mod pg_tests {
+    use sqlx::PgPool;
+    use trawl_core::ast::{FromSavedStage, SavedRunSelector};
+
+    use super::{
+        ResolvedFromSaved, parquet_source, resolve, resolve_all, resolve_latest, resolve_specific,
+    };
+    use crate::error::ServerError;
+    use crate::store::{SavedQueryStore, ScheduleStore};
+
+    /// Create a saved query and its schedule, returning both ids.
+    async fn seed(pool: &PgPool, key_id: i64, name: &str) -> (i64, ScheduleStore, SavedQueryStore) {
+        let saved_store = SavedQueryStore::new(pool.clone());
+        let sched_store = ScheduleStore::new(pool.clone());
+        let saved = saved_store
+            .create(key_id, name, "level=error")
+            .await
+            .unwrap();
+        sched_store
+            .create_schedule(saved.id, key_id, 300, None)
+            .await
+            .unwrap();
+        (saved.id, sched_store, saved_store)
+    }
+
+    /// Start then finish a run, returning its id. `path`/`status` let callers
+    /// build success-with-parquet, success-without-parquet, and error rows.
+    async fn run(
+        store: &ScheduleStore,
+        schedule_id: i64,
+        saved_id: i64,
+        status: &str,
+        path: Option<&str>,
+    ) -> i64 {
+        let rid = store
+            .start_run(schedule_id, saved_id, "q")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish_run(rid, status, 10, Some(1), None, None, path)
+            .await
+            .unwrap();
+        rid
+    }
+
+    /// Schedule id for a saved query (seed always creates exactly one).
+    async fn schedule_id(store: &ScheduleStore, saved_id: i64) -> i64 {
+        store
+            .get_schedule_for_saved_query(saved_id, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    /// Write a tiny single-row parquet file at `data_dir/rel` via `DuckDB`.
+    fn write_parquet(data_dir: &str, rel: &str, tag: i64) {
+        let full = format!("{data_dir}/{rel}");
+        std::fs::create_dir_all(std::path::Path::new(&full).parent().unwrap()).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT {tag}::BIGINT AS n, 'msg-{tag}' AS msg) \
+             TO '{full}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+    }
+
+    // --- resolve_latest -----------------------------------------------------
+
+    #[sqlx::test]
+    async fn resolve_latest_picks_newest_successful_run(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        run(
+            &sched_store,
+            sid,
+            saved_id,
+            "success",
+            Some("p/run_1.parquet"),
+        )
+        .await;
+        run(
+            &sched_store,
+            sid,
+            saved_id,
+            "success",
+            Some("p/run_2.parquet"),
+        )
+        .await;
+
+        let source = resolve_latest(&sched_store, saved_id, "/data")
+            .await
+            .unwrap();
+        // Newest wins (started_at DESC, id DESC).
+        assert_eq!(source, parquet_source("/data", "p/run_2.parquet"));
+    }
+
+    #[sqlx::test]
+    async fn resolve_latest_not_found_without_successful_runs(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest_none").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        // An error run and a success-without-parquet run are both ineligible.
+        run(&sched_store, sid, saved_id, "error", None).await;
+        run(&sched_store, sid, saved_id, "success", None).await;
+
+        let err = resolve_latest(&sched_store, saved_id, "/data")
+            .await
+            .expect_err("no successful parquet run must be NotFound");
+        assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
+    }
+
+    // --- resolve_specific ---------------------------------------------------
+
+    #[sqlx::test]
+    async fn resolve_specific_returns_source_for_run(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        let rid = run(
+            &sched_store,
+            sid,
+            saved_id,
+            "success",
+            Some("p/run_7.parquet"),
+        )
+        .await;
+
+        let source = resolve_specific(&sched_store, rid, 1, "/data")
+            .await
+            .unwrap();
+        assert_eq!(source, parquet_source("/data", "p/run_7.parquet"));
+    }
+
+    #[sqlx::test]
+    async fn resolve_specific_not_found_for_missing_run(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_missing").await;
+        let _ = saved_id;
+        let err = resolve_specific(&sched_store, 999_999, 1, "/data")
+            .await
+            .expect_err("unknown run id must be NotFound");
+        assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
+    }
+
+    #[sqlx::test]
+    async fn resolve_specific_not_found_for_other_users_run(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_owned").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        let rid = run(
+            &sched_store,
+            sid,
+            saved_id,
+            "success",
+            Some("p/run_1.parquet"),
+        )
+        .await;
+
+        // key_id 2 does not own the run — ownership join yields NotFound.
+        let err = resolve_specific(&sched_store, rid, 2, "/data")
+            .await
+            .expect_err("cross-user run access must be NotFound");
+        assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
+    }
+
+    #[sqlx::test]
+    async fn resolve_specific_not_found_when_run_has_no_parquet(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_noparquet").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        // A legacy blob-only success run: found by id, but no result_path.
+        let rid = run(&sched_store, sid, saved_id, "success", None).await;
+
+        let err = resolve_specific(&sched_store, rid, 1, "/data")
+            .await
+            .expect_err("run without result_path must be NotFound");
+        assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
+    }
+
+    // --- resolve_all --------------------------------------------------------
+
+    #[sqlx::test]
+    async fn resolve_all_not_found_without_successful_runs(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "all_none").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        run(&sched_store, sid, saved_id, "error", None).await;
+
+        let err = resolve_all(&sched_store, saved_id, "/data")
+            .await
+            .expect_err("no successful parquet runs must be NotFound");
+        assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
+    }
+
+    /// The `run=all` UNION subquery must be SQL `DuckDB` executes end-to-end:
+    /// every eligible run contributes a branch, the injected `_run_id` /
+    /// `_run_time` columns materialise, and the `TIMESTAMP '<offset>'` literal
+    /// built from the pg `started_at` parses (`DuckDB` accepts and ignores the
+    /// UTC offset). Ineligible runs (error, or success without parquet) are
+    /// excluded.
+    #[sqlx::test]
+    async fn resolve_all_builds_union_duckdb_executes(pool: PgPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "all_exec").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+
+        write_parquet(data_dir, "scheduled/all_exec/run_1.parquet", 1);
+        write_parquet(data_dir, "scheduled/all_exec/run_2.parquet", 2);
+        let r1 = run(
+            &sched_store,
+            sid,
+            saved_id,
+            "success",
+            Some("scheduled/all_exec/run_1.parquet"),
+        )
+        .await;
+        let r2 = run(
+            &sched_store,
+            sid,
+            saved_id,
+            "success",
+            Some("scheduled/all_exec/run_2.parquet"),
+        )
+        .await;
+        // Ineligible rows that must not appear in the union.
+        run(&sched_store, sid, saved_id, "error", None).await;
+        run(&sched_store, sid, saved_id, "success", None).await;
+
+        let source = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
+        assert!(source.contains("UNION ALL BY NAME"), "source: {source}");
+        assert!(source.contains("TIMESTAMP '"), "source: {source}");
+
+        // Execute the subquery exactly as the emitter would (`FROM (subquery)`).
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT _run_id, CAST(_run_time AS VARCHAR) AS t, n FROM {source} ORDER BY _run_id"
+            ))
+            .unwrap();
+        let rows: Vec<(i64, String, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2, "only the two parquet successes union in");
+        assert_eq!(rows[0].0, r1);
+        assert_eq!(rows[1].0, r2);
+        assert_eq!(rows[0].2, 1, "run_1 parquet payload");
+        assert_eq!(rows[1].2, 2, "run_2 parquet payload");
+        for (_, ts, _) in &rows {
+            assert!(!ts.is_empty(), "_run_time literal must materialise");
+        }
+    }
+
+    // --- resolve (entry point) ---------------------------------------------
+
+    #[sqlx::test]
+    async fn resolve_unknown_saved_query_is_not_found(pool: PgPool) {
+        let saved_store = SavedQueryStore::new(pool.clone());
+        let sched_store = ScheduleStore::new(pool.clone());
+        let stage = FromSavedStage {
+            name: "ghost".to_string(),
+            run: SavedRunSelector::Latest,
+        };
+        let dsl = "| from saved ghost";
+        let err = resolve(
+            &stage,
+            dsl,
+            dsl.len(),
+            &saved_store,
+            &sched_store,
+            1,
+            "/data",
+        )
+        .await
+        .expect_err("missing saved query must be NotFound");
+        assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
+    }
+
+    #[sqlx::test]
+    async fn resolve_strips_stage_and_prepends_wildcard(pool: PgPool) {
+        let (saved_id, sched_store, saved_store) = seed(&pool, 1, "rollup").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        run(
+            &sched_store,
+            sid,
+            saved_id,
+            "success",
+            Some("p/run_1.parquet"),
+        )
+        .await;
+
+        // Trailing pipeline after the stage becomes `* <remaining>`.
+        let dsl = "| from saved rollup | stats count() by host";
+        let span_end = dsl.find(" | stats").unwrap();
+        let ResolvedFromSaved {
+            source,
+            remaining_dsl,
+        } = resolve(
+            &stage_latest("rollup"),
+            dsl,
+            span_end,
+            &saved_store,
+            &sched_store,
+            1,
+            "/data",
+        )
+        .await
+        .unwrap();
+        assert_eq!(source, parquet_source("/data", "p/run_1.parquet"));
+        assert_eq!(remaining_dsl, "* | stats count() by host");
+
+        // No trailing pipeline collapses to a bare `*`.
+        let bare = "| from saved rollup";
+        let ResolvedFromSaved { remaining_dsl, .. } = resolve(
+            &stage_latest("rollup"),
+            bare,
+            bare.len(),
+            &saved_store,
+            &sched_store,
+            1,
+            "/data",
+        )
+        .await
+        .unwrap();
+        assert_eq!(remaining_dsl, "*");
+    }
+
+    fn stage_latest(name: &str) -> FromSavedStage {
+        FromSavedStage {
+            name: name.to_string(),
+            run: SavedRunSelector::Latest,
+        }
     }
 }
