@@ -109,23 +109,24 @@ pub enum FlipOutcome {
 /// Supported units: `s`, `m`, `h`, `d`, `w`. Minimum interval is 60 seconds.
 pub fn parse_interval(s: &str) -> Result<u64, StoreError> {
     let s = s.trim();
-    if s.is_empty() {
+    // char_indices, not byte split_at: a multi-byte trailing char would put
+    // `s.len() - 1` inside a UTF-8 sequence and panic on user-supplied input.
+    let Some((unit_idx, unit)) = s.char_indices().last() else {
         return Err(StoreError::InvalidInterval {
             input: s.to_string(),
         });
-    }
-
-    let (digits, unit) = s.split_at(s.len() - 1);
+    };
+    let digits = &s[..unit_idx];
     let value: u64 = digits.parse().map_err(|_| StoreError::InvalidInterval {
         input: s.to_string(),
     })?;
 
     let secs = match unit {
-        "s" => value,
-        "m" => value * 60,
-        "h" => value * 3600,
-        "d" => value * 86400,
-        "w" => value * 604_800,
+        's' => value,
+        'm' => value * 60,
+        'h' => value * 3600,
+        'd' => value * 86400,
+        'w' => value * 604_800,
         _ => {
             return Err(StoreError::InvalidInterval {
                 input: s.to_string(),
@@ -1040,6 +1041,14 @@ mod tests {
         assert!(parse_interval("").is_err());
         assert!(parse_interval("abc").is_err());
         assert!(parse_interval("5x").is_err());
+    }
+
+    #[test]
+    fn parse_interval_rejects_multibyte_without_panicking() {
+        // regression: split_at(len - 1) panicked mid-char on multi-byte input
+        assert!(parse_interval("5µ").is_err());
+        assert!(parse_interval("µ").is_err());
+        assert!(parse_interval("5週").is_err());
     }
 
     #[test]
