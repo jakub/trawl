@@ -86,8 +86,10 @@ impl Drop for LockGuard {
 /// holding the sole-writer advisory lock. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct StorageState {
-    /// Shared app-state pool (exposed for liveness pings and tests).
-    pub pool: PgPool,
+    /// Shared app-state pool. Private: the store facades each hold their own
+    /// clone, and `ping`/`ping_cached` reach it in-module — nothing outside
+    /// this crate bypasses a facade to run raw SQL against it.
+    pool: PgPool,
     /// Query history store.
     pub history: HistoryStore,
     /// Saved queries store.
