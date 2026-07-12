@@ -432,10 +432,6 @@ pub(crate) async fn execute_scheduled_query(
     }
 }
 
-/// Write a `QueryResult` to a parquet file under `{data_dir}/scheduled/{name}/`.
-///
-/// Returns `(Some(relative_path), None)` on success, or `(None, Some(blob))`
-/// as a zstd-JSON fallback if parquet writing fails.
 /// Best-effort removal of a report-run parquet file from disk.
 ///
 /// `relative` is a DB-stored path like `scheduled/foo/run_1.parquet`; it is
@@ -457,6 +453,10 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
     }
 }
 
+/// Write a `QueryResult` to a parquet file under `{data_dir}/scheduled/{name}/`.
+///
+/// Returns `(Some(relative_path), None)` on success, or `(None, Some(blob))`
+/// as a zstd-JSON fallback if parquet writing fails.
 fn write_result_parquet(
     pool: &ExecutorPool,
     run_id: i64,
