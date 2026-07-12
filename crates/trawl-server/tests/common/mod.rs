@@ -135,13 +135,37 @@ fn run_marker() -> String {
         .collect()
 }
 
+/// Parse `(run_marker, pid)` out of a `trawl_app_test_{run}_{pid}_{rand}`
+/// name. Names from other schemes yield `None` and are left alone.
+fn owner_of(datname: &str) -> Option<(String, u32)> {
+    let mut parts = datname.strip_prefix("trawl_app_test_")?.split('_');
+    let marker = parts.next()?.to_owned();
+    let pid = parts.next()?.parse().ok()?;
+    Some((marker, pid))
+}
+
+/// Whether a process with this pid is still alive (same host — nextest
+/// processes are local). Errs on the side of "alive".
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |s| s.success())
+}
+
 /// Best-effort sweep of sibling app databases leaked by earlier runs.
 ///
 /// The server's pools stay open until process exit, so a test cannot drop
 /// its OWN app database; instead each run garbage-collects its
-/// predecessors'. DROP without FORCE never touches a database with live
-/// connections (i.e. a concurrently-running sibling test), and a single
-/// advisory lock elects one sweeper across nextest's many processes.
+/// predecessors'. A database is only dropped when BOTH guards agree it is
+/// abandoned: (a) it belongs to a DIFFERENT nextest run — same-run
+/// siblings are structurally never touched, even in the window between
+/// their CREATE and the server's first connection — and (b) the owner pid
+/// encoded in its name is no longer alive. A single advisory lock elects
+/// one sweeper at a time, and DROP without FORCE is a final safety net
+/// (live connections make it error harmlessly).
 async fn sweep_stale_app_databases(pool: &PgPool) {
     use sqlx::Row as _;
 
@@ -164,11 +188,17 @@ async fn sweep_stale_app_databases(pool: &PgPool) {
             .fetch_all(&mut admin)
             .await
     {
+        let marker = run_marker();
         for row in rows {
             let Ok(name): Result<String, _> = row.try_get("datname") else {
                 continue;
             };
-            // No FORCE: an active sibling's database survives (DROP errors).
+            let Some((owner_marker, owner_pid)) = owner_of(&name) else {
+                continue;
+            };
+            if owner_marker == marker || pid_alive(owner_pid) {
+                continue;
+            }
             let _ = admin
                 .execute(format!(r#"DROP DATABASE IF EXISTS "{name}""#).as_str())
                 .await;
@@ -178,6 +208,25 @@ async fn sweep_stale_app_databases(pool: &PgPool) {
         .execute(&mut admin)
         .await;
     let _ = pool; // sweep uses its own admin connection
+}
+
+#[test]
+fn sweep_guards_parse_own_database_name() {
+    // The sweeper's abandoned-db detection must round-trip the naming
+    // scheme `create_app_database` uses — a parse mismatch here silently
+    // turns the sweeper into a live-sibling killer (it did once: the
+    // guard-bypassing bug behind transient 'database does not exist' boot
+    // failures).
+    let name = format!(
+        "trawl_app_test_{}_{}_{}",
+        run_marker(),
+        std::process::id(),
+        "abcdefghijkl"
+    );
+    let (marker, pid) = owner_of(&name).expect("own name must parse");
+    assert_eq!(marker, run_marker());
+    assert_eq!(pid, std::process::id());
+    assert!(pid_alive(pid), "our own pid is alive");
 }
 
 /// Forcibly drop a database by DSN, terminating live connections —
