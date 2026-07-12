@@ -9,7 +9,7 @@
 //! requests via `tower::ServiceExt::oneshot`, and asserts both response
 //! shape and that downstream handlers receive a populated
 //! `Extension<VerifiedKey>`. Real `KeyStore` against an ephemeral
-//! per-test Postgres database (see `common::PgFixture`).
+//! per-test Postgres database (via `#[sqlx::test]`).
 
 #![cfg(feature = "axum")]
 
@@ -29,9 +29,6 @@ use fleet_auth::{
 };
 use tower::ServiceExt as _;
 use zeroize::Zeroizing;
-
-#[macro_use]
-mod common;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -103,403 +100,403 @@ async fn body_string(response: axum::response::Response) -> String {
 // require_session
 // ---------------------------------------------------------------------------
 
-pg_test!(
-    session_valid_cookie_sets_extension,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn session_valid_cookie_sets_extension(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, session_key) = session_state(store, "trawl");
-        let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
-        let app = session_router(state);
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/protected")
-                    .header(
-                        header::COOKIE,
-                        cookie_header("fleet_session", &cookie_value),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let (state, session_key) = session_state(store, "trawl");
+    let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
+    let app = session_router(state);
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "happy path must not set/clear a cookie"
-        );
-        let body = body_string(response).await;
-        assert!(body.starts_with("ok name=alice"), "got: {body}");
-        assert!(body.contains("grants=trawl:analyst"), "got: {body}");
-    }
-);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(
+                    header::COOKIE,
+                    cookie_header("fleet_session", &cookie_value),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-pg_test!(
-    session_missing_cookie_returns_401,
-    |store: KeyStore| async move {
-        let (state, _) = session_state(store, "trawl");
-        let app = session_router(state);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "happy path must not set/clear a cookie"
+    );
+    let body = body_string(response).await;
+    assert!(body.starts_with("ok name=alice"), "got: {body}");
+    assert!(body.contains("grants=trawl:analyst"), "got: {body}");
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/protected")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn session_missing_cookie_returns_401(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(!response.headers().contains_key(header::SET_COOKIE));
-    }
-);
+    let (state, _) = session_state(store, "trawl");
+    let app = session_router(state);
 
-pg_test!(
-    session_expired_cookie_returns_401_keeps_cookie,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let (state, session_key) = session_state(store, "trawl");
-        // ttl_secs negative → exp in the past → is_expired true
-        let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, -60);
-        let app = session_router(state);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/protected")
-                    .header(
-                        header::COOKIE,
-                        cookie_header("fleet_session", &cookie_value),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn session_expired_cookie_returns_401_keeps_cookie(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        // ADR-0030: do NOT clear shared cookie on expiry — would log user out
-        // of every sibling app.
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "expired session must NOT clear the cookie"
-        );
-    }
-);
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-pg_test!(
-    session_tampered_cookie_returns_401,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+    let (state, session_key) = session_state(store, "trawl");
+    // ttl_secs negative → exp in the past → is_expired true
+    let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, -60);
+    let app = session_router(state);
 
-        let (state, session_key) = session_state(store, "trawl");
-        let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
-        // Flip a single character somewhere in the middle of the base64 body.
-        let mut bytes = cookie_value.into_bytes();
-        let mid = bytes.len() / 2;
-        bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
-        let tampered = String::from_utf8(bytes).unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(
+                    header::COOKIE,
+                    cookie_header("fleet_session", &cookie_value),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let app = session_router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/protected")
-                    .header(header::COOKIE, cookie_header("fleet_session", &tampered))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // ADR-0030: do NOT clear shared cookie on expiry — would log user out
+    // of every sibling app.
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "expired session must NOT clear the cookie"
+    );
+}
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-);
+#[sqlx::test]
+async fn session_tampered_cookie_returns_401(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-pg_test!(
-    session_no_grant_returns_403_html_keeps_cookie,
-    |store: KeyStore| async move {
-        // Key has a grant for trawl, but the app is configured as "coastwatch".
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        let (state, session_key) = session_state(store, "coastwatch");
-        let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
-        let app = session_router(state);
+    let (state, session_key) = session_state(store, "trawl");
+    let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
+    // Flip a single character somewhere in the middle of the base64 body.
+    let mut bytes = cookie_value.into_bytes();
+    let mid = bytes.len() / 2;
+    bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(bytes).unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/protected")
-                    .header(
-                        header::COOKIE,
-                        cookie_header("fleet_session", &cookie_value),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let app = session_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(header::COOKIE, cookie_header("fleet_session", &tampered))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "text/html; charset=utf-8"
-        );
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "no-grant 403 must NOT clear the cookie (ADR-0030)"
-        );
-        let body = body_string(response).await;
-        assert!(body.contains("alice"), "got: {body}");
-        assert!(body.contains("coastwatch"), "got: {body}");
-    }
-);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
 
-pg_test!(
-    session_grant_revoked_during_session_returns_403,
-    |store: KeyStore| async move {
-        // Key remains active, but the ONLY namespace grant is revoked
-        // after the cookie was issued. The next request must take the
-        // no-grant 403 path, proving middleware re-reads grants from the
-        // DB on each request rather than trusting cached state.
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn session_no_grant_returns_403_html_keeps_cookie(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, session_key) = session_state(store.clone(), "trawl");
-        let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
-        let app = session_router(state);
+    // Key has a grant for trawl, but the app is configured as "coastwatch".
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        store
-            .revoke_assignment(&created.info.prefix, "trawl")
-            .await
-            .unwrap();
+    let (state, session_key) = session_state(store, "coastwatch");
+    let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
+    let app = session_router(state);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/protected")
-                    .header(
-                        header::COOKIE,
-                        cookie_header("fleet_session", &cookie_value),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(
+                    header::COOKIE,
+                    cookie_header("fleet_session", &cookie_value),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "no-grant 403 must NOT clear the cookie (ADR-0030)"
-        );
-    }
-);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "no-grant 403 must NOT clear the cookie (ADR-0030)"
+    );
+    let body = body_string(response).await;
+    assert!(body.contains("alice"), "got: {body}");
+    assert!(body.contains("coastwatch"), "got: {body}");
+}
 
-pg_test!(
-    session_revoked_key_returns_401,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn session_grant_revoked_during_session_returns_403(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, session_key) = session_state(store.clone(), "trawl");
-        let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
+    // Key remains active, but the ONLY namespace grant is revoked
+    // after the cookie was issued. The next request must take the
+    // no-grant 403 path, proving middleware re-reads grants from the
+    // DB on each request rather than trusting cached state.
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        store.revoke_key(&created.info.prefix).await.unwrap();
+    let (state, session_key) = session_state(store.clone(), "trawl");
+    let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
+    let app = session_router(state);
 
-        let app = session_router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/protected")
-                    .header(
-                        header::COOKIE,
-                        cookie_header("fleet_session", &cookie_value),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    store
+        .revoke_assignment(&created.info.prefix, "trawl")
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(
+                    header::COOKIE,
+                    cookie_header("fleet_session", &cookie_value),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "no-grant 403 must NOT clear the cookie (ADR-0030)"
+    );
+}
+
+#[sqlx::test]
+async fn session_revoked_key_returns_401(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
+
+    let (state, session_key) = session_state(store.clone(), "trawl");
+    let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
+
+    store.revoke_key(&created.info.prefix).await.unwrap();
+
+    let app = session_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(
+                    header::COOKIE,
+                    cookie_header("fleet_session", &cookie_value),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
 
 // ---------------------------------------------------------------------------
 // require_bearer
 // ---------------------------------------------------------------------------
 
-pg_test!(
-    bearer_valid_token_sets_extension,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("svc", PrincipalKind::Service, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn bearer_valid_token_sets_extension(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, _) = session_state(store, "trawl");
-        let app = bearer_router(state);
+    let created = store
+        .create_key("svc", PrincipalKind::Service, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/thing")
-                    .header(
-                        header::AUTHORIZATION,
-                        format!("Bearer {}", created.plaintext_token.as_str()),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let (state, _) = session_state(store, "trawl");
+    let app = bearer_router(state);
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = body_string(response).await;
-        assert!(body.contains("name=svc"), "got: {body}");
-        assert!(body.contains("kind=service"), "got: {body}");
-    }
-);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/thing")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", created.plaintext_token.as_str()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-pg_test!(
-    bearer_missing_header_returns_401,
-    |store: KeyStore| async move {
-        let (state, _) = session_state(store, "trawl");
-        let app = bearer_router(state);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("name=svc"), "got: {body}");
+    assert!(body.contains("kind=service"), "got: {body}");
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/thing")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn bearer_missing_header_returns_401(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-);
+    let (state, _) = session_state(store, "trawl");
+    let app = bearer_router(state);
 
-pg_test!(
-    bearer_malformed_scheme_returns_401,
-    |store: KeyStore| async move {
-        let (state, _) = session_state(store, "trawl");
-        let app = bearer_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/thing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/thing")
-                    .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-);
+#[sqlx::test]
+async fn bearer_malformed_scheme_returns_401(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-pg_test!(
-    bearer_invalid_token_returns_401,
-    |store: KeyStore| async move {
-        let (state, _) = session_state(store, "trawl");
-        let app = bearer_router(state);
+    let (state, _) = session_state(store, "trawl");
+    let app = bearer_router(state);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/thing")
-                    .header(
-                        header::AUTHORIZATION,
-                        "Bearer flt_nope_not_a_real_token_at_all",
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/thing")
+                .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
 
-pg_test!(
-    bearer_does_not_enforce_namespace,
-    |store: KeyStore| async move {
-        // A key with NO grant in "coastwatch" still passes bearer middleware
-        // configured for "coastwatch" — per ADR-0030 cross-app service
-        // principals must be allowed past, and each app gates further with
-        // its own role guard.
-        let created = store
-            .create_key("svc", PrincipalKind::Service, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn bearer_invalid_token_returns_401(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, _) = session_state(store, "coastwatch");
-        let app = bearer_router(state);
+    let (state, _) = session_state(store, "trawl");
+    let app = bearer_router(state);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/thing")
-                    .header(
-                        header::AUTHORIZATION,
-                        format!("Bearer {}", created.plaintext_token.as_str()),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/thing")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer flt_nope_not_a_real_token_at_all",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test]
+async fn bearer_does_not_enforce_namespace(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+
+    // A key with NO grant in "coastwatch" still passes bearer middleware
+    // configured for "coastwatch" — per ADR-0030 cross-app service
+    // principals must be allowed past, and each app gates further with
+    // its own role guard.
+    let created = store
+        .create_key("svc", PrincipalKind::Service, &trawl_grant(), None)
+        .await
+        .unwrap();
+
+    let (state, _) = session_state(store, "coastwatch");
+    let app = bearer_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/thing")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", created.plaintext_token.as_str()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
 
 // ---------------------------------------------------------------------------
 // build-time sanity: SessionState rejects invalid config at construction
 // ---------------------------------------------------------------------------
 
-pg_test!(
-    session_state_rejects_invalid_config,
-    |_store: KeyStore| async move {
-        // After the I4 lockdown, external code can't construct an
-        // invalid SessionConfig — `#[non_exhaustive]` and `pub(crate)`
-        // fields force every external value through
-        // `SessionConfig::builder().build()`, which validates first.
-        // Verify the builder itself rejects an empty cookie name so the
-        // chokepoint that previously sat in SessionState::new is still
-        // observable to consumers.
-        let err = SessionConfig::builder()
-            .cookie_name("")
-            .app_namespace("trawl")
-            .build()
-            .unwrap_err();
-        assert!(matches!(err, fleet_auth::AuthError::InvalidApp(_)));
-    }
-);
+#[sqlx::test]
+async fn session_state_rejects_invalid_config(pool: sqlx::PgPool) {
+    let _store = KeyStore::from_pool(pool);
+
+    // After the I4 lockdown, external code can't construct an
+    // invalid SessionConfig — `#[non_exhaustive]` and `pub(crate)`
+    // fields force every external value through
+    // `SessionConfig::builder().build()`, which validates first.
+    // Verify the builder itself rejects an empty cookie name so the
+    // chokepoint that previously sat in SessionState::new is still
+    // observable to consumers.
+    let err = SessionConfig::builder()
+        .cookie_name("")
+        .app_namespace("trawl")
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, fleet_auth::AuthError::InvalidApp(_)));
+}

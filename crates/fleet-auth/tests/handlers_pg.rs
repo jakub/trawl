@@ -20,9 +20,6 @@ use fleet_auth::{
 };
 use tower::ServiceExt as _;
 
-#[macro_use]
-mod common;
-
 fn router_with_state(state: SessionState) -> Router {
     Router::new()
         .route("/api/auth/login", post(login))
@@ -78,95 +75,98 @@ async fn body_string(response: axum::response::Response) -> String {
 // login
 // ---------------------------------------------------------------------------
 
-pg_test!(
-    login_valid_key_sets_cookie_and_redirects,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn login_valid_key_sets_cookie_and_redirects(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, session_key) = session_state(store, "trawl");
-        let app = router_with_state(state);
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(login_request(&created.plaintext_token))
-            .await
-            .unwrap();
+    let (state, session_key) = session_state(store, "trawl");
+    let app = router_with_state(state);
 
-        assert_eq!(response.status(), StatusCode::FOUND);
-        assert_eq!(
-            response.headers().get(header::LOCATION).unwrap(),
-            "/dashboard"
-        );
+    let response = app
+        .oneshot(login_request(&created.plaintext_token))
+        .await
+        .unwrap();
 
-        let set_cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("Set-Cookie")
-            .to_str()
-            .unwrap()
-            .to_owned();
-        assert!(
-            set_cookie.starts_with("fleet_session="),
-            "got: {set_cookie}"
-        );
-        assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
-        assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
-        assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
-        assert!(set_cookie.contains("Max-Age="), "got: {set_cookie}");
-        // secure=false in test → no Secure attribute
-        assert!(!set_cookie.contains("Secure"), "got: {set_cookie}");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/dashboard"
+    );
 
-        // Extract the cookie value and decrypt — proves the round-trip works.
-        let pair = set_cookie.split(';').next().unwrap();
-        let value = pair.split_once('=').unwrap().1;
-        let payload = decrypt(&session_key, value).unwrap();
-        assert_eq!(payload.name, "alice");
-        assert_eq!(payload.token.as_str(), created.plaintext_token.as_str());
-    }
-);
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("Set-Cookie")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        set_cookie.starts_with("fleet_session="),
+        "got: {set_cookie}"
+    );
+    assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
+    assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
+    assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
+    assert!(set_cookie.contains("Max-Age="), "got: {set_cookie}");
+    // secure=false in test → no Secure attribute
+    assert!(!set_cookie.contains("Secure"), "got: {set_cookie}");
 
-pg_test!(
-    login_includes_domain_when_configured,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+    // Extract the cookie value and decrypt — proves the round-trip works.
+    let pair = set_cookie.split(';').next().unwrap();
+    let value = pair.split_once('=').unwrap().1;
+    let payload = decrypt(&session_key, value).unwrap();
+    assert_eq!(payload.name, "alice");
+    assert_eq!(payload.token.as_str(), created.plaintext_token.as_str());
+}
 
-        let session_key = Arc::new(SessionKey::generate());
-        let cfg = SessionConfig::builder()
-            .cookie_name("fleet_session")
-            .app_namespace("trawl")
-            .secure(false)
-            .domain("fleet.localhost")
-            .post_login_redirect("/")
-            .build()
-            .unwrap();
-        let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
-        let app = router_with_state(state);
+#[sqlx::test]
+async fn login_includes_domain_when_configured(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let response = app
-            .oneshot(login_request(&created.plaintext_token))
-            .await
-            .unwrap();
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FOUND);
-        let set_cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(
-            set_cookie.contains("Domain=fleet.localhost"),
-            "got: {set_cookie}"
-        );
-    }
-);
+    let session_key = Arc::new(SessionKey::generate());
+    let cfg = SessionConfig::builder()
+        .cookie_name("fleet_session")
+        .app_namespace("trawl")
+        .secure(false)
+        .domain("fleet.localhost")
+        .post_login_redirect("/")
+        .build()
+        .unwrap();
+    let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
+    let app = router_with_state(state);
 
-pg_test!(login_rejects_wrong_key, |store: KeyStore| async move {
+    let response = app
+        .oneshot(login_request(&created.plaintext_token))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.contains("Domain=fleet.localhost"),
+        "got: {set_cookie}"
+    );
+}
+
+#[sqlx::test]
+async fn login_rejects_wrong_key(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+
     let (state, _) = session_state(store, "trawl");
     let app = router_with_state(state);
 
@@ -180,9 +180,12 @@ pg_test!(login_rejects_wrong_key, |store: KeyStore| async move {
         !response.headers().contains_key(header::SET_COOKIE),
         "failed login must not set a cookie"
     );
-});
+}
 
-pg_test!(login_rejects_empty_key, |store: KeyStore| async move {
+#[sqlx::test]
+async fn login_rejects_empty_key(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+
     let (state, _) = session_state(store, "trawl");
     let app = router_with_state(state);
 
@@ -190,39 +193,39 @@ pg_test!(login_rejects_empty_key, |store: KeyStore| async move {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!response.headers().contains_key(header::SET_COOKIE));
-});
+}
 
-pg_test!(
-    login_no_grant_returns_403_no_cookie,
-    |store: KeyStore| async move {
-        // Key has grant in trawl, but app namespace is coastwatch.
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn login_no_grant_returns_403_no_cookie(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, _) = session_state(store, "coastwatch");
-        let app = router_with_state(state);
+    // Key has grant in trawl, but app namespace is coastwatch.
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(login_request(&created.plaintext_token))
-            .await
-            .unwrap();
+    let (state, _) = session_state(store, "coastwatch");
+    let app = router_with_state(state);
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "no-grant login must not set a cookie"
-        );
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "text/html; charset=utf-8"
-        );
-        let body = body_string(response).await;
-        assert!(body.contains("alice"), "got: {body}");
-        assert!(body.contains("coastwatch"), "got: {body}");
-    }
-);
+    let response = app
+        .oneshot(login_request(&created.plaintext_token))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "no-grant login must not set a cookie"
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let body = body_string(response).await;
+    assert!(body.contains("alice"), "got: {body}");
+    assert!(body.contains("coastwatch"), "got: {body}");
+}
 
 // ---------------------------------------------------------------------------
 // origin validation (default-on, ADR-0004 slice 2)
@@ -249,123 +252,126 @@ fn logout_request_with_origin(origin: &str, host: &str) -> Request<Body> {
         .unwrap()
 }
 
-pg_test!(
-    login_rejects_cross_origin_no_cookie,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn login_rejects_cross_origin_no_cookie(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, _) = session_state(store, "trawl");
-        let app = router_with_state(state);
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(login_request_with_origin(
-                &created.plaintext_token,
-                "https://evil.example.com",
-                "trawl.example.com",
-            ))
-            .await
-            .unwrap();
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "cross-origin login must not set a cookie"
-        );
-    }
-);
+    let response = app
+        .oneshot(login_request_with_origin(
+            &created.plaintext_token,
+            "https://evil.example.com",
+            "trawl.example.com",
+        ))
+        .await
+        .unwrap();
 
-pg_test!(
-    logout_rejects_cross_origin_no_clear,
-    |store: KeyStore| async move {
-        let (state, _) = session_state(store, "trawl");
-        let app = router_with_state(state);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "cross-origin login must not set a cookie"
+    );
+}
 
-        let response = app
-            .oneshot(logout_request_with_origin(
-                "https://evil.example.com",
-                "trawl.example.com",
-            ))
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn logout_rejects_cross_origin_no_clear(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "cross-origin logout must NOT clear the shared cookie"
-        );
-    }
-);
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
 
-pg_test!(
-    login_allows_same_host_origin,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+    let response = app
+        .oneshot(logout_request_with_origin(
+            "https://evil.example.com",
+            "trawl.example.com",
+        ))
+        .await
+        .unwrap();
 
-        let (state, _) = session_state(store, "trawl");
-        let app = router_with_state(state);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "cross-origin logout must NOT clear the shared cookie"
+    );
+}
 
-        let response = app
-            .oneshot(login_request_with_origin(
-                &created.plaintext_token,
-                "http://trawl.example.com",
-                "trawl.example.com",
-            ))
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn login_allows_same_host_origin(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        assert_eq!(response.status(), StatusCode::FOUND);
-        assert!(response.headers().contains_key(header::SET_COOKIE));
-    }
-);
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-pg_test!(
-    login_rejects_sibling_under_shared_domain,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
 
-        let session_key = Arc::new(SessionKey::generate());
-        let cfg = SessionConfig::builder()
-            .cookie_name("fleet_session")
-            .app_namespace("trawl")
-            .secure(false)
-            .domain("fleet.localhost")
-            .build()
-            .unwrap();
-        let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
-        let app = router_with_state(state);
+    let response = app
+        .oneshot(login_request_with_origin(
+            &created.plaintext_token,
+            "http://trawl.example.com",
+            "trawl.example.com",
+        ))
+        .await
+        .unwrap();
 
-        // Origin is a sibling app under the shared cookie domain. A
-        // parent-domain cookie is NOT an origin allowlist: origin
-        // validation stays strictly same-host, so a compromised sibling
-        // can't forge auth requests against trawl's endpoints (ADR-0004
-        // slice 2, commit a527ccbf).
-        let response = app
-            .oneshot(login_request_with_origin(
-                &created.plaintext_token,
-                "http://coastwatch.fleet.localhost",
-                "trawl.fleet.localhost",
-            ))
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(response.headers().contains_key(header::SET_COOKIE));
+}
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "sibling-origin login under shared domain must not set a cookie"
-        );
-    }
-);
+#[sqlx::test]
+async fn login_rejects_sibling_under_shared_domain(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-pg_test!(logout_allows_absent_origin, |store: KeyStore| async move {
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
+
+    let session_key = Arc::new(SessionKey::generate());
+    let cfg = SessionConfig::builder()
+        .cookie_name("fleet_session")
+        .app_namespace("trawl")
+        .secure(false)
+        .domain("fleet.localhost")
+        .build()
+        .unwrap();
+    let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
+    let app = router_with_state(state);
+
+    // Origin is a sibling app under the shared cookie domain. A
+    // parent-domain cookie is NOT an origin allowlist: origin
+    // validation stays strictly same-host, so a compromised sibling
+    // can't forge auth requests against trawl's endpoints (ADR-0004
+    // slice 2, commit a527ccbf).
+    let response = app
+        .oneshot(login_request_with_origin(
+            &created.plaintext_token,
+            "http://coastwatch.fleet.localhost",
+            "trawl.fleet.localhost",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "sibling-origin login under shared domain must not set a cookie"
+    );
+}
+
+#[sqlx::test]
+async fn logout_allows_absent_origin(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+
     // Non-browser clients send no Origin — logout keeps working.
     let (state, _) = session_state(store, "trawl");
     let app = router_with_state(state);
@@ -373,7 +379,7 @@ pg_test!(logout_allows_absent_origin, |store: KeyStore| async move {
     let response = app.oneshot(logout_request()).await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(response.headers().contains_key(header::SET_COOKIE));
-});
+}
 
 // -- HTTP/2 :authority fallback (no Host header) ----------------------------
 //
@@ -411,142 +417,145 @@ fn h2_logout_request(origin: &str) -> Request<Body> {
     req
 }
 
-pg_test!(
-    login_allows_same_origin_h2_without_host_header,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+#[sqlx::test]
+async fn login_allows_same_origin_h2_without_host_header(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let (state, _) = session_state(store, "trawl");
-        let app = router_with_state(state);
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(h2_login_request(
-                &created.plaintext_token,
-                "https://trawl.example.com",
-            ))
-            .await
-            .unwrap();
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
 
-        assert_eq!(response.status(), StatusCode::FOUND);
-        assert!(
-            response.headers().contains_key(header::SET_COOKIE),
-            "same-origin h2 login (Host from :authority) must set a cookie"
-        );
-    }
-);
+    let response = app
+        .oneshot(h2_login_request(
+            &created.plaintext_token,
+            "https://trawl.example.com",
+        ))
+        .await
+        .unwrap();
 
-pg_test!(
-    login_rejects_cross_origin_h2_via_authority_fallback,
-    |store: KeyStore| async move {
-        let created = store
-            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(
+        response.headers().contains_key(header::SET_COOKIE),
+        "same-origin h2 login (Host from :authority) must set a cookie"
+    );
+}
 
-        let (state, _) = session_state(store, "trawl");
-        let app = router_with_state(state);
+#[sqlx::test]
+async fn login_rejects_cross_origin_h2_via_authority_fallback(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let response = app
-            .oneshot(h2_login_request(
-                &created.plaintext_token,
-                "https://evil.example.com",
-            ))
-            .await
-            .unwrap();
+    let created = store
+        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "cross-origin h2 login must not set a cookie"
-        );
-    }
-);
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
 
-pg_test!(
-    logout_allows_same_origin_h2_without_host_header,
-    |store: KeyStore| async move {
-        let (state, _) = session_state(store, "trawl");
-        let app = router_with_state(state);
+    let response = app
+        .oneshot(h2_login_request(
+            &created.plaintext_token,
+            "https://evil.example.com",
+        ))
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(h2_logout_request("https://trawl.example.com"))
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "cross-origin h2 login must not set a cookie"
+    );
+}
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert!(
-            response.headers().contains_key(header::SET_COOKIE),
-            "same-origin h2 logout (Host from :authority) must clear the cookie"
-        );
-    }
-);
+#[sqlx::test]
+async fn logout_allows_same_origin_h2_without_host_header(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-pg_test!(
-    logout_rejects_cross_origin_h2_via_authority_fallback,
-    |store: KeyStore| async move {
-        let (state, _) = session_state(store, "trawl");
-        let app = router_with_state(state);
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
 
-        let response = app
-            .oneshot(h2_logout_request("https://evil.example.com"))
-            .await
-            .unwrap();
+    let response = app
+        .oneshot(h2_logout_request("https://trawl.example.com"))
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(
-            !response.headers().contains_key(header::SET_COOKIE),
-            "cross-origin h2 logout must NOT clear the shared cookie"
-        );
-    }
-);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        response.headers().contains_key(header::SET_COOKIE),
+        "same-origin h2 logout (Host from :authority) must clear the cookie"
+    );
+}
+
+#[sqlx::test]
+async fn logout_rejects_cross_origin_h2_via_authority_fallback(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
+
+    let response = app
+        .oneshot(h2_logout_request("https://evil.example.com"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "cross-origin h2 logout must NOT clear the shared cookie"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // logout
 // ---------------------------------------------------------------------------
 
-pg_test!(
-    logout_clears_cookie_with_matching_attrs,
-    |store: KeyStore| async move {
-        let session_key = Arc::new(SessionKey::generate());
-        let cfg = SessionConfig::builder()
-            .cookie_name("fleet_session")
-            .app_namespace("trawl")
-            .secure(true)
-            .domain("fleet.home.lan")
-            .build()
-            .unwrap();
-        let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
-        let app = router_with_state(state);
+#[sqlx::test]
+async fn logout_clears_cookie_with_matching_attrs(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
 
-        let response = app.oneshot(logout_request()).await.unwrap();
+    let session_key = Arc::new(SessionKey::generate());
+    let cfg = SessionConfig::builder()
+        .cookie_name("fleet_session")
+        .app_namespace("trawl")
+        .secure(true)
+        .domain("fleet.home.lan")
+        .build()
+        .unwrap();
+    let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
+    let app = router_with_state(state);
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let set_cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("logout sets clear cookie")
-            .to_str()
-            .unwrap();
-        assert!(
-            set_cookie.starts_with("fleet_session=;"),
-            "got: {set_cookie}"
-        );
-        assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
-        assert!(
-            set_cookie.contains("Domain=fleet.home.lan"),
-            "got: {set_cookie}"
-        );
-        assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
-        assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
-        assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
-        assert!(set_cookie.contains("Secure"), "got: {set_cookie}");
-    }
-);
+    let response = app.oneshot(logout_request()).await.unwrap();
 
-pg_test!(logout_requires_no_session, |store: KeyStore| async move {
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("logout sets clear cookie")
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.starts_with("fleet_session=;"),
+        "got: {set_cookie}"
+    );
+    assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
+    assert!(
+        set_cookie.contains("Domain=fleet.home.lan"),
+        "got: {set_cookie}"
+    );
+    assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
+    assert!(set_cookie.contains("Path=/"), "got: {set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "got: {set_cookie}");
+    assert!(set_cookie.contains("Secure"), "got: {set_cookie}");
+}
+
+#[sqlx::test]
+async fn logout_requires_no_session(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+
     // Even without a valid cookie, logout succeeds — the browser was
     // already in a confused state, our job is to make sure the cookie is
     // gone, not to gate on whether it was valid.
@@ -556,4 +565,4 @@ pg_test!(logout_requires_no_session, |store: KeyStore| async move {
     let response = app.oneshot(logout_request()).await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(response.headers().contains_key(header::SET_COOKIE));
-});
+}
