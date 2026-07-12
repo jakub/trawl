@@ -259,7 +259,6 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
     usable
 }
 
-#[allow(clippy::too_many_lines)] // outcome handling incl. orphan cleanup is cohesive
 pub(crate) async fn execute_scheduled_query(
     schedule_store: ScheduleStore,
     pool: ExecutorPool,
@@ -288,100 +287,16 @@ pub(crate) async fn execute_scheduled_query(
             let (result_path, result_data) =
                 write_result_parquet(&pool, run_id, query_name, &query_result);
 
-            match schedule_store
-                .finish_run(
-                    run_id,
-                    "success",
-                    duration_ms,
-                    Some(row_count),
-                    None,
-                    result_data.as_deref(),
-                    result_path.as_deref(),
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    // The run row was cascade-deleted mid-flight (its saved
-                    // query or schedule is gone): the file we just wrote is
-                    // orphaned — remove it.
-                    if let Some(ref relative) = result_path
-                        && remove_result_file(pool.base_dir(), relative)
-                    {
-                        tracing::info!(
-                            event_type = "scheduler_orphan_cleanup",
-                            run_id,
-                            path = %relative,
-                            "run was deleted mid-flight; removed orphaned parquet result"
-                        );
-                    }
-                }
-                Err(e) => {
-                    // A transient app-state DB error (pg restart/failover). This
-                    // is an AMBIGUOUS COMMIT: for a single autocommit UPDATE the
-                    // COMMIT can land server-side while the client's ack is lost,
-                    // so sqlx returns Err even though the row was written to
-                    // status='success' with result_path set. We therefore must
-                    // NOT delete the parquet we just wrote — if the success
-                    // committed, that file is the live result the row points at,
-                    // and unlinking it would leave a permanent dangling reference
-                    // (cleanup_stale_runs only repairs status='running' rows).
-                    // Worst case the row genuinely didn't commit and the file is
-                    // orphaned on disk; that's a bounded leak, not corruption.
-                    tracing::error!(
-                        event_type = "scheduler_error",
-                        run_id,
-                        error = %e,
-                        result_path = result_path.as_deref().unwrap_or("(blob)"),
-                        "failed to finish run (ambiguous commit); recovering via guarded flip"
-                    );
-                    // Guarded state transition: flip the row to 'error' only
-                    // while it is still 'running'. If the success COMMIT
-                    // actually landed (status is already 'success'), the flip
-                    // matches zero rows and we preserve the committed result
-                    // instead of destroying it. If the DB is still down the
-                    // flip also fails and boot-time cleanup_stale_runs is the
-                    // backstop.
-                    match schedule_store
-                        .fail_run_if_running(
-                            run_id,
-                            duration_ms,
-                            &format!("result persistence failed: {e}"),
-                        )
-                        .await
-                    {
-                        Ok(true) => {
-                            // The success never committed (row was 'running'):
-                            // the parquet we wrote is now orphaned — remove it.
-                            if let Some(ref relative) = result_path
-                                && remove_result_file(pool.base_dir(), relative)
-                            {
-                                tracing::info!(
-                                    event_type = "scheduler_orphan_cleanup",
-                                    run_id,
-                                    path = %relative,
-                                    "ambiguous commit did not land; removed orphaned parquet result"
-                                );
-                            }
-                        }
-                        Ok(false) => {
-                            // No running row matched: either the ambiguous
-                            // success committed (its result_path is live —
-                            // leave the file) or the run was cascade-deleted (a
-                            // bounded on-disk leak). Either way, do not touch
-                            // the file.
-                        }
-                        Err(e2) => {
-                            tracing::error!(
-                                event_type = "scheduler_error",
-                                run_id,
-                                error = %e2,
-                                "failed to flip wedged run to error; run stays stuck until restart"
-                            );
-                        }
-                    }
-                }
-            }
+            finish_run_or_recover(
+                &schedule_store,
+                pool.base_dir(),
+                run_id,
+                duration_ms,
+                row_count,
+                result_data.as_deref(),
+                result_path.as_deref(),
+            )
+            .await;
 
             tracing::info!(
                 event_type = "scheduled_query_completed",
@@ -427,6 +342,136 @@ pub(crate) async fn execute_scheduled_query(
                 status,
                 error = %e,
                 "scheduled query failed"
+            );
+        }
+    }
+}
+
+/// Persist a successful run's result, then reconcile the parquet file on disk
+/// with whatever the store actually committed.
+///
+/// Owns the unlink-vs-preserve decision for the success outcome:
+/// - `Ok(true)`  — the run row was updated; the file it points at stays.
+/// - `Ok(false)` — the row was cascade-deleted mid-flight (its saved query or
+///   schedule is gone); the file we just wrote is orphaned, so remove it.
+/// - `Err(_)`    — an ambiguous commit; recovery is delegated to
+///   [`recover_ambiguous_finish`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn finish_run_or_recover(
+    schedule_store: &ScheduleStore,
+    base_dir: &str,
+    run_id: i64,
+    duration_ms: u64,
+    row_count: usize,
+    result_data: Option<&[u8]>,
+    result_path: Option<&str>,
+) {
+    match schedule_store
+        .finish_run(
+            run_id,
+            "success",
+            duration_ms,
+            Some(row_count),
+            None,
+            result_data,
+            result_path,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            // The run row was cascade-deleted mid-flight: the file we just
+            // wrote is orphaned — remove it.
+            if let Some(relative) = result_path
+                && remove_result_file(base_dir, relative)
+            {
+                tracing::info!(
+                    event_type = "scheduler_orphan_cleanup",
+                    run_id,
+                    path = %relative,
+                    "run was deleted mid-flight; removed orphaned parquet result"
+                );
+            }
+        }
+        Err(e) => {
+            // A transient app-state DB error (pg restart/failover). This is an
+            // AMBIGUOUS COMMIT: for a single autocommit UPDATE the COMMIT can
+            // land server-side while the client's ack is lost, so sqlx returns
+            // Err even though the row was written to status='success' with
+            // result_path set. We therefore must NOT delete the parquet here —
+            // recovery flips the row only while it is still 'running'.
+            tracing::error!(
+                event_type = "scheduler_error",
+                run_id,
+                error = %e,
+                result_path = result_path.unwrap_or("(blob)"),
+                "failed to finish run (ambiguous commit); recovering via guarded flip"
+            );
+            recover_ambiguous_finish(
+                schedule_store,
+                base_dir,
+                run_id,
+                duration_ms,
+                result_path,
+                &e,
+            )
+            .await;
+        }
+    }
+}
+
+/// Recover from an ambiguous `finish_run` commit and reconcile the parquet on
+/// disk, without ever destroying a success that actually committed.
+///
+/// Guarded state transition: flip the row to `error` only while it is still
+/// `running`. If the success COMMIT actually landed (status is already
+/// `success`), the flip matches zero rows and we preserve the committed result
+/// instead of unlinking the file it points at. If the DB is still down the flip
+/// also fails and boot-time `cleanup_stale_runs` is the backstop.
+///
+/// Owns the unlink-vs-preserve decision for the recovery outcome:
+/// - `Ok(true)`  — the success never committed (row was `running`); the parquet
+///   we wrote is now orphaned — remove it.
+/// - `Ok(false)` — no running row matched: either the ambiguous success
+///   committed (its `result_path` is live) or the run was cascade-deleted (a
+///   bounded on-disk leak). Either way, leave the file.
+/// - `Err(_)`    — the flip itself failed (DB still down); the run stays wedged
+///   until restart and the file is left in place.
+pub(crate) async fn recover_ambiguous_finish(
+    schedule_store: &ScheduleStore,
+    base_dir: &str,
+    run_id: i64,
+    duration_ms: u64,
+    result_path: Option<&str>,
+    err: &crate::store::StoreError,
+) {
+    match schedule_store
+        .fail_run_if_running(
+            run_id,
+            duration_ms,
+            &format!("result persistence failed: {err}"),
+        )
+        .await
+    {
+        Ok(true) => {
+            if let Some(relative) = result_path
+                && remove_result_file(base_dir, relative)
+            {
+                tracing::info!(
+                    event_type = "scheduler_orphan_cleanup",
+                    run_id,
+                    path = %relative,
+                    "ambiguous commit did not land; removed orphaned parquet result"
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(e2) => {
+            tracing::error!(
+                event_type = "scheduler_error",
+                run_id,
+                error = %e2,
+                "failed to flip wedged run to error; run stays stuck until restart"
             );
         }
     }
@@ -531,4 +576,138 @@ fn zstd_fallback(result: &trawl_api::value::QueryResult) -> (Option<String>, Opt
         .ok()
         .and_then(|json| zstd::encode_all(json.as_slice(), 3).ok());
     (None, blob)
+}
+
+/// Pg-backed coverage for the ambiguous-commit recovery *wiring* — the
+/// orchestration that pairs each store outcome with an unlink-or-preserve file
+/// action. The store primitives (`finish_run`, `fail_run_if_running`) are unit
+/// tested in `tests/store_pg.rs`; these tests pin the file-cleanup decision the
+/// bool return alone doesn't prove (swapping the arms would leak files or
+/// destroy committed results with the store tests still green). The Err/Err
+/// double-fault arm needs fault injection and stays uncovered.
+#[cfg(test)]
+mod pg_tests {
+    use sqlx::PgPool;
+
+    use super::{finish_run_or_recover, recover_ambiguous_finish};
+    use crate::store::{SavedQueryStore, ScheduleStore, StoreError};
+
+    /// Seed a saved query + schedule + started (`running`) run, returning the
+    /// schedule store, the owning saved-query id, and the run id.
+    async fn seed_run(pool: &PgPool, name: &str) -> (ScheduleStore, i64, i64) {
+        let saved_store = SavedQueryStore::new(pool.clone());
+        let sched_store = ScheduleStore::new(pool.clone());
+        let saved = saved_store.create(1, name, "q").await.unwrap();
+        let sched = sched_store
+            .create_schedule(saved.id, 1, 300, None)
+            .await
+            .unwrap();
+        let rid = sched_store
+            .start_run(sched.id, saved.id, "q")
+            .await
+            .unwrap()
+            .unwrap();
+        (sched_store, saved.id, rid)
+    }
+
+    /// Write a dummy result file at `base_dir/rel`.
+    fn touch(base_dir: &str, rel: &str) {
+        let full = format!("{base_dir}/{rel}");
+        std::fs::create_dir_all(std::path::Path::new(&full).parent().unwrap()).unwrap();
+        std::fs::write(&full, b"parquet").unwrap();
+    }
+
+    fn exists(base_dir: &str, rel: &str) -> bool {
+        std::path::Path::new(&format!("{base_dir}/{rel}")).exists()
+    }
+
+    /// `finish_run` Ok(true): the committed result's file is preserved.
+    #[sqlx::test]
+    async fn finish_run_or_recover_keeps_file_on_committed_success(pool: PgPool) {
+        let (store, _saved, rid) = seed_run(&pool, "kept").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let rel = "scheduled/kept/run.parquet";
+        touch(base, rel);
+
+        finish_run_or_recover(&store, base, rid, 10, 1, None, Some(rel)).await;
+
+        assert!(exists(base, rel), "committed success must keep its file");
+        let run = store.get_run(rid, 1).await.unwrap().unwrap();
+        assert_eq!(run.status, "success");
+        assert_eq!(run.result_path.as_deref(), Some(rel));
+    }
+
+    /// `finish_run` Ok(false): a run cascade-deleted mid-flight orphans the
+    /// file we just wrote, so the wiring must unlink it.
+    #[sqlx::test]
+    async fn finish_run_or_recover_unlinks_orphan_after_cascade_delete(pool: PgPool) {
+        let saved_store = SavedQueryStore::new(pool.clone());
+        let (store, saved_id, rid) = seed_run(&pool, "orphan").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let rel = "scheduled/orphan/run.parquet";
+        touch(base, rel);
+
+        // Cascade-delete the run row mid-flight.
+        saved_store.delete(saved_id, 1).await.unwrap();
+
+        finish_run_or_recover(&store, base, rid, 10, 1, None, Some(rel)).await;
+
+        assert!(
+            !exists(base, rel),
+            "cascade-deleted run's orphaned file must be removed"
+        );
+    }
+
+    /// Recovery `fail_run_if_running` Ok(true): the success never committed
+    /// (row still `running`), so the parquet is orphaned and must be unlinked.
+    #[sqlx::test]
+    async fn recover_ambiguous_finish_unlinks_when_run_still_running(pool: PgPool) {
+        let (store, _saved, rid) = seed_run(&pool, "wedged").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let rel = "scheduled/wedged/run.parquet";
+        touch(base, rel);
+
+        let err = StoreError::Validation("boom".to_owned());
+        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), &err).await;
+
+        assert!(
+            !exists(base, rel),
+            "a run flipped from running to error orphans its file — remove it"
+        );
+        let run = store.get_run(rid, 1).await.unwrap().unwrap();
+        assert_eq!(run.status, "error");
+        assert_eq!(run.result_path, None);
+    }
+
+    /// Recovery `fail_run_if_running` Ok(false): the ambiguous success already
+    /// committed, so the guard matches zero rows and the live file is preserved.
+    #[sqlx::test]
+    async fn recover_ambiguous_finish_preserves_committed_success(pool: PgPool) {
+        let (store, _saved, rid) = seed_run(&pool, "committed").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let rel = "scheduled/committed/run.parquet";
+        touch(base, rel);
+
+        // The ambiguous commit actually landed: the row is already 'success'.
+        store
+            .finish_run(rid, "success", 10, Some(7), None, None, Some(rel))
+            .await
+            .unwrap();
+
+        let err = StoreError::Validation("boom".to_owned());
+        recover_ambiguous_finish(&store, base, rid, 5, Some(rel), &err).await;
+
+        assert!(
+            exists(base, rel),
+            "a committed success's file must never be unlinked by recovery"
+        );
+        let run = store.get_run(rid, 1).await.unwrap().unwrap();
+        assert_eq!(run.status, "success", "committed success preserved");
+        assert_eq!(run.result_path.as_deref(), Some(rel));
+        assert_eq!(run.row_count, Some(7));
+    }
 }
