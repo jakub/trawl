@@ -170,6 +170,51 @@ fn row_to_report_run(row: &PgRow) -> Result<ReportRun, sqlx::Error> {
     row_to_report_run_at(row, "")
 }
 
+/// SELECT fragment exposing the latest report run (aliased `r_*`) and the total
+/// run count (`run_count`) resolved by [`LATEST_RUN_JOINS`]. Decode the pair
+/// with [`latest_run_and_count_from_row`]. Requires a schedule aliased `s` and
+/// the lateral joins `lr`/`rc`.
+pub(crate) const LATEST_RUN_COLS: &str = "lr.id             AS r_id,
+     lr.schedule_id    AS r_schedule_id,
+     lr.saved_query_id AS r_saved_query_id,
+     lr.query          AS r_query,
+     lr.status         AS r_status,
+     lr.started_at     AS r_started_at,
+     lr.finished_at    AS r_finished_at,
+     lr.duration_ms    AS r_duration_ms,
+     lr.row_count      AS r_row_count,
+     lr.error_message  AS r_error_message,
+     lr.result_path    AS r_result_path,
+     rc.run_count      AS run_count";
+
+/// LEFT JOIN LATERAL fragment resolving the single latest run (`lr`, tie-broken
+/// by `started_at DESC, id DESC`) and the total run count (`rc`) for the
+/// schedule aliased `s`. Pairs with [`LATEST_RUN_COLS`].
+pub(crate) const LATEST_RUN_JOINS: &str = "LEFT JOIN LATERAL (
+         SELECT * FROM report_runs r
+         WHERE r.schedule_id = s.id
+         ORDER BY r.started_at DESC, r.id DESC
+         LIMIT 1
+     ) lr ON TRUE
+     LEFT JOIN LATERAL (
+         SELECT COUNT(*) AS run_count FROM report_runs r2 WHERE r2.schedule_id = s.id
+     ) rc ON TRUE";
+
+/// Decode the latest run (`r_` prefix, `None` when the schedule has no runs)
+/// and total run count (`run_count`) columns produced by [`LATEST_RUN_COLS`].
+pub(crate) fn latest_run_and_count_from_row(
+    row: &PgRow,
+) -> Result<(Option<ReportRun>, u64), sqlx::Error> {
+    let latest_run = if row.try_get::<Option<i64>, _>("r_id")?.is_some() {
+        Some(row_to_report_run_at(row, "r_")?)
+    } else {
+        None
+    };
+    let total_runs =
+        u64::try_from(row.try_get::<Option<i64>, _>("run_count")?.unwrap_or(0)).unwrap_or_default();
+    Ok((latest_run, total_runs))
+}
+
 const SCHEDULE_COLS: &str =
     "id, saved_query_id, key_id, interval_secs, max_runs, enabled, created_at, updated_at";
 
@@ -348,33 +393,14 @@ impl ScheduleStore {
         saved_query_id: i64,
         key_id: i64,
     ) -> Result<Option<(Schedule, Option<ReportRun>, u64)>, StoreError> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "SELECT s.id, s.saved_query_id, s.key_id, s.interval_secs, s.max_runs,
                     s.enabled, s.created_at, s.updated_at,
-                    lr.id             AS r_id,
-                    lr.schedule_id    AS r_schedule_id,
-                    lr.saved_query_id AS r_saved_query_id,
-                    lr.query          AS r_query,
-                    lr.status         AS r_status,
-                    lr.started_at     AS r_started_at,
-                    lr.finished_at    AS r_finished_at,
-                    lr.duration_ms    AS r_duration_ms,
-                    lr.row_count      AS r_row_count,
-                    lr.error_message  AS r_error_message,
-                    lr.result_path    AS r_result_path,
-                    rc.run_count      AS run_count
+                    {LATEST_RUN_COLS}
              FROM schedules s
-             LEFT JOIN LATERAL (
-                 SELECT * FROM report_runs r
-                 WHERE r.schedule_id = s.id
-                 ORDER BY r.started_at DESC, r.id DESC
-                 LIMIT 1
-             ) lr ON TRUE
-             LEFT JOIN LATERAL (
-                 SELECT COUNT(*) AS run_count FROM report_runs r2 WHERE r2.schedule_id = s.id
-             ) rc ON TRUE
+             {LATEST_RUN_JOINS}
              WHERE s.saved_query_id = $1 AND s.key_id = $2",
-        )
+        ))
         .bind(saved_query_id)
         .bind(key_id)
         .fetch_optional(&self.pool)
@@ -382,13 +408,7 @@ impl ScheduleStore {
 
         let Some(row) = row else { return Ok(None) };
         let schedule = row_to_schedule(&row)?;
-        let latest_run = if row.try_get::<Option<i64>, _>("r_id")?.is_some() {
-            Some(row_to_report_run_at(&row, "r_")?)
-        } else {
-            None
-        };
-        let total_runs = u64::try_from(row.try_get::<Option<i64>, _>("run_count")?.unwrap_or(0))
-            .unwrap_or_default();
+        let (latest_run, total_runs) = latest_run_and_count_from_row(&row)?;
         Ok(Some((schedule, latest_run, total_runs)))
     }
 

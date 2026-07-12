@@ -9,7 +9,10 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row as _};
 
 use super::error::{PgViolation, StoreError, classify_violation};
-use super::schedule::{ReportRun, Schedule, row_to_report_run_at, row_to_schedule_at};
+use super::schedule::{
+    LATEST_RUN_COLS, LATEST_RUN_JOINS, ReportRun, Schedule, latest_run_and_count_from_row,
+    row_to_schedule_at,
+};
 
 /// Validate that a saved query name matches `[a-zA-Z0-9_-]+`.
 fn validate_name(name: &str) -> Result<(), StoreError> {
@@ -108,7 +111,7 @@ impl SavedQueryStore {
         &self,
         key_id: i64,
     ) -> Result<Vec<SavedQueryDetails>, StoreError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT sq.id, sq.key_id, sq.name, sq.query, sq.created_at, sq.updated_at,
                     s.id             AS s_id,
                     s.saved_query_id AS s_saved_query_id,
@@ -118,33 +121,13 @@ impl SavedQueryStore {
                     s.enabled        AS s_enabled,
                     s.created_at     AS s_created_at,
                     s.updated_at     AS s_updated_at,
-                    lr.id             AS r_id,
-                    lr.schedule_id    AS r_schedule_id,
-                    lr.saved_query_id AS r_saved_query_id,
-                    lr.query          AS r_query,
-                    lr.status         AS r_status,
-                    lr.started_at     AS r_started_at,
-                    lr.finished_at    AS r_finished_at,
-                    lr.duration_ms    AS r_duration_ms,
-                    lr.row_count      AS r_row_count,
-                    lr.error_message  AS r_error_message,
-                    lr.result_path    AS r_result_path,
-                    rc.run_count      AS run_count
+                    {LATEST_RUN_COLS}
              FROM saved_queries sq
              LEFT JOIN schedules s ON s.saved_query_id = sq.id
-             LEFT JOIN LATERAL (
-                 SELECT * FROM report_runs r
-                 WHERE r.schedule_id = s.id
-                 ORDER BY r.started_at DESC, r.id DESC
-                 LIMIT 1
-             ) lr ON TRUE
-             LEFT JOIN LATERAL (
-                 SELECT COUNT(*) AS run_count FROM report_runs r2
-                 WHERE r2.schedule_id = s.id
-             ) rc ON TRUE
+             {LATEST_RUN_JOINS}
              WHERE sq.key_id = $1
              ORDER BY sq.name ASC",
-        )
+        ))
         .bind(key_id)
         .fetch_all(&self.pool)
         .await?;
@@ -154,14 +137,7 @@ impl SavedQueryStore {
             let saved = row_to_saved_query(row)?;
             let schedule = if row.try_get::<Option<i64>, _>("s_id")?.is_some() {
                 let schedule = row_to_schedule_at(row, "s_")?;
-                let latest_run = if row.try_get::<Option<i64>, _>("r_id")?.is_some() {
-                    Some(row_to_report_run_at(row, "r_")?)
-                } else {
-                    None
-                };
-                let total_runs =
-                    u64::try_from(row.try_get::<Option<i64>, _>("run_count")?.unwrap_or(0))
-                        .unwrap_or_default();
+                let (latest_run, total_runs) = latest_run_and_count_from_row(row)?;
                 Some(ScheduleWithStats {
                     schedule,
                     latest_run,
