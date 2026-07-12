@@ -19,7 +19,7 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
-use crate::store::ScheduleStore;
+use crate::store::{RunStatus, ScheduleStore};
 
 /// Spawn the scheduler background task.
 ///
@@ -310,9 +310,9 @@ pub(crate) async fn execute_scheduled_query(
         Err(e) => {
             // Check if it was a timeout (ServerError::Timeout) or other error.
             let (status, error_msg) = if matches!(e, crate::error::ServerError::Timeout) {
-                ("timeout", format!("{e}"))
+                (RunStatus::Timeout, format!("{e}"))
             } else {
-                ("error", format!("{e}"))
+                (RunStatus::Error, format!("{e}"))
             };
 
             if let Err(e2) = schedule_store
@@ -339,7 +339,7 @@ pub(crate) async fn execute_scheduled_query(
                 event_type = "scheduled_query_failed",
                 run_id,
                 duration_ms,
-                status,
+                status = status.as_str(),
                 error = %e,
                 "scheduled query failed"
             );
@@ -369,7 +369,7 @@ pub(crate) async fn finish_run_or_recover(
     match schedule_store
         .finish_run(
             run_id,
-            "success",
+            RunStatus::Success,
             duration_ms,
             Some(row_count),
             None,
@@ -590,7 +590,7 @@ mod pg_tests {
     use sqlx::PgPool;
 
     use super::{finish_run_or_recover, recover_ambiguous_finish};
-    use crate::store::{SavedQueryStore, ScheduleStore, StoreError};
+    use crate::store::{RunStatus, SavedQueryStore, ScheduleStore, StoreError};
 
     /// Seed a saved query + schedule + started (`running`) run, returning the
     /// schedule store, the owning saved-query id, and the run id.
@@ -634,7 +634,7 @@ mod pg_tests {
 
         assert!(exists(base, rel), "committed success must keep its file");
         let run = store.get_run(rid, 1).await.unwrap().unwrap();
-        assert_eq!(run.status, "success");
+        assert_eq!(run.status, RunStatus::Success);
         assert_eq!(run.result_path.as_deref(), Some(rel));
     }
 
@@ -678,7 +678,7 @@ mod pg_tests {
             "a run flipped from running to error orphans its file — remove it"
         );
         let run = store.get_run(rid, 1).await.unwrap().unwrap();
-        assert_eq!(run.status, "error");
+        assert_eq!(run.status, RunStatus::Error);
         assert_eq!(run.result_path, None);
     }
 
@@ -694,7 +694,7 @@ mod pg_tests {
 
         // The ambiguous commit actually landed: the row is already 'success'.
         store
-            .finish_run(rid, "success", 10, Some(7), None, None, Some(rel))
+            .finish_run(rid, RunStatus::Success, 10, Some(7), None, None, Some(rel))
             .await
             .unwrap();
 
@@ -706,7 +706,11 @@ mod pg_tests {
             "a committed success's file must never be unlinked by recovery"
         );
         let run = store.get_run(rid, 1).await.unwrap().unwrap();
-        assert_eq!(run.status, "success", "committed success preserved");
+        assert_eq!(
+            run.status,
+            RunStatus::Success,
+            "committed success preserved"
+        );
         assert_eq!(run.result_path.as_deref(), Some(rel));
         assert_eq!(run.row_count, Some(7));
     }

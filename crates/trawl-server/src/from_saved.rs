@@ -207,7 +207,7 @@ mod pg_tests {
         ResolvedFromSaved, parquet_source, resolve, resolve_all, resolve_latest, resolve_specific,
     };
     use crate::error::ServerError;
-    use crate::store::{SavedQueryStore, ScheduleStore};
+    use crate::store::{RunStatus, SavedQueryStore, ScheduleStore};
 
     /// Create a saved query and its schedule, returning both ids.
     async fn seed(pool: &PgPool, key_id: i64, name: &str) -> (i64, ScheduleStore, SavedQueryStore) {
@@ -230,7 +230,7 @@ mod pg_tests {
         store: &ScheduleStore,
         schedule_id: i64,
         saved_id: i64,
-        status: &str,
+        status: RunStatus,
         path: Option<&str>,
     ) -> i64 {
         let rid = store
@@ -277,7 +277,7 @@ mod pg_tests {
             &sched_store,
             sid,
             saved_id,
-            "success",
+            RunStatus::Success,
             Some("p/run_1.parquet"),
         )
         .await;
@@ -285,7 +285,7 @@ mod pg_tests {
             &sched_store,
             sid,
             saved_id,
-            "success",
+            RunStatus::Success,
             Some("p/run_2.parquet"),
         )
         .await;
@@ -302,8 +302,8 @@ mod pg_tests {
         let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest_none").await;
         let sid = schedule_id(&sched_store, saved_id).await;
         // An error run and a success-without-parquet run are both ineligible.
-        run(&sched_store, sid, saved_id, "error", None).await;
-        run(&sched_store, sid, saved_id, "success", None).await;
+        run(&sched_store, sid, saved_id, RunStatus::Error, None).await;
+        run(&sched_store, sid, saved_id, RunStatus::Success, None).await;
 
         let err = resolve_latest(&sched_store, saved_id, "/data")
             .await
@@ -321,7 +321,7 @@ mod pg_tests {
             &sched_store,
             sid,
             saved_id,
-            "success",
+            RunStatus::Success,
             Some("p/run_7.parquet"),
         )
         .await;
@@ -350,7 +350,7 @@ mod pg_tests {
             &sched_store,
             sid,
             saved_id,
-            "success",
+            RunStatus::Success,
             Some("p/run_1.parquet"),
         )
         .await;
@@ -367,7 +367,7 @@ mod pg_tests {
         let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_noparquet").await;
         let sid = schedule_id(&sched_store, saved_id).await;
         // A legacy blob-only success run: found by id, but no result_path.
-        let rid = run(&sched_store, sid, saved_id, "success", None).await;
+        let rid = run(&sched_store, sid, saved_id, RunStatus::Success, None).await;
 
         let err = resolve_specific(&sched_store, rid, 1, "/data")
             .await
@@ -381,7 +381,7 @@ mod pg_tests {
     async fn resolve_all_not_found_without_successful_runs(pool: PgPool) {
         let (saved_id, sched_store, _saved) = seed(&pool, 1, "all_none").await;
         let sid = schedule_id(&sched_store, saved_id).await;
-        run(&sched_store, sid, saved_id, "error", None).await;
+        run(&sched_store, sid, saved_id, RunStatus::Error, None).await;
 
         let err = resolve_all(&sched_store, saved_id, "/data")
             .await
@@ -409,7 +409,7 @@ mod pg_tests {
             &sched_store,
             sid,
             saved_id,
-            "success",
+            RunStatus::Success,
             Some("scheduled/all_exec/run_1.parquet"),
         )
         .await;
@@ -417,13 +417,13 @@ mod pg_tests {
             &sched_store,
             sid,
             saved_id,
-            "success",
+            RunStatus::Success,
             Some("scheduled/all_exec/run_2.parquet"),
         )
         .await;
         // Ineligible rows that must not appear in the union.
-        run(&sched_store, sid, saved_id, "error", None).await;
-        run(&sched_store, sid, saved_id, "success", None).await;
+        run(&sched_store, sid, saved_id, RunStatus::Error, None).await;
+        run(&sched_store, sid, saved_id, RunStatus::Success, None).await;
 
         let source = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
         assert!(source.contains("UNION ALL BY NAME"), "source: {source}");
@@ -485,7 +485,7 @@ mod pg_tests {
             &sched_store,
             sid,
             saved_id,
-            "success",
+            RunStatus::Success,
             Some("p/run_1.parquet"),
         )
         .await;

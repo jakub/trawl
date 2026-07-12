@@ -18,7 +18,7 @@ mod common;
 
 use sqlx::PgPool;
 use trawl_server::store::{
-    HistoryStore, RunClaim, SavedQueryStore, ScheduleStore, StorageState, StoreError,
+    HistoryStore, RunClaim, RunStatus, SavedQueryStore, ScheduleStore, StorageState, StoreError,
 };
 
 fn history(pool: &PgPool) -> HistoryStore {
@@ -43,7 +43,13 @@ async fn history_record_and_retrieve(pool: PgPool) {
     let key_id = 42;
 
     let id = store
-        .record_query(key_id, "service=nginx | stats count()", 123, 5, "success")
+        .record_query(
+            key_id,
+            "service=nginx | stats count()",
+            123,
+            5,
+            RunStatus::Success,
+        )
         .await
         .unwrap();
     assert!(id > 0);
@@ -57,7 +63,7 @@ async fn history_record_and_retrieve(pool: PgPool) {
     assert_eq!(entry.query, "service=nginx | stats count()");
     assert_eq!(entry.duration_ms, 123);
     assert_eq!(entry.row_count, 5);
-    assert_eq!(entry.status, "success");
+    assert_eq!(entry.status, RunStatus::Success);
 }
 
 #[sqlx::test]
@@ -67,7 +73,7 @@ async fn history_pagination(pool: PgPool) {
 
     for i in 0..5 {
         store
-            .record_query(key_id, &format!("query {i}"), 100, 10, "success")
+            .record_query(key_id, &format!("query {i}"), 100, 10, RunStatus::Success)
             .await
             .unwrap();
     }
@@ -124,15 +130,15 @@ async fn history_user_isolation(pool: PgPool) {
     let store = history(&pool);
 
     store
-        .record_query(1, "user 1 query", 50, 10, "success")
+        .record_query(1, "user 1 query", 50, 10, RunStatus::Success)
         .await
         .unwrap();
     store
-        .record_query(2, "user 2 query", 75, 20, "success")
+        .record_query(2, "user 2 query", 75, 20, RunStatus::Success)
         .await
         .unwrap();
     store
-        .record_query(1, "user 1 query 2", 100, 15, "success")
+        .record_query(1, "user 1 query 2", 100, 15, RunStatus::Success)
         .await
         .unwrap();
 
@@ -153,16 +159,21 @@ async fn history_empty(pool: PgPool) {
     assert_eq!(page.entries.len(), 0);
 }
 
-/// The status CHECK constraint surfaces as a Validation error, mapped by
-/// name — never a raw pg diagnostic.
+/// The `RunStatus` enum keeps the typed write path inside the status domain;
+/// the DB CHECK is the backstop against a raw write bypassing it. Prove the
+/// constraint (23514) still fires when an out-of-domain value is inserted
+/// directly.
 #[sqlx::test]
-async fn history_invalid_status_is_validation_error(pool: PgPool) {
-    let store = history(&pool);
-    let err = store
-        .record_query(1, "q", 1, 1, "bogus")
-        .await
-        .expect_err("CHECK must reject");
-    assert!(matches!(err, StoreError::Validation(_)), "got: {err:?}");
+async fn history_status_check_is_backstop(pool: PgPool) {
+    let err = sqlx::query(
+        "INSERT INTO query_history (key_id, query, executed_at, duration_ms, row_count, status)
+         VALUES (1, 'q', now(), 1, 1, 'bogus')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("CHECK must reject an out-of-domain status");
+    let db = err.as_database_error().expect("database error");
+    assert_eq!(db.code().as_deref(), Some("23514"), "got: {err:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +359,7 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
             .unwrap();
         assert!(
             schedule_store
-                .finish_run(rid, "success", 100 + i, Some(5), None, None, None)
+                .finish_run(rid, RunStatus::Success, 100 + i, Some(5), None, None, None)
                 .await
                 .unwrap()
         );
@@ -514,7 +525,7 @@ async fn cascade_on_saved_query_delete(pool: PgPool) {
         store
             .finish_run(
                 run_id,
-                "success",
+                RunStatus::Success,
                 100,
                 Some(5),
                 None,
@@ -552,7 +563,7 @@ async fn schedule_delete_collects_run_paths(pool: PgPool) {
     store
         .finish_run(
             run_id,
-            "success",
+            RunStatus::Success,
             10,
             Some(1),
             None,
@@ -583,13 +594,13 @@ async fn start_and_finish_run(pool: PgPool) {
         .expect("should start run");
 
     let run = store.get_run(run_id, 1).await.unwrap().unwrap();
-    assert_eq!(run.status, "running");
+    assert_eq!(run.status, RunStatus::Running);
 
     assert!(
         store
             .finish_run(
                 run_id,
-                "success",
+                RunStatus::Success,
                 150,
                 Some(42),
                 None,
@@ -601,7 +612,7 @@ async fn start_and_finish_run(pool: PgPool) {
     );
 
     let finished = store.get_run(run_id, 1).await.unwrap().unwrap();
-    assert_eq!(finished.status, "success");
+    assert_eq!(finished.status, RunStatus::Success);
     assert_eq!(finished.duration_ms, Some(150));
     assert_eq!(finished.row_count, Some(42));
 
@@ -624,7 +635,15 @@ async fn sequential_run_prevention(pool: PgPool) {
 
     // After finishing, a new run can start.
     store
-        .finish_run(first.unwrap(), "success", 100, None, None, None, None)
+        .finish_run(
+            first.unwrap(),
+            RunStatus::Success,
+            100,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let third = store.start_run(schedule.id, sq_id, "q").await.unwrap();
@@ -646,7 +665,7 @@ async fn list_runs_paginated_and_isolated(pool: PgPool) {
         store
             .finish_run(
                 run_id,
-                "success",
+                RunStatus::Success,
                 (i as u64) * 100,
                 Some(i),
                 None,
@@ -682,7 +701,7 @@ async fn cleanup_stale_runs_marks_error(pool: PgPool) {
     assert_eq!(cleaned, 1);
 
     let runs = store.list_runs(sq_id, 1, 100, 0).await.unwrap();
-    assert_eq!(runs[0].status, "error");
+    assert_eq!(runs[0].status, RunStatus::Error);
     assert_eq!(
         runs[0].error_message.as_deref(),
         Some("interrupted by server restart")
@@ -703,7 +722,7 @@ async fn latest_run_returns_newest(pool: PgPool) {
         .unwrap()
         .unwrap();
     store
-        .finish_run(run_id, "success", 100, None, None, None, None)
+        .finish_run(run_id, RunStatus::Success, 100, None, None, None, None)
         .await
         .unwrap();
 
@@ -713,12 +732,12 @@ async fn latest_run_returns_newest(pool: PgPool) {
         .unwrap()
         .unwrap();
     store
-        .finish_run(run_id, "error", 50, None, Some("boom"), None, None)
+        .finish_run(run_id, RunStatus::Error, 50, None, Some("boom"), None, None)
         .await
         .unwrap();
 
     let latest = store.latest_run(schedule.id).await.unwrap().unwrap();
-    assert_eq!(latest.status, "error");
+    assert_eq!(latest.status, RunStatus::Error);
     assert_eq!(latest.query, "q2");
 }
 
@@ -758,7 +777,7 @@ async fn list_all_runs_paginated_and_isolated(pool: PgPool) {
             .unwrap()
             .unwrap();
         store
-            .finish_run(rid, "success", 50, None, None, None, None)
+            .finish_run(rid, RunStatus::Success, 50, None, None, None, None)
             .await
             .unwrap();
     }
@@ -769,7 +788,7 @@ async fn list_all_runs_paginated_and_isolated(pool: PgPool) {
             .unwrap()
             .unwrap();
         store
-            .finish_run(rid, "success", 80, None, None, None, None)
+            .finish_run(rid, RunStatus::Success, 80, None, None, None, None)
             .await
             .unwrap();
     }
@@ -779,7 +798,7 @@ async fn list_all_runs_paginated_and_isolated(pool: PgPool) {
         .unwrap()
         .unwrap();
     store
-        .finish_run(rid, "success", 10, None, None, None, None)
+        .finish_run(rid, RunStatus::Success, 10, None, None, None, None)
         .await
         .unwrap();
 
@@ -808,10 +827,10 @@ async fn runs_stats_counts_by_status(pool: PgPool) {
     let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
     for (status, ms, err) in [
-        ("success", 100, None),
-        ("success", 200, None),
-        ("error", 50, Some("boom")),
-        ("timeout", 300, Some("timed out")),
+        (RunStatus::Success, 100, None),
+        (RunStatus::Success, 200, None),
+        (RunStatus::Error, 50, Some("boom")),
+        (RunStatus::Timeout, 300, Some("timed out")),
     ] {
         let rid = store
             .start_run(sched.id, sq_id, "q")
@@ -856,7 +875,7 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
         store
             .finish_run(
                 rid,
-                "success",
+                RunStatus::Success,
                 10,
                 Some(1),
                 None,
@@ -909,7 +928,7 @@ async fn successful_run_selectors(pool: PgPool) {
         .unwrap()
         .unwrap();
     store
-        .finish_run(r1, "error", 10, None, Some("x"), None, None)
+        .finish_run(r1, RunStatus::Error, 10, None, Some("x"), None, None)
         .await
         .unwrap();
     let r2 = store
@@ -920,7 +939,7 @@ async fn successful_run_selectors(pool: PgPool) {
     store
         .finish_run(
             r2,
-            "success",
+            RunStatus::Success,
             10,
             Some(1),
             None,
@@ -935,7 +954,15 @@ async fn successful_run_selectors(pool: PgPool) {
         .unwrap()
         .unwrap();
     store
-        .finish_run(r3, "success", 10, Some(1), None, Some(b"blob"), None)
+        .finish_run(
+            r3,
+            RunStatus::Success,
+            10,
+            Some(1),
+            None,
+            Some(b"blob"),
+            None,
+        )
         .await
         .unwrap();
 
@@ -991,7 +1018,7 @@ async fn concurrent_claims_respect_max_runs(pool: PgPool) {
         .unwrap()
         .unwrap();
     store
-        .finish_run(rid, "success", 10, None, None, None, None)
+        .finish_run(rid, RunStatus::Success, 10, None, None, None, None)
         .await
         .unwrap();
 
@@ -1037,7 +1064,7 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
     let updated = store
         .finish_run(
             rid,
-            "success",
+            RunStatus::Success,
             10,
             Some(1),
             None,
@@ -1078,7 +1105,7 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
         "a running row must be flipped to error"
     );
     let run = store.get_run(rid, 1).await.unwrap().unwrap();
-    assert_eq!(run.status, "error");
+    assert_eq!(run.status, RunStatus::Error);
     assert_eq!(run.result_path, None);
 
     // A run whose success already committed must survive the guarded flip:
@@ -1094,7 +1121,7 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
         store
             .finish_run(
                 rid2,
-                "success",
+                RunStatus::Success,
                 10,
                 Some(7),
                 None,
@@ -1113,7 +1140,11 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
         "a committed success must NOT be flipped (guard matches zero rows)"
     );
     let survived = store.get_run(rid2, 1).await.unwrap().unwrap();
-    assert_eq!(survived.status, "success", "committed success preserved");
+    assert_eq!(
+        survived.status,
+        RunStatus::Success,
+        "committed success preserved"
+    );
     assert_eq!(survived.row_count, Some(7), "row_count preserved");
     assert_eq!(
         survived.result_path.as_deref(),
@@ -1167,7 +1198,7 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     let finished = sched_store
-        .finish_run(rid, "success", 10, Some(1), None, None, Some(PATH))
+        .finish_run(rid, RunStatus::Success, 10, Some(1), None, None, Some(PATH))
         .await
         .unwrap();
 
@@ -1221,7 +1252,7 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     let finished = sched_store
-        .finish_run(rid, "success", 10, Some(1), None, None, Some(PATH))
+        .finish_run(rid, RunStatus::Success, 10, Some(1), None, None, Some(PATH))
         .await
         .unwrap();
 

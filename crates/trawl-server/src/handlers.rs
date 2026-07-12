@@ -36,8 +36,8 @@ use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, 
 use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues, CachedSchema};
 use crate::store::{
-    HistoryEntry, ReportRun, RunClaim, SavedQuery, Schedule, ScheduleWithStats, format_interval,
-    parse_interval,
+    HistoryEntry, ReportRun, RunClaim, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
+    format_interval, parse_interval,
 };
 
 // -- handlers ----------------------------------------------------------------
@@ -152,7 +152,13 @@ pub async fn query(
             if let Err(e) = state
                 .storage
                 .history
-                .record_query(verified.id, &req.query, duration_ms, total, "success")
+                .record_query(
+                    verified.id,
+                    &req.query,
+                    duration_ms,
+                    total,
+                    RunStatus::Success,
+                )
                 .await
             {
                 tracing::warn!(
@@ -958,10 +964,12 @@ fn history_entry_response(entry: HistoryEntry) -> HistoryEntryResponse {
         executed_at: entry.executed_at.to_rfc3339(),
         duration_ms: entry.duration_ms,
         row_count: entry.row_count,
-        status: entry
-            .status
-            .parse::<QueryStatus>()
-            .unwrap_or(QueryStatus::Error),
+        // History never records `Running`; map it to `Error` defensively.
+        status: match entry.status {
+            RunStatus::Success => QueryStatus::Success,
+            RunStatus::Timeout => QueryStatus::Timeout,
+            RunStatus::Error | RunStatus::Running => QueryStatus::Error,
+        },
     }
 }
 
@@ -1110,7 +1118,7 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
     ReportRunSummary {
         id: run.id,
         query: run.query,
-        status: run.status,
+        status: run.status.as_str().to_string(),
         started_at: run.started_at.to_rfc3339(),
         finished_at: run.finished_at.map(|t| t.to_rfc3339()),
         duration_ms: run.duration_ms,
@@ -1448,7 +1456,7 @@ pub async fn trigger_run(
     let summary = ReportRunSummary {
         id: run_id,
         query: saved.query.clone(),
-        status: "running".to_string(),
+        status: RunStatus::Running.as_str().to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
         finished_at: None,
         duration_ms: None,

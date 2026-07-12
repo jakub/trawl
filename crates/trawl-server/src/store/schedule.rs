@@ -29,6 +29,7 @@ use sqlx::{PgPool, Row as _};
 use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::{bind_u64, bind_usize};
 use super::saved::{SavedQuery, row_to_saved_query_at};
+use super::status::{RunStatus, decode_status};
 
 const MIN_INTERVAL_SECS: u64 = 60;
 
@@ -53,7 +54,7 @@ pub struct ReportRun {
     pub schedule_id: i64,
     pub saved_query_id: i64,
     pub query: String,
-    pub status: String,
+    pub status: RunStatus,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
@@ -151,7 +152,7 @@ pub(crate) fn row_to_report_run_at(row: &PgRow, prefix: &str) -> Result<ReportRu
         schedule_id: row.try_get(col("schedule_id").as_str())?,
         saved_query_id: row.try_get(col("saved_query_id").as_str())?,
         query: row.try_get(col("query").as_str())?,
-        status: row.try_get(col("status").as_str())?,
+        status: decode_status(row, col("status").as_str())?,
         started_at: row.try_get(col("started_at").as_str())?,
         finished_at: row.try_get(col("finished_at").as_str())?,
         duration_ms: row
@@ -585,7 +586,7 @@ impl ScheduleStore {
     pub async fn finish_run(
         &self,
         run_id: i64,
-        status: &str,
+        status: RunStatus,
         duration_ms: u64,
         row_count: Option<usize>,
         error_message: Option<&str>,
@@ -598,7 +599,7 @@ impl ScheduleStore {
                  error_message = $4, result_data = $5, result_path = $6
              WHERE id = $7",
         )
-        .bind(status)
+        .bind(status.as_str())
         .bind(bind_u64(duration_ms))
         .bind(row_count.map(bind_usize))
         .bind(error_message)
@@ -608,8 +609,10 @@ impl ScheduleStore {
         .execute(&self.pool)
         .await
         .map_err(|e| match classify_violation(&e) {
+            // Backstop: unreachable via the typed API, kept so a future raw
+            // path still maps the CHECK to Validation rather than 503.
             Some(PgViolation::Check) => {
-                StoreError::Validation(format!("invalid run status {status:?}"))
+                StoreError::Validation(format!("invalid run status {:?}", status.as_str()))
             }
             _ => StoreError::from(e),
         })?
@@ -618,7 +621,7 @@ impl ScheduleStore {
         tracing::info!(
             event_type = "report_run_finished",
             run_id,
-            status,
+            status = status.as_str(),
             duration_ms,
             orphaned = (updated == 0),
             "Report run finished"

@@ -23,6 +23,7 @@ pub mod error;
 pub mod history;
 pub mod saved;
 pub mod schedule;
+pub mod status;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,7 @@ pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{ReportRun, RunClaim, Schedule, ScheduleStore, format_interval, parse_interval};
+pub use status::RunStatus;
 
 use crate::ping::{PingCache, ping_cached_with};
 

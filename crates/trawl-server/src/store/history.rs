@@ -9,6 +9,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row as _};
 
 use super::error::{StoreError, classify_violation};
+use super::status::{RunStatus, decode_status};
 
 /// A single query history entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +20,7 @@ pub struct HistoryEntry {
     pub executed_at: DateTime<Utc>,
     pub duration_ms: u64,
     pub row_count: usize,
-    pub status: String,
+    pub status: RunStatus,
 }
 
 /// Paginated history response.
@@ -37,7 +38,7 @@ fn row_to_history_entry(row: &PgRow) -> Result<HistoryEntry, sqlx::Error> {
         executed_at: row.try_get("executed_at")?,
         duration_ms: u64::try_from(row.try_get::<i64, _>("duration_ms")?).unwrap_or_default(),
         row_count: usize::try_from(row.try_get::<i64, _>("row_count")?).unwrap_or_default(),
-        status: row.try_get("status")?,
+        status: decode_status(row, "status")?,
     })
 }
 
@@ -74,7 +75,7 @@ impl HistoryStore {
         query: &str,
         duration_ms: u64,
         row_count: usize,
-        status: &str,
+        status: RunStatus,
     ) -> Result<i64, StoreError> {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO query_history (key_id, query, executed_at, duration_ms, row_count, status)
@@ -85,12 +86,15 @@ impl HistoryStore {
         .bind(query)
         .bind(bind_u64(duration_ms))
         .bind(bind_usize(row_count))
-        .bind(status)
+        .bind(status.as_str())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| match classify_violation(&e) {
+            // Backstop: unreachable via the typed API (`running` is the only
+            // out-of-history-domain variant and callers never pass it), but
+            // kept so a future raw path still maps the CHECK to Validation.
             Some(super::error::PgViolation::Check) => {
-                StoreError::Validation(format!("invalid history status {status:?}"))
+                StoreError::Validation(format!("invalid history status {:?}", status.as_str()))
             }
             _ => StoreError::from(e),
         })?;
@@ -101,7 +105,7 @@ impl HistoryStore {
             key_id,
             duration_ms,
             row_count,
-            status,
+            status = status.as_str(),
             "Query saved to history"
         );
 
