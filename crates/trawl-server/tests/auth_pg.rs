@@ -12,8 +12,12 @@
 //! - AC5: error envelope per failure class (401 opaque, 403 grantless,
 //!   503 pg-down without backend detail)
 //! - AC6: scheduler skips revoked / expired / grant-stripped keys
-//! - AC7: legacy auth.db quarantine (colliding ids expose nothing)
 //! - AC8: audit poller sees out-of-process key mutations
+//!
+//! The slice-1 AC7 quarantine tests (legacy auth.db with colliding ids)
+//! were deleted in ADR-0004 slice 3: the transitional sqlite store and its
+//! quarantine apparatus no longer exist — the stores live in a dedicated
+//! postgres database keyed by fleet ids from day one.
 //! - SSE: revoked-before-connect → 401 (handshake-only auth is accepted
 //!   policy for this slice)
 
@@ -22,9 +26,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{ensure_fixtures, pg_fixture_or_skip, setup, setup_in_dir, trawl_only};
+use common::{ensure_fixtures, setup, trawl_only};
 use fleet_auth::{KeyStore, PrincipalKind};
 use parking_lot::Mutex;
+use sqlx::PgPool;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::policy::Role;
 
@@ -95,10 +100,10 @@ fn authenticated_routes() -> Vec<(reqwest::Method, &'static str)> {
 // AC1: fleet-minted key round-trip
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn ac1_key_roundtrip_create_whoami_revoke_401() {
-    let Some(server) = setup().await else { return };
-    let store = KeyStore::from_pool(server.fx.pool());
+#[sqlx::test(migrations = false)]
+async fn ac1_key_roundtrip_create_whoami_revoke_401(pool: PgPool) {
+    let server = setup(pool).await;
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
 
     // create (what fleet-admin does)
     let created = store
@@ -141,9 +146,9 @@ async fn ac1_key_roundtrip_create_whoami_revoke_401() {
 // AC3: route matrix
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn ac3_public_probes_unauthenticated() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac3_public_probes_unauthenticated(pool: PgPool) {
+    let server = setup(pool).await;
     let client = raw_client();
 
     let health = client
@@ -161,9 +166,9 @@ async fn ac3_public_probes_unauthenticated() {
     assert_eq!(metrics.status().as_u16(), 200);
 }
 
-#[tokio::test]
-async fn ac3_reader_blocked_from_export_stream_manage() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac3_reader_blocked_from_export_stream_manage(pool: PgPool) {
+    let server = setup(pool).await;
     for (method, path) in [
         (reqwest::Method::POST, "/api/v1/export"),
         (reqwest::Method::GET, "/api/v1/stream?query=*"),
@@ -186,9 +191,9 @@ async fn ac3_reader_blocked_from_export_stream_manage() {
     }
 }
 
-#[tokio::test]
-async fn ac3_ingest_only_key_can_ingest_but_nothing_else() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac3_ingest_only_key_can_ingest_but_nothing_else(pool: PgPool) {
+    let server = setup(pool).await;
 
     // Can ingest.
     let resp = raw_client()
@@ -221,9 +226,9 @@ async fn ac3_ingest_only_key_can_ingest_but_nothing_else() {
     }
 }
 
-#[tokio::test]
-async fn ac3_admin_cannot_ingest() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac3_admin_cannot_ingest(pool: PgPool) {
+    let server = setup(pool).await;
     let resp = raw_client()
         .post(format!("{}/api/v1/ingest", server.url))
         .header("authorization", format!("Bearer {}", server.admin_token))
@@ -239,9 +244,9 @@ async fn ac3_admin_cannot_ingest() {
     );
 }
 
-#[tokio::test]
-async fn ac3_grantless_key_403_on_every_authenticated_route() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac3_grantless_key_403_on_every_authenticated_route(pool: PgPool) {
+    let server = setup(pool).await;
     for (method, path) in authenticated_routes() {
         let (status, body) = request(
             &server.url,
@@ -258,21 +263,21 @@ async fn ac3_grantless_key_403_on_every_authenticated_route() {
     }
 }
 
-#[tokio::test]
-async fn ac3_grantless_key_never_reaches_rate_limiter() {
+#[sqlx::test(migrations = false)]
+async fn ac3_grantless_key_never_reaches_rate_limiter(pool: PgPool) {
     // Tight bucket for every role. A grantless key never reaches the rate
     // limiter (mandatory policy 403s it first) — so no request can ever be
     // 429, and none can succeed.
-    let Some(server) = common::setup_with_rate_limit(RateLimitConfig {
-        admin: 1,
-        analyst: 1,
-        reader: 1,
-        ingest: 1,
-    })
-    .await
-    else {
-        return;
-    };
+    let server = common::setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            admin: 1,
+            analyst: 1,
+            reader: 1,
+            ingest: 1,
+        },
+    )
+    .await;
 
     for _ in 0..30 {
         let (status, _) = request(
@@ -290,9 +295,9 @@ async fn ac3_grantless_key_never_reaches_rate_limiter() {
 // AC4: /whoami wire shape frozen (golden JSON per role)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn ac4_whoami_golden_json_per_role() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac4_whoami_golden_json_per_role(pool: PgPool) {
+    let server = setup(pool).await;
 
     let cases = [
         (
@@ -372,9 +377,9 @@ fn opaque_401() -> serde_json::Value {
     serde_json::json!({ "error": { "code": "auth_error", "message": "authentication failed" } })
 }
 
-#[tokio::test]
-async fn ac5_envelope_missing_and_malformed_and_invalid_tokens() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac5_envelope_missing_and_malformed_and_invalid_tokens(pool: PgPool) {
+    let server = setup(pool).await;
 
     // missing
     let (status, body) = request(&server.url, reqwest::Method::GET, "/api/v1/whoami", None).await;
@@ -417,10 +422,10 @@ async fn ac5_envelope_missing_and_malformed_and_invalid_tokens() {
     assert_eq!(body, opaque_401());
 }
 
-#[tokio::test]
-async fn ac5_envelope_revoked_and_expired_tokens() {
-    let Some(server) = setup().await else { return };
-    let store = KeyStore::from_pool(server.fx.pool());
+#[sqlx::test(migrations = false)]
+async fn ac5_envelope_revoked_and_expired_tokens(pool: PgPool) {
+    let server = setup(pool).await;
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
 
     // revoked
     let revoked = store
@@ -465,9 +470,9 @@ async fn ac5_envelope_revoked_and_expired_tokens() {
     assert_eq!(body, opaque_401());
 }
 
-#[tokio::test]
-async fn ac5_envelope_grantless_403() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac5_envelope_grantless_403(pool: PgPool) {
+    let server = setup(pool).await;
     let (status, body) = request(
         &server.url,
         reqwest::Method::GET,
@@ -484,12 +489,12 @@ async fn ac5_envelope_grantless_403() {
     );
 }
 
-#[tokio::test]
-async fn ac5_envelope_pg_down_503_without_backend_detail() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ac5_envelope_pg_down_503_without_backend_detail(pool: PgPool) {
+    let server = setup(pool).await;
 
     // Kill the auth backend under the running server.
-    server.fx.kill_database().await;
+    server.kill_fleet_database().await;
 
     let (status, body) = request(
         &server.url,
@@ -512,49 +517,64 @@ async fn ac5_envelope_pg_down_503_without_backend_detail() {
 // AC6: scheduler gates on key liveness + usable trawl grant
 // ---------------------------------------------------------------------------
 
-/// Drive the real scheduler over sqlite schedule state and a pg keystore,
+/// Drive the real scheduler over pg schedule state and a pg keystore,
 /// applying `mutate` to the owning key BEFORE the scheduler polls.
 /// Returns the number of runs recorded after ~2.5s of 1s polling.
+///
+/// `key_ttl`/`pre_sleep_ms` support the expiry case (expiry can't be set
+/// post-hoc through the public API).
 async fn scheduler_runs_after(
+    pool: PgPool,
+    key_ttl: Option<Duration>,
+    pre_sleep_ms: u64,
     mutate: impl AsyncFnOnce(&KeyStore, &fleet_auth::CreatedKey),
-) -> Option<u64> {
-    let fx = pg_fixture_or_skip().await?;
-    let key_store = KeyStore::from_pool(fx.pool());
+) -> u64 {
+    let key_store = common::fleet_keystore(&pool).await;
     let created = key_store
         .create_key(
             "sched-owner",
             PrincipalKind::Service,
             &trawl_only(Role::Analyst),
-            None,
+            key_ttl,
         )
         .await
         .unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
-    let store_db = tmp.path().join("store.db");
-    let saved_store = trawl_auth::SavedQueryStore::open(&store_db).unwrap();
-    let schedule_store = trawl_auth::ScheduleStore::open(&store_db).unwrap();
+    // Dedicated app-state database, migrated via the real boot path.
+    let app_db_url = common::create_app_database(&pool).await;
+    let storage = trawl_server::store::StorageState::connect(&app_db_url)
+        .await
+        .expect("boot app storage");
 
-    let saved = saved_store
+    let saved = storage
+        .saved
         .create(created.info.id, "gate-net", "* | head 1")
+        .await
         .unwrap();
-    let schedule = schedule_store
-        .create_schedule(saved.id, created.info.id, 1, None)
+    let schedule = storage
+        .schedule
+        // 60s is the store minimum; the first poll runs regardless of interval
+        // (never-run schedules are always due), so cadence is immaterial here.
+        .create_schedule(saved.id, created.info.id, 60, None)
+        .await
         .unwrap();
 
     mutate(&key_store, &created).await;
 
+    if pre_sleep_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(pre_sleep_ms)).await;
+    }
+
     // Real parquet fixtures so a permitted run actually succeeds.
     let data_glob = ensure_fixtures();
     let base_dir = data_glob.trim_end_matches("/**/*.parquet").to_owned();
-    let pool = trawl_server::pool::ExecutorPool::new(base_dir, 1, 1000, None);
+    let exec_pool = trawl_server::pool::ExecutorPool::new(base_dir, 1, 1000, None);
 
-    let schedule_store = Arc::new(Mutex::new(schedule_store));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = trawl_server::scheduler::spawn_scheduler(
-        Arc::clone(&schedule_store),
+        storage.schedule.clone(),
         key_store.clone(),
-        pool,
+        exec_pool,
         trawl_server::config::SchedulerConfig {
             enabled: true,
             poll_interval_secs: 1,
@@ -570,110 +590,67 @@ async fn scheduler_runs_after(
     let _ = shutdown_tx.send(true);
     let _ = handle.await;
 
-    let runs = schedule_store.lock().count_runs(schedule.id).unwrap();
-    Some(runs)
+    storage.schedule.count_runs(schedule.id).await.unwrap()
 }
 
-#[tokio::test]
-async fn ac6_scheduler_runs_for_live_key() {
-    let Some(runs) = scheduler_runs_after(async |_store, _key| {}).await else {
-        return;
-    };
+#[sqlx::test(migrations = false)]
+async fn ac6_scheduler_runs_for_live_key(pool: PgPool) {
+    let runs = scheduler_runs_after(pool, None, 0, async |_store, _key| {}).await;
     assert!(runs >= 1, "control case: live key must execute, got {runs}");
 }
 
-#[tokio::test]
-async fn ac6_scheduler_skips_revoked_key() {
-    let Some(runs) =
-        scheduler_runs_after(async |store: &KeyStore, key: &fleet_auth::CreatedKey| {
+#[sqlx::test(migrations = false)]
+async fn ac6_scheduler_skips_revoked_key(pool: PgPool) {
+    let runs = scheduler_runs_after(
+        pool,
+        None,
+        0,
+        async |store: &KeyStore, key: &fleet_auth::CreatedKey| {
             store.revoke_key(&key.info.prefix).await.unwrap();
-        })
-        .await
-    else {
-        return;
-    };
+        },
+    )
+    .await;
     assert_eq!(runs, 0, "revoked key must not execute schedules");
 }
 
-#[tokio::test]
-async fn ac6_scheduler_skips_expired_key() {
-    // Expiry can't be set post-hoc through the public API, so this case
-    // creates its own short-lived key by re-running the harness inline.
-    let Some(fx) = pg_fixture_or_skip().await else {
-        return;
-    };
-    let key_store = KeyStore::from_pool(fx.pool());
-    let created = key_store
-        .create_key(
-            "sched-expiring",
-            PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
-            Some(Duration::from_millis(100)),
-        )
-        .await
-        .unwrap();
-
-    let tmp = tempfile::tempdir().unwrap();
-    let store_db = tmp.path().join("store.db");
-    let saved_store = trawl_auth::SavedQueryStore::open(&store_db).unwrap();
-    let schedule_store = trawl_auth::ScheduleStore::open(&store_db).unwrap();
-    let saved = saved_store
-        .create(created.info.id, "exp-net", "* | head 1")
-        .unwrap();
-    let schedule = schedule_store
-        .create_schedule(saved.id, created.info.id, 1, None)
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(200)).await; // key expires
-
-    let data_glob = ensure_fixtures();
-    let base_dir = data_glob.trim_end_matches("/**/*.parquet").to_owned();
-    let pool = trawl_server::pool::ExecutorPool::new(base_dir, 1, 1000, None);
-    let schedule_store = Arc::new(Mutex::new(schedule_store));
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let handle = trawl_server::scheduler::spawn_scheduler(
-        Arc::clone(&schedule_store),
-        key_store,
+#[sqlx::test(migrations = false)]
+async fn ac6_scheduler_skips_expired_key(pool: PgPool) {
+    // Short-lived key + a sleep past its expiry before the scheduler starts.
+    let runs = scheduler_runs_after(
         pool,
-        trawl_server::config::SchedulerConfig {
-            enabled: true,
-            poll_interval_secs: 1,
-            report_max_rows: 1000,
-            max_runs_per_schedule: 100,
-            report_retention_days: 30,
-        },
-        10,
-        shutdown_rx,
-    );
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    let _ = shutdown_tx.send(true);
-    let _ = handle.await;
-
-    let runs = schedule_store.lock().count_runs(schedule.id).unwrap();
+        Some(Duration::from_millis(100)),
+        200,
+        async |_store, _key| {},
+    )
+    .await;
     assert_eq!(runs, 0, "expired key must not execute schedules");
 }
 
-#[tokio::test]
-async fn ac6_scheduler_skips_grant_stripped_key() {
-    let Some(runs) =
-        scheduler_runs_after(async |store: &KeyStore, key: &fleet_auth::CreatedKey| {
+#[sqlx::test(migrations = false)]
+async fn ac6_scheduler_skips_grant_stripped_key(pool: PgPool) {
+    let runs = scheduler_runs_after(
+        pool,
+        None,
+        0,
+        async |store: &KeyStore, key: &fleet_auth::CreatedKey| {
             store
                 .revoke_assignment(&key.info.prefix, "trawl")
                 .await
                 .unwrap();
-        })
-        .await
-    else {
-        return;
-    };
+        },
+    )
+    .await;
     assert_eq!(runs, 0, "grant-stripped key must not execute schedules");
 }
 
 /// A live key whose trawl grant is downgraded from analyst to a role lacking
 /// saved-query authority must stop running its schedules — otherwise removing
 /// a role leaves durable execution privilege behind.
-async fn assert_downgrade_stops_schedules(new_role: &str) {
-    let Some(runs) = scheduler_runs_after(
+async fn assert_downgrade_stops_schedules(pool: PgPool, new_role: &str) {
+    let runs = scheduler_runs_after(
+        pool,
+        None,
+        0,
         async move |store: &KeyStore, key: &fleet_auth::CreatedKey| {
             store
                 .revoke_assignment(&key.info.prefix, "trawl")
@@ -691,131 +668,24 @@ async fn assert_downgrade_stops_schedules(new_role: &str) {
                 .unwrap();
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     assert_eq!(
         runs, 0,
         "key downgraded to {new_role} must not execute schedules"
     );
 }
 
-#[tokio::test]
-async fn ac6_scheduler_skips_analyst_downgraded_to_reader() {
+#[sqlx::test(migrations = false)]
+async fn ac6_scheduler_skips_analyst_downgraded_to_reader(pool: PgPool) {
     // Reader holds Query but not SavedQuery: it cannot manage saved queries
     // interactively, so it must not keep running them on a schedule.
-    assert_downgrade_stops_schedules("reader").await;
+    assert_downgrade_stops_schedules(pool, "reader").await;
 }
 
-#[tokio::test]
-async fn ac6_scheduler_skips_analyst_downgraded_to_ingest() {
+#[sqlx::test(migrations = false)]
+async fn ac6_scheduler_skips_analyst_downgraded_to_ingest(pool: PgPool) {
     // Ingest holds neither Query nor SavedQuery.
-    assert_downgrade_stops_schedules("ingest").await;
-}
-
-// ---------------------------------------------------------------------------
-// AC7: legacy auth.db quarantine
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn ac7_legacy_auth_db_quarantined_with_colliding_ids() {
-    // Seed a populated legacy sqlite auth.db whose owner key id (1) WILL
-    // collide with the fresh pg sequence: the first key trawld mints in
-    // postgres is the analyst below, which also lands on id 1. The legacy
-    // keystore tables no longer exist as a crate type (the sqlite keystore
-    // died in slice 1 — keys now live in postgres), so the fixture seeds the
-    // history/saved/schedule rows trawld still keeps in sqlite directly,
-    // keyed to the colliding owner id.
-    let tmp = tempfile::tempdir().unwrap();
-    let legacy_db = tmp.path().join("auth.db");
-    {
-        let history = trawl_auth::HistoryStore::open(&legacy_db).unwrap();
-        history
-            .record_query(1, "* | stats count()", 5, 42, "success")
-            .unwrap();
-
-        let saved = trawl_auth::SavedQueryStore::open(&legacy_db).unwrap();
-        let legacy_saved = saved.create(1, "legacy-net", "* | head 1").unwrap();
-
-        let schedules = trawl_auth::ScheduleStore::open(&legacy_db).unwrap();
-        schedules
-            .create_schedule(legacy_saved.id, 1, 1, None)
-            .unwrap();
-    }
-
-    // Boot slice-1 trawld against the same datadir (fresh store.db).
-    let Some(server) = setup_in_dir(tmp.path(), RateLimitConfig::default()).await else {
-        return;
-    };
-    // analyst is the first key minted → pg id 1, colliding with legacy id 1.
-
-    let (status, history) = request(
-        &server.url,
-        reqwest::Method::GET,
-        "/api/v1/history",
-        Some(&server.analyst_token),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(
-        history["total"], 0,
-        "legacy history must be invisible: {history}"
-    );
-
-    let (status, saved) = request(
-        &server.url,
-        reqwest::Method::GET,
-        "/api/v1/saved",
-        Some(&server.analyst_token),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(
-        saved["queries"].as_array().map(Vec::len),
-        Some(0),
-        "legacy saved queries must be invisible: {saved}"
-    );
-
-    let (status, runs) = request(
-        &server.url,
-        reqwest::Method::GET,
-        "/api/v1/runs",
-        Some(&server.analyst_token),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(runs["total"], 0, "no legacy runs visible: {runs}");
-
-    // The legacy file is preserved in place, never deleted.
-    assert!(legacy_db.exists(), "auth.db must stay quarantined on disk");
-
-    // And zero legacy schedules execute: the scheduler polls the FRESH
-    // store.db (empty), so nothing can run — the /runs assertion above
-    // covers it. The legacy schedule is still present in the quarantined
-    // file, proving it was never migrated or drained.
-    let legacy_schedules = trawl_auth::ScheduleStore::open(&legacy_db).unwrap();
-    assert_eq!(
-        legacy_schedules.list_enabled_schedules().unwrap().len(),
-        1,
-        "legacy schedule untouched in quarantined file"
-    );
-
-    // Config-level guard: pointing db_path at the legacy file is a loud
-    // startup error (deb conffile upgrades preserve old trawld.toml).
-    let toml = format!(
-        r#"
-[server]
-[data]
-path = "/data"
-[auth]
-db_path = "{}"
-database_url = "postgres://unused/db"
-"#,
-        legacy_db.display()
-    );
-    let err = trawl_server::config::Config::from_toml(&toml).unwrap_err();
-    assert!(err.to_string().contains("runbook"), "got: {err}");
+    assert_downgrade_stops_schedules(pool, "ingest").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -836,8 +706,8 @@ impl std::io::Write for CaptureWriter {
     }
 }
 
-#[tokio::test]
-async fn ac8_audit_poller_emits_events_for_out_of_process_mutations() {
+#[sqlx::test(migrations = false)]
+async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool) {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let writer = CaptureWriter(Arc::clone(&buf));
     let _ = tracing_subscriber::fmt()
@@ -845,10 +715,7 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations() {
         .with_writer(move || writer.clone())
         .try_init();
 
-    let Some(fx) = pg_fixture_or_skip().await else {
-        return;
-    };
-    let key_store = KeyStore::from_pool(fx.pool());
+    let key_store = common::fleet_keystore(&pool).await;
 
     // Baseline key so the initial snapshot is non-trivial.
     key_store
@@ -872,7 +739,9 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations() {
 
     // Out-of-process mutation: a SECOND connection to the same database
     // (what fleet-admin does).
-    let second = KeyStore::connect(&fx.database_url()).await.unwrap();
+    let second = KeyStore::connect(&common::fleet_database_url(&pool))
+        .await
+        .unwrap();
     let created = second
         .create_key(
             "made-by-fleet-admin",
@@ -905,10 +774,10 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations() {
 // SSE: revoked-before-connect → 401 (handshake-only auth, accepted policy)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn sse_stream_rejects_revoked_key_at_handshake() {
-    let Some(server) = setup().await else { return };
-    let store = KeyStore::from_pool(server.fx.pool());
+#[sqlx::test(migrations = false)]
+async fn sse_stream_rejects_revoked_key_at_handshake(pool: PgPool) {
+    let server = setup(pool).await;
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
 
     let created = store
         .create_key(
@@ -931,4 +800,120 @@ async fn sse_stream_rejects_revoked_key_at_handshake() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 401);
+}
+
+// ---------------------------------------------------------------------------
+// AC9 (slice 3): storage-loss observability + redacted store errors
+// ---------------------------------------------------------------------------
+
+/// Killing the app-state database under a running server degrades /health
+/// (HTTP 200 — queries still serve) and turns store-backed endpoints into
+/// redacted 503s. Never a pg diagnostic on the wire.
+#[sqlx::test(migrations = false)]
+async fn storage_loss_degrades_health_and_503s_store_endpoints(pool: PgPool) {
+    let server = setup(pool).await;
+    let client = raw_client();
+
+    server.kill_app_database().await;
+
+    // The storage ping is memoised (~5s TTL) — poll until degradation
+    // propagates. The HTTP status must stay 200 throughout: app-state loss
+    // is non-critical (degraded), never a liveness failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let resp = client
+            .get(format!("{}/api/v1/health", server.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "storage loss must be Degraded + HTTP 200"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        if body["status"] == "degraded" {
+            let storage = body["checks"]["storage_db"].as_str().unwrap_or_default();
+            assert!(storage.starts_with("error:"), "got: {body}");
+            assert_eq!(body["checks"]["duckdb"], "ok", "got: {body}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "health never degraded: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Store-backed endpoint: 503 with the fixed redacted envelope.
+    let (status, body) = request(
+        &server.url,
+        reqwest::Method::GET,
+        "/api/v1/history",
+        Some(&server.analyst_token),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": {
+                "code": "service_unavailable",
+                "message": "app-state store unavailable"
+            }
+        }),
+        "503 must not leak postgres details"
+    );
+}
+
+/// `/api/v1/dashboard` reports the enabled-schedule count from postgres:
+/// the async snapshot collector polls the store and the sync snapshot
+/// carries it onto the wire.
+#[sqlx::test(migrations = false)]
+async fn dashboard_reports_schedule_count_from_pg(pool: PgPool) {
+    let server = setup(pool).await;
+    let client = raw_client();
+
+    // Create a saved query + schedule through the API.
+    let resp = client
+        .post(format!("{}/api/v1/saved", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({"name": "dash-net", "query": "* | head 1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let saved: serde_json::Value = resp.json().await.unwrap();
+    let saved_id = saved["id"].as_i64().unwrap();
+
+    let resp = client
+        .put(format!("{}/api/v1/saved/{saved_id}/schedule", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({"interval": "1h"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // The collector ticks every second; poll the dashboard until the count
+    // lands.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = request(
+            &server.url,
+            reqwest::Method::GET,
+            "/api/v1/dashboard",
+            Some(&server.admin_token),
+        )
+        .await;
+        if status == 200 && body["scheduler_schedules"] == 1 {
+            assert_eq!(body["scheduler_enabled"], true, "got: {body}");
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dashboard never showed the schedule: {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }

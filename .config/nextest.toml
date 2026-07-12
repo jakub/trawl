@@ -1,6 +1,25 @@
+# Test-group bounds.
+#
+# server-integration: each http_api/hot_query test boots a full trawld (TLS
+# listener, duckdb executor pool, two postgres pools), so parallelism is
+# bounded for memory AND postgres connections.
+#
+# pg: every other pg-backed test binary (fleet-auth, fleet-admin,
+# trawl-server's auth_pg/store_pg). nextest is process-per-test and sqlx
+# pools are process-local, so unbounded parallelism can exceed the postgres
+# server's max_connections (the CI service container runs the stock limit
+# of 100 — GH Actions can't override the postgres command line).
+
 [test-groups.server-integration]
 max-threads = 4
+
+[test-groups.pg]
+max-threads = 8
 
 [[profile.default.overrides]]
 filter = 'binary(http_api) | binary(hot_query)'
 test-group = 'server-integration'
+
+[[profile.default.overrides]]
+filter = 'binary(auth_pg) | binary(store_pg) | (package(fleet-auth) & kind(test)) | (package(fleet-admin) & kind(test))'
+test-group = 'pg'

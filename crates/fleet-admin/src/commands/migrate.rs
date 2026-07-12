@@ -5,7 +5,7 @@
 //! `fleet-admin migrate` — apply embedded fleet-auth schema migrations.
 
 use fleet_auth::MIGRATOR;
-use sqlx_postgres::PgPool;
+use sqlx::postgres::PgPool;
 
 use crate::error::AdminError;
 

@@ -11,7 +11,7 @@ use super::super::{App, MutationResult};
 
 /// Check if a saved query name matches `[a-zA-Z0-9_-]+`.
 ///
-/// Mirrors the server-side validation in `trawl-auth` for immediate
+/// Mirrors the server-side validation in trawl-server's app-state store for immediate
 /// client-side feedback (the server still validates independently).
 fn is_valid_query_name(name: &str) -> bool {
     !name.is_empty()

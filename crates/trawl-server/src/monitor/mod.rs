@@ -69,8 +69,28 @@ pub fn spawn_snapshot_collector(
         );
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             interval.tick().await;
+
+            // The enabled-schedule count lives in postgres now; the async
+            // collector loop owns that (store) access and pushes the value
+            // into the sync MonitorState. One indexed COUNT(*) per second
+            // on a tiny table is negligible, and per-tick refresh keeps the
+            // dashboard (and its tests) current.
+            if monitor.scheduler_enabled() {
+                match app_state.storage.schedule.count_enabled_schedules().await {
+                    Ok(count) => {
+                        monitor.set_schedule_count(usize::try_from(count).unwrap_or_default());
+                    }
+                    Err(e) => tracing::warn!(
+                        event_type = "monitor_schedule_count_error",
+                        error = %e,
+                        "failed to refresh enabled-schedule count"
+                    ),
+                }
+            }
+
             let snapshot = monitor.snapshot();
             *app_state.dashboard_snapshot.lock() = Some(snapshot.to_dashboard_snapshot());
         }

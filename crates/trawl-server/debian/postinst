@@ -5,20 +5,20 @@ if [ "$1" = "configure" ]; then
   # create trawl system user/group from sysusers.d config
   systemd-sysusers trawl.conf 2>/dev/null || true
 
-  # NOTE (ADR-0004 fleet-auth cutover): a legacy pre-cutover
-  # /var/lib/trawl/auth.db is deliberately PRESERVED in place, quarantined —
-  # never read, migrated, or deleted. trawld now keeps history/saved/
-  # schedules in a fresh store.db and refuses to start if [auth] db_path
-  # still points at auth.db (conffile upgrades keep the old trawld.toml —
-  # follow the cutover runbook in the docs).
+  # NOTE (ADR-0004 slice 3): trawld's app state (history, saved queries,
+  # schedules, report runs) lives in a dedicated `trawl` postgres database,
+  # auto-migrated at boot. Any leftover transitional sqlite file is
+  # PRESERVED in place, never read, migrated, or deleted; a leftover [auth]
+  # db_path in trawld.toml is a loud startup error (conffile upgrades keep
+  # the old file — follow the cutover runbook in the docs).
 
-  # Lock down the credential-bearing config files. Both can carry the
-  # fleet-auth Postgres DSN (keystore credential): trawld.toml holds [auth]
-  # database_url, and /etc/default/trawld is the documented home for a
-  # DATABASE_URL override. cargo-deb installs them 0640 root:root; chown them
-  # root:trawl so trawld (User/Group=trawl) can read its config while no
-  # unprivileged local user can read the DSN. systemd reads the EnvironmentFile
-  # as root, so root:trawl suffices there too.
+  # Lock down the credential-bearing config files. Both can carry postgres
+  # DSNs: trawld.toml holds [auth]/[storage] database_url, and
+  # /etc/default/trawld is the documented home for the FLEET_DATABASE_URL /
+  # TRAWL_DATABASE_URL overrides. cargo-deb installs them 0640 root:root;
+  # chown them root:trawl so trawld (User/Group=trawl) can read its config
+  # while no unprivileged local user can read the DSNs. systemd reads the
+  # EnvironmentFile as root, so root:trawl suffices there too.
   if id trawl >/dev/null 2>&1; then
     for f in /etc/trawl/trawld.toml /etc/default/trawld; do
       if [ -f "$f" ]; then

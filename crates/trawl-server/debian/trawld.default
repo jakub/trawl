@@ -2,3 +2,8 @@
 # Uncomment and modify as needed.
 
 # RUST_LOG=trawld=info
+
+# Postgres DSNs (take precedence over trawld.toml; keep credentials here
+# if you prefer them out of the config file — this file is 0640 root:trawl).
+# FLEET_DATABASE_URL=postgres://fleet:CHANGE_ME@db.example.internal:5432/fleet
+# TRAWL_DATABASE_URL=postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl

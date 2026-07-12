@@ -13,6 +13,17 @@ trawld --config /path/to/trawld.toml
 TRAWL_CONFIG=/path/to/trawld.toml trawld
 ```
 
+### Server environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `TRAWL_CONFIG` | Config file path |
+| `TRAWL_QUERY_LOG` | ndjson query debug log path |
+| `FLEET_DATABASE_URL` | Fleet keystore postgres URL (overrides `[auth] database_url`) |
+| `TRAWL_DATABASE_URL` | Trawl app-state postgres URL (overrides `[storage] database_url`) |
+
+`DATABASE_URL` is **not** read by trawld (it is fleet-admin's variable and the sqlx test harness's).
+
 ### Syntax notes
 
 **Byte sizes** accept human-readable strings with binary (1024-based) multipliers:
@@ -77,12 +88,23 @@ The `tls_reload_interval_secs` setting polls the cert/key files for content chan
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `database_url` | string | *(required unless `DATABASE_URL` is set)* | Fleet-auth postgres keystore URL — API keys and roles live here. The `DATABASE_URL` environment variable takes precedence |
-| `db_path` | path | *(required)* | Transitional SQLite store for query history, saved queries, and schedules. Must be a fresh file (e.g. `store.db`) — trawld refuses to start on the legacy `auth.db` |
+| `database_url` | string | *(required unless `FLEET_DATABASE_URL` is set)* | Fleet-auth postgres keystore URL — API keys and roles live here. The `FLEET_DATABASE_URL` environment variable takes precedence |
 | `audit_interval_secs` | integer | `30` | Poll the fleet keystore for key changes from `fleet-admin`; `0` disables |
 
 :::note
-trawld will not start until the fleet database is reachable and migrated (`fleet-admin migrate`). Key revocation takes effect immediately — liveness is checked in postgres on every request (the old `auth_cache_ttl_secs` token cache is gone). See the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for migrating an existing deployment.
+trawld will not start until the fleet database is reachable and migrated (`fleet-admin migrate`). Key revocation takes effect immediately — liveness is checked in postgres on every request. The bare `DATABASE_URL` override was removed in the slice-3 cutover (it is ceded to sqlx's test harness); a leftover `db_path` (the retired transitional SQLite store) fails validation with a message naming the migration. See the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for migrating an existing deployment.
+:::
+
+### `[storage]`
+
+Trawl's own app state — query history, saved queries, schedules, and report runs — lives in a **dedicated postgres database** owned by trawld (ADR-0004 slice 3).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `database_url` | string | *(required unless `TRAWL_DATABASE_URL` is set)* | Trawl app-state postgres URL. The `TRAWL_DATABASE_URL` environment variable takes precedence. **No fallback to the `[auth]` URL** |
+
+:::note
+trawld migrates this database automatically at boot (it is the sole writer) and holds a session advisory lock for its lifetime — a second trawld against the same database fails startup instead of racing. Provision a separate database whose role owns the schema; see the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for the exact role/grants.
 :::
 
 ### `[ingest]`
@@ -201,7 +223,9 @@ path = "/var/lib/trawl/data"
 
 [auth]
 database_url = "postgres://fleet:CHANGE_ME@db.internal:5432/fleet"
-db_path = "/var/lib/trawl/store.db"
+
+[storage]
+database_url = "postgres://trawl:CHANGE_ME@db.internal:5432/trawl"
 
 [ingest]
 enabled = true

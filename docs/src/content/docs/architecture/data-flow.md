@@ -75,6 +75,10 @@ data/
 
 Schema is fully dynamic — no predefined columns. `union_by_name=true` handles heterogeneous schemas across services. Timestamps are cast to native `TIMESTAMP` during compaction for predicate pushdown.
 
+### App-state store
+
+Log data is the parquet tree above; trawl's *app state* — query history, saved queries, schedules, and report run metadata — lives in a dedicated `trawl` postgres database. trawld migrates it automatically at boot and holds a session advisory lock for its lifetime (sole writer by design). Scheduled report *results* are written back into the data directory as parquet under `data/scheduled/{name}/run_{id}.parquet`, with only the relative path recorded in postgres.
+
 ## Query execution
 
 ```

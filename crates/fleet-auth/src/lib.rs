@@ -25,9 +25,6 @@ pub mod token;
 #[cfg(feature = "session")]
 pub mod session;
 
-#[cfg(feature = "test-support")]
-pub mod test_support;
-
 #[cfg(feature = "axum")]
 pub mod handlers;
 #[cfg(feature = "axum")]

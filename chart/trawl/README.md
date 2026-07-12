@@ -5,43 +5,62 @@ Self-hosted log collection, storage, and search for homelabs and small-to-medium
 ## Quick Start
 
 ```bash
-# Install from GHCR OCI registry
-helm install trawl oci://ghcr.io/jakub/charts/trawl
+# Two Secrets holding the postgres DSNs (fleet keystore + trawl app state)
+kubectl create secret generic fleet-db \
+  --from-literal=DATABASE_URL='postgres://fleet:...@pg:5432/fleet'
+kubectl create secret generic trawl-db \
+  --from-literal=TRAWL_DATABASE_URL='postgres://trawl:...@pg:5432/trawl'
 
-# Get the initial admin API token (first install only)
-kubectl logs trawl-0 -c init-auth
+# Install from GHCR OCI registry
+helm install trawl oci://ghcr.io/jakub/charts/trawl \
+  --set auth.database.existingSecret=fleet-db \
+  --set storage.database.existingSecret=trawl-db
 
 # Port-forward for local access
 kubectl port-forward svc/trawl 5514:5514
 
-# Query via CLI (self-signed cert)
+# Query via CLI (self-signed cert; mint tokens with fleet-admin)
 trawl query --url https://localhost:5514 --insecure --token <TOKEN> "* | head 5"
 ```
 
 ## Architecture
 
-trawl is **single-node only** — the chart deploys a StatefulSet with exactly 1 replica. Multiple replicas would corrupt the embedded SQLite auth database. This is by design: trawl targets homelabs and small infra, not multi-tenant clusters.
+trawl is **single-node only** — the chart deploys a StatefulSet with exactly 1 replica. trawld owns its parquet data directory and in-memory hot buffer outright, and it holds a session advisory lock on the trawl app-state database, so a second replica fails startup rather than split-braining. This is by design: trawl targets homelabs and small infra, not multi-tenant clusters.
 
 The single pod runs `trawld` with:
 - Embedded DuckDB for query execution
-- SQLite for auth (API keys, roles, saved queries)
 - Parquet files for log storage
 - Optional syslog listener (UDP/TCP)
+- The `trawl-web` session proxy sidecar (browser UI)
+
+Two **external postgres databases** back it (CNPG or any reachable postgres):
+
+| Database | DSN source | Owner | Contents |
+|----------|-----------|-------|----------|
+| `fleet` (shared across fleet apps) | Secret → `FLEET_DATABASE_URL` env (fleet-admin init container reads it as `DATABASE_URL`) | migrated by `fleet-admin migrate` (init container) | API keys, roles, grants |
+| `trawl` (dedicated) | Secret → `TRAWL_DATABASE_URL` env | migrated by trawld at boot (sole writer, advisory-locked) | query history, saved queries, schedules, report runs |
+
+There is no fallback between the two URLs — provision both databases. See the fleet-auth cutover runbook in the docs for the exact roles/grants (boot-time migration means the trawld role owns the `trawl` schema).
 
 ## Prerequisites
 
 - Kubernetes 1.26+ (for HTTPS health probes)
 - Helm 3.x
 - A StorageClass that supports `ReadWriteOnce` PVCs
+- A reachable postgres with the `fleet` and `trawl` databases provisioned
 
 ## Installing
 
 ```bash
 # Default install (self-signed TLS, 50Gi storage)
-helm install trawl oci://ghcr.io/jakub/charts/trawl
+helm install trawl oci://ghcr.io/jakub/charts/trawl \
+  --set auth.database.existingSecret=fleet-db \
+  --set storage.database.existingSecret=trawl-db
 
 # Custom values
 helm install trawl oci://ghcr.io/jakub/charts/trawl \
+  --set auth.database.existingSecret=fleet-db \
+  --set storage.database.existingSecret=trawl-db \
   --set persistence.size=100Gi \
   --set config.retention.maxAgeDays=180
 
@@ -49,24 +68,15 @@ helm install trawl oci://ghcr.io/jakub/charts/trawl \
 helm install trawl ./chart/trawl
 ```
 
-## Auth Bootstrap
+## Auth
 
-On first install, an init container creates the auth database and generates two API keys — an **admin** key and an **ingest** key. Both tokens are printed to the init container's logs:
-
-```bash
-kubectl logs trawl-0 -c init-auth
-```
-
-**Save these tokens** — they won't be shown again. The ingest token can be used immediately with Vector or any HTTP log shipper. To create additional keys:
+API keys live in the shared fleet keystore. An init container runs `fleet-admin migrate` on every pod start (idempotent — sqlx tracks applied migrations). Mint keys with `fleet-admin` against the keystore database:
 
 ```bash
-kubectl exec trawl-0 -- trawl-admin --db /var/lib/trawl/auth.db keys create \
-  --role analyst --name "my-analyst-key"
+fleet-admin keys create --name "my-analyst-key" --grant trawl:analyst
 ```
 
-Available roles: `admin`, `analyst`, `reader`, `ingest`.
-
-The init container is idempotent — on upgrades or restarts, it detects the existing `auth.db` and skips key creation entirely.
+Available trawl roles: `admin`, `analyst`, `reader`, `ingest`. One key can carry grants for several fleet apps; only the `trawl` grant matters to trawld.
 
 ## TLS
 
@@ -225,8 +235,7 @@ verify_certificate = false  # if using self-signed cert
 Create a dedicated ingest token:
 
 ```bash
-kubectl exec trawl-0 -- trawl-admin --db /var/lib/trawl/auth.db keys create \
-  --role ingest --name "vector"
+fleet-admin keys create --name "vector" --grant trawl:ingest
 ```
 
 ## Prometheus Metrics
@@ -264,12 +273,11 @@ config:
     [data]
     path = "/var/lib/trawl/data"
 
-    [auth]
-    db_path = "/var/lib/trawl/auth.db"
-
     [ingest]
     enabled = true
 ```
+
+The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_URL` env vars (from the Secrets), so `[auth]`/`[storage]` `database_url` lines are unnecessary in raw config too.
 
 ## Values Reference
 
@@ -306,7 +314,10 @@ config:
 | `config.server.maxConcurrentQueries` | string | `""` | DuckDB pool size (empty = CPU count) |
 | `config.server.shutdownDrainSecs` | int | `30` | Graceful shutdown timeout |
 | `config.data.path` | string | `/var/lib/trawl/data` | Parquet data directory |
-| `config.auth.dbPath` | string | `/var/lib/trawl/auth.db` | SQLite auth database path |
+| `auth.database.existingSecret` | string | `""` | Secret holding the fleet keystore DSN. REQUIRED |
+| `auth.database.existingSecretKey` | string | `DATABASE_URL` | Key within that Secret |
+| `storage.database.existingSecret` | string | `""` | Secret holding the trawl app-state DSN. REQUIRED |
+| `storage.database.existingSecretKey` | string | `TRAWL_DATABASE_URL` | Key within that Secret |
 | `config.ingest.enabled` | bool | `true` | Enable ingest endpoint |
 | `config.ingest.hotBufferMaxBytes` | string | `100M` | Hot buffer memory limit |
 | `config.retention.maxAgeDays` | int | `90` | Data retention (days, 0 = disabled) |
@@ -319,13 +330,10 @@ config:
 | `config.scheduler.enabled` | bool | `true` | Enable scheduled queries |
 | `tls.mode` | string | `auto` | TLS mode: auto, secret, certManager |
 | `tls.secretName` | string | `""` | TLS Secret name (mode=secret) |
-| `initAuth.enabled` | bool | `true` | Bootstrap auth on first install |
+| `initAuth.enabled` | bool | `true` | Run `fleet-admin migrate` init container on pod start |
 | `initAuth.resources.requests.cpu` | string | `50m` | Init container CPU request |
 | `initAuth.resources.requests.memory` | string | `64Mi` | Init container memory request |
 | `initAuth.resources.limits.memory` | string | `128Mi` | Init container memory limit |
-| `initAuth.keyName` | string | `helm-bootstrap` | Name for the initial admin key |
-| `initAuth.createIngestKey` | bool | `true` | Also create an ingest-role key |
-| `initAuth.ingestKeyName` | string | `helm-ingest` | Name for the initial ingest key |
 | `resources.requests.cpu` | string | `250m` | CPU request |
 | `resources.requests.memory` | string | `512Mi` | Memory request |
 | `resources.limits.memory` | string | `2Gi` | Memory limit |

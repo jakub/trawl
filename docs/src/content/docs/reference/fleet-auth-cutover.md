@@ -1,6 +1,6 @@
 ---
 title: Fleet-Auth Cutover Runbook
-description: Migrating a trawld deployment from the sqlite keystore to the fleet-auth postgres keystore (ADR-0004 slice 1), plus fleet SSO key provisioning (slice 2).
+description: Migrating a trawld deployment to the fleet-auth postgres keystore (ADR-0004 slice 1), fleet SSO key provisioning (slice 2), and the dedicated trawl app-state database (slice 3).
 ---
 
 Since ADR-0004 slice 1, trawld verifies API keys against **fleet-auth's
@@ -11,12 +11,16 @@ external postgres keystore**. The old sqlite keystore path is gone:
 - This is a **hard cutover with no data migration** — every existing `flt_`
   token stops working and must be re-minted. The token format is unchanged.
 - Key management moved from `trawl-admin keys` (removed) to `fleet-admin`.
-- The legacy `auth.db` is **quarantined in place**: postgres and sqlite key
-  ids are unrelated sequences, so reusing the file would let a new key
-  inherit another principal's query history, saved queries, and
-  auto-executing schedules. trawld refuses to start while `[auth] db_path`
-  points at a file named `auth.db` — repoint it at a fresh file (e.g.
-  `store.db`) and leave `auth.db` on disk untouched.
+- Since **slice 3**, trawld's app state (query history, saved queries,
+  schedules, report runs) lives in a **dedicated `trawl` postgres
+  database** — the transitional sqlite file is gone, and so is the `[auth]
+  db_path` setting (a leftover one fails config validation with a message
+  naming this migration). Any legacy sqlite file (`auth.db`, `store.db`)
+  stays on disk untouched; nothing is imported from it.
+- trawld reads `FLEET_DATABASE_URL` (keystore) and `TRAWL_DATABASE_URL`
+  (app state) as env overrides. The bare `DATABASE_URL` override was
+  removed from trawld in slice 3 — that variable belongs to `fleet-admin`
+  (and sqlx's test harness).
 
 ## Expected impact
 
@@ -40,8 +44,27 @@ keys. Schedules must be recreated (see below).
 
 ## Runbook
 
-1. **Migrate the schema.** Point `DATABASE_URL` at the fleet postgres
-   database and apply the embedded migrations (idempotent):
+0. **Provision the `trawl` app-state database** (slice 3). trawld migrates
+   the schema itself at boot, so its role must OWN the database (CI's
+   superuser proves nothing about prod shape — grant deliberately):
+
+   ```sql
+   -- as the postgres superuser / CNPG bootstrap
+   CREATE ROLE trawl LOGIN PASSWORD '…';
+   CREATE DATABASE trawl OWNER trawl;
+   -- postgres 15+: the owner already has CREATE on its database's public
+   -- schema; no further grants are needed. trawld creates the tables and
+   -- the _sqlx_migrations bookkeeping table on first boot.
+   ```
+
+   trawld also takes a session `pg_advisory_lock` on this database for its
+   whole lifetime — a second trawld pointed at the same database fails
+   startup instead of racing boot-time migration. Do NOT share this
+   database with anything else.
+
+1. **Migrate the fleet schema.** Point `DATABASE_URL` at the fleet postgres
+   database and apply the embedded migrations (idempotent). This is
+   `fleet-admin`'s own variable — trawld never reads it:
 
    ```bash
    export DATABASE_URL='postgres://fleet:…@db.internal:5432/fleet'
@@ -67,41 +90,62 @@ keys. Schedules must be recreated (see below).
 
    ```toml
    [auth]
-   # or set DATABASE_URL in /etc/default/trawld to keep it out of the file
+   # or set FLEET_DATABASE_URL in /etc/default/trawld
    database_url = "postgres://fleet:…@db.internal:5432/fleet"
-   # FRESH transitional store — never the legacy auth.db
-   db_path = "/var/lib/trawl/store.db"
+
+   [storage]
+   # or set TRAWL_DATABASE_URL in /etc/default/trawld
+   database_url = "postgres://trawl:…@db.internal:5432/trawl"
    ```
+
+   Remove any `db_path` line — it fails validation now. Then:
 
    ```bash
    systemctl restart trawld
    ```
 
-   trawld fails fast with a distinct "auth backend unreachable" error if the
-   database is down or unmigrated. If it refuses to start complaining about
-   `auth.db`, your `db_path` still points at the legacy file — repoint it,
-   do not delete `auth.db`.
+   trawld fails fast with a distinct error naming the culprit: "auth
+   backend unreachable" (fleet db down/unmigrated), "app-state database
+   unreachable" (trawl db missing/unprovisioned), or an advisory-lock
+   error (another trawld already owns the trawl database).
 
 5. **Roll out the vector tokens** (restart/reload vector). Buffered events
    drain once the new token authenticates.
 
-6. **Recreate schedules.** Saved queries and schedules lived in the legacy
-   `auth.db` and are not migrated. Recreate them under the new keys via the
-   API or web UI (`PUT /api/v1/saved/{id}/schedule`).
+6. **Recreate saved queries and schedules.** They lived in the legacy
+   sqlite file and are not migrated (hard-cutover doctrine — history is
+   ephemeral by nature). Recreate them under the new keys via the API or
+   web UI (`PUT /api/v1/saved/{id}/schedule`).
+
+:::note[Combined cutover]
+A deployment that never ran the slice-1 cutover (pre-postgres sqlite
+keystore) jumps straight here: the transitional sqlite window never
+existed for it, so the steps above are the whole story — provision both
+databases, re-mint every key, recreate saved queries/schedules.
+:::
 
 ### Kubernetes (helm)
 
-The chart wires this flow for you: create a Secret holding the DSN and set
-`auth.database.existingSecret`. The `init-auth` container runs
-`fleet-admin migrate` on every pod start; run the `fleet-admin keys create`
+The chart wires this flow for you: create two Secrets holding the DSNs and
+point the chart at them. The `init-auth` container runs `fleet-admin
+migrate` on every pod start; trawld boot-migrates the `trawl` database
+itself (no init container for it). Run the `fleet-admin keys create`
 commands from step 2 via `kubectl exec` into the trawld container (the
 image ships `fleet-admin`), or from any host with database access.
 
 ```bash
 kubectl create secret generic trawl-fleet-db \
   --from-literal=DATABASE_URL='postgres://fleet:…@cnpg-rw:5432/fleet'
-helm upgrade trawl chart/trawl --set auth.database.existingSecret=trawl-fleet-db
+kubectl create secret generic trawl-app-db \
+  --from-literal=TRAWL_DATABASE_URL='postgres://trawl:…@cnpg-rw:5432/trawl'
+helm upgrade trawl chart/trawl \
+  --set auth.database.existingSecret=trawl-fleet-db \
+  --set storage.database.existingSecret=trawl-app-db
 ```
+
+The fleet Secret's KEY inside the Secret stays `DATABASE_URL` by default
+(`auth.database.existingSecretKey`) — existing Secrets keep working; the
+chart injects it into trawld as the `FLEET_DATABASE_URL` env var.
 
 ## Fleet SSO (`fleet_session` cookie)
 

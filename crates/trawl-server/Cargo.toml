@@ -16,7 +16,6 @@ trawl-api = { workspace = true }
 trawl-config = { workspace = true }
 trawl-core = { workspace = true }
 trawl-engine = { workspace = true }
-trawl-auth = { workspace = true }
 trawl-dashboard = { workspace = true }
 fleet-auth = { workspace = true, features = ["axum"] }
 trawl-crashdump = { workspace = true }
@@ -43,6 +42,7 @@ dashmap = { workspace = true }
 shellexpand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 syslog_loose = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -78,8 +78,7 @@ test-support = []
 # `bundled` under CI's --no-default-features run (DUCKDB_DOWNLOAD_LIB).
 trawl-server = { path = ".", default-features = false, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
-trawl-auth = { workspace = true }
-fleet-auth = { workspace = true, features = ["axum", "fast-hash", "test-support"] }
+fleet-auth = { workspace = true, features = ["axum", "fast-hash"] }
 trawl-client = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true }

@@ -83,21 +83,22 @@ path = "~/.trawl/data"
 
 [auth]
 # Fleet-auth Postgres keystore URL (API keys and roles live here since the
-# ADR-0004 cutover). The DATABASE_URL environment variable takes precedence.
-# trawld will NOT start until this database is reachable and migrated
-# (`fleet-admin migrate`) — see the cutover runbook in the docs.
+# ADR-0004 cutover). The FLEET_DATABASE_URL environment variable takes
+# precedence. trawld will NOT start until this database is reachable and
+# migrated (`fleet-admin migrate`) — see the cutover runbook in the docs.
 database_url = "postgres://fleet:fleet@localhost:5433/fleet"
-
-# Path to the transitional SQLite app-state database (query history, saved
-# queries, schedules — moves to postgres in a later slice). Must be a FRESH
-# file at cutover: never point this at the legacy pre-cutover auth.db, which
-# stays quarantined on disk. trawld refuses to start on an auth.db path.
-db_path = "~/.trawl/store.db"
 
 # How often to poll the fleet keystore for key changes (seconds).
 # Detects keys created/revoked by fleet-admin and emits audit events.
 # Decrease for faster detection. 0 = disabled.
 # audit_interval_secs = 30
+
+[storage]
+# Trawl app-state Postgres URL (query history, saved queries, schedules,
+# report runs — ADR-0004 slice 3). A DEDICATED database, auto-migrated by
+# trawld at boot and advisory-locked (sole writer); no fallback to the
+# [auth] URL. The TRAWL_DATABASE_URL environment variable takes precedence.
+database_url = "postgres://fleet:fleet@localhost:5433/trawl"
 
 [ingest]
 # Whether the ingest endpoint (POST /api/v1/ingest) is enabled.

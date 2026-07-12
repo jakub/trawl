@@ -45,18 +45,24 @@ jobs:
           DUCKDB_DOWNLOAD_LIB: "1"
 
   test:
-    # The single workspace test job (ADR-0004 slice 1 consolidated the old
-    # dedicated fleet-auth-tests job into it). Postgres backs the pg-based
-    # integration tests in fleet-auth AND trawl-server: each test creates
-    # and drops an ephemeral per-test database, so the role must have
-    # CREATEDB. CI uses a throwaway postgres:18 container (the default
-    # `postgres` superuser has CREATEDB); local-dev and the homelab
-    # dev/prod environments use CNPG. An explicit `fleet-admin migrate`
-    # step (below) applies the embedded schema to the service container —
-    # this spells out the migration step and exercises the exact
-    # deploy-time command the helm init container runs against a live
-    # postgres. The per-test PgFixture (fleet_auth::test_support) then
-    # migrates each ephemeral database independently.
+    # The single workspace test job. Postgres backs the pg-based integration
+    # tests in fleet-auth, fleet-admin, AND trawl-server: every pg test runs
+    # under #[sqlx::test] (per-test ephemeral database off DATABASE_URL, so
+    # the role must have CREATEDB), and trawl-server's harness additionally
+    # creates a sibling trawl app-state database that trawld's real boot
+    # path migrates. CI uses a throwaway postgres:18 container (the default
+    # `postgres` superuser has CREATEDB); local-dev and the homelab dev/prod
+    # environments use CNPG. An explicit `fleet-admin migrate` step (below)
+    # applies the embedded fleet schema to the service container — it spells
+    # out the migration step and exercises the exact deploy-time command the
+    # helm init container runs. The trawl app-state database needs no CI
+    # migrate step: trawld auto-migrates it at boot (sole writer).
+    #
+    # Connection budget: nextest is process-per-test and sqlx pools are
+    # process-local, so unbounded parallelism can exceed the server's
+    # max_connections (default 100 — GH service containers can't override
+    # the postgres command line). The `pg` nextest group in
+    # .config/nextest.toml bounds pg-heavy test parallelism instead.
     name: test
     runs-on: k8s-big
     services:
@@ -90,22 +96,25 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # FEATURE TRAP: --no-default-features also strips fleet-auth's default
-      # `keystore`/`test-support` features when it is built as a selected
-      # workspace package, silently compiling out its pg test files. The
-      # explicit fleet-auth/* features below re-enable them deterministically.
-      # Do NOT drop them, and do NOT relax FLEET_TESTS_REQUIRED — it is the
-      # hard-fail backstop that turns "pg tests silently skipped" into a red
-      # job.
+      # `keystore` feature when it is built as a selected workspace package,
+      # silently compiling out its pg test files. The explicit fleet-auth/*
+      # features below re-enable them deterministically. Do NOT drop them.
+      # There is no skip mode: #[sqlx::test] panics loudly when DATABASE_URL
+      # is unset or unreachable, so "pg tests silently skipped" cannot
+      # produce a misleading green (the FLEET_TESTS_REQUIRED backstop died
+      # with the PgFixture in ADR-0004 slice 3 / issue #12).
       - run: >-
           cargo nextest run --workspace --no-default-features
-          --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash,fleet-auth/test-support
+          --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
         env:
           DUCKDB_DOWNLOAD_LIB: "1"
-          FLEET_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-          # Hard-fail if the env var didn't inject — otherwise the per-test
-          # PgFixture would skip every pg integration test and the job would
-          # report a misleading green.
-          FLEET_TESTS_REQUIRED: "1"
+          # DATABASE_URL, not FLEET_DATABASE_URL: trawld's [auth] resolution
+          # treats FLEET_DATABASE_URL as its highest-precedence keystore
+          # override (ADR-0004 slice 3), so setting it process-wide would
+          # silently repoint every fixture's per-test keystore DSN at the
+          # shared service container. The #[sqlx::test] harness hardwires
+          # DATABASE_URL.
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 
   msrv:
     name: msrv check

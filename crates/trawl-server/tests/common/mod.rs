@@ -4,18 +4,31 @@
 
 //! Shared harness for trawld's pg-backed end-to-end tests.
 //!
-//! Starts a real TLS server on a random port with a self-signed cert,
-//! mints keys in an ephemeral fleet-auth postgres database (shared
-//! `PgFixture` from fleet-auth's `test-support` feature), and hands out
-//! role tokens.
+//! Each test runs under `#[sqlx::test(migrations = false)]`: the sqlx
+//! harness (driven by `DATABASE_URL` — unset means a loud failure, never a
+//! skip) hands the test a fresh ephemeral database, which we use as the
+//! FLEET database (running `fleet_auth::MIGRATOR` on it explicitly). The
+//! trawl app-state database is a sibling database created empty by
+//! [`create_app_database`] and migrated by trawld's REAL boot path
+//! (`StorageState::connect`: pool → advisory lock → migrate), so every
+//! server test exercises boot-time migration.
+//!
+//! The two schemas must live in two databases: sqlx 0.8 hardwires one
+//! `_sqlx_migrations` table per database and both migration sets would
+//! collide in it. Two databases also match the production shape.
+//!
+//! Sibling databases are best-effort leftovers: nextest is process-per-test
+//! and the server's pools stay open until process exit, so we don't DROP
+//! them (a throwaway CI container makes leaks acceptable; local dev reuses
+//! names prefixed `trawl_app_test_` for easy bulk cleanup).
 
 #![allow(dead_code)] // each test binary uses a subset of these items
 
 use std::net::TcpListener;
 use std::path::PathBuf;
 
-use fleet_auth::test_support::PgFixture;
 use fleet_auth::{KeyStore, PrincipalKind, RoleAssignment};
+use sqlx::{Connection as _, Executor as _, PgPool, postgres::PgConnection};
 use trawl_server::policy::Role;
 
 /// Helper: build a single-grant `trawl:<role>` assignment vector for tests.
@@ -27,7 +40,7 @@ pub fn trawl_only(role: Role) -> Vec<RoleAssignment> {
 }
 use trawl_server::config::{
     AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig,
-    SchedulerConfig, ServerConfig, SyslogConfig, WebConfig,
+    SchedulerConfig, ServerConfig, StorageConfig, SyslogConfig, WebConfig,
 };
 use trawl_server::state::AppState;
 use trawl_server::transport::http;
@@ -47,6 +60,220 @@ pub fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
 pub fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
     listener.local_addr().unwrap().port()
+}
+
+/// The base admin DSN the sqlx test harness runs on.
+///
+/// `#[sqlx::test]` hardwires `DATABASE_URL`; it is guaranteed set by the
+/// time a test body runs (the harness panics loudly otherwise).
+pub fn admin_database_url() -> String {
+    std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set for #[sqlx::test] (the harness enforces this)")
+}
+
+/// Replace the database path of a postgres URL, preserving any query string.
+pub fn swap_database(url: &str, db: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    let authority = base[after_scheme..]
+        .find('/')
+        .map_or(base, |i| &base[..after_scheme + i]);
+    match query {
+        Some(q) => format!("{authority}/{db}?{q}"),
+        None => format!("{authority}/{db}"),
+    }
+}
+
+fn random_db_suffix() -> String {
+    use rand::Rng as _;
+    let mut rng = rand::thread_rng();
+    (0..12)
+        .map(|_| {
+            let n: u8 = rng.gen_range(0..26);
+            (b'a' + n) as char
+        })
+        .collect()
+}
+
+/// DSN of the sqlx-provided per-test database (used as the FLEET database).
+pub fn fleet_database_url(pool: &PgPool) -> String {
+    let opts = pool.connect_options();
+    let db = opts.get_database().expect("test pool has a database");
+    swap_database(&admin_database_url(), db)
+}
+
+/// Create an EMPTY sibling database for the trawl app-state store and
+/// return its DSN. trawld's real boot path migrates it (AC5).
+pub async fn create_app_database(pool: &PgPool) -> String {
+    sweep_stale_app_databases(pool).await;
+    // The run marker + owner pid are encoded in the name so future runs can
+    // tell an abandoned database from a live sibling's (see the sweep).
+    let name = format!(
+        "trawl_app_test_{}_{}_{}",
+        run_marker(),
+        std::process::id(),
+        random_db_suffix()
+    );
+    pool.execute(format!(r#"CREATE DATABASE "{name}""#).as_str())
+        .await
+        .expect("CREATE DATABASE for app store — does the role have CREATEDB?");
+    swap_database(&admin_database_url(), &name)
+}
+
+/// A marker shared by every test process of THIS nextest run (nextest
+/// exposes `NEXTEST_RUN_ID`; plain `cargo test` shares one process, so the
+/// pid suffices as fallback). Only alphanumerics survive, for db-name
+/// safety.
+fn run_marker() -> String {
+    std::env::var("NEXTEST_RUN_ID")
+        .unwrap_or_else(|_| std::process::id().to_string())
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect()
+}
+
+/// Parse `(run_marker, pid)` out of a `trawl_app_test_{run}_{pid}_{rand}`
+/// name. Names from other schemes yield `None` and are left alone.
+fn owner_of(datname: &str) -> Option<(String, u32)> {
+    let mut parts = datname.strip_prefix("trawl_app_test_")?.split('_');
+    let marker = parts.next()?.to_owned();
+    let pid = parts.next()?.parse().ok()?;
+    Some((marker, pid))
+}
+
+/// Whether a process with this pid is still alive (same host — nextest
+/// processes are local). Errs on the side of "alive".
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |s| s.success())
+}
+
+/// Best-effort sweep of sibling app databases leaked by earlier runs.
+///
+/// The server's pools stay open until process exit, so a test cannot drop
+/// its OWN app database; instead each run garbage-collects its
+/// predecessors'. A database is only dropped when BOTH guards agree it is
+/// abandoned: (a) it belongs to a DIFFERENT nextest run — same-run
+/// siblings are structurally never touched, even in the window between
+/// their CREATE and the server's first connection — and (b) the owner pid
+/// encoded in its name is no longer alive. A single advisory lock elects
+/// one sweeper at a time, and DROP without FORCE is a final safety net
+/// (live connections make it error harmlessly).
+async fn sweep_stale_app_databases(pool: &PgPool) {
+    use sqlx::Row as _;
+
+    let Ok(mut admin) = PgConnection::connect(&admin_database_url()).await else {
+        return;
+    };
+    // One sweeper at a time, and only if the lock is free right now.
+    let Ok(got_lock) = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(741_852_963)")
+        .fetch_one(&mut admin)
+        .await
+    else {
+        return;
+    };
+    if !got_lock {
+        return;
+    }
+
+    if let Ok(rows) =
+        sqlx::query("SELECT datname FROM pg_database WHERE datname LIKE 'trawl_app_test_%'")
+            .fetch_all(&mut admin)
+            .await
+    {
+        let marker = run_marker();
+        for row in rows {
+            let Ok(name): Result<String, _> = row.try_get("datname") else {
+                continue;
+            };
+            let Some((owner_marker, owner_pid)) = owner_of(&name) else {
+                continue;
+            };
+            if owner_marker == marker || pid_alive(owner_pid) {
+                continue;
+            }
+            let _ = admin
+                .execute(format!(r#"DROP DATABASE IF EXISTS "{name}""#).as_str())
+                .await;
+        }
+    }
+    let _ = sqlx::query("SELECT pg_advisory_unlock(741_852_963)")
+        .execute(&mut admin)
+        .await;
+    let _ = pool; // sweep uses its own admin connection
+}
+
+#[test]
+fn sweep_guards_parse_own_database_name() {
+    // The sweeper's abandoned-db detection must round-trip the naming
+    // scheme `create_app_database` uses — a parse mismatch here silently
+    // turns the sweeper into a live-sibling killer (it did once: the
+    // guard-bypassing bug behind transient 'database does not exist' boot
+    // failures).
+    let name = format!(
+        "trawl_app_test_{}_{}_{}",
+        run_marker(),
+        std::process::id(),
+        "abcdefghijkl"
+    );
+    let (marker, pid) = owner_of(&name).expect("own name must parse");
+    assert_eq!(marker, run_marker());
+    assert_eq!(pid, std::process::id());
+    assert!(pid_alive(pid), "our own pid is alive");
+}
+
+/// Forcibly drop a database by DSN, terminating live connections —
+/// simulates a backend dying under a running server.
+pub async fn kill_database(url: &str) {
+    let name = url
+        .rsplit('/')
+        .next()
+        .and_then(|last| last.split('?').next())
+        .expect("database name in url");
+    let mut admin = PgConnection::connect(&admin_database_url())
+        .await
+        .expect("connect to admin DB");
+    admin
+        .execute(format!(r#"DROP DATABASE IF EXISTS "{name}" WITH (FORCE)"#).as_str())
+        .await
+        .expect("force-drop database");
+}
+
+/// Terminate every backend connected to the database named in `url`,
+/// leaving the database itself intact — simulates the lock-holding session
+/// dying (pg restart, idle-timeout culling, `pg_terminate_backend`) while
+/// the database stays up so a replacement instance can re-acquire the lock.
+///
+/// Kills the dedicated advisory-lock connection *and* the app-state pool's
+/// connections; sqlx transparently reconnects the pool (the split-brain
+/// hazard), but the raw lock connection cannot, so its session-held
+/// advisory lock is released.
+pub async fn terminate_backends(url: &str) {
+    let name = url
+        .rsplit('/')
+        .next()
+        .and_then(|last| last.split('?').next())
+        .expect("database name in url");
+    let mut admin = PgConnection::connect(&admin_database_url())
+        .await
+        .expect("connect to admin DB");
+    // `pg_stat_activity`/`pg_terminate_backend` are cluster-wide; the admin
+    // connection sits on a different database, so filter by datname.
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(name)
+    .execute(&mut admin)
+    .await
+    .expect("terminate app-database backends");
 }
 
 /// Generate test parquet fixtures using `DuckDB`.
@@ -155,9 +382,6 @@ pub fn ensure_test_cert() -> (PathBuf, PathBuf) {
 }
 
 /// Test server handle with analyst, admin, and ingest tokens.
-///
-/// Holds the per-test postgres fixture so the ephemeral database outlives
-/// the server (dropped when the test ends).
 pub struct TestServer {
     pub url: String,
     pub analyst_token: String,
@@ -165,23 +389,24 @@ pub struct TestServer {
     pub reader_token: String,
     pub ingest_token: String,
     pub coastwatch_only_token: String,
-    /// Per-test postgres fixture; kept so the ephemeral database outlives
-    /// the server.
-    pub fx: PgFixture,
+    /// Pool on the per-test FLEET database (mint/revoke keys mid-test).
+    pub fleet_pool: PgPool,
+    /// DSN of the fleet database (kill it to simulate auth-backend loss).
+    pub fleet_db_url: String,
+    /// DSN of the sibling trawl app-state database.
+    pub app_db_url: String,
 }
 
-/// Set up the per-test postgres fixture, honouring skip-or-fail semantics:
-/// missing `FLEET_DATABASE_URL` skips unless `FLEET_TESTS_REQUIRED=1`.
-pub async fn pg_fixture_or_skip() -> Option<PgFixture> {
-    let fx = PgFixture::setup().await;
-    if fx.is_none() {
-        assert!(
-            !fleet_auth::test_support::require_database(),
-            "FLEET_DATABASE_URL not set but FLEET_TESTS_REQUIRED is — hard failure"
-        );
-        eprintln!("http_api test skipped: FLEET_DATABASE_URL not set or empty");
+impl TestServer {
+    /// Force-drop the fleet keystore database under the running server.
+    pub async fn kill_fleet_database(&self) {
+        kill_database(&self.fleet_db_url).await;
     }
-    fx
+
+    /// Force-drop the app-state database under the running server.
+    pub async fn kill_app_database(&self) {
+        kill_database(&self.app_db_url).await;
+    }
 }
 
 /// Create the standard role keys in the fleet keystore.
@@ -231,6 +456,16 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
     )
 }
 
+/// Migrate the sqlx-provided database with the FLEET schema and return a
+/// keystore on it. (`migrations = false` hands us a bare database.)
+pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
+    fleet_auth::MIGRATOR
+        .run(pool)
+        .await
+        .expect("apply fleet-auth migrations to per-test database");
+    KeyStore::from_pool(pool.clone())
+}
+
 /// Poll the health endpoint until the server is ready (up to 1s).
 pub async fn wait_for_ready(addr: &str) {
     let poll_client = reqwest::Client::builder()
@@ -248,27 +483,27 @@ pub async fn wait_for_ready(addr: &str) {
 }
 
 /// Set up a test server with custom rate limiting for rate limit tests.
-pub async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> Option<TestServer> {
+pub async fn setup_with_rate_limit(pool: PgPool, rate_limit: RateLimitConfig) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let server = setup_in_dir(tmp.path(), rate_limit).await;
+    let server = setup_in_dir(pool, tmp.path(), rate_limit).await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
 
-/// Set up a test server whose transitional sqlite store + WAL live under
-/// the given directory (which must outlive the server). Lets tests seed the
-/// directory beforehand — e.g. the legacy-auth.db quarantine test.
+/// Set up a test server whose WAL lives under the given directory (which
+/// must outlive the server).
 pub async fn setup_in_dir(
+    pool: PgPool,
     dir: &std::path::Path,
     rate_limit: RateLimitConfig,
-) -> Option<TestServer> {
+) -> TestServer {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let fx = pg_fixture_or_skip().await?;
-    // Transitional sqlite app-state store — FRESH file, never auth.db.
-    let store_db = dir.join("store.db");
 
-    let store = KeyStore::from_pool(fx.pool());
+    let store = fleet_keystore(&pool).await;
+    let fleet_db_url = fleet_database_url(&pool);
+    let app_db_url = create_app_database(&pool).await;
+
     let (analyst_token, admin_token, reader_token, ingest_token) = mint_role_keys(&store).await;
     let coastwatch_only = store
         .create_key(
@@ -313,8 +548,8 @@ pub async fn setup_in_dir(
             path: ensure_fixtures(),
         },
         auth: AuthConfig {
-            db_path: store_db,
-            database_url: Some(fx.database_url()),
+            db_path: None,
+            database_url: Some(fleet_db_url.clone()),
             audit_interval_secs: 0,
         },
         ingest: {
@@ -329,11 +564,25 @@ pub async fn setup_in_dir(
         scheduler: SchedulerConfig::default(),
         syslog: SyslogConfig::default(),
         web: WebConfig::default(),
+        storage: StorageConfig {
+            database_url: Some(app_db_url.clone()),
+        },
     };
 
     let (state, http_config) = AppState::from_config(&config, test_metrics_handle())
         .await
         .expect("failed to create app state");
+
+    // Snapshot collector: makes GET /api/v1/dashboard live in tests, same
+    // as trawld's main() does in production.
+    let _collector = trawl_server::monitor::spawn_snapshot_collector(
+        state.clone(),
+        addr.clone(),
+        config.server.max_sse_connections,
+        config.scheduler.enabled,
+        false,
+    );
+
     let server_config = config.server.clone();
     let state_dir = config.state_dir();
     tokio::spawn(async move {
@@ -343,21 +592,23 @@ pub async fn setup_in_dir(
     });
     wait_for_ready(&addr).await;
 
-    Some(TestServer {
+    TestServer {
         url: format!("https://{addr}"),
         analyst_token,
         admin_token,
         reader_token,
         ingest_token,
         coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
-        fx,
-    })
+        fleet_pool: pool,
+        fleet_db_url,
+        app_db_url,
+    }
 }
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
 ///
-/// Returns `None` (after logging) when no `FLEET_DATABASE_URL` is configured
-/// and `FLEET_TESTS_REQUIRED` is unset — callers `else { return }` to skip.
-pub async fn setup() -> Option<TestServer> {
-    setup_with_rate_limit(RateLimitConfig::default()).await
+/// `pool` is the `#[sqlx::test(migrations = false)]`-provided per-test
+/// database; it becomes the fleet keystore database.
+pub async fn setup(pool: PgPool) -> TestServer {
+    setup_with_rate_limit(pool, RateLimitConfig::default()).await
 }

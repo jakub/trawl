@@ -17,7 +17,7 @@ ndjson/JSON ingest → WAL → hot buffer (visible within milliseconds) → hour
 axum with a full middleware stack: rate limiting per role, CORS, HSTS, concurrency limits, request IDs. TLS with auto-generated self-signed certs and hot-reload. Prometheus metrics. Internal telemetry that feeds server ops back into its own pipeline.
 
 ### Authentication
-argon2id-hashed API keys with four roles (admin, analyst, reader, ingest). SQLite-backed with LRU-cached lookups and timing-safe dummy hashes.
+argon2id-hashed API keys with four roles (admin, analyst, reader, ingest), verified against the shared fleet-auth postgres keystore with timing-safe dummy hashes. Query history, saved queries, and schedules live in a dedicated trawl postgres database (boot-migrated, advisory-locked sole writer).
 
 ### CLI
 Query, validate, and embedded mode. Four output formats (table, JSON, CSV, parquet). Formula injection protection on CSV export.
@@ -40,10 +40,10 @@ Cross-compiled binaries (x86_64 + aarch64 Linux), `.deb` packages, APT repositor
 You're reading the first pass. Getting-started guides, Vector integration cookbook, and configuration reference are in progress.
 
 ### Upgrade and migration story
-Schema versioning for the auth SQLite database, embedded migration runner, and a documented breaking change policy.
+Both postgres databases carry sqlx-versioned embedded migrations (the fleet keystore via `fleet-admin migrate`, the trawl app-state database auto-migrated by trawld at boot). Still to come: a documented breaking change policy.
 
 ### Graceful degradation
-Explicit handling and recovery guidance for corrupted parquet files, truncated WAL files, and locked auth databases.
+Explicit handling and recovery guidance for corrupted parquet files, truncated WAL files, and unreachable postgres backends.
 
 ### Alerting and webhooks
 The scheduled reports infrastructure is a natural foundation — the next step is "when this condition fires, POST to a webhook or send to Slack."

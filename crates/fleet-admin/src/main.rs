@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use fleet_auth::{KeyStore, PrincipalKind, RoleAssignment};
-use sqlx_postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use fleet_admin::commands;
 use fleet_admin::commands::keys::KeyPrefix;

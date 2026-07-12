@@ -6,8 +6,9 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use trawl_auth::AuthError;
 use trawl_engine::error::EngineError;
+
+use crate::store::StoreError;
 
 /// Server errors, mapped to HTTP responses via [`IntoResponse`].
 #[derive(Debug, thiserror::Error)]
@@ -16,9 +17,11 @@ pub enum ServerError {
     #[error("{0}")]
     Engine(#[from] EngineError),
 
-    /// Authentication failure.
+    /// App-state store failure (history, saved queries, schedules, runs).
+    /// Mapped per the ADR-0004 table: unavailability → 503 (redacted),
+    /// conflict → 409, not-found → 404, validation → 400.
     #[error("{0}")]
-    Auth(#[from] AuthError),
+    Store(#[from] StoreError),
 
     /// Missing or malformed Authorization header.
     #[error("unauthorized: {0}")]
@@ -70,6 +73,9 @@ impl ServerError {
     pub fn safe_message(&self) -> String {
         match self {
             Self::Engine(EngineError::Database(_)) => "query execution failed".to_owned(),
+            Self::Store(StoreError::Unavailable(_) | StoreError::Migration(_)) => {
+                "app-state store unavailable".to_owned()
+            }
             Self::Internal(_) => "internal error".to_owned(),
             Self::Ingest(_) => "ingest error".to_owned(),
             Self::BadRequest(_) => "bad request".to_owned(),
@@ -126,6 +132,7 @@ pub(crate) fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl
 }
 
 impl IntoResponse for ServerError {
+    #[allow(clippy::too_many_lines)] // exhaustive error table is cohesive
     fn into_response(self) -> Response {
         use trawl_api::{ErrorCode, ErrorEnvelope};
 
@@ -160,11 +167,57 @@ impl IntoResponse for ServerError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),
             ),
-            // Auth errors are deliberately opaque.
-            Self::Auth(_) => (
-                StatusCode::UNAUTHORIZED,
-                ErrorEnvelope::simple(ErrorCode::AuthError, "authentication failed"),
-            ),
+            // App-state store errors follow the ADR-0004 table. Backend
+            // trouble is a 503 with pg diagnostics redacted from the wire
+            // (they are logged server-side); conflicts are 409 with their
+            // domain message; ownership misses are opaque 404s.
+            Self::Store(e) => match e {
+                StoreError::Unavailable(source) => {
+                    tracing::error!(target: "storage.backend", error = %source, "app-state store error");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ErrorEnvelope::simple(
+                            ErrorCode::ServiceUnavailable,
+                            "app-state store unavailable",
+                        ),
+                    )
+                }
+                StoreError::Migration(source) => {
+                    tracing::error!(target: "storage.backend", error = %source, "app-state store migration error");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ErrorEnvelope::simple(
+                            ErrorCode::ServiceUnavailable,
+                            "app-state store unavailable",
+                        ),
+                    )
+                }
+                StoreError::LockHeld => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorEnvelope::simple(
+                        ErrorCode::ServiceUnavailable,
+                        "app-state store unavailable",
+                    ),
+                ),
+                StoreError::DuplicateName { .. } | StoreError::ScheduleExists { .. } => (
+                    StatusCode::CONFLICT,
+                    ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
+                ),
+                StoreError::NotFound { resource, .. } => (
+                    StatusCode::NOT_FOUND,
+                    ErrorEnvelope::simple(
+                        ErrorCode::NotFound,
+                        format!("{resource} not found or unauthorized"),
+                    ),
+                ),
+                StoreError::Validation(_)
+                | StoreError::InvalidInterval { .. }
+                | StoreError::IntervalTooShort { .. }
+                | StoreError::InvalidName { .. } => (
+                    StatusCode::BAD_REQUEST,
+                    ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
+                ),
+            },
             Self::Unauthorized(msg) => (
                 StatusCode::UNAUTHORIZED,
                 ErrorEnvelope::simple(ErrorCode::Unauthorized, msg.clone()),
@@ -220,13 +273,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auth_error_maps_to_401() {
-        let err = ServerError::Auth(AuthError::InvalidKey("bad".into()));
-        let response = err.into_response();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
     fn unauthorized_maps_to_401() {
         let err = ServerError::Unauthorized("missing token".into());
         let response = err.into_response();
@@ -270,5 +316,85 @@ mod tests {
         let err = ServerError::ServiceUnavailable("not ready".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // -- StoreError → HTTP table (ADR-0004: 503 / 409 / 404 / 400) ─────────
+
+    /// Render a response body to a string for envelope assertions.
+    async fn body_string(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn store_error_http_table() {
+        let cases: Vec<(ServerError, StatusCode)> = vec![
+            (
+                ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut)),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                ServerError::Store(StoreError::LockHeld),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                ServerError::Store(StoreError::DuplicateName { name: "x".into() }),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ServerError::Store(StoreError::ScheduleExists { saved_query_id: 1 }),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ServerError::Store(StoreError::NotFound {
+                    id: 9,
+                    resource: "saved query",
+                }),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ServerError::Store(StoreError::Validation("bad".into())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Store(StoreError::InvalidInterval { input: "5x".into() }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Store(StoreError::IntervalTooShort { secs: 3 }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Store(StoreError::InvalidName { name: "a b".into() }),
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (err, expected) in cases {
+            let desc = format!("{err:?}");
+            let response = err.into_response();
+            assert_eq!(response.status(), expected, "wrong status for {desc}");
+        }
+    }
+
+    /// Postgres diagnostics must never reach the wire: the 503 body is the
+    /// fixed redacted envelope regardless of the underlying sqlx error.
+    #[tokio::test]
+    async fn store_unavailable_body_is_redacted() {
+        let err = ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut));
+        let response = err.into_response();
+        let body = body_string(response).await;
+        assert!(body.contains("app-state store unavailable"), "got: {body}");
+        assert!(
+            !body.to_lowercase().contains("pool") && !body.to_lowercase().contains("postgres"),
+            "pg diagnostics leaked: {body}"
+        );
+    }
+
+    #[test]
+    fn safe_message_redacts_store_backend_errors() {
+        let err = ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut));
+        assert_eq!(err.safe_message(), "app-state store unavailable");
     }
 }
