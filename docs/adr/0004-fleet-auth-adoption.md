@@ -104,6 +104,20 @@ transitional file along with the crate.
   a fleet-wide logout. `fleet_auth::login`/`logout` enforce it by default (safe:
   absent-Origin passes), so coastwatch inherits the fix on rebuild; trawl-web's
   hand-rolled handlers call the same helper.
+
+  **Accepted deviation from the issue #39 AC.** AC #6 as frozen required
+  "subdomain-of-`shared_domain` passes" (and an approach bullet spoke of a
+  `shared_domain` suffix match). That wording is self-defeating: the origin
+  check exists precisely because the cookie is shared across the parent domain,
+  so allowing *any* origin under that domain would re-admit the entire threat it
+  closes — a compromised or attacker-hosted sibling auto-submitting a logout POST
+  that clears `fleet_session` fleet-wide. We deliberately ship strictly same-host
+  instead: siblings are rejected (403), the shared domain governs only the
+  cookie's `Domain=` attribute, never who may hit auth endpoints. The
+  `sibling_under_shared_domain_is_rejected` /
+  `login_rejects_sibling_under_shared_domain` tests pin this reversal. All other
+  AC #6 clauses (absent passes, same-host passes, mismatch → 403, default-on pg
+  enforcement, trawl-web helper) hold as written.
 - **Upstream auth mapping in the proxy**: trawld 401 (key revoked/expired
   fleet-wide) → clear the session cookie, session is dead everywhere; trawld
   403 (valid key, no trawl grant) → 403 with the cookie PRESERVED, mirroring
