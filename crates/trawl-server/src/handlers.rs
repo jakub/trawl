@@ -1506,14 +1506,13 @@ pub async fn get_report_run(
         ));
     }
 
-    // Pre-fetch legacy blob (cheap if NULL in db).
+    // Pre-fetch legacy blob (cheap if NULL in db). A genuine absence is `Ok(None)`;
+    // a StoreError here is a live db fault and must surface as 5xx, not empty result.
     let legacy_blob = state
         .storage
         .schedule
         .get_run_result(run_id, key_id)
-        .await
-        .ok()
-        .flatten();
+        .await?;
 
     // Try parquet result first, fall back to legacy zstd blob.
     let result = if let Some(ref result_path) = run.result_path {
@@ -1561,8 +1560,24 @@ pub async fn get_report_run(
 /// Decompress a legacy zstd-compressed JSON result blob.
 fn decompress_legacy_blob(blob: Option<Vec<u8>>) -> Option<QueryResult> {
     let compressed = blob?;
-    let decompressed = zstd::decode_all(compressed.as_slice()).ok()?;
-    serde_json::from_slice::<QueryResult>(&decompressed).ok()
+    let decompressed = zstd::decode_all(compressed.as_slice())
+        .inspect_err(|e| {
+            tracing::warn!(
+                event_type = "legacy_blob_zstd_decode_failed",
+                error = %e,
+                "failed to zstd-decode legacy result blob"
+            );
+        })
+        .ok()?;
+    serde_json::from_slice::<QueryResult>(&decompressed)
+        .inspect_err(|e| {
+            tracing::warn!(
+                event_type = "legacy_blob_deserialize_failed",
+                error = %e,
+                "failed to deserialize legacy result blob"
+            );
+        })
+        .ok()
 }
 
 /// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.
