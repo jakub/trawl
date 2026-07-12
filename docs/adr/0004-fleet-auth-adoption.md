@@ -132,6 +132,107 @@ transitional file along with the crate.
   unchanged. Legacy `trawl_session` cookies are not cleaned up (dead name,
   expire at TTL); the app-switcher UI stays deferred per ADR-0030.
 
+## Slice 3 design decisions (2026-07-11 prep grill)
+
+- **Store code lives in trawl-server** (`src/store/` + `crates/trawl-server/migrations/`),
+  not a new crate: trawl-server is the sole consumer and — with boot-time
+  migration — the sole migration runner, so a crate boundary would fence
+  nothing. The three store types (`HistoryStore`, `SavedQueryStore`,
+  `ScheduleStore`) survive as separate types sharing one `PgPool`; the API
+  goes async and the `Arc<Mutex<_>>` serialization dies with rusqlite.
+- **trawld auto-migrates the `trawl` database at boot.** The fleet database
+  forbids auto-migration because two binaries share it and deploys would
+  race; the `trawl` database has exactly one writer (single-replica trawld),
+  so the rationale doesn't transfer. `sqlx::migrate!()` runs in
+  `build_auth_state` before the stores open. No new fleet-admin/trawl-admin
+  subcommand, no second helm init container. fleet-admin growing
+  `--app trawl` was rejected as a layering inversion (substrate depending on
+  app-owned schema).
+- **New `[storage]` config block**: `database_url` resolved as
+  `TRAWL_DATABASE_URL` env > `[storage] database_url`, mirroring `[auth]`'s
+  order. No fallback to the auth URL — the stores are app state, not auth,
+  and housing their DSN under `[auth]` would perpetuate the historical
+  accident that put them in the auth crate. `[auth]` shrinks to
+  `database_url` + `audit_interval_secs`; `db_path` and its `auth.db`
+  basename guard die, as does `trawl_auth::reject_legacy_keystore` — the
+  quarantine apparatus only ever protected the sqlite era.
+- **Transitional sqlite data is dropped, no importer.** Consistent with the
+  arc's hard-cutover doctrine. Homelab prod has not yet run the slice-1
+  cutover, so cutting over straight to post-slice-3 means the transitional
+  file never exists; an importer would be code written for a window that
+  closes before it opens. The runbook documents recreating saved queries and
+  schedules; history is ephemeral by nature.
+- **Issue #12 folds in.** Deleting trawl-auth removes the workspace's last
+  `links = "sqlite3"` dependency at resolve time *within this PR*, so the
+  same change reverts fleet-auth to the umbrella `sqlx` crate, replaces the
+  hand-built `LazyLock<Migrator>` with `sqlx::migrate!()`, and swaps
+  `PgFixture` + `pg_test!` for `#[sqlx::test]`. The new store never ships
+  the workaround idiom at all.
+- **Test model: `#[sqlx::test]` per-test databases, hard-require.** Adopts
+  coastwatch's fail-fast posture (tests panic with a descriptive message
+  when `DATABASE_URL` is unset — no soft-skip, no silent degradation to
+  "no integration tests ran"). Coastwatch's shared-pool +
+  transaction-rollback harness was considered and rejected: its
+  connection-budget rationale (shared CNPG primary in CI) doesn't apply to
+  trawl's throwaway pg service container, and the scheduler's atomic
+  `start_run` guard needs real cross-connection isolation to test. The
+  `FLEET_TESTS_REQUIRED` skip-or-fail machinery dies with `pg_test!`. The
+  conversion covers **every `PgFixture`/`pg_test!` consumer** — fleet-auth,
+  fleet-admin, and trawl-server's integration harness — not just fleet-auth.
+- **`DATABASE_URL` is ceded to the sqlx test harness.** `#[sqlx::test]`
+  hardwires that variable, and trawld's `[auth]` resolution treated the same
+  variable as its highest-precedence keystore override — setting it
+  process-wide for a test run would silently repoint every fixture's fleet
+  DSN (codex design review). `[auth]` now resolves
+  `FLEET_DATABASE_URL` env > `[auth] database_url` toml, matching what
+  coastwatch prod already reads; the bare `DATABASE_URL` override is
+  removed from trawld. The helm statefulset env var renames accordingly;
+  fleet-admin (separate process, explicitly-set env) keeps `DATABASE_URL`.
+- **A session advisory lock enforces the sole-writer premise.** trawld takes
+  a `pg_advisory_lock` on the `trawl` database right after pool connect and
+  holds it for the process lifetime; a second instance (second helm
+  release, stray deb install, manual run) fails startup with a descriptive
+  error instead of racing boot-time migration or letting
+  `cleanup_stale_runs` mark a live sibling's runs as errored.
+- **Concurrency semantics are redesigned for postgres, not ported.** The
+  sqlite stores were atomic by accident of the process-wide `Mutex`; pg
+  READ COMMITTED gives none of that. `start_run`'s no-concurrent-run guard
+  becomes a partial unique index (`UNIQUE (schedule_id) WHERE
+  status = 'running'`) with the named-constraint `23505` mapped to
+  "already running"; the manual-trigger path's `max_runs` check joins the
+  run claim in one transaction; saved-query deletion collects parquet
+  paths and deletes rows in one transaction, and a `finish_run` that
+  updates zero rows (its run was cascade-deleted mid-flight) cleans up the
+  file it just wrote. Every constraint is named in the migration and a
+  central pg-code+constraint-name → domain-error map replaces string
+  matching.
+- **Postgres schema takes proper types** — `BIGSERIAL`/`BIGINT` ids,
+  `TIMESTAMPTZ` timestamps, `BYTEA` result blobs, `TEXT` + `CHECK` status
+  columns; the `saved_queries → schedules → report_runs` `ON DELETE CASCADE`
+  chain and `UNIQUE(key_id, name)` survive, and `result_path` ships in the
+  initial migration (sqlite added it via runtime migration; retention,
+  `from_saved`, and download all key off it — `result_data` stays strictly
+  the parquet-failure fallback). `key_id` stays a plain `BIGINT`
+  carried by value: fleet keys live in the `fleet` database and postgres
+  cannot enforce FKs across databases — the scheduler's per-tick
+  `get_live_key_by_id` liveness gate remains the integrity mechanism.
+- **The wire is the contract, not the call pattern.** Handlers keep their
+  request/response shapes but internal per-item lookup loops are replaced
+  with bulk joins (the saved-query list does per-item schedule/latest-run/
+  count lookups today — ported verbatim that's `1 + 3n` network round
+  trips). The sync `MonitorState::snapshot` path that feeds
+  `/api/v1/dashboard` is reworked for async stores, `/health` gains a
+  timeout-bounded storage ping, and a defined `StoreError → HTTP` table
+  (unavailability → 503, conflict → 409, not-found → 404, validation → 400)
+  replaces the blanket auth-error mapping — pg diagnostics never reach the
+  wire.
+- **Helm**: `storage.database.existingSecret`/`existingSecretKey` →
+  `TRAWL_DATABASE_URL` env, mirroring the auth wiring. `replicas: 1` stays —
+  trawl is single-node by design (parquet + hot buffer), the sqlite store
+  was never the real constraint — but the comment justifying it is
+  rewritten. The chart README gets the full refresh it has needed since
+  slice 1.
+
 ## Consequences
 
 - Deploying trawld now requires a reachable postgres (CNPG in the homelab;
