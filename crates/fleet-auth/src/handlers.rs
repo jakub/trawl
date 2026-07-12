@@ -61,8 +61,10 @@ pub struct LoginResponse {
 
 /// `POST /login` handler.
 ///
-/// - Cross-origin request (`Origin` present and matching neither the
-///   request `Host` nor the configured cookie domain) → 403, no cookie.
+/// - Cross-origin request (`Origin` present whose host doesn't match the
+///   request `Host`) → 403, no cookie. The check is strictly same-host: the
+///   shared cookie domain is deliberately NOT an Origin allowlist, so a
+///   sibling app under the same parent domain is rejected.
 /// - Empty `api_key` → 400.
 /// - Invalid `api_key` → 401 JSON (same shape as middleware).
 /// - Valid `api_key` but no grant for `app_namespace` → 403 HTML (same
