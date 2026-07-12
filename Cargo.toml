@@ -15,7 +15,6 @@ publish = false
 # internal crates
 trawl-core = { path = "crates/trawl-core" }
 trawl-engine = { path = "crates/trawl-engine", default-features = false }
-trawl-auth = { path = "crates/trawl-auth" }
 trawl-server = { path = "crates/trawl-server" }
 trawl-api = { path = "crates/trawl-api" }
 trawl-client = { path = "crates/trawl-client" }
@@ -67,7 +66,6 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "query", "stream"] }
-rusqlite = { version = "0.38", features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
@@ -75,20 +73,17 @@ tokio-stream = "0.1"
 shellexpand = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# sqlx is used via the sqlx-core + sqlx-postgres crates directly rather than
-# the umbrella `sqlx` crate, because `sqlx` and `sqlx-macros-core` declare
-# `sqlx-sqlite` as an optional dependency — and cargo's `links` uniqueness
-# check evaluates optional deps at resolve time, conflicting with the
-# `rusqlite` (links = "sqlite3") that lives in trawl-auth. ADR-0029 + ADR-0030
-# document the broader rusqlite/sqlx-sqlite collision; this is the local fix.
-sqlx-core = { version = "0.8.6", default-features = false, features = [
-    "_rt-tokio",
-    "_tls-rustls-ring-webpki",
-    "migrate",
-] }
-sqlx-postgres = { version = "0.8.6", default-features = false, features = [
+# Umbrella sqlx: the rusqlite (links = "sqlite3") collision that forced the
+# direct sqlx-core/sqlx-postgres workaround died with the trawl-auth crate in
+# ADR-0004 slice 3, closing issue #12. tls-rustls-ring-webpki keeps the same
+# webpki root store the workspace shipped with (`_tls-rustls-ring-webpki`).
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring-webpki",
+    "postgres",
     "chrono",
     "migrate",
+    "macros",
 ] }
 thiserror = "2"
 tokio = { version = "1", features = [

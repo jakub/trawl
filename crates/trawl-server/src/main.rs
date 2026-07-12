@@ -203,7 +203,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let scheduler_handle = if config.scheduler.enabled {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = trawl_server::scheduler::spawn_scheduler(
-            Arc::clone(&state.auth.schedule),
+            state.storage.schedule.clone(),
             state.auth.key_store.clone(),
             state.query.pool.clone(),
             config.scheduler.clone(),

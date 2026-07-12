@@ -13,10 +13,10 @@ pub enum AdminError {
     EmptyDatabaseUrl,
 
     #[error("database connection failed: {0}")]
-    Connect(#[source] sqlx_core::Error),
+    Connect(#[source] sqlx::Error),
 
     #[error("migrations failed: {0}")]
-    Migrate(#[from] sqlx_core::migrate::MigrateError),
+    Migrate(#[from] sqlx::migrate::MigrateError),
 
     /// Pass-through for any error originating in fleet-auth (keystore /
     /// session). Preserves variant identity so future error-aware UX (exit

@@ -5,15 +5,14 @@
 //! Resolve `| from saved <name>` pipe stages to parquet sources.
 //!
 //! Called from the query handler before pool execution. Looks up the
-//! named saved query in the auth database, resolves run selectors
+//! named saved query in the app-state store, resolves run selectors
 //! (`latest`, `all`, or a specific run ID) to parquet file paths,
 //! and rewrites the DSL string with the `from saved` stage stripped.
 
-use trawl_auth::SavedQueryStore;
-use trawl_auth::schedule::ScheduleStore;
 use trawl_core::ast::{FromSavedStage, SavedRunSelector};
 
 use crate::error::ServerError;
+use crate::store::{SavedQueryStore, ScheduleStore};
 
 /// Result of resolving a `from saved` stage.
 pub(crate) struct ResolvedFromSaved {
@@ -30,7 +29,7 @@ pub(crate) struct ResolvedFromSaved {
 /// `from saved` stage ends (from the `Spanned` wrapper). Everything
 /// after that offset becomes the remaining pipeline.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve(
+pub(crate) async fn resolve(
     stage: &FromSavedStage,
     original_dsl: &str,
     stage_span_end: usize,
@@ -42,16 +41,16 @@ pub(crate) fn resolve(
     // Look up the saved query by name (user-scoped).
     let saved = saved_store
         .get_by_name(key_id, &stage.name)
-        .map_err(|e| ServerError::Internal(format!("failed to look up saved query: {e}")))?
+        .await?
         .ok_or_else(|| ServerError::NotFound(format!("saved query '{}' not found", stage.name)))?;
 
     // Resolve the run selector to a DuckDB source expression.
     let source = match stage.run {
-        SavedRunSelector::Latest => resolve_latest(schedule_store, saved.id, data_dir)?,
+        SavedRunSelector::Latest => resolve_latest(schedule_store, saved.id, data_dir).await?,
         SavedRunSelector::Specific(run_id) => {
-            resolve_specific(schedule_store, run_id, key_id, data_dir)?
+            resolve_specific(schedule_store, run_id, key_id, data_dir).await?
         }
-        SavedRunSelector::All => resolve_all(schedule_store, saved.id, data_dir)?,
+        SavedRunSelector::All => resolve_all(schedule_store, saved.id, data_dir).await?,
     };
 
     // Strip the `from saved` stage from the original DSL. Everything
@@ -72,14 +71,14 @@ pub(crate) fn resolve(
 }
 
 /// Resolve `run=latest` — most recent successful run with a parquet result.
-fn resolve_latest(
+async fn resolve_latest(
     schedule_store: &ScheduleStore,
     saved_query_id: i64,
     data_dir: &str,
 ) -> Result<String, ServerError> {
     let run = schedule_store
         .latest_successful_run(saved_query_id)
-        .map_err(|e| ServerError::Internal(format!("failed to look up latest run: {e}")))?
+        .await?
         .ok_or_else(|| {
             ServerError::NotFound("no successful runs with parquet results".to_string())
         })?;
@@ -92,7 +91,7 @@ fn resolve_latest(
 }
 
 /// Resolve `run=N` — a specific run by ID.
-fn resolve_specific(
+async fn resolve_specific(
     schedule_store: &ScheduleStore,
     run_id: i64,
     key_id: i64,
@@ -100,7 +99,7 @@ fn resolve_specific(
 ) -> Result<String, ServerError> {
     let run = schedule_store
         .get_run(run_id, key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to look up run {run_id}: {e}")))?
+        .await?
         .ok_or_else(|| ServerError::NotFound(format!("report run {run_id} not found")))?;
 
     let result_path = run.result_path.ok_or_else(|| {
@@ -113,14 +112,12 @@ fn resolve_specific(
 }
 
 /// Resolve `run=all` — all successful runs, unioned with `_run_id` and `_run_time` metadata.
-fn resolve_all(
+async fn resolve_all(
     schedule_store: &ScheduleStore,
     saved_query_id: i64,
     data_dir: &str,
 ) -> Result<String, ServerError> {
-    let runs = schedule_store
-        .list_successful_runs(saved_query_id)
-        .map_err(|e| ServerError::Internal(format!("failed to list successful runs: {e}")))?;
+    let runs = schedule_store.list_successful_runs(saved_query_id).await?;
 
     if runs.is_empty() {
         return Err(ServerError::NotFound(
@@ -136,7 +133,7 @@ fn resolve_all(
             continue;
         };
         let source = parquet_source(data_dir, result_path);
-        let safe_time = run.started_at.replace('\'', "''");
+        let safe_time = run.started_at.to_rfc3339().replace('\'', "''");
         parts.push(format!(
             "SELECT *, {run_id} AS _run_id, TIMESTAMP '{safe_time}' AS _run_time FROM {source}",
             run_id = run.id,

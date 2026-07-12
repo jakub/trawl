@@ -24,13 +24,9 @@ use trawl_api::{
     SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest,
     StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
-use trawl_auth::schedule::{ReportRun, format_interval, parse_interval};
-use trawl_auth::{HistoryEntry, SavedQuery};
 use trawl_engine::value::{QueryResult, Value};
 
 use std::collections::BTreeMap;
-
-use std::sync::Arc;
 
 use crate::bus::{EventBus, EventSubscriber as _};
 use crate::error::ServerError;
@@ -39,6 +35,10 @@ use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
 use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues, CachedSchema};
+use crate::store::{
+    HistoryEntry, ReportRun, RunClaim, SavedQuery, Schedule, ScheduleWithStats, format_interval,
+    parse_interval,
+};
 
 // -- handlers ----------------------------------------------------------------
 
@@ -105,32 +105,33 @@ pub async fn query(
 
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
-    let outcome = if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query)? {
-        state
-            .query
-            .pool
-            .execute_with_source(
-                query_id,
-                &resolved.remaining_dsl,
-                &resolved.source,
-                timeout,
-                capture_debug,
-                utc_offset_secs,
-            )
-            .await
-    } else {
-        state
-            .query
-            .pool
-            .execute(
-                query_id,
-                &req.query,
-                timeout,
-                capture_debug,
-                utc_offset_secs,
-            )
-            .await
-    };
+    let outcome =
+        if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
+            state
+                .query
+                .pool
+                .execute_with_source(
+                    query_id,
+                    &resolved.remaining_dsl,
+                    &resolved.source,
+                    timeout,
+                    capture_debug,
+                    utc_offset_secs,
+                )
+                .await
+        } else {
+            state
+                .query
+                .pool
+                .execute(
+                    query_id,
+                    &req.query,
+                    timeout,
+                    capture_debug,
+                    utc_offset_secs,
+                )
+                .await
+        };
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let duration_secs = start.elapsed().as_secs_f64();
@@ -147,14 +148,13 @@ pub async fn query(
             // Auto-save successful queries to history (per user preference).
             // verified.id is the authoritative fleet keystore id. Best-effort:
             // a history-store write failure must not fail the query, but log it
-            // so a broken store (disk-full, SQLITE_BUSY, corruption) is visible.
-            if let Err(e) = state.auth.history.lock().record_query(
-                verified.id,
-                &req.query,
-                duration_ms,
-                total,
-                "success",
-            ) {
+            // so a broken store (pg down, constraint trouble) is visible.
+            if let Err(e) = state
+                .storage
+                .history
+                .record_query(verified.id, &req.query, duration_ms, total, "success")
+                .await
+            {
                 tracing::warn!(
                     event_type = "history_error",
                     key_id = verified.id,
@@ -328,9 +328,10 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     // keystore reports an unhealthy auth subsystem (non-critical → `Degraded` →
     // HTTP 200) instead of stalling this liveness path.
     let pool = state.query.pool.clone();
-    let (duckdb_join, auth_result) = tokio::join!(
+    let (duckdb_join, auth_result, storage_result) = tokio::join!(
         tokio::spawn(async move { pool.ping().await }),
         state.auth.ping_cached(),
+        state.storage.ping_cached(),
     );
 
     // Data path: check that the base directory exists and is readable.
@@ -354,9 +355,10 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         .and_then(|r| r.map_err(|e| e.to_string()));
 
     // Build checks map.
-    let mut checks = HashMap::with_capacity(3);
+    let mut checks = HashMap::with_capacity(4);
     let duckdb_healthy = duckdb_ok.is_ok();
     let auth_healthy = auth_result.is_ok();
+    let storage_healthy = storage_result.is_ok();
     let data_healthy = data_result.is_ok();
 
     checks.insert(
@@ -366,6 +368,10 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     checks.insert(
         "auth_db".into(),
         auth_result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
+    );
+    checks.insert(
+        "storage_db".into(),
+        storage_result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
     );
     checks.insert(
         "data_path".into(),
@@ -383,13 +389,18 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     } else {
         0.0
     });
+    metrics::gauge!("trawl_health_check", "subsystem" => "storage_db").set(if storage_healthy {
+        1.0
+    } else {
+        0.0
+    });
     metrics::gauge!("trawl_health_check", "subsystem" => "data_path").set(if data_healthy {
         1.0
     } else {
         0.0
     });
 
-    let status = derive_health_status(duckdb_healthy, auth_healthy, data_healthy);
+    let status = derive_health_status(duckdb_healthy, auth_healthy, storage_healthy, data_healthy);
     let http_status = match status {
         HealthStatus::Ok | HealthStatus::Degraded => StatusCode::OK,
         HealthStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -408,13 +419,20 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
 /// Derive overall health status from individual subsystem results.
 ///
 /// - All green → `Ok`
-/// - Any non-critical (`auth_db`, `data_path`) fails → `Degraded`
+/// - Any non-critical (`auth_db`, `storage_db`, `data_path`) fails →
+///   `Degraded` (HTTP 200 — the query path can still serve)
 /// - Any critical (duckdb) fails → `Unavailable`
-fn derive_health_status(duckdb_ok: bool, auth_ok: bool, data_ok: bool) -> HealthStatus {
+#[allow(clippy::fn_params_excessive_bools)] // subsystem flags, call sites are named
+fn derive_health_status(
+    duckdb_ok: bool,
+    auth_ok: bool,
+    storage_ok: bool,
+    data_ok: bool,
+) -> HealthStatus {
     if !duckdb_ok {
         return HealthStatus::Unavailable;
     }
-    if !auth_ok || !data_ok {
+    if !auth_ok || !storage_ok || !data_ok {
         return HealthStatus::Degraded;
     }
     HealthStatus::Ok
@@ -907,11 +925,10 @@ pub async fn history(
     let offset = params.offset.unwrap_or(0);
 
     let page = state
-        .auth
+        .storage
         .history
-        .lock()
         .get_user_history(key_id, limit, offset)
-        .map_err(|e| ServerError::Internal(format!("history query failed: {e}")))?;
+        .await?;
 
     Ok(Json(HistoryResponse {
         entries: page
@@ -931,11 +948,14 @@ pub struct HistoryParams {
 }
 
 /// Convert a [`HistoryEntry`] into a [`HistoryEntryResponse`].
+///
+/// Timestamps are `DateTime<Utc>` in the domain and RFC 3339 strings on the
+/// wire — formatting happens here, at the handler boundary.
 fn history_entry_response(entry: HistoryEntry) -> HistoryEntryResponse {
     HistoryEntryResponse {
         id: entry.id,
         query: entry.query,
-        executed_at: entry.executed_at,
+        executed_at: entry.executed_at.to_rfc3339(),
         duration_ms: entry.duration_ms,
         row_count: entry.row_count,
         status: entry
@@ -956,34 +976,25 @@ pub async fn list_saved(
 
     let key_id = verified.id;
 
-    let queries = state
-        .auth
-        .saved
-        .lock()
-        .list(key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to list saved queries: {e}")))?;
+    // Single bulk-join statement: schedule + latest run + run count arrive
+    // with the saved queries, so the query count is independent of item
+    // count (the sqlite-era loop was 1 + 3n round trips).
+    let details = state.storage.saved.list_with_details(key_id).await?;
 
-    // Enrich saved queries with schedule info.
-    let schedule_store = state.auth.schedule.lock();
-    let responses: Vec<SavedQueryResponse> = queries
+    let responses: Vec<SavedQueryResponse> = details
         .into_iter()
-        .map(|sq| {
-            let schedule = schedule_store
-                .get_schedule_for_saved_query(sq.id, key_id)
-                .ok()
-                .flatten()
-                .map(|s| build_schedule_response(&schedule_store, s));
+        .map(|d| {
+            let schedule = d.schedule.map(schedule_response_from_stats);
             SavedQueryResponse {
-                id: sq.id,
-                name: sq.name,
-                query: sq.query,
-                created_at: sq.created_at,
-                updated_at: sq.updated_at,
+                id: d.saved.id,
+                name: d.saved.name,
+                query: d.saved.query,
+                created_at: d.saved.created_at.to_rfc3339(),
+                updated_at: d.saved.updated_at.to_rfc3339(),
                 schedule,
             }
         })
         .collect();
-    drop(schedule_store);
 
     Ok(Json(ListSavedResponse { queries: responses }))
 }
@@ -1000,17 +1011,12 @@ pub async fn create_saved(
 
     let key_id = verified.id;
 
+    // DuplicateName → 409, InvalidName → 400 via the StoreError table.
     let saved = state
-        .auth
+        .storage
         .saved
-        .lock()
         .create(key_id, &req.name, &req.query)
-        .map_err(|e| match e {
-            trawl_auth::AuthError::DuplicateName { name } => {
-                ServerError::BadRequest(format!("a saved query named '{name}' already exists"))
-            }
-            e => ServerError::Internal(format!("failed to create saved query: {e}")),
-        })?;
+        .await?;
 
     Ok(Json(saved_query_response(saved)))
 }
@@ -1028,23 +1034,12 @@ pub async fn update_saved(
 
     let key_id = verified.id;
 
+    // NotFound → 404, InvalidName → 400, DuplicateName → 409.
     let saved = state
-        .auth
+        .storage
         .saved
-        .lock()
         .update(id, key_id, &req.query, req.name.as_deref())
-        .map_err(|e| match e {
-            trawl_auth::AuthError::NotFound { .. } => {
-                ServerError::NotFound("saved query not found or unauthorized".into())
-            }
-            trawl_auth::AuthError::InvalidName { .. } => {
-                ServerError::BadRequest("invalid name: must match [a-zA-Z0-9_-]+".into())
-            }
-            trawl_auth::AuthError::DuplicateName { name } => {
-                ServerError::BadRequest(format!("name '{name}' is already taken"))
-            }
-            e => ServerError::Internal(format!("failed to update saved query: {e}")),
-        })?;
+        .await?;
 
     Ok(Json(saved_query_response(saved)))
 }
@@ -1061,25 +1056,9 @@ pub async fn delete_saved(
 
     let key_id = verified.id;
 
-    // Collect parquet file paths before deletion (FK CASCADE will wipe run rows).
-    let run_paths = state
-        .auth
-        .schedule
-        .lock()
-        .collect_run_paths(id)
-        .unwrap_or_default();
-
-    state
-        .auth
-        .saved
-        .lock()
-        .delete(id, key_id)
-        .map_err(|e| match e {
-            trawl_auth::AuthError::NotFound { .. } => {
-                ServerError::NotFound("saved query not found or unauthorized".into())
-            }
-            e => ServerError::Internal(format!("failed to delete saved query: {e}")),
-        })?;
+    // The store collects parquet result paths and deletes the rows in ONE
+    // transaction (FK CASCADE wipes runs); we unlink the files after commit.
+    let run_paths = state.storage.saved.delete(id, key_id).await?;
 
     cleanup_run_parquet_files(&state, &run_paths);
 
@@ -1092,24 +1071,18 @@ fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
         id: saved.id,
         name: saved.name,
         query: saved.query,
-        created_at: saved.created_at,
-        updated_at: saved.updated_at,
+        created_at: saved.created_at.to_rfc3339(),
+        updated_at: saved.updated_at.to_rfc3339(),
         schedule: None,
     }
 }
 
-/// Build a [`ScheduleResponse`] from a schedule, enriched with run metadata.
+/// Build a [`ScheduleResponse`] from a schedule with pre-fetched run stats.
 fn build_schedule_response(
-    store: &trawl_auth::ScheduleStore,
-    schedule: trawl_auth::Schedule,
+    schedule: &Schedule,
+    latest_run: Option<ReportRun>,
+    total_runs: u64,
 ) -> ScheduleResponse {
-    let last_run = store
-        .latest_run(schedule.id)
-        .ok()
-        .flatten()
-        .map(report_run_summary);
-    let total_runs = store.count_runs(schedule.id).unwrap_or(0);
-
     ScheduleResponse {
         id: schedule.id,
         saved_query_id: schedule.saved_query_id,
@@ -1117,21 +1090,29 @@ fn build_schedule_response(
         interval_secs: schedule.interval_secs,
         max_runs: schedule.max_runs,
         enabled: schedule.enabled,
-        created_at: schedule.created_at,
-        updated_at: schedule.updated_at,
-        last_run,
+        created_at: schedule.created_at.to_rfc3339(),
+        updated_at: schedule.updated_at.to_rfc3339(),
+        last_run: latest_run.map(report_run_summary),
         total_runs,
     }
 }
 
+/// Build a [`ScheduleResponse`] from a bulk-join [`ScheduleWithStats`] row.
+fn schedule_response_from_stats(stats: ScheduleWithStats) -> ScheduleResponse {
+    build_schedule_response(&stats.schedule, stats.latest_run, stats.total_runs)
+}
+
 /// Convert a [`ReportRun`] into a [`ReportRunSummary`].
+///
+/// Timestamps are `DateTime<Utc>` in the domain and RFC 3339 strings on the
+/// wire — formatting happens here, at the handler boundary.
 fn report_run_summary(run: ReportRun) -> ReportRunSummary {
     ReportRunSummary {
         id: run.id,
         query: run.query,
         status: run.status,
-        started_at: run.started_at,
-        finished_at: run.finished_at,
+        started_at: run.started_at.to_rfc3339(),
+        finished_at: run.finished_at.map(|t| t.to_rfc3339()),
         duration_ms: run.duration_ms,
         row_count: run.row_count,
         error_message: run.error_message,
@@ -1165,7 +1146,7 @@ fn cleanup_run_parquet_files(state: &AppState, relative_paths: &[String]) {
 /// Returns `Ok(Some(resolved))` if the query starts with `| from saved`,
 /// `Ok(None)` if it's a normal query, or `Err(...)` if resolution fails
 /// (e.g. saved query not found, no successful runs).
-fn try_resolve_from_saved(
+async fn try_resolve_from_saved(
     state: &AppState,
     verified: &VerifiedKey,
     dsl: &str,
@@ -1183,10 +1164,6 @@ fn try_resolve_from_saved(
 
     let key_id = verified.id;
 
-    // Lock both stores for the duration of resolution.
-    let saved_store = state.auth.saved.lock();
-    let schedule_store = state.auth.schedule.lock();
-
     // The span end of the first pipeline stage tells us where to slice
     // the remaining DSL.
     let stage_span_end = ast.pipeline[0].span.end;
@@ -1195,11 +1172,12 @@ fn try_resolve_from_saved(
         from_saved,
         dsl,
         stage_span_end,
-        &saved_store,
-        &schedule_store,
+        &state.storage.saved,
+        &state.storage.schedule,
         key_id,
         state.query.pool.base_dir(),
-    )?;
+    )
+    .await?;
 
     Ok(Some(resolved))
 }
@@ -1221,42 +1199,54 @@ pub async fn set_schedule(
 
     // Verify saved query ownership.
     state
-        .auth
+        .storage
         .saved
-        .lock()
-        .list(key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to list saved queries: {e}")))?
-        .iter()
-        .find(|sq| sq.id == saved_id)
+        .get(saved_id, key_id)
+        .await?
         .ok_or_else(|| ServerError::NotFound("saved query not found or unauthorized".into()))?;
 
-    let schedule_store = state.auth.schedule.lock();
-
-    // Try update first, fall back to create.
-    let schedule = match schedule_store.get_schedule_for_saved_query(saved_id, key_id) {
-        Ok(Some(existing)) => schedule_store
-            .update_schedule(
-                existing.id,
-                key_id,
-                interval_secs,
-                req.max_runs,
-                req.enabled,
-            )
-            .map_err(|e| ServerError::Internal(format!("failed to update schedule: {e}")))?,
-        Ok(None) => schedule_store
-            .create_schedule(saved_id, key_id, interval_secs, req.max_runs)
-            .map_err(|e| ServerError::Internal(format!("failed to create schedule: {e}")))?,
-        Err(e) => {
-            return Err(ServerError::Internal(format!(
-                "failed to check schedule: {e}"
-            )));
+    // Try update first, fall back to create. A racing create between the
+    // two statements surfaces as ScheduleExists → 409.
+    let schedule = match state
+        .storage
+        .schedule
+        .get_schedule_for_saved_query(saved_id, key_id)
+        .await?
+    {
+        Some(existing) => {
+            state
+                .storage
+                .schedule
+                .update_schedule(
+                    existing.id,
+                    key_id,
+                    interval_secs,
+                    req.max_runs,
+                    req.enabled,
+                )
+                .await?
+        }
+        None => {
+            state
+                .storage
+                .schedule
+                .create_schedule(saved_id, key_id, interval_secs, req.max_runs)
+                .await?
         }
     };
 
-    let response = build_schedule_response(&schedule_store, schedule);
-    drop(schedule_store);
+    // Freshly created/updated schedules can already have runs (updates);
+    // fetch the stats the response carries.
+    let (_, latest_run, total_runs) = state
+        .storage
+        .schedule
+        .get_schedule_with_stats(saved_id, key_id)
+        .await?
+        .map_or((None, None, 0), |(s, lr, tr)| (Some(s), lr, tr));
 
-    Ok(Json(response))
+    Ok(Json(build_schedule_response(
+        &schedule, latest_run, total_runs,
+    )))
 }
 
 /// `GET /api/v1/saved/{id}/schedule` — get schedule for a saved query.
@@ -1270,17 +1260,17 @@ pub async fn get_schedule(
     }
 
     let key_id = verified.id;
-    let schedule_store = state.auth.schedule.lock();
 
-    let schedule = schedule_store
-        .get_schedule_for_saved_query(saved_id, key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to get schedule: {e}")))?
+    let (schedule, latest_run, total_runs) = state
+        .storage
+        .schedule
+        .get_schedule_with_stats(saved_id, key_id)
+        .await?
         .ok_or_else(|| ServerError::NotFound("no schedule for this saved query".into()))?;
 
-    let response = build_schedule_response(&schedule_store, schedule);
-    drop(schedule_store);
-
-    Ok(Json(response))
+    Ok(Json(build_schedule_response(
+        &schedule, latest_run, total_runs,
+    )))
 }
 
 /// `DELETE /api/v1/saved/{id}/schedule` — delete a schedule.
@@ -1295,22 +1285,13 @@ pub async fn delete_schedule(
 
     let key_id = verified.id;
 
-    // Collect parquet file paths before deletion (FK CASCADE will wipe the rows).
-    let run_paths = {
-        let schedule_store = state.auth.schedule.lock();
-        let paths = schedule_store
-            .collect_run_paths(saved_id)
-            .unwrap_or_default();
-        schedule_store
-            .delete_schedule(saved_id, key_id)
-            .map_err(|e| match e {
-                trawl_auth::AuthError::NotFound { .. } => {
-                    ServerError::NotFound("schedule not found or unauthorized".into())
-                }
-                e => ServerError::Internal(format!("failed to delete schedule: {e}")),
-            })?;
-        paths
-    };
+    // The store collects parquet result paths and deletes the schedule (and
+    // its cascaded runs) in ONE transaction; we unlink files after commit.
+    let run_paths = state
+        .storage
+        .schedule
+        .delete_schedule(saved_id, key_id)
+        .await?;
 
     cleanup_run_parquet_files(&state, &run_paths);
 
@@ -1342,17 +1323,18 @@ pub async fn list_report_runs(
     }
 
     let key_id = verified.id;
-    let schedule_store = state.auth.schedule.lock();
 
-    let runs = schedule_store
+    let runs = state
+        .storage
+        .schedule
         .list_runs(saved_id, key_id, params.limit, params.offset)
-        .map_err(|e| ServerError::Internal(format!("failed to list runs: {e}")))?;
+        .await?;
 
-    let total = schedule_store
+    let total = state
+        .storage
+        .schedule
         .count_runs_for_saved_query(saved_id, key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to count runs: {e}")))?;
-
-    drop(schedule_store);
+        .await?;
 
     Ok(Json(ListReportRunsResponse {
         runs: runs.into_iter().map(report_run_summary).collect(),
@@ -1371,17 +1353,14 @@ pub async fn list_all_runs(
     }
 
     let key_id = verified.id;
-    let schedule_store = state.auth.schedule.lock();
 
-    let runs = schedule_store
+    let runs = state
+        .storage
+        .schedule
         .list_all_runs(key_id, params.limit, params.offset)
-        .map_err(|e| ServerError::Internal(format!("failed to list all runs: {e}")))?;
+        .await?;
 
-    let total = schedule_store
-        .count_all_runs(key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to count all runs: {e}")))?;
-
-    drop(schedule_store);
+    let total = state.storage.schedule.count_all_runs(key_id).await?;
 
     Ok(Json(ListAllRunsResponse {
         runs: runs
@@ -1406,11 +1385,9 @@ pub async fn runs_stats(
     }
 
     let key_id = verified.id;
-    let schedule_store = state.auth.schedule.lock();
 
-    let (total_runs, success_count, error_count, timeout_count, avg_duration_ms) = schedule_store
-        .runs_stats(key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to get runs stats: {e}")))?;
+    let (total_runs, success_count, error_count, timeout_count, avg_duration_ms) =
+        state.storage.schedule.runs_stats(key_id).await?;
 
     Ok(Json(RunsStatsResponse {
         total_runs,
@@ -1437,42 +1414,42 @@ pub async fn trigger_run(
 
     let key_id = verified.id;
 
-    // Look up the saved query.
+    // Look up the saved query (ownership check included).
     let saved = state
-        .auth
+        .storage
         .saved
-        .lock()
-        .list(key_id)
-        .map_err(|e| ServerError::Internal(format!("failed to list saved queries: {e}")))?
-        .into_iter()
-        .find(|q| q.id == saved_id)
+        .get(saved_id, key_id)
+        .await?
         .ok_or_else(|| ServerError::NotFound("saved query not found".into()))?;
 
-    // Single lock scope: look up schedule, check max_runs, start run atomically.
-    let run_id = {
-        let store = state.auth.schedule.lock();
-        let schedule = store
-            .get_schedule_for_saved_query(saved_id, key_id)
-            .map_err(|e| ServerError::Internal(format!("failed to get schedule: {e}")))?
-            .ok_or_else(|| {
-                ServerError::BadRequest("attach a schedule before triggering a run".into())
-            })?;
+    let schedule = state
+        .storage
+        .schedule
+        .get_schedule_for_saved_query(saved_id, key_id)
+        .await?
+        .ok_or_else(|| {
+            ServerError::BadRequest("attach a schedule before triggering a run".into())
+        })?;
 
-        if let Some(max) = schedule.max_runs {
-            let count = store.count_runs(schedule.id).unwrap_or(0);
-            if count >= max {
-                return Err(ServerError::BadRequest(
-                    "max runs reached for this net".into(),
-                ));
-            }
+    // One transaction: lock the schedule row, enforce max_runs, claim the
+    // run. Concurrent triggers cannot exceed the cap or double-claim.
+    let run_id = match state
+        .storage
+        .schedule
+        .claim_run(schedule.id, saved_id, &saved.query, schedule.max_runs)
+        .await?
+    {
+        RunClaim::Started(id) => id,
+        RunClaim::MaxRunsReached => {
+            return Err(ServerError::BadRequest(
+                "max runs reached for this net".into(),
+            ));
         }
-
-        store
-            .start_run(schedule.id, saved_id, &saved.query)
-            .map_err(|e| ServerError::Internal(format!("failed to start run: {e}")))?
-            .ok_or_else(|| {
-                ServerError::BadRequest("a run is already in progress for this net".into())
-            })?
+        RunClaim::AlreadyRunning => {
+            return Err(ServerError::BadRequest(
+                "a run is already in progress for this net".into(),
+            ));
+        }
     };
 
     // Return the summary immediately, execute in background.
@@ -1488,7 +1465,7 @@ pub async fn trigger_run(
         result_path: None,
     };
 
-    let schedule_store = Arc::clone(&state.auth.schedule);
+    let schedule_store = state.storage.schedule.clone();
     let pool = state.query.pool.clone();
     let query = saved.query;
     let query_name = saved.name;
@@ -1524,27 +1501,27 @@ pub async fn get_report_run(
 
     let key_id = verified.id;
 
-    // Fetch run metadata and legacy blob under one lock, then release
-    // before any async work (parking_lot guards are not Send).
-    let (run, legacy_blob) = {
-        let schedule_store = state.auth.schedule.lock();
+    let run = state
+        .storage
+        .schedule
+        .get_run(run_id, key_id)
+        .await?
+        .ok_or_else(|| ServerError::NotFound("report run not found or unauthorized".into()))?;
 
-        let run = schedule_store
-            .get_run(run_id, key_id)
-            .map_err(|e| ServerError::Internal(format!("failed to get run: {e}")))?
-            .ok_or_else(|| ServerError::NotFound("report run not found or unauthorized".into()))?;
+    if run.saved_query_id != saved_id {
+        return Err(ServerError::NotFound(
+            "report run not found for this saved query".into(),
+        ));
+    }
 
-        if run.saved_query_id != saved_id {
-            return Err(ServerError::NotFound(
-                "report run not found for this saved query".into(),
-            ));
-        }
-
-        // Pre-fetch legacy blob (cheap if NULL in db).
-        let blob = schedule_store.get_run_result(run_id, key_id).ok().flatten();
-
-        (run, blob)
-    };
+    // Pre-fetch legacy blob (cheap if NULL in db).
+    let legacy_blob = state
+        .storage
+        .schedule
+        .get_run_result(run_id, key_id)
+        .await
+        .ok()
+        .flatten();
 
     // Try parquet result first, fall back to legacy zstd blob.
     let result = if let Some(ref result_path) = run.result_path {
@@ -2303,13 +2280,26 @@ mod tests {
 
     #[test]
     fn health_all_ok() {
-        assert_eq!(derive_health_status(true, true, true), HealthStatus::Ok);
+        assert_eq!(
+            derive_health_status(true, true, true, true),
+            HealthStatus::Ok
+        );
     }
 
     #[test]
     fn health_auth_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, false, true),
+            derive_health_status(true, false, true, true),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn health_storage_down_is_degraded() {
+        // App-state store loss is non-critical: queries still serve, so the
+        // wire contract is Degraded + HTTP 200 (never a liveness failure).
+        assert_eq!(
+            derive_health_status(true, true, false, true),
             HealthStatus::Degraded
         );
     }
@@ -2317,15 +2307,15 @@ mod tests {
     #[test]
     fn health_data_path_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, true, false),
+            derive_health_status(true, true, true, false),
             HealthStatus::Degraded
         );
     }
 
     #[test]
-    fn health_both_noncritical_down_is_degraded() {
+    fn health_all_noncritical_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, false, false),
+            derive_health_status(true, false, false, false),
             HealthStatus::Degraded
         );
     }
@@ -2333,7 +2323,7 @@ mod tests {
     #[test]
     fn health_duckdb_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, true, true),
+            derive_health_status(false, true, true, true),
             HealthStatus::Unavailable
         );
     }
@@ -2341,7 +2331,7 @@ mod tests {
     #[test]
     fn health_all_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, false, false),
+            derive_health_status(false, false, false, false),
             HealthStatus::Unavailable
         );
     }
@@ -2349,7 +2339,7 @@ mod tests {
     #[test]
     fn health_duckdb_and_noncritical_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, false, true),
+            derive_health_status(false, false, true, true),
             HealthStatus::Unavailable
         );
     }

@@ -18,8 +18,8 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx_core::row::Row as _;
-use sqlx_postgres::{PgPool, PgRow};
+use sqlx::Row as _;
+use sqlx::postgres::{PgPool, PgRow};
 
 use crate::cache::{VerificationCache, VerificationCacheKey, VerificationCacheStats};
 use crate::error::AuthError;
@@ -92,7 +92,7 @@ impl KeyStore {
         /// request path plus background pollers — not a tunable yet.
         const MAX_CONNECTIONS: u32 = 8;
 
-        let pool = sqlx_postgres::PgPoolOptions::new()
+        let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
             .connect(database_url)
             .await?;
@@ -112,9 +112,7 @@ impl KeyStore {
 
     /// Lightweight health check: runs `SELECT 1` against the pool.
     pub async fn ping(&self) -> Result<(), AuthError> {
-        sqlx_core::query::query("SELECT 1")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
 
@@ -177,7 +175,7 @@ impl KeyStore {
 
             let mut tx = self.pool.begin().await?;
 
-            let insert_result = sqlx_core::query::query(
+            let insert_result = sqlx::query(
                 "INSERT INTO api_keys (prefix, name, hash, kind, created_at, expires_at)
                  VALUES ($1, $2, $3, $4, $5, $6)
                  RETURNING id",
@@ -193,7 +191,7 @@ impl KeyStore {
 
             let row = match insert_result {
                 Ok(row) => row,
-                Err(sqlx_core::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
                     // Prefix collision — drop transaction, retry with a new token.
                     drop(tx);
                     continue;
@@ -204,7 +202,7 @@ impl KeyStore {
             let id: i64 = row.try_get("id")?;
 
             for a in assignments {
-                sqlx_core::query::query(
+                sqlx::query(
                     "INSERT INTO api_key_role_assignment (key_id, app, role)
                      VALUES ($1, $2, $3)",
                 )
@@ -265,7 +263,7 @@ impl KeyStore {
             AuthError::MalformedToken("token must start with flt_ and be at least 12 chars".into())
         })?;
 
-        let row_opt: Option<PgRow> = sqlx_core::query::query(
+        let row_opt: Option<PgRow> = sqlx::query(
             "SELECT id, prefix, name, hash, kind, active, expires_at
              FROM api_keys
              WHERE prefix = $1",
@@ -314,7 +312,7 @@ impl KeyStore {
         // assignments, so the assignment SELECT below observes a grant set
         // that cannot change underneath this in-flight verify.
         let mut tx = self.pool.begin().await?;
-        let updated = sqlx_core::query::query(
+        let updated = sqlx::query(
             "UPDATE api_keys
              SET last_used = NOW()
              WHERE id = $1
@@ -364,7 +362,7 @@ impl KeyStore {
     ///
     /// [`verify_key`]: Self::verify_key
     pub async fn get_live_key_by_id(&self, id: i64) -> Result<Option<VerifiedKey>, AuthError> {
-        let row_opt: Option<PgRow> = sqlx_core::query::query(
+        let row_opt: Option<PgRow> = sqlx::query(
             "SELECT id, prefix, name, kind
              FROM api_keys
              WHERE id = $1
@@ -394,7 +392,7 @@ impl KeyStore {
 
     /// Load all `(app, role)` grants for a key, ordered by app.
     async fn load_assignments(&self, key_id: i64) -> Result<Vec<RoleAssignment>, AuthError> {
-        let rows = sqlx_core::query::query(
+        let rows = sqlx::query(
             "SELECT app, role
              FROM api_key_role_assignment
              WHERE key_id = $1
@@ -416,10 +414,10 @@ impl KeyStore {
 
     /// Load all `(app, role)` grants within an existing transaction.
     async fn load_assignments_in_tx(
-        tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         key_id: i64,
     ) -> Result<Vec<RoleAssignment>, AuthError> {
-        let rows = sqlx_core::query::query(
+        let rows = sqlx::query(
             "SELECT app, role
              FROM api_key_role_assignment
              WHERE key_id = $1
@@ -452,7 +450,7 @@ impl KeyStore {
              ORDER BY created_at DESC"
         };
 
-        let rows = sqlx_core::query::query(sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
         let mut keys: Vec<ApiKeyInfo> = rows
             .iter()
             .map(row_to_api_key_info_no_assignments)
@@ -469,7 +467,7 @@ impl KeyStore {
 
     /// Look up a key's full metadata by prefix.
     pub async fn get_key_by_prefix(&self, prefix: &str) -> Result<ApiKeyInfo, AuthError> {
-        let row_opt = sqlx_core::query::query(
+        let row_opt = sqlx::query(
             "SELECT id, prefix, name, kind, active, created_at, expires_at, last_used, revoked_at
              FROM api_keys
              WHERE prefix = $1",
@@ -494,7 +492,7 @@ impl KeyStore {
     /// Errors with [`AuthError::KeyRevoked`] if the key exists but is already
     /// revoked, and [`AuthError::KeyNotFound`] if the prefix isn't known.
     pub async fn revoke_key(&self, prefix: &str) -> Result<ApiKeyInfo, AuthError> {
-        let updated = sqlx_core::query::query(
+        let updated = sqlx::query(
             "UPDATE api_keys
              SET active = FALSE, revoked_at = NOW()
              WHERE prefix = $1 AND active = TRUE",
@@ -526,7 +524,7 @@ impl KeyStore {
         let mut tx = self.pool.begin().await?;
         let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
 
-        let result = sqlx_core::query::query(
+        let result = sqlx::query(
             "INSERT INTO api_key_role_assignment (key_id, app, role)
              VALUES ($1, $2, $3)",
         )
@@ -548,7 +546,7 @@ impl KeyStore {
                 );
                 Ok(())
             }
-            Err(sqlx_core::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
                 Err(AuthError::GrantExists {
                     prefix: prefix.to_owned(),
                     app: assignment.app.clone(),
@@ -567,14 +565,13 @@ impl KeyStore {
         let mut tx = self.pool.begin().await?;
         let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
 
-        let removed = sqlx_core::query::query(
-            "DELETE FROM api_key_role_assignment WHERE key_id = $1 AND app = $2",
-        )
-        .bind(key_id)
-        .bind(app)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let removed =
+            sqlx::query("DELETE FROM api_key_role_assignment WHERE key_id = $1 AND app = $2")
+                .bind(key_id)
+                .bind(app)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
 
         if removed == 0 {
             return Err(AuthError::GrantNotFound {
@@ -608,14 +605,13 @@ impl KeyStore {
         prefix: &str,
         kind: PrincipalKind,
     ) -> Result<ApiKeyInfo, AuthError> {
-        let updated = sqlx_core::query::query(
-            "UPDATE api_keys SET kind = $1 WHERE prefix = $2 AND revoked_at IS NULL",
-        )
-        .bind(kind.as_str())
-        .bind(prefix)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let updated =
+            sqlx::query("UPDATE api_keys SET kind = $1 WHERE prefix = $2 AND revoked_at IS NULL")
+                .bind(kind.as_str())
+                .bind(prefix)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
 
         if updated == 0 {
             return Err(self.classify_prefix_miss(prefix).await?);
@@ -630,13 +626,12 @@ impl KeyStore {
     /// revoked. Used by `revoke_key` and `retype_key`, both of which guard
     /// their UPDATE on `active = TRUE` / `revoked_at IS NULL`.
     async fn classify_prefix_miss(&self, prefix: &str) -> Result<AuthError, AuthError> {
-        let exists: bool = sqlx_core::query::query(
-            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE prefix = $1) AS exists",
-        )
-        .bind(prefix)
-        .fetch_one(&self.pool)
-        .await?
-        .try_get("exists")?;
+        let exists: bool =
+            sqlx::query("SELECT EXISTS(SELECT 1 FROM api_keys WHERE prefix = $1) AS exists")
+                .bind(prefix)
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("exists")?;
 
         Ok(if exists {
             AuthError::KeyRevoked {
@@ -651,7 +646,7 @@ impl KeyStore {
 
     /// Internal helper: resolve a prefix to its database row id.
     async fn get_key_id_by_prefix(&self, prefix: &str) -> Result<i64, AuthError> {
-        let row_opt = sqlx_core::query::query("SELECT id FROM api_keys WHERE prefix = $1")
+        let row_opt = sqlx::query("SELECT id FROM api_keys WHERE prefix = $1")
             .bind(prefix)
             .fetch_optional(&self.pool)
             .await?;
@@ -666,10 +661,10 @@ impl KeyStore {
     /// Lock the key row for the duration of assignment mutation.
     async fn lock_key_id_by_prefix(
         &self,
-        tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         prefix: &str,
     ) -> Result<i64, AuthError> {
-        let row_opt = sqlx_core::query::query(
+        let row_opt = sqlx::query(
             "SELECT id
              FROM api_keys
              WHERE prefix = $1

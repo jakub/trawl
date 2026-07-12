@@ -17,8 +17,8 @@
 #![allow(dead_code)] // each test binary uses a subset of these items
 
 use fleet_auth::MIGRATOR;
-use sqlx_core::executor::Executor as _;
-use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
+use sqlx::Executor as _;
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 
 /// Reads the base database URL from the environment.
 ///
@@ -51,7 +51,7 @@ pub struct PgFixture {
 
 impl PgFixture {
     pub async fn setup() -> Option<Self> {
-        use sqlx_core::connection::Connection as _;
+        use sqlx::Connection as _;
 
         let admin_url = base_database_url()?;
         let admin_opts: PgConnectOptions = admin_url
@@ -105,7 +105,7 @@ impl Drop for PgFixture {
                 .build()
                 .expect("teardown runtime");
             rt.block_on(async move {
-                use sqlx_core::connection::Connection as _;
+                use sqlx::Connection as _;
                 if let Ok(mut admin) = PgConnection::connect_with(&admin_opts).await {
                     let _ = admin
                         .execute(

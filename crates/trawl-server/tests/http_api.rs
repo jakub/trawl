@@ -18,25 +18,25 @@ use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::policy::Role;
 
-#[tokio::test]
-async fn health_returns_ok() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn health_returns_ok(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, "unused").unwrap();
     let health = client.health().await.unwrap();
     assert_eq!(health.status, trawl_api::HealthStatus::Ok);
 }
 
-#[tokio::test]
-async fn query_returns_results() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_returns_results(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client.query_paginated("*", None, None).await.unwrap();
     assert_eq!(result.result.row_count(), 3);
 }
 
-#[tokio::test]
-async fn query_with_filter() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_with_filter(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client
         .query_paginated("service=nginx", None, None)
@@ -45,9 +45,9 @@ async fn query_with_filter() {
     assert_eq!(result.result.row_count(), 2);
 }
 
-#[tokio::test]
-async fn query_with_stats_pipeline() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_with_stats_pipeline(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client
         .query_paginated("* | stats count() by service", None, None)
@@ -57,9 +57,9 @@ async fn query_with_stats_pipeline() {
     assert_eq!(result.result.row_count(), 2);
 }
 
-#[tokio::test]
-async fn query_rejects_missing_auth() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_rejects_missing_auth(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, "").unwrap();
 
     let result = client.query_paginated("*", None, None).await;
@@ -73,9 +73,9 @@ async fn query_rejects_missing_auth() {
     }
 }
 
-#[tokio::test]
-async fn query_rejects_invalid_token() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_rejects_invalid_token(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client =
         HttpClient::new_insecure(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234").unwrap();
 
@@ -90,9 +90,9 @@ async fn query_rejects_invalid_token() {
     }
 }
 
-#[tokio::test]
-async fn query_rejects_bad_dsl() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_rejects_bad_dsl(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = client.query_paginated("| | | broken {{{", None, None).await;
@@ -108,9 +108,9 @@ async fn query_rejects_bad_dsl() {
 
 // -- schema endpoint tests ---------------------------------------------------
 
-#[tokio::test]
-async fn schema_returns_columns() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn schema_returns_columns(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let schema = client.schema().await.unwrap();
@@ -126,9 +126,9 @@ async fn schema_returns_columns() {
     assert_eq!(schema.file_count, 2);
 }
 
-#[tokio::test]
-async fn schema_caching_works() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn schema_caching_works(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let first = client.schema().await.unwrap();
@@ -140,9 +140,9 @@ async fn schema_caching_works() {
 
 // -- queries endpoint tests --------------------------------------------------
 
-#[tokio::test]
-async fn queries_shows_history() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn queries_shows_history(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
@@ -158,9 +158,9 @@ async fn queries_shows_history() {
     assert!(!queries.recent[0].timed_out);
 }
 
-#[tokio::test]
-async fn queries_accessible_by_analyst_and_reader() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn queries_accessible_by_analyst_and_reader(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
@@ -169,9 +169,9 @@ async fn queries_accessible_by_analyst_and_reader() {
     reader.queries().await.unwrap();
 }
 
-#[tokio::test]
-async fn queries_rejects_ingest_role() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn queries_rejects_ingest_role(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let result = client.queries().await;
@@ -195,9 +195,9 @@ fn raw_client() -> reqwest::Client {
         .unwrap()
 }
 
-#[tokio::test]
-async fn ingest_accepts_ndjson() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ingest_accepts_ndjson(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let records = vec![
@@ -209,9 +209,9 @@ async fn ingest_accepts_ndjson() {
     assert_eq!(resp.accepted, 2);
 }
 
-#[tokio::test]
-async fn ingest_rejects_missing_auth() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ingest_rejects_missing_auth(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = raw_client();
 
     let resp = client
@@ -225,9 +225,9 @@ async fn ingest_rejects_missing_auth() {
     assert_eq!(resp.status(), 401);
 }
 
-#[tokio::test]
-async fn ingest_rejects_analyst_role() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ingest_rejects_analyst_role(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = raw_client();
 
     let resp = client
@@ -242,9 +242,9 @@ async fn ingest_rejects_analyst_role() {
     assert_eq!(resp.status(), 401);
 }
 
-#[tokio::test]
-async fn ingest_partial_success() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ingest_partial_success(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = raw_client();
 
     // 3 ndjson events: good, bad json, good
@@ -267,9 +267,9 @@ async fn ingest_partial_success() {
     assert_eq!(body.errors[0].index, 1);
 }
 
-#[tokio::test]
-async fn ingest_all_rejected_per_event() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn ingest_all_rejected_per_event(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = raw_client();
 
     // All 3 events are bad (no service field)
@@ -294,18 +294,18 @@ async fn ingest_all_rejected_per_event() {
 
 // -- rate limit tests --------------------------------------------------------
 
-#[tokio::test]
-async fn rate_limit_returns_429() {
-    let Some(server) = setup_with_rate_limit(RateLimitConfig {
-        admin: 0,
-        analyst: 2, // burst of 2
-        reader: 0,
-        ingest: 0,
-    })
-    .await
-    else {
-        return;
-    };
+#[sqlx::test(migrations = false)]
+async fn rate_limit_returns_429(pool: sqlx::PgPool) {
+    let server = setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            admin: 0,
+            analyst: 2, // burst of 2
+            reader: 0,
+            ingest: 0,
+        },
+    )
+    .await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // First 2 should succeed (burst capacity).
@@ -326,9 +326,9 @@ async fn rate_limit_returns_429() {
 
 // ── new endpoint tests (cancellation, validation, pagination, stats, field values) ──
 
-#[tokio::test]
-async fn cancel_query_by_admin() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn cancel_query_by_admin(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
@@ -352,9 +352,9 @@ async fn cancel_query_by_admin() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), slow_query).await;
 }
 
-#[tokio::test]
-async fn cancel_query_nonexistent_returns_false() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn cancel_query_nonexistent_returns_false(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let resp = admin.cancel_query(9999).await.unwrap();
@@ -362,9 +362,9 @@ async fn cancel_query_nonexistent_returns_false() {
     assert_eq!(resp.query_id, 9999);
 }
 
-#[tokio::test]
-async fn cancel_query_by_analyst_for_nonexistent() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn cancel_query_by_analyst_for_nonexistent(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Analyst gets "cannot cancel" for non-existent queries — no information
@@ -373,9 +373,9 @@ async fn cancel_query_by_analyst_for_nonexistent() {
     assert!(result.is_err());
 }
 
-#[tokio::test]
-async fn cancel_query_rejects_ingest_role() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn cancel_query_rejects_ingest_role(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let result = ingest.cancel_query(1).await;
@@ -402,8 +402,8 @@ async fn cancel_query_rejects_ingest_role() {
 /// The pool's `TEST_QUERY_DELAY_MS` hook (via the crate's `test-support`
 /// feature) holds the query in-flight deterministically — no dataset-size
 /// timing bets against fast CI runners.
-#[tokio::test]
-async fn cancel_query_isolated_by_key_id_not_name() {
+#[sqlx::test(migrations = false)]
+async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
     // Permissive rate limits: the observe/cancel polls below run in a tight
     // window and must not trip the per-minute buckets.
     let permissive = RateLimitConfig {
@@ -412,9 +412,7 @@ async fn cancel_query_isolated_by_key_id_not_name() {
         reader: 1_000_000,
         ingest: 1_000_000,
     };
-    let Some(server) = setup_with_rate_limit(permissive).await else {
-        return;
-    };
+    let server = setup_with_rate_limit(pool, permissive).await;
 
     // Hold every pool query open long enough to observe and cancel it.
     // nextest runs each test in its own process, so the global is private
@@ -422,7 +420,7 @@ async fn cancel_query_isolated_by_key_id_not_name() {
     trawl_server::pool::TEST_QUERY_DELAY_MS.store(3_000, Ordering::Relaxed);
 
     // Two analyst keys with the SAME display name but distinct keystore ids.
-    let store = KeyStore::from_pool(server.fx.pool());
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
     let key_a = store
         .create_key(
             "twin",
@@ -511,9 +509,9 @@ async fn cancel_query_isolated_by_key_id_not_name() {
     let _ = slow.await;
 }
 
-#[tokio::test]
-async fn validate_query_valid() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn validate_query_valid(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -524,9 +522,9 @@ async fn validate_query_valid() {
     assert!(resp.errors.is_empty());
 }
 
-#[tokio::test]
-async fn validate_query_syntax_error() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn validate_query_syntax_error(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -537,9 +535,9 @@ async fn validate_query_syntax_error() {
     assert!(!resp.errors.is_empty());
 }
 
-#[tokio::test]
-async fn validate_query_unknown_function() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn validate_query_unknown_function(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client.validate("* | stats unknown_func()").await.unwrap();
@@ -547,9 +545,9 @@ async fn validate_query_unknown_function() {
     assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
 }
 
-#[tokio::test]
-async fn query_pagination_limit_offset() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_pagination_limit_offset(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // We have 3 rows total. Request 2 rows starting at offset 1.
@@ -560,9 +558,9 @@ async fn query_pagination_limit_offset() {
     assert_eq!(resp.result.row_count(), 2);
 }
 
-#[tokio::test]
-async fn query_pagination_offset_beyond_results() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_pagination_offset_beyond_results(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -574,9 +572,9 @@ async fn query_pagination_offset_beyond_results() {
     assert_eq!(resp.result.row_count(), 0);
 }
 
-#[tokio::test]
-async fn query_pagination_defaults() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn query_pagination_defaults(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // No limit/offset specified — defaults should apply.
@@ -585,18 +583,18 @@ async fn query_pagination_defaults() {
     assert_eq!(resp.pagination.returned, 3);
 }
 
-#[tokio::test]
-async fn stats_endpoint_admin_only() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn stats_endpoint_admin_only(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let stats = admin.stats().await.unwrap();
     assert!(stats.pool_capacity > 0);
 }
 
-#[tokio::test]
-async fn stats_endpoint_analyst_forbidden() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn stats_endpoint_analyst_forbidden(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = analyst.stats().await;
@@ -607,9 +605,9 @@ async fn stats_endpoint_analyst_forbidden() {
     }
 }
 
-#[tokio::test]
-async fn dashboard_rejects_analyst() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn dashboard_rejects_analyst(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = analyst.dashboard().await;
@@ -620,11 +618,11 @@ async fn dashboard_rejects_analyst() {
     }
 }
 
-#[tokio::test]
-async fn dashboard_returns_503_before_collector_runs() {
+#[sqlx::test(migrations = false)]
+async fn dashboard_returns_503_before_collector_runs(pool: sqlx::PgPool) {
     // Test harness doesn't spawn the snapshot collector, so the endpoint
     // returns 503 Service Unavailable (snapshot is None).
-    let Some(server) = setup().await else { return };
+    let server = setup(pool).await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let result = admin.dashboard().await;
@@ -635,9 +633,9 @@ async fn dashboard_returns_503_before_collector_runs() {
     }
 }
 
-#[tokio::test]
-async fn whoami_admin_has_server_manage() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn whoami_admin_has_server_manage(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let resp = admin.whoami().await.unwrap();
@@ -657,9 +655,9 @@ async fn whoami_admin_has_server_manage() {
     );
 }
 
-#[tokio::test]
-async fn whoami_reader_lacks_server_manage() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn whoami_reader_lacks_server_manage(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     let resp = reader.whoami().await.unwrap();
@@ -668,22 +666,22 @@ async fn whoami_reader_lacks_server_manage() {
     assert!(resp.permissions.contains(&"query".to_owned()));
 }
 
-#[tokio::test]
-async fn whoami_rejects_missing_auth() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn whoami_rejects_missing_auth(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, "invalid-token").unwrap();
 
     let result = client.whoami().await;
     assert!(result.is_err());
 }
 
-#[tokio::test]
-async fn whoami_no_trawl_grant_is_403() {
+#[sqlx::test(migrations = false)]
+async fn whoami_no_trawl_grant_is_403(pool: sqlx::PgPool) {
     // Policy change with the fleet-auth cutover (ADR-0004): a foreign-app-only
     // key is rejected by the mandatory trawl policy layer on EVERY
     // authenticated route — including /whoami, which previously leaked
     // cross-app assignments to grantless keys.
-    let Some(server) = setup().await else { return };
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.coastwatch_only_token).unwrap();
 
     let result = client.whoami().await;
@@ -693,9 +691,9 @@ async fn whoami_no_trawl_grant_is_403() {
     }
 }
 
-#[tokio::test]
-async fn field_values_endpoint() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn field_values_endpoint(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client.field_values("service", Some(5), None).await.unwrap();
@@ -704,9 +702,9 @@ async fn field_values_endpoint() {
     assert!(resp.values.iter().any(|v| v == "nginx"));
 }
 
-#[tokio::test]
-async fn field_values_cached() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn field_values_cached(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // First request should populate cache.
@@ -718,9 +716,9 @@ async fn field_values_cached() {
     assert!(resp2.cached);
 }
 
-#[tokio::test]
-async fn field_values_invalid_field_name() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn field_values_invalid_field_name(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = client.field_values("bad;name", None, None).await;
@@ -733,9 +731,9 @@ async fn field_values_invalid_field_name() {
 
 // -- request ID tests --------------------------------------------------------
 
-#[tokio::test]
-async fn response_includes_ulid_request_id() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn response_includes_ulid_request_id(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = raw_client();
 
     let resp = client
@@ -769,17 +767,17 @@ fn assert_401<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) 
     }
 }
 
-#[tokio::test]
-async fn validate_rejects_reader() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn validate_rejects_reader(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.validate("* | head 1").await);
 }
 
-#[tokio::test]
-async fn saved_queries_reject_reader() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn saved_queries_reject_reader(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.list_saved().await);
@@ -788,9 +786,9 @@ async fn saved_queries_reject_reader() {
     assert_401(reader.delete_saved(1).await);
 }
 
-#[tokio::test]
-async fn export_rejects_reader() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn export_rejects_reader(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(
@@ -800,9 +798,9 @@ async fn export_rejects_reader() {
     );
 }
 
-#[tokio::test]
-async fn reader_can_query_and_view_history() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn reader_can_query_and_view_history(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     // Reader can execute queries.
@@ -823,9 +821,9 @@ async fn reader_can_query_and_view_history() {
 // Runs stats endpoint
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn runs_stats_empty() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn runs_stats_empty(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let stats = client.runs_stats().await.unwrap();
@@ -836,9 +834,9 @@ async fn runs_stats_empty() {
     assert_eq!(stats.avg_duration_ms, None);
 }
 
-#[tokio::test]
-async fn runs_stats_rejects_reader() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn runs_stats_rejects_reader(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.runs_stats().await);
@@ -848,9 +846,9 @@ async fn runs_stats_rejects_reader() {
 // Trigger run endpoint
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn trigger_run_requires_schedule() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn trigger_run_requires_schedule(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Create a net without a schedule.
@@ -872,9 +870,9 @@ async fn trigger_run_requires_schedule() {
     }
 }
 
-#[tokio::test]
-async fn trigger_run_starts_execution() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn trigger_run_starts_execution(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Create net + attach schedule.
@@ -910,9 +908,9 @@ async fn trigger_run_starts_execution() {
     assert!(stats.avg_duration_ms.is_some());
 }
 
-#[tokio::test]
-async fn trigger_run_rejects_reader() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn trigger_run_rejects_reader(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.trigger_run(1).await);
@@ -922,9 +920,9 @@ async fn trigger_run_rejects_reader() {
 // Rename net (update with name)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn rename_saved_query() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn rename_saved_query(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let saved = client.create_saved("old-name", "* | head 1").await.unwrap();
@@ -943,9 +941,9 @@ async fn rename_saved_query() {
     assert!(!list.queries.iter().any(|q| q.name == "old-name"));
 }
 
-#[tokio::test]
-async fn rename_to_duplicate_fails() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn rename_to_duplicate_fails(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     client
@@ -957,16 +955,17 @@ async fn rename_to_duplicate_fails() {
         .await
         .unwrap();
 
-    // Try to rename `other` to the taken name.
+    // Try to rename `other` to the taken name. Conflicts are 409 since the
+    // pg cutover (ADR-0004 StoreError -> HTTP table).
     let err = client
         .update_saved_with_name(other.id, "* | head 2", Some("taken-name"))
         .await
         .expect_err("expected conflict");
     match err {
         trawl_client::ClientError::Server { status, .. } => {
-            assert_eq!(status, 400);
+            assert_eq!(status, 409);
         }
-        other => panic!("expected 400, got: {other:?}"),
+        other => panic!("expected 409, got: {other:?}"),
     }
 }
 
@@ -974,9 +973,9 @@ async fn rename_to_duplicate_fails() {
 // List all runs endpoint
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn list_all_runs_paginated() {
-    let Some(server) = setup().await else { return };
+#[sqlx::test(migrations = false)]
+async fn list_all_runs_paginated(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Empty initially.

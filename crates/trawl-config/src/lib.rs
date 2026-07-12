@@ -24,6 +24,7 @@ use serde::Deserialize;
 pub struct Config {
     pub server: ServerConfig,
     pub data: DataConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub ingest: IngestConfig,
@@ -770,20 +771,24 @@ pub const DEFAULT_AUDIT_INTERVAL_SECS: u64 = 30;
 
 /// Authentication settings.
 ///
-/// API keys live in the fleet-auth Postgres keystore (`database_url`);
-/// `db_path` points at the transitional `SQLite` store that still carries
-/// query history, saved queries, and schedules (dies in ADR-0004 slice 3).
+/// API keys live in the fleet-auth Postgres keystore (`database_url`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
-    /// Path to the transitional `SQLite` app-state database (history, saved
-    /// queries, schedules). Must be a FRESH file at cutover — never the
-    /// legacy `auth.db` (see [`Config::validate`] and the cutover runbook).
-    pub db_path: PathBuf,
+    /// REMOVED in ADR-0004 slice 3 — retained only as a deprecated sentinel.
+    ///
+    /// The transitional `SQLite` app-state store (query history, saved
+    /// queries, schedules) moved to the dedicated `trawl` postgres database
+    /// (`[storage] database_url`). serde has no `deny_unknown_fields` here,
+    /// so without this field an old config's `db_path` would silently
+    /// vanish; instead [`Config::validate`] rejects it with a message naming
+    /// the migration.
+    #[serde(default)]
+    pub db_path: Option<PathBuf>,
 
     /// Fleet-auth Postgres keystore URL (e.g.
-    /// `postgres://user:pass@host:5432/fleet`). The `DATABASE_URL`
-    /// environment variable takes precedence, consistent with fleet-admin.
-    /// trawld refuses to start when neither is set.
+    /// `postgres://user:pass@host:5432/fleet`). The `FLEET_DATABASE_URL`
+    /// environment variable takes precedence. trawld refuses to start when
+    /// neither is set.
     #[serde(default)]
     pub database_url: Option<String>,
 
@@ -792,6 +797,16 @@ pub struct AuthConfig {
     /// audit events. Set to 0 to disable. Default: 30.
     #[serde(default = "default_audit_interval_secs")]
     pub audit_interval_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            db_path: None,
+            database_url: None,
+            audit_interval_secs: default_audit_interval_secs(),
+        }
+    }
 }
 
 impl AuthConfig {
@@ -1066,7 +1081,6 @@ impl Config {
     /// Expand `~` to `$HOME` in all path fields.
     fn resolve_paths(&mut self) {
         self.data.path = expand_tilde(&self.data.path);
-        self.auth.db_path = PathBuf::from(expand_tilde(&self.auth.db_path.to_string_lossy()));
         if let Some(log_file) = &self.server.log_file {
             self.server.log_file = Some(PathBuf::from(expand_tilde(&log_file.to_string_lossy())));
         }
@@ -1145,34 +1159,18 @@ impl Config {
             return Err(ConfigError::Validation("data.path cannot be empty".into()));
         }
 
-        if self.auth.db_path.as_os_str().is_empty() {
+        // db_path died in ADR-0004 slice 3: the app-state stores (query
+        // history, saved queries, schedules) moved to the dedicated trawl
+        // postgres database. Deb upgrades preserve the old trawld.toml
+        // (conffile semantics), so a leftover db_path must be a LOUD error
+        // naming the migration — serde would otherwise silently ignore it.
+        if self.auth.db_path.is_some() {
             return Err(ConfigError::Validation(
-                "auth.db_path cannot be empty".into(),
-            ));
-        }
-
-        // Legacy-db quarantine (ADR-0004): postgres and sqlite key ids are
-        // unrelated sequences, so reusing the pre-cutover auth.db would let
-        // a new pg key with id N inherit sqlite key N's history, saved
-        // queries, and auto-executing schedules. Deb upgrades preserve the
-        // old trawld.toml (conffile semantics), so without this guard the
-        // quarantine silently fails on every real upgrade.
-        //
-        // This is a naming-convention check only — a legacy keystore renamed
-        // to anything else sails past it. The real, content-based control is
-        // `trawl_auth::reject_legacy_keystore`, run at store-open in trawld
-        // (trawl-config is a pure no-I/O crate and can't inspect the file).
-        if self
-            .auth
-            .db_path
-            .file_name()
-            .is_some_and(|f| f == "auth.db")
-        {
-            return Err(ConfigError::Validation(
-                "auth.db_path points at the legacy pre-cutover keystore file 'auth.db'. \
-                 The fleet-auth cutover requires a FRESH app-state file (e.g. store.db) — \
-                 leave auth.db quarantined in place and repoint db_path. \
-                 See the fleet-auth cutover runbook in the docs"
+                "auth.db_path was removed in the ADR-0004 slice-3 migration: query history, \
+                 saved queries, and schedules now live in the dedicated trawl postgres \
+                 database. Remove db_path from [auth], configure [storage] database_url \
+                 (or TRAWL_DATABASE_URL), and see the fleet-auth cutover runbook. The old \
+                 sqlite file is not imported — recreate saved queries and schedules"
                     .into(),
             ));
         }
@@ -1248,7 +1246,6 @@ mod tests {
 path = "/var/lib/trawl/data/**/*.parquet"
 
 [auth]
-db_path = "/var/lib/trawl/auth.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.http_addr, "127.0.0.1:8080");
@@ -1273,7 +1270,6 @@ log_file = "/var/log/trawld.log"
 path = "/data/**/*.parquet"
 
 [auth]
-db_path = "~/.trawl/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.http_addr, "0.0.0.0:9090");
@@ -1292,7 +1288,6 @@ db_path = "~/.trawl/store.db"
 [data]
 path = ""
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
@@ -1300,17 +1295,23 @@ db_path = "/tmp/store.db"
     }
 
     #[test]
-    fn validation_rejects_empty_auth_path() {
+    fn validation_rejects_leftover_db_path() {
+        // db_path died in ADR-0004 slice 3. Deb conffile upgrades preserve
+        // old trawld.toml files, so a leftover db_path must be a loud error
+        // naming the migration — never a silent ignore.
         let toml = r#"
 [server]
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = ""
+db_path = "/var/lib/trawl/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("auth.db_path"));
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("db_path was removed"), "got: {err}");
+        assert!(err.contains("slice-3"), "got: {err}");
+        assert!(err.contains("[storage]"), "got: {err}");
+        assert!(err.contains("runbook"), "got: {err}");
     }
 
     #[test]
@@ -1321,7 +1322,6 @@ max_concurrent_queries = 0
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
@@ -1337,7 +1337,6 @@ tls_key_path = "/etc/trawl/key.pem"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(
@@ -1358,7 +1357,6 @@ tls_cert_path = "/etc/trawl/cert.pem"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
@@ -1372,7 +1370,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let warns = config.warnings();
@@ -1388,7 +1385,6 @@ tls_key_path = "/etc/trawl/key.pem"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let warns = config.warnings();
@@ -1402,7 +1398,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.server.cors_allowed_origins.is_empty());
@@ -1455,7 +1450,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ingest.enabled);
@@ -1475,7 +1469,6 @@ cors_allowed_origins = ["https://trawl.example.com", "https://admin.example.com"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.cors_allowed_origins.len(), 2);
@@ -1492,7 +1485,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.rate_limit.admin, 100);
@@ -1513,7 +1505,6 @@ ingest = 500
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.rate_limit.admin, 200);
@@ -1529,7 +1520,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ingest.internal_telemetry);
@@ -1543,7 +1533,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [ingest]
 internal_telemetry = false
 "#;
@@ -1559,7 +1548,6 @@ internal_telemetry = false
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [ingest]
 enabled = false
 internal_telemetry = true
@@ -1582,7 +1570,6 @@ log_file = "/var/log/trawld.log"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let warns = config.warnings();
@@ -1596,7 +1583,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [ingest]
 daily_rollup = false
 "#;
@@ -1611,7 +1597,6 @@ daily_rollup = false
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.retention.max_age_days, 90);
@@ -1626,7 +1611,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [retention]
 max_age_days = 30
 min_free_disk_bytes = 0
@@ -1645,7 +1629,6 @@ retention_interval_secs = 1800
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [retention]
 max_age_days = 0
 min_free_disk_bytes = 0
@@ -1720,7 +1703,6 @@ max_request_body_bytes = "256K"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.max_request_body_bytes, 256 * 1024);
@@ -1734,7 +1716,6 @@ max_request_body_bytes = 262144
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.max_request_body_bytes, 262_144);
@@ -1747,7 +1728,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [ingest]
 max_body_bytes = "32M"
 hot_buffer_max_bytes = "200M"
@@ -1764,7 +1744,6 @@ hot_buffer_max_bytes = "200M"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [retention]
 min_free_disk_bytes = "2G"
 "#;
@@ -1781,7 +1760,6 @@ min_free_disk_bytes = "2G"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ingest.stats_interval_secs, 60);
@@ -1795,7 +1773,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [ingest]
 stats_interval_secs = 30
 telemetry_flush_interval_secs = 5
@@ -1812,7 +1789,6 @@ telemetry_flush_interval_secs = 5
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [ingest]
 stats_interval_secs = 0
 "#;
@@ -1828,7 +1804,6 @@ stats_interval_secs = 0
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.web.bind_addr.is_none());
@@ -1848,7 +1823,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -1865,7 +1839,6 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.auth.database_url.is_none());
@@ -1906,34 +1879,13 @@ db_path = "/tmp/store.db"
     }
 
     #[test]
-    fn validation_rejects_legacy_auth_db_basename() {
-        // Legacy-db quarantine (ADR-0004): postgres and sqlite key ids are
-        // unrelated sequences — pointing the transitional store at the old
-        // auth.db would let a new pg key inherit a sqlite key's history,
-        // saved queries, and auto-executing schedules. Deb upgrades preserve
-        // the old trawld.toml (conffile), so this must be a loud startup
-        // error, not a silent quarantine failure.
+    fn validation_accepts_auth_without_db_path() {
         let toml = r#"
 [server]
 [data]
 path = "/data"
 [auth]
-db_path = "/var/lib/trawl/auth.db"
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("auth.db"), "got: {err}");
-        assert!(err.contains("runbook"), "got: {err}");
-    }
-
-    #[test]
-    fn validation_accepts_fresh_store_basename() {
-        let toml = r#"
-[server]
-[data]
-path = "/data"
-[auth]
-db_path = "/var/lib/trawl/store.db"
+database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         config.validate().unwrap();
@@ -1948,11 +1900,10 @@ db_path = "/var/lib/trawl/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 auth_cache_ttl_secs = 300
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.auth.db_path, PathBuf::from("/tmp/store.db"));
+        assert_eq!(config.auth.audit_interval_secs, 30);
     }
 
     // -- [storage] database_url (ADR-0004 slice 3) ----------------------------
@@ -1964,7 +1915,6 @@ auth_cache_ttl_secs = 300
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 [storage]
 database_url = "postgres://trawl:trawl@localhost:5433/trawl"
 "#;
@@ -1984,7 +1934,6 @@ database_url = "postgres://trawl:trawl@localhost:5433/trawl"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.storage.database_url.is_none());
@@ -2032,7 +1981,6 @@ db_path = "/tmp/store.db"
 [data]
 path = "/data"
 [auth]
-db_path = "/tmp/store.db"
 database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2056,9 +2004,8 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
         // DATABASE_URL set (CI sets it for the whole test job — this test
         // fails there if the bare override ever creeps back in).
         let auth = AuthConfig {
-            db_path: PathBuf::from("/tmp/store.db"),
             database_url: Some("postgres://toml/fleet".into()),
-            audit_interval_secs: 30,
+            ..AuthConfig::default()
         };
         if std::env::var("FLEET_DATABASE_URL").is_err() {
             assert_eq!(
@@ -2082,7 +2029,6 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 [web]
 bind_addr = "0.0.0.0:8090"
 upstream_url = "https://localhost:5514"
@@ -2113,7 +2059,6 @@ allow_insecure_cookies = true
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 [web]
 shared_domain = ".fleet.lab.ktle.net"
 "#;
@@ -2132,7 +2077,6 @@ shared_domain = ".fleet.lab.ktle.net"
 [data]
 path = "/data/*.parquet"
 [auth]
-db_path = "/tmp/store.db"
 [web]
 "#;
         let config: Config = toml::from_str(toml).unwrap();

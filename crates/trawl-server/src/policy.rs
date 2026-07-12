@@ -9,7 +9,7 @@
 //! mandatory policy layer behind it (ADR-0004):
 //!
 //! - [`Role`] / [`Permission`]: the trawl permission model, moved here from
-//!   trawl-auth (app policy, not substrate).
+//!   the retired trawl-auth crate (app policy, not substrate).
 //! - [`TrawlAuthz`]: extension trait giving [`fleet_auth::VerifiedKey`] the
 //!   `trawl_role()` / `has_permission()` surface every handler checks.
 //! - [`require_trawl_grant`]: middleware that 403s keys with no trawl grant
@@ -31,7 +31,7 @@ use fleet_auth::{TRAWL_APP, VerifiedKey};
 
 use crate::error::ServerError;
 
-// -- roles + permissions (ported from trawl-auth, minus rusqlite) ------------
+// -- roles + permissions (ported from the retired trawl-auth crate) ----------
 
 /// The four roles in the trawl permission model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -171,7 +171,7 @@ impl std::str::FromStr for Role {
 
 /// Trawl-side authorization surface over a fleet-auth [`VerifiedKey`].
 ///
-/// Every call site that previously used trawl-auth's inherent
+/// Every call site that previously used the retired trawl-auth crate's inherent
 /// `trawl_role()` / `has_permission()` methods survives on an import swap.
 pub trait TrawlAuthz {
     /// Parsed trawl-app role, if this key has a `("trawl", _)` grant with a
@@ -328,7 +328,7 @@ mod tests {
 
     use super::*;
 
-    // -- role/permission tables (ported from trawl-auth) --------------------
+    // -- role/permission tables (ported from the retired trawl-auth) --------
 
     #[test]
     fn admin_has_all_non_ingest_permissions() {

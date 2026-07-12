@@ -21,8 +21,8 @@
 //! `sqlx-macros` transitively triggers a cargo links-uniqueness conflict
 //! with the workspace's rusqlite (see `migrations.rs` for context).
 
-use sqlx_core::executor::Executor as _;
-use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
+use sqlx::Executor as _;
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 
 use crate::MIGRATOR;
 
@@ -77,7 +77,7 @@ impl PgFixture {
     /// lacks `CREATEDB`, or migrations fail — all environment defects that
     /// should fail the test loudly rather than skip.
     pub async fn setup() -> Option<Self> {
-        use sqlx_core::connection::Connection as _;
+        use sqlx::Connection as _;
 
         let admin_url = base_database_url()?;
         let admin_opts: PgConnectOptions = admin_url
@@ -136,7 +136,7 @@ impl PgFixture {
     /// # Panics
     /// Panics when the admin connection or the drop itself fails.
     pub async fn kill_database(&self) {
-        use sqlx_core::connection::Connection as _;
+        use sqlx::Connection as _;
         let mut admin = PgConnection::connect_with(&self.admin_opts)
             .await
             .expect("connect to admin DB");
@@ -162,7 +162,7 @@ impl Drop for PgFixture {
                 .build()
                 .expect("teardown runtime");
             rt.block_on(async move {
-                use sqlx_core::connection::Connection as _;
+                use sqlx::Connection as _;
                 if let Ok(mut admin) = PgConnection::connect_with(&admin_opts).await {
                     let _ = admin
                         .execute(

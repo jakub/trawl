@@ -10,12 +10,12 @@ pub enum AuthError {
     /// The underlying database operation failed.
     #[cfg(feature = "keystore")]
     #[error("auth database error: {0}")]
-    Database(#[from] sqlx_core::Error),
+    Database(#[from] sqlx::Error),
 
     /// A schema migration operation failed.
     #[cfg(feature = "keystore")]
     #[error("auth migration error: {0}")]
-    Migration(#[from] sqlx_core::migrate::MigrateError),
+    Migration(#[from] sqlx::migrate::MigrateError),
 
     /// Argon2id hashing or verification failed.
     #[error("token hashing error: {0}")]

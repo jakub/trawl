@@ -244,7 +244,7 @@ pg_test!(
         // SQL so we don't bust the cache, then verify again. The conditional
         // last_used UPDATE catches the revocation.
         store.verify_key(&created.plaintext_token).await.unwrap();
-        sqlx_core::query::query("UPDATE api_keys SET active = FALSE WHERE id = $1")
+        sqlx::query("UPDATE api_keys SET active = FALSE WHERE id = $1")
             .bind(created.info.id)
             .execute(store.pool())
             .await
@@ -302,7 +302,7 @@ pg_test!(
         // deterministic interleaving instead of hoping the scheduler lands
         // inside a microsecond race window.
         let mut tx = store.pool().begin().await.unwrap();
-        sqlx_core::query::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
+        sqlx::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
             .bind(created.info.id)
             .fetch_one(&mut *tx)
             .await

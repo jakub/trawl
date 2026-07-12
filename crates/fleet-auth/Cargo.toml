@@ -23,8 +23,7 @@ dashmap = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-sqlx-core = { workspace = true, optional = true }
-sqlx-postgres = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 # tokio is needed for spawn_blocking — argon2id KDF runs ~200 ms in prod
 # params and must not block tokio worker threads. The `rt` feature is the
 # minimum surface for spawn_blocking.
@@ -52,8 +51,7 @@ keystore = [
     "dep:chrono",
     "dep:dashmap",
     "dep:rand",
-    "dep:sqlx-core",
-    "dep:sqlx-postgres",
+    "dep:sqlx",
     "dep:tokio",
     "dep:tracing",
 ]

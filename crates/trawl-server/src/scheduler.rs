@@ -5,29 +5,28 @@
 //! Background scheduler for periodic query execution.
 //!
 //! Polls [`ScheduleStore`] for enabled schedules and spawns query execution
-//! tasks on the [`ExecutorPool`]. Results are zstd-compressed and stored as
-//! report runs in the auth database.
+//! tasks on the [`ExecutorPool`]. Results are written as parquet files (with
+//! a zstd-JSON blob fallback) and recorded as report runs in the app-state
+//! database.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use fleet_auth::KeyStore;
-use trawl_auth::schedule::ScheduleStore;
 
 use crate::config::SchedulerConfig;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
+use crate::store::ScheduleStore;
 
 /// Spawn the scheduler background task.
 ///
 /// Returns a join handle and shutdown sender. Dropping the sender or
 /// sending `true` signals the task to exit.
 pub fn spawn_scheduler(
-    schedule_store: Arc<Mutex<ScheduleStore>>,
+    schedule_store: ScheduleStore,
     key_store: KeyStore,
     pool: ExecutorPool,
     config: SchedulerConfig,
@@ -45,7 +44,7 @@ pub fn spawn_scheduler(
 }
 
 async fn scheduler_loop(
-    schedule_store: Arc<Mutex<ScheduleStore>>,
+    schedule_store: ScheduleStore,
     key_store: KeyStore,
     pool: ExecutorPool,
     config: SchedulerConfig,
@@ -57,21 +56,20 @@ async fn scheduler_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Clean up any runs left in 'running' state from a previous crash.
-    {
-        let store = schedule_store.lock();
-        match store.cleanup_stale_runs() {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                event_type = "scheduler_stale_cleanup",
-                count = n,
-                "cleaned up stale report runs"
-            ),
-            Err(e) => tracing::error!(
-                event_type = "scheduler_error",
-                error = %e,
-                "failed to cleanup stale runs"
-            ),
-        }
+    // Safe against live siblings: the boot-time advisory lock guarantees
+    // this process is the only trawld on this database.
+    match schedule_store.cleanup_stale_runs().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            event_type = "scheduler_stale_cleanup",
+            count = n,
+            "cleaned up stale report runs"
+        ),
+        Err(e) => tracing::error!(
+            event_type = "scheduler_error",
+            error = %e,
+            "failed to cleanup stale runs"
+        ),
     }
 
     let mut retention_counter: u64 = 0;
@@ -100,8 +98,9 @@ async fn scheduler_loop(
         retention_counter += 1;
         if retention_counter >= retention_interval {
             retention_counter = 0;
-            let store = schedule_store.lock();
-            match store.delete_old_runs(config.report_retention_days, config.max_runs_per_schedule)
+            match schedule_store
+                .delete_old_runs(config.report_retention_days, config.max_runs_per_schedule)
+                .await
             {
                 Ok((_count, paths)) => {
                     // Clean up parquet files from disk for deleted runs.
@@ -132,80 +131,44 @@ async fn scheduler_loop(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn poll_and_execute(
-    schedule_store: &Arc<Mutex<ScheduleStore>>,
+    schedule_store: &ScheduleStore,
     key_store: &KeyStore,
     pool: &ExecutorPool,
     config: &SchedulerConfig,
     timeout_secs: u64,
 ) {
-    let schedules = {
-        let store = schedule_store.lock();
-        match store.list_enabled_schedules() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(
-                    event_type = "scheduler_error",
-                    error = %e,
-                    "failed to list enabled schedules"
-                );
-                return;
-            }
+    let schedules = match schedule_store.list_enabled_schedules().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                event_type = "scheduler_error",
+                error = %e,
+                "failed to list enabled schedules"
+            );
+            return;
         }
     };
 
     for (schedule, saved_query) in schedules {
-        // Check if max_runs reached.
-        if let Some(max) = schedule.max_runs {
-            let count = match schedule_store.lock().count_runs(schedule.id) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        event_type = "scheduler_error",
-                        schedule_id = schedule.id,
-                        error = %e,
-                        "failed to count runs; skipping tick to honour max_runs cap"
-                    );
-                    continue;
-                }
-            };
-            if count >= max {
-                continue;
-            }
-        }
-
         // Check if enough time has passed since last run.
-        let should_run = {
-            let store = schedule_store.lock();
-            match store.latest_run(schedule.id) {
-                Ok(Some(last)) => match chrono::DateTime::parse_from_rfc3339(&last.started_at) {
-                    Ok(dt) => {
-                        let now = chrono::Utc::now().timestamp();
-                        let elapsed = (now - dt.timestamp()).unsigned_abs();
-                        elapsed >= schedule.interval_secs
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            event_type = "scheduler_error",
-                            schedule_id = schedule.id,
-                            started_at = %last.started_at,
-                            error = %e,
-                            "unparseable last-run timestamp; skipping tick conservatively"
-                        );
-                        false
-                    }
-                },
-                Ok(None) => true, // Never run before.
-                Err(e) => {
-                    tracing::warn!(
-                        event_type = "scheduler_error",
-                        schedule_id = schedule.id,
-                        error = %e,
-                        "failed to check latest run"
-                    );
-                    false
-                }
+        let should_run = match schedule_store.latest_run(schedule.id).await {
+            Ok(Some(last)) => {
+                let elapsed = chrono::Utc::now()
+                    .signed_duration_since(last.started_at)
+                    .num_seconds()
+                    .unsigned_abs();
+                elapsed >= schedule.interval_secs
+            }
+            Ok(None) => true, // Never run before.
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "scheduler_error",
+                    schedule_id = schedule.id,
+                    error = %e,
+                    "failed to check latest run"
+                );
+                false
             }
         };
 
@@ -218,26 +181,35 @@ async fn poll_and_execute(
             continue;
         }
 
-        // Atomically start a run (prevents concurrent execution).
-        let run_id = {
-            let store = schedule_store.lock();
-            match store.start_run(schedule.id, saved_query.id, &saved_query.query) {
-                Ok(Some(id)) => id,
-                Ok(None) => continue, // Already running.
-                Err(e) => {
-                    tracing::error!(
-                        event_type = "scheduler_error",
-                        schedule_id = schedule.id,
-                        error = %e,
-                        "failed to start run"
-                    );
-                    continue;
-                }
+        // Claim a run in one transaction: the max_runs check and the insert
+        // are atomic (FOR UPDATE on the schedule row), and the partial
+        // unique index rejects a second concurrent 'running' row.
+        let run_id = match schedule_store
+            .claim_run(
+                schedule.id,
+                saved_query.id,
+                &saved_query.query,
+                schedule.max_runs,
+            )
+            .await
+        {
+            Ok(crate::store::RunClaim::Started(id)) => id,
+            Ok(crate::store::RunClaim::AlreadyRunning | crate::store::RunClaim::MaxRunsReached) => {
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(
+                    event_type = "scheduler_error",
+                    schedule_id = schedule.id,
+                    error = %e,
+                    "failed to start run"
+                );
+                continue;
             }
         };
 
         // Spawn execution as a separate task so it doesn't block the poll loop.
-        let store = Arc::clone(schedule_store);
+        let store = schedule_store.clone();
         let pool = pool.clone();
         let query = saved_query.query.clone();
         let query_name = saved_query.name.clone();
@@ -295,8 +267,9 @@ async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i6
     usable
 }
 
+#[allow(clippy::too_many_lines)] // outcome handling incl. orphan cleanup is cohesive
 pub(crate) async fn execute_scheduled_query(
-    schedule_store: Arc<Mutex<ScheduleStore>>,
+    schedule_store: ScheduleStore,
     pool: ExecutorPool,
     run_id: i64,
     query: &str,
@@ -315,8 +288,6 @@ pub(crate) async fn execute_scheduled_query(
     #[allow(clippy::cast_possible_truncation)]
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let store = schedule_store.lock();
-
     match outcome.result {
         Ok(query_result) => {
             let row_count = query_result.rows.len();
@@ -325,21 +296,51 @@ pub(crate) async fn execute_scheduled_query(
             let (result_path, result_data) =
                 write_result_parquet(&pool, run_id, query_name, &query_result);
 
-            if let Err(e) = store.finish_run(
-                run_id,
-                "success",
-                duration_ms,
-                Some(row_count),
-                None,
-                result_data.as_deref(),
-                result_path.as_deref(),
-            ) {
-                tracing::error!(
-                    event_type = "scheduler_error",
+            match schedule_store
+                .finish_run(
                     run_id,
-                    error = %e,
-                    "failed to finish run"
-                );
+                    "success",
+                    duration_ms,
+                    Some(row_count),
+                    None,
+                    result_data.as_deref(),
+                    result_path.as_deref(),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    // The run row was cascade-deleted mid-flight (its saved
+                    // query or schedule is gone): the file we just wrote is
+                    // orphaned — remove it.
+                    if let Some(ref relative) = result_path {
+                        let base = pool.base_dir().trim_end_matches('/');
+                        let full = format!("{base}/{relative}");
+                        if let Err(e) = std::fs::remove_file(&full) {
+                            tracing::warn!(
+                                event_type = "scheduler_orphan_cleanup_error",
+                                path = %full,
+                                error = %e,
+                                "failed to delete orphaned parquet result"
+                            );
+                        } else {
+                            tracing::info!(
+                                event_type = "scheduler_orphan_cleanup",
+                                run_id,
+                                path = %full,
+                                "run was deleted mid-flight; removed orphaned parquet result"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        event_type = "scheduler_error",
+                        run_id,
+                        error = %e,
+                        "failed to finish run"
+                    );
+                }
             }
 
             tracing::info!(
@@ -359,15 +360,18 @@ pub(crate) async fn execute_scheduled_query(
                 ("error", format!("{e}"))
             };
 
-            if let Err(e2) = store.finish_run(
-                run_id,
-                status,
-                duration_ms,
-                None,
-                Some(&error_msg),
-                None,
-                None,
-            ) {
+            if let Err(e2) = schedule_store
+                .finish_run(
+                    run_id,
+                    status,
+                    duration_ms,
+                    None,
+                    Some(&error_msg),
+                    None,
+                    None,
+                )
+                .await
+            {
                 tracing::error!(
                     event_type = "scheduler_error",
                     run_id,

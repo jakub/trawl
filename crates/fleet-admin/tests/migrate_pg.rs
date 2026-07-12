@@ -13,7 +13,7 @@
 mod common;
 
 use fleet_auth::{KeyStore, MIGRATOR, PrincipalKind};
-use sqlx_core::row::Row as _;
+use sqlx::Row as _;
 
 pg_test!(
     migrator_is_idempotent_on_already_migrated_db,
@@ -35,7 +35,7 @@ pg_test!(
 pg_test!(
     migrator_creates_expected_tables,
     |store: KeyStore| async move {
-        let tables: Vec<String> = sqlx_core::query::query(
+        let tables: Vec<String> = sqlx::query(
             "SELECT table_name FROM information_schema.tables
          WHERE table_schema = 'public'
          ORDER BY table_name",

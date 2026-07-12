@@ -20,8 +20,7 @@ fleet-auth = { workspace = true, features = ["keystore", "session"] }
 chrono = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
-sqlx-core = { workspace = true }
-sqlx-postgres = { workspace = true }
+sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
