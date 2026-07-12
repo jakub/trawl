@@ -553,7 +553,9 @@ async fn scheduler_runs_after(
         .unwrap();
     let schedule = storage
         .schedule
-        .create_schedule(saved.id, created.info.id, 1, None)
+        // 60s is the store minimum; the first poll runs regardless of interval
+        // (never-run schedules are always due), so cadence is immaterial here.
+        .create_schedule(saved.id, created.info.id, 60, None)
         .await
         .unwrap();
 

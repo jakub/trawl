@@ -111,6 +111,19 @@ pub fn parse_interval(s: &str) -> Result<u64, StoreError> {
     Ok(secs)
 }
 
+/// Reject a sub-minute interval at the store boundary.
+///
+/// [`parse_interval`] already rejects short strings, but that guards only the
+/// one handler path; binding the invariant here means every entry into
+/// [`ScheduleStore::create_schedule`]/[`ScheduleStore::update_schedule`]
+/// upholds it, matched by the migration's `CHECK (interval_secs >= 60)`.
+fn ensure_min_interval(secs: u64) -> Result<(), StoreError> {
+    if secs < MIN_INTERVAL_SECS {
+        return Err(StoreError::IntervalTooShort { secs });
+    }
+    Ok(())
+}
+
 /// Format seconds into a human-readable duration string (e.g. "5m", "1h").
 pub fn format_interval(secs: u64) -> String {
     if secs.is_multiple_of(604_800) {
@@ -249,6 +262,8 @@ impl ScheduleStore {
         interval_secs: u64,
         max_runs: Option<u64>,
     ) -> Result<Schedule, StoreError> {
+        ensure_min_interval(interval_secs)?;
+
         let row = sqlx::query(&format!(
             "INSERT INTO schedules
                  (saved_query_id, key_id, interval_secs, max_runs, enabled, created_at, updated_at)
@@ -293,6 +308,8 @@ impl ScheduleStore {
         max_runs: Option<u64>,
         enabled: bool,
     ) -> Result<Schedule, StoreError> {
+        ensure_min_interval(interval_secs)?;
+
         let row = sqlx::query(&format!(
             "UPDATE schedules
              SET interval_secs = $1, max_runs = $2, enabled = $3, updated_at = now()

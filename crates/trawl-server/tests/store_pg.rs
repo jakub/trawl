@@ -433,6 +433,25 @@ async fn schedule_for_missing_saved_query_is_not_found(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn schedule_rejects_sub_minute_interval(pool: PgPool) {
+    // The store enforces the 60s minimum on both create and update paths,
+    // not just in the handler's parse_interval.
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "test").await;
+
+    assert!(matches!(
+        store.create_schedule(sq_id, 1, 30, None).await,
+        Err(StoreError::IntervalTooShort { secs: 30 })
+    ));
+
+    let created = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    assert!(matches!(
+        store.update_schedule(created.id, 1, 45, None, true).await,
+        Err(StoreError::IntervalTooShort { secs: 45 })
+    ));
+}
+
+#[sqlx::test]
 async fn schedule_update(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;

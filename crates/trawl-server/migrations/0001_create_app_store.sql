@@ -45,7 +45,8 @@ CREATE TABLE schedules (
         CONSTRAINT schedules_saved_query_fk
         REFERENCES saved_queries (id) ON DELETE CASCADE,
     key_id         BIGINT      NOT NULL,
-    interval_secs  BIGINT      NOT NULL,
+    interval_secs  BIGINT      NOT NULL
+        CONSTRAINT schedules_interval_min CHECK (interval_secs >= 60),
     max_runs       BIGINT,
     enabled        BOOLEAN     NOT NULL DEFAULT TRUE,
     created_at     TIMESTAMPTZ NOT NULL,
