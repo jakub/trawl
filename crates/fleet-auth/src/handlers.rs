@@ -26,7 +26,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -60,13 +60,25 @@ pub struct LoginResponse {
 
 /// `POST /login` handler.
 ///
+/// - Cross-origin request (`Origin` present whose host doesn't match the
+///   request `Host`) → 403, no cookie. The check is strictly same-host: the
+///   shared cookie domain is deliberately NOT an Origin allowlist, so a
+///   sibling app under the same parent domain is rejected.
 /// - Empty `api_key` → 400.
 /// - Invalid `api_key` → 401 JSON (same shape as middleware).
 /// - Valid `api_key` but no grant for `app_namespace` → 403 HTML (same
 ///   body as middleware no-grant; no cookie set).
 /// - Success → 302 with `Set-Cookie` and `Location: post_login_redirect`.
 #[allow(clippy::implicit_hasher)]
-pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginRequest>) -> Response {
+pub async fn login(
+    State(state): State<SessionState>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(req): Json<LoginRequest>,
+) -> Response {
+    if let Some(resp) = reject_cross_origin(&headers, &uri, "login") {
+        return resp;
+    }
     let api_key = req.api_key;
     if api_key.trim().is_empty() {
         return error_response(
@@ -157,21 +169,25 @@ pub async fn login(State(state): State<SessionState>, Json(req): Json<LoginReque
 
 /// `POST /logout` handler.
 ///
-/// Always returns 204 with a `Set-Cookie` clear directive — never errors,
-/// never requires a valid session (logout works even with a stale cookie).
-/// Attributes match what login sets so browsers accept the clear.
+/// Returns 204 with a `Set-Cookie` clear directive — never requires a
+/// valid session (logout works even with a stale cookie). Attributes
+/// match what login sets so browsers accept the clear.
 ///
-/// # CSRF caveat
+/// # Origin enforcement (default-on)
 ///
-/// This handler does NOT perform CSRF / origin validation. Because the
-/// `fleet_session` cookie is shared across sibling apps under a parent
-/// domain, a forged cross-site POST to any app's logout endpoint can clear
-/// the shared cookie and sign the user out of every sibling app
-/// (annoyance, not data loss). Consumers wiring this route on a
-/// browser-facing surface SHOULD layer a CSRF token check or
-/// Origin/Referer validation in front. The library does not enforce one
-/// because there is no CSRF infrastructure shared across fleet apps yet.
-pub async fn logout(State(state): State<SessionState>) -> Response {
+/// Because the `fleet_session` cookie is shared across sibling apps under
+/// a parent domain, a forged cross-site POST to any app's logout endpoint
+/// would clear the shared cookie and sign the user out of every sibling
+/// app. Both `login` and `logout` therefore validate the `Origin` header
+/// by default via [`session::check_origin`] (ADR-0004 slice 2): a present Origin
+/// whose host doesn't match the request `Host` → 403 with NO `Set-Cookie`.
+/// Sharing a parent-domain cookie is deliberately NOT an origin allowlist —
+/// a sibling app is a different origin and is rejected. Absent Origin is
+/// allowed, so curl/scripted clients are unaffected.
+pub async fn logout(State(state): State<SessionState>, uri: Uri, headers: HeaderMap) -> Response {
+    if let Some(resp) = reject_cross_origin(&headers, &uri, "logout") {
+        return resp;
+    }
     let cfg = state.config();
     let cookie_header = build_clear_cookie_header(
         cfg.cookie_name(),
@@ -191,6 +207,29 @@ pub async fn logout(State(state): State<SessionState>) -> Response {
     headers.insert(header::SET_COOKIE, set_cookie);
 
     (StatusCode::NO_CONTENT, headers).into_response()
+}
+
+/// Run the present-only, strictly same-host Origin check against the
+/// request headers. Returns `Some(403)` when the request must be rejected,
+/// `None` when the handler may proceed. Delegates the decision + rejection
+/// log to the shared [`session::check_origin`] so the log fields/message
+/// live in one place; the cookie's shared domain is deliberately NOT an
+/// origin allowlist — see [`session::origin_allowed`].
+///
+/// The request host is read from the `Host` header, falling back to the URI's
+/// `:authority` — under HTTP/2 browsers send `:authority` instead of a `Host`
+/// header, and a Host-only lookup would be `None`, so a present-Origin
+/// same-origin login/logout would be wrongly rejected (403, no `Set-Cookie`).
+fn reject_cross_origin(headers: &HeaderMap, uri: &Uri, handler: &str) -> Option<Response> {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let host = session::request_host(headers, uri);
+    session::check_origin(origin, host, handler).err().map(|_| {
+        error_response(
+            StatusCode::FORBIDDEN,
+            "origin_mismatch",
+            "cross-origin request rejected",
+        )
+    })
 }
 
 fn internal_error(detail: &str) -> Response {

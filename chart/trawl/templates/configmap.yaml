@@ -111,5 +111,8 @@ data:
     cookie_secret_path = "/etc/trawl/web.cookie"
     session_ttl_secs = {{ .Values.web.sessionTtlSecs | int }}
     allow_insecure_cookies = {{ .Values.web.allowInsecureCookies }}
+    {{- if .Values.web.sharedDomain }}
+    shared_domain = {{ .Values.web.sharedDomain | quote }}
+    {{- end }}
     {{- end }}
     {{- end }}

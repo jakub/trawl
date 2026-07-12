@@ -53,7 +53,7 @@ pub async fn forward(
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
-    do_forward(state.upstream_url(), "", state.http(), auth, req).await
+    do_forward(&state, state.upstream_url(), "", auth, req).await
 }
 
 pub async fn forward_intel(
@@ -64,17 +64,33 @@ pub async fn forward_intel(
     let base = state.coastwatch_url().ok_or_else(|| {
         ProxyError::ServiceUnavailable("coastwatch upstream not configured".into())
     })?;
-    do_forward(base, "/api/intel", state.http(), auth, req).await
+    do_forward(&state, base, "/api/intel", auth, req).await
 }
 
 async fn do_forward(
+    state: &AppState,
     base: &str,
     strip_prefix: &str,
-    http: &reqwest::Client,
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
+    let http = state.http();
     let (parts, body) = req.into_parts();
+
+    // CSRF defense for cookie-authed requests. The shared `fleet_session`
+    // cookie is `SameSite=Lax` and (in SSO mode) scoped to the parent domain,
+    // so the browser attaches it to same-site *sibling*-origin requests
+    // (`coastwatch.fleet…` → `trawl.fleet…`) — including mutating POST/PUT/
+    // DELETE. Without this check a victim loading attacker content on any
+    // sibling origin could forge state-changing calls carrying their session
+    // (delete/create saved queries, cancel queries, trigger exports). Reuse
+    // the same present-only Origin guard the auth endpoints use, before the
+    // victim's bearer token is ever forwarded upstream. Bearer clients
+    // (CLI/API) hold no cookie, send no `Origin`, and are not CSRF targets —
+    // so the guard applies only to the `Session` branch.
+    if matches!(auth, Auth::Session(_)) {
+        crate::routes::auth::check_origin(&parts.headers, &parts.uri, "proxy")?;
+    }
 
     let upstream_uri = build_upstream_uri(base, &parts.uri, strip_prefix)?;
 
@@ -112,8 +128,40 @@ async fn do_forward(
     let out_headers = out.headers_mut().expect("fresh response has headers map");
     copy_response_headers(&upstream_headers, out_headers);
 
+    if let Some(clear) = clear_cookie_for_proxied_response(status, &auth) {
+        out_headers.insert(header::SET_COOKIE, clear);
+    }
+
     out.body(Body::from_stream(body_stream))
         .map_err(|e| ProxyError::Internal(format!("response build: {e}")))
+}
+
+/// Whether — and how — a *proxied* upstream response should clear the
+/// shared `fleet_session` cookie; `None` leaves the cookie untouched.
+///
+/// The single home for the proxy-path 401/403 cookie rule (ADR-0004
+/// slice 2), consulted identically by the generic forwarder, the
+/// `/api/intel` forwarder, and the SSE handler so a newly added proxied
+/// path can't silently diverge.
+///
+/// Always `None` today: trawld returns an opaque `401` for BOTH classes of
+/// failure — a dead key (revoked/expired fleet-wide) AND a live key that
+/// merely lacks the permission grant for one endpoint (e.g. a non-admin
+/// whose SPA hits an admin-only route). The two are indistinguishable at
+/// this layer, so clearing on any proxied `401` would log valid users out
+/// of the entire fleet (shared `fleet_session`) on a routine authz denial;
+/// a `403` may likewise still carry grants for sibling apps. Cookie
+/// lifecycle is therefore owned solely by `auth::me`, which decides against
+/// the permission-free upstream `/whoami` — the only place a `401` is
+/// unambiguously a dead key. `_status`/`_auth` are the signals a future
+/// clear-on-`<status>` policy would key on (and where `AppState`'s
+/// `build_clear_cookie` would be invoked to mint the directive).
+#[must_use]
+pub(crate) fn clear_cookie_for_proxied_response(
+    _status: StatusCode,
+    _auth: &Auth,
+) -> Option<HeaderValue> {
+    None
 }
 
 const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -382,6 +430,135 @@ mod tests {
         assert_eq!(built, "https://coastwatch:7700/v1/stories/sto_abc123");
     }
 
+    // -- upstream auth mapping (AC #5) -------------------------------------
+
+    #[tokio::test]
+    async fn forward_upstream_401_with_session_preserves_cookie() {
+        // trawld returns an opaque 401 for BOTH a dead key and a live key
+        // that merely lacks the permission grant for one endpoint (e.g. a
+        // non-admin whose SPA hits an admin-only route). The proxy can't
+        // tell them apart, so it must NOT clear the shared cookie on any
+        // proxied 401 — doing so would log valid users out of the entire
+        // fleet on a routine authz denial. Cookie lifecycle is owned by
+        // `auth::me`, which decides against the permission-free /whoami.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schema"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a proxied 401 (possibly a mere authz denial) must NOT clear the \
+             shared fleet_session cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_upstream_403_preserves_cookie() {
+        // Valid key, no trawl grant: the shared fleet_session cookie may
+        // still hold grants for sibling apps — clearing it would log the
+        // user out of coastwatch. 403 passes through with NO Set-Cookie.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schema"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "upstream 403 must NOT clear the shared cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_upstream_401_with_bearer_does_not_clear() {
+        // Bearer clients hold no cookie — a clear directive would be
+        // meaningless noise (and confusing for API clients).
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/schema"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/schema")
+            .header("authorization", "Bearer flt_dead")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "bearer-authed 401 must not emit a cookie clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_intel_upstream_401_with_session_preserves_cookie() {
+        // The coastwatch intel path is a proxied route like any other — its
+        // 401 is equally ambiguous (dead key vs. authz denial), so it must
+        // not clear the shared cookie either.
+        let trawld = MockServer::start().await;
+        let coastwatch = MockServer::start().await;
+        let state = state_with_intel(&trawld, &coastwatch);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &trawld).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/stories"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&coastwatch)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/intel/v1/stories")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a proxied intel 401 must NOT clear the shared fleet_session cookie"
+        );
+    }
+
     #[tokio::test]
     async fn forward_accepts_bearer_header() {
         let upstream = MockServer::start().await;
@@ -521,5 +698,148 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -- CSRF / origin validation on mutating proxy routes ----------------
+
+    #[tokio::test]
+    async fn forward_rejects_cookie_authed_sibling_origin_mutation() {
+        // The shared `fleet_session` cookie is SameSite=Lax, so the browser
+        // attaches it to same-site *sibling*-origin POSTs (a compromised
+        // coastwatch.fleet… forging a write to trawl.fleet…). Present-only
+        // Origin validation must reject it BEFORE the victim's bearer token
+        // reaches trawld. No upstream mock is mounted for the route: a 403
+        // (not a forwarded 404) proves the request was blocked at the proxy.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("cookie", &cookie)
+            .header("origin", "https://coastwatch.fleet.test")
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"x","dsl":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a rejected cross-origin mutation must not touch the cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_allows_cookie_authed_same_origin_mutation() {
+        // Same-origin POST from the SPA carries a matching Origin and must
+        // pass through to upstream.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/saved"))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("cookie", &cookie)
+            .header("origin", "https://trawl.fleet.test")
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"x","dsl":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn forward_allows_cookie_authed_mutation_without_origin() {
+        // Present-only semantics: a request carrying no Origin header (some
+        // same-origin navigations, non-browser cookie clients) is allowed —
+        // the Session extractor still validates the cookie itself.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/saved"))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"x","dsl":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn forward_bearer_cross_origin_mutation_is_allowed() {
+        // Bearer clients (CLI/API) hold no cookie and are not CSRF targets —
+        // the origin guard must not apply to them even on a "cross-origin"
+        // (irrelevant, header-set) POST.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/saved"))
+            .and(bearer_token("flt_direct"))
+            .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("authorization", "Bearer flt_direct")
+            .header("origin", "https://evil.example.com")
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"x","dsl":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn forward_intel_rejects_cookie_authed_sibling_origin_mutation() {
+        // The coastwatch intel path shares `do_forward`, so its cookie-authed
+        // mutations get the same CSRF guard.
+        let trawld = MockServer::start().await;
+        let coastwatch = MockServer::start().await;
+        let state = state_with_intel(&trawld, &coastwatch);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &trawld).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/intel/v1/stories")
+            .header("cookie", &cookie)
+            .header("origin", "https://coastwatch.fleet.test")
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

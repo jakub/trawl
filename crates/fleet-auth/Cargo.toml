@@ -20,6 +20,7 @@ chacha20poly1305 = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true, features = ["serde"] }
 cookie = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sqlx-core = { workspace = true, optional = true }
@@ -65,8 +66,18 @@ session = [
     "dep:chacha20poly1305",
     "dep:chrono",
     "dep:cookie",
+    # `http` types (`HeaderMap`/`Uri`) back `request_host` — the shared
+    # Host-header → `:authority` derivation both fleet-auth's own handlers and
+    # thin session-only proxies (trawl-web) feed into `check_origin`. `http` is
+    # a lightweight, wasm-clean types crate, so it stays fine for session-only
+    # (e.g. renderer) consumers.
+    "dep:http",
     "dep:rand",
     "dep:serde_json",
+    # `check_origin` emits the canonical cross-origin-rejection log so the
+    # fields/message live in one place; tracing is a lightweight, wasm-clean
+    # facade, so this stays fine for session-only (e.g. renderer) consumers.
+    "dep:tracing",
 ]
 # Axum middleware (RequireSession, RequireBearer) + login/logout handler
 # factories. Pulls keystore (verify_key on the request path) and session

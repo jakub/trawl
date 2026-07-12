@@ -8,7 +8,7 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 - **ingestion**: vector → parquet (columnar, compressed, partitioned by hour)
 - **query engine**: custom DSL → AST → DuckDB SQL (parameterized)
 - **web ui**: leptos 0.8 CSR SPA (`trawl-web-ui`) served by the `trawl-web` session proxy (cookie sessions → bearer tokens)
-- **shared fleet substrate** (ADR-0030, consumed by coastwatch via sibling path deps): `fleet-auth` (postgres keystore + session AEAD), `fleet-ui` (leptos design system), `fleet-admin` (ops CLI)
+- **shared fleet substrate** (ADR-0030, consumed by coastwatch via sibling path deps): `fleet-auth` (postgres keystore + session AEAD — its `session` feature also backs trawl-web's `fleet_session` SSO cookie in-repo), `fleet-ui` (leptos design system), `fleet-admin` (ops CLI)
 - **agent** (v2 scope): signed-template execution on managed endpoints, mTLS, ed25519 signing — not yet started
 
 ## workspace layout
@@ -24,11 +24,11 @@ crates/
   trawl-client/          # typed async HTTP client library
   trawl-cli/             # unified CLI + TUI binary
   trawl-admin/           # admin CLI (TLS cert generation only — key mgmt lives in fleet-admin)
-  trawl-web/             # browser-facing session proxy (serves SPA, cookie → bearer)
+  trawl-web/             # browser-facing session proxy (serves SPA, cookie → bearer); fleet_session SSO cookie AEAD comes from fleet-auth's session feature, hand-rolled session.rs retired (ADR-0004 slice 2)
   trawl-web-ui/          # leptos 0.8 CSR SPA (wasm32)
   trawl-dashboard/       # shared ratatui dashboard rendering
   trawl-crashdump/       # minidump capture for trawld (linux fatal-signal handler)
-  fleet-auth/            # postgres-backed keystore + session cookie AEAD + axum middleware (ADR-0030)
+  fleet-auth/            # postgres-backed keystore + session cookie AEAD + present-only origin validation + axum middleware (ADR-0030); session feature = pure primitives (no pg), consumed by trawl-web
   fleet-ui/              # shared leptos design tokens + components for fleet apps (wasm32)
   fleet-admin/           # fleet keystore ops CLI (migrations, session keys, key lifecycle)
   coastwatch-api-types/  # vendored coastwatch API wire types

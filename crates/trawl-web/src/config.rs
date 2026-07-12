@@ -11,9 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use fleet_auth::{KEY_LEN, SessionKey};
 use trawl_config::{Config, ServerConfig, WebConfig};
-
-use crate::session::{KEY_LEN, SessionKey};
 
 /// Default bind address for the proxy HTTP listener.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -42,6 +41,10 @@ pub struct ResolvedConfig {
     pub allow_insecure_cookies: bool,
     pub insecure_upstream_tls: bool,
     pub cookie_key: SessionKey,
+    /// Parent domain for the shared `fleet_session` SSO cookie
+    /// (`Domain=` attribute). `None` (unset or empty in config) means
+    /// standalone mode — origin-scoped cookie.
+    pub shared_domain: Option<String>,
 }
 
 /// Errors while loading or validating proxy configuration.
@@ -123,6 +126,9 @@ impl ResolvedConfig {
             insecure_upstream_tls: std::env::var(ENV_INSECURE_UPSTREAM)
                 .is_ok_and(|v| !v.is_empty()),
             cookie_key,
+            // Empty string == unset == standalone mode, so an operator can
+            // "comment out" SSO by blanking the value.
+            shared_domain: web.shared_domain.clone().filter(|s| !s.is_empty()),
         })
     }
 }
@@ -336,6 +342,35 @@ mod tests {
         // `toml::from_str` with only mandatory fields gives us a fully
         // defaulted ServerConfig (serde defaults fill everything else).
         toml::from_str::<ServerConfig>("http_addr = \"127.0.0.1:8080\"").unwrap()
+    }
+
+    #[test]
+    fn shared_domain_resolves_when_set() {
+        let web = WebConfig {
+            shared_domain: Some(".fleet.lab.ktle.net".into()),
+            ..WebConfig::default()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
+        assert_eq!(
+            resolved.shared_domain.as_deref(),
+            Some(".fleet.lab.ktle.net")
+        );
+    }
+
+    #[test]
+    fn shared_domain_empty_or_absent_is_none() {
+        // Absent → standalone.
+        let resolved = ResolvedConfig::from_parsed(&WebConfig::default(), None).unwrap();
+        assert!(resolved.shared_domain.is_none());
+
+        // Empty string == unset — lets an operator blank the value to
+        // disable SSO without deleting the line.
+        let web = WebConfig {
+            shared_domain: Some(String::new()),
+            ..WebConfig::default()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
+        assert!(resolved.shared_domain.is_none());
     }
 
     #[test]

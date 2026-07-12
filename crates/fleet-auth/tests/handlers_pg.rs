@@ -225,6 +225,285 @@ pg_test!(
 );
 
 // ---------------------------------------------------------------------------
+// origin validation (default-on, ADR-0004 slice 2)
+// ---------------------------------------------------------------------------
+
+fn login_request_with_origin(api_key: &str, origin: &str, host: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json")
+        .header("origin", origin)
+        .header("host", host)
+        .body(Body::from(format!(r#"{{"api_key":"{api_key}"}}"#)))
+        .unwrap()
+}
+
+fn logout_request_with_origin(origin: &str, host: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/auth/logout")
+        .header("origin", origin)
+        .header("host", host)
+        .body(Body::empty())
+        .unwrap()
+}
+
+pg_test!(
+    login_rejects_cross_origin_no_cookie,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let (state, _) = session_state(store, "trawl");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(login_request_with_origin(
+                &created.plaintext_token,
+                "https://evil.example.com",
+                "trawl.example.com",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "cross-origin login must not set a cookie"
+        );
+    }
+);
+
+pg_test!(
+    logout_rejects_cross_origin_no_clear,
+    |store: KeyStore| async move {
+        let (state, _) = session_state(store, "trawl");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(logout_request_with_origin(
+                "https://evil.example.com",
+                "trawl.example.com",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "cross-origin logout must NOT clear the shared cookie"
+        );
+    }
+);
+
+pg_test!(
+    login_allows_same_host_origin,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let (state, _) = session_state(store, "trawl");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(login_request_with_origin(
+                &created.plaintext_token,
+                "http://trawl.example.com",
+                "trawl.example.com",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(response.headers().contains_key(header::SET_COOKIE));
+    }
+);
+
+pg_test!(
+    login_rejects_sibling_under_shared_domain,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let session_key = Arc::new(SessionKey::generate());
+        let cfg = SessionConfig::builder()
+            .cookie_name("fleet_session")
+            .app_namespace("trawl")
+            .secure(false)
+            .domain("fleet.localhost")
+            .build()
+            .unwrap();
+        let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
+        let app = router_with_state(state);
+
+        // Origin is a sibling app under the shared cookie domain. A
+        // parent-domain cookie is NOT an origin allowlist: origin
+        // validation stays strictly same-host, so a compromised sibling
+        // can't forge auth requests against trawl's endpoints (ADR-0004
+        // slice 2, commit a527ccbf).
+        let response = app
+            .oneshot(login_request_with_origin(
+                &created.plaintext_token,
+                "http://coastwatch.fleet.localhost",
+                "trawl.fleet.localhost",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "sibling-origin login under shared domain must not set a cookie"
+        );
+    }
+);
+
+pg_test!(logout_allows_absent_origin, |store: KeyStore| async move {
+    // Non-browser clients send no Origin — logout keeps working.
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
+
+    let response = app.oneshot(logout_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(response.headers().contains_key(header::SET_COOKIE));
+});
+
+// -- HTTP/2 :authority fallback (no Host header) ----------------------------
+//
+// Under HTTP/2 browsers send the `:authority` pseudo-header instead of a
+// `Host` header, which hyper parks in the request URI (absolute-form URI).
+// These cases exercise the fallback end-to-end through the real handlers:
+// `request_host`'s unit tests prove the lookup, but only a full login/logout
+// request proves the wiring — a `reject_cross_origin` refactor that drops the
+// `uri.authority()` fallback would 403 a legitimate same-origin h2 login while
+// every `request_host` unit test still passes. Mirrors trawl-web's
+// `logout_{allows_same,rejects_cross}_origin_h2_*` coverage.
+
+/// Absolute-form URI (authority present) with an `Origin` header but no `Host`
+/// header — the shape hyper produces for an HTTP/2 request.
+fn h2_login_request(api_key: &str, origin: &str) -> Request<Body> {
+    let req = Request::builder()
+        .method("POST")
+        .uri("https://trawl.example.com/api/auth/login")
+        .header("content-type", "application/json")
+        .header("origin", origin)
+        .body(Body::from(format!(r#"{{"api_key":"{api_key}"}}"#)))
+        .unwrap();
+    assert!(req.headers().get(header::HOST).is_none());
+    req
+}
+
+fn h2_logout_request(origin: &str) -> Request<Body> {
+    let req = Request::builder()
+        .method("POST")
+        .uri("https://trawl.example.com/api/auth/logout")
+        .header("origin", origin)
+        .body(Body::empty())
+        .unwrap();
+    assert!(req.headers().get(header::HOST).is_none());
+    req
+}
+
+pg_test!(
+    login_allows_same_origin_h2_without_host_header,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let (state, _) = session_state(store, "trawl");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(h2_login_request(
+                &created.plaintext_token,
+                "https://trawl.example.com",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(
+            response.headers().contains_key(header::SET_COOKIE),
+            "same-origin h2 login (Host from :authority) must set a cookie"
+        );
+    }
+);
+
+pg_test!(
+    login_rejects_cross_origin_h2_via_authority_fallback,
+    |store: KeyStore| async move {
+        let created = store
+            .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+            .await
+            .unwrap();
+
+        let (state, _) = session_state(store, "trawl");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(h2_login_request(
+                &created.plaintext_token,
+                "https://evil.example.com",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "cross-origin h2 login must not set a cookie"
+        );
+    }
+);
+
+pg_test!(
+    logout_allows_same_origin_h2_without_host_header,
+    |store: KeyStore| async move {
+        let (state, _) = session_state(store, "trawl");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(h2_logout_request("https://trawl.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response.headers().contains_key(header::SET_COOKIE),
+            "same-origin h2 logout (Host from :authority) must clear the cookie"
+        );
+    }
+);
+
+pg_test!(
+    logout_rejects_cross_origin_h2_via_authority_fallback,
+    |store: KeyStore| async move {
+        let (state, _) = session_state(store, "trawl");
+        let app = router_with_state(state);
+
+        let response = app
+            .oneshot(h2_logout_request("https://evil.example.com"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "cross-origin h2 logout must NOT clear the shared cookie"
+        );
+    }
+);
+
+// ---------------------------------------------------------------------------
 // logout
 // ---------------------------------------------------------------------------
 

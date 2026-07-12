@@ -4,11 +4,10 @@
 
 //! Unified proxy error type with HTTP status mapping.
 
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use fleet_auth::SessionError;
 use serde_json::json;
-
-use crate::session::{SESSION_COOKIE, SessionError, build_clear_cookie_header};
 
 /// Errors produced anywhere in the proxy, mapped to HTTP responses via
 /// [`IntoResponse`]. Error bodies are intentionally minimal — the browser
@@ -24,15 +23,27 @@ pub enum ProxyError {
     #[error("unauthorized")]
     Unauthorized,
 
-    /// Session cookie decrypted correctly but `exp` is in the past.
-    /// This path DOES clear the cookie so the browser stops sending a
-    /// token it can't redeem. `secure_cookie` mirrors the original
-    /// cookie's `Secure` attribute (which depends on whether dev's
-    /// `allow_insecure_cookies` is set) so the clear directive matches.
+    /// The session is dead: the cookie's `exp` is in the past, or upstream
+    /// trawld rejected the session's key with 401 (revoked/expired
+    /// fleet-wide). This path DOES clear the cookie so the browser stops
+    /// sending a token it can't redeem. Carries the pre-built, validated
+    /// clear header from `AppState::build_clear_cookie()` so the attributes
+    /// are guaranteed to match issuance (browsers reject mismatched clears)
+    /// and the `Set-Cookie` can never silently vanish on a parse failure.
     #[error("session expired")]
-    ExpiredSession { secure_cookie: bool },
+    ExpiredSession { clear_cookie: HeaderValue },
+
+    /// A browser sent a cross-origin request to a state-changing auth
+    /// endpoint (login/logout). With the shared `fleet_session` cookie a
+    /// forged logout would sign the user out of every fleet app, so the
+    /// Origin header is validated by default (ADR-0004 slice 2).
+    #[error("cross-origin request rejected")]
+    OriginMismatch,
 
     /// Upstream trawld returned a non-2xx status when the proxy called it.
+    /// NOTE: 403 deliberately maps to 403 with NO cookie mutation — the
+    /// key is valid but lacks a trawl grant; clearing the shared cookie
+    /// would log the user out of sibling apps where they DO have access.
     #[error("upstream returned {0}")]
     Upstream(StatusCode),
 
@@ -63,6 +74,7 @@ impl IntoResponse for ProxyError {
         let (status, message) = match &self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::ExpiredSession { .. } => (StatusCode::UNAUTHORIZED, "session expired"),
+            Self::OriginMismatch => (StatusCode::FORBIDDEN, "cross-origin request rejected"),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad request"),
             Self::Upstream(s) if s.as_u16() == 401 => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Upstream(s) if s.as_u16() == 403 => (StatusCode::FORBIDDEN, "forbidden"),
@@ -81,6 +93,9 @@ impl IntoResponse for ProxyError {
             Self::Unauthorized | Self::ExpiredSession { .. } | Self::BadRequest(_) => {
                 tracing::debug!(error = %self, "proxy error (expected)");
             }
+            Self::OriginMismatch => {
+                tracing::warn!(error = %self, "proxy origin mismatch");
+            }
             Self::Upstream(_) | Self::Network(_) => {
                 tracing::warn!(error = %self, "proxy upstream error");
             }
@@ -97,13 +112,10 @@ impl IntoResponse for ProxyError {
         // request. Other 401 paths (missing/tampered) skip this: there
         // may be no cookie to clear, and we don't want to confirm to a
         // probing attacker that their tampered cookie was recognized.
-        if let Self::ExpiredSession { secure_cookie } = &self {
+        if let Self::ExpiredSession { clear_cookie } = &self {
             let body = axum::Json(json!({ "error": message }));
-            let header_val = build_clear_cookie_header(SESSION_COOKIE, *secure_cookie);
             let mut headers = HeaderMap::new();
-            if let Ok(v) = header_val.parse() {
-                headers.insert(header::SET_COOKIE, v);
-            }
+            headers.insert(header::SET_COOKIE, clear_cookie.clone());
             return (status, headers, body).into_response();
         }
 

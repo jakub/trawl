@@ -631,6 +631,151 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
     Ok(payload)
 }
 
+/// Present-only Origin validation for login/logout endpoints (ADR-0004
+/// slice 2).
+///
+/// The shared `fleet_session` cookie makes logout forgeable cross-site: a
+/// forged POST to any fleet app's logout endpoint would clear the cookie
+/// for every sibling app. This helper closes that hole while keeping
+/// curl/scripted clients working:
+///
+/// - `origin` **absent** → allow. Browsers always send `Origin` on
+///   cross-site POSTs, so the attack is blocked; non-browser clients
+///   (which send no `Origin`) keep working.
+/// - `origin` host equals the request `host` (ports stripped,
+///   case-insensitive) → allow.
+/// - Malformed `origin` (including the opaque `"null"` origin) → reject,
+///   fail closed.
+/// - Anything else → reject.
+///
+/// Sharing a parent-domain cookie is **not** an origin allowlist: a
+/// sibling fleet app (`evil.fleet.example` posting to
+/// `trawl.fleet.example/logout`) is a *different* origin and must be
+/// rejected even though both sit under the cookie's `shared_domain`.
+/// Otherwise any compromised sibling — or attacker-hosted content on one —
+/// could auto-submit a form POST that clears `fleet_session` fleet-wide.
+/// So origin validation is strictly same-host; the shared domain governs
+/// only the cookie's `Domain=` attribute, never who may hit auth endpoints.
+///
+/// Pure string parsing — no request types — so both fleet-auth's own
+/// handlers and thin proxies that only take the `session` feature call
+/// the literally-same function instead of growing diverged copies.
+///
+/// Note: the exact-host arm trusts the request `Host` header. A reverse
+/// proxy in front MUST forward the original `Host` or legitimate
+/// same-origin requests will be rejected.
+#[must_use]
+pub fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let Some(origin_host) = origin_host(origin) else {
+        return false;
+    };
+
+    match host {
+        Some(request_host) => origin_host.eq_ignore_ascii_case(strip_port(request_host)),
+        None => false,
+    }
+}
+
+/// Returned by [`check_origin`] when a request's `Origin` is rejected. The
+/// rejection has already been logged with its `origin`/`host`/`handler`
+/// fields; each caller maps this marker onto its own error/response type
+/// (403, no `Set-Cookie`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginRejected;
+
+/// Present-only Origin guard for state-changing auth endpoints, wrapping
+/// [`origin_allowed`] with the canonical rejection log.
+///
+/// Callers pass the raw `Origin`/`Host` header values (already `Option<&str>`)
+/// rather than a request type, so this stays usable from both fleet-auth's
+/// own axum handlers and thin proxies that take only the `session` feature.
+/// On rejection it emits the shared `tracing::warn!` — the log fields and
+/// message live in **one** place so they can't drift between call sites — and
+/// returns [`OriginRejected`]. `handler` labels the endpoint (`"login"` /
+/// `"logout"`) in the log line.
+///
+/// # Errors
+///
+/// Returns [`OriginRejected`] when [`origin_allowed`] rejects the pair.
+pub fn check_origin(
+    origin: Option<&str>,
+    host: Option<&str>,
+    handler: &str,
+) -> Result<(), OriginRejected> {
+    if origin_allowed(origin, host) {
+        return Ok(());
+    }
+    tracing::warn!(
+        origin = origin.unwrap_or("<unparseable>"),
+        host = host.unwrap_or("<none>"),
+        handler,
+        "auth: cross-origin request rejected"
+    );
+    Err(OriginRejected)
+}
+
+/// Derive the request authority (host[:port]) for the Origin check, preferring
+/// the `Host` header and falling back to the URI's `:authority` pseudo-header.
+///
+/// HTTP/1.1 carries the target host in the `Host` header (the URI is
+/// origin-form, so `uri.authority()` is `None`); HTTP/2 carries it in the
+/// `:authority` pseudo-header, which hyper parks in the request URI while
+/// leaving `Host` absent. Consulting both keeps the same-host Origin guard
+/// working on either protocol.
+///
+/// This is the one host-derivation used by *both* fleet-auth's own axum
+/// handlers and thin session-only proxies (trawl-web), so the two `check_origin`
+/// call sites can't silently diverge on this CSRF-relevant surface. Feed the
+/// result straight into [`check_origin`].
+#[must_use]
+pub fn request_host<'a>(headers: &'a http::HeaderMap, uri: &'a http::Uri) -> Option<&'a str> {
+    headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.authority().map(http::uri::Authority::as_str))
+}
+
+/// Extract the host component from an `Origin` header value
+/// (`scheme "://" host [":" port]`). Returns `None` for anything that
+/// doesn't parse as a serialized origin — including the opaque `"null"`
+/// origin — so callers fail closed.
+fn origin_host(origin: &str) -> Option<&str> {
+    let (scheme, rest) = origin.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    // A serialized origin has no path, query, fragment, or userinfo.
+    if rest.is_empty() || rest.contains(['/', '\\', '?', '#', '@']) {
+        return None;
+    }
+    let host = strip_port(rest);
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// Strip a trailing `:port` from a host, handling bracketed IPv6
+/// literals (`[::1]:8080` → `::1`). Values without a valid numeric port
+/// pass through unchanged.
+fn strip_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        // IPv6 literal: everything up to the closing bracket.
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        return host; // malformed — compare as-is, will simply not match
+    }
+    match host.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => host,
+    }
+}
+
 /// Check whether `now` is past a payload's `exp`.
 ///
 /// Uses `<` (strictly earlier) so the cookie is valid up to and *including*
@@ -1048,6 +1193,153 @@ mod tests {
             matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("SameSite=None")),
             "got: {err:?}"
         );
+    }
+
+    // -- origin_allowed truth table -------------------------------------
+
+    #[test]
+    fn origin_absent_is_allowed() {
+        // curl / scripted logins / same-origin GET navigations don't send
+        // Origin — the check is present-only by design.
+        assert!(origin_allowed(None, Some("trawl.example.com")));
+        assert!(origin_allowed(None, None));
+    }
+
+    #[test]
+    fn origin_matching_request_host_is_allowed() {
+        assert!(origin_allowed(
+            Some("https://trawl.example.com"),
+            Some("trawl.example.com")
+        ));
+        // ports are stripped on both sides
+        assert!(origin_allowed(
+            Some("https://trawl.example.com:8443"),
+            Some("trawl.example.com:8443")
+        ));
+        assert!(origin_allowed(
+            Some("http://localhost:8090"),
+            Some("localhost:8090")
+        ));
+        // case-insensitive host comparison
+        assert!(origin_allowed(
+            Some("https://Trawl.Example.COM"),
+            Some("trawl.example.com")
+        ));
+        // bracketed IPv6 literal: the port is stripped inside the brackets on
+        // both sides, so `[::1]:8090` matches. Pins strip_port's IPv6 branch —
+        // a naive rsplit_once(':') rewrite would flip this to false and 403
+        // IPv6 localhost/homelab logins with no other failing test.
+        assert!(origin_allowed(
+            Some("http://[::1]:8090"),
+            Some("[::1]:8090")
+        ));
+    }
+
+    #[test]
+    fn sibling_under_shared_domain_is_rejected() {
+        // A parent-domain cookie is NOT an origin allowlist: a sibling
+        // fleet app posting to trawl's auth endpoints is a *different*
+        // origin and must be rejected, even though both live under the
+        // same `shared_domain`. Otherwise a compromised (or
+        // attacker-hosted) sibling could forge a logout that clears
+        // `fleet_session` fleet-wide. This is the ADR-0004-slice-2
+        // regression: origin validation stays strictly same-host.
+        assert!(!origin_allowed(
+            Some("https://evil.fleet.lab.ktle.net"),
+            Some("trawl.fleet.lab.ktle.net")
+        ));
+        // even the bare parent domain is a different host
+        assert!(!origin_allowed(
+            Some("https://fleet.lab.ktle.net"),
+            Some("trawl.fleet.lab.ktle.net")
+        ));
+    }
+
+    #[test]
+    fn origin_mismatch_is_rejected() {
+        // strict same-host mode: any other host is rejected
+        assert!(!origin_allowed(
+            Some("https://evil.example.com"),
+            Some("trawl.example.com")
+        ));
+        // no Host to match against → fail closed
+        assert!(!origin_allowed(Some("https://trawl.example.com"), None));
+        // suffix forgery: eviltrawl.example.com is NOT trawl.example.com
+        assert!(!origin_allowed(
+            Some("https://eviltrawl.example.com"),
+            Some("trawl.example.com")
+        ));
+        // distinct bracketed IPv6 literals must not match once ports are
+        // stripped inside the brackets (::2 != ::1)
+        assert!(!origin_allowed(
+            Some("http://[::2]:8090"),
+            Some("[::1]:8090")
+        ));
+        // port-only mismatch on the exact-host arm still passes because
+        // ports are stripped (Origin comparison is host-scoped here)
+        assert!(origin_allowed(
+            Some("https://trawl.example.com:9999"),
+            Some("trawl.example.com:8443")
+        ));
+    }
+
+    #[test]
+    fn origin_malformed_is_rejected() {
+        // opaque "null" origin (sandboxed iframe, data: URL) — fail closed
+        assert!(!origin_allowed(Some("null"), Some("trawl.example.com")));
+        // no scheme
+        assert!(!origin_allowed(
+            Some("trawl.example.com"),
+            Some("trawl.example.com")
+        ));
+        // garbage
+        assert!(!origin_allowed(Some("https://"), Some("trawl.example.com")));
+        assert!(!origin_allowed(Some(""), Some("trawl.example.com")));
+        // path smuggling: Origin never carries a path
+        assert!(!origin_allowed(
+            Some("https://evil.com/trawl.example.com"),
+            Some("trawl.example.com")
+        ));
+        // userinfo smuggling
+        assert!(!origin_allowed(
+            Some("https://trawl.example.com@evil.com"),
+            Some("trawl.example.com")
+        ));
+    }
+
+    // -- request_host Host-header / :authority fallback -----------------
+
+    #[test]
+    fn request_host_prefers_host_header() {
+        // HTTP/1.1: Host header present, URI is origin-form (no authority).
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, "trawl.example.com".parse().unwrap());
+        let uri: http::Uri = "/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_falls_back_to_uri_authority() {
+        // HTTP/2: no Host header; hyper parks `:authority` in the request URI.
+        let headers = http::HeaderMap::new();
+        let uri: http::Uri = "https://trawl.example.com/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_prefers_host_over_authority() {
+        // If both are present the Host header wins (matches HTTP/1.1 posture).
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, "trawl.example.com".parse().unwrap());
+        let uri: http::Uri = "https://other.example.com/x".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_none_when_neither_present() {
+        let headers = http::HeaderMap::new();
+        let uri: http::Uri = "/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), None);
     }
 
     #[test]

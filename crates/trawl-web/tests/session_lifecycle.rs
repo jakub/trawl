@@ -17,11 +17,11 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use fleet_auth::{SessionExpiry, SessionPayload, encrypt};
 use tower::ServiceExt;
 use trawl_config::WebConfig;
 use trawl_web::config::ResolvedConfig;
 use trawl_web::routes;
-use trawl_web::session::{SessionPayload, encrypt};
 use trawl_web::state::AppState;
 use zeroize::Zeroizing;
 
@@ -38,11 +38,10 @@ fn expired_cookie(state: &AppState) -> String {
     let payload = SessionPayload {
         token: Zeroizing::new("flt_irrelevant".into()),
         name: "alice".into(),
-        role: "admin".into(),
-        exp: past_exp,
+        exp: SessionExpiry::from_unix_seconds(past_exp),
     };
     let value = encrypt(state.cookie_key(), &payload).unwrap();
-    format!("trawl_session={value}")
+    format!("fleet_session={value}")
 }
 
 #[tokio::test]
@@ -68,10 +67,10 @@ async fn expired_session_returns_401_with_clear_cookie() {
         .to_str()
         .unwrap();
 
-    assert!(set_cookie.starts_with("trawl_session=;"));
+    assert!(set_cookie.starts_with("fleet_session=;"));
     assert!(set_cookie.contains("Max-Age=0"));
     assert!(set_cookie.contains("HttpOnly"));
-    assert!(set_cookie.contains("SameSite=Strict"));
+    assert!(set_cookie.contains("SameSite=Lax"));
     // dev: allow_insecure_cookies=true → no Secure
     assert!(!set_cookie.contains("Secure"));
 }
@@ -134,8 +133,7 @@ async fn tampered_cookie_does_not_send_set_cookie() {
     let payload = SessionPayload {
         token: Zeroizing::new("flt_x".into()),
         name: "x".into(),
-        role: "x".into(),
-        exp: chrono::Utc::now().timestamp() + 3600,
+        exp: SessionExpiry::from_unix_seconds(chrono::Utc::now().timestamp() + 3600),
     };
     let mut value = encrypt(state.cookie_key(), &payload).unwrap();
     // Flip a byte near the middle — lands inside ciphertext → AEAD reject.
@@ -145,7 +143,7 @@ async fn tampered_cookie_does_not_send_set_cookie() {
     let orig = value.as_bytes()[mid];
     let replacement = if orig == b'A' { 'B' } else { 'A' };
     value.replace_range(mid..=mid, &replacement.to_string());
-    let cookie = format!("trawl_session={value}");
+    let cookie = format!("fleet_session={value}");
 
     let req = Request::builder()
         .method("GET")

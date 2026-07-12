@@ -23,6 +23,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Auth;
+use crate::routes::proxy::clear_cookie_for_proxied_response;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -87,14 +88,24 @@ pub async fn forward(
         upstream_ct.unwrap_or_else(|| "application/json".to_string())
     };
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
         // Disable proxy buffering (e.g. nginx) upstream of us. Trawld sets
         // this too but we re-set it to be resilient to misconfigured
         // intermediate proxies when trawl-web is fronted by another one.
-        .header("X-Accel-Buffering", "no")
+        .header("X-Accel-Buffering", "no");
+
+    // The SSE path shares the proxy-wide 401/403 cookie rule; see
+    // `clear_cookie_for_proxied_response`. (Today it never clears — an
+    // EventSource reconnect keeps 401ing until the SPA's next `/me` poll
+    // drops the dead cookie, the permission-aware place to make that call.)
+    if let Some(clear) = clear_cookie_for_proxied_response(status, &auth) {
+        builder = builder.header(header::SET_COOKIE, clear);
+    }
+
+    builder
         .body(Body::from_stream(capped_stream))
         .map_err(|e| ProxyError::Internal(format!("SSE response build: {e}")))
 }
@@ -251,6 +262,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_upstream_401_with_session_preserves_cookie() {
+        // trawld's 401 on the SSE path is just as ambiguous as on any other
+        // proxied route — it covers both a dead key and a live key lacking
+        // the `stream` permission. Clearing on it would sign valid users out
+        // of the whole fleet on a routine authz denial, so the stream path
+        // must NOT touch the shared cookie. `auth::me` (permission-free
+        // /whoami) remains the sole authority for the cookie lifecycle.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=*")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a proxied SSE 401 must NOT clear the shared fleet_session cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_403_preserves_cookie() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/stream"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?query=*")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "stream upstream 403 must NOT clear the shared cookie"
+        );
+    }
+
+    #[tokio::test]
     async fn stream_preserves_upstream_400_for_bad_query() {
         // Invalid DSL is a user error, not a proxy error — we must
         // preserve trawld's 400 so the client can render the real message.
@@ -369,7 +442,7 @@ mod tests {
         // End-to-end smoke: session with exp ~1s in the future, upstream
         // returns a body that would otherwise stream indefinitely. The
         // response body must EOF before ~2s elapse.
-        use crate::session::{SessionPayload, encrypt};
+        use fleet_auth::{SessionExpiry, SessionPayload, encrypt};
         use zeroize::Zeroizing;
 
         let upstream = MockServer::start().await;
@@ -394,11 +467,10 @@ mod tests {
         let payload = SessionPayload {
             token: Zeroizing::new("flt_test".to_string()),
             name: "test".into(),
-            role: "admin".into(),
-            exp: now + 1,
+            exp: SessionExpiry::from_unix_seconds(now + 1),
         };
         let cookie_value = encrypt(state.cookie_key(), &payload).unwrap();
-        let cookie = format!("trawl_session={cookie_value}");
+        let cookie = format!("fleet_session={cookie_value}");
 
         let req = Request::builder()
             .method("GET")

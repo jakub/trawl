@@ -13,14 +13,14 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { workspace = true }
-base64ct = { workspace = true, features = ["alloc"] }
-chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
-cookie = { workspace = true }
+# Session cookie AEAD + cookie builders + origin validation come from the
+# shared substrate. `session` only — no pg pool, no keystore, no axum
+# handlers (the thin proxy validates keys via upstream /whoami instead).
+fleet-auth = { workspace = true, features = ["session"] }
 futures = { workspace = true }
 mime_guess = { workspace = true }
-rand = { workspace = true }
 rust-embed = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
