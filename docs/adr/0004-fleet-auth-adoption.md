@@ -67,6 +67,54 @@ disclosure, found in the codex design review. The legacy `auth.db` is
 quarantined on disk at cutover and never read again; slice 3 deletes the
 transitional file along with the crate.
 
+## Slice 2 design decisions (2026-07-11 prep grill)
+
+- **`[web] shared_domain`** is the SSO knob: optional string driving the cookie
+  `Domain=` attribute, named to mirror coastwatch's `session.shared_domain` so
+  operator docs can say "set the same value in both apps". Unset/empty →
+  origin-scoped cookie (standalone mode). `SameSite=Lax` is hardcoded, not
+  configurable — it is a correctness requirement for parent-domain SSO
+  (ADR-0030), and the flip from trawl-web's current `Strict` is the explicit
+  security-posture change ADR-0030 already mandates for this step.
+- **Homelab SSO domain**: `{trawl,coastwatch}.fleet.lab.ktle.net` with
+  `shared_domain = ".fleet.lab.ktle.net"`. coastwatch's committed prod value
+  (`.fleet.home.lan`) predates this decision and must be updated in the
+  coastwatch repo — a mismatched `Domain=` silently breaks SSO. `trawl-01.lab.ktle.net`
+  remains the direct trawld API endpoint for CLI/vector bearer clients
+  (cookie-free, unaffected).
+- **Shared-key packaging is SSO-opt-in.** Both channels keep self-generating an
+  app-local session key by default so standalone installs work with no
+  1Password dependency. SSO = the operator provisions the shared key from
+  `op://Homelab/Fleet session key/credential` (minted by
+  `fleet-admin generate-session-key`): debian by overwriting
+  `/var/lib/trawl/web.cookie`, helm via `web.cookieSecret.existingSecret`
+  pointed at an `op inject`-provisioned Secret. The cutover runbook documents
+  the procedure. Per coastwatch ADR-0038 the key stays an `op://` runtime
+  reference — never committed ciphertext — because it is cross-repo shared.
+- **Origin validation lands in the fleet-auth substrate, default-on.** The
+  shared `fleet_session` cookie makes logout forgeable cross-site (fleet-auth's
+  documented caveat: a forged POST to either app's `/api/auth/logout` clears
+  the cookie for both). `fleet_auth::session` gains an origin-validation helper
+  with present-only semantics — Origin header present and mismatched against
+  request Host / `shared_domain` suffix → 403; absent → allow (browsers always
+  send Origin cross-site, so the attack is blocked while curl/scripted logins
+  keep working). `fleet_auth::login`/`logout` enforce it by default (safe:
+  absent-Origin passes), so coastwatch inherits the fix on rebuild; trawl-web's
+  hand-rolled handlers call the same helper.
+- **Upstream auth mapping in the proxy**: trawld 401 (key revoked/expired
+  fleet-wide) → clear the session cookie, session is dead everywhere; trawld
+  403 (valid key, no trawl grant) → 403 with the cookie PRESERVED, mirroring
+  coastwatch's no-grant semantics — clearing would log the user out of the
+  sibling app where they do have access.
+- **Login/me flow**: login keeps trawl-web's 200+JSON `{name, role}` response
+  with SPA-driven redirect (fleet-auth's 302 handler needs a KeyStore and is
+  unusable in the thin proxy). `/api/auth/me` stops reading `role` from the
+  now-role-less payload and calls trawld `/api/v1/whoami` per request, exactly
+  as login already does. `session_ttl_secs` (default 86 400) and both key
+  knobs (`cookie_secret_path` raw bytes / `cookie_secret_env` base64) survive
+  unchanged. Legacy `trawl_session` cookies are not cleaned up (dead name,
+  expire at TTL); the app-switcher UI stays deferred per ADR-0030.
+
 ## Consequences
 
 - Deploying trawld now requires a reachable postgres (CNPG in the homelab;
