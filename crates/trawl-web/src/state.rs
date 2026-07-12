@@ -17,6 +17,8 @@
 
 use std::sync::Arc;
 
+use axum::http::HeaderValue;
+use axum::http::header::InvalidHeaderValue;
 use fleet_auth::{
     DEFAULT_COOKIE_NAME, SameSite, SessionKey, build_clear_cookie_header,
     build_session_cookie_header,
@@ -110,14 +112,23 @@ impl AppState {
     /// Attributes are guaranteed to match [`Self::build_session_cookie`]
     /// (same name, `SameSite`, `Path`, `Secure`, `Domain`) — a mismatched
     /// clear is silently ignored by browsers.
-    #[must_use]
-    pub fn build_clear_cookie(&self) -> String {
+    ///
+    /// Returns a validated [`HeaderValue`] so callers carry a typed clear
+    /// directive rather than a stringly-typed one that could fail to parse
+    /// (and be silently dropped) at response-assembly time.
+    ///
+    /// # Errors
+    /// Returns [`InvalidHeaderValue`] if the serialized cookie isn't a valid
+    /// header value — impossible for the fully-controlled attribute set, but
+    /// surfaced explicitly rather than degrading to a missing `Set-Cookie`.
+    pub fn build_clear_cookie(&self) -> Result<HeaderValue, InvalidHeaderValue> {
         build_clear_cookie_header(
             self.cookie_name(),
             !self.inner.allow_insecure_cookies,
             SameSite::Lax,
             self.shared_domain(),
         )
+        .parse()
     }
 
     #[must_use]

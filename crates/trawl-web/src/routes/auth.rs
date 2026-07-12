@@ -203,17 +203,19 @@ pub async fn me(
     State(state): State<AppState>,
     session: Session,
 ) -> Result<Json<MeResponse>, ProxyError> {
-    let whoami = fetch_whoami(&state, session.token())
-        .await
-        .map_err(|e| match e {
-            // At login time Unauthorized just means "bad key, no cookie
-            // yet". Here the browser IS holding a cookie for that key, so
-            // upstream 401 means the session is dead fleet-wide — clear it.
-            ProxyError::Unauthorized => ProxyError::ExpiredSession {
-                clear_cookie: state.build_clear_cookie(),
-            },
-            other => other,
-        })?;
+    let whoami = match fetch_whoami(&state, session.token()).await {
+        Ok(whoami) => whoami,
+        // At login time Unauthorized just means "bad key, no cookie yet".
+        // Here the browser IS holding a cookie for that key, so upstream
+        // 401 means the session is dead fleet-wide — clear it.
+        Err(ProxyError::Unauthorized) => {
+            let clear_cookie = state
+                .build_clear_cookie()
+                .map_err(|e| ProxyError::Internal(e.to_string()))?;
+            return Err(ProxyError::ExpiredSession { clear_cookie });
+        }
+        Err(other) => return Err(other),
+    };
 
     let role = whoami
         .trawl_role()
@@ -233,14 +235,11 @@ pub async fn logout(
 ) -> Result<Response, ProxyError> {
     check_origin(&headers, &uri, "logout")?;
 
-    let header_value = state.build_clear_cookie();
+    let header_value = state
+        .build_clear_cookie()
+        .map_err(|e| ProxyError::Internal(e.to_string()))?;
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::SET_COOKIE,
-        header_value
-            .parse()
-            .map_err(|e: header::InvalidHeaderValue| ProxyError::Internal(e.to_string()))?,
-    );
+    headers.insert(header::SET_COOKIE, header_value);
     Ok((StatusCode::NO_CONTENT, headers).into_response())
 }
 

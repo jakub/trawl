@@ -66,9 +66,10 @@ impl FromRequestParts<AppState> for Session {
             // IS presenting a cookie, it just can't be redeemed. Tell
             // it to drop the cookie so subsequent requests don't keep
             // sending a token we'll always reject.
-            return Err(ProxyError::ExpiredSession {
-                clear_cookie: state.build_clear_cookie(),
-            });
+            let clear_cookie = state
+                .build_clear_cookie()
+                .map_err(|e| ProxyError::Internal(e.to_string()))?;
+            return Err(ProxyError::ExpiredSession { clear_cookie });
         }
 
         Ok(Session(payload))

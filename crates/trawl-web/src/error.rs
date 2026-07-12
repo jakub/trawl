@@ -4,7 +4,7 @@
 
 //! Unified proxy error type with HTTP status mapping.
 
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use fleet_auth::SessionError;
 use serde_json::json;
@@ -26,11 +26,12 @@ pub enum ProxyError {
     /// The session is dead: the cookie's `exp` is in the past, or upstream
     /// trawld rejected the session's key with 401 (revoked/expired
     /// fleet-wide). This path DOES clear the cookie so the browser stops
-    /// sending a token it can't redeem. Carries the pre-built clear header
-    /// from `AppState::build_clear_cookie()` so the attributes are
-    /// guaranteed to match issuance — browsers reject mismatched clears.
+    /// sending a token it can't redeem. Carries the pre-built, validated
+    /// clear header from `AppState::build_clear_cookie()` so the attributes
+    /// are guaranteed to match issuance (browsers reject mismatched clears)
+    /// and the `Set-Cookie` can never silently vanish on a parse failure.
     #[error("session expired")]
-    ExpiredSession { clear_cookie: String },
+    ExpiredSession { clear_cookie: HeaderValue },
 
     /// A browser sent a cross-origin request to a state-changing auth
     /// endpoint (login/logout). With the shared `fleet_session` cookie a
@@ -114,9 +115,7 @@ impl IntoResponse for ProxyError {
         if let Self::ExpiredSession { clear_cookie } = &self {
             let body = axum::Json(json!({ "error": message }));
             let mut headers = HeaderMap::new();
-            if let Ok(v) = clear_cookie.parse() {
-                headers.insert(header::SET_COOKIE, v);
-            }
+            headers.insert(header::SET_COOKIE, clear_cookie.clone());
             return (status, headers, body).into_response();
         }
 
