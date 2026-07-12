@@ -928,6 +928,93 @@ async fn trigger_run_rejects_reader(pool: sqlx::PgPool) {
     assert_401(reader.trigger_run(1).await);
 }
 
+#[sqlx::test(migrations = false)]
+async fn trigger_run_rejects_when_max_runs_reached(pool: sqlx::PgPool) {
+    use trawl_server::store::schedule::ScheduleStore;
+
+    let server = setup(pool).await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("trigger-cap", "* | head 3")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", Some(1), true)
+        .await
+        .unwrap();
+
+    // Seed a run directly so the schedule is already at its max_runs=1 cap;
+    // count(*) >= max_runs short-circuits the claim before the insert.
+    let store = ScheduleStore::new(sqlx::PgPool::connect(&server.app_db_url).await.unwrap());
+    store
+        .start_run(schedule.id, saved.id, "* | head 3")
+        .await
+        .unwrap()
+        .expect("seeded run id");
+
+    // Triggering again exceeds the cap -> 400 "max runs reached".
+    let err = client
+        .trigger_run(saved.id)
+        .await
+        .expect_err("expected max-runs error");
+    match err {
+        trawl_client::ClientError::Server { status, error } => {
+            assert_eq!(status, 400);
+            assert!(
+                error.message.contains("max runs reached"),
+                "unexpected message: {}",
+                error.message
+            );
+        }
+        other => panic!("expected 400, got: {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn trigger_run_rejects_when_already_running(pool: sqlx::PgPool) {
+    use trawl_server::store::schedule::ScheduleStore;
+
+    let server = setup(pool).await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("trigger-busy", "* | head 3")
+        .await
+        .unwrap();
+    // No max_runs cap, so the in-progress guard is what rejects the trigger.
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true)
+        .await
+        .unwrap();
+
+    // Seed an in-progress run directly, avoiding a race with the background
+    // task the happy-path trigger spawns.
+    let store = ScheduleStore::new(sqlx::PgPool::connect(&server.app_db_url).await.unwrap());
+    store
+        .start_run(schedule.id, saved.id, "* | head 3")
+        .await
+        .unwrap()
+        .expect("seeded running run id");
+
+    // Triggering while a run is in progress -> 400 "already in progress".
+    let err = client
+        .trigger_run(saved.id)
+        .await
+        .expect_err("expected already-running error");
+    match err {
+        trawl_client::ClientError::Server { status, error } => {
+            assert_eq!(status, 400);
+            assert!(
+                error.message.contains("already in progress"),
+                "unexpected message: {}",
+                error.message
+            );
+        }
+        other => panic!("expected 400, got: {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rename net (update with name)
 // ---------------------------------------------------------------------------
