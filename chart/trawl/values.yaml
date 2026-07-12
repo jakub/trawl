@@ -135,10 +135,6 @@ config:
     path: "/var/lib/trawl/data"
 
   auth:
-    # Transitional SQLite app-state store (history/saved/schedules). Must be
-    # a FRESH file at cutover — trawld refuses to start on the legacy
-    # auth.db, which stays quarantined on the PVC.
-    dbPath: "/var/lib/trawl/store.db"
     auditIntervalSecs: 30
 
   ingest:
@@ -206,17 +202,35 @@ tls:
 
 # -- Fleet-auth postgres keystore (ADR-0004)
 # API keys are verified against an EXTERNAL postgres database shared across
-# fleet apps. The connection string is injected as DATABASE_URL from an
-# existing Secret into both the init-auth container and trawld — it is
-# never rendered into the ConfigMap or config.raw. Provision keys with
-# fleet-admin (see the cutover runbook); expect vector ingest to buffer to
-# disk during the cutover window (size buffers accordingly, e.g. 1 GiB).
+# fleet apps. The connection string is injected from an existing Secret
+# into the init-auth container (as DATABASE_URL, what fleet-admin reads)
+# and into trawld (as FLEET_DATABASE_URL — the bare DATABASE_URL override
+# was removed from trawld in ADR-0004 slice 3). It is never rendered into
+# the ConfigMap or config.raw. Provision keys with fleet-admin (see the
+# cutover runbook); expect vector ingest to buffer to disk during the
+# cutover window (size buffers accordingly, e.g. 1 GiB).
 auth:
   database:
     # Name of an existing Secret holding the postgres URL. REQUIRED.
     existingSecret: ""
-    # Key within that Secret.
+    # Key within that Secret (the SECRET key name, not the env var name —
+    # existing Secrets keep working unchanged across the slice-3 upgrade).
     existingSecretKey: "DATABASE_URL"
+
+# -- Trawl app-state database (ADR-0004 slice 3)
+# Query history, saved queries, schedules, and report runs live in a
+# DEDICATED postgres database owned by trawld: boot-migrated automatically
+# and guarded by a session advisory lock (sole writer). The connection
+# string is injected as the TRAWL_DATABASE_URL env var from an existing
+# Secret — never rendered into the ConfigMap. There is NO fallback to the
+# auth URL; provision a separate database whose role owns the schema (see
+# the fleet-auth cutover runbook for the exact role/grants).
+storage:
+  database:
+    # Name of an existing Secret holding the postgres URL. REQUIRED.
+    existingSecret: ""
+    # Key within that Secret.
+    existingSecretKey: "TRAWL_DATABASE_URL"
 
 # -- Auth schema migration
 # An init container runs `fleet-admin migrate` against the fleet keystore

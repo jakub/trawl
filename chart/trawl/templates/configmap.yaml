@@ -47,9 +47,11 @@ data:
 
     [auth]
     # database_url deliberately absent: the fleet keystore DSN is injected
-    # as the DATABASE_URL env var from a Secret (never rendered here).
-    db_path = {{ .Values.config.auth.dbPath | quote }}
+    # as the FLEET_DATABASE_URL env var from a Secret (never rendered here).
     audit_interval_secs = {{ .Values.config.auth.auditIntervalSecs | int }}
+
+    # [storage] database_url deliberately absent too: the trawl app-state
+    # DSN is injected as the TRAWL_DATABASE_URL env var from a Secret.
 
     [ingest]
     enabled = {{ .Values.config.ingest.enabled }}

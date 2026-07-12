@@ -5,8 +5,10 @@ metadata:
   labels:
     {{- include "trawl.labels" . | nindent 4 }}
 spec:
-  # Single-node only — multiple replicas would corrupt the transitional
-  # SQLite app-state store (history/saved/schedules).
+  # Single-node by design: trawld owns its parquet data dir and in-memory
+  # hot buffer outright (no shared/clustered storage model), and it holds a
+  # session advisory lock on the trawl app-state database — a second
+  # replica would fail startup rather than split-brain.
   replicas: 1
   serviceName: {{ include "trawl.fullname" . }}
   selector:
@@ -72,11 +74,23 @@ spec:
             - name: HOME
               value: /var/lib/trawl
             # Fleet keystore DSN — from the Secret, never the ConfigMap.
-            - name: DATABASE_URL
+            # FLEET_DATABASE_URL since ADR-0004 slice 3: the bare
+            # DATABASE_URL override was removed from trawld (that variable
+            # is ceded to the sqlx test harness). fleet-admin (init
+            # container above) still reads DATABASE_URL.
+            - name: FLEET_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "auth.database.existingSecret is required (Secret holding the fleet keystore DATABASE_URL)" .Values.auth.database.existingSecret }}
+                  name: {{ required "auth.database.existingSecret is required (Secret holding the fleet keystore DSN)" .Values.auth.database.existingSecret }}
                   key: {{ .Values.auth.database.existingSecretKey }}
+            # Trawl app-state DSN (history/saved/schedules/runs) — a
+            # DEDICATED database, boot-migrated and advisory-locked by
+            # trawld. No fallback to the auth URL.
+            - name: TRAWL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "storage.database.existingSecret is required (Secret holding the trawl app-state DSN)" .Values.storage.database.existingSecret }}
+                  key: {{ .Values.storage.database.existingSecretKey }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- if .Values.crashDump.enabled }}
