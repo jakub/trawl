@@ -26,7 +26,8 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::uri::Authority;
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -70,10 +71,11 @@ pub struct LoginResponse {
 #[allow(clippy::implicit_hasher)]
 pub async fn login(
     State(state): State<SessionState>,
+    uri: Uri,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    if let Some(resp) = reject_cross_origin(&headers, "login") {
+    if let Some(resp) = reject_cross_origin(&headers, &uri, "login") {
         return resp;
     }
     let api_key = req.api_key;
@@ -181,8 +183,8 @@ pub async fn login(
 /// Sharing a parent-domain cookie is deliberately NOT an origin allowlist —
 /// a sibling app is a different origin and is rejected. Absent Origin is
 /// allowed, so curl/scripted clients are unaffected.
-pub async fn logout(State(state): State<SessionState>, headers: HeaderMap) -> Response {
-    if let Some(resp) = reject_cross_origin(&headers, "logout") {
+pub async fn logout(State(state): State<SessionState>, uri: Uri, headers: HeaderMap) -> Response {
+    if let Some(resp) = reject_cross_origin(&headers, &uri, "logout") {
         return resp;
     }
     let cfg = state.config();
@@ -212,9 +214,14 @@ pub async fn logout(State(state): State<SessionState>, headers: HeaderMap) -> Re
 /// log to the shared [`session::check_origin`] so the log fields/message
 /// live in one place; the cookie's shared domain is deliberately NOT an
 /// origin allowlist — see [`session::origin_allowed`].
-fn reject_cross_origin(headers: &HeaderMap, handler: &str) -> Option<Response> {
+///
+/// The request host is read from the `Host` header, falling back to the URI's
+/// `:authority` — under HTTP/2 browsers send `:authority` instead of a `Host`
+/// header, and a Host-only lookup would be `None`, so a present-Origin
+/// same-origin login/logout would be wrongly rejected (403, no `Set-Cookie`).
+fn reject_cross_origin(headers: &HeaderMap, uri: &Uri, handler: &str) -> Option<Response> {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    let host = request_host(headers, uri);
     session::check_origin(origin, host, handler).err().map(|_| {
         error_response(
             StatusCode::FORBIDDEN,
@@ -224,6 +231,60 @@ fn reject_cross_origin(headers: &HeaderMap, handler: &str) -> Option<Response> {
     })
 }
 
+/// Derive the request authority (host[:port]) for the Origin check, preferring
+/// the `Host` header and falling back to the URI's `:authority` pseudo-header.
+///
+/// HTTP/1.1 carries the target host in the `Host` header (the URI is
+/// origin-form, so `uri.authority()` is `None`); HTTP/2 carries it in the
+/// `:authority` pseudo-header, which hyper parks in the request URI while
+/// leaving `Host` absent. Consulting both keeps the same-host Origin guard
+/// working on either protocol.
+fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.authority().map(Authority::as_str))
+}
+
 fn internal_error(detail: &str) -> Response {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_host;
+    use axum::http::{HeaderMap, Uri, header};
+
+    #[test]
+    fn request_host_prefers_host_header() {
+        // HTTP/1.1: Host header present, URI is origin-form (no authority).
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "trawl.example.com".parse().unwrap());
+        let uri: Uri = "/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_falls_back_to_uri_authority() {
+        // HTTP/2: no Host header; hyper parks `:authority` in the request URI.
+        let headers = HeaderMap::new();
+        let uri: Uri = "https://trawl.example.com/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_prefers_host_over_authority() {
+        // If both are present the Host header wins (matches HTTP/1.1 posture).
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "trawl.example.com".parse().unwrap());
+        let uri: Uri = "https://other.example.com/x".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    }
+
+    #[test]
+    fn request_host_none_when_neither_present() {
+        let headers = HeaderMap::new();
+        let uri: Uri = "/api/auth/logout".parse().unwrap();
+        assert_eq!(request_host(&headers, &uri), None);
+    }
 }

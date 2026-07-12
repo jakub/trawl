@@ -23,7 +23,8 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::uri::Authority;
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use fleet_auth::{SessionExpiry, SessionPayload, session};
 use serde::{Deserialize, Serialize};
@@ -52,18 +53,27 @@ pub struct LoginResponse {
 /// present-only decision, log fields, and message that the fleet-auth
 /// substrate handlers use (ADR-0004 slice 2) — and maps its rejection onto
 /// this proxy's [`ProxyError::OriginMismatch`].
-fn check_origin(headers: &HeaderMap, handler: &str) -> Result<(), ProxyError> {
+///
+/// The request host is read from the `Host` header, falling back to the URI's
+/// `:authority` — under HTTP/2 browsers send `:authority` instead of a `Host`
+/// header, and a Host-only lookup would be `None`, so a present-Origin
+/// same-origin login/logout would be wrongly rejected (403, no `Set-Cookie`).
+fn check_origin(headers: &HeaderMap, uri: &Uri, handler: &str) -> Result<(), ProxyError> {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.authority().map(Authority::as_str));
     session::check_origin(origin, host, handler).map_err(|_| ProxyError::OriginMismatch)
 }
 
 pub async fn login(
     State(state): State<AppState>,
+    uri: Uri,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ProxyError> {
-    check_origin(&headers, "login")?;
+    check_origin(&headers, &uri, "login")?;
 
     if req.api_key.trim().is_empty() {
         return Err(ProxyError::BadRequest("api_key is required".into()));
@@ -210,9 +220,10 @@ pub async fn me(
 
 pub async fn logout(
     State(state): State<AppState>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, ProxyError> {
-    check_origin(&headers, "logout")?;
+    check_origin(&headers, &uri, "logout")?;
 
     let header_value = state.build_clear_cookie();
     let mut headers = HeaderMap::new();
@@ -679,6 +690,47 @@ mod tests {
             !response.headers().contains_key(header::SET_COOKIE),
             "forged sibling-origin logout must NOT clear the shared cookie"
         );
+    }
+
+    #[tokio::test]
+    async fn logout_allows_same_origin_h2_without_host_header() {
+        // HTTP/2 regression: browsers send the `:authority` pseudo-header
+        // instead of a `Host` header, which hyper parks in the request URI.
+        // A present same-origin `Origin` must still be accepted — reading only
+        // the (absent) Host header would 403 legitimate logout and NOT clear
+        // the cookie. Absolute-form URI = authority present, no Host header.
+        let app = routes::build(test_state("http://unused".into()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://trawl.example.com/api/auth/logout")
+            .header("origin", "https://trawl.example.com")
+            .body(Body::empty())
+            .unwrap();
+        assert!(req.headers().get(header::HOST).is_none());
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response.headers().contains_key(header::SET_COOKIE),
+            "same-origin h2 logout must clear the cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_rejects_cross_origin_h2_via_authority_fallback() {
+        // The `:authority` fallback must not weaken the guard: a cross-origin
+        // POST with no Host header is still rejected against the URI authority.
+        let app = routes::build(test_state("http://unused".into()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://trawl.example.com/api/auth/logout")
+            .header("origin", "https://evil.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
     }
 
     #[tokio::test]
