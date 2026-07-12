@@ -25,8 +25,8 @@ trawl is implemented as a Rust workspace with clean crate boundaries:
 |-------|---------|
 | `trawl-core` | DSL parser, AST, SQL emitter (pure, no I/O) |
 | `trawl-engine` | DuckDB integration, query execution |
-| `trawl-auth` | API keys, roles, schedules (SQLite-backed) |
 | `trawl-api` | Shared wire types (request/response structs) |
+| `fleet-auth` | Shared postgres keystore + session substrate (ADR-0030) |
 | `trawl-server` | Daemon (axum, HTTPS via tokio-rustls) |
 | `trawl-client` | Typed async HTTP client library |
 | `trawl-cli` | Unified CLI + TUI binary |
@@ -51,7 +51,7 @@ Outermost to innermost:
 
 ### Authentication
 
-API keys use `flt_` prefix + 43 base64url characters. Hashed with argon2id (128 MiB memory, 3 iterations, 4 lanes). Prefix-based SQLite lookup with a 5-minute DashMap cache. Timing-safe dummy hash for invalid tokens prevents oracle attacks.
+API keys use `flt_` prefix + 43 base64url characters. Hashed with argon2id (128 MiB memory, 3 iterations, 4 lanes). Prefix-based lookup against the shared fleet-auth postgres keystore, with a KDF verification cache; revocation is checked per request. Timing-safe dummy hash for invalid tokens prevents oracle attacks.
 
 Four roles: admin, analyst, reader, ingest.
 

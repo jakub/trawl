@@ -28,7 +28,12 @@ http_addr = "127.0.0.1:5514"
 path = "~/.trawl/data"
 
 [auth]
-db_path = "~/.trawl/auth.db"
+# fleet keystore (API keys) — see the configuration reference
+database_url = "postgres://fleet:fleet@localhost:5432/fleet"
+
+[storage]
+# trawl app state (history, saved queries, schedules) — boot-migrated
+database_url = "postgres://trawl:trawl@localhost:5432/trawl"
 ```
 
 See the [configuration reference](/reference/configuration/) for all available options.

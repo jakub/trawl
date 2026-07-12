@@ -48,14 +48,17 @@ the helm chart.
 
 ## Sequencing (one PR per slice)
 
-0. fleet-admin parity (`revoke-grant`, `retype`)
+0. fleet-admin parity (`revoke-grant`, `retype`) — LANDED (#37)
 1. trawld keystore cutover: `require_bearer` adoption + policy layer moves
    into trawl-server, scheduler key-liveness via pg, audit poller port,
    `[auth] database_url` config, trawl-admin `keys` removal, CI pg service,
    minimal deb/helm `DATABASE_URL` wiring + helm init-auth rewrite (which is
-   already broken against the current trawl-admin CLI).
+   already broken against the current trawl-admin CLI). — LANDED (#38)
 2. trawl-web session swap + fleet_session SSO + shared-key packaging.
-3. app stores → postgres (`trawl` database); `trawl-auth` crate deleted.
+   — LANDED (#40)
+3. app stores → postgres (`trawl` database); `trawl-auth` crate deleted
+   (folds in #12: umbrella sqlx, `sqlx::migrate!()`, `#[sqlx::test]`).
+   — LANDED (#41); the arc is complete.
 
 Transitional state between slices 1 and 3: history/saved/schedule stores remain
 on sqlite, holding postgres key ids as plain i64s — but in a **fresh database
