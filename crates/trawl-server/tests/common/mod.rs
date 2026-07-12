@@ -246,6 +246,36 @@ pub async fn kill_database(url: &str) {
         .expect("force-drop database");
 }
 
+/// Terminate every backend connected to the database named in `url`,
+/// leaving the database itself intact — simulates the lock-holding session
+/// dying (pg restart, idle-timeout culling, `pg_terminate_backend`) while
+/// the database stays up so a replacement instance can re-acquire the lock.
+///
+/// Kills the dedicated advisory-lock connection *and* the app-state pool's
+/// connections; sqlx transparently reconnects the pool (the split-brain
+/// hazard), but the raw lock connection cannot, so its session-held
+/// advisory lock is released.
+pub async fn terminate_backends(url: &str) {
+    let name = url
+        .rsplit('/')
+        .next()
+        .and_then(|last| last.split('?').next())
+        .expect("database name in url");
+    let mut admin = PgConnection::connect(&admin_database_url())
+        .await
+        .expect("connect to admin DB");
+    // `pg_stat_activity`/`pg_terminate_backend` are cluster-wide; the admin
+    // connection sits on a different database, so filter by datname.
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(name)
+    .execute(&mut admin)
+    .await
+    .expect("terminate app-database backends");
+}
+
 /// Generate test parquet fixtures using `DuckDB`.
 ///
 /// Writes fixtures to a stable path under `CARGO_MANIFEST_DIR` so all

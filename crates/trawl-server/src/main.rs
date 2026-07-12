@@ -132,6 +132,26 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Sole-writer guard: if the app-state advisory lock is ever lost (its
+    // session died and postgres freed the lock), a second trawld could
+    // acquire it and become a concurrent writer. Terminate immediately —
+    // split-brain is a correctness emergency, so a hard exit that stops all
+    // writes beats a graceful drain that keeps serving. The supervisor
+    // restarts us; boot re-acquires the lock or fails on the replacement.
+    {
+        let mut lock_lost = state.storage.lock_lost();
+        tokio::spawn(async move {
+            if lock_lost.wait_for(|lost| *lost).await.is_ok() {
+                tracing::error!(
+                    event_type = "lifecycle",
+                    "app-state sole-writer lock lost; terminating trawld to prevent a \
+                     split-brain second writer"
+                );
+                std::process::exit(1);
+            }
+        });
+    }
+
     let compaction_handle = spawn_ingest_pipeline(&config, &state)?;
 
     // Spawn syslog listeners if enabled (requires ingest to be enabled).

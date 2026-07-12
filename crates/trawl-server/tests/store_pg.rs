@@ -1243,3 +1243,60 @@ async fn boot_unreachable_database_fails_descriptively(pool: PgPool) {
         .expect_err("dead DSN must fail");
     assert!(matches!(err, StoreError::Unavailable(_)), "got: {err:?}");
 }
+
+/// Losing the lock-holding session must be detected, and must free the lock
+/// for a replacement — the split-brain guard from the [high] review finding.
+///
+/// Terminating every backend on the app database kills the dedicated
+/// advisory-lock connection (postgres releases the session lock) while the
+/// database survives. The original instance's guard must flip its lock-lost
+/// signal (and report unhealthy on `/health`), and a *replacement* instance
+/// must then be able to acquire the freed lock — proving the original can no
+/// longer be trusted as sole writer.
+#[sqlx::test(migrations = false)]
+async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool) {
+    use std::time::Duration;
+
+    let url = common::create_app_database(&pool).await;
+    let first = StorageState::connect(&url).await.expect("first boot");
+
+    let mut lost = first.lock_lost();
+    assert!(!*lost.borrow_and_update(), "lock is healthy at boot");
+    first.ping_cached().await.expect("storage healthy at boot");
+
+    // While the lock is held, a replacement cannot start.
+    assert!(
+        matches!(StorageState::connect(&url).await, Err(StoreError::LockHeld)),
+        "second live instance must be locked out while the lock is held"
+    );
+
+    // Kill the lock-holding session (database stays up).
+    common::terminate_backends(&url).await;
+
+    // The guard keepalive-probes on an interval, so allow a few cycles.
+    tokio::time::timeout(Duration::from_secs(30), lost.wait_for(|v| *v))
+        .await
+        .expect("guard must detect the lost lock")
+        .expect("lock-lost sender must stay alive");
+
+    // `/health` now reports storage unhealthy even though the pool itself
+    // could reconnect — the split-brain hazard is surfaced.
+    assert!(
+        first.ping_cached().await.is_err(),
+        "health must report the lost lock"
+    );
+
+    // The freed lock lets a replacement instance acquire it, retrying until
+    // postgres has finished releasing the terminated session's lock.
+    let mut last_err = None;
+    for _ in 0..50 {
+        match StorageState::connect(&url).await {
+            Ok(_replacement) => return,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("replacement never acquired the freed lock: {last_err:?}");
+}

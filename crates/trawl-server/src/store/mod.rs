@@ -10,6 +10,14 @@
 //! [`sqlx::migrate!`]. The fleet keystore database forbids auto-migration
 //! because two binaries share it; the rationale doesn't transfer here —
 //! single-replica trawld is the only writer by design.
+//!
+//! The advisory lock is *session*-scoped: postgres releases it the instant
+//! the holding connection dies (pg restart, an idle-timeout device culling
+//! the socket, a `pg_terminate_backend`). A background guard task therefore
+//! keepalive-probes the lock connection and, the moment the probe fails,
+//! flips a lock-lost signal — surfaced through `/health` and awaited by
+//! `main` to terminate the daemon before a second instance can acquire the
+//! freed lock and become a concurrent writer.
 
 pub mod error;
 pub mod history;
@@ -21,6 +29,8 @@ use std::time::Duration;
 
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection as _, PgPool};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
@@ -47,8 +57,28 @@ const MAX_CONNECTIONS: u32 = 8;
 /// Bound on the boot-time connection attempt (see `connect`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// App-state storage: one shared pool, three store facades, and the session
-/// connection holding the sole-writer advisory lock. Cheap to clone.
+/// How often the guard task probes the lock-holding session. Doubles as a
+/// keepalive that stops an idle-timeout network device from culling the
+/// connection, and as the upper bound on how long a genuinely lost lock
+/// goes undetected — kept short because every second of an undetected loss
+/// is a second in which a second writer could start.
+const LOCK_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Owns the guard task that keepalive-probes the lock connection. Aborting
+/// the task on drop drops the lock connection with it, so a graceful
+/// shutdown (the last `StorageState` clone dropping) releases the advisory
+/// lock — the behaviour the boot-idempotency path depends on.
+#[derive(Debug)]
+struct LockGuard(JoinHandle<()>);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// App-state storage: one shared pool, three store facades, and the guard
+/// holding the sole-writer advisory lock. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct StorageState {
     /// Shared app-state pool (exposed for liveness pings and tests).
@@ -59,12 +89,45 @@ pub struct StorageState {
     pub saved: SavedQueryStore,
     /// Schedules + report runs store.
     pub schedule: ScheduleStore,
-    /// Dedicated session connection holding `pg_advisory_lock` for the
-    /// process lifetime. Never queried again — dropping it releases the
-    /// lock, so it must live exactly as long as the state.
-    _advisory_lock: Arc<tokio::sync::Mutex<PgConnection>>,
+    /// Guard task owning the dedicated session connection that holds
+    /// `pg_advisory_lock`. Lives exactly as long as the state; its `Drop`
+    /// aborts the task, dropping the connection and releasing the lock.
+    _lock_guard: Arc<LockGuard>,
+    /// Watch flipped to `true` the moment the guard detects the lock is
+    /// gone. Surfaced by `ping_cached` (so `/health` reports it) and awaited
+    /// by `main` to terminate the daemon before a second writer can start.
+    lock_lost_rx: watch::Receiver<bool>,
     /// Memoised storage liveness ping shared by every `/health` probe.
     storage_ping: Arc<PingCache>,
+}
+
+/// Keepalive-probe the lock-holding session forever. The first probe failure
+/// means the connection — and with it the session-scoped advisory lock — is
+/// gone; flip the watch and return so the socket drops.
+///
+/// A raw [`PgConnection`] never reconnects, so a failed probe is proof the
+/// original session died: the lock is definitively released and this
+/// instance must stop writing.
+async fn guard_advisory_lock(mut conn: PgConnection, lost_tx: watch::Sender<bool>) {
+    let mut ticker = tokio::time::interval(LOCK_KEEPALIVE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // consume the immediate first tick
+
+    loop {
+        ticker.tick().await;
+        if let Err(e) = sqlx::query("SELECT 1").execute(&mut conn).await {
+            tracing::error!(
+                event_type = "storage_lock_lost",
+                error = %e,
+                "sole-writer advisory lock lost: the app-state session died and \
+                 postgres has released the lock; another trawld can now acquire it \
+                 and become a second writer. terminating to preserve the \
+                 single-writer invariant."
+            );
+            let _ = lost_tx.send(true);
+            return;
+        }
+    }
 }
 
 impl StorageState {
@@ -101,6 +164,11 @@ impl StorageState {
 
         MIGRATOR.run(&pool).await?;
 
+        // Guard the lock for the process lifetime: keepalive-probe its
+        // session and flip `lock_lost_rx` the instant it dies.
+        let (lost_tx, lock_lost_rx) = watch::channel(false);
+        let guard = tokio::spawn(guard_advisory_lock(lock_conn, lost_tx));
+
         tracing::info!(
             event_type = "storage_ready",
             "app-state database migrated and advisory-locked"
@@ -111,9 +179,18 @@ impl StorageState {
             saved: SavedQueryStore::new(pool.clone()),
             schedule: ScheduleStore::new(pool.clone()),
             pool,
-            _advisory_lock: Arc::new(tokio::sync::Mutex::new(lock_conn)),
+            _lock_guard: Arc::new(LockGuard(guard)),
+            lock_lost_rx,
             storage_ping: Arc::new(PingCache::new(None)),
         })
+    }
+
+    /// A receiver that flips to `true` when the sole-writer advisory lock is
+    /// lost. `main` awaits this to terminate the daemon before a second
+    /// instance can acquire the freed lock.
+    #[must_use]
+    pub fn lock_lost(&self) -> watch::Receiver<bool> {
+        self.lock_lost_rx.clone()
     }
 
     /// Raw liveness ping against the app-state pool.
@@ -127,7 +204,18 @@ impl StorageState {
     /// Liveness ping memoised behind a TTL and bounded by a timeout —
     /// mirrors the fleet-keystore ping guarding `/health` (see
     /// [`crate::ping`] for the rationale).
+    ///
+    /// A lost sole-writer lock short-circuits to an error *before* the cache:
+    /// the pool itself may still ping fine (it reconnects transparently),
+    /// which is precisely the split-brain hazard `/health` must expose.
     pub async fn ping_cached(&self) -> Result<(), String> {
+        if *self.lock_lost_rx.borrow() {
+            return Err(
+                "sole-writer advisory lock lost — trawld is terminating to avoid \
+                 a second writer"
+                    .to_owned(),
+            );
+        }
         ping_cached_with(
             &self.storage_ping,
             Self::PING_CACHE_TTL,
