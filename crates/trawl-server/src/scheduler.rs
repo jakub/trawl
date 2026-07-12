@@ -317,33 +317,31 @@ pub(crate) async fn execute_scheduled_query(
                     }
                 }
                 Err(e) => {
-                    // A transient app-state DB error (pg restart/failover) left
-                    // the run row stuck at status='running' with no result_path
-                    // recorded. Two things must be undone: the parquet we just
-                    // wrote is orphaned (retention only ever sees recorded
-                    // paths, so it can never reclaim it), and the still-running
-                    // row trips the report_runs_one_running guard, wedging every
-                    // future run of this schedule until the next daemon restart.
+                    // A transient app-state DB error (pg restart/failover). This
+                    // is an AMBIGUOUS COMMIT: for a single autocommit UPDATE the
+                    // COMMIT can land server-side while the client's ack is lost,
+                    // so sqlx returns Err even though the row was written to
+                    // status='success' with result_path set. We therefore must
+                    // NOT delete the parquet we just wrote — if the success
+                    // committed, that file is the live result the row points at,
+                    // and unlinking it would leave a permanent dangling reference
+                    // (cleanup_stale_runs only repairs status='running' rows).
+                    // Worst case the row genuinely didn't commit and the file is
+                    // orphaned on disk; that's a bounded leak, not corruption.
                     tracing::error!(
                         event_type = "scheduler_error",
                         run_id,
                         error = %e,
-                        "failed to finish run; removing orphaned result and flipping run to error"
+                        result_path = result_path.as_deref().unwrap_or("(blob)"),
+                        "failed to finish run (ambiguous commit); leaving result file in place, \
+                         flipping run to error"
                     );
-                    if let Some(ref relative) = result_path
-                        && remove_result_file(pool.base_dir(), relative)
-                    {
-                        tracing::info!(
-                            event_type = "scheduler_orphan_cleanup",
-                            run_id,
-                            path = %relative,
-                            "finish_run failed; removed orphaned parquet result"
-                        );
-                    }
-                    // Best-effort: flip the wedged row to 'error' so the schedule
-                    // recovers without a restart. If the DB is still down this
-                    // also fails; boot-time cleanup_stale_runs remains the
-                    // backstop.
+                    // Best-effort: flip the row to 'error' so a genuinely-stuck
+                    // 'running' row doesn't wedge the report_runs_one_running
+                    // guard until the next restart. If the success actually
+                    // committed this is a harmless overwrite (the schedule's next
+                    // tick produces a fresh run); if the DB is still down this
+                    // also fails and boot-time cleanup_stale_runs is the backstop.
                     if let Err(e2) = schedule_store
                         .finish_run(
                             run_id,
