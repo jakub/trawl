@@ -1052,6 +1052,124 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
     );
 }
 
+/// Barrier-driven regression: a scheduler's `finish_run` landing its parquet
+/// path while `SavedQueryStore::delete` is mid-flight must never orphan the
+/// file. A blocker transaction pins the interleaving to the exact window the
+/// finding describes — `finish_run` commits its path after `delete` collected
+/// paths but before its cascade wipes the row. The fix locks the parent and
+/// every run row first, so `delete` either collects the path or the run row
+/// survives long enough for `finish_run` to report the orphan. Invariant:
+/// `delete` returns the path iff `finish_run` succeeded — exactly one side owns
+/// cleanup. The pre-fix code returns an empty set while `finish_run` reports
+/// success, leaking the file, and trips this assertion.
+#[sqlx::test]
+async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
+    const PATH: &str = "scheduled/race/run.parquet";
+    let saved_store = saved(&pool);
+    let sched_store = schedules(&pool);
+    let sq = saved_store.create(1, "race", "q").await.unwrap();
+    let sched = sched_store
+        .create_schedule(sq.id, 1, 300, None)
+        .await
+        .unwrap();
+    let rid = sched_store
+        .start_run(sched.id, sq.id, "q")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Hold the parent row so `delete` stalls at the spot the race needs: the
+    // fixed code blocks on its parent `FOR UPDATE`; the pre-fix code blocks on
+    // its cascade `DELETE` — after it already read an empty path set.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(sq.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let delete_store = saved_store.clone();
+    let sq_id = sq.id;
+    let delete_task = tokio::spawn(async move { delete_store.delete(sq_id, 1).await });
+
+    // Let `delete` reach its blocking point (so the pre-fix path read has
+    // already run) before the scheduler commits its result path.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let finished = sched_store
+        .finish_run(rid, "success", 10, Some(1), None, None, Some(PATH))
+        .await
+        .unwrap();
+
+    blocker.rollback().await.unwrap();
+    let delete_paths = delete_task.await.unwrap().unwrap();
+
+    assert!(
+        finished,
+        "finish_run committed its path before the cascade — it must report success"
+    );
+    assert_eq!(
+        delete_paths.contains(&PATH.to_string()),
+        finished,
+        "exactly one side must own the parquet cleanup: delete returned {delete_paths:?}"
+    );
+    assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
+}
+
+/// Same barrier-driven race for `ScheduleStore::delete_schedule`: the blocker
+/// holds the schedule row, `finish_run` commits its path mid-delete, and the
+/// fix guarantees `delete_schedule` collects it (rather than cascading it away
+/// while `finish_run` believed it persisted).
+#[sqlx::test]
+async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
+    const PATH: &str = "scheduled/race/sched.parquet";
+    let sched_store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "race").await;
+    let sched = sched_store
+        .create_schedule(sq_id, 1, 300, None)
+        .await
+        .unwrap();
+    let rid = sched_store
+        .start_run(sched.id, sq_id, "q")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM schedules WHERE saved_query_id = $1 AND key_id = $2 FOR UPDATE",
+    )
+    .bind(sq_id)
+    .bind(1_i64)
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+
+    let delete_store = sched_store.clone();
+    let delete_task = tokio::spawn(async move { delete_store.delete_schedule(sq_id, 1).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let finished = sched_store
+        .finish_run(rid, "success", 10, Some(1), None, None, Some(PATH))
+        .await
+        .unwrap();
+
+    blocker.rollback().await.unwrap();
+    let delete_paths = delete_task.await.unwrap().unwrap();
+
+    assert!(
+        finished,
+        "finish_run committed its path before the cascade — it must report success"
+    );
+    assert_eq!(
+        delete_paths.contains(&PATH.to_string()),
+        finished,
+        "exactly one side must own the parquet cleanup: delete_schedule returned {delete_paths:?}"
+    );
+    assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // boot: advisory lock + migration (AC5)
 // ---------------------------------------------------------------------------

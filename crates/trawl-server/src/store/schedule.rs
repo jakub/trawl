@@ -13,7 +13,10 @@
 //! - the manual-trigger path's `max_runs` check joins the run claim in one
 //!   transaction ([`ScheduleStore::claim_run`], `FOR UPDATE` on the schedule
 //!   row);
-//! - deletions collect parquet paths and delete rows in one transaction;
+//! - deletions lock the parent row then every `report_runs` row (`FOR
+//!   UPDATE`, no `result_path` filter) before collecting parquet paths, so a
+//!   concurrent `finish_run` either lands its path before the lock or blocks
+//!   until the cascade removes its row — never orphaning the file;
 //! - [`ScheduleStore::finish_run`] reports whether it updated a row so a run
 //!   cascade-deleted mid-flight can have its freshly-written file removed.
 
@@ -322,6 +325,15 @@ impl ScheduleStore {
     /// Delete a schedule by its saved query id, collecting the parquet paths
     /// of its runs in the SAME transaction (cascade wipes the rows).
     ///
+    /// Lock order matches [`Self::claim_run`]: the schedule row first (`FOR
+    /// UPDATE`, which also blocks a concurrent run INSERT via its FK `FOR KEY
+    /// SHARE`), then every one of its `report_runs`. Locking all run rows — not
+    /// just those with a non-null `result_path` — forces a concurrent
+    /// `finish_run` to either commit its path before us (collected here) or
+    /// block until our cascade deletes its row (it then updates zero rows and
+    /// the caller unlinks the file). Filtering on `result_path IS NOT NULL`
+    /// would skip still-running rows and reopen the orphan-file race.
+    ///
     /// Returns the relative parquet paths for the caller to unlink, or
     /// `NotFound` if no schedule is owned by `key_id` for this saved query.
     pub async fn delete_schedule(
@@ -331,32 +343,35 @@ impl ScheduleStore {
     ) -> Result<Vec<String>, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        let paths: Vec<String> = sqlx::query_scalar(
-            "SELECT r.result_path
-             FROM report_runs r
-             JOIN schedules s ON s.id = r.schedule_id
-             WHERE s.saved_query_id = $1 AND s.key_id = $2 AND r.result_path IS NOT NULL",
+        let schedule_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM schedules WHERE saved_query_id = $1 AND key_id = $2 FOR UPDATE",
         )
         .bind(saved_query_id)
         .bind(key_id)
-        .fetch_all(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-
-        let deleted =
-            sqlx::query("DELETE FROM schedules WHERE saved_query_id = $1 AND key_id = $2")
-                .bind(saved_query_id)
-                .bind(key_id)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-
-        if deleted == 0 {
+        let Some(schedule_id) = schedule_id else {
             tx.rollback().await?;
             return Err(StoreError::NotFound {
                 id: saved_query_id,
                 resource: "schedule",
             });
-        }
+        };
+
+        let paths: Vec<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT result_path FROM report_runs WHERE schedule_id = $1 FOR UPDATE",
+        )
+        .bind(schedule_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(schedule_id)
+            .execute(&mut *tx)
+            .await?;
 
         tx.commit().await?;
 

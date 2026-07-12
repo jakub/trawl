@@ -270,36 +270,53 @@ impl SavedQueryStore {
     }
 
     /// Delete a saved query, collecting the parquet result paths of its runs
-    /// in the SAME transaction as the delete (the FK cascade wipes the rows,
-    /// so a separate read would race a concurrent scheduler write).
+    /// in the SAME transaction as the delete.
+    ///
+    /// Lock order (shared with [`super::ScheduleStore::claim_run`]): the parent
+    /// row first, then its `report_runs`. Locking the parent `FOR UPDATE` blocks
+    /// a concurrent run INSERT (which needs a `FOR KEY SHARE` on the same row via
+    /// the FK), so no new run can slip in after we collect paths. Locking every
+    /// run row — NOT just those with a non-null `result_path` — forces a
+    /// concurrent `finish_run` to either commit its path before us (we collect it
+    /// here) or block until our cascade deletes its row (it then updates zero rows
+    /// and the caller unlinks the file it wrote). Filtering on
+    /// `result_path IS NOT NULL` would skip still-running rows and reopen that
+    /// race, orphaning the parquet file.
     ///
     /// Returns the relative parquet paths for the caller to unlink, or
     /// `NotFound` if the query doesn't exist or isn't owned by the user.
     pub async fn delete(&self, id: i64, key_id: i64) -> Result<Vec<String>, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        let paths: Vec<String> = sqlx::query_scalar(
-            "SELECT result_path FROM report_runs
-             WHERE saved_query_id = $1 AND result_path IS NOT NULL",
+        let owned: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM saved_queries WHERE id = $1 AND key_id = $2 FOR UPDATE",
         )
         .bind(id)
-        .fetch_all(&mut *tx)
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
         .await?;
-
-        let deleted = sqlx::query("DELETE FROM saved_queries WHERE id = $1 AND key_id = $2")
-            .bind(id)
-            .bind(key_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-
-        if deleted == 0 {
+        if owned.is_none() {
             tx.rollback().await?;
             return Err(StoreError::NotFound {
                 id,
                 resource: "saved query",
             });
         }
+
+        let paths: Vec<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT result_path FROM report_runs WHERE saved_query_id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+
+        sqlx::query("DELETE FROM saved_queries WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
 
         tx.commit().await?;
 
