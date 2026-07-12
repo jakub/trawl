@@ -105,18 +105,10 @@ async fn scheduler_loop(
                 Ok((_count, paths)) => {
                     // Clean up parquet files from disk for deleted runs.
                     // Paths from the DB are relative (e.g. "scheduled/foo/run_1.parquet"),
-                    // so we must prepend the data directory.
-                    let base = pool.base_dir().trim_end_matches('/');
+                    // resolved against the data directory by remove_result_file.
+                    let base = pool.base_dir();
                     for path in paths {
-                        let full = format!("{base}/{path}");
-                        if let Err(e) = std::fs::remove_file(&full) {
-                            tracing::warn!(
-                                event_type = "scheduler_retention_file_error",
-                                path = %full,
-                                error = %e,
-                                "failed to delete parquet file for expired run"
-                            );
-                        }
+                        remove_result_file(base, &path);
                     }
                 }
                 Err(e) => {
@@ -313,24 +305,15 @@ pub(crate) async fn execute_scheduled_query(
                     // The run row was cascade-deleted mid-flight (its saved
                     // query or schedule is gone): the file we just wrote is
                     // orphaned — remove it.
-                    if let Some(ref relative) = result_path {
-                        let base = pool.base_dir().trim_end_matches('/');
-                        let full = format!("{base}/{relative}");
-                        if let Err(e) = std::fs::remove_file(&full) {
-                            tracing::warn!(
-                                event_type = "scheduler_orphan_cleanup_error",
-                                path = %full,
-                                error = %e,
-                                "failed to delete orphaned parquet result"
-                            );
-                        } else {
-                            tracing::info!(
-                                event_type = "scheduler_orphan_cleanup",
-                                run_id,
-                                path = %full,
-                                "run was deleted mid-flight; removed orphaned parquet result"
-                            );
-                        }
+                    if let Some(ref relative) = result_path
+                        && remove_result_file(pool.base_dir(), relative)
+                    {
+                        tracing::info!(
+                            event_type = "scheduler_orphan_cleanup",
+                            run_id,
+                            path = %relative,
+                            "run was deleted mid-flight; removed orphaned parquet result"
+                        );
                     }
                 }
                 Err(e) => {
@@ -396,6 +379,27 @@ pub(crate) async fn execute_scheduled_query(
 ///
 /// Returns `(Some(relative_path), None)` on success, or `(None, Some(blob))`
 /// as a zstd-JSON fallback if parquet writing fails.
+/// Best-effort removal of a report-run parquet file from disk.
+///
+/// `relative` is a DB-stored path like `scheduled/foo/run_1.parquet`; it is
+/// resolved against the executor's `base_dir`. Returns `true` if the file was
+/// removed, `false` (with a logged warning) on failure. Shared by retention
+/// cleanup, mid-flight orphan cleanup, and the run-deletion handler.
+pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
+    let full = format!("{}/{relative}", base_dir.trim_end_matches('/'));
+    if let Err(e) = std::fs::remove_file(&full) {
+        tracing::warn!(
+            event_type = "result_file_cleanup_error",
+            path = %full,
+            error = %e,
+            "failed to delete parquet result file"
+        );
+        false
+    } else {
+        true
+    }
+}
+
 fn write_result_parquet(
     pool: &ExecutorPool,
     run_id: i64,

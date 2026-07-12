@@ -1127,17 +1127,9 @@ fn cleanup_run_parquet_files(state: &AppState, relative_paths: &[String]) {
     if relative_paths.is_empty() {
         return;
     }
-    let base = state.query.pool.base_dir().trim_end_matches('/');
+    let base = state.query.pool.base_dir();
     for path in relative_paths {
-        let full = format!("{base}/{path}");
-        if let Err(e) = std::fs::remove_file(&full) {
-            tracing::warn!(
-                event_type = "cleanup_parquet_file_error",
-                path = %full,
-                error = %e,
-                "failed to delete parquet file for deleted run"
-            );
-        }
+        crate::scheduler::remove_result_file(base, path);
     }
 }
 
