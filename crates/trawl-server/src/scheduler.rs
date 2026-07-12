@@ -333,33 +333,52 @@ pub(crate) async fn execute_scheduled_query(
                         run_id,
                         error = %e,
                         result_path = result_path.as_deref().unwrap_or("(blob)"),
-                        "failed to finish run (ambiguous commit); leaving result file in place, \
-                         flipping run to error"
+                        "failed to finish run (ambiguous commit); recovering via guarded flip"
                     );
-                    // Best-effort: flip the row to 'error' so a genuinely-stuck
-                    // 'running' row doesn't wedge the report_runs_one_running
-                    // guard until the next restart. If the success actually
-                    // committed this is a harmless overwrite (the schedule's next
-                    // tick produces a fresh run); if the DB is still down this
-                    // also fails and boot-time cleanup_stale_runs is the backstop.
-                    if let Err(e2) = schedule_store
-                        .finish_run(
+                    // Guarded state transition: flip the row to 'error' only
+                    // while it is still 'running'. If the success COMMIT
+                    // actually landed (status is already 'success'), the flip
+                    // matches zero rows and we preserve the committed result
+                    // instead of destroying it. If the DB is still down the
+                    // flip also fails and boot-time cleanup_stale_runs is the
+                    // backstop.
+                    match schedule_store
+                        .fail_run_if_running(
                             run_id,
-                            "error",
                             duration_ms,
-                            None,
-                            Some(&format!("result persistence failed: {e}")),
-                            None,
-                            None,
+                            &format!("result persistence failed: {e}"),
                         )
                         .await
                     {
-                        tracing::error!(
-                            event_type = "scheduler_error",
-                            run_id,
-                            error = %e2,
-                            "failed to flip wedged run to error; run stays stuck until restart"
-                        );
+                        Ok(true) => {
+                            // The success never committed (row was 'running'):
+                            // the parquet we wrote is now orphaned — remove it.
+                            if let Some(ref relative) = result_path
+                                && remove_result_file(pool.base_dir(), relative)
+                            {
+                                tracing::info!(
+                                    event_type = "scheduler_orphan_cleanup",
+                                    run_id,
+                                    path = %relative,
+                                    "ambiguous commit did not land; removed orphaned parquet result"
+                                );
+                            }
+                        }
+                        Ok(false) => {
+                            // No running row matched: either the ambiguous
+                            // success committed (its result_path is live —
+                            // leave the file) or the run was cascade-deleted (a
+                            // bounded on-disk leak). Either way, do not touch
+                            // the file.
+                        }
+                        Err(e2) => {
+                            tracing::error!(
+                                event_type = "scheduler_error",
+                                run_id,
+                                error = %e2,
+                                "failed to flip wedged run to error; run stays stuck until restart"
+                            );
+                        }
                     }
                 }
             }

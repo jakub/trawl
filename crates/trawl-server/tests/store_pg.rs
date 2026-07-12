@@ -1052,6 +1052,76 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
     );
 }
 
+/// `fail_run_if_running` is the ambiguous-commit recovery guard: it flips a
+/// still-`running` row to `error`, but must NEVER clobber a run whose success
+/// already committed. Regression for the finding where an unconditional retry
+/// destroyed a committed result and orphaned its parquet file.
+#[sqlx::test]
+async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
+    let saved_store = saved(&pool);
+    let store = schedules(&pool);
+
+    // A still-running run flips to error and the result path is cleared.
+    let sq = saved_store.create(1, "running", "q").await.unwrap();
+    let sched = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
+    let rid = store
+        .start_run(sched.id, sq.id, "q")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        store
+            .fail_run_if_running(rid, 5, "result persistence failed")
+            .await
+            .unwrap(),
+        "a running row must be flipped to error"
+    );
+    let run = store.get_run(rid, 1).await.unwrap().unwrap();
+    assert_eq!(run.status, "error");
+    assert_eq!(run.result_path, None);
+
+    // A run whose success already committed must survive the guarded flip:
+    // the ambiguous-commit case where the first finish_run's COMMIT landed.
+    let sq2 = saved_store.create(1, "committed", "q").await.unwrap();
+    let sched2 = store.create_schedule(sq2.id, 1, 300, None).await.unwrap();
+    let rid2 = store
+        .start_run(sched2.id, sq2.id, "q")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .finish_run(
+                rid2,
+                "success",
+                10,
+                Some(7),
+                None,
+                None,
+                Some("scheduled/committed/run.parquet"),
+            )
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        !store
+            .fail_run_if_running(rid2, 5, "result persistence failed")
+            .await
+            .unwrap(),
+        "a committed success must NOT be flipped (guard matches zero rows)"
+    );
+    let survived = store.get_run(rid2, 1).await.unwrap().unwrap();
+    assert_eq!(survived.status, "success", "committed success preserved");
+    assert_eq!(survived.row_count, Some(7), "row_count preserved");
+    assert_eq!(
+        survived.result_path.as_deref(),
+        Some("scheduled/committed/run.parquet"),
+        "result_path preserved so the parquet file is not orphaned"
+    );
+}
+
 /// Barrier-driven regression: a scheduler's `finish_run` landing its parquet
 /// path while `SavedQueryStore::delete` is mid-flight must never orphan the
 /// file. A blocker transaction pins the interleaving to the exact window the

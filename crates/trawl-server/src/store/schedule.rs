@@ -627,6 +627,52 @@ impl ScheduleStore {
         Ok(updated > 0)
     }
 
+    /// Flip a run to `error`, but only while it is still `running`.
+    ///
+    /// This is the scheduler's ambiguous-commit recovery path: a prior
+    /// `finish_run("success", …)` returned `Err`, which for a single autocommit
+    /// UPDATE can mean the COMMIT landed server-side while the client's ack was
+    /// lost. An unconditional overwrite would destroy that committed success —
+    /// clearing `row_count`/`result_data`/`result_path` and permanently
+    /// orphaning the parquet file the row pointed at. Guarding on
+    /// `status = 'running'` makes completion a state transition: the flip lands
+    /// only if the success did NOT commit.
+    ///
+    /// Returns `Ok(true)` when a running row was flipped (the earlier success
+    /// never committed, so any parquet the caller wrote is now orphaned and
+    /// should be removed), `Ok(false)` when no running row matched — either the
+    /// ambiguous success actually committed (its result must be preserved) or
+    /// the run was cascade-deleted.
+    pub async fn fail_run_if_running(
+        &self,
+        run_id: i64,
+        duration_ms: u64,
+        error_message: &str,
+    ) -> Result<bool, StoreError> {
+        let updated = sqlx::query(
+            "UPDATE report_runs
+             SET status = 'error', finished_at = now(), duration_ms = $1,
+                 row_count = NULL, error_message = $2, result_data = NULL,
+                 result_path = NULL
+             WHERE id = $3 AND status = 'running'",
+        )
+        .bind(bind_u64(duration_ms))
+        .bind(error_message)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        tracing::info!(
+            event_type = "report_run_fail_if_running",
+            run_id,
+            flipped = (updated > 0),
+            "Guarded run failure applied"
+        );
+
+        Ok(updated > 0)
+    }
+
     /// List runs for a saved query, paginated. Excludes result blobs.
     pub async fn list_runs(
         &self,
