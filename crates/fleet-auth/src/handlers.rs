@@ -34,7 +34,7 @@ use zeroize::Zeroizing;
 use crate::middleware::{SessionState, classify_verify_error, error_response, no_grant_response};
 use crate::session::{
     self, SessionExpiry, SessionPayload, build_clear_cookie_header, build_session_cookie_header,
-    origin_allowed, zeroizing_string,
+    zeroizing_string,
 };
 
 /// `POST /login` request body.
@@ -176,7 +176,7 @@ pub async fn login(
 /// a parent domain, a forged cross-site POST to any app's logout endpoint
 /// would clear the shared cookie and sign the user out of every sibling
 /// app. Both `login` and `logout` therefore validate the `Origin` header
-/// by default via [`origin_allowed`] (ADR-0004 slice 2): a present Origin
+/// by default via [`session::check_origin`] (ADR-0004 slice 2): a present Origin
 /// whose host doesn't match the request `Host` → 403 with NO `Set-Cookie`.
 /// Sharing a parent-domain cookie is deliberately NOT an origin allowlist —
 /// a sibling app is a different origin and is rejected. Absent Origin is
@@ -208,25 +208,20 @@ pub async fn logout(State(state): State<SessionState>, headers: HeaderMap) -> Re
 
 /// Run the present-only, strictly same-host Origin check against the
 /// request headers. Returns `Some(403)` when the request must be rejected,
-/// `None` when the handler may proceed. The cookie's shared domain is
-/// deliberately NOT an origin allowlist — see [`origin_allowed`].
+/// `None` when the handler may proceed. Delegates the decision + rejection
+/// log to the shared [`session::check_origin`] so the log fields/message
+/// live in one place; the cookie's shared domain is deliberately NOT an
+/// origin allowlist — see [`session::origin_allowed`].
 fn reject_cross_origin(headers: &HeaderMap, handler: &str) -> Option<Response> {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    if origin_allowed(origin, host) {
-        return None;
-    }
-    tracing::warn!(
-        origin = origin.unwrap_or("<unparseable>"),
-        host = host.unwrap_or("<none>"),
-        handler,
-        "auth: cross-origin request rejected"
-    );
-    Some(error_response(
-        StatusCode::FORBIDDEN,
-        "origin_mismatch",
-        "cross-origin request rejected",
-    ))
+    session::check_origin(origin, host, handler).err().map(|_| {
+        error_response(
+            StatusCode::FORBIDDEN,
+            "origin_mismatch",
+            "cross-origin request rejected",
+        )
+    })
 }
 
 fn internal_error(detail: &str) -> Response {

@@ -25,7 +25,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use fleet_auth::{SessionExpiry, SessionPayload, origin_allowed, session};
+use fleet_auth::{SessionExpiry, SessionPayload, session};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -48,22 +48,14 @@ pub struct LoginResponse {
 
 /// Reject cross-origin browser requests to state-changing auth endpoints.
 ///
-/// Same present-only semantics as the fleet-auth substrate handlers —
-/// this IS the same `origin_allowed` function they call (ADR-0004
-/// slice 2).
-fn check_origin(headers: &HeaderMap) -> Result<(), ProxyError> {
+/// Delegates to the shared [`fleet_auth::check_origin`] — the same
+/// present-only decision, log fields, and message that the fleet-auth
+/// substrate handlers use (ADR-0004 slice 2) — and maps its rejection onto
+/// this proxy's [`ProxyError::OriginMismatch`].
+fn check_origin(headers: &HeaderMap, handler: &str) -> Result<(), ProxyError> {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    if origin_allowed(origin, host) {
-        Ok(())
-    } else {
-        tracing::warn!(
-            origin = origin.unwrap_or("<unparseable>"),
-            host = host.unwrap_or("<none>"),
-            "auth: cross-origin request rejected"
-        );
-        Err(ProxyError::OriginMismatch)
-    }
+    session::check_origin(origin, host, handler).map_err(|_| ProxyError::OriginMismatch)
 }
 
 pub async fn login(
@@ -71,7 +63,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ProxyError> {
-    check_origin(&headers)?;
+    check_origin(&headers, "login")?;
 
     if req.api_key.trim().is_empty() {
         return Err(ProxyError::BadRequest("api_key is required".into()));
@@ -220,7 +212,7 @@ pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ProxyError> {
-    check_origin(&headers)?;
+    check_origin(&headers, "logout")?;
 
     let header_value = state.build_clear_cookie();
     let mut headers = HeaderMap::new();

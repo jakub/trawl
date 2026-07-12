@@ -67,6 +67,10 @@ session = [
     "dep:cookie",
     "dep:rand",
     "dep:serde_json",
+    # `check_origin` emits the canonical cross-origin-rejection log so the
+    # fields/message live in one place; tracing is a lightweight, wasm-clean
+    # facade, so this stays fine for session-only (e.g. renderer) consumers.
+    "dep:tracing",
 ]
 # Axum middleware (RequireSession, RequireBearer) + login/logout handler
 # factories. Pulls keystore (verify_key on the request path) and session

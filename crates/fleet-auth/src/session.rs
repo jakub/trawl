@@ -679,6 +679,44 @@ pub fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
     }
 }
 
+/// Returned by [`check_origin`] when a request's `Origin` is rejected. The
+/// rejection has already been logged with its `origin`/`host`/`handler`
+/// fields; each caller maps this marker onto its own error/response type
+/// (403, no `Set-Cookie`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginRejected;
+
+/// Present-only Origin guard for state-changing auth endpoints, wrapping
+/// [`origin_allowed`] with the canonical rejection log.
+///
+/// Callers pass the raw `Origin`/`Host` header values (already `Option<&str>`)
+/// rather than a request type, so this stays usable from both fleet-auth's
+/// own axum handlers and thin proxies that take only the `session` feature.
+/// On rejection it emits the shared `tracing::warn!` — the log fields and
+/// message live in **one** place so they can't drift between call sites — and
+/// returns [`OriginRejected`]. `handler` labels the endpoint (`"login"` /
+/// `"logout"`) in the log line.
+///
+/// # Errors
+///
+/// Returns [`OriginRejected`] when [`origin_allowed`] rejects the pair.
+pub fn check_origin(
+    origin: Option<&str>,
+    host: Option<&str>,
+    handler: &str,
+) -> Result<(), OriginRejected> {
+    if origin_allowed(origin, host) {
+        return Ok(());
+    }
+    tracing::warn!(
+        origin = origin.unwrap_or("<unparseable>"),
+        host = host.unwrap_or("<none>"),
+        handler,
+        "auth: cross-origin request rejected"
+    );
+    Err(OriginRejected)
+}
+
 /// Extract the host component from an `Origin` header value
 /// (`scheme "://" host [":" port]`). Returns `None` for anything that
 /// doesn't parse as a serialized origin — including the opaque `"null"`
