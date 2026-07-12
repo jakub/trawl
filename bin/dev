@@ -4,6 +4,12 @@
 # that mode trawl delegates the coastwatch service list to
 # `../coastwatch/bin/dev --joined-mprocs` and merges the YAML it produces.
 # run from anywhere — resolves repo root via git.
+#
+# trawld hard-requires two postgres DSNs since ADR-0004 slice 3: the fleet
+# keystore (FLEET_DATABASE_URL) and the trawl app-state db
+# (TRAWL_DATABASE_URL), both on the homelab cnpg dev cluster. resolution
+# mirrors coastwatch/bin/dev: a set env var wins wholesale; otherwise creds
+# come from 1password. point both vars at a local postgres to skip op.
 
 set -euo pipefail
 
@@ -39,12 +45,88 @@ if [[ -z "${TRAWL_COOKIE_SECRET:-}" ]]; then
 fi
 export TRAWL_COOKIE_SECRET
 
+# --- cnpg dev databases (ADR-0004) ------------------------------------------
+# DSNs assemble from the op items the homelab repo provisions
+# (`CNPG fleet_dev`, `CNPG trawl_dev`, same convention as coastwatch's
+# config registry). op-generated passwords carry URL-hostile symbols, so
+# both userinfo parts are percent-encoded via jq before entering the DSN.
+cnpg_host="10.0.100.89:5432"
+
+dsn_from_op() {
+    local item="$1" db="$2" user pass
+    user="$(op read "op://Homelab/CNPG ${item}/username")" \
+        || die "op read failed for 'CNPG ${item}' username"
+    pass="$(op read "op://Homelab/CNPG ${item}/password")" \
+        || die "op read failed for 'CNPG ${item}' password"
+    printf 'postgres://%s:%s@%s/%s' \
+        "$(jq -rn --arg v "$user" '$v|@uri')" \
+        "$(jq -rn --arg v "$pass" '$v|@uri')" \
+        "$cnpg_host" "$db"
+}
+
+if [[ -z "${FLEET_DATABASE_URL:-}" || -z "${TRAWL_DATABASE_URL:-}" ]]; then
+    command -v op >/dev/null || die "1password cli (op) not found — install from 1password.com/downloads/mac"
+    command -v jq >/dev/null || die "jq not found (url-encodes db creds). install with 'brew install jq'."
+    op whoami >/dev/null 2>&1 || die "not signed in to 1password — run 'op signin' first"
+fi
+[[ -n "${FLEET_DATABASE_URL:-}" ]] || FLEET_DATABASE_URL="$(dsn_from_op fleet_dev fleet_dev)"
+[[ -n "${TRAWL_DATABASE_URL:-}" ]] || TRAWL_DATABASE_URL="$(dsn_from_op trawl_dev trawl_dev)"
+export FLEET_DATABASE_URL TRAWL_DATABASE_URL
+
 coastwatch_dir="$repo_root/../coastwatch"
 
 printf 'bin/dev: building trawl bins...\n'
-cargo build -p trawl-server -p trawl-web
+cargo build -p trawl-server -p trawl-web -p fleet-admin
 
-mprocs_config="$repo_root/mprocs.yaml"
+# fleet-admin owns the bare DATABASE_URL variable (trawld never reads it) —
+# scope it per invocation rather than exporting. migrate is idempotent;
+# trawld boot-migrates the trawl app-state db itself, so fleet is the only
+# schema handled here.
+printf 'bin/dev: applying fleet-auth migrations to fleet_dev...\n'
+DATABASE_URL="$FLEET_DATABASE_URL" cargo run -q -p fleet-admin -- migrate \
+    || die "fleet-admin migrate failed — cnpg dev reachable?"
+
+# Bootstrap a dev api key for the SPA login form and CLI. Mirrors
+# coastwatch/bin/dev's ~/.coastwatch/dev-api-key: persisted under $HOME so
+# it survives `cargo clean` and never touches the working tree. Granted
+# trawl:admin (not analyst) so the one dev key also reaches the admin-only
+# dashboard route.
+dev_key_file="${HOME}/.trawl/dev-api-key"
+if [[ ! -s "$dev_key_file" ]]; then
+    printf 'bin/dev: minting dev api key via fleet-admin (human/trawl:admin)...\n'
+    minted=$(DATABASE_URL="$FLEET_DATABASE_URL" cargo run -q -p fleet-admin -- \
+        keys create --name "trawl-dev-$(whoami)" --kind human --grant trawl:admin) \
+        || die "fleet-admin keys create failed"
+    mkdir -p "${HOME}/.trawl"
+    umask 077
+    printf '%s' "$minted" > "$dev_key_file"
+    chmod 600 "$dev_key_file"
+    printf 'bin/dev: stored dev api key at %s\n' "$dev_key_file"
+fi
+
+emit_procs_yaml() {
+    cat <<YAML
+procs:
+  trawld:
+    shell: cargo run -p trawl-server --bin trawld
+  trawl-web:
+    shell: cargo run -p trawl-web
+  trunk:
+    shell: trunk serve
+    cwd: crates/trawl-web-ui
+YAML
+    # `exec mprocs` enters the alternate screen and wipes pre-launch output,
+    # so surface the login token as a self-exiting info pane. The token is
+    # read from the cache file when the pane launches — never baked into
+    # this yaml (which lands in a mktemp file).
+    if [[ -s "$dev_key_file" ]]; then
+        cat <<YAML
+  trawl-login:
+    shell: echo "paste this api key into http://127.0.0.1:8080/login:"; echo; cat "${dev_key_file}"
+YAML
+    fi
+}
+
 cleanup_paths=()
 cleanup() {
     for p in "${cleanup_paths[@]}"; do
@@ -52,6 +134,10 @@ cleanup() {
     done
 }
 trap cleanup EXIT
+
+mprocs_config="$(mktemp "${TMPDIR:-/tmp}/trawl-dev-mprocs.XXXXXX.yaml")"
+cleanup_paths+=("$mprocs_config")
+emit_procs_yaml > "$mprocs_config"
 
 if $with_coastwatch; then
     [[ -d "$coastwatch_dir" ]] || die "coastwatch repo not found at $coastwatch_dir"
@@ -62,24 +148,9 @@ if $with_coastwatch; then
         || die "coastwatch/bin/dev --joined-mprocs failed"
     cleanup_paths+=("$coastwatch_yaml")
 
-    merged="$(mktemp "${TMPDIR:-/tmp}/trawl-dev-mprocs.XXXXXX.yaml")"
-    cleanup_paths+=("$merged")
-
-    # merge trawl's procs and coastwatch's procs under a single `procs:` key.
     # coastwatch emits a self-contained mprocs config with its own `procs:`
     # header — strip that header line, then append the body under trawl's.
-    cat > "$merged" <<YAML
-procs:
-  trawld:
-    shell: cargo run -p trawl-server --bin trawld
-  trawl-web:
-    shell: cargo run -p trawl-web
-  trunk:
-    shell: trunk serve
-    cwd: crates/trawl-web-ui
-YAML
-    awk '!/^procs:[[:space:]]*$/' "$coastwatch_yaml" >> "$merged"
-    mprocs_config="$merged"
+    awk '!/^procs:[[:space:]]*$/' "$coastwatch_yaml" >> "$mprocs_config"
 fi
 
 exec mprocs --config "$mprocs_config"
