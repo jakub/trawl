@@ -317,12 +317,52 @@ pub(crate) async fn execute_scheduled_query(
                     }
                 }
                 Err(e) => {
+                    // A transient app-state DB error (pg restart/failover) left
+                    // the run row stuck at status='running' with no result_path
+                    // recorded. Two things must be undone: the parquet we just
+                    // wrote is orphaned (retention only ever sees recorded
+                    // paths, so it can never reclaim it), and the still-running
+                    // row trips the report_runs_one_running guard, wedging every
+                    // future run of this schedule until the next daemon restart.
                     tracing::error!(
                         event_type = "scheduler_error",
                         run_id,
                         error = %e,
-                        "failed to finish run"
+                        "failed to finish run; removing orphaned result and flipping run to error"
                     );
+                    if let Some(ref relative) = result_path
+                        && remove_result_file(pool.base_dir(), relative)
+                    {
+                        tracing::info!(
+                            event_type = "scheduler_orphan_cleanup",
+                            run_id,
+                            path = %relative,
+                            "finish_run failed; removed orphaned parquet result"
+                        );
+                    }
+                    // Best-effort: flip the wedged row to 'error' so the schedule
+                    // recovers without a restart. If the DB is still down this
+                    // also fails; boot-time cleanup_stale_runs remains the
+                    // backstop.
+                    if let Err(e2) = schedule_store
+                        .finish_run(
+                            run_id,
+                            "error",
+                            duration_ms,
+                            None,
+                            Some(&format!("result persistence failed: {e}")),
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            event_type = "scheduler_error",
+                            run_id,
+                            error = %e2,
+                            "failed to flip wedged run to error; run stays stuck until restart"
+                        );
+                    }
                 }
             }
 
