@@ -95,10 +95,13 @@ transitional file along with the crate.
   shared `fleet_session` cookie makes logout forgeable cross-site (fleet-auth's
   documented caveat: a forged POST to either app's `/api/auth/logout` clears
   the cookie for both). `fleet_auth::session` gains an origin-validation helper
-  with present-only semantics — Origin header present and mismatched against
-  request Host / `shared_domain` suffix → 403; absent → allow (browsers always
-  send Origin cross-site, so the attack is blocked while curl/scripted logins
-  keep working). `fleet_auth::login`/`logout` enforce it by default (safe:
+  with present-only, strictly same-host semantics — Origin header present and
+  its host mismatched against request Host → 403; absent → allow (browsers
+  always send Origin cross-site, so the attack is blocked while curl/scripted
+  logins keep working). The shared cookie's `shared_domain` is deliberately
+  **not** an origin allowlist: a sibling app under the same parent domain is a
+  different origin and is rejected, otherwise a compromised sibling could forge
+  a fleet-wide logout. `fleet_auth::login`/`logout` enforce it by default (safe:
   absent-Origin passes), so coastwatch inherits the fix on rebuild; trawl-web's
   hand-rolled handlers call the same helper.
 - **Upstream auth mapping in the proxy**: trawld 401 (key revoked/expired

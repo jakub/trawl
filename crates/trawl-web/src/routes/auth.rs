@@ -51,10 +51,10 @@ pub struct LoginResponse {
 /// Same present-only semantics as the fleet-auth substrate handlers —
 /// this IS the same `origin_allowed` function they call (ADR-0004
 /// slice 2).
-fn check_origin(state: &AppState, headers: &HeaderMap) -> Result<(), ProxyError> {
+fn check_origin(headers: &HeaderMap) -> Result<(), ProxyError> {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    if origin_allowed(origin, host, state.shared_domain()) {
+    if origin_allowed(origin, host) {
         Ok(())
     } else {
         tracing::warn!(
@@ -71,7 +71,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ProxyError> {
-    check_origin(&state, &headers)?;
+    check_origin(&headers)?;
 
     if req.api_key.trim().is_empty() {
         return Err(ProxyError::BadRequest("api_key is required".into()));
@@ -220,7 +220,7 @@ pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ProxyError> {
-    check_origin(&state, &headers)?;
+    check_origin(&headers)?;
 
     let header_value = state.build_clear_cookie();
     let mut headers = HeaderMap::new();
@@ -663,7 +663,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_allows_same_host_origin_and_sso_sibling() {
+    async fn logout_rejects_sso_sibling_origin_without_clearing() {
+        // Regression (ADR-0004 slice 2): a compromised sibling under the
+        // shared domain — or attacker-hosted content on one — can auto-submit
+        // a plain HTML form POST to trawl's logout endpoint. Its sibling
+        // `Origin` must NOT be trusted just because it lives under the same
+        // parent-domain cookie; the response must be 403 with NO Set-Cookie,
+        // so `fleet_session` is not cleared fleet-wide.
+        let app = routes::build(sso_state("http://unused".into()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/auth/logout")
+            // form-POST content type: no CORS preflight, no response access
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", "https://coastwatch.fleet.test")
+            .header("host", "trawl.fleet.test")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "forged sibling-origin logout must NOT clear the shared cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_allows_same_host_but_rejects_sso_sibling() {
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
@@ -673,7 +700,7 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        // Same-host origin, standalone mode.
+        // Same-host origin, standalone mode → allowed.
         let app = routes::build(test_state(upstream.uri()));
         let req = Request::builder()
             .method("POST")
@@ -686,7 +713,9 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Sibling app under the shared domain, SSO mode.
+        // Sibling app under the SAME shared domain is a DIFFERENT origin and
+        // must be rejected (403, no cookie). Sharing a parent-domain cookie
+        // is not an origin allowlist — see `origin_allowed`.
         let app = routes::build(sso_state(upstream.uri()));
         let req = Request::builder()
             .method("POST")
@@ -697,7 +726,8 @@ mod tests {
             .body(Body::from(r#"{"api_key":"flt_token"}"#))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
     }
 
     /// Returns just the `name=value` pair from a Set-Cookie header, ready

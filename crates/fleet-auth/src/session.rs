@@ -644,27 +644,28 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
 ///   (which send no `Origin`) keep working.
 /// - `origin` host equals the request `host` (ports stripped,
 ///   case-insensitive) → allow.
-/// - `shared_domain` set and the origin host equals it or is a subdomain
-///   of it (dot-boundary suffix match; a leading `.` on the config value
-///   is accepted and ignored per RFC 6265) → allow.
 /// - Malformed `origin` (including the opaque `"null"` origin) → reject,
 ///   fail closed.
 /// - Anything else → reject.
+///
+/// Sharing a parent-domain cookie is **not** an origin allowlist: a
+/// sibling fleet app (`evil.fleet.example` posting to
+/// `trawl.fleet.example/logout`) is a *different* origin and must be
+/// rejected even though both sit under the cookie's `shared_domain`.
+/// Otherwise any compromised sibling — or attacker-hosted content on one —
+/// could auto-submit a form POST that clears `fleet_session` fleet-wide.
+/// So origin validation is strictly same-host; the shared domain governs
+/// only the cookie's `Domain=` attribute, never who may hit auth endpoints.
 ///
 /// Pure string parsing — no request types — so both fleet-auth's own
 /// handlers and thin proxies that only take the `session` feature call
 /// the literally-same function instead of growing diverged copies.
 ///
 /// Note: the exact-host arm trusts the request `Host` header. A reverse
-/// proxy in front MUST forward the original `Host` (or the deployment
-/// must rely on the `shared_domain` arm) or legitimate same-origin
-/// requests will be rejected.
+/// proxy in front MUST forward the original `Host` or legitimate
+/// same-origin requests will be rejected.
 #[must_use]
-pub fn origin_allowed(
-    origin: Option<&str>,
-    host: Option<&str>,
-    shared_domain: Option<&str>,
-) -> bool {
+pub fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
     let Some(origin) = origin else {
         return true;
     };
@@ -672,24 +673,10 @@ pub fn origin_allowed(
         return false;
     };
 
-    if let Some(request_host) = host
-        && origin_host.eq_ignore_ascii_case(strip_port(request_host))
-    {
-        return true;
+    match host {
+        Some(request_host) => origin_host.eq_ignore_ascii_case(strip_port(request_host)),
+        None => false,
     }
-
-    if let Some(domain) = shared_domain {
-        let suffix = domain.trim_start_matches('.');
-        if !suffix.is_empty() {
-            let origin_lower = origin_host.to_ascii_lowercase();
-            let suffix_lower = suffix.to_ascii_lowercase();
-            if origin_lower == suffix_lower || origin_lower.ends_with(&format!(".{suffix_lower}")) {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 /// Extract the host component from an `Origin` header value
@@ -1155,148 +1142,95 @@ mod tests {
     fn origin_absent_is_allowed() {
         // curl / scripted logins / same-origin GET navigations don't send
         // Origin — the check is present-only by design.
-        assert!(origin_allowed(None, Some("trawl.example.com"), None));
-        assert!(origin_allowed(None, None, None));
-        assert!(origin_allowed(None, None, Some(".fleet.lab.ktle.net")));
+        assert!(origin_allowed(None, Some("trawl.example.com")));
+        assert!(origin_allowed(None, None));
     }
 
     #[test]
     fn origin_matching_request_host_is_allowed() {
         assert!(origin_allowed(
             Some("https://trawl.example.com"),
-            Some("trawl.example.com"),
-            None
+            Some("trawl.example.com")
         ));
         // ports are stripped on both sides
         assert!(origin_allowed(
             Some("https://trawl.example.com:8443"),
-            Some("trawl.example.com:8443"),
-            None
+            Some("trawl.example.com:8443")
         ));
         assert!(origin_allowed(
             Some("http://localhost:8090"),
-            Some("localhost:8090"),
-            None
+            Some("localhost:8090")
         ));
         // case-insensitive host comparison
         assert!(origin_allowed(
             Some("https://Trawl.Example.COM"),
-            Some("trawl.example.com"),
-            None
+            Some("trawl.example.com")
         ));
     }
 
     #[test]
-    fn origin_matching_shared_domain_is_allowed() {
-        // exact match on the (dot-stripped) shared domain
-        assert!(origin_allowed(
+    fn sibling_under_shared_domain_is_rejected() {
+        // A parent-domain cookie is NOT an origin allowlist: a sibling
+        // fleet app posting to trawl's auth endpoints is a *different*
+        // origin and must be rejected, even though both live under the
+        // same `shared_domain`. Otherwise a compromised (or
+        // attacker-hosted) sibling could forge a logout that clears
+        // `fleet_session` fleet-wide. This is the ADR-0004-slice-2
+        // regression: origin validation stays strictly same-host.
+        assert!(!origin_allowed(
+            Some("https://evil.fleet.lab.ktle.net"),
+            Some("trawl.fleet.lab.ktle.net")
+        ));
+        // even the bare parent domain is a different host
+        assert!(!origin_allowed(
             Some("https://fleet.lab.ktle.net"),
-            None,
-            Some(".fleet.lab.ktle.net")
-        ));
-        // subdomain of the shared domain
-        assert!(origin_allowed(
-            Some("https://coastwatch.fleet.lab.ktle.net"),
-            Some("trawl.fleet.lab.ktle.net"),
-            Some(".fleet.lab.ktle.net")
-        ));
-        // dotless config form is equivalent per RFC 6265
-        assert!(origin_allowed(
-            Some("https://trawl.fleet.lab.ktle.net"),
-            None,
-            Some("fleet.lab.ktle.net")
-        ));
-        // subdomain with a port
-        assert!(origin_allowed(
-            Some("https://trawl.fleet.lab.ktle.net:8443"),
-            None,
-            Some(".fleet.lab.ktle.net")
+            Some("trawl.fleet.lab.ktle.net")
         ));
     }
 
     #[test]
     fn origin_mismatch_is_rejected() {
-        // no shared_domain: strict same-host mode
+        // strict same-host mode: any other host is rejected
         assert!(!origin_allowed(
             Some("https://evil.example.com"),
-            Some("trawl.example.com"),
-            None
+            Some("trawl.example.com")
         ));
-        // shared_domain set but origin outside it
+        // no Host to match against → fail closed
+        assert!(!origin_allowed(Some("https://trawl.example.com"), None));
+        // suffix forgery: eviltrawl.example.com is NOT trawl.example.com
         assert!(!origin_allowed(
-            Some("https://evil.example.com"),
-            Some("trawl.fleet.lab.ktle.net"),
-            Some(".fleet.lab.ktle.net")
-        ));
-        // no Host and no shared_domain: nothing to match against
-        assert!(!origin_allowed(
-            Some("https://trawl.example.com"),
-            None,
-            None
-        ));
-        // suffix forgery: evilfleet.lab.ktle.net is NOT under
-        // .fleet.lab.ktle.net (the dot boundary must hold)
-        assert!(!origin_allowed(
-            Some("https://evilfleet.lab.ktle.net"),
-            None,
-            Some(".fleet.lab.ktle.net")
+            Some("https://eviltrawl.example.com"),
+            Some("trawl.example.com")
         ));
         // port-only mismatch on the exact-host arm still passes because
         // ports are stripped (Origin comparison is host-scoped here)
         assert!(origin_allowed(
             Some("https://trawl.example.com:9999"),
-            Some("trawl.example.com:8443"),
-            None
+            Some("trawl.example.com:8443")
         ));
     }
 
     #[test]
     fn origin_malformed_is_rejected() {
         // opaque "null" origin (sandboxed iframe, data: URL) — fail closed
-        assert!(!origin_allowed(
-            Some("null"),
-            Some("trawl.example.com"),
-            None
-        ));
+        assert!(!origin_allowed(Some("null"), Some("trawl.example.com")));
         // no scheme
         assert!(!origin_allowed(
             Some("trawl.example.com"),
-            Some("trawl.example.com"),
-            None
+            Some("trawl.example.com")
         ));
         // garbage
-        assert!(!origin_allowed(
-            Some("https://"),
-            Some("trawl.example.com"),
-            None
-        ));
-        assert!(!origin_allowed(Some(""), Some("trawl.example.com"), None));
+        assert!(!origin_allowed(Some("https://"), Some("trawl.example.com")));
+        assert!(!origin_allowed(Some(""), Some("trawl.example.com")));
         // path smuggling: Origin never carries a path
         assert!(!origin_allowed(
             Some("https://evil.com/trawl.example.com"),
-            Some("trawl.example.com"),
-            None
+            Some("trawl.example.com")
         ));
         // userinfo smuggling
         assert!(!origin_allowed(
             Some("https://trawl.example.com@evil.com"),
-            Some("trawl.example.com"),
-            None
-        ));
-    }
-
-    #[test]
-    fn origin_empty_shared_domain_never_matches() {
-        // An empty or dot-only shared_domain must not become a wildcard.
-        assert!(!origin_allowed(
-            Some("https://evil.example.com"),
-            None,
-            Some("")
-        ));
-        assert!(!origin_allowed(
-            Some("https://evil.example.com"),
-            None,
-            Some(".")
+            Some("trawl.example.com")
         ));
     }
 

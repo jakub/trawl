@@ -73,7 +73,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    if let Some(resp) = reject_cross_origin(&headers, &state, "login") {
+    if let Some(resp) = reject_cross_origin(&headers, "login") {
         return resp;
     }
     let api_key = req.api_key;
@@ -177,11 +177,12 @@ pub async fn login(
 /// would clear the shared cookie and sign the user out of every sibling
 /// app. Both `login` and `logout` therefore validate the `Origin` header
 /// by default via [`origin_allowed`] (ADR-0004 slice 2): a present Origin
-/// that matches neither the request `Host` nor the configured cookie
-/// domain (exact or subdomain) → 403 with NO `Set-Cookie`. Absent Origin
-/// is allowed, so curl/scripted clients are unaffected.
+/// whose host doesn't match the request `Host` → 403 with NO `Set-Cookie`.
+/// Sharing a parent-domain cookie is deliberately NOT an origin allowlist —
+/// a sibling app is a different origin and is rejected. Absent Origin is
+/// allowed, so curl/scripted clients are unaffected.
 pub async fn logout(State(state): State<SessionState>, headers: HeaderMap) -> Response {
-    if let Some(resp) = reject_cross_origin(&headers, &state, "logout") {
+    if let Some(resp) = reject_cross_origin(&headers, "logout") {
         return resp;
     }
     let cfg = state.config();
@@ -205,17 +206,14 @@ pub async fn logout(State(state): State<SessionState>, headers: HeaderMap) -> Re
     (StatusCode::NO_CONTENT, headers).into_response()
 }
 
-/// Run the present-only Origin check against the request headers and the
-/// app's configured cookie domain. Returns `Some(403)` when the request
-/// must be rejected, `None` when the handler may proceed.
-fn reject_cross_origin(
-    headers: &HeaderMap,
-    state: &SessionState,
-    handler: &str,
-) -> Option<Response> {
+/// Run the present-only, strictly same-host Origin check against the
+/// request headers. Returns `Some(403)` when the request must be rejected,
+/// `None` when the handler may proceed. The cookie's shared domain is
+/// deliberately NOT an origin allowlist — see [`origin_allowed`].
+fn reject_cross_origin(headers: &HeaderMap, handler: &str) -> Option<Response> {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    if origin_allowed(origin, host, state.config().domain()) {
+    if origin_allowed(origin, host) {
         return None;
     }
     tracing::warn!(
