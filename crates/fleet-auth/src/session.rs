@@ -1225,6 +1225,14 @@ mod tests {
             Some("https://Trawl.Example.COM"),
             Some("trawl.example.com")
         ));
+        // bracketed IPv6 literal: the port is stripped inside the brackets on
+        // both sides, so `[::1]:8090` matches. Pins strip_port's IPv6 branch —
+        // a naive rsplit_once(':') rewrite would flip this to false and 403
+        // IPv6 localhost/homelab logins with no other failing test.
+        assert!(origin_allowed(
+            Some("http://[::1]:8090"),
+            Some("[::1]:8090")
+        ));
     }
 
     #[test]
@@ -1260,6 +1268,12 @@ mod tests {
         assert!(!origin_allowed(
             Some("https://eviltrawl.example.com"),
             Some("trawl.example.com")
+        ));
+        // distinct bracketed IPv6 literals must not match once ports are
+        // stripped inside the brackets (::2 != ::1)
+        assert!(!origin_allowed(
+            Some("http://[::2]:8090"),
+            Some("[::1]:8090")
         ));
         // port-only mismatch on the exact-host arm still passes because
         // ports are stripped (Origin comparison is host-scoped here)
