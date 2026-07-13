@@ -40,8 +40,8 @@ pub fn Login() -> impl IntoView {
     });
 
     // brand_accent="" (not the topbar's "_"): the pre-migration login
-    // h1 was plain amber "trawl" with no accent glyph, and zero visual
-    // change is the contract. The empty amber span renders nothing.
+    // h1 was plain accent "trawl" with no accent glyph, and zero visual
+    // change is the contract. The empty accent span renders nothing.
     view! {
         <fleet_ui::Login
             brand="trawl"

@@ -193,14 +193,14 @@ fn segmented_emits_one_strip_family_with_a_single_active_treatment() {
     emits(SEGMENTED_CLASS, r#"String::from("seg")"#, ".seg");
     emits(SEGMENTED, r#"class="seg-opt""#, ".seg .seg-opt");
     emits(SEGMENTED, "class:on", ".seg .seg-opt.on");
-    // ADR-0003: ONE amber-wash active treatment. The size axis must not
+    // ADR-0003: ONE accent-wash active treatment. The size axis must not
     // grow its own active rule — exactly one `.seg-opt.on` declaration
     // ships in the stylesheet.
     let active_rules = FLEET_CSS.matches(".seg-opt.on").count();
     assert_eq!(
         active_rules, 1,
         "expected exactly one `.seg-opt.on` active rule in fleet-ui.css \
-         (single amber-wash treatment across sizes), found {active_rules}"
+         (single accent-wash treatment across sizes), found {active_rules}"
     );
 }
 

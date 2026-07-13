@@ -20,7 +20,7 @@ pub fn Sparkline(
     /// Sample values, left-to-right chronological.
     data: Vec<u64>,
     /// Stroke/fill color (CSS). Fill is applied at 10% opacity.
-    #[prop(into, default = "var(--amber)".to_string())]
+    #[prop(into, default = "var(--accent)".to_string())]
     color: String,
     #[prop(default = 120)] w: u32,
     #[prop(default = 22)] h: u32,

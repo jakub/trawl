@@ -41,7 +41,7 @@ use fleet_ui::status_dot::{StatusTone, dot_class};
 /// families but deliberately does not load them.
 const FONT_LINKS: &str = r#"<link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"/>"#;
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600;700&family=Fira+Code:wght@400;500;600;700&display=swap"/>"#;
 
 /// Gallery scaffolding: the light/dark split, section headings, swatch
 /// grid, and neutralizers for fleet's fixed-position overlay/toast
@@ -74,7 +74,7 @@ body { margin: 0; font-family: var(--font-ui); }
   display: flex; align-items: center; justify-content: center;
   font-size: 10px; font-family: var(--font-mono); color: var(--ink-3);
 }
-.ds-spacebar { background: var(--amber-wash); border: 1px solid var(--amber); height: 14px; }
+.ds-spacebar { background: var(--accent-wash); border: 1px solid var(--accent); height: 14px; }
 /* Fleet's overlay/toast/drawer hosts are position:fixed full-viewport;
  * pin them into the pane flow so both themes show in one card. */
 .ds-pane .modal-scrim { position: static; padding: 24px 0; }
@@ -293,15 +293,15 @@ fn heading(text: &str) -> String {
 fn tokens_card() -> Card {
     let surface_tokens = ["--bg", "--panel", "--panel-2", "--panel-3"];
     let ink_tokens = ["--ink", "--ink-2", "--ink-3", "--ink-4"];
-    let line_tokens = ["--line", "--line-2", "--selection", "--amber-glow"];
+    let line_tokens = ["--line", "--line-2", "--selection", "--accent-glow"];
     let semantic_tokens = [
-        "--amber",
+        "--accent",
         "--teal",
         "--red",
         "--yellow",
         "--green",
         "--blue",
-        "--amber-wash",
+        "--accent-wash",
         "--red-wash",
     ];
 
@@ -318,11 +318,14 @@ fn tokens_card() -> Card {
     };
 
     let type_specimens = r#"
-<p class="ds-type" style="font-size:16px; font-weight:600">Heading — Inter 600 / 16px</p>
-<p class="ds-type" style="font-size:13px">Body — Inter 400 / 13px</p>
-<p class="ds-type" style="font-size:11px; color:var(--ink-3)">Caption — Inter 400 / 11px</p>
-<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--editor-fs)">Editor mono — JetBrains Mono / var(--editor-fs)</p>
-<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--table-fs)">Table mono — JetBrains Mono / var(--table-fs)</p>"#;
+<p class="ds-type" style="font-size:var(--fs-title); font-weight:600">Title — Open Sans 600 / var(--fs-title)</p>
+<p class="ds-type" style="font-size:var(--fs-section); font-weight:600">Section — Open Sans 600 / var(--fs-section)</p>
+<p class="ds-type" style="font-size:var(--fs-base)">Body — Open Sans 400 / var(--fs-base)</p>
+<p class="ds-type" style="font-size:var(--fs-control)">Control — Open Sans 400 / var(--fs-control)</p>
+<p class="ds-type" style="font-size:var(--fs-label)">Label — Open Sans 400 / var(--fs-label)</p>
+<p class="ds-type" style="font-size:var(--fs-small); color:var(--ink-3)">Small — Open Sans 400 / var(--fs-small)</p>
+<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--editor-fs)">Editor mono — Fira Code / var(--editor-fs)</p>
+<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--table-fs)">Table mono — Fira Code / var(--table-fs)</p>"#;
 
     let spacing_bars: String = ["--row-pad-y", "--row-pad-x", "--ui-gap", "--pad", "--row-h"]
         .iter()
@@ -449,7 +452,7 @@ fn feedback_card() -> Card {
 
     let toast = |kind: &str, title: &str, detail: &str| {
         format!(
-            r#"<div class="toast {kind}"><div class="body"><div class="title">{title}</div><div class="detail">{detail}</div></div><span class="x">{close}</span></div>"#,
+            r#"<div class="toast {kind}"><div class="toast-body"><div class="title">{title}</div><div class="detail">{detail}</div></div><span class="x">{close}</span></div>"#,
             close = close_icon()
         )
     };
@@ -681,7 +684,7 @@ fn data_card() -> Card {
         "{}{}{}",
         sparkline(
             &[3, 7, 4, 12, 9, 15, 11, 18, 14, 9],
-            "var(--amber)",
+            "var(--accent)",
             120,
             22
         ),
@@ -776,7 +779,7 @@ fn reason_modal_card() -> Card {
 fn login_card() -> Card {
     let submit = btn_full(Variant::Form, Size::Default, true, "Sign In", false);
     let body = format!(
-        r#"{h}<div class="login-shell"><form class="login-card"><h1><span>traw</span><span class="amber">l</span></h1><p class="subtitle">sign in with your API key</p><label class="field"><span>API key</span><input type="password" autocomplete="off" spellcheck="false"/></label>{submit}</form></div>"#,
+        r#"{h}<div class="login-shell"><form class="login-card"><h1><span>traw</span><span class="accent">l</span></h1><p class="subtitle">sign in with your API key</p><label class="field"><span>API key</span><input type="password" autocomplete="off" spellcheck="false"/></label>{submit}</form></div>"#,
         h = heading("Login"),
     );
 
@@ -792,7 +795,7 @@ fn login_card() -> Card {
 fn chrome_card() -> Card {
     let modes = r#"<div class="modes"><a class="mode active"><span class="dot"></span><span>Search</span></a><a class="mode"><span class="dot"></span><span>Dashboards</span></a><a class="mode"><span class="dot"></span><span>Sources</span></a></div>"#;
     let topbar = format!(
-        r#"<div class="topbar"><div class="brand"><span>traw</span><span class="amber">l</span></div>{modes}<div class="sp"></div><div class="jump">{search}<span class="gh">Jump to query, source, dashboard…</span><span class="kbd">⌘K</span></div><div class="env"><span class="pulse"></span><span>session</span></div><div class="iconbtn">{bell}</div><div class="user-wrap"><div class="user"><div class="avatar">JB</div><span class="who">jakub</span>{chevron}</div></div></div>"#,
+        r#"<div class="topbar"><div class="brand"><span>traw</span><span class="accent">l</span></div>{modes}<div class="sp"></div><div class="jump">{search}<span class="gh">Jump to query, source, dashboard…</span><span class="kbd">⌘K</span></div><div class="env"><span class="pulse"></span><span>session</span></div><div class="iconbtn">{bell}</div><div class="user-wrap"><div class="user"><div class="avatar">JB</div><span class="who">jakub</span>{chevron}</div></div></div>"#,
         search = search_icon(),
         bell = icon_svg(
             14,

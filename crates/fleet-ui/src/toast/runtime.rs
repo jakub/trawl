@@ -7,6 +7,11 @@
 //! Toasts auto-dismiss after 4.5s via a `gloo_timers::future::TimeoutFuture`
 //! launched per push. Border-left color encodes the kind — the class
 //! mapping lives on [`ToastKind::as_class`] so it's testable natively.
+//!
+//! The title+detail wrapper is `toast-body`, NOT `body`: `.body` is a
+//! reserved Shell chrome class (the rail+main row), and its
+//! `display: flex` leaked into toasts when they shared the name,
+//! flattening title and detail onto one line.
 
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
@@ -104,7 +109,7 @@ pub fn Toasts(bus: ToastBus) -> impl IntoView {
                     let cls = format!("toast {}", t.kind.as_class());
                     view! {
                         <div class=cls>
-                            <div class="body">
+                            <div class="toast-body">
                                 <div class="title">{t.title}</div>
                                 {t.detail.map(|d| view! { <div class="detail">{d}</div> })}
                             </div>

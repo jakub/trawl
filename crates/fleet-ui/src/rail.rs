@@ -18,7 +18,7 @@ fn item_class(active: bool) -> &'static str {
 
 /// A single item in the rail. `path` is the route navigated to on
 /// click; `id` is the discriminant the parent compares against the
-/// `active` signal to drive the amber-bar styling.
+/// `active` signal to drive the accent-bar styling.
 ///
 /// `badge` is an optional count chip (unread stories, pending
 /// editions…). Like `ModeTab.active`, it's a plain value — callers

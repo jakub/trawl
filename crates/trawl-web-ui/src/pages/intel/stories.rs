@@ -188,7 +188,7 @@ pub fn StoriesPage() -> impl IntoView {
 
 pub(crate) fn state_badge(s: &str) -> (&'static str, &'static str) {
     match s.parse::<StoryState>() {
-        Ok(StoryState::Emerging) => ("emerging", "--amber"),
+        Ok(StoryState::Emerging) => ("emerging", "--yellow"),
         Ok(StoryState::Active) => ("active", "--green"),
         Ok(StoryState::Monitoring) => ("monitoring", "--teal"),
         Ok(StoryState::Closed) => ("closed", "--ink-3"),

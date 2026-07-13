@@ -40,7 +40,7 @@ pub(crate) fn tone_for_var(var: &str) -> fleet_ui::Tone {
     match var {
         "--green" => fleet_ui::Tone::Success,
         "--red" => fleet_ui::Tone::Danger,
-        "--amber" | "--yellow" => fleet_ui::Tone::Warn,
+        "--yellow" => fleet_ui::Tone::Warn,
         "--blue" | "--teal" => fleet_ui::Tone::Info,
         _ => fleet_ui::Tone::Neutral,
     }
@@ -71,7 +71,6 @@ mod tests {
     fn tone_for_var_maps_known_vars() {
         assert_eq!(tone_for_var("--green"), fleet_ui::Tone::Success);
         assert_eq!(tone_for_var("--red"), fleet_ui::Tone::Danger);
-        assert_eq!(tone_for_var("--amber"), fleet_ui::Tone::Warn);
         assert_eq!(tone_for_var("--yellow"), fleet_ui::Tone::Warn);
         assert_eq!(tone_for_var("--blue"), fleet_ui::Tone::Info);
         // Sanctioned narrowing (ADR-0003): teal collapses onto Info.
