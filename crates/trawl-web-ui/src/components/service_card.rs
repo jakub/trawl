@@ -56,7 +56,7 @@ pub fn ServiceCard(
         .rev()
         .collect();
     let spark_color = if healthy {
-        "var(--amber)"
+        "var(--accent)"
     } else {
         "var(--red)"
     };

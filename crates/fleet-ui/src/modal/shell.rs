@@ -41,7 +41,7 @@ use crate::icon::{Icon, IconView};
 ///
 /// `role` should be `"dialog"` (default) or `"alertdialog"` for
 /// confirm-style interruptions. `narrow` adds `modal-sm` (380px vs
-/// 460px). `icon` renders the amber header chip (`m-hd .ic`).
+/// 460px). `icon` renders the accent header chip (`m-hd .ic`).
 #[component]
 pub fn Modal(
     title: &'static str,

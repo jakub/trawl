@@ -252,7 +252,7 @@ fn DateRangePopover(
                         </div>
                     </div>
                     <div class="foot">
-                        <div class="summary">"bucket: " <span class="amber">"auto · 1m"</span></div>
+                        <div class="summary">"bucket: " <span class="accent">"auto · 1m"</span></div>
                         <div class="btns">
                             <Btn
                                 variant=Variant::Secondary

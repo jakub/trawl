@@ -8,7 +8,7 @@
 //! modal's `.fmt-btn` row, the schema page's `.seg-mini` density
 //! toggle, and the date-range popover's mini tab strip) onto ONE
 //! canonical treatment (ADR-0003): a bordered pill group with a single
-//! amber-wash active style, `.seg > button.seg-opt(.on)` in
+//! accent-wash active style, `.seg > button.seg-opt(.on)` in
 //! fleet-ui.css.
 //!
 //! Option identity is a `&'static str` id; apps with typed enums adapt

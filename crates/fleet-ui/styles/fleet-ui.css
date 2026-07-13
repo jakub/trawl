@@ -82,11 +82,11 @@
   --line-2:    #e8eaee;
   --selection: rgba(42,92,138,.20);
 
-  --amber:     #2a5c8a;
-  --amber-2:   color-mix(in oklab, #2a5c8a 80%, #000);
-  --amber-soft:#7ea6cc;
-  --amber-glow:rgba(42,92,138,.28);
-  --amber-wash:rgba(42,92,138,.10);
+  --accent:     #2a5c8a;
+  --accent-2:   color-mix(in oklab, #2a5c8a 80%, #000);
+  --accent-soft:#7ea6cc;
+  --accent-glow:rgba(42,92,138,.28);
+  --accent-wash:rgba(42,92,138,.10);
 
   --teal:       #0e8b7a;
   --teal-wash:  rgba(14,139,122,.10);
@@ -102,7 +102,7 @@
   --shadow-1:    0 1px 0 rgba(0,0,0,.03);
   --shadow-2:    0 1px 2px rgba(0,0,0,.06), 0 2px 6px rgba(0,0,0,.04);
   --shadow-3:    0 4px 16px rgba(0,0,0,.08), 0 1px 3px rgba(0,0,0,.06);
-  --shadow-glow: 0 0 0 3px var(--amber-glow);
+  --shadow-glow: 0 0 0 3px var(--accent-glow);
 }
 
 /* Dark mirror of the slate/blue pass — derived, not from the workbench
@@ -123,11 +123,11 @@
   --line-2:    #1c212b;
   --selection: rgba(90,159,212,.24);
 
-  --amber:     #5a9fd4;
-  --amber-2:   color-mix(in oklab, #5a9fd4 80%, #000);
-  --amber-soft:#8fb8dc;
-  --amber-glow:rgba(90,159,212,.30);
-  --amber-wash:rgba(90,159,212,.12);
+  --accent:     #5a9fd4;
+  --accent-2:   color-mix(in oklab, #5a9fd4 80%, #000);
+  --accent-soft:#8fb8dc;
+  --accent-glow:rgba(90,159,212,.30);
+  --accent-wash:rgba(90,159,212,.12);
 
   --teal:       #4ec9b0;
   --teal-wash:  rgba(78,201,176,.12);
@@ -143,7 +143,7 @@
   --shadow-1:    0 1px 0 rgba(0,0,0,.3);
   --shadow-2:    0 1px 2px rgba(0,0,0,.4), 0 2px 6px rgba(0,0,0,.3);
   --shadow-3:    0 4px 16px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
-  --shadow-glow: 0 0 0 3px var(--amber-glow);
+  --shadow-glow: 0 0 0 3px var(--accent-glow);
 }
 
 :root {
@@ -215,7 +215,7 @@ body {
 button { font: inherit; }
 ::selection { background: var(--selection); }
 
-/* Focus ring — amber glow, never browser blue. */
+/* Focus ring — accent glow, never browser blue. */
 button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
@@ -284,7 +284,7 @@ textarea:focus-visible,
 .field input:focus {
   outline: none;
   box-shadow: var(--shadow-glow);
-  border-color: var(--amber);
+  border-color: var(--accent);
 }
 
 .field .field-hint {
@@ -305,8 +305,8 @@ textarea:focus-visible,
 
 /* ─────────────────────────────────────────────────────────────────
  *  Buttons
- *  - .btn        is the large amber primary (login-page form)
- *  - .btn-pri    is the compact amber primary (modal footers, toolbars)
+ *  - .btn        is the large accent primary (login-page form)
+ *  - .btn-pri    is the compact accent primary (modal footers, toolbars)
  *  - .btn-sec    is the neutral secondary
  *  - .btn-danger is the destructive variant (NEW — closes the dangling
  *                reference that existed in confirm_modal.rs before
@@ -316,9 +316,9 @@ textarea:focus-visible,
 .btn {
   display: inline-block;
   padding: 8px 18px;
-  background: var(--amber);
+  background: var(--accent);
   color: #fff;
-  border: 1px solid var(--amber-2);
+  border: 1px solid var(--accent-2);
   border-radius: 3px;
   font-family: var(--font-ui);
   font-weight: 600;
@@ -327,7 +327,7 @@ textarea:focus-visible,
   box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 0 rgba(0,0,0,.06);
   transition: scale 150ms ease-out;
 }
-.btn:hover { background: var(--amber-2); }
+.btn:hover { background: var(--accent-2); }
 .btn:active:not(:disabled) { scale: 0.96; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-full { width: 100%; }
@@ -350,14 +350,14 @@ textarea:focus-visible,
   font-size: var(--fs-control);
   font-weight: 600;
   font-family: var(--font-ui);
-  background: var(--amber);
+  background: var(--accent);
   color: #fff;
-  border: 1px solid var(--amber-2);
+  border: 1px solid var(--accent-2);
   border-radius: 2px;
   cursor: pointer;
   transition: scale 150ms ease-out;
 }
-.btn-pri:hover { background: var(--amber-2); }
+.btn-pri:hover { background: var(--accent-2); }
 .btn-pri:active:not(:disabled) { scale: 0.96; }
 .btn-pri:disabled { opacity: .5; cursor: not-allowed; }
 
@@ -397,8 +397,8 @@ textarea:focus-visible,
   cursor: pointer;
 }
 .btn-sm:hover:not(:disabled) {
-  border-color: var(--amber);
-  color: var(--amber);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .btn-sm:disabled {
   opacity: 0.4;
@@ -447,8 +447,8 @@ textarea:focus-visible,
  * prop (moved from trawl's main.css, issue #28). */
 .modal .m-hd .ic {
   width: 22px; height: 22px; display: grid; place-items: center;
-  color: var(--amber);
-  background: var(--amber-wash); border-radius: 3px;
+  color: var(--accent);
+  background: var(--accent-wash); border-radius: 3px;
 }
 .modal .m-hd .t {
   flex: 1; font-family: var(--font-ui); font-size: var(--fs-base); font-weight: 600;
@@ -485,7 +485,7 @@ textarea:focus-visible,
   color: var(--ink); outline: none; height: 30px;
 }
 .modal .m-field input:focus {
-  border-color: var(--amber); box-shadow: 0 0 0 3px var(--amber-glow);
+  border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow);
 }
 
 .reason-input {
@@ -496,8 +496,8 @@ textarea:focus-visible,
   resize: vertical;
 }
 .reason-input:focus {
-  outline: none; box-shadow: 0 0 0 3px var(--amber-glow);
-  border-color: var(--amber);
+  outline: none; box-shadow: 0 0 0 3px var(--accent-glow);
+  border-color: var(--accent);
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -529,7 +529,7 @@ textarea:focus-visible,
   font-family: var(--font-ui);
 }
 .tabs .t:hover { color: var(--ink-2); }
-.tabs .t.active { color: var(--ink); border-bottom-color: var(--amber); font-weight: 500; }
+.tabs .t.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 500; }
 .tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: var(--fs-small); }
 .tabs .sp { flex: 1; }
 
@@ -585,7 +585,7 @@ textarea:focus-visible,
   transition: color 100ms, border-color 100ms;
 }
 .sd-tabs .tb:hover { color: var(--ink-2); }
-.sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--amber); font-weight: 600; }
+.sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
 .sd-tabs .sp { flex: 1; }
 .sd-tabs .meta { font-size: var(--fs-small); color: var(--ink-3); padding-right: 4px; }
 
@@ -610,7 +610,7 @@ textarea:focus-visible,
   max-width: 380px;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-left: 3px solid var(--amber);
+  border-left: 3px solid var(--accent);
   border-radius: 3px;
   padding: 13px 15px;
   display: flex;
@@ -675,7 +675,7 @@ textarea:focus-visible,
 .login-card h1 {
   margin: 0 0 20px 0;
   font-size: var(--fs-title);
-  color: var(--amber);
+  color: var(--accent);
   font-weight: var(--title-weight);
   text-transform: var(--title-transform);
   letter-spacing: var(--title-spacing);
@@ -728,9 +728,9 @@ textarea:focus-visible,
   letter-spacing: -.2px;
   color: var(--ink);
 }
-.topbar .brand .amber {
-  color: var(--amber);
-  text-shadow: 0 0 8px var(--amber-glow);
+.topbar .brand .accent {
+  color: var(--accent);
+  text-shadow: 0 0 8px var(--accent-glow);
 }
 
 .topbar .modes { display: flex; gap: 0; margin-left: 4px; }
@@ -758,7 +758,7 @@ textarea:focus-visible,
   border-radius: 50%;
   background: transparent;
 }
-.topbar .mode.active .dot { background: var(--amber); }
+.topbar .mode.active .dot { background: var(--accent); }
 
 .topbar .sp { flex: 1; }
 
@@ -839,7 +839,7 @@ textarea:focus-visible,
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  background: var(--amber);
+  background: var(--accent);
   color: #fff;
   display: grid;
   place-items: center;
@@ -947,7 +947,7 @@ textarea:focus-visible,
   font-weight: 500;
 }
 .rail .it:hover { color: var(--ink); background: var(--panel-2); }
-.rail .it.active { color: var(--amber); }
+.rail .it.active { color: var(--accent); }
 .rail .it.active::before {
   content: "";
   position: absolute;
@@ -955,8 +955,8 @@ textarea:focus-visible,
   top: 8px;
   bottom: 8px;
   width: 2px;
-  background: var(--amber);
-  box-shadow: 0 0 6px var(--amber-glow);
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow);
 }
 /* Count chip — RailItem.badge. Anchored to the item's top-right
  * corner (the .it is position: relative). */
@@ -967,8 +967,8 @@ textarea:focus-visible,
   min-width: 15px;
   padding: 1px 4px;
   border-radius: 8px;
-  background: var(--amber-wash);
-  color: var(--amber);
+  background: var(--accent-wash);
+  color: var(--accent);
   font-family: var(--font-mono);
   font-size: 9px;
   font-weight: 600;
@@ -1012,7 +1012,7 @@ textarea:focus-visible,
 .bdg.warn    { background: var(--yellow-wash);color: var(--yellow); }
 .bdg.danger  { background: var(--red-wash);  color: var(--red); }
 
-/* Segmented — <Segmented/>. One active treatment: amber wash. */
+/* Segmented — <Segmented/>. One active treatment: accent wash. */
 .seg {
   display: inline-flex; background: var(--panel-2);
   border: 1px solid var(--line); border-radius: 4px;
@@ -1030,8 +1030,8 @@ textarea:focus-visible,
 .seg .seg-opt:last-child { border-right: none; }
 .seg .seg-opt:hover { color: var(--ink-2); }
 .seg .seg-opt.on {
-  background: var(--amber-wash);
-  color: var(--amber);
+  background: var(--accent-wash);
+  color: var(--accent);
   font-weight: 600;
 }
 .seg-sm .seg-opt { padding: 4px 9px; font-size: var(--fs-small); }
@@ -1073,7 +1073,7 @@ textarea:focus-visible,
 }
 .status-dot.success { background: var(--green);  box-shadow: 0 0 0 2px color-mix(in oklab, var(--green) 25%, transparent); }
 .status-dot.error   { background: var(--red);    box-shadow: 0 0 0 2px color-mix(in oklab, var(--red) 25%, transparent); }
-.status-dot.running { background: var(--amber);  box-shadow: 0 0 0 2px color-mix(in oklab, var(--amber) 25%, transparent); animation: dot-pulse 1.6s ease-in-out infinite; }
+.status-dot.running { background: var(--accent);  box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 25%, transparent); animation: dot-pulse 1.6s ease-in-out infinite; }
 @keyframes dot-pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
 
 /* Toggle — <Toggle/> (moved verbatim from trawl's main.css). */
@@ -1091,7 +1091,7 @@ textarea:focus-visible,
   width: 14px; height: 14px; border-radius: 50%;
   background: var(--panel); transition: transform 200ms;
 }
-.toggle input:checked + .toggle-slider { background: var(--amber); }
+.toggle input:checked + .toggle-slider { background: var(--accent); }
 .toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
 
 /* Kbd — <Kbd/>. `.kbd` moved verbatim from trawl's main.css (the

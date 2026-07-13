@@ -52,7 +52,7 @@ pub fn Login(
         <div class="login-shell">
             <form class="login-card" on:submit=on_form_submit>
                 <h1>
-                    <span>{brand}</span><span class="amber">{brand_accent}</span>
+                    <span>{brand}</span><span class="accent">{brand_accent}</span>
                 </h1>
                 <p class="subtitle">"sign in with your API key"</p>
 

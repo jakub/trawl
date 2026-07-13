@@ -40,7 +40,7 @@ pub fn can_write_derivations(role: &str) -> bool {
 
 pub(crate) fn transformation_color(t: &str) -> &'static str {
     match t {
-        "redaction" => "--amber",
+        "redaction" => "--yellow",
         "indicator_extraction" => "--blue",
         "summarization" => "--green",
         "aggregation" => "--teal",

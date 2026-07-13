@@ -79,7 +79,7 @@ pub fn TopBar(
     view! {
         <div class="topbar">
             <div class="brand">
-                <span>{brand}</span><span class="amber">{brand_accent}</span>
+                <span>{brand}</span><span class="accent">{brand_accent}</span>
             </div>
 
             <div class="modes">

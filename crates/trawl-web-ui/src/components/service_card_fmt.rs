@@ -180,10 +180,10 @@ pub fn type_bucket(data_type: &str) -> (&'static str, &'static str, &'static str
         || t == "SMALLINT"
         || t == "TINYINT"
     {
-        return ("INT", "var(--amber-2)", "tp-bigint");
+        return ("INT", "var(--accent-2)", "tp-bigint");
     }
     if t == "DOUBLE" || t == "FLOAT" || t == "REAL" || t == "DECIMAL" {
-        return ("NUM", "var(--amber-soft)", "tp-float");
+        return ("NUM", "var(--accent-soft)", "tp-float");
     }
     if t == "BOOLEAN" || t == "BOOL" {
         return ("BOOL", "var(--teal)", "tp-bool");

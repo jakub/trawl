@@ -22,7 +22,7 @@ pub enum Variant {
     Primary,
     Secondary,
     Danger,
-    /// The large amber form primary (bare `.btn`) — the login page's
+    /// The large accent form primary (bare `.btn`) — the login page's
     /// submit button. Distinct from [`Variant::Primary`], which is the
     /// compact `.btn-pri` used in modal footers and toolbars.
     Form,

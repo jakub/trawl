@@ -172,7 +172,7 @@ fn StoryHeader(
     let updated_ago = time_ago(&updated_at, now_ms);
 
     view! {
-        <div class="page-hd compact" style="border-left:2px solid var(--amber)">
+        <div class="page-hd compact" style="border-left:2px solid var(--accent)">
             <div style="display:flex;flex-direction:column;gap:6px">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                     <h1 style="margin:0">{title}</h1>
@@ -391,7 +391,7 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                             let (delta_label, delta_color) = delta_badge(&ev.delta_type);
                             let material_class = if ev.material { "v-timeline-node material" } else { "v-timeline-node" };
                             let origin_color = match ev.origin.as_str() {
-                                "analyst" => "--amber",
+                                "analyst" => "--yellow",
                                 "backfill" => "--ink-4",
                                 _ => "--ink-3",
                             };
@@ -805,7 +805,7 @@ fn claim_row(
         row_style.push_str("background:var(--red-wash);");
     }
     if claim.material {
-        row_style.push_str("border-left:2px solid var(--amber);");
+        row_style.push_str("border-left:2px solid var(--accent);");
     }
 
     let dim_class = if dim { "tbl-row claim-dim" } else { "tbl-row" };
@@ -1200,7 +1200,7 @@ fn format_severity(payload: &serde_json::Value) -> (String, &'static str) {
     };
     let color = match severity {
         "critical" | "high" => "--red",
-        "medium" => "--amber",
+        "medium" => "--yellow",
         "low" => "--green",
         _ => "--ink-3",
     };
@@ -1273,7 +1273,7 @@ fn format_fix_status(payload: &serde_json::Value) -> (String, Option<bool>) {
 
 fn delta_badge(delta_type: &str) -> (String, &'static str) {
     match delta_type {
-        "initial_report" => ("initial report".into(), "--amber"),
+        "initial_report" => ("initial report".into(), "--yellow"),
         "exploitation_confirmed" => ("exploited".into(), "--red"),
         "patch_released" => ("patch released".into(), "--green"),
         "correction" => ("correction".into(), "--yellow"),
@@ -1289,7 +1289,7 @@ fn modality_icon(modality: &str) -> (&'static str, &'static str) {
         Ok(Modality::Inferred | Modality::Assessed | Modality::Predicted) => {
             ("\u{25c8}", "--ink-3")
         }
-        Ok(Modality::Rumored) => ("\u{25c7}", "--amber"),
+        Ok(Modality::Rumored) => ("\u{25c7}", "--yellow"),
         Err(_) => ("?", "--ink-4"),
     }
 }
@@ -1298,7 +1298,7 @@ fn conf_bar_color(confidence: f64) -> &'static str {
     if confidence < 0.4 {
         "--red"
     } else if confidence < 0.7 {
-        "--amber"
+        "--yellow"
     } else {
         "--green"
     }
@@ -1376,7 +1376,7 @@ fn relationship_badge(s: &str) -> (&'static str, &'static str) {
         Ok(StoryClaimRelationship::Contradiction) => ("contradiction", "--red"),
         Ok(StoryClaimRelationship::Supersession) => ("supersession", "--yellow"),
         Ok(StoryClaimRelationship::Correction) => ("correction", "--yellow"),
-        Ok(StoryClaimRelationship::Evolution) => ("evolution", "--amber"),
+        Ok(StoryClaimRelationship::Evolution) => ("evolution", "--yellow"),
         Ok(StoryClaimRelationship::Related) => ("related", "--ink-2"),
         Ok(StoryClaimRelationship::Background) => ("background", "--ink-3"),
         Ok(StoryClaimRelationship::Duplicate) => ("duplicate", "--ink-4"),

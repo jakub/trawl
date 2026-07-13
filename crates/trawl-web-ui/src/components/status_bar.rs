@@ -106,7 +106,7 @@ pub fn StatusBar(
             <span class="divider">"·"</span>
             <div class="grp"><span>"— indexed"</span></div>
             <span class="divider">"·"</span>
-            <div class="grp"><span>"ingest " <span class="amber">"—/s"</span></span></div>
+            <div class="grp"><span>"ingest " <span class="accent">"—/s"</span></span></div>
             <span class="divider">"·"</span>
             <div class="grp">
                 <span>
@@ -119,7 +119,7 @@ pub fn StatusBar(
             <div class="sp"></div>
             <div class="grp">
                 <span>"range "</span>
-                <span class="amber">{move || range.get().label()}</span>
+                <span class="accent">{move || range.get().label()}</span>
             </div>
             <span class="divider">"·"</span>
             <div class="grp clickable" on:click=toggle_theme title="Switch theme">

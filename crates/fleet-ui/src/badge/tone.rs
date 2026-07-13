@@ -13,7 +13,7 @@
 
 /// Semantic tone. Maps onto the `.bdg.{tone}` classes shipped in
 /// `styles/fleet-ui.css`, drawing on the fleet color tokens
-/// (`--ink-3` / `--blue` / `--green` / `--amber` / `--red`).
+/// (`--ink-3` / `--blue` / `--green` / `--yellow` / `--red`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
     #[default]
