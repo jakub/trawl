@@ -2,12 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Workspace task runner. Currently only hosts `build-web`, which runs
-//! the two-step SPA-into-binary build in the right order:
-//! 1. `trunk build [--release]` inside `crates/trawl-web-ui/`
-//! 2. `cargo build [--release] -p trawl-web`
+//! Workspace task runner:
+//! - `build-web` — the two-step SPA-into-binary build in the right order:
+//!   1. `trunk build [--release]` inside `crates/trawl-web-ui/`
+//!   2. `cargo build [--release] -p trawl-web`
+//! - `design-cards` — emit static fleet-ui preview cards for
+//!   claude.ai/design (see `design_cards` module).
 //!
 //! Aliased as `cargo xtask` via `.cargo/config.toml`.
+
+mod design_cards;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -29,12 +33,29 @@ enum Cmd {
         #[arg(long)]
         release: bool,
     },
+    /// Emit static fleet-ui HTML preview cards (derived from the
+    /// component class contracts; regenerate, never hand-edit).
+    DesignCards {
+        /// Output directory for the generated cards.
+        #[arg(long, default_value = "target/design-cards")]
+        out: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::BuildWeb { release } => build_web(release),
+        Cmd::DesignCards { out } => {
+            let root = workspace_root();
+            let css = root.join("crates/fleet-ui/styles/fleet-ui.css");
+            let out = if out.is_absolute() {
+                out
+            } else {
+                root.join(out)
+            };
+            design_cards::generate(&css, &out)
+        }
     }
 }
 
