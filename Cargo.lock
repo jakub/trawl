@@ -7723,6 +7723,7 @@ name = "xtask"
 version = "0.3.3"
 dependencies = [
  "clap",
+ "fleet-ui",
 ]
 
 [[package]]

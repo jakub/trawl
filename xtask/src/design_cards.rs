@@ -25,9 +25,16 @@
 // the fold+write! shape clippy prefers buries the templates in plumbing.
 #![allow(clippy::format_collect)]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
+
+use fleet_ui::badge::{Tone, badge_class};
+use fleet_ui::button::{Size, Variant, btn_class};
+use fleet_ui::segmented::segmented_class;
+use fleet_ui::sparkline::spark_path;
+use fleet_ui::status_dot::{StatusTone, dot_class};
 
 /// Google Fonts links, same families/weights as the consuming apps
 /// (`crates/trawl-web-ui/index.html`) — fleet-ui.css declares the
@@ -68,10 +75,19 @@ body { margin: 0; font-family: var(--font-ui); }
   font-size: 10px; font-family: var(--font-mono); color: var(--ink-3);
 }
 .ds-spacebar { background: var(--amber-wash); border: 1px solid var(--amber); height: 14px; }
-/* Fleet's overlay/toast hosts are position:fixed full-viewport; pin
- * them into the pane flow so both themes show in one card. */
+/* Fleet's overlay/toast/drawer hosts are position:fixed full-viewport;
+ * pin them into the pane flow so both themes show in one card. */
 .ds-pane .modal-scrim { position: static; padding: 24px 0; }
 .ds-pane .toasts { position: static; padding: 0; }
+.ds-pane .sd-scrim { position: static; padding: 16px 0; background: rgba(20,15,5,.06); }
+.ds-pane .sd-drawer { position: static; width: 100%; height: 380px; box-shadow: var(--shadow-3); }
+.ds-pane .login-shell { height: auto; padding: 24px 0; }
+/* Room for absolutely-positioned dropdowns rendered in open state; the
+ * left margin keeps the right-anchored .actions-menu inside the pane. */
+.ds-dropdown-room { min-height: 170px; }
+.ds-dropdown-room .actions-wrap { margin-left: 160px; }
+/* Wide-chrome cards stack light above dark instead of side by side. */
+.ds-split.ds-stacked { grid-template-columns: 1fr; }
 ";
 
 struct Card {
@@ -79,6 +95,9 @@ struct Card {
     group: &'static str,
     title: &'static str,
     body: String,
+    /// Stack the theme panes vertically (for wide chrome like `TopBar`
+    /// that can't fit in a half-width pane).
+    stacked: bool,
 }
 
 /// Generate all cards into `out_dir`. `css_path` is the canonical
@@ -102,6 +121,12 @@ pub fn generate(css_path: &Path, out_dir: &Path) -> ExitCode {
         feedback_card(),
         forms_card(),
         overlays_card(),
+        navigation_card(),
+        data_card(),
+        drawer_card(),
+        reason_modal_card(),
+        login_card(),
+        chrome_card(),
     ];
 
     for card in &cards {
@@ -136,7 +161,7 @@ fn render_card(card: &Card, fleet_css: &str) -> String {
 </style>
 </head>
 <body>
-<div class="ds-split">
+<div class="ds-split{stacked}">
 <section class="ds-pane" data-theme="light">
 {body}
 </section>
@@ -150,31 +175,34 @@ fn render_card(card: &Card, fleet_css: &str) -> String {
         group = card.group,
         title = card.title,
         body = card.body,
+        stacked = if card.stacked { " ds-stacked" } else { "" },
     )
 }
 
 // ── snippet emitters — each mirrors a fleet-ui component's view! ────
 
-/// `<Btn/>` — `crates/fleet-ui/src/button/`: `btn_class(variant, size,
-/// full)` composes `.btn-pri`/`.btn-sec`/`.btn-danger`/`.btn`, with
-/// `.btn-sm` standalone, `.btn-xs` composing, `.btn-full` appended.
-fn btn(class: &str, label: &str, disabled: bool) -> String {
+/// `<Btn/>` — class composition via fleet-ui's own `btn_class`, so the
+/// gallery can't drift from `crates/fleet-ui/src/button/variant.rs`.
+fn btn(variant: Variant, size: Size, label: &str, disabled: bool) -> String {
+    btn_full(variant, size, false, label, disabled)
+}
+
+fn btn_full(variant: Variant, size: Size, full: bool, label: &str, disabled: bool) -> String {
+    let class = btn_class(variant, size, full);
     let dis = if disabled { " disabled" } else { "" };
     format!(r#"<button class="{class}"{dis}>{label}</button>"#)
 }
 
-/// `<Badge/>` — `badge_class(tone)` = `bdg {{tone}}`.
-fn badge(tone: &str, label: &str) -> String {
-    format!(r#"<span class="bdg {tone}">{label}</span>"#)
+/// `<Badge/>` — class via fleet-ui's `badge_class`.
+fn badge(tone: Tone, label: &str) -> String {
+    let class = badge_class(tone);
+    format!(r#"<span class="{class}">{label}</span>"#)
 }
 
-/// `<StatusDot/>` — `dot_class(tone)`; Neutral renders the bare class.
-fn status_dot(tone: &str) -> String {
-    if tone.is_empty() {
-        r#"<span class="status-dot"></span>"#.to_string()
-    } else {
-        format!(r#"<span class="status-dot {tone}"></span>"#)
-    }
+/// `<StatusDot/>` — class via fleet-ui's `dot_class`.
+fn status_dot(tone: StatusTone) -> String {
+    let class = dot_class(tone);
+    format!(r#"<span class="{class}"></span>"#)
 }
 
 /// `<IconView/>` — 16×16 viewBox, currentColor stroke (icon.rs).
@@ -219,8 +247,10 @@ fn toggle(checked: bool) -> String {
     )
 }
 
-/// `<Segmented/>` — `segmented_class(size, full)` over `.seg-opt[.on]`.
-fn segmented(class: &str, options: &[&str], active: usize) -> String {
+/// `<Segmented/>` — class via fleet-ui's `segmented_class` over
+/// `.seg-opt[.on]` option buttons.
+fn segmented(size: Size, full: bool, options: &[&str], active: usize) -> String {
+    let class = segmented_class(size, full);
     let opts: String = options
         .iter()
         .enumerate()
@@ -331,52 +361,54 @@ fn tokens_card() -> Card {
         group: "Foundations",
         title: "Tokens",
         body,
+        stacked: false,
     }
 }
 
 fn actions_card() -> Card {
     let variants = [
-        ("Primary", "btn-pri"),
-        ("Secondary", "btn-sec"),
-        ("Danger", "btn-danger"),
-        ("Form", "btn"),
+        ("Primary", Variant::Primary),
+        ("Secondary", Variant::Secondary),
+        ("Danger", Variant::Danger),
+        ("Form", Variant::Form),
     ];
 
     let default_row: String = variants
         .iter()
-        .map(|(label, class)| btn(class, label, false))
+        .map(|(label, v)| btn(*v, Size::Default, label, false))
         .collect::<String>();
     let xs_row: String = variants
         .iter()
-        .map(|(label, class)| btn(&format!("{class} btn-xs"), label, false))
+        .map(|(label, v)| btn(*v, Size::Xs, label, false))
         .collect::<String>();
     let disabled_row: String = variants
         .iter()
-        .map(|(label, class)| btn(class, label, true))
+        .map(|(label, v)| btn(*v, Size::Default, label, true))
         .collect::<String>();
+    let full_btn = format!(
+        r#"<div style="width:260px">{}</div>"#,
+        btn_full(Variant::Primary, Size::Default, true, "Full width", false)
+    );
 
     let body = format!(
         "{h_btn}{r_default}{r_sm}{r_xs}{r_disabled}{r_full}{h_kbd}{r_kbd}{h_seg}{r_seg}{r_seg_sm}",
         h_btn = heading("Btn — variant × size"),
         r_default = labeled_row("default", &default_row),
-        r_sm = labeled_row("sm", &btn("btn-sm", "Small", false)),
+        r_sm = labeled_row("sm", &btn(Variant::Secondary, Size::Sm, "Small", false)),
         r_xs = labeled_row("xs", &xs_row),
         r_disabled = labeled_row("disabled", &disabled_row),
-        r_full = labeled_row(
-            "full",
-            &format!(
-                r#"<div style="width:260px">{}</div>"#,
-                btn("btn-pri btn-full", "Full width", false)
-            )
-        ),
+        r_full = labeled_row("full", &full_btn),
         h_kbd = heading("Kbd"),
         r_kbd = labeled_row(
             "chips",
             r#"<span class="kbd">⌘⏎</span><span class="kbd">Esc</span><span class="kbd-inline">⌘K</span>"#
         ),
         h_seg = heading("Segmented"),
-        r_seg = labeled_row("default", &segmented("seg", &["CSV", "JSON", "Parquet"], 0)),
-        r_seg_sm = labeled_row("sm", &segmented("seg seg-sm", &["1h", "24h", "7d"], 1)),
+        r_seg = labeled_row(
+            "default",
+            &segmented(Size::Default, false, &["CSV", "JSON", "Parquet"], 0)
+        ),
+        r_seg_sm = labeled_row("sm", &segmented(Size::Sm, false, &["1h", "24h", "7d"], 1)),
     );
 
     Card {
@@ -384,30 +416,36 @@ fn actions_card() -> Card {
         group: "Actions",
         title: "Actions",
         body,
+        stacked: false,
     }
 }
 
 fn feedback_card() -> Card {
     let badges: String = [
-        ("neutral", "Neutral"),
-        ("info", "Info"),
-        ("success", "Success"),
-        ("warn", "Warn"),
-        ("danger", "Danger"),
+        (Tone::Neutral, "Neutral"),
+        (Tone::Info, "Info"),
+        (Tone::Success, "Success"),
+        (Tone::Warn, "Warn"),
+        (Tone::Danger, "Danger"),
     ]
     .iter()
-    .map(|(tone, label)| badge(tone, label))
+    .map(|(tone, label)| badge(*tone, label))
     .collect::<String>();
 
-    let dots: String = [("", "neutral"), ("success", "success"), ("error", "error"), ("running", "running")]
-        .iter()
-        .map(|(tone, label)| {
-            format!(
-                r#"<span style="display:inline-flex; align-items:center; gap:6px; font-size:12px">{dot}{label}</span>"#,
-                dot = status_dot(tone)
-            )
-        })
-        .collect::<String>();
+    let dots: String = [
+        (StatusTone::Neutral, "neutral"),
+        (StatusTone::Success, "success"),
+        (StatusTone::Error, "error"),
+        (StatusTone::Running, "running"),
+    ]
+    .iter()
+    .map(|(tone, label)| {
+        format!(
+            r#"<span style="display:inline-flex; align-items:center; gap:6px; font-size:12px">{dot}{label}</span>"#,
+            dot = status_dot(*tone)
+        )
+    })
+    .collect::<String>();
 
     let toast = |kind: &str, title: &str, detail: &str| {
         format!(
@@ -438,6 +476,7 @@ fn feedback_card() -> Card {
         group: "Feedback",
         title: "Feedback",
         body,
+        stacked: false,
     }
 }
 
@@ -445,7 +484,7 @@ fn forms_card() -> Card {
     let toggles = format!("{}{}", toggle(true), toggle(false));
     let seg_full = format!(
         r#"<div style="max-width:340px">{}</div>"#,
-        segmented("seg seg-full", &["CSV", "JSON", "Parquet"], 2)
+        segmented(Size::Default, true, &["CSV", "JSON", "Parquet"], 2)
     );
     let body = format!(
         "{h_field}<div class=\"ds-col\">{f_hint}{f_error}</div>{h_search}{r_search}{h_toggle}{r_toggle}{h_seg}{r_seg}",
@@ -475,6 +514,7 @@ fn forms_card() -> Card {
         group: "Forms",
         title: "Forms",
         body,
+        stacked: false,
     }
 }
 
@@ -484,12 +524,12 @@ fn overlays_card() -> Card {
         "Export results",
         &format!(
             r#"<div class="m-field"><label>Format</label>{seg}</div><div class="m-field"><label>File name</label><input type="text" value="report.csv"/></div>"#,
-            seg = segmented("seg seg-full", &["CSV", "JSON", "Parquet"], 0)
+            seg = segmented(Size::Default, true, &["CSV", "JSON", "Parquet"], 0)
         ),
         &format!(
             "<div></div>{cancel}{confirm}",
-            cancel = btn("btn-sec", "Cancel", false),
-            confirm = btn("btn-pri", "Export", false)
+            cancel = btn(Variant::Secondary, Size::Default, "Cancel", false),
+            confirm = btn(Variant::Primary, Size::Default, "Export", false)
         ),
     );
 
@@ -499,8 +539,8 @@ fn overlays_card() -> Card {
         r#"<p style="margin:0; font-size:13px; color:var(--ink-2)">Delete "errors by host"? This can't be undone.</p>"#,
         &format!(
             "<div></div>{cancel}{del}",
-            cancel = btn("btn-sec", "Cancel", false),
-            del = btn("btn-danger", "Delete", false)
+            cancel = btn(Variant::Secondary, Size::Default, "Cancel", false),
+            del = btn(Variant::Danger, Size::Default, "Delete", false)
         ),
     );
 
@@ -515,5 +555,315 @@ fn overlays_card() -> Card {
         group: "Overlays",
         title: "Overlays",
         body,
+        stacked: false,
+    }
+}
+
+// ── full-roster emitters (second slice) ─────────────────────────────
+
+/// Workspace `<Tabs/>` — `.tabs > div.t[.active]` with optional count
+/// chip `.c`, trailing spacer `.sp` (tabs.rs, Workspace arm).
+fn tabs_workspace(items: &[(&str, Option<usize>)], active: usize) -> String {
+    let mut out = String::from(r#"<div class="tabs">"#);
+    for (i, (label, count)) in items.iter().enumerate() {
+        let class = if i == active { "t active" } else { "t" };
+        let chip = count.map_or(String::new(), |c| format!(r#"<span class="c">{c}</span>"#));
+        let _ = write!(
+            out,
+            r#"<div class="{class}"><span>{label}</span>{chip}</div>"#
+        );
+    }
+    out.push_str(r#"<div class="sp"></div></div>"#);
+    out
+}
+
+/// Drawer `<Tabs/>` — `.sd-tabs > span.tb[.on]`, spacer, optional
+/// trailing `.meta` (tabs.rs, Drawer arm).
+fn tabs_drawer(items: &[&str], active: usize, meta: Option<&str>) -> String {
+    let mut out = String::from(r#"<div class="sd-tabs">"#);
+    for (i, label) in items.iter().enumerate() {
+        let class = if i == active { "tb on" } else { "tb" };
+        let _ = write!(out, r#"<span class="{class}">{label}</span>"#);
+    }
+    out.push_str(r#"<span class="sp"></span>"#);
+    if let Some(m) = meta {
+        let _ = write!(out, r#"<span class="meta">{m}</span>"#);
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// `<Pager/>` — `.results-footer` with summary + sm secondary prev/next
+/// buttons (pager.rs).
+fn pager(summary: &str, can_prev: bool, can_next: bool) -> String {
+    let prev = btn(Variant::Secondary, Size::Sm, "← prev", !can_prev);
+    let next = btn(Variant::Secondary, Size::Sm, "next →", !can_next);
+    format!(
+        r#"<footer class="results-footer"><span class="results-summary">{summary}</span><div class="results-pager">{prev}{next}</div></footer>"#
+    )
+}
+
+/// `<LoadMore/>` — `.load-more` wrapping a secondary Btn or the
+/// terminal `.load-more-end` text (`load_more.rs` phase table).
+fn load_more(inner: &str) -> String {
+    format!(r#"<div class="load-more">{inner}</div>"#)
+}
+
+/// `<Sparkline/>` — geometry via fleet-ui's own `spark_path`
+/// (sparkline/geometry.rs), assembled exactly as component.rs does.
+fn sparkline(data: &[u64], color: &str, w: u32, h: u32) -> String {
+    let Some(path) = spark_path(data, f64::from(w), f64::from(h)) else {
+        return format!(
+            r#"<svg class="sc-spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}"></svg>"#
+        );
+    };
+    format!(
+        r#"<svg class="sc-spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}"><polygon points="{fill}" fill="{color}" opacity="0.10"/><polyline points="{line}" fill="none" stroke="{color}" stroke-width="1.25" stroke-linejoin="round"/></svg>"#,
+        fill = path.fill,
+        line = path.line,
+    )
+}
+
+/// `<ActionsMenu/>` — `.actions-wrap > .btn-icon` trigger with the
+/// panel in static open state (`actions_menu.rs`).
+fn actions_menu_open(items: &[(&str, bool)]) -> String {
+    let mut menu = String::from(r#"<div class="actions-menu" role="menu">"#);
+    for (label, danger) in items {
+        let class = if *danger { "item danger" } else { "item" };
+        let _ = write!(
+            menu,
+            r#"<button class="{class}" type="button" role="menuitem">{label}</button>"#
+        );
+    }
+    menu.push_str("</div>");
+    format!(
+        r#"<div class="actions-wrap"><button class="btn-icon" type="button" aria-haspopup="menu" aria-expanded="true">⋯</button>{menu}</div>"#
+    )
+}
+
+/// `<When/>` — `.when` span with the RFC 3339 title (time/when.rs).
+fn when(label: &str, title: &str) -> String {
+    format!(r#"<span class="when" title="{title}">{label}</span>"#)
+}
+
+fn navigation_card() -> Card {
+    let ws_tabs = tabs_workspace(
+        &[
+            ("Events", Some(1284)),
+            ("Patterns", None),
+            ("Sources", Some(12)),
+        ],
+        0,
+    );
+    let dr_tabs = tabs_drawer(
+        &["Overview", "Fields", "Tail"],
+        1,
+        Some("3.2k events · 48 MB · 22 fields"),
+    );
+
+    let body = format!(
+        "{h_ws}{ws_tabs}{h_dr}{dr_tabs}",
+        h_ws = heading("Tabs — workspace style"),
+        h_dr = heading("Tabs — drawer style (with meta)"),
+    );
+
+    Card {
+        slug: "navigation",
+        group: "Navigation",
+        title: "Navigation",
+        body,
+        stacked: false,
+    }
+}
+
+fn data_card() -> Card {
+    let spark_row = format!(
+        "{}{}{}",
+        sparkline(
+            &[3, 7, 4, 12, 9, 15, 11, 18, 14, 9],
+            "var(--amber)",
+            120,
+            22
+        ),
+        sparkline(&[2, 2, 3, 2, 8, 14, 6, 3, 2, 2], "var(--green)", 120, 22),
+        sparkline(&[0, 0, 0, 0, 0, 0], "var(--red)", 120, 22),
+    );
+    let whens = format!(
+        "{}{}",
+        when("5m ago", "2026-07-12T15:40:00+00:00"),
+        when("2026-07-12 15:40 UTC", "2026-07-12T15:40:00+00:00"),
+    );
+    let load_states = format!(
+        "{idle}{busy}{end}{empty}",
+        idle = load_more(&btn(Variant::Secondary, Size::Default, "load more", false)),
+        busy = load_more(&btn(Variant::Secondary, Size::Default, "loading…", true)),
+        end = load_more(r#"<span class="load-more-end">end of list</span>"#),
+        empty = load_more(r#"<span class="load-more-end">nothing here yet</span>"#),
+    );
+
+    let body = format!(
+        "{h_pager}{pager}{h_load}{load_states}{h_spark}{r_spark}{h_when}{r_when}{h_menu}<div class=\"ds-dropdown-room\">{menu}</div>",
+        h_pager = heading("Pager"),
+        pager = pager("1–50 of 213", false, true),
+        h_load = heading("LoadMore — idle / busy / end / empty"),
+        h_spark = heading("Sparkline"),
+        r_spark = labeled_row("series", &spark_row),
+        h_when = heading("When — relative / absolute"),
+        r_when = labeled_row("modes", &whens),
+        h_menu = heading("ActionsMenu (open)"),
+        menu = actions_menu_open(&[("Rename", false), ("Duplicate", false), ("Delete", true)]),
+    );
+
+    Card {
+        slug: "data",
+        group: "Data",
+        title: "Data",
+        body,
+        stacked: false,
+    }
+}
+
+fn drawer_card() -> Card {
+    let tabs = tabs_drawer(
+        &["Overview", "Fields", "Tail"],
+        0,
+        Some("3.2k events · 48 MB · 22 fields"),
+    );
+    let title = format!(
+        "{dot}<span>nginx-access</span>",
+        dot = status_dot(StatusTone::Success)
+    );
+    let action = btn(Variant::Secondary, Size::Sm, "Tail", false);
+    let drawer_body = r#"<p style="margin:0; font-size:12px; color:var(--ink-2)">Drawer body — app-owned pane content renders here.</p>"#;
+
+    let body = format!(
+        r#"{h}<div class="sd-scrim"><aside class="sd-drawer" role="dialog"><div class="sd-hd"><div class="sd-ttl">{title}</div><div class="sd-actions">{action}<span class="sd-x" title="Close (Esc)">{close}</span></div></div>{tabs}<div class="sd-body">{drawer_body}</div></aside></div>"#,
+        h = heading("Drawer (open, drawer tabs + meta)"),
+        close = close_icon(),
+    );
+
+    Card {
+        slug: "drawer",
+        group: "Overlays",
+        title: "Drawer",
+        body,
+        stacked: false,
+    }
+}
+
+fn reason_modal_card() -> Card {
+    let modal_body = r#"<p style="margin:0; font-size:13px; color:var(--ink-2)">Invalidate this run? Downstream reports will be regenerated.</p><div class="m-field"><label>Reason</label><textarea class="reason-input" placeholder="Why is this run being invalidated?"></textarea></div>"#;
+    let footer = format!(
+        "<div></div>{cancel}{confirm}",
+        cancel = btn(Variant::Secondary, Size::Default, "Cancel", false),
+        confirm = btn(Variant::Danger, Size::Default, "Invalidate", true),
+    );
+    let body = format!(
+        "{h}{m}",
+        h = heading("ConfirmWithReasonModal (confirm disabled until reason)"),
+        m = modal(true, "Invalidate run", modal_body, &footer),
+    );
+
+    Card {
+        slug: "reason-modal",
+        group: "Overlays",
+        title: "Reason modal",
+        body,
+        stacked: false,
+    }
+}
+
+fn login_card() -> Card {
+    let submit = btn_full(Variant::Form, Size::Default, true, "Sign In", false);
+    let body = format!(
+        r#"{h}<div class="login-shell"><form class="login-card"><h1><span>traw</span><span class="amber">l</span></h1><p class="subtitle">sign in with your API key</p><label class="field"><span>API key</span><input type="password" autocomplete="off" spellcheck="false"/></label>{submit}</form></div>"#,
+        h = heading("Login"),
+    );
+
+    Card {
+        slug: "login",
+        group: "Chrome",
+        title: "Login",
+        body,
+        stacked: false,
+    }
+}
+
+fn chrome_card() -> Card {
+    let modes = r#"<div class="modes"><a class="mode active"><span class="dot"></span><span>Search</span></a><a class="mode"><span class="dot"></span><span>Dashboards</span></a><a class="mode"><span class="dot"></span><span>Sources</span></a></div>"#;
+    let topbar = format!(
+        r#"<div class="topbar"><div class="brand"><span>traw</span><span class="amber">l</span></div>{modes}<div class="sp"></div><div class="jump">{search}<span class="gh">Jump to query, source, dashboard…</span><span class="kbd">⌘K</span></div><div class="env"><span class="pulse"></span><span>session</span></div><div class="iconbtn">{bell}</div><div class="user-wrap"><div class="user"><div class="avatar">JB</div><span class="who">jakub</span>{chevron}</div></div></div>"#,
+        search = search_icon(),
+        bell = icon_svg(
+            14,
+            r#"<g><path d="M3.5 12V7a4.5 4.5 0 1 1 9 0v5l1 1.5h-11l1-1.5z"/><path d="M7 14a1 1 0 0 0 2 0"/></g>"#
+        ),
+        chevron = icon_svg(10, r#"<g><path d="m4 6 4 4 4-4"/></g>"#),
+    );
+
+    let rail_item = |icon: &str, label: &str, active: bool, badge: Option<u64>| {
+        let class = if active { "it active" } else { "it" };
+        let chip = badge.map_or(String::new(), |n| {
+            format!(r#"<span class="badge">{n}</span>"#)
+        });
+        format!(
+            r#"<a class="{class}" title="{label}">{icon}<span class="lb">{label}</span>{chip}</a>"#
+        )
+    };
+    let rail = format!(
+        r#"<nav class="rail" style="height:280px">{search}{db}{news}{alert}</nav>"#,
+        search = rail_item(
+            &icon_svg(
+                16,
+                r#"<g><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></g>"#
+            ),
+            "Search",
+            true,
+            None
+        ),
+        db = rail_item(
+            &icon_svg(
+                16,
+                r#"<g><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .8 2.2 1.5 5 1.5s5-.7 5-1.5v-9"/><path d="M3 8c0 .8 2.2 1.5 5 1.5s5-.7 5-1.5"/></g>"#
+            ),
+            "Sources",
+            false,
+            None
+        ),
+        news = rail_item(
+            &icon_svg(
+                16,
+                r#"<g><rect x="2" y="3" width="11" height="10" rx="1"/><path d="M4.5 6h6M4.5 8.5h6M4.5 11h4"/></g>"#
+            ),
+            "Stories",
+            false,
+            Some(7)
+        ),
+        alert = rail_item(
+            &icon_svg(
+                16,
+                r#"<g><path d="M8 2 14 13H2z"/><path d="M8 6.5v3M8 11.5v.01" stroke-linecap="round"/></g>"#
+            ),
+            "Alerts",
+            false,
+            None
+        ),
+    );
+
+    let user_menu = r#"<div class="user-wrap" style="display:inline-block"><div class="user-menu" style="position:static; animation:none"><div class="hdr"><div class="name">jakub</div><div class="mail">admin</div></div><div class="item disabled"><span>Profile</span></div><div class="item disabled"><span>API tokens</span></div><div class="item"><span>Switch to dark theme</span><span class="kbd">⌘⇧L</span></div><div class="sep"></div><div class="item danger"><span>Sign Out</span></div></div></div>"#;
+
+    let body = format!(
+        "{h_top}{topbar}{h_rail}{rail}{h_menu}{user_menu}",
+        h_top = heading("TopBar"),
+        h_rail = heading("Rail"),
+        h_menu = heading("User menu (open)"),
+    );
+
+    Card {
+        slug: "chrome",
+        group: "Chrome",
+        title: "App chrome",
+        body,
+        stacked: true,
     }
 }
