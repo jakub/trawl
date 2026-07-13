@@ -182,8 +182,8 @@ fn btn_size_classes_shipped_with_crate() {
 
     let xs = rule_body(".btn-xs");
     assert!(
-        xs.contains("font-size: 11px") && xs.contains("padding: 3px 8px"),
-        ".btn-xs modifier body moved verbatim"
+        xs.contains("font-size: var(--fs-small)") && xs.contains("padding: 3px 8px"),
+        ".btn-xs modifier body matches the ADR-0005 baseline"
     );
     // .btn-xs must appear AFTER the variant rules: equal specificity, and
     // its padding/font-size must win over .btn-pri/.btn-sec/.btn-danger
@@ -208,16 +208,18 @@ fn modal_family_classes_shipped_with_crate() {
     // (coastwatch consumes the reason modal next — app-side CSS would
     // leave it unstyled there). Bodies pinned to the moved values.
     assert!(
-        rule_body(".modal .m-hd .ic").contains("background: var(--amber-wash)"),
-        ".modal .m-hd .ic (header icon chip) moved verbatim"
+        rule_body(".modal .m-hd .ic").contains("background: var(--accent-wash)"),
+        ".modal .m-hd .ic (header icon chip) keeps the accent-wash chip"
     );
     assert!(
         rule_body(".modal .m-field").contains("flex-direction: column"),
         ".modal .m-field wrapper moved verbatim"
     );
+    // ADR-0005: label typography routes through the --label-* treatment
+    // tokens (sentence case) instead of hardcoded uppercase-mono.
     assert!(
-        rule_body(".modal .m-field label").contains("text-transform: uppercase"),
-        ".modal .m-field label typography moved verbatim"
+        rule_body(".modal .m-field label").contains("text-transform: var(--label-transform)"),
+        ".modal .m-field label reads the --label-* treatment tokens"
     );
     assert!(
         rule_body(".modal .m-field input").contains("height: 30px"),
