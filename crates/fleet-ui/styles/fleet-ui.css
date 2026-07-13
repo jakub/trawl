@@ -2,7 +2,9 @@
  * fleet-ui — shared design system (ADR-0030, step 2)
  *
  * Tokens, reset, base styles, and component CSS for fleet apps.
- * Extracted verbatim from trawl-web-ui's "Herring" main.css. App
+ * Extracted verbatim from trawl-web-ui's "Herring" main.css, then
+ * restyled by the design-workbench pass (ADR-0005): slate/blue
+ * palette, Open Sans/Fira Code, --fs-* type rhythm. App
  * consumers reach this file via Trunk's `data-trunk rel="css"`
  * directive; Trunk resolves the href relative to the consumer's
  * index.html location. The two current consumers:
@@ -62,24 +64,29 @@
 /* ─────────────────────────────────────────────────────────────────
  *  Design tokens
  * ─────────────────────────────────────────────────────────────── */
+/* Slate/blue direction (design-workbench pass, ADR-0005): cool grey
+ * surfaces + blue accent replaced the original warm paper + amber.
+ * The accent hue deliberately equals --blue today; the tokens stay
+ * separate because they name different ROLES (brand accent vs info
+ * semantic) that merely share a value. */
 :root, [data-theme="light"] {
-  --bg:        #faf7f0;
-  --panel:     #fffdf7;
-  --panel-2:   #f3ede0;
-  --panel-3:   #ece5d2;
-  --ink:       #1a1714;
-  --ink-2:     #5c564a;
-  --ink-3:     #8a8272;
-  --ink-4:     #b8b1a0;
-  --line:      #e4ddcc;
-  --line-2:    #efe8d6;
-  --selection: rgba(200,121,26,.20);
+  --bg:        #f1f2f4;
+  --panel:     #fcfcfd;
+  --panel-2:   #e6e8ec;
+  --panel-3:   #dadde3;
+  --ink:       #0f1012;
+  --ink-2:     #35383d;
+  --ink-3:     #545860;
+  --ink-4:     #82868e;
+  --line:      #d8dbe1;
+  --line-2:    #e8eaee;
+  --selection: rgba(42,92,138,.20);
 
-  --amber:     #c8791a;
-  --amber-2:   #b56a10;
-  --amber-soft:#f0c87a;
-  --amber-glow:rgba(200,121,26,.22);
-  --amber-wash:rgba(200,121,26,.08);
+  --amber:     #2a5c8a;
+  --amber-2:   color-mix(in oklab, #2a5c8a 80%, #000);
+  --amber-soft:#7ea6cc;
+  --amber-glow:rgba(42,92,138,.28);
+  --amber-wash:rgba(42,92,138,.10);
 
   --teal:       #0e8b7a;
   --teal-wash:  rgba(14,139,122,.10);
@@ -98,24 +105,29 @@
   --shadow-glow: 0 0 0 3px var(--amber-glow);
 }
 
+/* Dark mirror of the slate/blue pass — derived, not from the workbench
+ * (the handoff changed light only). Surfaces/lines were already cool
+ * and stay; the warm cream ink ramp is neutralized and the accent
+ * follows the dark --blue hue, matching how the light accent tracks
+ * the light --blue. */
 [data-theme="dark"] {
   --bg:        #0f1216;
   --panel:     #141820;
   --panel-2:   #1a1f28;
   --panel-3:   #242b36;
-  --ink:       #e8e3d7;
-  --ink-2:     #9aa0ad;
-  --ink-3:     #6c7280;
-  --ink-4:     #4a505c;
+  --ink:       #e8eaed;
+  --ink-2:     #9ba1ab;
+  --ink-3:     #6b7280;
+  --ink-4:     #4a505a;
   --line:      #242a34;
   --line-2:    #1c212b;
-  --selection: rgba(240,168,72,.22);
+  --selection: rgba(90,159,212,.24);
 
-  --amber:     #f0a848;
-  --amber-2:   #d08820;
-  --amber-soft:#f4c47a;
-  --amber-glow:rgba(240,168,72,.28);
-  --amber-wash:rgba(240,168,72,.10);
+  --amber:     #5a9fd4;
+  --amber-2:   color-mix(in oklab, #5a9fd4 80%, #000);
+  --amber-soft:#8fb8dc;
+  --amber-glow:rgba(90,159,212,.30);
+  --amber-wash:rgba(90,159,212,.12);
 
   --teal:       #4ec9b0;
   --teal-wash:  rgba(78,201,176,.12);
@@ -135,8 +147,32 @@
 }
 
 :root {
-  --font-ui:   "Inter", system-ui, -apple-system, sans-serif;
-  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
+  --font-ui:   "Open Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "Fira Code", "SF Mono", ui-monospace, Menlo, monospace;
+
+  /* Type rhythm (workbench pass): one base size drives every level.
+   * Up-steps are golden ratio, down-steps interpolate geometrically
+   * from base to a 13px readability floor. To re-derive at base B
+   * (floor F = 13): up B·φⁿ; down max(F, B·(F/B)^frac) for
+   * frac ∈ {⅓, ⅔, 1}; round to 0.5px. --table-fs/--editor-fs below
+   * are exempt — data-dense surfaces stay compact by design. */
+  --fs-title:   23.5px;  /* base × φ */
+  --fs-section: 18.5px;  /* base × φ^½ */
+  --fs-base:    14.5px;  /* base */
+  --fs-control: 14px;    /* ⅓ toward floor */
+  --fs-label:   13.5px;  /* ⅔ toward floor */
+  --fs-small:   13px;    /* floor */
+  --lh:         1.5;
+
+  /* Label + title treatment: sentence case (the uppercase-mono label
+   * treatment was rejected in the workbench pass). */
+  --label-font:      var(--font-ui);
+  --label-transform: none;
+  --label-variant:   normal;
+  --label-spacing:   .01em;
+  --title-weight:    700;
+  --title-transform: none;
+  --title-spacing:   -.4px;
 
   --row-h:      24px;
   --row-pad-y:  3px;
@@ -171,8 +207,8 @@ body {
   background: var(--bg);
   color: var(--ink);
   font-family: var(--font-ui);
-  font-size: 12.5px;
-  line-height: 1.5;
+  font-size: var(--fs-base);
+  line-height: var(--lh);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -224,11 +260,12 @@ textarea:focus-visible,
 
 .field label {
   display: block;
-  font-size: 10px;
+  font-size: var(--fs-label);
   color: var(--ink-3);
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: .08em;
+  font-family: var(--label-font);
+  text-transform: var(--label-transform);
+  font-variant: var(--label-variant);
+  letter-spacing: var(--label-spacing);
   margin-bottom: 6px;
 }
 
@@ -241,7 +278,7 @@ textarea:focus-visible,
   border: 1px solid var(--line);
   border-radius: 3px;
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: var(--fs-base);
 }
 
 .field input:focus {
@@ -251,7 +288,7 @@ textarea:focus-visible,
 }
 
 .field .field-hint {
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--ink-3);
   margin: 4px 0 0;
   line-height: 1.4;
@@ -263,7 +300,7 @@ textarea:focus-visible,
   color: var(--red);
   padding: 8px 10px;
   border-radius: 3px;
-  font-size: 12px;
+  font-size: var(--fs-base);
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -285,7 +322,7 @@ textarea:focus-visible,
   border-radius: 3px;
   font-family: var(--font-ui);
   font-weight: 600;
-  font-size: 12px;
+  font-size: var(--fs-control);
   cursor: pointer;
   box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 0 rgba(0,0,0,.06);
   transition: scale 150ms ease-out;
@@ -297,7 +334,7 @@ textarea:focus-visible,
 
 .btn-sec {
   padding: 5px 11px;
-  font-size: 12px;
+  font-size: var(--fs-control);
   font-family: var(--font-ui);
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -310,7 +347,7 @@ textarea:focus-visible,
 
 .btn-pri {
   padding: 5px 14px;
-  font-size: 12px;
+  font-size: var(--fs-control);
   font-weight: 600;
   font-family: var(--font-ui);
   background: var(--amber);
@@ -326,7 +363,7 @@ textarea:focus-visible,
 
 .btn-danger {
   padding: 5px 14px;
-  font-size: 12px;
+  font-size: var(--fs-control);
   font-weight: 600;
   font-family: var(--font-ui);
   background: var(--red);
@@ -355,7 +392,7 @@ textarea:focus-visible,
   color: var(--ink-2);
   border: 1px solid var(--line);
   border-radius: 2px;
-  font-size: 11px;
+  font-size: var(--fs-small);
   font-family: var(--font-ui);
   cursor: pointer;
 }
@@ -368,7 +405,7 @@ textarea:focus-visible,
   cursor: not-allowed;
 }
 
-.btn-xs { font-size: 11px; padding: 3px 8px; }
+.btn-xs { font-size: var(--fs-small); padding: 3px 8px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Modal scaffolding
@@ -414,7 +451,7 @@ textarea:focus-visible,
   background: var(--amber-wash); border-radius: 3px;
 }
 .modal .m-hd .t {
-  flex: 1; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
+  flex: 1; font-family: var(--font-ui); font-size: var(--fs-base); font-weight: 600;
   color: var(--ink); letter-spacing: -.1px;
 }
 .modal .m-hd .x {
@@ -438,12 +475,13 @@ textarea:focus-visible,
  * (moved from trawl's main.css, issue #28). */
 .modal .m-field { display: flex; flex-direction: column; gap: 4px; }
 .modal .m-field label {
-  font-family: var(--font-ui); font-size: 10.5px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
+  font-family: var(--label-font); font-size: var(--fs-label); font-weight: 600;
+  text-transform: var(--label-transform); font-variant: var(--label-variant);
+  letter-spacing: var(--label-spacing); color: var(--ink-3);
 }
 .modal .m-field input {
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
-  padding: 6px 10px; font-family: var(--font-ui); font-size: 13px;
+  padding: 6px 10px; font-family: var(--font-ui); font-size: var(--fs-base);
   color: var(--ink); outline: none; height: 30px;
 }
 .modal .m-field input:focus {
@@ -454,7 +492,7 @@ textarea:focus-visible,
   width: 100%; min-height: 60px; padding: 6px 8px;
   background: var(--panel-2); color: var(--ink);
   border: 1px solid var(--line); border-radius: 3px;
-  font-family: var(--font-mono); font-size: 12px;
+  font-family: var(--font-mono); font-size: var(--fs-base);
   resize: vertical;
 }
 .reason-input:focus {
@@ -480,7 +518,7 @@ textarea:focus-visible,
 }
 .tabs .t {
   padding: 8px 12px;
-  font-size: 12.5px;
+  font-size: var(--fs-base);
   color: var(--ink-3);
   cursor: pointer;
   border-bottom: 2px solid transparent;
@@ -492,7 +530,7 @@ textarea:focus-visible,
 }
 .tabs .t:hover { color: var(--ink-2); }
 .tabs .t.active { color: var(--ink); border-bottom-color: var(--amber); font-weight: 500; }
-.tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: 11px; }
+.tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: var(--fs-small); }
 .tabs .sp { flex: 1; }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -541,7 +579,7 @@ textarea:focus-visible,
   background: var(--panel);
 }
 .sd-tabs .tb {
-  font-family: var(--font-ui); font-size: 12px; font-weight: 500;
+  font-family: var(--font-ui); font-size: var(--fs-base); font-weight: 500;
   color: var(--ink-3); padding: 9px 12px; cursor: pointer;
   border-bottom: 2px solid transparent; margin-bottom: -1px;
   transition: color 100ms, border-color 100ms;
@@ -549,7 +587,7 @@ textarea:focus-visible,
 .sd-tabs .tb:hover { color: var(--ink-2); }
 .sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--amber); font-weight: 600; }
 .sd-tabs .sp { flex: 1; }
-.sd-tabs .meta { font-size: 11px; color: var(--ink-3); padding-right: 4px; }
+.sd-tabs .meta { font-size: var(--fs-small); color: var(--ink-3); padding-right: 4px; }
 
 .sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
 
@@ -574,13 +612,13 @@ textarea:focus-visible,
   border: 1px solid var(--line);
   border-left: 3px solid var(--amber);
   border-radius: 3px;
-  padding: 10px 12px;
+  padding: 13px 15px;
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 12px;
   box-shadow: var(--shadow-3);
   animation: toastIn 180ms cubic-bezier(.2,.8,.2,1);
-  font-size: 12px;
+  font-size: var(--fs-base);
 }
 .toast.success { border-left-color: var(--green); }
 .toast.error   { border-left-color: var(--red); }
@@ -593,14 +631,18 @@ textarea:focus-visible,
   font-weight: 600;
   color: var(--ink);
   font-family: var(--font-ui);
-  font-size: 12.5px;
-  margin-bottom: 2px;
+  font-size: var(--fs-base);
+  line-height: 1.35;
+  margin-bottom: 4px;
 }
-.toast .detail { color: var(--ink-2); font-size: 11px; line-height: 1.4; }
+.toast .detail { color: var(--ink-2); font-size: var(--fs-small); line-height: 1.45; }
+/* Close ✕ nudged to optically align with the title's first line. */
 .toast .x {
   color: var(--ink-3);
   cursor: pointer;
-  padding: 2px 6px;
+  padding: 1px 6px;
+  margin: -1px -4px 0 0;
+  line-height: 1.35;
   border-radius: 2px;
   font-family: var(--font-mono);
 }
@@ -632,16 +674,17 @@ textarea:focus-visible,
 
 .login-card h1 {
   margin: 0 0 20px 0;
-  font-size: 28px;
+  font-size: var(--fs-title);
   color: var(--amber);
-  font-weight: 700;
-  letter-spacing: -.4px;
+  font-weight: var(--title-weight);
+  text-transform: var(--title-transform);
+  letter-spacing: var(--title-spacing);
 }
 
 .login-card .subtitle {
   margin: -16px 0 20px 0;
   color: var(--ink-3);
-  font-size: 12px;
+  font-size: var(--fs-base);
 }
 
 .login-card .error { margin-bottom: 16px; }
@@ -681,7 +724,7 @@ textarea:focus-visible,
   gap: 4px;
   font-family: var(--font-ui);
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--fs-base);
   letter-spacing: -.2px;
   color: var(--ink);
 }
@@ -693,7 +736,7 @@ textarea:focus-visible,
 .topbar .modes { display: flex; gap: 0; margin-left: 4px; }
 .topbar .mode {
   padding: 4px 11px;
-  font-size: 12px;
+  font-size: var(--fs-base);
   color: var(--ink-2);
   cursor: pointer;
   border-radius: 3px;
@@ -730,12 +773,12 @@ textarea:focus-visible,
   border-radius: 3px;
   width: 280px;
   color: var(--ink-3);
-  font-size: 12px;
+  font-size: var(--fs-base);
   cursor: text;
   transition: border-color 120ms;
 }
 .topbar .jump:hover { border-color: var(--ink-4); }
-.topbar .jump .gh { flex: 1; font-family: var(--font-ui); font-size: 12px; }
+.topbar .jump .gh { flex: 1; font-family: var(--font-ui); font-size: var(--fs-base); }
 
 .topbar .env {
   display: flex;
@@ -745,7 +788,7 @@ textarea:focus-visible,
   border: 1px solid var(--line);
   border-radius: 3px;
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-base);
   color: var(--ink-2);
   background: var(--panel-2);
 }
@@ -787,7 +830,7 @@ textarea:focus-visible,
   padding: 2px 8px 2px 4px;
   border-radius: 3px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-base);
   color: var(--ink-2);
   user-select: none;
 }
@@ -805,7 +848,7 @@ textarea:focus-visible,
   font-family: var(--font-ui);
   letter-spacing: .02em;
 }
-.topbar .user .who { font-family: var(--font-ui); font-size: 12px; }
+.topbar .user .who { font-family: var(--font-ui); font-size: var(--fs-base); }
 
 /* User menu dropdown — anchored to .user-wrap. */
 .user-menu {
@@ -826,9 +869,9 @@ textarea:focus-visible,
   border-bottom: 1px solid var(--line-2);
   margin-bottom: 4px;
 }
-.user-menu .hdr .name { font-size: 13px; font-weight: 600; color: var(--ink); }
+.user-menu .hdr .name { font-size: var(--fs-base); font-weight: 600; color: var(--ink); }
 .user-menu .hdr .mail {
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--ink-3);
   font-family: var(--font-mono);
   margin-top: 1px;
@@ -840,7 +883,7 @@ textarea:focus-visible,
   padding: 6px 10px;
   border-radius: 3px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-base);
   color: var(--ink);
 }
 .user-menu .item:hover { background: var(--panel-2); }
@@ -900,7 +943,7 @@ textarea:focus-visible,
 }
 .rail .it .lb {
   font-family: var(--font-ui);
-  font-size: 10px;
+  font-size: var(--fs-small);
   font-weight: 500;
 }
 .rail .it:hover { color: var(--ink); background: var(--panel-2); }
@@ -957,14 +1000,16 @@ textarea:focus-visible,
  * rule would leak display/text-transform into it via the cascade. */
 .bdg {
   display: inline-flex; align-items: center;
-  font-size: 10px; font-weight: 600; letter-spacing: .04em;
+  font-size: var(--fs-small); font-weight: 600; letter-spacing: .04em;
   padding: 1px 6px; border-radius: 3px;
   white-space: nowrap; text-transform: uppercase;
 }
 .bdg.neutral { background: var(--panel-2);   color: var(--ink-3); }
 .bdg.info    { background: var(--panel-2);   color: var(--blue); }
 .bdg.success { background: var(--green-wash);color: var(--green); }
-.bdg.warn    { background: var(--amber-wash);color: var(--amber); }
+/* warn reads yellow, not the accent — warnings must keep their
+ * semantic color regardless of what hue the accent slot carries. */
+.bdg.warn    { background: var(--yellow-wash);color: var(--yellow); }
 .bdg.danger  { background: var(--red-wash);  color: var(--red); }
 
 /* Segmented — <Segmented/>. One active treatment: amber wash. */
@@ -976,7 +1021,7 @@ textarea:focus-visible,
 .seg-full { display: flex; }
 .seg-full .seg-opt { flex: 1; }
 .seg .seg-opt {
-  padding: 6px 10px; font-size: 12px; font-weight: 500;
+  padding: 6px 10px; font-size: var(--fs-control); font-weight: 500;
   color: var(--ink-3); background: transparent;
   border: none; border-right: 1px solid var(--line);
   cursor: pointer;
@@ -989,12 +1034,12 @@ textarea:focus-visible,
   color: var(--amber);
   font-weight: 600;
 }
-.seg-sm .seg-opt { padding: 4px 9px; font-size: 11px; }
+.seg-sm .seg-opt { padding: 4px 9px; font-size: var(--fs-small); }
 
 /* Loaded — <Loaded/> tri-state hints (canonical copy tested natively). */
 .load-hint {
   padding: 12px;
-  font-size: 12px;
+  font-size: var(--fs-base);
   color: var(--ink-3);
   font-family: var(--font-ui);
 }
@@ -1003,7 +1048,7 @@ textarea:focus-visible,
  * neutral hint tone, slightly dimmer than the headline copy. */
 .load-hint .load-sub {
   margin-top: 4px;
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--ink-4);
 }
 
@@ -1056,7 +1101,7 @@ textarea:focus-visible,
  * dimmed treatment for shortcuts inside colored buttons. */
 .kbd {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--fs-small);
   padding: 1px 5px;
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -1065,7 +1110,7 @@ textarea:focus-visible,
 }
 .kbd-inline {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-small);
   opacity: .6;
 }
 
@@ -1076,7 +1121,7 @@ textarea:focus-visible,
   align-items: center;
   justify-content: space-between;
   padding: 8px 14px;
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--ink-3);
   background: var(--panel);
   border-top: 1px solid var(--line);
@@ -1100,7 +1145,7 @@ textarea:focus-visible,
 }
 .inp-wrap input {
   flex: 1; background: transparent; border: 0; outline: none;
-  font-family: var(--font-ui); font-size: 12px; color: var(--ink);
+  font-family: var(--font-ui); font-size: var(--fs-base); color: var(--ink);
 }
 
 /* ActionsMenu trigger + panel (moved verbatim from trawl's main.css;
@@ -1121,7 +1166,7 @@ textarea:focus-visible,
 .actions-menu .item {
   display: block; width: 100%; text-align: left;
   background: none; border: none; font-family: inherit;
-  padding: 6px 12px; font-size: 12px; cursor: pointer;
+  padding: 6px 12px; font-size: var(--fs-base); cursor: pointer;
   color: var(--ink-2);
 }
 .actions-menu .item:hover,
@@ -1136,7 +1181,7 @@ textarea:focus-visible,
 /* LoadMore — <LoadMore/> cursor-driven list footer (issue #33). */
 .load-more { display: flex; align-items: center; gap: 6px; }
 .load-more .load-more-end {
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--ink-3);
   font-family: var(--font-mono);
 }
