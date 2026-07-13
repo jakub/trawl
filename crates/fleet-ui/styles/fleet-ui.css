@@ -585,7 +585,10 @@ textarea:focus-visible,
 .toast.success { border-left-color: var(--green); }
 .toast.error   { border-left-color: var(--red); }
 .toast.info    { border-left-color: var(--blue); }
-.toast .body { flex: 1; }
+/* `toast-body`, not `body` — the Shell chrome reserves `.body` for the
+ * rail+main row below, and its `display: flex` used to leak into any
+ * toast child sharing the name. The rename ends the collision class. */
+.toast .toast-body { flex: 1; }
 .toast .title {
   font-weight: 600;
   color: var(--ink);

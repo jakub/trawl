@@ -449,7 +449,7 @@ fn feedback_card() -> Card {
 
     let toast = |kind: &str, title: &str, detail: &str| {
         format!(
-            r#"<div class="toast {kind}"><div class="body"><div class="title">{title}</div><div class="detail">{detail}</div></div><span class="x">{close}</span></div>"#,
+            r#"<div class="toast {kind}"><div class="toast-body"><div class="title">{title}</div><div class="detail">{detail}</div></div><span class="x">{close}</span></div>"#,
             close = close_icon()
         )
     };
