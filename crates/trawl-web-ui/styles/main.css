@@ -375,7 +375,11 @@
   font-size: var(--editor-fs);
 }
 .dsl-editor .cm-editor.cm-focused { outline: none; }
-.dsl-editor .cm-scroller { overflow: auto; }
+/* CM6's injected base theme puts `font-family: monospace` directly on
+ * .cm-scroller, which beats the stack inherited from .cm-editor above
+ * (injected <style> comes after this sheet in source order). Re-state
+ * the stack at higher specificity so Fira Code actually renders. */
+.dsl-editor .cm-editor .cm-scroller { overflow: auto; font-family: var(--font-mono); }
 
 .editor-right {
   display: flex;
