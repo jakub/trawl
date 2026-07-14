@@ -164,13 +164,17 @@ YAML
 cleanup_paths=()
 cleanup() {
     for p in "${cleanup_paths[@]}"; do
-        [[ -n "$p" && -f "$p" ]] && rm -f "$p"
+        [[ -n "$p" && -e "$p" ]] && rm -rf "$p"
     done
 }
 trap cleanup EXIT
 
-mprocs_config="$(mktemp "${TMPDIR:-/tmp}/trawl-dev-mprocs.XXXXXX.yaml")"
-cleanup_paths+=("$mprocs_config")
+# Two hard constraints collide on the config filename: BSD mktemp only
+# substitutes trailing Xs (no suffix after them), while mprocs rejects any
+# config without a lua/yaml/yml/json extension. A temp dir satisfies both.
+mprocs_dir="$(mktemp -d "${TMPDIR:-/tmp}/trawl-dev-mprocs.XXXXXX")"
+cleanup_paths+=("$mprocs_dir")
+mprocs_config="$mprocs_dir/mprocs.yaml"
 emit_procs_yaml > "$mprocs_config"
 
 if $with_coastwatch; then
