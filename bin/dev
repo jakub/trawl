@@ -30,6 +30,40 @@ command -v mprocs >/dev/null || die "mprocs not found. install with 'cargo insta
 command -v trunk  >/dev/null || die "trunk not found. install with 'cargo install --locked trunk'."
 command -v openssl >/dev/null || die "openssl not found."
 
+# Dev SPA must be reached via the .fleet.localhost host, NOT 127.0.0.1: trunk's
+# proxy stamps its backend authority (trawl.fleet.localhost:8090, Trunk.toml)
+# as the Host header on proxied /api/* requests, and fleet-auth's present-only
+# Origin guard compares Origin host against it — a 127.0.0.1 origin mismatches
+# and login/logout 403. Mirrors coastwatch/bin/dev; requires a
+# `127.0.0.1 trawl.fleet.localhost` resolver entry (checked below).
+dev_host="trawl.fleet.localhost"
+dev_login_url="http://${dev_host}:8080/login"
+
+# Resolve a hostname and report whether it maps to a loopback address.
+# Portable across Linux (getent) and macOS (dscacheutil); returns failure
+# when neither exists so the caller warns rather than blocks.
+host_resolves_loopback() {
+    local host="$1" out=""
+    if command -v getent >/dev/null 2>&1; then
+        out=$(getent hosts "$host" 2>/dev/null) || return 1
+    elif command -v dscacheutil >/dev/null 2>&1; then
+        out=$(dscacheutil -q host -a name "$host" 2>/dev/null)
+    else
+        return 1
+    fi
+    [[ "$out" == *127.0.0.1* || "$out" == *::1* ]]
+}
+
+if ! host_resolves_loopback "$dev_host"; then
+    printf 'bin/dev: WARNING — %s does not resolve to loopback.\n' "$dev_host" >&2
+    printf '  trunk proxies /api/* to this host and fleet-auth rejects logins whose\n' >&2
+    printf '  Origin host differs from it, so the SPA 403s. add the hosts entry, then\n' >&2
+    printf '  open %s:\n' "$dev_login_url" >&2
+    # leading \n guards against a hosts file with no trailing newline —
+    # a bare append glues the entry onto the last line and breaks BOTH.
+    printf "    printf '\\\\n127.0.0.1 %s\\\\n' | sudo tee -a /etc/hosts\n" "$dev_host" >&2
+fi
+
 cookie_file="${HOME}/.trawl/dev-cookie-secret"
 if [[ -z "${TRAWL_COOKIE_SECRET:-}" ]]; then
     if [[ -s "$cookie_file" ]]; then
@@ -122,7 +156,7 @@ YAML
     if [[ -s "$dev_key_file" ]]; then
         cat <<YAML
   trawl-login:
-    shell: echo "paste this api key into http://127.0.0.1:8080/login:"; echo; cat "${dev_key_file}"
+    shell: echo "paste this api key into ${dev_login_url}:"; echo; cat "${dev_key_file}"
 YAML
     fi
 }

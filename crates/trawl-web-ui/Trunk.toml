@@ -6,6 +6,7 @@
 #
 # Mode A — trunk serve with proxy (SPA hot reload):
 #   trunk serve
+#   browse http://trawl.fleet.localhost:8080/login
 #
 #   Trunk serves compiled wasm + index.html at :8080 and proxies only
 #   /api/* to the trawl-web backend at :8090. SPA routes (/login,
@@ -14,9 +15,18 @@
 #   triggers a rebuild and live browser refresh. Requires trawl-web +
 #   trawld running separately.
 #
-#   Cookies set by trawl-web on /api/auth/login are scoped to the
-#   :8080 origin (the browser's view of the host), so subsequent
-#   /api/* fetches carry them automatically. SameSite=Strict works.
+#   The dev host MUST be trawl.fleet.localhost, resolving to loopback
+#   (bin/dev checks the resolver at boot). Trunk's proxy rewrites the
+#   Host header to the backend authority — it cannot forward the
+#   browser's original Host — and fleet-auth's present-only Origin
+#   guard compares Origin against Host (ports stripped). Pointing the
+#   proxy backend at the SAME hostname the browser uses is what keeps
+#   login/logout from 403ing; it also means browsing via 127.0.0.1:8080
+#   does NOT work in this mode (Origin host mismatch → 403).
+#
+#   Cookies set by trawl-web on /api/auth/login are host-only on
+#   trawl.fleet.localhost (the browser's view of the host), so
+#   subsequent /api/* fetches carry them automatically.
 #
 # Mode B — single-origin via TRAWL_WEB_SPA_DIR (prod-like):
 #   cd crates/trawl-web-ui && trunk build
@@ -36,8 +46,12 @@
 target = "index.html"
 dist = "dist"
 
+# Bind BOTH loopback families: macOS resolves *.localhost to ::1 and
+# 127.0.0.1 regardless of /etc/hosts, and IPv6-first clients (curl,
+# Safari) would otherwise land on whatever squats [::]:8080 — on stock
+# macOS that's Apache's wildcard bind, which answers 404.
 [serve]
-addresses = ["127.0.0.1"]
+addresses = ["127.0.0.1", "::1"]
 port = 8080
 
 # Trunk 0.21.14 panics on root-mounted proxies (axum no longer allows
@@ -47,5 +61,10 @@ port = 8080
 # trawl-web at :8090. Client-side SPA routes (`/login`, `/search`,
 # etc.) are handled by trunk's index.html fallback and never hit the
 # backend, so the SPA's own router gets to interpret them.
+#
+# The backend host is trawl.fleet.localhost, NOT 127.0.0.1: trunk stamps
+# this authority as the proxied request's Host, and it must match the
+# browser origin's host or fleet-auth's Origin guard 403s login/logout
+# (see the Mode A note above).
 [[proxy]]
-backend = "http://127.0.0.1:8090/api/"
+backend = "http://trawl.fleet.localhost:8090/api/"
