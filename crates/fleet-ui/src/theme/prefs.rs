@@ -78,6 +78,14 @@ impl Density {
             Self::Comfortable => "comfortable",
         }
     }
+
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Compact => Self::Comfortable,
+            Self::Comfortable => Self::Compact,
+        }
+    }
 }
 
 impl FromStr for Density {

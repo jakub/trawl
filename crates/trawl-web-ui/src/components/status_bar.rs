@@ -3,14 +3,15 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<StatusBar/>` — 26px footer with status, last-search summary,
-//! theme toggle, and version.
+//! theme + density toggles, and version.
 //!
 //! Sources count + indexed total + ingest rate are stubbed (`—`)
-//! until `/api/v1/stats` gets wired through. Theme toggle calls
-//! `UiPrefs::theme().update()` and fleet-ui's install effect
-//! re-projects to `<html data-theme>`.
+//! until `/api/v1/stats` gets wired through. Theme/density toggles
+//! call `UiPrefs::theme()`/`UiPrefs::density()` `.update()` and
+//! fleet-ui's install effect re-projects to `<html data-theme>` /
+//! `<html data-density>`.
 
-use fleet_ui::{Theme, UiPrefs};
+use fleet_ui::{Density, Theme, UiPrefs};
 use leptos::prelude::*;
 use leptos::web_sys;
 
@@ -57,6 +58,19 @@ pub fn StatusBar(
         prefs.map_or("light", |p| match p.theme().get() {
             Theme::Light => "light",
             Theme::Dark => "dark",
+        })
+    };
+
+    let toggle_density = move |_| {
+        if let Some(p) = prefs {
+            p.density().update(|d| *d = d.toggled());
+        }
+    };
+
+    let density_label = move || {
+        prefs.map_or("compact", |p| match p.density().get() {
+            Density::Compact => "compact",
+            Density::Comfortable => "comfortable",
         })
     };
 
@@ -124,6 +138,10 @@ pub fn StatusBar(
             <span class="divider">"·"</span>
             <div class="grp clickable" on:click=toggle_theme title="Switch theme">
                 <span>{theme_label}</span>
+            </div>
+            <span class="divider">"·"</span>
+            <div class="grp clickable" on:click=toggle_density title="Switch density">
+                <span>{density_label}</span>
             </div>
             <span class="divider">"·"</span>
             <div class="grp">
