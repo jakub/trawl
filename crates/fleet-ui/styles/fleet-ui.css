@@ -158,11 +158,22 @@
    * are exempt — data-dense surfaces stay compact by design. */
   --fs-title:   23.5px;  /* base × φ */
   --fs-section: 18.5px;  /* base × φ^½ */
+  --fs-heading: 16px;    /* drawer/card titles — fills the control→section gap */
   --fs-base:    14.5px;  /* base */
   --fs-control: 14px;    /* ⅓ toward floor */
   --fs-label:   13.5px;  /* ⅔ toward floor */
   --fs-small:   13px;    /* floor */
   --lh:         1.5;
+
+  /* Dense sub-scale: data-dense surfaces (tables, facets, chips,
+   * axes) that sit BELOW the 13px readability floor by design —
+   * the same exemption --table-fs/--editor-fs already claim. 1px
+   * steps; scales +1px under [data-density="comfortable"] alongside
+   * the two exempt tokens. Don't use these for prose or controls. */
+  --fs-ui:     12px;   /* compact ui text: meta strips, buttons, group titles */
+  --fs-dense:  11px;   /* dense data rows: facet values, chips, hints */
+  --fs-micro:  10px;   /* table headers, badges, pills, secondary counts */
+  --fs-tiny:   9px;    /* axis labels, sort arrows — smallest legible */
 
   /* Label + title treatment: sentence case (the uppercase-mono label
    * treatment was rejected in the workbench pass). */
@@ -196,6 +207,10 @@
   --pad:       14px;
   --editor-fs: 13px;
   --table-fs:  12.5px;
+  --fs-ui:     13px;
+  --fs-dense:  12px;
+  --fs-micro:  11px;
+  --fs-tiny:   10px;
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -843,7 +858,7 @@ textarea:focus-visible,
   color: #fff;
   display: grid;
   place-items: center;
-  font-size: 10px;
+  font-size: var(--fs-micro);
   font-weight: 600;
   font-family: var(--font-ui);
   letter-spacing: .02em;
@@ -970,7 +985,7 @@ textarea:focus-visible,
   background: var(--accent-wash);
   color: var(--accent);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: var(--fs-tiny);
   font-weight: 600;
   line-height: 1.3;
   text-align: center;
