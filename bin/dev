@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # trawl local dev stack: trawld + trawl-web + trunk serve under mprocs.
-# pass --with-coastwatch to also run coastwatch's api + ingest + worker; in
+# pass --with-coastwatch to also run coastwatch's web api + worker + SPA; in
 # that mode trawl delegates the coastwatch service list to
 # `../coastwatch/bin/dev --joined-mprocs` and merges the YAML it produces.
 # run from anywhere — resolves repo root via git.
