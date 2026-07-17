@@ -567,15 +567,15 @@
   height: 100%;
 }
 .histo .bar .ok {
-  background: var(--ink-3);
-  opacity: .32;
+  background: var(--accent);
+  opacity: .38;
   transition: opacity 120ms;
 }
 .histo .bar .err {
-  background: var(--accent);
-  box-shadow: 0 0 3px var(--accent-glow);
+  background: var(--red);
+  box-shadow: 0 0 3px color-mix(in srgb, var(--red) 30%, transparent);
 }
-.histo .bar:hover .ok { opacity: .55; }
+.histo .bar:hover .ok { opacity: .62; }
 .histo .bar:hover::after {
   content: "";
   position: absolute;
