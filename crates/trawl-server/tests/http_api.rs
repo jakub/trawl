@@ -646,6 +646,71 @@ async fn dashboard_becomes_available_once_collector_ticks(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn dashboard_stream_rejects_analyst(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let client = raw_client();
+
+    let resp = client
+        .get(format!("{}/api/v1/dashboard/stream", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_stream_emits_stats_event(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let client = raw_client();
+
+    let resp = client
+        .get(format!("{}/api/v1/dashboard/stream", server.url))
+        .header("authorization", format!("Bearer {}", server.admin_token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "unexpected content-type: {content_type}"
+    );
+
+    // The handler skips ticks until the collector's first snapshot lands,
+    // so read chunks until a full `stats` frame arrives (bounded overall).
+    let mut resp = resp;
+    let frame = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = String::new();
+        loop {
+            let chunk = resp.chunk().await.unwrap().expect("stream ended early");
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            if let Some(start) = buf.find("event: stats")
+                && let Some(end) = buf[start..].find("\n\n")
+            {
+                return buf[start..start + end].to_owned();
+            }
+        }
+    })
+    .await
+    .expect("no stats event within 10s");
+
+    let data_line = frame
+        .lines()
+        .find_map(|l| l.strip_prefix("data: "))
+        .expect("stats frame missing data line");
+    let snapshot: trawl_api::DashboardSnapshot = serde_json::from_str(data_line).unwrap();
+    assert!(snapshot.pool_capacity > 0);
+}
+
+#[sqlx::test(migrations = false)]
 async fn whoami_admin_has_server_manage(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();

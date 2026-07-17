@@ -779,6 +779,58 @@ pub async fn dashboard(
     }
 }
 
+/// `GET /api/v1/dashboard/stream` — push the dashboard snapshot every 2s via SSE (admin only).
+///
+/// Per-connection interval loop over the snapshot cache refreshed by the
+/// background collector — no dedicated push channel. Each snapshot is
+/// emitted as a named `stats` SSE event. Before the collector's first tick
+/// the loop silently skips (never a 503 mid-stream: `EventSource` treats a
+/// non-200 as terminal, whereas an empty wait of ≤1s self-heals).
+pub async fn dashboard_stream(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<
+    Sse<
+        KeepAliveStream<
+            std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>>,
+        >,
+    >,
+    ServerError,
+> {
+    if !verified.has_permission(Permission::ServerManage) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    // Bound concurrent dashboard streams. The owned permit is held by the
+    // stream future and auto-released when the client disconnects.
+    let permit = state
+        .query
+        .dashboard_sse_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ServerError::TooManyStreams)?;
+
+    let stats_stream: std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>,
+    > = Box::pin(async_stream::stream! {
+        let _permit = permit; // hold until the client disconnects
+
+        const PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut timer = tokio::time::interval(PUSH_INTERVAL);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            timer.tick().await; // first tick is immediate
+            let snapshot = state.dashboard_snapshot.lock().clone();
+            let Some(snapshot) = snapshot else { continue };
+            let Ok(json) = serde_json::to_string(&snapshot) else { continue };
+            yield Ok(Event::default().event("stats").data(json));
+        }
+    });
+
+    Ok(Sse::new(stats_stream).keep_alive(KeepAlive::default()))
+}
+
 /// `GET /api/v1/schema/services` — rich per-service schema from background refresh.
 ///
 /// Pure cache read. Returns 503 if the background refresh hasn't completed yet.

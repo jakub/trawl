@@ -48,6 +48,11 @@ pub struct AppState {
     pub dashboard_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
 }
 
+/// Maximum concurrent admin dashboard-stats SSE streams. Hard-coded (no
+/// config knob): the endpoint is `ServerManage`-gated, so this only bounds
+/// a handful of admin browser tabs.
+const MAX_DASHBOARD_STREAMS: usize = 8;
+
 /// Query execution state: pool, tracker, timeout, and schema cache.
 #[derive(Debug, Clone)]
 pub struct QueryState {
@@ -75,6 +80,12 @@ pub struct QueryState {
     pub service_schema_cache: Arc<Mutex<Option<CachedServiceSchema>>>,
     /// Semaphore bounding concurrent SSE streaming connections.
     pub sse_semaphore: Arc<Semaphore>,
+    /// Semaphore bounding concurrent admin dashboard-stats streams.
+    ///
+    /// Separate from `sse_semaphore` so long-lived footer connections
+    /// neither consume user query-stream slots nor pollute the monitor's
+    /// `sse_active` stat (computed from `sse_semaphore` permits).
+    pub dashboard_sse_semaphore: Arc<Semaphore>,
     /// Optional ndjson query debug log.
     pub query_log: Option<Arc<QueryLog>>,
 }
@@ -409,6 +420,7 @@ impl AppState {
                 hot_buffer,
                 service_schema_cache: Arc::new(Mutex::new(None)),
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
+                dashboard_sse_semaphore: Arc::new(Semaphore::new(MAX_DASHBOARD_STREAMS)),
                 query_log: None,
             },
             auth,
