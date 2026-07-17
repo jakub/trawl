@@ -9,7 +9,11 @@ pre-commit:
       run: source "$HOME/.cargo/env" && cargo clippy --workspace --all-targets -- -D warnings
 
 pre-push:
-  parallel: true
+  # Serial on purpose: both suites run sqlx pg tests against the same
+  # dev postgres, and concurrent sqlx test-database setup/cleanup races
+  # (the later run reliably dies ~4s in). Parallel saves ~2min but
+  # can't pass.
+  parallel: false
   commands:
     test:
       run: source "$HOME/.cargo/env" && cargo nextest run --workspace
