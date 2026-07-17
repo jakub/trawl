@@ -68,7 +68,7 @@ pub fn Field(
             Some(view! { <p id=helper_id.clone() class="field-hint">{h}</p> }.into_any())
         }
         Helper::Error(e) => {
-            Some(view! { <p id=helper_id.clone() class="error">{e}</p> }.into_any())
+            Some(view! { <p id=helper_id.clone() class="error-banner">{e}</p> }.into_any())
         }
     };
 

@@ -413,11 +413,12 @@ fn when_renders_both_modes_off_the_shared_clock() {
 
 #[test]
 fn error_banner_emits_error_class_with_alert_role() {
-    // ErrorBanner reuses the moved `.error` class (byte-identical CSS) and
-    // adds the sole sanctioned DOM delta of the whole migration:
-    // role="alert". Pin both — the class so it paints, the role so the
-    // sanctioned a11y delta isn't silently dropped.
-    emits(ERROR_BANNER, r#"class="error""#, ".error");
+    // ErrorBanner paints via `.error-banner` — renamed from the moved
+    // bare `.error`, whose selector leaked banner padding onto every
+    // element using `error` as a state token (`.status-dot.error`,
+    // `.load-hint.error`). Pin both — the class so it paints, the role
+    // so the sanctioned a11y delta isn't silently dropped.
+    emits(ERROR_BANNER, r#"class="error-banner""#, ".error-banner");
     assert!(
         ERROR_BANNER.contains(r#"role="alert""#),
         "ErrorBanner must keep role=\"alert\" — the one sanctioned DOM \

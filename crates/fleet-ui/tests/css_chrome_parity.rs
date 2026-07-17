@@ -144,9 +144,10 @@ fn mode_tabs_suppress_anchor_underline() {
 fn login_error_spacing_preserved() {
     // The more-specific override that restores the pre-migration 16px gap.
     assert!(
-        rule_body(".login-card .error").contains("margin-bottom: 16px"),
-        "`.login-card .error` must keep `margin-bottom: 16px` — the login \
-         form's error spacing depends on this override of base `.error`"
+        rule_body(".login-card .error-banner").contains("margin-bottom: 16px"),
+        "`.login-card .error-banner` must keep `margin-bottom: 16px` — the \
+         login form's error spacing depends on this override of the base \
+         `.error-banner`"
     );
 }
 

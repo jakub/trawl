@@ -8,9 +8,10 @@
 //! this is that strip with the alert role screen readers need. Renders
 //! nothing while the signal is `None`, so the conditional-render idiom
 //! (`{move || error.get().map(|msg| …)}`) collapses into a single
-//! component invocation. The `.error` class already ships in
-//! fleet-ui.css — adopting this component changes exactly one thing in
-//! the DOM: the `role="alert"` attribute.
+//! component invocation. The class is `.error-banner`, NOT bare
+//! `.error` — a bare `.error` selector leaks padding/border onto every
+//! element that uses `error` as a state token (`.status-dot.error`,
+//! `.load-hint.error`, …).
 
 use leptos::prelude::*;
 
@@ -19,6 +20,6 @@ pub fn ErrorBanner(#[prop(into)] error: Signal<Option<String>>) -> impl IntoView
     move || {
         error
             .get()
-            .map(|msg| view! { <div class="error" role="alert">{msg}</div> })
+            .map(|msg| view! { <div class="error-banner" role="alert">{msg}</div> })
     }
 }

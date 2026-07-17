@@ -31,7 +31,7 @@
  *     focus ring, scrollbars, ::selection)
  *   - Universal keyframes: blink, spin, toastIn, fadeIn, modalFadeIn,
  *     modalIn
- *   - Base form/button: .field, .btn, .btn-full, .error
+ *   - Base form/button: .field, .btn, .btn-full, .error-banner
  *   - Variants: .btn-pri, .btn-sec, .btn-danger
  *   - Sizes: .btn-sm (standalone compact), .btn-xs (modifier)
  *   - Modal scaffolding: .modal-scrim, .modal, .modal-sm, .m-hd
@@ -266,7 +266,7 @@ textarea:focus-visible,
 }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Form: .field, .error
+ *  Form: .field, .error-banner
  * ─────────────────────────────────────────────────────────────── */
 .field {
   display: block;
@@ -309,7 +309,7 @@ textarea:focus-visible,
   line-height: 1.4;
 }
 
-.error {
+.error-banner {
   background: var(--red-wash);
   border: 1px solid var(--red);
   color: var(--red);
@@ -667,9 +667,9 @@ textarea:focus-visible,
  *  Login page (.login-shell, .login-card)
  *
  *  Centered card on the bg, sized for the API-key form. Reuses the
- *  generic .field + .btn classes defined above; the .error rule lives
- *  in the form block so login-specific spacing (margin-bottom) is
- *  preserved without duplicating the base .error.
+ *  generic .field + .btn classes defined above; the .error-banner
+ *  rule lives in the form block so login-specific spacing
+ *  (margin-bottom) is preserved without duplicating the base rule.
  * ─────────────────────────────────────────────────────────────── */
 .login-shell {
   display: grid;
@@ -702,7 +702,7 @@ textarea:focus-visible,
   font-size: var(--fs-base);
 }
 
-.login-card .error { margin-bottom: 16px; }
+.login-card .error-banner { margin-bottom: 16px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  App shell — grid (topbar / body / footer)
