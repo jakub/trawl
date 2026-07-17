@@ -985,16 +985,15 @@
 .tbl-hd .th .dir { font-size: var(--fs-micro); color: var(--accent-2); }
 
 /* Schema services table — name cell. The canonical 7px + 2px-ring
- * StatusDot reads swollen against dense row text; scope it down to
- * the old 6px run-dot footprint with a hairline ring. */
+ * StatusDot reads swollen against dense row text; here it's a bare
+ * 3px speck, no ring (a ring is mush at this size). */
 .svc-cell { display: flex; align-items: center; gap: 8px; }
 .svc-cell .name {
   color: var(--ink); font-weight: 500;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.svc-cell .status-dot { width: 6px; height: 6px; }
-.svc-cell .status-dot.success { box-shadow: 0 0 0 1px color-mix(in oklab, var(--green) 30%, transparent); }
-.svc-cell .status-dot.error   { box-shadow: 0 0 0 1px color-mix(in oklab, var(--red) 30%, transparent); }
+.svc-cell .status-dot { width: 3px; height: 3px; }
+.svc-cell .status-dot.success, .svc-cell .status-dot.error { box-shadow: none; }
 
 /* Hover-revealed row quick-actions (Search / Tail on schema rows). */
 .tbl-row .row-act {
