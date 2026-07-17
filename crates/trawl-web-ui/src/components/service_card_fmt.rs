@@ -39,6 +39,35 @@ pub fn format_bytes(n: u64) -> String {
     }
 }
 
+/// Compact uptime: `"42s"`, `"12m"`, `"5h 12m"`, `"3d 4h"`. Zero
+/// remainders are omitted (`"5h"`, not `"5h 0m"`).
+#[must_use]
+pub fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return if rem_mins == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {rem_mins}m")
+        };
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    if rem_hours == 0 {
+        format!("{days}d")
+    } else {
+        format!("{days}d {rem_hours}h")
+    }
+}
+
 /// Average non-null coverage across a set of columns, expressed as
 /// `"N%"`. Returns `"—"` when there are no columns.
 #[must_use]
@@ -249,6 +278,18 @@ mod tests {
         assert_eq!(format_bytes(4_200), "4 KB");
         assert_eq!(format_bytes(284_000_000), "284 MB");
         assert_eq!(format_bytes(1_200_000_000), "1.2 GB");
+    }
+
+    #[test]
+    fn format_uptime_picks_two_largest_units() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(42), "42s");
+        assert_eq!(format_uptime(60), "1m");
+        assert_eq!(format_uptime(12 * 60 + 30), "12m");
+        assert_eq!(format_uptime(5 * 3600 + 12 * 60), "5h 12m");
+        assert_eq!(format_uptime(5 * 3600), "5h");
+        assert_eq!(format_uptime(3 * 86_400 + 4 * 3600), "3d 4h");
+        assert_eq!(format_uptime(3 * 86_400), "3d");
     }
 
     #[test]

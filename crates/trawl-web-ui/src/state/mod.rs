@@ -19,4 +19,6 @@ pub mod query;
 #[cfg(target_arch = "wasm32")]
 pub mod search_session;
 #[cfg(target_arch = "wasm32")]
+pub mod stats_stream;
+#[cfg(target_arch = "wasm32")]
 pub mod stream_session;

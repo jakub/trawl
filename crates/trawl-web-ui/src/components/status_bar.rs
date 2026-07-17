@@ -3,19 +3,24 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<StatusBar/>` — 26px footer with status, last-search summary,
-//! theme + density toggles, and version.
+//! admin stats, theme + density toggles, and version.
 //!
-//! Sources count + indexed total + ingest rate are stubbed (`—`)
-//! until `/api/v1/stats` gets wired through. Theme/density toggles
-//! call `UiPrefs::theme()`/`UiPrefs::density()` `.update()` and
-//! fleet-ui's install effect re-projects to `<html data-theme>` /
+//! The stats cluster (hot buffer / WAL backlog / active queries /
+//! uptime) renders only while the `stats` signal carries a
+//! [`DashboardSnapshot`] — AuthShell feeds it from the admin-only
+//! `/api/v1/dashboard/stream` SSE stream, so non-admins never see the
+//! group. Theme/density toggles call
+//! `UiPrefs::theme()`/`UiPrefs::density()` `.update()` and fleet-ui's
+//! install effect re-projects to `<html data-theme>` /
 //! `<html data-density>`.
 
 use fleet_ui::{Density, Theme, UiPrefs};
 use leptos::prelude::*;
 use leptos::web_sys;
+use trawl_api::DashboardSnapshot;
 
 use crate::api;
+use crate::components::service_card_fmt::{format_bytes, format_count, format_uptime};
 use crate::state::query::RangeSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +50,10 @@ pub fn StatusBar(
     /// back-pressure notification.
     #[prop(into)]
     lagged: Signal<Option<u64>>,
+    /// Live admin stats from `/api/v1/dashboard/stream`; `None` for
+    /// non-admin sessions (the stats cluster is hidden entirely).
+    #[prop(into)]
+    stats: Signal<Option<DashboardSnapshot>>,
 ) -> impl IntoView {
     let prefs = use_context::<UiPrefs>();
 
@@ -115,12 +124,36 @@ pub fn StatusBar(
                     </div>
                 </>
             })}
-            <span class="divider">"·"</span>
-            <div class="grp"><span>"— sources"</span></div>
-            <span class="divider">"·"</span>
-            <div class="grp"><span>"— indexed"</span></div>
-            <span class="divider">"·"</span>
-            <div class="grp"><span>"ingest " <span class="accent">"—/s"</span></span></div>
+            {move || stats.get().map(|s| view! {
+                <>
+                    <span class="divider">"·"</span>
+                    <div class="grp" title="Hot buffer (events / bytes)">
+                        <span>"hot "</span>
+                        <span class="strong">
+                            {format_count(u64::try_from(s.hot_buffer_events).unwrap_or_default())}
+                        </span>
+                        <span>
+                            {format!(" / {}", format_bytes(u64::try_from(s.hot_buffer_bytes).unwrap_or_default()))}
+                        </span>
+                    </div>
+                    <span class="divider">"·"</span>
+                    <div class="grp" title="WAL backlog (files / bytes)">
+                        <span>"wal "</span>
+                        <span class="strong">{s.wal_files.to_string()}</span>
+                        <span>{format!(" / {}", format_bytes(s.wal_bytes))}</span>
+                    </div>
+                    <span class="divider">"·"</span>
+                    <div class="grp" title="Active queries">
+                        <span>"queries "</span>
+                        <span class="strong">{s.active_queries.len().to_string()}</span>
+                    </div>
+                    <span class="divider">"·"</span>
+                    <div class="grp" title="Server uptime">
+                        <span>"up "</span>
+                        <span class="accent">{format_uptime(s.uptime_secs)}</span>
+                    </div>
+                </>
+            })}
             <span class="divider">"·"</span>
             <div class="grp">
                 <span>

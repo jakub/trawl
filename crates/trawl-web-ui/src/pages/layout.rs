@@ -22,6 +22,7 @@ use crate::components::status_bar::{StatusBar, StatusKind};
 use crate::state::app_mode::{self, AppMode};
 use crate::state::query::RangeSpec;
 use crate::state::section;
+use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
 
 /// Shared status signals that the shell owns and the StatusBar reads.
 /// Search (or any page that wants to drive the status bar) writes to
@@ -67,6 +68,27 @@ pub fn AuthShell() -> impl IntoView {
     };
     provide_context(shell_status);
     provide_context(me);
+
+    // Admin-only live stats for the footer. The stream opens only after
+    // `/me` resolves with the admin role — the endpoint is
+    // `ServerManage`-gated upstream, so non-admins never even issue the
+    // request. The `StoredValue` bounds the `EventSource` lifetime;
+    // dropping it closes the connection.
+    let admin_stats = RwSignal::new(None::<trawl_api::DashboardSnapshot>);
+    let stats_handle: StoredValue<Option<StatsLifecycle>, LocalStorage> =
+        StoredValue::new_local(None);
+    on_cleanup(move || stats_handle.update_value(|s| *s = None));
+    Effect::new(move |_| {
+        let is_admin = me.get().is_some_and(|m| m.role == "admin");
+        // Drop any previous stream first — this Effect re-runs whenever
+        // `me` changes, and two live EventSources would double-push.
+        stats_handle.update_value(|s| *s = None);
+        if is_admin {
+            stats_handle.update_value(|s| *s = start_stats_stream(admin_stats));
+        } else {
+            admin_stats.set(None);
+        }
+    });
 
     let rail_items = Signal::derive(move || {
         section::items_for(current_app.get())
@@ -128,6 +150,7 @@ pub fn AuthShell() -> impl IntoView {
                     count=Signal::derive(move || shell_status.count.get())
                     range=Signal::derive(move || shell_status.range.get())
                     lagged=Signal::derive(move || shell_status.lagged.get())
+                    stats=admin_stats
                 />
             }.into_any())
             rail_bottom=Box::new(|| view! {
