@@ -2,11 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! SSE pass-through for `/api/v1/stream`.
+//! SSE pass-through for `/api/v1/stream` and `/api/v1/dashboard/stream`.
 //!
 //! The generic `/api/v1/*` forwarder buffers request/response bodies,
 //! which is wrong for Server-Sent Events — those are streams of
-//! unbounded size and unpredictable duration. This handler streams the
+//! unbounded size and unpredictable duration. These handlers stream the
 //! upstream response bytes straight to the browser without parsing. The
 //! browser's `EventSource` handles framing on its end; reconnection
 //! after a drop is automatic and rides the same session cookie.
@@ -50,6 +50,39 @@ pub async fn forward(
         .await
         .map_err(ProxyError::Network)?;
 
+    forward_sse_response(&state, &auth, upstream_resp)
+}
+
+/// SSE pass-through for the admin dashboard-stats stream. No params —
+/// trawld's `ServerManage` check is the sole authorization gate.
+pub async fn forward_dashboard(
+    State(state): State<AppState>,
+    auth: Auth,
+) -> Result<Response, ProxyError> {
+    let upstream_url = format!(
+        "{}/api/v1/dashboard/stream",
+        state.upstream_url().trim_end_matches('/')
+    );
+
+    let upstream_resp = state
+        .http()
+        .get(&upstream_url)
+        .bearer_auth(auth.token())
+        .send()
+        .await
+        .map_err(ProxyError::Network)?;
+
+    forward_sse_response(&state, &auth, upstream_resp)
+}
+
+/// Turn an upstream SSE response into the browser-facing streaming
+/// response: status mirroring, session-expiry cap, SSE headers, and the
+/// proxy-wide cookie rule. Shared by both SSE forwarders.
+fn forward_sse_response(
+    state: &AppState,
+    auth: &Auth,
+    upstream_resp: reqwest::Response,
+) -> Result<Response, ProxyError> {
     // Mirror the upstream status verbatim. The previous implementation
     // routed non-2xx through `ProxyError::Upstream`, whose `IntoResponse`
     // collapses everything that isn't 401/403 into 502 — so trawld's
@@ -72,7 +105,7 @@ pub async fn forward(
     // `Body::from_stream` otherwise has no deadline. Dropping the
     // upstream stream also cleanly closes the TCP connection via
     // reqwest's drop handling.
-    let ttl = match &auth {
+    let ttl = match auth {
         Auth::Session(s) => remaining_ttl(s.exp(), chrono::Utc::now().timestamp()),
         Auth::Bearer(_) => Duration::from_secs(state.session_ttl_secs()),
     };
@@ -101,7 +134,7 @@ pub async fn forward(
     // `clear_cookie_for_proxied_response`. (Today it never clears — an
     // EventSource reconnect keeps 401ing until the SPA's next `/me` poll
     // drops the dead cookie, the permission-aware place to make that call.)
-    if let Some(clear) = clear_cookie_for_proxied_response(status, &auth) {
+    if let Some(clear) = clear_cookie_for_proxied_response(status, auth) {
         builder = builder.header(header::SET_COOKIE, clear);
     }
 
@@ -488,6 +521,95 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "stream should close at session.exp (~1s), took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_stream_forwards_body_with_sse_headers() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        let sse_body = "event: stats\ndata: {\"uptime_secs\":42}\n\n";
+        Mock::given(method("GET"))
+            .and(path("/api/v1/dashboard/stream"))
+            .and(bearer_token("flt_token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/dashboard/stream")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert_eq!(resp.headers().get("x-accel-buffering").unwrap(), "no");
+
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), sse_body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn dashboard_stream_rejects_missing_cookie() {
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/dashboard/stream")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dashboard_stream_upstream_401_preserves_cookie() {
+        // trawld 401s this path for every non-admin session (ServerManage
+        // check), so the shared-cookie rule matters most here: a routine
+        // authz denial must never sign the user out of the whole fleet.
+        let upstream = MockServer::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/dashboard/stream"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/dashboard/stream")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !resp.headers().contains_key(header::SET_COOKIE),
+            "a proxied dashboard-stream 401 must NOT clear the shared fleet_session cookie"
         );
     }
 
