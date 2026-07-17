@@ -4,8 +4,8 @@
 
 //! `<ResultsTable/>` — paginated snapshot results table.
 //!
-//! Restyled for the v0.14 design: 10px uppercase column headers with
-//! a right-aligned sort affordance, expandable rows that reveal a
+//! Restyled for the v0.14 design: sans-serif column headers (matching
+//! the meta/filter strip) with a sort affordance, expandable rows that reveal a
 //! `_time` / field tag detail panel with Copy _raw / Show context /
 //! Find similar action buttons. Detail-row tag clicks add filters
 //! through a parent-supplied callback.

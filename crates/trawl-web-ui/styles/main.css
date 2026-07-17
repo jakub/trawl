@@ -118,10 +118,9 @@
   top: 0;
   background: var(--panel-2);
   color: var(--ink-3);
-  text-transform: uppercase;
-  font-size: var(--fs-micro);
-  letter-spacing: .08em;
-  font-weight: 500;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  font-weight: 600;
   text-align: left;
   padding: 6px var(--row-pad-x);
   border-bottom: 1px solid var(--line);
