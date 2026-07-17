@@ -108,6 +108,7 @@ fn ResultsTableBody(
     }).collect::<Vec<_>>();
 
     let has_rows = !rows_data.is_empty();
+    let sorted_indices = SortedIndices::new(&rows_data, sort);
     let cur_page = page.get();
     let can_prev = cur_page > 0;
     let can_next = returned == PAGE_SIZE;
@@ -135,25 +136,26 @@ fn ResultsTableBody(
                     </thead>
                     <tbody>
                         {if has_rows {
-                            let sorted_indices = SortedIndices::new(&rows_data, sort);
-                            sorted_indices.render(
+                            // Closure, not a bare block: row rendering must
+                            // re-run when the sort memo changes.
+                            (move || sorted_indices.render(
                                 rows_data.clone(),
-                                cols_for_view,
+                                cols_for_view.clone(),
                                 level_idx,
                                 expanded,
                                 on_add_filter,
                                 on_navigate,
                                 bus,
-                            )
+                            )).into_any()
                         } else {
                             let cols_len = columns.len() + 1;
-                            vec![view! {
+                            view! {
                                 <tr>
                                     <td class="results-empty-cell" colspan=cols_len>
                                         "no fish in this net yet"
                                     </td>
                                 </tr>
-                            }.into_any()]
+                            }.into_any()
                         }}
                     </tbody>
                 </table>
@@ -178,6 +180,7 @@ fn ResultsTableBody(
 
 /// Sort indirection: the table renders rows by index, applying the
 /// current sort lazily on each render. Avoids cloning rows.
+#[derive(Clone, Copy)]
 struct SortedIndices {
     indices: Memo<Vec<usize>>,
 }
