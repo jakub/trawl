@@ -2,8 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<SchemaPage/>` — cards-grid browser over `/api/v1/schema/services`
-//! with a slide-out drawer inspector for each service.
+//! `<SchemaPage/>` — sortable services table over
+//! `/api/v1/schema/services` with a slide-out drawer inspector for
+//! each service.
 //!
 //! URL params:
 //! - `svc=<name>` — opens the drawer on the named service; clearing
@@ -11,23 +12,82 @@
 //! - `stab=overview|fields|tail` — which drawer tab is active
 //!   (default: overview).
 //!
-//! Density (Comfy/Compact) is a session-scoped `RwSignal` — kept out
-//! of the URL to reduce noise on shared links.
+//! Density comes from the global statusbar toggle
+//! (`<html data-density>`) like every other table — the old
+//! page-local Comfy/Compact control is gone.
 
 use leptos::prelude::*;
+use leptos::web_sys;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::ServiceSchema;
 
 use crate::api;
-use crate::components::service_card::ServiceCard;
-use crate::components::service_card_fmt::today_yesterday_utc;
+use crate::components::service_card_fmt::{
+    avg_cov_permille, date_range, format_avg_coverage, format_bytes, format_count, is_healthy,
+    today_yesterday_utc,
+};
 use crate::components::service_drawer::ServiceDrawer;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use fleet_ui::{
-    Btn, LoadState, Loaded, SearchInput, Segmented, SegmentedOption, Size, ToastBus, ToastKind,
-    Variant,
+    Btn, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
+    ToastBus, ToastKind, Variant,
 };
+
+/// Days of `daily_event_counts` history shown in the activity sparkline.
+const SPARK_DAYS: usize = 30;
+
+/// Sort key for the services table. Clicking the active header flips
+/// direction; a fresh key starts at its natural direction (name
+/// ascending, everything else descending).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SvcSort {
+    Name,
+    LastIngest,
+    Events,
+    Storage,
+    Fields,
+    Coverage,
+}
+
+impl SvcSort {
+    fn default_desc(self) -> bool {
+        !matches!(self, Self::Name)
+    }
+}
+
+/// One sortable header cell. Not a `#[component]` — the flex sizing
+/// `style` is per-column and threading it through props buys nothing.
+fn sort_th(
+    sort: RwSignal<(SvcSort, bool)>,
+    key: SvcSort,
+    label: &'static str,
+    style: &'static str,
+) -> impl IntoView {
+    let arrow = move || {
+        let (k, desc) = sort.get();
+        (k == key).then_some(if desc { "↓" } else { "↑" })
+    };
+    view! {
+        <div
+            class="th sortable"
+            class:active=move || sort.get().0 == key
+            style=style
+            on:click=move |_| {
+                sort.update(|s| {
+                    if s.0 == key {
+                        s.1 = !s.1;
+                    } else {
+                        *s = (key, key.default_desc());
+                    }
+                });
+            }
+        >
+            {label}
+            <span class="dir">{arrow}</span>
+        </div>
+    }
+}
 
 #[component]
 #[allow(clippy::too_many_lines)]
@@ -44,8 +104,7 @@ pub fn SchemaPage() -> impl IntoView {
     let tab_sig: Signal<String> = Signal::derive(move || tab_param.get());
 
     let filter = RwSignal::new(String::new());
-    let compact = RwSignal::new(false);
-    let compact_sig: Signal<bool> = Signal::derive(move || compact.get());
+    let sort = RwSignal::new((SvcSort::Name, false));
 
     let services = LocalResource::new(|| async move { api::schema_services().await });
 
@@ -130,73 +189,163 @@ pub fn SchemaPage() -> impl IntoView {
             <div class="page-hd compact">
                 <div>
                     <h1>"Schema · Services"</h1>
-                    <p class="sub">"Click a card to inspect fields, ingest rate, and tail live."</p>
+                    <p class="sub">"Click a service to inspect fields, ingest rate, and tail live."</p>
                 </div>
                 <div class="actions">
                     <SearchInput value=filter placeholder="filter services…"/>
-                    <Segmented
-                        size=Size::Sm
-                        options=vec![
-                            SegmentedOption::new("comfy", "Comfy"),
-                            SegmentedOption::new("compact", "Compact"),
-                        ]
-                        active=Signal::derive(move || {
-                            if compact.get() { "compact" } else { "comfy" }.to_string()
-                        })
-                        on_change=Callback::new(move |id: String| compact.set(id == "compact"))
-                        attr:title="Card density"
-                    />
                     <Btn variant=Variant::Primary on_click=on_new_extractor>"+ New extractor"</Btn>
                 </div>
             </div>
 
-            <div class=move || if compact.get() { "sc-grid compact" } else { "sc-grid" }>
-                <Loaded
-                    state=Signal::derive(move || LoadState::from_resource(services.get()))
-                    label="schema"
-                    render=Box::new(move |resp: trawl_api::ServiceSchemaResponse| {
-                        let needle = filter.get().to_lowercase();
-                        let visible: Vec<ServiceSchema> = resp.services.iter()
-                            .filter(|s| {
-                                if needle.is_empty() { return true; }
-                                if s.name.to_lowercase().contains(&needle) { return true; }
-                                s.columns.iter().any(|c| c.name.to_lowercase().contains(&needle))
-                            })
-                            .cloned()
-                            .collect();
-                        if visible.is_empty() {
-                            return view! {
-                                <div class="sc-more" style="padding:24px">
-                                    {if resp.services.is_empty() {
-                                        "no services yet — ingest some logs and they'll appear here"
-                                    } else {
-                                        "no services match that filter"
-                                    }}
-                                </div>
-                            }.into_any();
-                        }
-                        let today = today.clone();
-                        let yesterday = yesterday.clone();
-                        visible.into_iter().map(|svc| {
-                            let name_for_active = svc.name.clone();
-                            let active_sig: Signal<bool> = Signal::derive(move || {
-                                svc_selected.get().as_deref() == Some(name_for_active.as_str())
-                            });
-                            view! {
-                                <ServiceCard
-                                    svc=svc
-                                    compact=compact_sig
-                                    active=active_sig
-                                    today=today.clone()
-                                    yesterday=yesterday.clone()
-                                    on_open=on_open
-                                    on_search=on_search
-                                    on_tail=on_tail
-                                />
+            <div class="tbl">
+                <div class="tbl-hd">
+                    {sort_th(sort, SvcSort::Name, "Service", "flex:2; min-width:0")}
+                    <div class="th" style="flex:0 0 110px">"Activity"</div>
+                    {sort_th(sort, SvcSort::LastIngest, "Range", "flex:0 0 170px")}
+                    {sort_th(sort, SvcSort::Events, "Events", "flex:0 0 64px; justify-content:flex-end")}
+                    {sort_th(sort, SvcSort::Storage, "Storage", "flex:0 0 80px; justify-content:flex-end")}
+                    {sort_th(sort, SvcSort::Fields, "Fields", "flex:0 0 56px; justify-content:flex-end")}
+                    {sort_th(sort, SvcSort::Coverage, "Avg cov", "flex:0 0 68px; justify-content:flex-end")}
+                    <div style="flex:0 0 64px"></div>
+                </div>
+                <div class="tbl-body">
+                    <Loaded
+                        state=Signal::derive(move || LoadState::from_resource(services.get()))
+                        label="schema"
+                        render=Box::new(move |resp: trawl_api::ServiceSchemaResponse| {
+                            let needle = filter.get().to_lowercase();
+                            let mut visible: Vec<ServiceSchema> = resp.services.iter()
+                                .filter(|s| {
+                                    if needle.is_empty() { return true; }
+                                    if s.name.to_lowercase().contains(&needle) { return true; }
+                                    s.columns.iter().any(|c| c.name.to_lowercase().contains(&needle))
+                                })
+                                .cloned()
+                                .collect();
+                            if visible.is_empty() {
+                                return view! {
+                                    <div class="tbl-empty">
+                                        {if resp.services.is_empty() {
+                                            "no services yet — ingest some logs and they'll appear here"
+                                        } else {
+                                            "no services match that filter"
+                                        }}
+                                    </div>
+                                }.into_any();
                             }
-                        }).collect::<Vec<_>>().into_any()
-                    })
-                />
+
+                            let (key, desc) = sort.get();
+                            visible.sort_by(|a, b| {
+                                let ord = match key {
+                                    SvcSort::Name => {
+                                        a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                                    }
+                                    // ISO dates compare correctly as strings;
+                                    // None (no ingest yet) sorts before any date.
+                                    SvcSort::LastIngest => a.latest_date.cmp(&b.latest_date),
+                                    SvcSort::Events => a.total_events.cmp(&b.total_events),
+                                    SvcSort::Storage => a.total_bytes.cmp(&b.total_bytes),
+                                    SvcSort::Fields => a.columns.len().cmp(&b.columns.len()),
+                                    SvcSort::Coverage => avg_cov_permille(&a.columns)
+                                        .cmp(&avg_cov_permille(&b.columns)),
+                                };
+                                if desc { ord.reverse() } else { ord }
+                            });
+
+                            let count = visible.len();
+                            let today = today.clone();
+                            let yesterday = yesterday.clone();
+                            let rows = visible.into_iter().map(|svc| {
+                                let name = svc.name.clone();
+                                let healthy = is_healthy(&svc, &today, &yesterday);
+                                let dot_tone = if healthy {
+                                    StatusTone::Success
+                                } else {
+                                    StatusTone::Error
+                                };
+                                let spark_color = if healthy {
+                                    "var(--accent)"
+                                } else {
+                                    "var(--red)"
+                                };
+                                let spark_data: Vec<u64> = svc
+                                    .daily_event_counts
+                                    .iter()
+                                    .rev()
+                                    .take(SPARK_DAYS)
+                                    .map(|d| d.count)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect();
+                                let range = date_range(&svc);
+                                let range = if range.is_empty() { "—".to_string() } else { range };
+                                let events_label = format_count(svc.total_events);
+                                let storage_label = format_bytes(svc.total_bytes);
+                                let field_count = svc.columns.len();
+                                let coverage_label = format_avg_coverage(&svc.columns);
+
+                                let name_for_active = name.clone();
+                                let name_open = name.clone();
+                                let name_search = name.clone();
+                                let name_tail = name.clone();
+                                view! {
+                                    <div
+                                        class="tbl-row"
+                                        class:active=move || {
+                                            svc_selected.get().as_deref()
+                                                == Some(name_for_active.as_str())
+                                        }
+                                        on:click=move |_| on_open.run(name_open.clone())
+                                    >
+                                        <div class="svc-cell" style="flex:2; min-width:0">
+                                            <StatusDot tone=dot_tone/>
+                                            <span class="mono name">{name}</span>
+                                        </div>
+                                        <div style="flex:0 0 110px">
+                                            <Sparkline data=spark_data color=spark_color w=96 h=16/>
+                                        </div>
+                                        <div class="mono range" style="flex:0 0 170px">{range}</div>
+                                        <div class="num" style="flex:0 0 64px">{events_label}</div>
+                                        <div class="num" style="flex:0 0 80px">{storage_label}</div>
+                                        <div class="num" style="flex:0 0 56px">{field_count}</div>
+                                        <div class="num" style="flex:0 0 68px">{coverage_label}</div>
+                                        <div class="row-act" style="flex:0 0 64px">
+                                            <span
+                                                class="qa"
+                                                title="Search this service"
+                                                on:click=move |e: web_sys::MouseEvent| {
+                                                    e.stop_propagation();
+                                                    on_search.run(name_search.clone());
+                                                }
+                                            >
+                                                <IconView icon=Icon::Search size=12 stroke_width=1.5/>
+                                            </span>
+                                            <span
+                                                class="qa"
+                                                title="Live tail"
+                                                on:click=move |e: web_sys::MouseEvent| {
+                                                    e.stop_propagation();
+                                                    on_tail.run(name_tail.clone());
+                                                }
+                                            >
+                                                <IconView icon=Icon::Bolt size=12 stroke_width=1.5/>
+                                            </span>
+                                        </div>
+                                    </div>
+                                }
+                            }).collect::<Vec<_>>();
+                            view! {
+                                {rows}
+                                // Summary-only Pager — the table is unpaginated.
+                                <Pager summary=format!(
+                                    "{count} service{}",
+                                    if count == 1 { "" } else { "s" },
+                                )/>
+                            }.into_any()
+                        })
+                    />
+                </div>
             </div>
 
             {move || {

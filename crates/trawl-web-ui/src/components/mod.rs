@@ -32,7 +32,6 @@ pub mod meta_strip;
 pub mod net_drawer;
 pub mod results_table;
 pub mod save_as_net_modal;
-pub mod service_card;
 pub mod service_card_fmt;
 pub mod service_drawer;
 pub mod status_bar;

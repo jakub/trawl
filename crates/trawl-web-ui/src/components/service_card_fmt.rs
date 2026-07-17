@@ -64,6 +64,37 @@ pub fn format_avg_coverage(columns: &[trawl_api::ServiceColumnStats]) -> String 
     format!("{:.0}%", avg * 100.0)
 }
 
+/// Mean non-null coverage across columns as integer permille
+/// (`0..=1000`) — an `Ord`-friendly twin of [`format_avg_coverage`]
+/// for the services table sort. Returns 0 when there are no columns.
+#[must_use]
+pub fn avg_cov_permille(columns: &[trawl_api::ServiceColumnStats]) -> u32 {
+    if columns.is_empty() {
+        return 0;
+    }
+    let sum: f64 = columns
+        .iter()
+        .map(|c| {
+            if c.total_count == 0 {
+                0.0
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    (c.total_count - c.null_count) as f64 / c.total_count as f64
+                }
+            }
+        })
+        .sum();
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    {
+        (sum / columns.len() as f64 * 1000.0).round() as u32
+    }
+}
+
 /// Format the `earliest_date`/`latest_date` pair from a `ServiceSchema`
 /// as `"YYYY-MM-DD → YYYY-MM-DD"`, collapsing to a single date when
 /// they match. Returns an empty string when either is missing.
@@ -226,6 +257,24 @@ mod tests {
         assert_eq!(cov_pct(0, 100), 100);
         assert_eq!(cov_pct(50, 100), 50);
         assert_eq!(cov_pct(99, 100), 1);
+    }
+
+    #[test]
+    fn avg_cov_permille_averages_columns() {
+        let col = |null_count, total_count| trawl_api::ServiceColumnStats {
+            name: String::new(),
+            data_type: String::new(),
+            null_count,
+            total_count,
+            min_value: None,
+            max_value: None,
+            compressed_bytes: 0,
+        };
+        assert_eq!(avg_cov_permille(&[]), 0);
+        assert_eq!(avg_cov_permille(&[col(0, 100)]), 1000);
+        assert_eq!(avg_cov_permille(&[col(0, 100), col(50, 100)]), 750);
+        // total_count == 0 counts as zero coverage, not a div-by-zero
+        assert_eq!(avg_cov_permille(&[col(0, 0), col(0, 100)]), 500);
     }
 
     #[test]
