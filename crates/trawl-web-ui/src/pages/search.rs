@@ -276,16 +276,12 @@ pub fn Search() -> impl IntoView {
         );
     });
     Effect::new(move |_| {
-        shell_status.range.set(range.get());
-    });
-    Effect::new(move |_| {
         shell_status.lagged.set(lagged.get());
     });
 
     on_cleanup(move || {
         shell_status.kind.set(StatusKind::Connected);
         shell_status.count.set(None);
-        shell_status.range.set(RangeSpec::default());
         shell_status.lagged.set(None);
     });
 

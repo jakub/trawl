@@ -20,7 +20,6 @@ use fleet_ui::{Icon, IconView, ModeTab, RailItem, Shell, UserInfo};
 use crate::api;
 use crate::components::status_bar::{StatusBar, StatusKind};
 use crate::state::app_mode::{self, AppMode};
-use crate::state::query::RangeSpec;
 use crate::state::section;
 use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
 
@@ -31,7 +30,6 @@ use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
 pub struct ShellStatus {
     pub kind: RwSignal<StatusKind>,
     pub count: RwSignal<Option<usize>>,
-    pub range: RwSignal<RangeSpec>,
     pub lagged: RwSignal<Option<u64>>,
 }
 
@@ -63,7 +61,6 @@ pub fn AuthShell() -> impl IntoView {
     let shell_status = ShellStatus {
         kind: RwSignal::new(StatusKind::Connected),
         count: RwSignal::new(None),
-        range: RwSignal::new(RangeSpec::default()),
         lagged: RwSignal::new(None),
     };
     provide_context(shell_status);
@@ -148,7 +145,6 @@ pub fn AuthShell() -> impl IntoView {
                 <StatusBar
                     status=Signal::derive(move || shell_status.kind.get())
                     count=Signal::derive(move || shell_status.count.get())
-                    range=Signal::derive(move || shell_status.range.get())
                     lagged=Signal::derive(move || shell_status.lagged.get())
                     stats=admin_stats
                 />

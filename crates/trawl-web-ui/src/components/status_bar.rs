@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<StatusBar/>` — 26px footer with status, last-search summary,
-//! admin stats, theme + density toggles, and version.
+//! admin stats, and corner theme + density toggles.
 //!
 //! The stats cluster (hot buffer / WAL backlog / active queries /
 //! uptime) renders only while the `stats` signal carries a
@@ -21,7 +21,6 @@ use trawl_api::DashboardSnapshot;
 
 use crate::api;
 use crate::components::service_card_fmt::{format_bytes, format_count, format_uptime};
-use crate::state::query::RangeSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
@@ -43,9 +42,6 @@ pub fn StatusBar(
     /// Last-search row count (`None` if nothing has run yet).
     #[prop(into)]
     count: Signal<Option<usize>>,
-    /// Currently selected range spec.
-    #[prop(into)]
-    range: Signal<RangeSpec>,
     /// Currently lagged events count, if the live stream emitted a
     /// back-pressure notification.
     #[prop(into)]
@@ -164,22 +160,12 @@ pub fn StatusBar(
                 </span>
             </div>
             <div class="sp"></div>
-            <div class="grp">
-                <span>"range "</span>
-                <span class="accent">{move || range.get().label()}</span>
-            </div>
-            <span class="divider">"·"</span>
             <div class="grp clickable" on:click=toggle_theme title="Switch theme">
                 <span>{theme_label}</span>
             </div>
             <span class="divider">"·"</span>
             <div class="grp clickable" on:click=toggle_density title="Switch density">
                 <span>{density_label}</span>
-            </div>
-            <span class="divider">"·"</span>
-            <div class="grp">
-                <span>"trawl "</span>
-                <span class="strong">{concat!("v", env!("CARGO_PKG_VERSION"))}</span>
             </div>
         </div>
     }
