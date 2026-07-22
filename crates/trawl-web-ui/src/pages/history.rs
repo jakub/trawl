@@ -74,7 +74,7 @@ pub fn HistoryPage() -> impl IntoView {
     let on_clear = Callback::new(move |()| {
         bus.push(
             ToastKind::Info,
-            "Clear History",
+            "Clear history",
             Some("Server-side history clearing is landing soon.".into()),
         );
     });
@@ -113,12 +113,12 @@ pub fn HistoryPage() -> impl IntoView {
             <div class="page-hd compact">
                 <div>
                     <h1>"Search history"</h1>
-                    <p class="sub">"Every query you've cast. Re-run the net anytime."</p>
+                    <p class="sub">"Every query you've run. Re-cast the net anytime or create a scheduled search."</p>
                 </div>
                 <div class="actions">
                     <SearchInput value=filter placeholder="filter history…"/>
                     <Btn variant=Variant::Secondary on_click=on_export>"Export"</Btn>
-                    <Btn variant=Variant::Secondary on_click=on_clear>"Clear History"</Btn>
+                    <Btn variant=Variant::Secondary on_click=on_clear>"Clear history"</Btn>
                 </div>
             </div>
 

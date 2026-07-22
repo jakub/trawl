@@ -6,8 +6,8 @@
 //!
 //! Layout (top to bottom inside `.search-col`):
 //! editor wrap (header + `DslEditor` + date range + run button)
-//! → meta strip (count · duration · chips · save/export)
-//! → tabs (Events / Visualization)
+//! → meta strip (filter chips — hidden while empty)
+//! → tabs (Events / Visualization · trailing Save/Export actions)
 //! → tab body (Events: histogram + results table | Visualization: chart)
 //!
 //! State split:
@@ -34,7 +34,7 @@ use crate::state::query::{
     Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, url_signals,
 };
 use crate::state::search_session::rows_resource;
-use fleet_ui::{TabItem, Tabs};
+use fleet_ui::{TabItem, Tabs, ToastBus, ToastKind};
 
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
@@ -72,6 +72,7 @@ impl ResultsTab {
 #[component]
 pub fn Search() -> impl IntoView {
     let shell_status = use_context::<ShellStatus>().expect("ShellStatus context");
+    let bus = expect_context::<ToastBus>();
 
     let query_text = RwSignal::new(String::new());
 
@@ -320,11 +321,9 @@ pub fn Search() -> impl IntoView {
                     on_save=on_save
                 />
                 <MetaStrip
-                    count=last_count
                     truncated=truncated
                     filters=filters_sig
                     on_remove=on_remove_filter
-                    on_export=on_export
                 />
                 <Tabs
                     items=vec![
@@ -333,6 +332,20 @@ pub fn Search() -> impl IntoView {
                     ]
                     active=tabs_active
                     on_change=on_tab_change
+                    trailing=Box::new(move || view! {
+                        <span
+                            class="action"
+                            on:click=move |_| bus.push(
+                                ToastKind::Info,
+                                "Save",
+                                Some("Net saving is landing soon — use the history page for now.".into()),
+                            )
+                        >"Save"</span>
+                        <span
+                            class="action"
+                            on:click=move |_| on_export.run(())
+                        >"Export"</span>
+                    }.into_any())
                 />
                 {move || match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {

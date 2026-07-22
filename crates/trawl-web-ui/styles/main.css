@@ -94,7 +94,7 @@
   padding: 12px 16px;
   color: var(--ink-3);
   font-size: var(--fs-ui);
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
 }
 
 .results-table-wrap {
@@ -142,6 +142,8 @@
 .results-empty-cell {
   text-align: center;
   color: var(--ink-3);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
   font-style: italic;
 }
 
@@ -195,25 +197,11 @@
 }
 .facets .phead .clear:hover { text-decoration: underline; }
 
-.facets .fsearch {
+/* Filter input is fleet_ui::SearchInput (.inp-wrap) — same styling as
+ * every other page's toolbar filter; only placement is local. */
+.facets .inp-wrap {
   margin: 0 12px 8px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  padding: 3px 8px;
-  color: var(--ink-3);
-}
-.facets .fsearch input {
-  flex: 1;
-  background: transparent;
-  border: 0;
-  outline: none;
-  font-family: var(--font-mono);
-  font-size: var(--fs-dense);
-  color: var(--ink);
+  min-width: 0;
 }
 
 .facets .g {
@@ -345,6 +333,9 @@
   display: flex;
   align-items: center;
   gap: 4px;
+  /* One step up from the header's --fs-dense base — the tools are the
+   * header's primary actions, not metadata. */
+  font-size: var(--fs-ui);
 }
 .editor-hd .tool:hover { background: var(--panel-2); color: var(--ink-2); }
 
@@ -380,64 +371,61 @@
  * the stack at higher specificity so Fira Code actually renders. */
 .dsl-editor .cm-editor .cm-scroller { overflow: auto; font-family: var(--font-mono); }
 
+/* Right column beside the editor: date-range trigger stacked over Run.
+ * The old 2×3 pill strip is gone — both rows are plain 28px controls. */
 .editor-right {
   display: flex;
   flex-direction: column;
   gap: 6px;
   align-items: stretch;
-  min-width: 200px;
+  width: 172px;
   flex-shrink: 0;
 }
 
-/* Date range — quick buttons. Custom popover deferred.
- * Pills wrap into two rows of three to keep the right column narrow and
- * let the editor breathe. */
-.daterange { display: flex; align-items: stretch; }
-.daterange .quick {
+/* Date range — single trigger (grafana-style); all presets live in the
+ * popover. */
+.daterange { position: relative; display: flex; align-items: stretch; }
+.daterange .dr-trigger { flex: 1; }
+.dr-trigger {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 3px;
-  flex: 1;
-  overflow: hidden;
-}
-.daterange .quick .q {
-  flex: 1 1 33.333%;
-  height: 28px;
-  padding: 0 4px;
-  font-family: var(--font-ui);
-  font-size: var(--table-fs);
+  border-radius: 6px;
   color: var(--ink-2);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
   cursor: pointer;
-  display: grid;
-  place-items: center;
-  border-right: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
   user-select: none;
-  box-sizing: border-box;
+  white-space: nowrap;
+  transition: color 120ms, background 120ms, border-color 120ms;
 }
-/* Strip the trailing border on the last column of each row and the
- * bottom border on the final row so the pill block stays clean. */
-.daterange .quick .q:nth-child(3n) { border-right: 0; }
-.daterange .quick .q:nth-last-child(-n + 3) { border-bottom: 0; }
-.daterange .quick .q:hover { color: var(--ink); background: var(--panel-3); }
-.daterange .quick .q.on {
-  background: var(--accent);
-  color: #fff;
-  font-weight: 600;
+/* Absolute-range labels ("2026-07-16… → now") can exceed the column —
+ * ellipsize instead of blowing the layout out. */
+.dr-trigger span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dr-trigger:hover { color: var(--ink); background: var(--panel-3); }
+.dr-trigger.open {
+  color: var(--accent);
+  background: var(--accent-wash);
+  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
 }
 
-/* Run button — confident accent. Matches the daterange pill-strip
- * height so the right column reads as two equal rows rather than one
- * row + a giant button. */
+/* Run button — confident accent; the only solid-accent block in the
+ * editor chrome now that the active pill strip is gone. */
 .run {
   height: 28px;
   padding: 0 18px;
   background: var(--accent);
   color: #fff;
   border: 1px solid var(--accent-2);
-  border-radius: 3px;
+  border-radius: 6px;
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
   font-weight: 600;
@@ -462,11 +450,12 @@
  * emits it; the .run scoping was dropped with the generalization. */
 
 /* ─────────────────────────────────────────────────────────────────
- *  Meta strip — under the editor
+ *  Meta strip — under the editor. Chips + truncation note only; the
+ *  component renders nothing while both are empty, so no empty band.
  * ─────────────────────────────────────────────────────────────── */
 .meta {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: 1fr auto;
   align-items: start;
   gap: 0 14px;
   padding: 6px 14px;
@@ -478,23 +467,10 @@
   font-size: var(--fs-ui);
   color: var(--ink-2);
 }
-.meta-count { display: flex; align-items: center; gap: 8px; padding: 2px 0; white-space: nowrap; }
 .meta-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0; }
-.meta-actions { display: flex; align-items: center; gap: 8px; padding: 2px 0; justify-self: end; }
-.meta .num { color: var(--accent); font-weight: 600; }
-.meta .action {
-  cursor: pointer;
-  color: var(--ink-3);
-  padding: 1px 4px;
-  border-radius: 2px;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.meta .action:hover { color: var(--ink); background: var(--panel-2); }
+.meta .dim { color: var(--ink-3); padding: 2px 0; white-space: nowrap; }
 
-/* Filter chips — one per active Filter; render between scanned-bytes
- * and the save/export action links. */
+/* Filter chips — one per active Filter. */
 .meta .chip {
   display: inline-flex;
   align-items: center;
@@ -526,7 +502,19 @@
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
  *  fleet_ui::Tabs emits it). The old .dr-pop .tabs popover reskin was
  *  retired in issue #31: that strip is fleet_ui::Segmented now.
+ *  App-side: the strip's trailing slot carries the results Save/Export
+ *  action links (moved from the meta strip).
  * ─────────────────────────────────────────────────────────────── */
+.tabs .action {
+  cursor: pointer;
+  align-self: center;
+  color: var(--ink-3);
+  font-size: var(--fs-ui);
+  padding: 3px 6px;
+  border-radius: 2px;
+}
+.tabs .action + .action { margin-left: 4px; }
+.tabs .action:hover { color: var(--ink); background: var(--panel-2); }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Histogram — 78px strip on Events
@@ -546,7 +534,7 @@
   align-self: center;
   width: 100%;
   text-align: center;
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
   font-size: var(--fs-micro);
   color: var(--ink-3);
 }
@@ -790,25 +778,6 @@
  *  Date-range popover + shared secondary/primary buttons
  * ─────────────────────────────────────────────────────────────── */
 
-/* Custom-range trigger inside the .daterange pill strip. */
-.daterange .custom {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  border-left: 0;
-  border-radius: 0 2px 2px 0;
-  background: var(--panel-2);
-  color: var(--ink-2);
-  cursor: pointer;
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui);
-  white-space: nowrap;
-}
-.daterange .custom:hover { color: var(--ink); background: var(--panel-3); }
-.daterange { position: relative; }
-
 /* Fullscreen click-outside scrim under the popover. */
 .scrim {
   position: fixed;
@@ -821,10 +790,10 @@
   z-index: 40;
   top: calc(100% + 4px);
   right: 0;
-  width: 420px;
+  width: 320px;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 6px;
   box-shadow: var(--shadow-3);
   padding: 12px;
   animation: fadeIn 120ms;
@@ -834,36 +803,37 @@
 .dr-pop .seg { margin-bottom: 10px; }
 .dr-pop .grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 6px;
 }
 .dr-pop .opt {
-  padding: 6px 10px;
+  padding: 6px 4px;
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
   color: var(--ink);
   background: var(--panel-2);
   border: 1px solid var(--line-2);
-  border-radius: 2px;
+  border-radius: 4px;
   cursor: pointer;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  text-align: center;
+  user-select: none;
 }
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
 .dr-pop .opt.on {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
+  background: var(--accent-wash);
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+  font-weight: 600;
 }
-.dr-pop .opt .dim { color: var(--ink-3); font-size: var(--fs-micro); }
-.dr-pop .opt.on .dim { color: rgba(255, 255, 255, .7); }
+/* From/To stack vertically — a full ISO timestamp at mono --table-fs
+ * needs ~154px and two-abreast cells in the 320px popover can't hold
+ * that without clipping. */
 .dr-pop .cust {
   margin-top: 10px;
   padding-top: 10px;
   border-top: 1px solid var(--line-2);
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 8px;
 }
 .dr-pop .cust .fld {
@@ -883,25 +853,19 @@
   padding: 5px 8px;
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 2px;
+  border-radius: 4px;
   color: var(--ink);
   outline: none;
 }
 .dr-pop .cust .fld input:focus { border-color: var(--accent); }
 .dr-pop .foot {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-end;
   align-items: center;
   margin-top: 10px;
   padding-top: 10px;
   border-top: 1px solid var(--line-2);
 }
-.dr-pop .foot .summary {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui);
-  color: var(--ink-2);
-}
-.dr-pop .foot .summary .accent { color: var(--accent); }
 .dr-pop .foot .btns { display: flex; gap: 6px; }
 .dr-pop .rt-hint {
   padding: 6px 2px;
@@ -918,7 +882,7 @@
   padding: 0 4px;
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 2px;
+  border-radius: 4px;
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -958,7 +922,7 @@
 .tbl-hd {
   display: flex; padding: 8px 14px; gap: 12px;
   background: var(--panel-2); color: var(--ink-3);
-  font-family: var(--font-ui); font-size: var(--fs-dense); font-weight: 600;
+  font-family: var(--font-ui); font-size: var(--fs-ui); font-weight: 600;
   border-bottom: 1px solid var(--line);
 }
 .tbl-row {

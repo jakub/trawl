@@ -76,7 +76,7 @@ fn ResultsTableBody(
 
     if columns.is_empty() {
         return view! {
-            <div class="results-empty">"no fish in this net yet — type a query and press ⌘⏎"</div>
+            <div class="results-empty">"No fish in this net yet — type a query and press ⌘⏎"</div>
         }
         .into_any();
     }
@@ -152,7 +152,7 @@ fn ResultsTableBody(
                             view! {
                                 <tr>
                                     <td class="results-empty-cell" colspan=cols_len>
-                                        "no fish in this net yet"
+                                        "No fish in this net yet"
                                     </td>
                                 </tr>
                             }.into_any()

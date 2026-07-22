@@ -41,7 +41,7 @@ pub fn Pager(
                 size=Size::Sm
                 disabled=Signal::derive(move || !enabled.get())
                 on_click=cb
-            >"← prev"</Btn>
+            >"← Prev"</Btn>
         }
     });
     let next = on_next.map(|cb| {
@@ -52,7 +52,7 @@ pub fn Pager(
                 size=Size::Sm
                 disabled=Signal::derive(move || !enabled.get())
                 on_click=cb
-            >"next →"</Btn>
+            >"Next →"</Btn>
         }
     });
     let has_controls = prev.is_some() || next.is_some();

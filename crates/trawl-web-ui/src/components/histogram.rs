@@ -43,7 +43,7 @@ pub fn Histogram(
                     let buckets = build_buckets(&resp);
                     if buckets.is_empty() {
                         return view! {
-                            <div class="histo-hint">"no time series for this query"</div>
+                            <div class="histo-hint">"No time series for this query"</div>
                         }.into_any();
                     }
                     let max = buckets.iter().map(|b| b.ok + b.err).max().unwrap_or(1).max(1);

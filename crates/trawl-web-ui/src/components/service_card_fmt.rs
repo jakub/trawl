@@ -124,18 +124,6 @@ pub fn avg_cov_permille(columns: &[trawl_api::ServiceColumnStats]) -> u32 {
     }
 }
 
-/// Format the `earliest_date`/`latest_date` pair from a `ServiceSchema`
-/// as `"YYYY-MM-DD → YYYY-MM-DD"`, collapsing to a single date when
-/// they match. Returns an empty string when either is missing.
-#[must_use]
-pub fn date_range(svc: &trawl_api::ServiceSchema) -> String {
-    match (svc.earliest_date.as_deref(), svc.latest_date.as_deref()) {
-        (Some(a), Some(b)) if a == b => a.to_string(),
-        (Some(a), Some(b)) => format!("{a} → {b}"),
-        _ => String::new(),
-    }
-}
-
 /// A service is "healthy" for display purposes when its most recent
 /// `daily_event_counts` entry has a non-zero count AND matches either
 /// `today` or `yesterday` (both formatted as `YYYY-MM-DD`). Pure —

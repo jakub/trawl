@@ -56,7 +56,7 @@ pub fn Rail(
                             attr:class=move || item_class(active.get() == id)
                             attr:title=label_attr
                         >
-                            <IconView icon=item.icon size=16 stroke_width=1.4/>
+                            <IconView icon=item.icon size=20 stroke_width=1.4/>
                             <span class="lb">{item.label}</span>
                             {item.badge.filter(|n| *n > 0).map(|n| view! { <span class="badge">{n}</span> })}
                         </A>

@@ -4,8 +4,8 @@
 
 //! `<TopBar/>` — generic application chrome.
 //!
-//! brand · mode tabs · spacer · command-palette stub · session pill ·
-//! notif iconbtn · user-menu dropdown. Theme toggle reads from the
+//! brand · mode tabs · spacer · command-palette stub · notif iconbtn ·
+//! user-menu dropdown. Theme toggle reads from the
 //! `UiPrefs` context provided by `fleet_ui::install()`. The bar knows
 //! nothing about auth, /me, or app-specific endpoints — `on_logout`
 //! is a callback the consumer wires to its own logout flow.
@@ -93,7 +93,6 @@ pub fn TopBar(
                     let class = tab_class(tab.active);
                     view! {
                         <A href=tab.path attr:class=class>
-                            <span class="dot"></span>
                             <span>{tab.label}</span>
                         </A>
                     }
@@ -104,13 +103,8 @@ pub fn TopBar(
 
             <div class="jump" title="Command palette — coming soon">
                 <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                <span class="gh">"Jump to query, source, dashboard…"</span>
+                <span class="gh">"Search…"</span>
                 <span class="kbd">"⌘K"</span>
-            </div>
-
-            <div class="env" title="session">
-                <span class="pulse"></span>
-                <span>"session"</span>
             </div>
 
             <div class="iconbtn" title="Notifications — coming soon">

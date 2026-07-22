@@ -151,7 +151,7 @@ pub fn AuthShell() -> impl IntoView {
             }.into_any())
             rail_bottom=Box::new(|| view! {
                 <div class="it" title="Help — coming soon">
-                    <IconView icon=Icon::Question size=16 stroke_width=1.4/>
+                    <IconView icon=Icon::Question size=20 stroke_width=1.4/>
                     <span class="lb">"Help"</span>
                 </div>
             }.into_any())

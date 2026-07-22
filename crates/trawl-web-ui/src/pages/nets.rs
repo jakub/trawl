@@ -16,19 +16,27 @@ use trawl_api::SavedQueryResponse;
 
 use crate::api;
 use crate::components::net_drawer::NetDrawer;
-use crate::components::save_as_net_modal::SaveAsNetModal;
+use crate::components::sort_th::sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
-    ActionItem, ActionsMenu, Btn, ConfirmModal, ConfirmState, LoadState, Loaded, Pager,
-    SearchInput, StatusDot, ToastBus, ToastKind, Variant,
+    ActionItem, ActionsMenu, ConfirmModal, ConfirmState, LoadState, Loaded, Pager, SearchInput,
+    StatusDot, ToastBus, ToastKind,
 };
 
+/// Sort key for the nets table. Name starts ascending; the two
+/// timestamp keys start descending (most recent first).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetSort {
     Name,
     LastRun,
     Created,
+}
+
+impl NetSort {
+    fn default_desc(self) -> bool {
+        !matches!(self, Self::Name)
+    }
 }
 
 #[component]
@@ -47,9 +55,8 @@ pub fn NetsPage() -> impl IntoView {
     let tab_sig: Signal<String> = Signal::derive(move || tab_param.get());
 
     let filter = RwSignal::new(String::new());
-    let sort = RwSignal::new(NetSort::Name);
+    let sort = RwSignal::new((NetSort::Name, false));
     let refresh = RwSignal::new(0u64);
-    let show_create_modal = RwSignal::new(false);
     let confirm_delete: RwSignal<ConfirmState<(i64, String)>> =
         RwSignal::new(ConfirmState::default());
 
@@ -153,64 +160,46 @@ pub fn NetsPage() -> impl IntoView {
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = move || js_sys::Date::now() as i64;
 
-    let sort_nets = move |nets: &mut [&SavedQueryResponse]| match sort.get() {
-        NetSort::Name => nets.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-        NetSort::LastRun => nets.sort_by(|a, b| {
-            let a_ts = a
-                .schedule
+    let sort_nets = move |nets: &mut [&SavedQueryResponse]| {
+        let (key, desc) = sort.get();
+        let last_run_ts = |n: &SavedQueryResponse| {
+            n.schedule
                 .as_ref()
                 .and_then(|s| s.last_run.as_ref())
-                .map_or("", |r| r.started_at.as_str());
-            let b_ts = b
-                .schedule
-                .as_ref()
-                .and_then(|s| s.last_run.as_ref())
-                .map_or("", |r| r.started_at.as_str());
-            b_ts.cmp(a_ts)
-        }),
-        NetSort::Created => nets.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+                .map_or("", |r| r.started_at.as_str())
+                .to_string()
+        };
+        nets.sort_by(|a, b| {
+            let ord = match key {
+                NetSort::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                // ISO timestamps compare correctly as strings; nets that
+                // never ran ("") sort last under the default descending.
+                NetSort::LastRun => last_run_ts(a).cmp(&last_run_ts(b)),
+                NetSort::Created => a.created_at.cmp(&b.created_at),
+            };
+            if desc { ord.reverse() } else { ord }
+        });
     };
 
     view! {
         <div class="page">
             <div class="page-hd compact">
                 <div>
-                    <h1>"Nets · Saved Queries"</h1>
+                    <h1>"Nets"</h1>
                     <p class="sub">"Manage saved queries, attach schedules, and inspect run history."</p>
                 </div>
                 <div class="actions">
                     <SearchInput value=filter placeholder="filter nets…"/>
-                    // (the old `sort-select` class had no CSS rule — dropped,
-                    // issue #31 C7)
-                    <select
-                        on:change=move |e| {
-                            let v = event_target_value(&e);
-                            sort.set(match v.as_str() {
-                                "last_run" => NetSort::LastRun,
-                                "created" => NetSort::Created,
-                                _ => NetSort::Name,
-                            });
-                        }
-                    >
-                        <option value="name" selected=move || sort.get() == NetSort::Name>"Sort: Name"</option>
-                        <option value="last_run" selected=move || sort.get() == NetSort::LastRun>"Sort: Last Run"</option>
-                        <option value="created" selected=move || sort.get() == NetSort::Created>"Sort: Created"</option>
-                    </select>
-                    <Btn
-                        variant=Variant::Primary
-                        on_click=Callback::new(move |()| show_create_modal.set(true))
-                    >
-                        "+ New Net"
-                    </Btn>
                 </div>
             </div>
 
             <div class="tbl">
                 <div class="tbl-hd">
-                    <div style="flex:2">"Name"</div>
-                    <div style="flex:3">"Query"</div>
-                    <div style="flex:0 0 80px">"Schedule"</div>
-                    <div style="flex:0 0 140px">"Last Run"</div>
+                    {sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "flex:2")}
+                    <div class="th" style="flex:3">"Query"</div>
+                    <div class="th" style="flex:0 0 80px">"Schedule"</div>
+                    {sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "flex:0 0 140px")}
+                    {sort_th(sort, NetSort::Created, NetSort::Created.default_desc(), "Created", "flex:0 0 90px")}
                     <div style="flex:0 0 40px"></div>
                 </div>
                 <div class="tbl-body">
@@ -244,6 +233,7 @@ pub fn NetsPage() -> impl IntoView {
                                     let id = net.id;
                                     let name = net.name.clone();
                                     let query_text = net.query.clone();
+                                    let created = time_ago(&net.created_at, now);
                                     let name_for_delete = net.name.clone();
                                     let name_for_trigger = net.name.clone();
                                     let query_for_run = net.query.clone();
@@ -318,6 +308,7 @@ pub fn NetsPage() -> impl IntoView {
                                             <div style="flex:3; min-width:0" class="mono path">{query_text}</div>
                                             <div style="flex:0 0 80px">{sched_badge}</div>
                                             <div style="flex:0 0 140px">{last_run_view}</div>
+                                            <div style="flex:0 0 90px" class="mono">{created}</div>
                                             <div style="flex:0 0 40px">
                                                 // fleet_ui::ActionsMenu owns the ⋯ trigger, the
                                                 // open state, and Escape/outside-click dismissal
@@ -371,17 +362,6 @@ pub fn NetsPage() -> impl IntoView {
                     />
                 })
             }}
-
-            // Create modal
-            <Show when=move || show_create_modal.get()>
-                <SaveAsNetModal
-                    query=String::new()
-                    on_close=Callback::new(move |saved: bool| {
-                        show_create_modal.set(false);
-                        if saved { refresh.update(|n| *n += 1); }
-                    })
-                />
-            </Show>
 
             // Delete confirmation modal — open/close plumbing via the
             // natively-tested fleet_ui::ConfirmState (issue #31); the

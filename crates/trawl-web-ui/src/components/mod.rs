@@ -34,4 +34,5 @@ pub mod results_table;
 pub mod save_as_net_modal;
 pub mod service_card_fmt;
 pub mod service_drawer;
+pub mod sort_th;
 pub mod status_bar;

@@ -82,16 +82,16 @@ pub fn EditorWrap(
                 <span
                     class="tool"
                     on:click=move |_| on_save.run(())
-                >"save"</span>
+                >"Save"</span>
                 <CopyButton
                     class="tool"
                     text=share_text
                     success_detail="Search URL copied to clipboard."
-                >"share"</CopyButton>
+                >"Share"</CopyButton>
                 <span
                     class="tool"
                     on:click=do_format
-                >"format"</span>
+                >"Format"</span>
             </div>
             <div class="editor-row">
                 <DslEditor query=query on_submit=on_submit format_trigger=format_trigger/>
@@ -118,12 +118,10 @@ pub fn EditorWrap(
     }
 }
 
-/// Date-range picker: quick pills + custom popover with Relative /
-/// Absolute / Real-time tabs.
-///
-/// The quick pills (5m … 7d) mirror the mockup's strip and directly
-/// write `RangeSpec::Quick(label)` on click. The "Custom…" pill opens
-/// a popover for absolute windows and the full preset grid.
+/// Date-range picker: a single trigger button (grafana-style) opening
+/// the popover with Relative / Absolute / Real-time tabs. The popover's
+/// preset grid is the one and only quick-range surface — the old
+/// always-visible pill strip was retired in the picker redesign.
 #[component]
 fn DateRange(
     #[prop(into)] value: Signal<RangeSpec>,
@@ -131,23 +129,20 @@ fn DateRange(
 ) -> impl IntoView {
     let open = RwSignal::new(false);
 
+    let trigger_label = move || match value.get() {
+        RangeSpec::Quick(q) => format!("Last {q}"),
+        abs @ RangeSpec::Absolute { .. } => abs.label(),
+    };
+
     view! {
         <div class="daterange">
-            <div class="quick">
-                {QUICK_RANGES.iter().copied().map(|r| {
-                    let is_on = Signal::derive(move || matches!(value.get(), RangeSpec::Quick(q) if q == r));
-                    view! {
-                        <div
-                            class="q"
-                            class:on=move || is_on.get()
-                            on:click=move |_| on_change.run(RangeSpec::Quick(r))
-                        >{r}</div>
-                    }
-                }).collect::<Vec<_>>()}
-            </div>
-            <div class="custom" on:click=move |_| open.update(|o| *o = !*o)>
-                <IconView icon=Icon::Calendar size=11 stroke_width=1.5/>
-                <span>{move || value.get().label()}</span>
+            <div
+                class="dr-trigger"
+                class:open=move || open.get()
+                on:click=move |_| open.update(|o| *o = !*o)
+            >
+                <IconView icon=Icon::Clock size=12 stroke_width=1.5/>
+                <span>{trigger_label}</span>
                 <IconView icon=Icon::Chevron size=10 stroke_width=1.5/>
             </div>
             <Show when=move || open.get()>
@@ -206,6 +201,7 @@ fn DateRangePopover(
             // fleet Segmented (issue #31) with a two-line id ↔ enum map.
             <Segmented
                 size=Size::Sm
+                full=true
                 options=vec![
                     SegmentedOption::new("relative", "Relative"),
                     SegmentedOption::new("absolute", "Absolute"),
@@ -224,10 +220,7 @@ fn DateRangePopover(
                                     class="opt"
                                     class:on=move || is_on.get()
                                     on:click=move |_| apply_quick(q)
-                                >
-                                    <span>{format!("last {q}")}</span>
-                                    <span class="dim">{q}</span>
-                                </div>
+                                >{format!("Last {q}")}</div>
                             }
                         }).collect::<Vec<_>>()}
                     </div>
@@ -252,7 +245,6 @@ fn DateRangePopover(
                         </div>
                     </div>
                     <div class="foot">
-                        <div class="summary">"bucket: " <span class="accent">"auto · 1m"</span></div>
                         <div class="btns">
                             <Btn
                                 variant=Variant::Secondary

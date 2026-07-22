@@ -24,14 +24,14 @@ use trawl_api::ServiceSchema;
 
 use crate::api;
 use crate::components::service_card_fmt::{
-    avg_cov_permille, date_range, format_avg_coverage, format_bytes, format_count, is_healthy,
+    avg_cov_permille, format_avg_coverage, format_bytes, format_count, is_healthy,
     today_yesterday_utc,
 };
 use crate::components::service_drawer::ServiceDrawer;
+use crate::components::sort_th::sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use fleet_ui::{
-    Btn, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
-    ToastBus, ToastKind, Variant,
+    Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
 };
 
 /// Days of `daily_event_counts` history shown in the activity sparkline.
@@ -43,7 +43,8 @@ const SPARK_DAYS: usize = 30;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SvcSort {
     Name,
-    LastIngest,
+    Earliest,
+    Latest,
     Events,
     Storage,
     Fields,
@@ -56,43 +57,9 @@ impl SvcSort {
     }
 }
 
-/// One sortable header cell. Not a `#[component]` — the flex sizing
-/// `style` is per-column and threading it through props buys nothing.
-fn sort_th(
-    sort: RwSignal<(SvcSort, bool)>,
-    key: SvcSort,
-    label: &'static str,
-    style: &'static str,
-) -> impl IntoView {
-    let arrow = move || {
-        let (k, desc) = sort.get();
-        (k == key).then_some(if desc { "↓" } else { "↑" })
-    };
-    view! {
-        <div
-            class="th sortable"
-            class:active=move || sort.get().0 == key
-            style=style
-            on:click=move |_| {
-                sort.update(|s| {
-                    if s.0 == key {
-                        s.1 = !s.1;
-                    } else {
-                        *s = (key, key.default_desc());
-                    }
-                });
-            }
-        >
-            {label}
-            <span class="dir">{arrow}</span>
-        </div>
-    }
-}
-
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn SchemaPage() -> impl IntoView {
-    let bus = expect_context::<ToastBus>();
     let qm = use_query_map();
     let svc_selected = Memo::new(move |_| qm.get().get("svc"));
     let tab_param = Memo::new(move |_| {
@@ -174,38 +141,30 @@ pub fn SchemaPage() -> impl IntoView {
         })
     };
 
-    let on_new_extractor = Callback::new(move |()| {
-        bus.push(
-            ToastKind::Info,
-            "New extractor",
-            Some("Field extractor authoring is landing soon.".into()),
-        );
-    });
-
     let (today, yesterday) = today_yesterday_utc();
 
     view! {
         <div class="page">
             <div class="page-hd compact">
                 <div>
-                    <h1>"Schema · Services"</h1>
+                    <h1>"Schema"</h1>
                     <p class="sub">"Click a service to inspect fields, ingest rate, and tail live."</p>
                 </div>
                 <div class="actions">
                     <SearchInput value=filter placeholder="filter services…"/>
-                    <Btn variant=Variant::Primary on_click=on_new_extractor>"+ New extractor"</Btn>
                 </div>
             </div>
 
             <div class="tbl">
                 <div class="tbl-hd">
-                    {sort_th(sort, SvcSort::Name, "Service", "flex:2; min-width:0")}
+                    {sort_th(sort, SvcSort::Name, SvcSort::Name.default_desc(), "Service", "flex:2; min-width:0")}
                     <div class="th" style="flex:0 0 110px">"Activity"</div>
-                    {sort_th(sort, SvcSort::LastIngest, "Range", "flex:0 0 170px")}
-                    {sort_th(sort, SvcSort::Events, "Events", "flex:0 0 64px; justify-content:flex-end")}
-                    {sort_th(sort, SvcSort::Storage, "Storage", "flex:0 0 80px; justify-content:flex-end")}
-                    {sort_th(sort, SvcSort::Fields, "Fields", "flex:0 0 56px; justify-content:flex-end")}
-                    {sort_th(sort, SvcSort::Coverage, "Avg cov", "flex:0 0 68px; justify-content:flex-end")}
+                    {sort_th(sort, SvcSort::Earliest, SvcSort::Earliest.default_desc(), "Earliest", "flex:0 0 88px")}
+                    {sort_th(sort, SvcSort::Latest, SvcSort::Latest.default_desc(), "Latest", "flex:0 0 88px")}
+                    {sort_th(sort, SvcSort::Events, SvcSort::Events.default_desc(), "Events", "flex:0 0 64px; justify-content:flex-end")}
+                    {sort_th(sort, SvcSort::Storage, SvcSort::Storage.default_desc(), "Storage", "flex:0 0 80px; justify-content:flex-end")}
+                    {sort_th(sort, SvcSort::Fields, SvcSort::Fields.default_desc(), "Fields", "flex:0 0 56px; justify-content:flex-end")}
+                    {sort_th(sort, SvcSort::Coverage, SvcSort::Coverage.default_desc(), "Avg cov", "flex:0 0 68px; justify-content:flex-end")}
                     <div style="flex:0 0 64px"></div>
                 </div>
                 <div class="tbl-body">
@@ -242,7 +201,8 @@ pub fn SchemaPage() -> impl IntoView {
                                     }
                                     // ISO dates compare correctly as strings;
                                     // None (no ingest yet) sorts before any date.
-                                    SvcSort::LastIngest => a.latest_date.cmp(&b.latest_date),
+                                    SvcSort::Earliest => a.earliest_date.cmp(&b.earliest_date),
+                                    SvcSort::Latest => a.latest_date.cmp(&b.latest_date),
                                     SvcSort::Events => a.total_events.cmp(&b.total_events),
                                     SvcSort::Storage => a.total_bytes.cmp(&b.total_bytes),
                                     SvcSort::Fields => a.columns.len().cmp(&b.columns.len()),
@@ -278,8 +238,14 @@ pub fn SchemaPage() -> impl IntoView {
                                     .into_iter()
                                     .rev()
                                     .collect();
-                                let range = date_range(&svc);
-                                let range = if range.is_empty() { "—".to_string() } else { range };
+                                let earliest = svc
+                                    .earliest_date
+                                    .clone()
+                                    .unwrap_or_else(|| "—".to_string());
+                                let latest = svc
+                                    .latest_date
+                                    .clone()
+                                    .unwrap_or_else(|| "—".to_string());
                                 let events_label = format_count(svc.total_events);
                                 let storage_label = format_bytes(svc.total_bytes);
                                 let field_count = svc.columns.len();
@@ -305,7 +271,8 @@ pub fn SchemaPage() -> impl IntoView {
                                         <div style="flex:0 0 110px">
                                             <Sparkline data=spark_data color=spark_color w=96 h=16/>
                                         </div>
-                                        <div class="mono range" style="flex:0 0 170px">{range}</div>
+                                        <div class="mono" style="flex:0 0 88px">{earliest}</div>
+                                        <div class="mono" style="flex:0 0 88px">{latest}</div>
                                         <div class="num" style="flex:0 0 64px">{events_label}</div>
                                         <div class="num" style="flex:0 0 80px">{storage_label}</div>
                                         <div class="num" style="flex:0 0 56px">{field_count}</div>

@@ -80,6 +80,10 @@ pub enum TabsStyle {
 /// (issue #33 D7) while static Strings still convert via `into`, and
 /// [`Drawer`](crate::Drawer) forwards its own optional straight
 /// through.)
+///
+/// `trailing` is the workspace family's right-aligned action slot,
+/// rendered after the flex spacer (trawl's results Save/Export links);
+/// ignored by the drawer family, which has `meta` in that position.
 #[component]
 pub fn Tabs(
     #[prop(optional)] style: TabsStyle,
@@ -87,6 +91,7 @@ pub fn Tabs(
     #[prop(into)] active: Signal<String>,
     on_change: Callback<String>,
     #[prop(into, optional)] meta: MaybeProp<String>,
+    #[prop(optional)] trailing: Option<Children>,
 ) -> impl IntoView {
     match style {
         TabsStyle::Workspace => view! {
@@ -105,6 +110,7 @@ pub fn Tabs(
                     }
                 }).collect_view()}
                 <div class="sp"></div>
+                {trailing.map(|t| t())}
             </div>
         }
         .into_any(),

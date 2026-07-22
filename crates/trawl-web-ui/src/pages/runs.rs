@@ -55,7 +55,7 @@ pub fn RunsPage() -> impl IntoView {
         <div class="page">
             <div class="page-hd compact">
                 <div>
-                    <h1>"Runs · Dashboard"</h1>
+                    <h1>"Runs"</h1>
                     <p class="sub">"Recent scheduled runs across all nets."</p>
                 </div>
                 <div class="actions">
@@ -90,15 +90,15 @@ pub fn RunsPage() -> impl IntoView {
 
                     view! {
                         <div class="stat-card">
-                            <div class="label">"Active Nets"</div>
+                            <div class="label">"Active nets"</div>
                             <div class="value">{active_nets.to_string()}</div>
                         </div>
                         <div class="stat-card">
-                            <div class="label">"Success Rate"</div>
+                            <div class="label">"Success rate"</div>
                             <div class="value">{success_rate}</div>
                         </div>
                         <div class="stat-card">
-                            <div class="label">"Avg Duration"</div>
+                            <div class="label">"Avg duration"</div>
                             <div class="value">{avg_dur}</div>
                         </div>
                     }

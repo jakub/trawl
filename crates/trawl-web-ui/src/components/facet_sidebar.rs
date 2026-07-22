@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use fleet_ui::{Icon, IconView, LoadState, Loaded};
+use fleet_ui::{Icon, IconView, LoadState, Loaded, SearchInput};
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
 
@@ -51,13 +51,7 @@ pub fn FacetSidebar(
                     >"clear all"</div>
                 </Show>
             </div>
-            <div class="fsearch">
-                <IconView icon=Icon::Search size=11 stroke_width=1.5/>
-                <input
-                    placeholder="filter field values"
-                    on:input=move |e| needle.set(event_target_value(&e))
-                />
-            </div>
+            <SearchInput value=needle placeholder="filter field values"/>
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 // Deliberate quiet-error override (issue #31 C4): the

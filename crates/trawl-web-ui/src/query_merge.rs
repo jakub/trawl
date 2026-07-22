@@ -72,8 +72,7 @@ impl RangeSpec {
     }
 }
 
-/// Quick-range presets offered by the date-range popover. Keep in sync
-/// with `EditorWrap`'s pill strip.
+/// Quick-range presets offered by the date-range popover.
 pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 
 /// Merge `(base_q, filters, range)` into the DSL string that actually runs.
