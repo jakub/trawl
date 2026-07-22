@@ -25,9 +25,9 @@ filter = 'binary(auth_pg) | binary(store_pg) | (package(fleet-auth) & kind(test)
 test-group = 'pg'
 
 [[profile.default.overrides]]
-# Asserts a wall-clock executor-reclaim window (TEST_QUERY_DELAY_MS hook) and
-# flakes only when the machine is saturated (e.g. both pre-push suites running).
-# One retry absorbs scheduler jitter without masking real regressions; the
-# durable fix is porting the test to tokio paused time.
-filter = 'test(pool_executor_reclaimed_after_timeout)'
+# Both tests assert wall-clock windows (executor reclaim via TEST_QUERY_DELAY_MS;
+# token-bucket 429 timing) and flake only when the machine is saturated (e.g.
+# both pre-push suites running). One retry absorbs scheduler jitter without
+# masking real regressions; the durable fix is porting them to tokio paused time.
+filter = 'test(pool_executor_reclaimed_after_timeout) | test(rate_limit_returns_429)'
 retries = 1

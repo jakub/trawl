@@ -31,5 +31,9 @@ pre-push:
         - "crates/*/migrations/*.sql"
       # Scoped to the crates that declare features — the featureless rest
       # resolves identically under --no-default-features and is already
-      # covered by `test`.
-      run: source "$HOME/.cargo/env" && DATABASE_URL="${DATABASE_URL%/*}/fleet_test_nd" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features
+      # covered by `test`. The http_api/hot_query binaries are excluded:
+      # trawl-server's only no-defaults delta is duckdb linkage (exercised by
+      # the store/engine tests), and double-booting full trawld instances
+      # across two parallel suites starves the wall-clock-sensitive
+      # integration tests into flaking.
+      run: source "$HOME/.cargo/env" && DATABASE_URL="${DATABASE_URL%/*}/fleet_test_nd" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features -E 'not (binary(http_api) | binary(hot_query))'
