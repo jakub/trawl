@@ -20,7 +20,10 @@ services:
       POSTGRES_USER: fleet
       POSTGRES_PASSWORD: fleet
       POSTGRES_DB: fleet_test
-    command: -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+    # max_connections raised well past stock 100: two parallel pre-push suites
+    # x process-per-test sqlx pools (8 conns each) can exceed the default —
+    # see the budget math in .config/nextest.toml's pg test-group comment.
+    command: -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=300
     volumes:
       - ./dev/pg-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
     tmpfs:
