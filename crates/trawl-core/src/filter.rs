@@ -648,6 +648,17 @@ mod tests {
         filter.matches(&event)
     }
 
+    /// Helper: like `matches_event`, but with an injected `now`. Time-window
+    /// tests must use this — going through `matches()` races the wall clock
+    /// between event construction and evaluation, which flakes under load.
+    fn matches_event_at(dsl: &str, event_json: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let query = parser::parse(dsl).expect("parse should succeed");
+        let filter = CompiledFilter::compile(&query.search);
+        let event: serde_json::Map<String, Value> =
+            serde_json::from_str(event_json).expect("valid JSON object");
+        filter.matches_at(&event, now)
+    }
+
     // ── field filters ─────────────────────────────────────────────────
 
     #[test]
@@ -1069,62 +1080,71 @@ mod tests {
 
     #[test]
     fn time_filter_recent_event_matches() {
-        // Event 1 second ago → should match last=1h
-        let recent = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        // Event 1 second before `now` → matches last=1h.
+        let now = chrono::Utc::now();
+        let recent = (now - chrono::Duration::seconds(1)).to_rfc3339();
         let event = event_with_timestamp(&recent);
-        assert!(matches_event(
+        assert!(matches_event_at(
             "last=1h",
-            &serde_json::to_string(&event).unwrap()
+            &serde_json::to_string(&event).unwrap(),
+            now
         ));
     }
 
     #[test]
     fn time_filter_old_event_excluded() {
-        // Event 2 hours ago → should NOT match last=1h
-        let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        // Event 2 hours before `now` → does NOT match last=1h.
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::hours(2)).to_rfc3339();
         let event = event_with_timestamp(&old);
-        assert!(!matches_event(
+        assert!(!matches_event_at(
             "last=1h",
-            &serde_json::to_string(&event).unwrap()
+            &serde_json::to_string(&event).unwrap(),
+            now
         ));
     }
 
     #[test]
     fn time_filter_boundary_matches() {
-        // Event at exactly the cutoff (3600 seconds ago) → should match
-        // (>= comparison). We use 3599s to avoid sub-millisecond races.
-        let boundary = (chrono::Utc::now() - chrono::Duration::seconds(3599)).to_rfc3339();
+        // Event at exactly the cutoff (3600 seconds before `now`) → matches:
+        // the window comparison is >=. Injected `now` makes the boundary
+        // exact — the wall-clock variant needed slack and still flaked.
+        let now = chrono::Utc::now();
+        let boundary = (now - chrono::Duration::seconds(3600)).to_rfc3339();
         let event = event_with_timestamp(&boundary);
-        assert!(matches_event(
+        assert!(matches_event_at(
             "last=1h",
-            &serde_json::to_string(&event).unwrap()
+            &serde_json::to_string(&event).unwrap(),
+            now
         ));
     }
 
     #[test]
     fn time_filter_just_past_boundary_excluded() {
-        // Event 1 second past the cutoff → should NOT match last=1h.
-        let past = (chrono::Utc::now() - chrono::Duration::seconds(3601)).to_rfc3339();
+        // Event 1 second past the cutoff → does NOT match last=1h.
+        let now = chrono::Utc::now();
+        let past = (now - chrono::Duration::seconds(3601)).to_rfc3339();
         let event = event_with_timestamp(&past);
-        assert!(!matches_event(
+        assert!(!matches_event_at(
             "last=1h",
-            &serde_json::to_string(&event).unwrap()
+            &serde_json::to_string(&event).unwrap(),
+            now
         ));
     }
 
     #[test]
     fn time_filter_epoch_seconds_event() {
-        // Epoch-seconds timestamp 1 second ago → should match last=1h.
-        let recent_epoch = chrono::Utc::now().timestamp() - 1;
-        let event = event_with_epoch_secs(recent_epoch);
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(matches_event("last=1h", &json));
+        let now = chrono::Utc::now();
 
-        // Epoch-seconds timestamp 2 hours ago → should NOT match.
-        let old_epoch = chrono::Utc::now().timestamp() - 7200;
-        let event = event_with_epoch_secs(old_epoch);
+        // Epoch-seconds timestamp 1 second before `now` → matches last=1h.
+        let event = event_with_epoch_secs(now.timestamp() - 1);
         let json = serde_json::to_string(&event).unwrap();
-        assert!(!matches_event("last=1h", &json));
+        assert!(matches_event_at("last=1h", &json, now));
+
+        // Epoch-seconds timestamp 2 hours before `now` → does NOT match.
+        let event = event_with_epoch_secs(now.timestamp() - 7200);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!matches_event_at("last=1h", &json, now));
     }
 
     #[test]
