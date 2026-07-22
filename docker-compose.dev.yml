@@ -1,14 +1,19 @@
 # Dev postgres backing the pg test suites (fleet-auth / fleet-admin /
 # trawl-server integration tests, pre-push hook, and coastwatch's fleet-auth
-# tests via the same container).
+# tests via the fleet-auth-dev container).
 #
 #   docker compose -f docker-compose.dev.yml up -d
 #
-# Durability is deliberately OFF (fsync etc.) and the data dir is tmpfs: this
-# instance exists to make per-test CREATE DATABASE cheap. Never point anything
-# stateful at it. `fleet_test` serves the default-features suite; `fleet_test_nd`
-# (created by dev/pg-init.sql) isolates the --no-default-features suite so the
-# two can run in parallel without racing sqlx's test-database setup/cleanup.
+# Durability is deliberately OFF (fsync etc.) and the data dirs are tmpfs:
+# these instances exist to make per-test CREATE DATABASE cheap. Never point
+# anything stateful at them.
+#
+# TWO clusters, one per pre-push suite: sqlx names its per-test databases by
+# a hash of the test path ALONE (sqlx-core testing/mod.rs db_name), so the
+# same test running in both suites maps to the same `_sqlx_test_*` database
+# no matter which logical database DATABASE_URL points at. Cluster-level
+# separation is the only isolation that lets the suites run in parallel
+# without dropdb-vs-live-connections races (SQLSTATE 55006).
 services:
   fleet-auth-dev:
     image: postgres:18
@@ -20,11 +25,24 @@ services:
       POSTGRES_USER: fleet
       POSTGRES_PASSWORD: fleet
       POSTGRES_DB: fleet_test
-    # max_connections raised well past stock 100: two parallel pre-push suites
-    # x process-per-test sqlx pools (8 conns each) can exceed the default —
+    # max_connections raised well past stock 100: process-per-test sqlx pools
+    # (8 conns each) at full pre-push parallelism can exceed the default —
     # see the budget math in .config/nextest.toml's pg test-group comment.
     command: -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=300
-    volumes:
-      - ./dev/pg-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    tmpfs:
+      - /var/lib/postgresql
+
+  # Dedicated cluster for the --no-default-features suite (see header).
+  fleet-auth-dev-nd:
+    image: postgres:18
+    container_name: fleet-auth-dev-nd
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: fleet
+      POSTGRES_PASSWORD: fleet
+      POSTGRES_DB: fleet_test_nd
+    command: -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=300
     tmpfs:
       - /var/lib/postgresql
