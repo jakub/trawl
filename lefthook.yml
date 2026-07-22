@@ -9,13 +9,27 @@ pre-commit:
       run: source "$HOME/.cargo/env" && cargo clippy --workspace --all-targets -- -D warnings
 
 pre-push:
-  # Serial on purpose: both suites run sqlx pg tests against the same
-  # dev postgres, and concurrent sqlx test-database setup/cleanup races
-  # (the later run reliably dies ~4s in). Parallel saves ~2min but
-  # can't pass.
-  parallel: false
+  # Parallel is safe again: each suite gets its own logical database
+  # (docker-compose.dev.yml + dev/pg-init.sql), so the sqlx test-database
+  # setup/cleanup race that used to force serialization is gone.
+  # The glob keeps doc-only pushes from paying for the full suites — tests
+  # run only when the push touches code, manifests, or migrations.
+  parallel: true
   commands:
     test:
+      glob:
+        - "*.rs"
+        - "*.toml"
+        - "Cargo.lock"
+        - "crates/*/migrations/*.sql"
       run: source "$HOME/.cargo/env" && cargo nextest run --workspace
     test-no-defaults:
-      run: source "$HOME/.cargo/env" && cargo nextest run --workspace --no-default-features
+      glob:
+        - "*.rs"
+        - "*.toml"
+        - "Cargo.lock"
+        - "crates/*/migrations/*.sql"
+      # Scoped to the crates that declare features — the featureless rest
+      # resolves identically under --no-default-features and is already
+      # covered by `test`.
+      run: source "$HOME/.cargo/env" && DATABASE_URL="${DATABASE_URL%/*}/fleet_test_nd" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features

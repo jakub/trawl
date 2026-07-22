@@ -1,0 +1,27 @@
+# Dev postgres backing the pg test suites (fleet-auth / fleet-admin /
+# trawl-server integration tests, pre-push hook, and coastwatch's fleet-auth
+# tests via the same container).
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# Durability is deliberately OFF (fsync etc.) and the data dir is tmpfs: this
+# instance exists to make per-test CREATE DATABASE cheap. Never point anything
+# stateful at it. `fleet_test` serves the default-features suite; `fleet_test_nd`
+# (created by dev/pg-init.sql) isolates the --no-default-features suite so the
+# two can run in parallel without racing sqlx's test-database setup/cleanup.
+services:
+  fleet-auth-dev:
+    image: postgres:18
+    container_name: fleet-auth-dev
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: fleet
+      POSTGRES_PASSWORD: fleet
+      POSTGRES_DB: fleet_test
+    command: -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+    volumes:
+      - ./dev/pg-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    tmpfs:
+      - /var/lib/postgresql
