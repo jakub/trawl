@@ -581,14 +581,16 @@ pub fn encrypt(key: &SessionKey, payload: &SessionPayload) -> Result<String, Ses
     let plaintext =
         Zeroizing::new(serde_json::to_vec(payload).map_err(|e| SessionError::Json(e.to_string()))?);
 
-    let cipher = XChaCha20Poly1305::new(key.0.as_ref().into());
+    let cipher = XChaCha20Poly1305::new(
+        <&chacha20poly1305::Key>::try_from(key.0.as_slice()).expect("SessionKey is 32 bytes"),
+    );
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let nonce = XNonce::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_slice())
+        .encrypt(&nonce, plaintext.as_slice())
         .map_err(|_| SessionError::Aead)?;
 
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -614,9 +616,11 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
     }
 
     let (nonce_bytes, ciphertext) = bytes.split_at(NONCE_LEN);
-    let nonce = XNonce::from_slice(nonce_bytes);
+    let nonce = <&XNonce>::try_from(nonce_bytes).expect("split_at yields exactly NONCE_LEN bytes");
 
-    let cipher = XChaCha20Poly1305::new(key.0.as_ref().into());
+    let cipher = XChaCha20Poly1305::new(
+        <&chacha20poly1305::Key>::try_from(key.0.as_slice()).expect("SessionKey is 32 bytes"),
+    );
     // Wrap decrypted plaintext in Zeroizing so the bearer token bytes are
     // wiped after we parse out the SessionPayload (whose .token is itself
     // Zeroizing<String> with the same posture).
