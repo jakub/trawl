@@ -354,7 +354,7 @@ dependencies = [
  "memchr",
  "num-traits",
  "regex",
- "regex-syntax 0.8.11",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -743,9 +743,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.3.0"
+version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89588d05638b5b4594a3348a2d6c20277e43a7f5c5202b05cc56888475a47b8"
+checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -786,13 +786,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "chacha20"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "chacha20poly1305"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
 dependencies = [
  "aead",
- "chacha20",
+ "chacha20 0.9.1",
  "cipher",
  "poly1305",
  "zeroize",
@@ -814,12 +825,12 @@ dependencies = [
 
 [[package]]
 name = "chumsky"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ba4a05c9ce83b07de31b31c874e87c069881ac4355db9e752e3a55c11ec75a6"
+checksum = "e0d2bfadce76f963d776feff99db6dc33783829539258314776383b33e2a00f8"
 dependencies = [
  "hashbrown 0.15.5",
- "regex-automata 0.3.9",
+ "regex-automata",
  "serde",
  "stacker",
  "unicode-ident",
@@ -1938,12 +1949,12 @@ dependencies = [
 
 [[package]]
 name = "fs4"
-version = "0.13.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2121,6 +2132,7 @@ dependencies = [
  "js-sys",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
  "wasm-bindgen",
 ]
 
@@ -2174,9 +2186,9 @@ dependencies = [
 
 [[package]]
 name = "gloo-timers"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+checksum = "482ce8a491a501da4cd806bd190275363d674f2845005c6ddbd5d3e1dd54495d"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -2936,9 +2948,9 @@ dependencies = [
 
 [[package]]
 name = "leptos-use"
-version = "0.18.3"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17cded1fffd0646ff028f38552724be36054052a35d293531c8766bbeb25dcc5"
+checksum = "cc07f2657dcc366ef2d80045354143f6e0a86919763a1a5753cd3871f8f95e2d"
 dependencies = [
  "cfg-if",
  "default-struct-builder",
@@ -3347,7 +3359,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
- "regex-automata 0.4.16",
+ "regex-automata",
 ]
 
 [[package]]
@@ -4424,6 +4436,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+dependencies = [
+ "chacha20 0.10.1",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_chacha"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4460,6 +4483,12 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_xoshiro"
@@ -4703,19 +4732,8 @@ checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-automata 0.4.16",
- "regex-syntax 0.8.11",
-]
-
-[[package]]
-name = "regex-automata"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59b23e92ee4318893fa3fe3e6fb365258efbfe6ac6ab30f090cdcbb7aa37efa9"
-dependencies = [
- "aho-corasick",
- "memchr",
- "regex-syntax 0.7.5",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -4726,14 +4744,8 @@ checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-syntax 0.8.11",
+ "regex-syntax",
 ]
-
-[[package]]
-name = "regex-syntax"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbb5fb1acd8a1a18b3dd5be62d25485eb770e05afb408a9627d14d451bae12da"
 
 [[package]]
 name = "regex-syntax"
@@ -6327,7 +6339,7 @@ dependencies = [
  "matchers",
  "nu-ansi-term",
  "once_cell",
- "regex-automata 0.4.16",
+ "regex-automata",
  "serde",
  "serde_json",
  "sharded-slab",
@@ -6634,11 +6646,11 @@ dependencies = [
 
 [[package]]
 name = "ulid"
-version = "1.2.1"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+checksum = "947dde63b6d514cc5e044edad4e0ca7261afd1099d16c83d942cb2b2f348689c"
 dependencies = [
- "rand 0.9.5",
+ "rand 0.10.2",
  "web-time",
 ]
 

@@ -207,7 +207,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
 
 /// Generate a ULID request ID, stash it in extensions, and set `X-Request-Id` on the response.
 async fn request_id_middleware(mut request: Request, next: middleware::Next) -> Response {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     request.extensions_mut().insert(RequestId(id.clone()));
 
     let mut response = next.run(request).await;

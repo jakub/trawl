@@ -37,7 +37,7 @@ blake3 = "1.8"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cookie = "0.18"
-chumsky = "0.12"
+chumsky = "0.13"
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["bracketed-paste"] }
 dashmap = "6"
@@ -45,7 +45,7 @@ comfy-table = "7"
 duckdb = { version = "1.5" }
 flate2 = "1"
 futures = "0.3"
-fs4 = "0.13"
+fs4 = "1.1"
 governor = "0.10"
 hostname = "0.4"
 http = "1"
@@ -96,7 +96,7 @@ tokio = { version = "1", features = [
     "time",
 ] }
 toml = "1"
-ulid = "1"
+ulid = "3"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "catch-panic", "cors", "limit", "set-header"] }
 tracing = "0.1"
