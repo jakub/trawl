@@ -71,8 +71,8 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
 
-    const LONG_TTL: Duration = Duration::from_secs(3600);
-    const LONG_TIMEOUT: Duration = Duration::from_secs(60);
+    const LONG_TTL: Duration = Duration::from_hours(1);
+    const LONG_TIMEOUT: Duration = Duration::from_mins(1);
 
     /// A successful ping is cached: within the TTL a second probe returns the
     /// stored `Ok` without re-invoking the pinger.
@@ -156,7 +156,7 @@ mod tests {
         let ping = || async {
             // Far outlives the 2s bound; paused-clock auto-advance fires the
             // timeout first, so the test itself never really waits.
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
             Ok::<(), String>(())
         };
 

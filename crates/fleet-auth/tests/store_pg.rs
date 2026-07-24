@@ -117,7 +117,7 @@ async fn create_key_with_expiry_in_future(pool: sqlx::PgPool) {
             "expiring",
             PrincipalKind::Human,
             &trawl_admin(),
-            Some(Duration::from_secs(86400)),
+            Some(Duration::from_hours(24)),
         )
         .await
         .expect("create");

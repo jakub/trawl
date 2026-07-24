@@ -456,23 +456,20 @@ mod tests {
     fn parse_duration_days() {
         assert_eq!(
             parse_duration("90d").unwrap(),
-            Duration::from_secs(90 * 86_400)
+            Duration::from_hours(90 * 24)
         );
     }
 
     #[test]
     fn parse_duration_hours() {
-        assert_eq!(
-            parse_duration("24h").unwrap(),
-            Duration::from_secs(24 * 3600)
-        );
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_hours(24));
     }
 
     #[test]
     fn parse_duration_weeks() {
         assert_eq!(
             parse_duration("52w").unwrap(),
-            Duration::from_secs(52 * 604_800)
+            Duration::from_hours(52 * 7 * 24)
         );
     }
 

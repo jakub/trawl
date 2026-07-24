@@ -45,7 +45,7 @@ impl HttpClient {
     /// Long timeout for analytical queries over large parquet sets.
     /// The server enforces its own `query_timeout_sec`; this prevents
     /// client-side network timeouts on slow connections.
-    const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
     /// Create a new client targeting the given daemon URL with an API key.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, ClientError> {

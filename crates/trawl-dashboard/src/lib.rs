@@ -783,7 +783,7 @@ mod tests {
     fn format_duration_display() {
         assert_eq!(format_duration(Duration::from_secs(45)), "45s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
-        assert_eq!(format_duration(Duration::from_secs(9240)), "2h 34m");
+        assert_eq!(format_duration(Duration::from_mins(154)), "2h 34m");
     }
 
     #[test]

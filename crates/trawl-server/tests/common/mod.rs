@@ -116,7 +116,7 @@ pub async fn create_app_database(pool: &PgPool) -> String {
         std::process::id(),
         random_db_suffix()
     );
-    pool.execute(format!(r#"CREATE DATABASE "{name}""#).as_str())
+    pool.execute(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
         .await
         .expect("CREATE DATABASE for app store — does the role have CREATEDB?");
     swap_database(&admin_database_url(), &name)
@@ -200,7 +200,9 @@ async fn sweep_stale_app_databases(pool: &PgPool) {
                 continue;
             }
             let _ = admin
-                .execute(format!(r#"DROP DATABASE IF EXISTS "{name}""#).as_str())
+                .execute(sqlx::AssertSqlSafe(format!(
+                    r#"DROP DATABASE IF EXISTS "{name}""#
+                )))
                 .await;
         }
     }
@@ -241,7 +243,9 @@ pub async fn kill_database(url: &str) {
         .await
         .expect("connect to admin DB");
     admin
-        .execute(format!(r#"DROP DATABASE IF EXISTS "{name}" WITH (FORCE)"#).as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            r#"DROP DATABASE IF EXISTS "{name}" WITH (FORCE)"#
+        )))
         .await
         .expect("force-drop database");
 }

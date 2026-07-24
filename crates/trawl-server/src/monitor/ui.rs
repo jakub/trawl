@@ -27,7 +27,7 @@ mod tests {
         MonitorSnapshot {
             hostname: "test-host".into(),
             listen_addr: "127.0.0.1:5514".into(),
-            uptime: std::time::Duration::from_secs(9240), // 2h 34m
+            uptime: std::time::Duration::from_mins(154), // 2h 34m
             version: "0.1.0",
             healthy: true,
             pool_capacity: 4,

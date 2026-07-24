@@ -466,7 +466,7 @@ mod tests {
         let far_future = 1_000 + 3_153_600_000; // ~100y in seconds
         assert_eq!(
             remaining_ttl(far_future, 1000),
-            Duration::from_secs(3_153_600_000)
+            Duration::from_hours(100 * 365 * 24)
         );
     }
 

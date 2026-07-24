@@ -31,10 +31,11 @@ mod tests {
         let migrations: Vec<_> = MIGRATOR.iter().collect();
         assert_eq!(migrations.len(), 1);
         assert_eq!(migrations[0].version, 20_260_515_000_001);
-        assert!(migrations[0].sql.contains("CREATE TABLE api_keys"));
+        assert!(migrations[0].sql.as_str().contains("CREATE TABLE api_keys"));
         assert!(
             migrations[0]
                 .sql
+                .as_str()
                 .contains("CREATE TABLE api_key_role_assignment")
         );
     }

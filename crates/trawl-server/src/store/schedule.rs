@@ -24,7 +24,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row as _};
+use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
 use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::{bind_u64, bind_usize};
@@ -294,12 +294,12 @@ impl ScheduleStore {
     ) -> Result<Schedule, StoreError> {
         ensure_min_interval(interval_secs)?;
 
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO schedules
                  (saved_query_id, key_id, interval_secs, max_runs, enabled, created_at, updated_at)
              VALUES ($1, $2, $3, $4, TRUE, now(), now())
              RETURNING {SCHEDULE_COLS}"
-        ))
+        )))
         .bind(saved_query_id)
         .bind(key_id)
         .bind(bind_u64(interval_secs))
@@ -340,12 +340,12 @@ impl ScheduleStore {
     ) -> Result<Schedule, StoreError> {
         ensure_min_interval(interval_secs)?;
 
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "UPDATE schedules
              SET interval_secs = $1, max_runs = $2, enabled = $3, updated_at = now()
              WHERE id = $4 AND key_id = $5
              RETURNING {SCHEDULE_COLS}"
-        ))
+        )))
         .bind(bind_u64(interval_secs))
         .bind(max_runs.map(bind_u64))
         .bind(enabled)
@@ -439,9 +439,9 @@ impl ScheduleStore {
         saved_query_id: i64,
         key_id: i64,
     ) -> Result<Option<Schedule>, StoreError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {SCHEDULE_COLS} FROM schedules WHERE saved_query_id = $1 AND key_id = $2"
-        ))
+        )))
         .bind(saved_query_id)
         .bind(key_id)
         .fetch_optional(&self.pool)
@@ -456,14 +456,14 @@ impl ScheduleStore {
         saved_query_id: i64,
         key_id: i64,
     ) -> Result<Option<(Schedule, Option<ReportRun>, u64)>, StoreError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT s.id, s.saved_query_id, s.key_id, s.interval_secs, s.max_runs,
                     s.enabled, s.created_at, s.updated_at,
                     {LATEST_RUN_COLS}
              FROM schedules s
              {LATEST_RUN_JOINS}
              WHERE s.saved_query_id = $1 AND s.key_id = $2",
-        ))
+        )))
         .bind(saved_query_id)
         .bind(key_id)
         .fetch_optional(&self.pool)
@@ -698,7 +698,7 @@ impl ScheduleStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ReportRun>, StoreError> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {cols}
              FROM report_runs r
              JOIN schedules s ON s.id = r.schedule_id
@@ -706,7 +706,7 @@ impl ScheduleStore {
              ORDER BY r.started_at DESC, r.id DESC
              LIMIT $3 OFFSET $4",
             cols = run_cols("r.")
-        ))
+        )))
         .bind(saved_query_id)
         .bind(key_id)
         .bind(bind_usize(limit))
@@ -721,13 +721,13 @@ impl ScheduleStore {
 
     /// Get a single run by id (no result blob). Checks ownership via schedule.
     pub async fn get_run(&self, run_id: i64, key_id: i64) -> Result<Option<ReportRun>, StoreError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {cols}
              FROM report_runs r
              JOIN schedules s ON s.id = r.schedule_id
              WHERE r.id = $1 AND s.key_id = $2",
             cols = run_cols("r.")
-        ))
+        )))
         .bind(run_id)
         .bind(key_id)
         .fetch_optional(&self.pool)
@@ -766,12 +766,12 @@ impl ScheduleStore {
 
     /// Get the most recent run for a schedule.
     pub async fn latest_run(&self, schedule_id: i64) -> Result<Option<ReportRun>, StoreError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {RUN_COLS} FROM report_runs
              WHERE schedule_id = $1
              ORDER BY started_at DESC, id DESC
              LIMIT 1"
-        ))
+        )))
         .bind(schedule_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -783,12 +783,12 @@ impl ScheduleStore {
         &self,
         saved_query_id: i64,
     ) -> Result<Option<ReportRun>, StoreError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {RUN_COLS} FROM report_runs
              WHERE saved_query_id = $1 AND status = 'success' AND result_path IS NOT NULL
              ORDER BY started_at DESC, id DESC
              LIMIT 1"
-        ))
+        )))
         .bind(saved_query_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -801,11 +801,11 @@ impl ScheduleStore {
         &self,
         saved_query_id: i64,
     ) -> Result<Vec<ReportRun>, StoreError> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {RUN_COLS} FROM report_runs
              WHERE saved_query_id = $1 AND status = 'success' AND result_path IS NOT NULL
              ORDER BY started_at ASC, id ASC"
-        ))
+        )))
         .bind(saved_query_id)
         .fetch_all(&self.pool)
         .await?;
@@ -923,7 +923,7 @@ impl ScheduleStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<(ReportRun, String)>, StoreError> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {cols}, sq.name AS sq_name
              FROM report_runs r
              JOIN schedules s ON s.id = r.schedule_id
@@ -932,7 +932,7 @@ impl ScheduleStore {
              ORDER BY r.started_at DESC, r.id DESC
              LIMIT $2 OFFSET $3",
             cols = run_cols("r.")
-        ))
+        )))
         .bind(key_id)
         .bind(bind_usize(limit))
         .bind(bind_usize(offset))

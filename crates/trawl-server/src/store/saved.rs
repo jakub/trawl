@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row as _};
+use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
 use super::error::{PgViolation, StoreError, classify_violation};
 use super::schedule::{
@@ -92,9 +92,9 @@ impl SavedQueryStore {
 
     /// List all saved queries for a user, sorted by name.
     pub async fn list(&self, key_id: i64) -> Result<Vec<SavedQuery>, StoreError> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {SAVED_COLS} FROM saved_queries WHERE key_id = $1 ORDER BY name ASC"
-        ))
+        )))
         .bind(key_id)
         .fetch_all(&self.pool)
         .await?;
@@ -111,7 +111,7 @@ impl SavedQueryStore {
         &self,
         key_id: i64,
     ) -> Result<Vec<SavedQueryDetails>, StoreError> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT sq.id, sq.key_id, sq.name, sq.query, sq.created_at, sq.updated_at,
                     s.id             AS s_id,
                     s.saved_query_id AS s_saved_query_id,
@@ -127,7 +127,7 @@ impl SavedQueryStore {
              {LATEST_RUN_JOINS}
              WHERE sq.key_id = $1
              ORDER BY sq.name ASC",
-        ))
+        )))
         .bind(key_id)
         .fetch_all(&self.pool)
         .await?;
@@ -153,9 +153,9 @@ impl SavedQueryStore {
 
     /// Look up a saved query by id for a specific user.
     pub async fn get(&self, id: i64, key_id: i64) -> Result<Option<SavedQuery>, StoreError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {SAVED_COLS} FROM saved_queries WHERE id = $1 AND key_id = $2"
-        ))
+        )))
         .bind(id)
         .bind(key_id)
         .fetch_optional(&self.pool)
@@ -169,9 +169,9 @@ impl SavedQueryStore {
         key_id: i64,
         name: &str,
     ) -> Result<Option<SavedQuery>, StoreError> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {SAVED_COLS} FROM saved_queries WHERE key_id = $1 AND name = $2"
-        ))
+        )))
         .bind(key_id)
         .bind(name)
         .fetch_optional(&self.pool)
@@ -191,11 +191,11 @@ impl SavedQueryStore {
     ) -> Result<SavedQuery, StoreError> {
         validate_name(name)?;
 
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
              VALUES ($1, $2, $3, now(), now())
              RETURNING {SAVED_COLS}"
-        ))
+        )))
         .bind(key_id)
         .bind(name)
         .bind(query)
@@ -236,12 +236,12 @@ impl SavedQueryStore {
             validate_name(n)?;
         }
 
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "UPDATE saved_queries
              SET query = $1, name = COALESCE($2, name), updated_at = now()
              WHERE id = $3 AND key_id = $4
              RETURNING {SAVED_COLS}"
-        ))
+        )))
         .bind(query)
         .bind(name)
         .bind(id)

@@ -166,7 +166,7 @@ async fn revoke_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
 async fn create_with_expires_persists_expires_at(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
 
-    let ninety_days = Duration::from_secs(90 * 86_400);
+    let ninety_days = Duration::from_hours(90 * 24);
     let before = chrono::Utc::now();
     keys::create(
         &store,
