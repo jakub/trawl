@@ -1,12 +1,17 @@
+# Portability: hooks run under POSIX `sh`, on both Linux and macOS dev boxes.
+# `. "$HOME/.cargo/env"` (POSIX dot, not the bash-only `source`) loads a
+# rustup PATH if present and is silently skipped otherwise (system-package
+# rust puts cargo on PATH already). CPU count is `nproc` (Linux) falling back
+# to `sysctl -n hw.ncpu` (macOS).
 pre-commit:
   parallel: true
   commands:
     fmt-check:
       glob: "*.rs"
-      run: source "$HOME/.cargo/env" && cargo fmt --check
+      run: . "$HOME/.cargo/env" 2>/dev/null; cargo fmt --check
     clippy:
       glob: "*.rs"
-      run: source "$HOME/.cargo/env" && cargo clippy --workspace --all-targets -- -D warnings
+      run: . "$HOME/.cargo/env" 2>/dev/null; cargo clippy --workspace --all-targets -- -D warnings
 
 pre-push:
   # Parallel is safe because each suite gets its own postgres CLUSTER
@@ -28,7 +33,7 @@ pre-push:
         - "crates/*/migrations/*.sql"
       # Half the cores each: two parallel suites at full test-thread counts
       # oversubscribe the machine 2x and flake every wall-clock-sensitive test.
-      run: source "$HOME/.cargo/env" && DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet_test cargo nextest run --workspace --test-threads="$(( $(sysctl -n hw.ncpu) / 2 ))"
+      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet_test cargo nextest run --workspace --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))"
     test-no-defaults:
       glob:
         - "*.rs"
@@ -42,4 +47,4 @@ pre-push:
       # the store/engine tests), and double-booting full trawld instances
       # across two parallel suites starves the wall-clock-sensitive
       # integration tests into flaking.
-      run: source "$HOME/.cargo/env" && DATABASE_URL=postgres://fleet:fleet@localhost:5434/fleet_test_nd cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query))'
+      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL=postgres://fleet:fleet@localhost:5434/fleet_test_nd cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query))'
