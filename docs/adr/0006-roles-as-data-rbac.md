@@ -136,13 +136,20 @@ Companion coastwatch arc is prepped separately in that repo after slice 1.
 
 ## Slice 1 addendum (2026-07-26 implementation, #44)
 
-- **Metrics/log role labels become operator-defined strings.** Everywhere a
-  label previously carried one of four fixed role names (`trawl_role()`),
-  it now carries the sorted, comma-joined role-NAME list (`roles_display()`,
-  `"none"` fallback; the `ActiveQuerySnapshot.role` wire field keeps its
-  name). Cardinality is therefore operator-bounded rather than
-  enum-bounded — cosmetic at homelab scale, worth knowing before pointing a
-  high-cardinality-sensitive metrics backend at it.
+- **Log/wire role fields become operator-defined strings; prometheus keeps
+  none.** Everywhere an AUTHENTICATED surface previously carried one of four
+  fixed role names (`trawl_role()`), it now carries the sorted, comma-joined
+  role-NAME list (`roles_display()`, `"none"` fallback; the
+  `ActiveQuerySnapshot.role` wire field keeps its name). The prometheus
+  `role` label on `trawl_queries_total` / `trawl_query_duration_seconds` is
+  DROPPED instead of converted: `/metrics` is unauthenticated, and
+  data-defined role names are operator-chosen and span apps, so the joined
+  list would publish cross-app fleet role membership to any scraper and make
+  the series count combinatorial in distinct role sets (a permanent
+  histogram per new combination). Per-principal query attribution stays on
+  the authenticated surfaces (structured logs, query log, history,
+  `/api/v1/queries`). No principal-derived label may be added to a metric
+  while `/metrics` sits outside the auth stack.
 - **The conversion migration is the runtime cut point for both apps.** The
   ADR accepted a red coastwatch *build* between the arcs; the shared fleet
   database makes it a *runtime* window too — `api_key_role_assignment` is

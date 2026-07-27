@@ -96,7 +96,6 @@ pub async fn query(
         .map_err(ServerError::BadRequest)?
         .unwrap_or(0);
 
-    let role_str = verified.roles_display();
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
 
@@ -177,9 +176,14 @@ pub async fn query(
                 "query complete"
             );
 
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "success").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str.clone())
-                .record(duration_secs);
+            // SECURITY: no principal-derived label here — `/metrics` is
+            // unauthenticated (see `transport::http`). Role names are
+            // operator-defined and cross-app since ADR-0006, so labelling by
+            // them would publish fleet role membership to any scraper and
+            // make the series count combinatorial in role sets. Per-principal
+            // attribution lives in the authenticated query log / history.
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "success").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
 
             // Write query debug log entry (success).
             write_query_log(
@@ -205,9 +209,8 @@ pub async fn query(
         Err(ServerError::Timeout) => {
             state.query.tracker.timeout(query_id);
 
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "timeout").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str.clone())
-                .record(duration_secs);
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "timeout").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
 
             tracing::warn!(
                 event_type = "query_timeout",
@@ -237,9 +240,8 @@ pub async fn query(
             let safe_msg = e.safe_message();
             state.query.tracker.fail(query_id, &safe_msg);
 
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "error").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str)
-                .record(duration_secs);
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "error").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
             match &e {
                 ServerError::Engine(
                     trawl_engine::error::EngineError::Parse(_)
