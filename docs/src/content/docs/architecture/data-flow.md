@@ -7,7 +7,7 @@ description: How events move through trawl — from ingest to query.
 
 ```
 Vector (gzip JSON batch, 1MB / 5s)
-  → POST /api/v1/ingest (rate limit: 1000/min, body: 16MB max)
+  → POST /api/v1/ingest (rate limit: default_rpm per key, body: 16MB max)
     → auth middleware (argon2id, 5-min DashMap cache)
     → spawn_blocking:
         decompress → parse JSON/ndjson → validate service name

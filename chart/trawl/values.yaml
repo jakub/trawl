@@ -124,12 +124,12 @@ config:
     corsAllowedOrigins: []
     schemaCacheTtlSecs: 60
     maxQueryHistory: 1000
-    # Per-role rate limits (requests/minute). 0 = disabled.
+    # Per-key rate limit (requests/minute): every API key gets an
+    # independent bucket of defaultRpm requests/minute. 0 = disabled.
+    # The per-role keys (admin/analyst/reader/ingest) were removed in
+    # ADR-0006 slice 0 — a values file still carrying them fails at render.
     rateLimit:
-      admin: 100
-      analyst: 60
-      reader: 30
-      ingest: 1000
+      defaultRpm: 1000
 
   data:
     path: "/var/lib/trawl/data"

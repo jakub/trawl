@@ -36,11 +36,15 @@ data:
     tls_reload_interval_secs = {{ .Values.config.server.tlsReloadIntervalSecs | int }}
     {{- end }}
 
+    {{- /* The per-role knobs died in ADR-0006 slice 0. A stale user values
+         file carrying them would merge cleanly with the chart defaults and
+         silently drop the operator's tuned quotas — fail the render instead
+         so the operator migrates to defaultRpm deliberately. */}}
+    {{- if or (hasKey .Values.config.server.rateLimit "admin") (hasKey .Values.config.server.rateLimit "analyst") (hasKey .Values.config.server.rateLimit "reader") (hasKey .Values.config.server.rateLimit "ingest") }}
+    {{- fail "config.server.rateLimit.{admin,analyst,reader,ingest} were removed in ADR-0006 slice 0: rate limiting is now per API key. Replace them with config.server.rateLimit.defaultRpm (requests/minute per key, 0 disables)." }}
+    {{- end }}
     [server.rate_limit]
-    admin = {{ .Values.config.server.rateLimit.admin | int }}
-    analyst = {{ .Values.config.server.rateLimit.analyst | int }}
-    reader = {{ .Values.config.server.rateLimit.reader | int }}
-    ingest = {{ .Values.config.server.rateLimit.ingest | int }}
+    default_rpm = {{ .Values.config.server.rateLimit.defaultRpm | int }}
 
     [data]
     path = {{ .Values.config.data.path | quote }}

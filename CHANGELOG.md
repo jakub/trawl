@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING — rate limiting is per API key, not per role (ADR-0006 slice 0, #43).** Every key now gets an independent token bucket keyed by its keystore id, so one noisy key can no longer starve others; the `[server.rate_limit]` per-role knobs (`admin`, `analyst`, `reader`, `ingest`) are replaced by a single `default_rpm` (default 1000 — the old ingest ceiling; 0 disables). A config still carrying a per-role key fails validation at boot with a message naming the migration, and the helm chart fails at render if a values file still sets `rateLimit.admin`/`analyst`/`reader`/`ingest` (`rateLimit.defaultRpm` replaces them) — never a silent ignore of tuned quotas. 429 semantics and response shape are unchanged. Role-differentiated class-of-service is deliberately deferred to slice 1, where it returns as a `rate_rpm` role attribute; the `rate_limit_exceeded` log event now carries `key_id` instead of `role`.
+
 ## [0.4.0] - 2026-07-24
 
 ### Added
