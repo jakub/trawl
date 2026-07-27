@@ -73,10 +73,10 @@ helm install trawl ./chart/trawl
 API keys live in the shared fleet keystore. An init container runs `fleet-admin migrate` on every pod start (idempotent — sqlx tracks applied migrations). Mint keys with `fleet-admin` against the keystore database:
 
 ```bash
-fleet-admin keys create --name "my-analyst-key" --grant trawl:analyst
+fleet-admin keys create --name "my-analyst-key" --kind human --role trawl-analyst
 ```
 
-Available trawl roles: `admin`, `analyst`, `reader`, `ingest`. One key can carry grants for several fleet apps; only the `trawl` grant matters to trawld.
+Roles are data-defined permission bundles (ADR-0006), managed with `fleet-admin roles`; the converted tiers are `trawl-admin`, `trawl-analyst`, `trawl-reader`, and `trawl-ingest`. One key can hold several roles spanning several fleet apps; only the resolved `trawl` permissions matter to trawld.
 
 ## TLS
 
@@ -235,7 +235,7 @@ verify_certificate = false  # if using self-signed cert
 Create a dedicated ingest token:
 
 ```bash
-fleet-admin keys create --name "vector" --grant trawl:ingest
+fleet-admin keys create --name "vector" --kind service --role trawl-ingest
 ```
 
 ## Prometheus Metrics
