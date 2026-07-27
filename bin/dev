@@ -122,14 +122,32 @@ DATABASE_URL="$FLEET_DATABASE_URL" cargo run -q -p fleet-admin -- migrate \
 
 # Bootstrap a dev api key for the SPA login form and CLI. Mirrors
 # coastwatch/bin/dev's ~/.coastwatch/dev-api-key: persisted under $HOME so
-# it survives `cargo clean` and never touches the working tree. Granted
-# trawl:admin (not analyst) so the one dev key also reaches the admin-only
-# dashboard route.
+# it survives `cargo clean` and never touches the working tree. Held via
+# the trawl-admin role (not analyst) so the one dev key also reaches the
+# admin-only dashboard route.
 dev_key_file="${HOME}/.trawl/dev-api-key"
+dev_role="trawl-admin"
 if [[ ! -s "$dev_key_file" ]]; then
-    printf 'bin/dev: minting dev api key via fleet-admin (human/trawl:admin)...\n'
+    # Roles are data-defined since ADR-0006 slice 1 and `keys create --role`
+    # refuses names that don't exist, so the tier has to be there first. A
+    # converted fleet db already has trawl-admin (the migration lifts legacy
+    # grants into roles); a fresh one has no roles at all. `roles show` is
+    # the idempotence probe — `roles create` errors with RoleExists.
+    if ! DATABASE_URL="$FLEET_DATABASE_URL" cargo run -q -p fleet-admin -- \
+        roles show "$dev_role" >/dev/null 2>&1
+    then
+        printf 'bin/dev: creating %s role via fleet-admin...\n' "$dev_role"
+        DATABASE_URL="$FLEET_DATABASE_URL" cargo run -q -p fleet-admin -- \
+            roles create --name "$dev_role" \
+            --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+            --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
+            --perm trawl:query_cancel --perm trawl:server_manage \
+            || die "fleet-admin roles create failed"
+    fi
+
+    printf 'bin/dev: minting dev api key via fleet-admin (human/%s)...\n' "$dev_role"
     minted=$(DATABASE_URL="$FLEET_DATABASE_URL" cargo run -q -p fleet-admin -- \
-        keys create --name "trawl-dev-$(whoami)" --kind human --grant trawl:admin) \
+        keys create --name "trawl-dev-$(whoami)" --kind human --role "$dev_role") \
         || die "fleet-admin keys create failed"
     mkdir -p "${HOME}/.trawl"
     umask 077
