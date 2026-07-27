@@ -322,6 +322,66 @@ async fn rate_limit_returns_429(pool: sqlx::PgPool) {
     }
 }
 
+/// AC1 (ADR-0006 slice 0): two keys holding the SAME role get independent
+/// buckets — the limiter keys on the keystore id, not on any shared role
+/// bucket. Exhausting key A's quota 429s A while key B still gets 200.
+/// (Role here is test-side policy vocabulary only; the limiter never sees it.)
+#[sqlx::test(migrations = false)]
+async fn rate_limit_isolates_keys_with_same_role(pool: sqlx::PgPool) {
+    let server = setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            default_rpm: 2, // burst of 2 per key
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
+
+    // Two analyst keys with distinct keystore ids.
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let key_a = store
+        .create_key(
+            "noisy",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .await
+        .unwrap();
+    let key_b = store
+        .create_key(
+            "quiet",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        key_a.info.id, key_b.info.id,
+        "keys must have distinct keystore ids"
+    );
+
+    let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
+    let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
+
+    // Exhaust A's burst, then confirm A is limited.
+    a.query_paginated("*", None, None).await.unwrap();
+    a.query_paginated("*", None, None).await.unwrap();
+    let err = a.query_paginated("*", None, None).await.unwrap_err();
+    match err {
+        trawl_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 429, "key A must be rate limited");
+        }
+        other => panic!("expected 429 for exhausted key A, got: {other:?}"),
+    }
+
+    // B holds the same role but its own bucket — still 200.
+    b.query_paginated("*", None, None)
+        .await
+        .expect("key B must not be limited by key A's exhaustion");
+}
+
 // ── new endpoint tests (cancellation, validation, pagination, stats, field values) ──
 
 #[sqlx::test(migrations = false)]
