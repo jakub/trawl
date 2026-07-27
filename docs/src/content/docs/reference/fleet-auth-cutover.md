@@ -72,15 +72,37 @@ keys. Schedules must be recreated (see below).
    ```
 
 2. **Re-mint keys** for every principal — admin, human CLI users, and one
-   service key per vector fleet:
+   service key per vector fleet. Since ADR-0006 slice 1, minting is
+   role-based: roles are data-defined permission bundles created with
+   `fleet-admin roles create`, and keys reference them by name (which must
+   pre-exist — a typo'd name errors instead of minting a capability-less
+   key). On a converted deployment the migration already created
+   `trawl-admin` / `trawl-analyst` / `trawl-reader` / `trawl-ingest` (and
+   the `coastwatch-*` tiers); a fresh install creates them first:
 
    ```bash
-   fleet-admin keys create --name ops-admin   --kind human   --grant trawl:admin
-   fleet-admin keys create --name jakub-cli   --kind human   --grant trawl:analyst
-   fleet-admin keys create --name vector-lab  --kind service --grant trawl:ingest
+   # fresh install only — converted deployments already have these
+   fleet-admin roles create --name trawl-admin \
+     --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+     --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
+     --perm trawl:query_cancel --perm trawl:server_manage
+   fleet-admin roles create --name trawl-analyst \
+     --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+     --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
+     --perm trawl:query_cancel
+   fleet-admin roles create --name trawl-ingest --perm trawl:ingest
+
+   fleet-admin keys create --name ops-admin   --kind human   --role trawl-admin
+   fleet-admin keys create --name jakub-cli   --kind human   --role trawl-analyst
+   fleet-admin keys create --name vector-lab  --kind service --role trawl-ingest
    ```
 
-   Each command prints the plaintext token once; it is never recoverable.
+   Each `keys create` prints the plaintext token once; it is never
+   recoverable. `--role` is repeatable (union semantics), and roles can be
+   reshaped later with `roles add-perm` / `remove-perm` /
+   `keys assign-role` / `unassign-role` — no re-mint, no deploy. A role
+   mutation naming a permission outside the registered vocabulary warns on
+   stderr but persists (warn-only registry — double-check for typos).
 
 3. **Distribute the vector ingest tokens** to every vector instance
    (`TRAWL_INGEST_TOKEN` in the vector env / secret), but do not restart
@@ -249,16 +271,53 @@ against fleet-auth.
   shared cookie everywhere; trawld 403 (valid key, no trawl grant) keeps
   the cookie so the user stays signed in to sibling apps.
 
+## Roles-as-data migration (ADR-0006 slice 1)
+
+The `20260726000001_roles_as_data` fleet-auth migration replaces the
+static `(key, app, role)` grant model with data-defined roles. Operational
+facts:
+
+- **The migration is the runtime cut point for BOTH apps on the shared
+  fleet database.** It drops `api_key_role_assignment` in the same file
+  that creates the new tables, so a still-running pre-cutover coastwatch
+  binary starts failing key verification the moment `fleet-admin migrate`
+  runs — its roles-as-data companion arc must ship in the same maintenance
+  window, not merely "eventually".
+- **Irreversible.** The DROP lives in the same migration as the
+  conversion; there is no down path (consistent with repo migration
+  doctrine). Take a fleet-database backup before migrating if you want a
+  rollback story.
+- **No re-minting.** Every legacy `(app, role)` grant is converted in
+  place to a role named `<app>-<role>` (`trawl-admin`,
+  `coastwatch-analyst`, …) carrying the permission list the owning app
+  hardcoded at freeze time; keys keep working through the deploy.
+- **Coastwatch wire-string contract.** The migration freezes coastwatch's
+  permission vocabulary as `snake_case` of its `Permission` variant names:
+  `stories_read`, `analyst_decisions_write`, `editions_review`,
+  `editions_revise`, `editions_correct`, `ioc_exports_read`,
+  `pipeline_read`, `document_upload`, `system_config_manage`,
+  `api_keys_manage`. Coastwatch's companion arc MUST implement its
+  permission `as_str` to match these exact strings — any drift silently
+  strips capability from converted keys. That arc also owes
+  `app_permissions` registry seeding for the `coastwatch` namespace
+  (warn-only, so the gap is cosmetic until then).
+- `key_manage` is dropped by the conversion (dead — no handler ever
+  checked it) and is not seeded into the vocabulary registry.
+
 ## What changed in enforcement
 
 - Revocation now takes effect **immediately** (per-request liveness in
   postgres); the old in-memory token cache and its
   `auth_cache_ttl_secs` revocation window are gone.
-- Keys from other fleet apps (e.g. a coastwatch-only key) get an opaque
+- Authorization is permission-based (ADR-0006): a key must resolve at
+  least one **recognized** trawl permission through its roles to pass the
+  policy layer. Keys resolving none — foreign-app-only keys, role-less
+  keys, keys whose roles carry only unrecognized strings — get an opaque
   `403` on every authenticated trawl route, including `/whoami` and
   `/ingest`.
 - The scheduler skips schedules whose owning key is revoked, expired, or
-  stripped of its trawl grant.
+  no longer resolves both `query` and `saved_query` — whether the key lost
+  a role or the role lost the permission.
 - SSE `/stream` authenticates at the handshake; an already-established
   stream survives revocation until it disconnects (accepted policy for this
   slice).

@@ -133,3 +133,31 @@ Companion coastwatch arc is prepped separately in that repo after slice 1.
   principals (see "No users table"). If that bites, the escalation path is a
   class-scoped attribute (`rate_rpm_ingest`), *not* a precedence rule layering
   attributes over route-class defaults.
+
+## Slice 1 addendum (2026-07-26 implementation, #44)
+
+- **Metrics/log role labels become operator-defined strings.** Everywhere a
+  label previously carried one of four fixed role names (`trawl_role()`),
+  it now carries the sorted, comma-joined role-NAME list (`roles_display()`,
+  `"none"` fallback; the `ActiveQuerySnapshot.role` wire field keeps its
+  name). Cardinality is therefore operator-bounded rather than
+  enum-bounded — cosmetic at homelab scale, worth knowing before pointing a
+  high-cardinality-sensitive metrics backend at it.
+- **The conversion migration is the runtime cut point for both apps.** The
+  ADR accepted a red coastwatch *build* between the arcs; the shared fleet
+  database makes it a *runtime* window too — `api_key_role_assignment` is
+  dropped in the same migration that creates the new tables, so a running
+  pre-arc coastwatch fails at `fleet-admin migrate` time. Its companion arc
+  ships in the same maintenance window. The migration also freezes
+  coastwatch's permission wire strings as snake_case of its `Permission`
+  variant names (recorded in the cutover runbook); that arc's `as_str` must
+  match them exactly.
+- **Registry seeding is migrate-time only.** trawl's 9 permission strings
+  are seeded by the migration SQL; no boot-time vocabulary registration
+  exists (parked — the warn-only registry makes staleness cosmetic).
+  Coastwatch seeds its own namespace in its arc.
+- **`require_trawl_grant` gates on *recognized* permissions.** "Holds ≥1
+  trawl permission" is evaluated against trawl's compile-time vocabulary:
+  a key whose roles carry only unrecognized `trawl:*` strings resolves no
+  usable capability and 403s — the fail-closed doctrine applied at the
+  door, matching the old unknown-role behaviour.
