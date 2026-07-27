@@ -304,6 +304,39 @@ async fn conversion_names_legacy_grants_it_cannot_convert(pool: PgPool) {
     assert!(legacy_exists, "failed migration must roll back cleanly");
 }
 
+/// A legacy role outside the frozen bundles has nothing to seed, so
+/// converting it would hand its key a permission-less role — a silent
+/// capability strip, with `api_key_role_assignment` dropped in the same
+/// transaction. The pre-flight must refuse and name the pair instead.
+#[sqlx::test(migrations = false)]
+async fn conversion_refuses_roles_with_no_frozen_permission_bundle(pool: PgPool) {
+    sqlx::raw_sql(BASE_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect("base migration");
+
+    // Name-format-legal, but in neither app's frozen table.
+    seed_legacy_key(&pool, "legacy-superuser", &[("trawl", "superuser")]).await;
+    seed_legacy_key(&pool, "legacy-cw", &[("coastwatch", "reviewer")]).await;
+
+    let err = sqlx::raw_sql(ROLES_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect_err("migration must refuse unknown legacy roles");
+    let msg = err.to_string();
+    assert!(msg.contains("superuser"), "offending role not named: {msg}");
+    assert!(msg.contains("reviewer"), "offending role not named: {msg}");
+
+    // Nothing applied: the legacy grants survive for the operator to fix.
+    let legacy_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE tablename = 'api_key_role_assignment')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(legacy_exists, "failed migration must roll back cleanly");
+}
+
 #[sqlx::test(migrations = false)]
 async fn conversion_dedupes_shared_roles_across_keys(pool: PgPool) {
     sqlx::raw_sql(BASE_MIGRATION)

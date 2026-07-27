@@ -83,6 +83,14 @@ keys. Schedules must be recreated (see below).
    WHERE app = 'trawl' AND role = 'ANALYST';
    ```
 
+   A second pre-flight enforces that the conversion is **closed-world**: it
+   only knows the permission bundles frozen from each app's compile-time
+   table (`trawl` admin/analyst/reader/ingest, `coastwatch`
+   analyst/operator/siem_consumer). A grant naming anything else aborts the
+   migration with the pair named rather than converting it into a
+   permission-less role. Repoint or delete those grants and re-create the
+   role with `fleet-admin roles create` after migrating.
+
 2. **Re-mint keys** for every principal — admin, human CLI users, and one
    service key per vector fleet. Since ADR-0006 slice 1, minting is
    role-based: roles are data-defined permission bundles created with
@@ -303,6 +311,10 @@ facts:
   place to a role named `<app>-<role>` (`trawl-admin`,
   `coastwatch-analyst`, …) carrying the permission list the owning app
   hardcoded at freeze time; keys keep working through the deploy.
+- **Closed-world.** Only those frozen pairs convert. A grant naming any
+  other role aborts the migration (nothing applied) instead of becoming a
+  permission-less role — the strip would otherwise be silent and
+  irreversible, since the legacy table is dropped in the same transaction.
 - **Coastwatch wire-string contract.** The migration freezes coastwatch's
   permission vocabulary as `snake_case` of its `Permission` variant names:
   `stories_read`, `analyst_decisions_write`, `editions_review`,
