@@ -70,13 +70,32 @@ helm install trawl ./chart/trawl
 
 ## Auth
 
-API keys live in the shared fleet keystore. An init container runs `fleet-admin migrate` on every pod start (idempotent — sqlx tracks applied migrations). Mint keys with `fleet-admin` against the keystore database:
+API keys live in the shared fleet keystore. An init container runs `fleet-admin migrate` on every pod start (idempotent — sqlx tracks applied migrations). Roles are data-defined permission bundles (ADR-0006), managed with `fleet-admin roles` against the keystore database.
+
+The migration only *converts* the legacy grants it finds, so a **fresh install starts with no roles at all** — create the tiers you need once per fleet database before minting any key (`keys create --role` errors on an unknown role rather than minting a capability-less key):
+
+```bash
+# fresh install only — a converted deployment already has these
+fleet-admin roles create --name trawl-admin \
+  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+  --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
+  --perm trawl:query_cancel --perm trawl:server_manage
+fleet-admin roles create --name trawl-analyst \
+  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+  --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
+  --perm trawl:query_cancel
+fleet-admin roles create --name trawl-reader \
+  --perm trawl:query --perm trawl:schema_read --perm trawl:query_cancel
+fleet-admin roles create --name trawl-ingest --perm trawl:ingest
+```
+
+Then mint keys against those roles:
 
 ```bash
 fleet-admin keys create --name "my-analyst-key" --kind human --role trawl-analyst
 ```
 
-Roles are data-defined permission bundles (ADR-0006), managed with `fleet-admin roles`; the converted tiers are `trawl-admin`, `trawl-analyst`, `trawl-reader`, and `trawl-ingest`. One key can hold several roles spanning several fleet apps; only the resolved `trawl` permissions matter to trawld.
+On a deployment upgraded from the pre-ADR-0006 grant model the migration has already created the same four tiers (`trawl-admin`, `trawl-analyst`, `trawl-reader`, `trawl-ingest`) with exactly the permission sets above — skip the `roles create` block there. One key can hold several roles spanning several fleet apps; only the resolved `trawl` permissions matter to trawld.
 
 ## TLS
 
@@ -232,7 +251,7 @@ headers.authorization = "Bearer <INGEST_TOKEN>"
 verify_certificate = false  # if using self-signed cert
 ```
 
-Create a dedicated ingest token:
+Create a dedicated ingest token (the `trawl-ingest` role must exist first — see [Auth](#auth)):
 
 ```bash
 fleet-admin keys create --name "vector" --kind service --role trawl-ingest
