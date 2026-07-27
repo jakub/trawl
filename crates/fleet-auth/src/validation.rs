@@ -27,27 +27,51 @@ pub const MAX_ROLE_NAME_LEN: usize = 64;
 /// Maximum length of a permission string, in bytes.
 pub const MAX_PERMISSION_LEN: usize = 64;
 
-/// Validate an app namespace identifier.
+/// The one place the identifier rules live: non-empty, within a byte
+/// budget, and restricted to lowercase ascii alphanumerics + underscore
+/// (optionally plus hyphen). Every public validator below is a thin
+/// wrapper over this, so a charset or length tweak lands in one spot
+/// instead of drifting across three copies — and stays checkable against
+/// its Postgres CHECK-constraint twin.
 ///
-/// Rules: lowercase ascii + digits + underscore, length 1..=64.
-pub fn validate_app_namespace(app: &str) -> Result<(), AuthError> {
-    if app.is_empty() {
-        return Err(AuthError::InvalidApp("app namespace is empty".into()));
+/// `kind` names the identifier in error messages ("role name"), and
+/// `ctor` picks the [`AuthError`] variant the caller's domain expects.
+fn validate_identifier(
+    value: &str,
+    kind: &str,
+    max_len: usize,
+    allow_hyphen: bool,
+    ctor: fn(String) -> AuthError,
+) -> Result<(), AuthError> {
+    if value.is_empty() {
+        return Err(ctor(format!("{kind} is empty")));
     }
-    if app.len() > MAX_APP_NAMESPACE_LEN {
-        return Err(AuthError::InvalidApp(format!(
-            "app namespace exceeds {MAX_APP_NAMESPACE_LEN} bytes: {app}"
-        )));
+    if value.len() > max_len {
+        return Err(ctor(format!("{kind} exceeds {max_len} bytes: {value}")));
     }
-    if !app
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-    {
-        return Err(AuthError::InvalidApp(format!(
-            "app namespace must be lowercase ascii alphanum + underscore: {app}"
+    if !value.bytes().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || (allow_hyphen && b == b'-')
+    }) {
+        let hyphen = if allow_hyphen { " + hyphen" } else { "" };
+        return Err(ctor(format!(
+            "{kind} must be lowercase ascii alphanum + underscore{hyphen}: {value}"
         )));
     }
     Ok(())
+}
+
+/// Validate an app namespace identifier.
+///
+/// Rules: lowercase ascii + digits + underscore, length 1..=64. Mirrors
+/// the `app_permissions_app_format` CHECK.
+pub fn validate_app_namespace(app: &str) -> Result<(), AuthError> {
+    validate_identifier(
+        app,
+        "app namespace",
+        MAX_APP_NAMESPACE_LEN,
+        false,
+        AuthError::InvalidApp,
+    )
 }
 
 /// Validate a role name.
@@ -56,23 +80,13 @@ pub fn validate_app_namespace(app: &str) -> Result<(), AuthError> {
 /// the hyphen is required by the converted legacy names (`trawl-admin`,
 /// `coastwatch-analyst`, …). Mirrors the `roles_name_format` CHECK.
 pub fn validate_role_name(role: &str) -> Result<(), AuthError> {
-    if role.is_empty() {
-        return Err(AuthError::InvalidRole("role name is empty".into()));
-    }
-    if role.len() > MAX_ROLE_NAME_LEN {
-        return Err(AuthError::InvalidRole(format!(
-            "role name exceeds {MAX_ROLE_NAME_LEN} bytes: {role}"
-        )));
-    }
-    if !role
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
-    {
-        return Err(AuthError::InvalidRole(format!(
-            "role name must be lowercase ascii alphanum + underscore + hyphen: {role}"
-        )));
-    }
-    Ok(())
+    validate_identifier(
+        role,
+        "role name",
+        MAX_ROLE_NAME_LEN,
+        true,
+        AuthError::InvalidRole,
+    )
 }
 
 /// Validate a permission string.
@@ -81,25 +95,13 @@ pub fn validate_role_name(role: &str) -> Result<(), AuthError> {
 /// digits + underscore, length 1..=64. Mirrors the
 /// `role_permissions_permission_format` CHECK.
 pub fn validate_permission(permission: &str) -> Result<(), AuthError> {
-    if permission.is_empty() {
-        return Err(AuthError::InvalidPermission(
-            "permission string is empty".into(),
-        ));
-    }
-    if permission.len() > MAX_PERMISSION_LEN {
-        return Err(AuthError::InvalidPermission(format!(
-            "permission string exceeds {MAX_PERMISSION_LEN} bytes: {permission}"
-        )));
-    }
-    if !permission
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-    {
-        return Err(AuthError::InvalidPermission(format!(
-            "permission string must be lowercase ascii alphanum + underscore: {permission}"
-        )));
-    }
-    Ok(())
+    validate_identifier(
+        permission,
+        "permission string",
+        MAX_PERMISSION_LEN,
+        false,
+        AuthError::InvalidPermission,
+    )
 }
 
 #[cfg(test)]
