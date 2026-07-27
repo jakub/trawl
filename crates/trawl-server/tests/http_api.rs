@@ -426,6 +426,55 @@ async fn rate_limit_isolates_keys_with_same_role(pool: sqlx::PgPool) {
         .expect("key B must not be limited by key A's exhaustion");
 }
 
+/// The shipper-sized `ingest_rpm` is earned by `Permission::Ingest`, not by
+/// reaching `/api/v1/ingest`. The handler's permission check runs downstream of
+/// the limiter (axum resolves `body: Bytes` first), so an ungated ingest bucket
+/// would widen every reader/analyst key's throughput on the heaviest endpoint
+/// to the shipper ceiling. A reader must stay on `default_rpm`.
+#[sqlx::test(migrations = false)]
+async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission(pool: sqlx::PgPool) {
+    let server = setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            default_rpm: 1,
+            ingest_rpm: 10,
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
+    let raw = raw_client();
+
+    let post_ingest = async |token: &str| {
+        raw.post(format!("{}/api/v1/ingest", server.url))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/x-ndjson")
+            .body(r#"{"service":"test-svc","message":"probe"}"#)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+
+    // Reader burst is default_rpm (1): rejected on permission first, then on
+    // rate — never the ingest_rpm allowance of 10.
+    assert_eq!(post_ingest(&server.reader_token).await, 401);
+    assert_eq!(
+        post_ingest(&server.reader_token).await,
+        429,
+        "a reader key must ride the interactive bucket on /ingest, not ingest_rpm"
+    );
+
+    // The gate is on the permission, not on the route: a real shipper key
+    // still gets its full ingest_rpm burst.
+    for i in 0..10 {
+        assert_eq!(
+            post_ingest(&server.ingest_token).await,
+            200,
+            "ingest request {i} must not be limited"
+        );
+    }
+}
+
 // ── new endpoint tests (cancellation, validation, pagination, stats, field values) ──
 
 #[sqlx::test(migrations = false)]

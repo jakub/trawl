@@ -53,7 +53,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let cors_origins = &http.cors_allowed_origins;
     let ingest_enabled = state.ingest.wal_writer.is_some();
     let interactive_rate_state = RateLimitState::interactive(&http.rate_limit);
-    let ingest_rate_state = RateLimitState::ingest(&http.rate_limit);
+    let ingest_rate_state = RateLimitState::ingest(&http.rate_limit, &interactive_rate_state);
     let bearer_state = state.auth.bearer_state.clone();
 
     // Query routes. Onion (first .layer() = innermost): body limit →
@@ -114,7 +114,10 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             .route("/ingest", post(ingest::handler::ingest))
             .layer(middleware::from_fn(rate_limit_middleware))
             // Ingest gets the shipper-sized `ingest_rpm` buckets — a separate
-            // bucket map, so the ceiling never applies to the query routes.
+            // bucket map, so the ceiling never applies to the query routes,
+            // and only for keys holding `Permission::Ingest` (the handler's
+            // own check runs downstream of the limiter). Everyone else stays
+            // on the interactive buckets.
             .layer(axum::Extension(ingest_rate_state))
             .layer(middleware::from_fn(require_trawl_grant))
             .layer(middleware::from_fn_with_state(

@@ -68,7 +68,9 @@ Per-key rate limiting in requests per minute. Every API key gets an independent 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `default_rpm` | integer | `100` | Requests/minute allowed per API key on the interactive API routes; `0` disables |
-| `ingest_rpm` | integer | `1000` | Requests/minute allowed per API key on `/api/v1/ingest`; `0` disables |
+| `ingest_rpm` | integer | `1000` | Requests/minute allowed per ingest-permitted API key on `/api/v1/ingest`; `0` disables |
+
+The shipper-sized ceiling is earned by the `ingest` permission, not by the route: a key without it (reader, analyst, admin) stays on its `default_rpm` bucket when it posts to `/api/v1/ingest`, on top of being rejected with 401.
 
 The two classes need ceilings orders of magnitude apart: vector flushes a batch per 1 MB / 5 s per source and sources commonly share one ingest key, while `/query`, `/export`, and `/stream` each run a DuckDB scan. Raise `ingest_rpm` for large shipper fleets; raise `default_rpm` for dashboard-heavy UI use.
 

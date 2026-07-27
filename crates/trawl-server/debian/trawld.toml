@@ -52,6 +52,8 @@ http_addr = "0.0.0.0:5514"
 # Per-key rate limit (requests per minute). Every API key gets an
 # independent bucket: default_rpm on the interactive API routes,
 # ingest_rpm on /api/v1/ingest; 0 = disabled for that route class.
+# ingest_rpm is earned by the ingest permission — every other key stays
+# on default_rpm there too.
 # Per-role ceilings return as a role rate_rpm attribute (ADR-0006 slice 1).
 # [server.rate_limit]
 # default_rpm = 100
