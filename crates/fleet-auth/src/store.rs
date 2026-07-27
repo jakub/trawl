@@ -718,6 +718,42 @@ impl KeyStore {
         Ok(count)
     }
 
+    /// Set (or clear with `None`) a role's `rate_rpm` ceiling, returning the
+    /// updated role.
+    ///
+    /// This is the non-destructive way to re-tier class-of-service: the
+    /// role's permission bundle and every `key_roles` assignment are left
+    /// untouched, so no key loses capability while the ceiling changes.
+    /// Clearing falls the role's keys back to the route-class config
+    /// defaults. Errors with [`AuthError::RoleNotFound`] for an unknown name.
+    pub async fn set_role_rate_rpm(
+        &self,
+        name: &str,
+        rate_rpm: Option<u32>,
+    ) -> Result<Role, AuthError> {
+        validate_role_name(name)?;
+        let updated = sqlx::query("UPDATE roles SET rate_rpm = $1 WHERE name = $2")
+            .bind(rate_rpm.map(i64::from))
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+        if updated == 0 {
+            return Err(AuthError::RoleNotFound {
+                name: name.to_owned(),
+            });
+        }
+
+        tracing::info!(
+            event_type = "role_rate_rpm_set",
+            role = name,
+            rate_rpm,
+            "role rate ceiling updated"
+        );
+        self.get_role(name).await
+    }
+
     /// Delete a role.
     ///
     /// Refuses with [`AuthError::RoleInUse`] (carrying the affected-key

@@ -152,6 +152,23 @@ enum RolesAction {
         #[arg(required = true, value_name = "APP:PERMISSION", value_parser = commands::roles::parse_perm)]
         perms: Vec<RolePermission>,
     },
+    /// Change a role's rate ceiling in place (keys keep the role).
+    SetRate {
+        /// The role name.
+        #[arg(value_parser = RoleName::parse)]
+        name: RoleName,
+        /// New per-key requests/minute ceiling for keys holding this role.
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u32).range(1..),
+            conflicts_with = "default",
+            required_unless_present = "default"
+        )]
+        rate_rpm: Option<u32>,
+        /// Clear the ceiling — keys fall back to the route-class defaults.
+        #[arg(long)]
+        default: bool,
+    },
     /// Delete a role. Refuses while keys still hold it unless --force.
     Delete {
         /// The role name.
@@ -255,6 +272,14 @@ async fn dispatch_roles(store: KeyStore, action: RolesAction) -> Result<(), Admi
         RolesAction::RemovePerm { name, perms } => {
             commands::roles::remove_perm(&store, &name, &perms).await
         }
+        // `--default` only exists to make "clear the ceiling" explicit at
+        // the CLI boundary; clap's conflict/requirement rules already
+        // collapse it into `rate_rpm == None`.
+        RolesAction::SetRate {
+            name,
+            rate_rpm,
+            default: _,
+        } => commands::roles::set_rate(&store, &name, rate_rpm).await,
         RolesAction::Delete { name, force, yes } => {
             commands::roles::delete(&store, &name, force, yes).await
         }
@@ -283,5 +308,36 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn set_rate_takes_exactly_one_of_rate_rpm_or_default() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+
+        // Ambiguity is a parse error in both directions — an operator never
+        // gets to guess whether a ceiling was set or cleared.
+        assert!(parse(&["fleet-admin", "roles", "set-rate", "tier"]).is_err());
+        assert!(
+            parse(&[
+                "fleet-admin",
+                "roles",
+                "set-rate",
+                "tier",
+                "--rate-rpm",
+                "60",
+                "--default",
+            ])
+            .is_err()
+        );
+
+        // `--default` is how "clear the ceiling" reaches the store as None.
+        let cli = parse(&["fleet-admin", "roles", "set-rate", "tier", "--default"]).unwrap();
+        let Command::Roles {
+            action: RolesAction::SetRate { rate_rpm, .. },
+        } = cli.command
+        else {
+            panic!("expected roles set-rate");
+        };
+        assert_eq!(rate_rpm, None);
     }
 }

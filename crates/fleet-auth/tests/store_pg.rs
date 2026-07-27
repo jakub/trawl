@@ -330,6 +330,49 @@ async fn add_and_remove_role_permissions_reflected_on_next_verify(pool: sqlx::Pg
 }
 
 #[sqlx::test]
+async fn set_role_rate_rpm_updates_in_place_without_touching_assignments(pool: sqlx::PgPool) {
+    // AC5: re-tiering class-of-service must not cost an authz outage — the
+    // key keeps the role (and its permissions) across the change.
+    let store = KeyStore::from_pool(pool);
+    store
+        .create_role("tier", Some(120), &[rp("trawl", "query")])
+        .await
+        .unwrap();
+    let created = store
+        .create_key("shipper", PrincipalKind::Service, &names(&["tier"]), None)
+        .await
+        .unwrap();
+    let before = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert_eq!(before.rate_rpm(), Some(120));
+
+    let updated = store.set_role_rate_rpm("tier", Some(2000)).await.unwrap();
+    assert_eq!(updated.rate_rpm, Some(2000));
+    assert_eq!(updated.permissions, vec![rp("trawl", "query")]);
+
+    let verified = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert_eq!(verified.rate_rpm(), Some(2000));
+    assert_eq!(verified.roles(), ["tier"]);
+    assert!(verified.has_app_permission("trawl", "query"));
+
+    // `None` clears the override back to the route-class config defaults.
+    let cleared = store.set_role_rate_rpm("tier", None).await.unwrap();
+    assert_eq!(cleared.rate_rpm, None);
+    let after = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert_eq!(after.rate_rpm(), None);
+    assert_eq!(store.count_role_assignments("tier").await.unwrap(), 1);
+}
+
+#[sqlx::test]
+async fn set_role_rate_rpm_unknown_is_role_not_found(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    let err = store
+        .set_role_rate_rpm("ghost", Some(60))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::RoleNotFound { ref name } if name == "ghost"));
+}
+
+#[sqlx::test]
 async fn delete_role_refuses_while_assigned_unless_forced(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
     store

@@ -119,7 +119,7 @@ keys. Schedules must be recreated (see below).
 
    Each `keys create` prints the plaintext token once; it is never
    recoverable. `--role` is repeatable (union semantics), and roles can be
-   reshaped later with `roles add-perm` / `remove-perm` /
+   reshaped later with `roles add-perm` / `remove-perm` / `roles set-rate` /
    `keys assign-role` / `unassign-role` — no re-mint, no deploy. A role
    mutation naming a permission outside the registered vocabulary warns on
    stderr but persists (warn-only registry — double-check for typos).

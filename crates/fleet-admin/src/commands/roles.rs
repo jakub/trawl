@@ -138,6 +138,23 @@ pub async fn add_perm(
     Ok(())
 }
 
+/// `roles set-rate <NAME> (--rate-rpm N | --default)`.
+///
+/// `None` clears the ceiling back to the route-class config defaults.
+/// Non-destructive by design: the permission bundle and every key
+/// assignment survive, so re-tiering class-of-service no longer means
+/// `delete --force` + recreate + reassign.
+pub async fn set_rate(
+    store: &KeyStore,
+    name: &RoleName,
+    rate_rpm: Option<u32>,
+) -> Result<(), AdminError> {
+    let role = store.set_role_rate_rpm(name.as_str(), rate_rpm).await?;
+    eprintln!("updated role:\n");
+    print_role(&role);
+    Ok(())
+}
+
 /// `roles remove-perm <NAME> <APP:PERMISSION>...`.
 pub async fn remove_perm(
     store: &KeyStore,
