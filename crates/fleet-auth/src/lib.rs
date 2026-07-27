@@ -4,10 +4,12 @@
 
 //! Shared auth substrate for fleet apps (ADR-0030).
 //!
-//! Provides the canonical app-agnostic auth types (`PrincipalKind`,
-//! `RoleAssignment`, `VerifiedKey`, `ApiKeyInfo`, `CreatedKey`) and, behind
+//! Provides the canonical app-agnostic auth types (`PrincipalKind`, `Role`,
+//! `RolePermission`, `VerifiedKey`, `ApiKeyInfo`, `CreatedKey`) and, behind
 //! the `keystore` default feature, a Postgres-backed `KeyStore` plus the
-//! `flt_*` token module and embedded sqlx migrations.
+//! `flt_*` token module and embedded sqlx migrations. Roles are data-defined
+//! cross-app permission bundles (ADR-0006): keys hold any number of roles
+//! and effective permissions are the union.
 
 pub mod error;
 pub mod types;
@@ -57,10 +59,8 @@ pub use middleware::{
 };
 
 pub use error::AuthError;
-pub use types::{
-    ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey, format_assignments,
-};
+pub use types::{ApiKeyInfo, CreatedKey, PrincipalKind, Role, RolePermission, VerifiedKey};
 pub use validation::{
-    MAX_APP_NAMESPACE_LEN, TRAWL_APP, validate_app_namespace, validate_assignment,
-    validate_role_name,
+    MAX_APP_NAMESPACE_LEN, MAX_PERMISSION_LEN, MAX_ROLE_NAME_LEN, TRAWL_APP,
+    validate_app_namespace, validate_permission, validate_role_name,
 };

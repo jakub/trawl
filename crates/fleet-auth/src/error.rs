@@ -70,22 +70,53 @@ pub enum AuthError {
     #[error("invalid role: {0}")]
     InvalidRole(String),
 
-    /// A grant already exists for this `(key, app)` pair. Callers must revoke
-    /// the existing grant first to make the swap intentional.
-    #[error("grant already exists for key {prefix} in app {app}")]
-    GrantExists {
-        /// The key prefix.
-        prefix: String,
-        /// The app namespace.
-        app: String,
+    /// Permission string failed validation.
+    #[error("invalid permission: {0}")]
+    InvalidPermission(String),
+
+    /// No role with the given name exists. Explicit error rather than a
+    /// silent no-op so a typo can never mint a capability-less key or
+    /// assign nothing.
+    #[error("role not found: {name}")]
+    RoleNotFound {
+        /// The role name that was looked up.
+        name: String,
     },
 
-    /// No grant exists for this `(key, app)` pair.
-    #[error("no grant exists for key {prefix} in app {app}")]
-    GrantNotFound {
+    /// A role with this name already exists (`roles(name)` is UNIQUE).
+    #[error("role already exists: {name}")]
+    RoleExists {
+        /// The conflicting role name.
+        name: String,
+    },
+
+    /// The key already holds this role. Explicit error mirrors the old
+    /// grant doctrine: assignment mutations never silently no-op.
+    #[error("role {role} is already assigned to key {prefix}")]
+    RoleAlreadyAssigned {
         /// The key prefix.
         prefix: String,
-        /// The app namespace.
-        app: String,
+        /// The role name.
+        role: String,
+    },
+
+    /// The key does not hold this role — unassigning nothing is a typo,
+    /// not a success.
+    #[error("role {role} is not assigned to key {prefix}")]
+    RoleNotAssigned {
+        /// The key prefix.
+        prefix: String,
+        /// The role name.
+        role: String,
+    },
+
+    /// The role is still assigned to keys and deletion was not forced.
+    /// Deleting it would silently strip capability from live keys.
+    #[error("role {name} is still assigned to {key_count} key(s); use force to delete anyway")]
+    RoleInUse {
+        /// The role name.
+        name: String,
+        /// How many keys currently hold the role.
+        key_count: i64,
     },
 }

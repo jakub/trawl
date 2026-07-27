@@ -114,7 +114,7 @@ async fn poll_changes(
                     prefix = %key.prefix,
                     name = %key.name,
                     kind = %key.kind,
-                    assignments = ?key.assignments,
+                    roles = ?key.roles,
                     occurred_at = %key.created_at.to_rfc3339(),
                     "API key created (detected by audit)"
                 );

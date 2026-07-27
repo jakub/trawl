@@ -15,7 +15,7 @@ use axum::extract::Request;
 use axum::http::{StatusCode, header};
 use axum::routing::post;
 use fleet_auth::{
-    KeyStore, PrincipalKind, RoleAssignment, SessionConfig, SessionKey, SessionState, decrypt,
+    KeyStore, PrincipalKind, RolePermission, SessionConfig, SessionKey, SessionState, decrypt,
     login, logout,
 };
 use tower::ServiceExt as _;
@@ -40,11 +40,21 @@ fn session_state(store: KeyStore, app_namespace: &str) -> (SessionState, Arc<Ses
     (state, session_key)
 }
 
-fn trawl_grant() -> Vec<RoleAssignment> {
-    vec![RoleAssignment {
-        app: "trawl".into(),
-        role: "analyst".into(),
-    }]
+/// Seed the converted-shape `trawl-analyst` role and return its name as
+/// the role list every test key is created with.
+async fn trawl_role(store: &KeyStore) -> Vec<String> {
+    store
+        .create_role(
+            "trawl-analyst",
+            None,
+            &[RolePermission {
+                app: "trawl".into(),
+                permission: "query".into(),
+            }],
+        )
+        .await
+        .expect("seed trawl-analyst role");
+    vec!["trawl-analyst".to_owned()]
 }
 
 fn login_request(api_key: &str) -> Request<Body> {
@@ -80,7 +90,12 @@ async fn login_valid_key_sets_cookie_and_redirects(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
         .await
         .unwrap();
 
@@ -129,7 +144,12 @@ async fn login_includes_domain_when_configured(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
         .await
         .unwrap();
 
@@ -201,7 +221,12 @@ async fn login_no_grant_returns_403_no_cookie(pool: sqlx::PgPool) {
 
     // Key has grant in trawl, but app namespace is coastwatch.
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
         .await
         .unwrap();
 
@@ -257,7 +282,12 @@ async fn login_rejects_cross_origin_no_cookie(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
         .await
         .unwrap();
 
@@ -307,7 +337,12 @@ async fn login_allows_same_host_origin(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
         .await
         .unwrap();
 
@@ -332,7 +367,12 @@ async fn login_rejects_sibling_under_shared_domain(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
         .await
         .unwrap();
 
@@ -422,7 +462,12 @@ async fn login_allows_same_origin_h2_without_host_header(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
         .await
         .unwrap();
 
@@ -449,7 +494,12 @@ async fn login_rejects_cross_origin_h2_via_authority_fallback(pool: sqlx::PgPool
     let store = KeyStore::from_pool(pool);
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
         .await
         .unwrap();
 

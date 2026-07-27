@@ -12,8 +12,6 @@ use dashmap::DashMap;
 use fleet_auth::VerifiedKey;
 use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
 
-use crate::policy::TrawlAuthz as _;
-
 /// Tracks active and recently completed queries.
 ///
 /// Query ids are allocated by `ExecutorPool::allocate_query_id` — a single
@@ -83,9 +81,7 @@ impl QueryTracker {
                 id,
                 key_id: verified.id,
                 user: verified.name.clone(),
-                role: verified
-                    .trawl_role()
-                    .map_or_else(|| "none".to_owned(), |r| r.to_string()),
+                role: verified.roles_display(),
                 query: query.to_owned(),
                 started_at: Instant::now(),
             },
@@ -180,21 +176,26 @@ impl QueryTracker {
 
 #[cfg(test)]
 mod tests {
-    use fleet_auth::{PrincipalKind, RoleAssignment};
+    use fleet_auth::{PrincipalKind, Role, RolePermission};
 
     use super::*;
 
     fn test_key() -> VerifiedKey {
-        VerifiedKey {
-            id: 1,
-            prefix: "testtest".into(),
-            name: "test-user".into(),
-            kind: PrincipalKind::Human,
-            assignments: vec![RoleAssignment {
-                app: "trawl".into(),
-                role: "analyst".into(),
+        VerifiedKey::from_roles(
+            1,
+            "testtest",
+            "test-user",
+            PrincipalKind::Human,
+            vec![Role {
+                id: 1,
+                name: "trawl-analyst".into(),
+                rate_rpm: None,
+                permissions: vec![RolePermission {
+                    app: "trawl".into(),
+                    permission: "query".into(),
+                }],
             }],
-        }
+        )
     }
 
     #[test]

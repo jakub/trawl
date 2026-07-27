@@ -12,11 +12,10 @@ mod common;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{setup, setup_with_rate_limit, trawl_only};
+use common::{roles, setup, setup_with_rate_limit};
 use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
-use trawl_server::policy::Role;
 
 #[sqlx::test(migrations = false)]
 async fn health_returns_ok(pool: sqlx::PgPool) {
@@ -387,7 +386,7 @@ async fn rate_limit_isolates_keys_with_same_role(pool: sqlx::PgPool) {
         .create_key(
             "noisy",
             PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
+            &roles(&["trawl-analyst"]),
             None,
         )
         .await
@@ -396,7 +395,7 @@ async fn rate_limit_isolates_keys_with_same_role(pool: sqlx::PgPool) {
         .create_key(
             "quiet",
             PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
+            &roles(&["trawl-analyst"]),
             None,
         )
         .await
@@ -574,7 +573,7 @@ async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
         .create_key(
             "twin",
             PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
+            &roles(&["trawl-analyst"]),
             None,
         )
         .await
@@ -583,7 +582,7 @@ async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
         .create_key(
             "twin",
             PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
+            &roles(&["trawl-analyst"]),
             None,
         )
         .await
@@ -865,7 +864,7 @@ async fn whoami_admin_has_server_manage(pool: sqlx::PgPool) {
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let resp = admin.whoami().await.unwrap();
-    assert_eq!(resp.role_for("trawl"), Some("admin"));
+    assert_eq!(resp.roles, ["trawl-admin"]);
     assert!(resp.permissions.contains(&"server_manage".to_owned()));
     assert!(resp.permissions.contains(&"query".to_owned()));
     // prefix is the stable 8-char fingerprint of the key; downstream
@@ -887,7 +886,7 @@ async fn whoami_reader_lacks_server_manage(pool: sqlx::PgPool) {
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     let resp = reader.whoami().await.unwrap();
-    assert_eq!(resp.role_for("trawl"), Some("reader"));
+    assert_eq!(resp.roles, ["trawl-reader"]);
     assert!(!resp.permissions.contains(&"server_manage".to_owned()));
     assert!(resp.permissions.contains(&"query".to_owned()));
 }

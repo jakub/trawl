@@ -373,7 +373,8 @@ pub struct ActiveQuerySnapshot {
     pub id: u64,
     /// Authenticated user name.
     pub user: String,
-    /// User's role.
+    /// The key's role names, comma-joined and sorted (`"none"` when the
+    /// key holds no roles). Wire field name kept from the one-role era.
     pub role: String,
     /// The DSL query string.
     pub query: String,
@@ -471,24 +472,14 @@ impl std::str::FromStr for PrincipalKind {
     }
 }
 
-/// A namespaced role grant on an API key.
+/// Response from the whoami endpoint — token identity, roles, and the
+/// resolved trawl permission set.
 ///
-/// `app` is an opaque app namespace (e.g. `"trawl"`, `"coastwatch"`); the
-/// role string is interpreted by each app independently — there is no
-/// shared role vocabulary across apps.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RoleAssignment {
-    /// App namespace this grant applies to.
-    pub app: String,
-    /// App-defined role name (e.g. `"admin"` for trawl, `"siem_consumer"` for coastwatch).
-    pub role: String,
-}
-
-/// Response from the whoami endpoint — token identity, kind, and grants.
-///
-/// `permissions` is the server-resolved permission set for THIS server's
-/// app namespace (`"trawl"`). Other consumers (coastwatch et al.) read
-/// `assignments` and resolve their own permission set locally.
+/// `roles` carries the names of every data-defined role the key holds
+/// (display/audit; roles are cross-app bundles and are NOT app-scoped —
+/// ADR-0006). `permissions` is the server-resolved permission union for
+/// THIS server's app namespace (`"trawl"`), in canonical order; only
+/// permissions this server recognizes appear.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoAmIResponse {
     /// Key prefix (stable 8-char fingerprint). Intended as an immutable
@@ -499,24 +490,12 @@ pub struct WhoAmIResponse {
     pub name: String,
     /// Whether the underlying principal is a human or a service.
     pub kind: PrincipalKind,
-    /// All `(app, role)` grants attached to this key, across every app.
-    pub assignments: Vec<RoleAssignment>,
-    /// Permissions for the trawl-app role on THIS server (e.g. `"query"`,
-    /// `"server_manage"`). Empty when the key has no trawl-app grant.
+    /// Names of every role attached to this key, sorted.
+    pub roles: Vec<String>,
+    /// Recognized trawl permissions resolved for this key on THIS server
+    /// (e.g. `"query"`, `"server_manage"`), in canonical order. Empty when
+    /// the key holds no recognized trawl permission.
     pub permissions: Vec<String>,
-}
-
-impl WhoAmIResponse {
-    /// Look up the role granted to this principal in the given app namespace.
-    ///
-    /// Returns `None` if the key has no grant in that app. Consumers should
-    /// treat `None` as "not authorized for this app" rather than as a default.
-    pub fn role_for(&self, app: &str) -> Option<&str> {
-        self.assignments
-            .iter()
-            .find(|a| a.app == app)
-            .map(|a| a.role.as_str())
-    }
 }
 
 // -- dashboard ---------------------------------------------------------------
@@ -1243,49 +1222,48 @@ mod tests {
             prefix: "abcd1234".into(),
             name: "dev-key".into(),
             kind: PrincipalKind::Human,
-            assignments: vec![RoleAssignment {
-                app: "trawl".into(),
-                role: "admin".into(),
-            }],
+            roles: vec!["trawl-admin".into()],
             permissions: vec!["query".into(), "schema_read".into(), "server_manage".into()],
         };
         let rt = roundtrip(&resp);
         assert_eq!(rt.prefix, "abcd1234");
         assert_eq!(rt.name, "dev-key");
         assert_eq!(rt.kind, PrincipalKind::Human);
-        assert_eq!(rt.assignments.len(), 1);
-        assert_eq!(rt.assignments[0].app, "trawl");
-        assert_eq!(rt.assignments[0].role, "admin");
-        assert_eq!(rt.role_for("trawl"), Some("admin"));
-        assert_eq!(rt.role_for("nonexistent"), None);
+        assert_eq!(rt.roles, vec!["trawl-admin".to_owned()]);
         assert_eq!(rt.permissions.len(), 3);
         assert!(rt.permissions.contains(&"server_manage".to_owned()));
     }
 
     #[test]
-    fn whoami_multi_app_assignments_roundtrip() {
+    fn whoami_multi_role_roundtrip() {
+        // Roles are cross-app bundles: ALL role names travel, unfiltered;
+        // permissions stay trawl-scoped.
         let resp = WhoAmIResponse {
             prefix: "abcd1234".into(),
             name: "siem-bot".into(),
             kind: PrincipalKind::Service,
-            assignments: vec![
-                RoleAssignment {
-                    app: "trawl".into(),
-                    role: "analyst".into(),
-                },
-                RoleAssignment {
-                    app: "coastwatch".into(),
-                    role: "siem_consumer".into(),
-                },
-            ],
+            roles: vec!["coastwatch-siem_consumer".into(), "trawl-analyst".into()],
             permissions: vec!["query".into(), "schema_read".into()],
         };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"roles\""));
+        assert!(
+            !json.contains("assignments"),
+            "the (app, role) assignments wire field is retired"
+        );
         let rt = roundtrip(&resp);
         assert_eq!(rt.kind, PrincipalKind::Service);
-        assert_eq!(rt.assignments.len(), 2);
-        assert_eq!(rt.role_for("trawl"), Some("analyst"));
-        assert_eq!(rt.role_for("coastwatch"), Some("siem_consumer"));
-        assert_eq!(rt.role_for("missing"), None);
+        assert_eq!(
+            rt.roles,
+            vec![
+                "coastwatch-siem_consumer".to_owned(),
+                "trawl-analyst".to_owned()
+            ]
+        );
+        assert_eq!(
+            rt.permissions,
+            vec!["query".to_owned(), "schema_read".to_owned()]
+        );
     }
 
     #[test]

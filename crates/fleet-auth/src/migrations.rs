@@ -26,17 +26,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrator_exposes_one_migration() {
-        // Smoke test that the Migrator builds and the SQL embed is non-empty.
+    fn migrator_exposes_both_migrations() {
+        // Smoke test that the Migrator builds and the SQL embeds are non-empty.
         let migrations: Vec<_> = MIGRATOR.iter().collect();
-        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations.len(), 2);
         assert_eq!(migrations[0].version, 20_260_515_000_001);
         assert!(migrations[0].sql.as_str().contains("CREATE TABLE api_keys"));
+        assert_eq!(migrations[1].version, 20_260_726_000_001);
+        assert!(migrations[1].sql.as_str().contains("CREATE TABLE roles"));
         assert!(
-            migrations[0]
+            migrations[1]
                 .sql
                 .as_str()
-                .contains("CREATE TABLE api_key_role_assignment")
+                .contains("DROP TABLE api_key_role_assignment")
         );
     }
 }

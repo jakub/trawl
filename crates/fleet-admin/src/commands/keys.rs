@@ -8,12 +8,16 @@
 //! `create` writes the plaintext token to stdout once; everything else
 //! (metadata, prompts, summaries) goes to stderr so the output of
 //! `keys create` is shell-pipeable.
+//!
+//! Keys hold data-defined roles (ADR-0006): `create --role <NAME>`
+//! (repeatable) and `assign-role`/`unassign-role` replace the retired
+//! `--grant APP:ROLE` / `grant` / `revoke-grant` surface.
 
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use fleet_auth::{ApiKeyInfo, KeyStore, PrincipalKind, RoleAssignment};
+use fleet_auth::{ApiKeyInfo, KeyStore, PrincipalKind};
 
 use crate::error::AdminError;
 
@@ -53,26 +57,47 @@ impl std::fmt::Display for KeyPrefix {
     }
 }
 
-/// Create a new API key.
+/// Role name argument, shape-validated at the clap boundary via
+/// fleet-auth's canonical [`fleet_auth::validate_role_name`] so a typo'd
+/// charset never reaches the SQL layer.
+#[derive(Debug, Clone)]
+pub struct RoleName(String);
+
+impl RoleName {
+    pub fn parse(s: &str) -> Result<Self, AdminError> {
+        fleet_auth::validate_role_name(s)?;
+        Ok(Self(s.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RoleName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Create a new API key holding the named (pre-existing) roles.
 ///
 /// Emits the plaintext token to stdout exactly once. All metadata
-/// (name, kind, grants, prefix, expiry) goes to stderr.
+/// (name, kind, roles, prefix, expiry) goes to stderr. Unknown role names
+/// error store-side (`RoleNotFound`) before anything is persisted.
 pub async fn create(
     store: &KeyStore,
     name: &str,
     kind: PrincipalKind,
-    assignments: &[RoleAssignment],
+    roles: &[String],
     expires: Option<Duration>,
 ) -> Result<(), AdminError> {
-    let created = store.create_key(name, kind, assignments, expires).await?;
+    let created = store.create_key(name, kind, roles, expires).await?;
 
     eprintln!("created API key:\n");
     eprintln!("  name:    {}", created.info.name);
     eprintln!("  kind:    {}", created.info.kind);
-    eprintln!(
-        "  grants:  {}",
-        format_assignments(&created.info.assignments)
-    );
+    eprintln!("  roles:   {}", format_roles(&created.info.roles));
     eprintln!("  prefix:  {}", created.info.prefix);
     if let Some(exp) = created.info.expires_at {
         eprintln!("  expires: {}", format_timestamp(&exp));
@@ -128,7 +153,7 @@ pub async fn revoke(store: &KeyStore, prefix: &KeyPrefix, yes: bool) -> Result<(
     eprintln!("  prefix:  {}", info.prefix);
     eprintln!("  name:    {}", info.name);
     eprintln!("  kind:    {}", info.kind);
-    eprintln!("  grants:  {}", format_assignments(&info.assignments));
+    eprintln!("  roles:   {}", format_roles(&info.roles));
     eprintln!("  created: {}", format_timestamp(&info.created_at));
 
     if !yes && !confirm_or_refuse("revoke this key?")? {
@@ -173,12 +198,12 @@ pub fn confirm_prompt<R: BufRead, W: Write>(
 /// TTY-gated `[y/N]` confirmation shared by confirmable subcommands.
 ///
 /// Refuses with [`AdminError::NonInteractive`] unless both stdin and stderr
-/// are TTYs, so a piped `keys revoke`/`revoke-grant` never proceeds without an
+/// are TTYs, so a piped destructive subcommand never proceeds without an
 /// explicit `--yes`. Otherwise locks the descriptors and defers to
 /// [`confirm_prompt`], returning whether the operator confirmed. Centralizes
 /// the non-interactive-refusal invariant so new confirmable subcommands don't
 /// hand-roll their own copy.
-fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
+pub(crate) fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
     use std::io::IsTerminal as _;
     let stdin = std::io::stdin();
     let stderr = std::io::stderr();
@@ -191,27 +216,39 @@ fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
     confirm_prompt(question, &mut reader, &mut writer).map_err(Into::into)
 }
 
-/// Revoke a key's grant on an app, with `[y/N]` confirmation unless `--yes`.
-///
-/// Same interactivity contract as [`revoke`]: refuses to proceed unless both
-/// stdin and stderr are TTYs or `--yes` was passed. No preflight read — the prompt
-/// is built from the arguments, and a missing grant surfaces as the store's
-/// `GrantNotFound` after confirmation (no read-then-delete race).
-pub async fn revoke_grant(
+/// Assign a role to an existing key.
+pub async fn assign_role(
     store: &KeyStore,
     prefix: &KeyPrefix,
-    app: &str,
+    role: &RoleName,
+) -> Result<(), AdminError> {
+    store.assign_role(prefix.as_str(), role.as_str()).await?;
+    eprintln!("assigned role {role} to key {prefix}");
+    Ok(())
+}
+
+/// Remove a role from a key, with `[y/N]` confirmation unless `--yes`.
+///
+/// Same interactivity contract as [`revoke`]: refuses to proceed unless both
+/// stdin and stderr are TTYs or `--yes` was passed. No preflight read — the
+/// prompt is built from the arguments, and a missing assignment surfaces as
+/// the store's `RoleNotAssigned` after confirmation (no read-then-delete
+/// race).
+pub async fn unassign_role(
+    store: &KeyStore,
+    prefix: &KeyPrefix,
+    role: &RoleName,
     yes: bool,
 ) -> Result<(), AdminError> {
     if !yes {
-        let question = format!("revoke grant for app {app} on key {prefix}?");
+        let question = format!("unassign role {role} from key {prefix}?");
         if !confirm_or_refuse(&question)? {
             return Ok(());
         }
     }
 
-    store.revoke_assignment(prefix.as_str(), app).await?;
-    eprintln!("revoked grant for app {app} on key {prefix}");
+    store.unassign_role(prefix.as_str(), role.as_str()).await?;
+    eprintln!("unassigned role {role} from key {prefix}");
     Ok(())
 }
 
@@ -233,79 +270,20 @@ pub async fn retype(
     Ok(())
 }
 
-/// Parse a `revoke-grant` app argument, extracting the app half.
+/// Render role names as `"role-a, role-b"`, sorted, or `"(none)"` if empty.
 ///
-/// Accepts either a bare `app` or the `app:role` form `keys grant` takes —
-/// the role half is ignored, since grants are keyed by `(key, app)`. First
-/// colon wins, mirroring trawl-admin (`foo:super:admin` → `foo`). An empty
-/// app (from `""` or `:role`) is rejected at the clap boundary rather than
-/// surviving to the store and garbling the confirmation prompt.
-pub fn parse_revoke_grant_app(s: &str) -> Result<String, AdminError> {
-    let app = s.split_once(':').map_or(s, |(app, _)| app);
-    if app.is_empty() {
-        return Err(AdminError::InvalidGrant {
-            input: s.to_owned(),
-            reason: "empty app",
-        });
-    }
-    Ok(app.to_owned())
-}
-
-/// Add a grant to an existing key.
-pub async fn grant(
-    store: &KeyStore,
-    prefix: &KeyPrefix,
-    assignment: &RoleAssignment,
-) -> Result<(), AdminError> {
-    store.grant_assignment(prefix.as_str(), assignment).await?;
-    eprintln!(
-        "granted {}:{} to key {}",
-        assignment.app, assignment.role, prefix
-    );
-    Ok(())
-}
-
-/// Parse a `--grant app:role` value into a [`RoleAssignment`].
-///
-/// Multiple colons are kept in the role half (`foo:super:admin` →
-/// `(foo, super:admin)`) so role names can themselves be namespaced.
-pub fn parse_grant(s: &str) -> Result<RoleAssignment, AdminError> {
-    let bad = |reason: &'static str| AdminError::InvalidGrant {
-        input: s.to_owned(),
-        reason,
-    };
-    if s.chars().any(char::is_whitespace) {
-        return Err(bad("whitespace not allowed in APP:ROLE"));
-    }
-    let (app, role) = s.split_once(':').ok_or_else(|| bad("expected APP:ROLE"))?;
-    if app.is_empty() || role.is_empty() {
-        return Err(bad("empty app or role"));
-    }
-    Ok(RoleAssignment {
-        app: app.to_owned(),
-        role: role.to_owned(),
-    })
-}
-
-/// Render assignments as `"app1:role1, app2:role2"`, sorted by app, or
-/// `"(none)"` if empty.
-///
-/// CLI-output flavour of [`fleet_auth::format_assignments`] — that one uses
-/// `"none"` and comma-without-space for log fields; this one uses
-/// `"(none)"` and comma-space for human reading. Sorted independently of
-/// the input so callers can hand us an arbitrarily-ordered slice and still
-/// get deterministic output.
-fn format_assignments(assignments: &[RoleAssignment]) -> String {
-    if assignments.is_empty() {
+/// CLI-output flavour of `VerifiedKey::roles_display` — that one uses
+/// `"none"` and comma-without-space for log fields; this one uses `"(none)"`
+/// and comma-space for human reading. Sorted independently of the input so
+/// callers can hand us an arbitrarily-ordered slice and still get
+/// deterministic output.
+pub(crate) fn format_roles(roles: &[String]) -> String {
+    if roles.is_empty() {
         return "(none)".to_owned();
     }
-    let mut sorted: Vec<&RoleAssignment> = assignments.iter().collect();
-    sorted.sort_by(|a, b| a.app.cmp(&b.app));
-    sorted
-        .iter()
-        .map(|a| format!("{}:{}", a.app, a.role))
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut sorted: Vec<&str> = roles.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.join(", ")
 }
 
 /// Render an [`ApiKeyInfo`] slice as a `comfy_table` block.
@@ -320,7 +298,7 @@ fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
         "prefix",
         "name",
         "kind",
-        "grants",
+        "roles",
         "active",
         "created",
         "last used",
@@ -331,7 +309,7 @@ fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
             key.prefix.clone(),
             key.name.clone(),
             key.kind.to_string(),
-            format_assignments(&key.assignments),
+            format_roles(&key.roles),
             if key.active {
                 "yes".to_owned()
             } else {
@@ -348,7 +326,7 @@ fn format_keys_table(keys: &[ApiKeyInfo]) -> comfy_table::Table {
 }
 
 /// Format a `DateTime<Utc>` as `YYYY-MM-DD HH:MM:SS`.
-fn format_timestamp(ts: &DateTime<Utc>) -> String {
+pub(crate) fn format_timestamp(ts: &DateTime<Utc>) -> String {
     ts.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
@@ -396,60 +374,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_grant_valid() {
-        let g = parse_grant("trawl:admin").unwrap();
-        assert_eq!(g.app, "trawl");
-        assert_eq!(g.role, "admin");
+    fn role_name_accepts_converted_shape() {
+        for s in ["trawl-admin", "coastwatch-siem_consumer", "tier1"] {
+            assert_eq!(RoleName::parse(s).unwrap().as_str(), s);
+        }
     }
 
     #[test]
-    fn parse_grant_missing_colon() {
-        assert!(parse_grant("trawladmin").is_err());
-    }
-
-    #[test]
-    fn parse_grant_empty_app() {
-        assert!(parse_grant(":admin").is_err());
-    }
-
-    #[test]
-    fn parse_grant_empty_role() {
-        assert!(parse_grant("trawl:").is_err());
-    }
-
-    #[test]
-    fn parse_grant_multiple_colons_keeps_role_intact() {
-        let g = parse_grant("trawl:super:admin").unwrap();
-        assert_eq!(g.app, "trawl");
-        assert_eq!(g.role, "super:admin");
-    }
-
-    #[test]
-    fn parse_revoke_grant_app_bare_app() {
-        assert_eq!(parse_revoke_grant_app("trawl").unwrap(), "trawl");
-    }
-
-    #[test]
-    fn parse_revoke_grant_app_strips_role() {
-        assert_eq!(parse_revoke_grant_app("trawl:admin").unwrap(), "trawl");
-    }
-
-    #[test]
-    fn parse_revoke_grant_app_first_colon_semantics() {
-        assert_eq!(
-            parse_revoke_grant_app("trawl:super:admin").unwrap(),
-            "trawl"
-        );
-    }
-
-    #[test]
-    fn parse_revoke_grant_app_rejects_empty_input() {
-        assert!(parse_revoke_grant_app("").is_err());
-    }
-
-    #[test]
-    fn parse_revoke_grant_app_rejects_empty_app_before_colon() {
-        assert!(parse_revoke_grant_app(":admin").is_err());
+    fn role_name_rejects_bad_charset() {
+        for s in ["", "Tier One", "trawl:admin", "ADMIN"] {
+            assert!(RoleName::parse(s).is_err(), "should reject {s:?}");
+        }
     }
 
     #[test]
@@ -506,29 +441,22 @@ mod tests {
     }
 
     #[test]
-    fn format_assignments_sorts_by_app() {
-        let unsorted = vec![
-            grant_for("zebra", "ro"),
-            grant_for("alpha", "rw"),
-            grant_for("mango", "admin"),
-        ];
-        assert_eq!(
-            format_assignments(&unsorted),
-            "alpha:rw, mango:admin, zebra:ro"
-        );
-    }
-
-    #[test]
     fn parse_duration_rejects_never_literal() {
         let err = parse_duration("never").unwrap_err().to_string();
         assert!(err.contains("omit --expires"), "got: {err}");
     }
 
-    fn grant_for(app: &str, role: &str) -> RoleAssignment {
-        RoleAssignment {
-            app: app.into(),
-            role: role.into(),
-        }
+    #[test]
+    fn format_roles_sorts_and_falls_back() {
+        assert_eq!(format_roles(&[]), "(none)");
+        let roles = vec![
+            "trawl-admin".to_owned(),
+            "coastwatch-siem_consumer".to_owned(),
+        ];
+        assert_eq!(
+            format_roles(&roles),
+            "coastwatch-siem_consumer, trawl-admin"
+        );
     }
 
     fn fixed_ts(s: &str) -> DateTime<Utc> {
@@ -542,7 +470,7 @@ mod tests {
                 prefix: "dGhpcyBp".into(),
                 name: "web-frontend".into(),
                 kind: PrincipalKind::Human,
-                assignments: vec![grant_for("trawl", "analyst")],
+                roles: vec!["trawl-analyst".into()],
                 active: true,
                 created_at: fixed_ts("2026-02-10T12:00:00+00:00"),
                 expires_at: Some(fixed_ts("2026-05-11T12:00:00+00:00")),
@@ -554,7 +482,7 @@ mod tests {
                 prefix: "YW5vdGhl".into(),
                 name: "cli-readonly".into(),
                 kind: PrincipalKind::Service,
-                assignments: vec![grant_for("trawl", "reader")],
+                roles: vec!["trawl-reader".into()],
                 active: true,
                 created_at: fixed_ts("2026-02-09T08:00:00+00:00"),
                 expires_at: None,
@@ -566,10 +494,7 @@ mod tests {
                 prefix: "cmV2b2tl".into(),
                 name: "old-key".into(),
                 kind: PrincipalKind::Human,
-                assignments: vec![
-                    grant_for("trawl", "admin"),
-                    grant_for("coastwatch", "siem_consumer"),
-                ],
+                roles: vec!["trawl-admin".into(), "coastwatch-siem_consumer".into()],
                 active: false,
                 created_at: fixed_ts("2026-01-01T00:00:00+00:00"),
                 expires_at: None,
@@ -644,18 +569,10 @@ mod tests {
             out.contains("revoke this key? [y/N]"),
             "missing prompt text in {out:?}"
         );
-        let (_, out) = run_prompt("revoke grant for app trawl on key aaaabbbb?", "n\n");
+        let (_, out) = run_prompt("unassign role trawl-admin from key aaaabbbb?", "n\n");
         assert!(
-            out.contains("revoke grant for app trawl on key aaaabbbb? [y/N]"),
+            out.contains("unassign role trawl-admin from key aaaabbbb? [y/N]"),
             "question must come from the caller, got {out:?}"
         );
-    }
-
-    #[test]
-    fn format_assignments_renders_or_falls_back() {
-        assert_eq!(format_assignments(&[]), "(none)");
-        let a = vec![grant_for("trawl", "admin"), grant_for("cw", "ro")];
-        // Sorted by app — see [`format_assignments`].
-        assert_eq!(format_assignments(&a), "cw:ro, trawl:admin");
     }
 }

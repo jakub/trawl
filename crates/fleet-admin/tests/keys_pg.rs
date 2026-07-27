@@ -13,30 +13,53 @@ mod common;
 
 use std::time::Duration;
 
-use fleet_admin::commands::keys::{self, KeyPrefix};
+use fleet_admin::commands::keys::{self, KeyPrefix, RoleName};
 use fleet_admin::error::AdminError;
-use fleet_auth::{AuthError, PrincipalKind, RoleAssignment};
+use fleet_auth::{AuthError, KeyStore, PrincipalKind, RolePermission};
 
-fn trawl_admin() -> RoleAssignment {
-    RoleAssignment {
-        app: "trawl".into(),
-        role: "admin".into(),
+fn rp(app: &str, permission: &str) -> RolePermission {
+    RolePermission {
+        app: app.into(),
+        permission: permission.into(),
     }
 }
 
-fn coastwatch_consumer() -> RoleAssignment {
-    RoleAssignment {
-        app: "coastwatch".into(),
-        role: "siem_consumer".into(),
-    }
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// Seed the converted-shape roles the key tests hand out.
+async fn seed_roles(store: &KeyStore) {
+    store
+        .create_role(
+            "trawl-admin",
+            None,
+            &[rp("trawl", "query"), rp("trawl", "server_manage")],
+        )
+        .await
+        .expect("seed trawl-admin");
+    store
+        .create_role(
+            "coastwatch-siem_consumer",
+            None,
+            &[rp("coastwatch", "ioc_exports_read")],
+        )
+        .await
+        .expect("seed coastwatch-siem_consumer");
 }
 
 #[sqlx::test(migrations = false)]
 async fn create_emits_flt_prefix_and_persists(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let created = store
-        .create_key("svc", PrincipalKind::Service, &[trawl_admin()], None)
+        .create_key(
+            "svc",
+            PrincipalKind::Service,
+            &names(&["trawl-admin"]),
+            None,
+        )
         .await
         .expect("create");
 
@@ -53,19 +76,48 @@ async fn create_emits_flt_prefix_and_persists(pool: sqlx::PgPool) {
     assert_eq!(listed[0].prefix, created.info.prefix);
     assert_eq!(listed[0].name, "svc");
     assert_eq!(listed[0].kind, PrincipalKind::Service);
-    assert_eq!(listed[0].assignments.len(), 1);
+    assert_eq!(listed[0].roles, ["trawl-admin"]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn create_with_unknown_role_is_refused(pool: sqlx::PgPool) {
+    let store = common::migrated_store(pool).await;
+
+    let err = keys::create(
+        &store,
+        "typo",
+        PrincipalKind::Service,
+        &names(&["trawl-adnim"]),
+        None,
+    )
+    .await
+    .expect_err("unknown role must be refused, not silently minted");
+    assert!(
+        matches!(
+            err,
+            AdminError::Auth(AuthError::RoleNotFound { ref name }) if name == "trawl-adnim"
+        ),
+        "expected RoleNotFound, got {err:?}"
+    );
+    assert!(store.list_keys(false).await.unwrap().is_empty());
 }
 
 #[sqlx::test(migrations = false)]
 async fn list_all_includes_revoked(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let alive = store
-        .create_key("alive", PrincipalKind::Human, &[trawl_admin()], None)
+        .create_key(
+            "alive",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
         .await
         .unwrap();
     let dead = store
-        .create_key("dead", PrincipalKind::Human, &[trawl_admin()], None)
+        .create_key("dead", PrincipalKind::Human, &names(&["trawl-admin"]), None)
         .await
         .unwrap();
     store.revoke_key(&dead.info.prefix).await.unwrap();
@@ -105,48 +157,56 @@ async fn revoke_sets_active_false_and_revoked_at(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn grant_adds_assignment_and_rejects_duplicate(pool: sqlx::PgPool) {
+async fn assign_role_adds_and_rejects_duplicate(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let created = store
         .create_key("grantee", PrincipalKind::Service, &[], None)
         .await
         .unwrap();
+    let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
+    let role = RoleName::parse("trawl-admin").expect("parse role");
 
-    store
-        .grant_assignment(&created.info.prefix, &trawl_admin())
+    keys::assign_role(&store, &prefix, &role)
         .await
-        .expect("first grant");
+        .expect("first assignment");
 
-    // Same (key, app) again → GrantExists, NOT silent overwrite.
-    let err = store
-        .grant_assignment(&created.info.prefix, &trawl_admin())
+    // Same role again → RoleAlreadyAssigned, NOT silent no-op.
+    let err = keys::assign_role(&store, &prefix, &role)
         .await
-        .unwrap_err();
+        .expect_err("duplicate assignment must error");
     assert!(
-        matches!(err, AuthError::GrantExists { ref app, .. } if app == "trawl"),
-        "expected GrantExists for app=trawl, got {err:?}"
+        matches!(
+            err,
+            AdminError::Auth(AuthError::RoleAlreadyAssigned { ref role, .. })
+                if role == "trawl-admin"
+        ),
+        "expected RoleAlreadyAssigned, got {err:?}"
     );
 
-    store
-        .grant_assignment(&created.info.prefix, &coastwatch_consumer())
+    let second = RoleName::parse("coastwatch-siem_consumer").unwrap();
+    keys::assign_role(&store, &prefix, &second)
         .await
-        .expect("grant on different app");
+        .expect("assignment of a different role");
 
     let info = store.get_key_by_prefix(&created.info.prefix).await.unwrap();
-    assert_eq!(info.assignments.len(), 2);
+    assert_eq!(info.roles, ["coastwatch-siem_consumer", "trawl-admin"]);
 }
 
 #[sqlx::test(migrations = false)]
-async fn grant_on_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
+async fn assign_role_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
-    let err = store
-        .grant_assignment("ghostpfx", &trawl_admin())
-        .await
-        .unwrap_err();
+    let prefix = KeyPrefix::parse("ghostpfx").unwrap();
+    let role = RoleName::parse("trawl-admin").unwrap();
+    let err = keys::assign_role(&store, &prefix, &role).await.unwrap_err();
     assert!(
-        matches!(err, AuthError::KeyNotFound { ref prefix } if prefix == "ghostpfx"),
+        matches!(
+            err,
+            AdminError::Auth(AuthError::KeyNotFound { ref prefix }) if prefix == "ghostpfx"
+        ),
         "expected KeyNotFound, got {err:?}"
     );
 }
@@ -165,6 +225,7 @@ async fn revoke_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
 #[sqlx::test(migrations = false)]
 async fn create_with_expires_persists_expires_at(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let ninety_days = Duration::from_hours(90 * 24);
     let before = chrono::Utc::now();
@@ -172,7 +233,7 @@ async fn create_with_expires_persists_expires_at(pool: sqlx::PgPool) {
         &store,
         "exp",
         PrincipalKind::Service,
-        &[trawl_admin()],
+        &names(&["trawl-admin"]),
         Some(ninety_days),
     )
     .await
@@ -193,9 +254,15 @@ async fn create_with_expires_persists_expires_at(pool: sqlx::PgPool) {
 #[sqlx::test(migrations = false)]
 async fn revoke_twice_returns_already_revoked(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let created = store
-        .create_key("twice", PrincipalKind::Human, &[trawl_admin()], None)
+        .create_key(
+            "twice",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
         .await
         .unwrap();
     let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
@@ -214,64 +281,85 @@ async fn revoke_twice_returns_already_revoked(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn revoke_grant_removes_only_named_app(pool: sqlx::PgPool) {
+async fn unassign_role_removes_only_named_role(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let created = store
         .create_key(
             "multi",
             PrincipalKind::Service,
-            &[trawl_admin(), coastwatch_consumer()],
+            &names(&["trawl-admin", "coastwatch-siem_consumer"]),
             None,
         )
         .await
         .unwrap();
     let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
 
-    keys::revoke_grant(&store, &prefix, "trawl", true)
-        .await
-        .expect("revoke grant");
+    keys::unassign_role(
+        &store,
+        &prefix,
+        &RoleName::parse("trawl-admin").unwrap(),
+        true,
+    )
+    .await
+    .expect("unassign role");
 
     let info = store.get_key_by_prefix(&created.info.prefix).await.unwrap();
-    assert_eq!(info.assignments.len(), 1, "other grant must survive");
-    assert_eq!(info.assignments[0].app, "coastwatch");
+    assert_eq!(
+        info.roles,
+        ["coastwatch-siem_consumer"],
+        "other role must survive"
+    );
 }
 
 #[sqlx::test(migrations = false)]
-async fn revoke_grant_missing_app_returns_grant_not_found(pool: sqlx::PgPool) {
+async fn unassign_role_not_held_returns_role_not_assigned(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let created = store
         .create_key(
             "bare",
             PrincipalKind::Service,
-            &[coastwatch_consumer()],
+            &names(&["coastwatch-siem_consumer"]),
             None,
         )
         .await
         .unwrap();
     let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");
 
-    let err = keys::revoke_grant(&store, &prefix, "trawl", true)
-        .await
-        .expect_err("missing grant must error, not silently succeed");
+    let err = keys::unassign_role(
+        &store,
+        &prefix,
+        &RoleName::parse("trawl-admin").unwrap(),
+        true,
+    )
+    .await
+    .expect_err("missing assignment must error, not silently succeed");
     assert!(
         matches!(
             err,
-            AdminError::Auth(AuthError::GrantNotFound { ref app, .. }) if app == "trawl"
+            AdminError::Auth(AuthError::RoleNotAssigned { ref role, .. }) if role == "trawl-admin"
         ),
-        "expected GrantNotFound for app=trawl, got {err:?}"
+        "expected RoleNotAssigned, got {err:?}"
     );
 }
 
 #[sqlx::test(migrations = false)]
-async fn revoke_grant_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
+async fn unassign_role_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let prefix = KeyPrefix::parse("ghostpfx").expect("parse prefix");
-    let err = keys::revoke_grant(&store, &prefix, "trawl", true)
-        .await
-        .expect_err("unknown prefix must error");
+    let err = keys::unassign_role(
+        &store,
+        &prefix,
+        &RoleName::parse("trawl-admin").unwrap(),
+        true,
+    )
+    .await
+    .expect_err("unknown prefix must error");
     assert!(
         matches!(
             err,
@@ -284,9 +372,10 @@ async fn revoke_grant_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
 #[sqlx::test(migrations = false)]
 async fn retype_flips_kind_both_directions(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
 
     let created = store
-        .create_key("flip", PrincipalKind::Human, &[trawl_admin()], None)
+        .create_key("flip", PrincipalKind::Human, &names(&["trawl-admin"]), None)
         .await
         .unwrap();
     let prefix = KeyPrefix::parse(&created.info.prefix).expect("parse prefix");

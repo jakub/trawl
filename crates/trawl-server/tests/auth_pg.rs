@@ -26,12 +26,11 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{ensure_fixtures, setup, trawl_only};
+use common::{ensure_fixtures, roles, setup};
 use fleet_auth::{KeyStore, PrincipalKind};
 use parking_lot::Mutex;
 use sqlx::PgPool;
 use trawl_server::config::RateLimitConfig;
-use trawl_server::policy::Role;
 
 /// Raw reqwest client accepting the self-signed test cert.
 fn raw_client() -> reqwest::Client {
@@ -110,7 +109,7 @@ async fn ac1_key_roundtrip_create_whoami_revoke_401(pool: PgPool) {
         .create_key(
             "roundtrip",
             PrincipalKind::Human,
-            &trawl_only(Role::Analyst),
+            &roles(&["trawl-analyst"]),
             None,
         )
         .await
@@ -289,6 +288,135 @@ async fn ac3_grantless_key_never_reaches_rate_limiter(pool: PgPool) {
     }
 }
 
+/// Roles-as-data addition to the grantless matrix: a key whose role EXISTS
+/// but resolves zero permissions anywhere is still 403 on every
+/// authenticated route — holding a role is not capability, permissions are.
+#[sqlx::test(migrations = false)]
+async fn ac3_zero_permission_role_key_403_everywhere(pool: PgPool) {
+    let server = setup(pool).await;
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+
+    store
+        .create_role("empty-shell", None, &[])
+        .await
+        .expect("create permissionless role");
+    let created = store
+        .create_key(
+            "shell-holder",
+            PrincipalKind::Service,
+            &roles(&["empty-shell"]),
+            None,
+        )
+        .await
+        .unwrap();
+
+    for (method, path) in authenticated_routes() {
+        let (status, body) = request(
+            &server.url,
+            method.clone(),
+            path,
+            Some(&created.plaintext_token),
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "{method} {path} must 403 for zero-permission-role key"
+        );
+        assert_eq!(
+            body["error"]["code"], "forbidden",
+            "{method} {path} body: {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC5 (rate_rpm): a role ceiling overrides the class defaults end-to-end,
+// spent separately on the interactive and ingest classes.
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = false)]
+async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class(pool: PgPool) {
+    // Generous class defaults so any 429 observed can only come from the
+    // role's rate_rpm override — proving override-not-max.
+    let server = common::setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            default_rpm: 10_000,
+            ingest_rpm: 10_000,
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+
+    store
+        .create_role(
+            "capped",
+            Some(2),
+            &common::trawl_perms(&["query", "ingest"]),
+        )
+        .await
+        .expect("create capped role");
+    let created = store
+        .create_key(
+            "capped-key",
+            PrincipalKind::Service,
+            &roles(&["capped"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let token = created.plaintext_token.to_string();
+
+    // Interactive class: burst of 2, then 429 — despite default_rpm 10_000.
+    let mut statuses = Vec::new();
+    for _ in 0..4 {
+        let (status, _) = request(
+            &server.url,
+            reqwest::Method::POST,
+            "/api/v1/query",
+            Some(&token),
+        )
+        .await;
+        statuses.push(status);
+    }
+    assert!(
+        statuses[..2].iter().all(|s| *s != 429),
+        "first two interactive requests are within the ceiling: {statuses:?}"
+    );
+    assert_eq!(
+        statuses[2..],
+        [429, 429],
+        "role rate_rpm=2 must cap /query despite the huge class default: {statuses:?}"
+    );
+
+    // Ingest class: its OWN budget of 2 — the interactive spend above must
+    // not have consumed it.
+    let client = raw_client();
+    let mut ingest_statuses = Vec::new();
+    for _ in 0..4 {
+        let resp = client
+            .post(format!("{}/api/v1/ingest", server.url))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/x-ndjson")
+            .body(r#"{"service":"t","message":"m"}"#)
+            .send()
+            .await
+            .unwrap();
+        ingest_statuses.push(resp.status().as_u16());
+    }
+    assert_eq!(
+        ingest_statuses[..2],
+        [200, 200],
+        "ingest budget is separate from the interactive one: {ingest_statuses:?}"
+    );
+    assert_eq!(
+        ingest_statuses[2..],
+        [429, 429],
+        "the same rate_rpm=2 ceiling applies independently on ingest: {ingest_statuses:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC4: /whoami wire shape frozen (golden JSON per role)
 // ---------------------------------------------------------------------------
@@ -297,11 +425,14 @@ async fn ac3_grantless_key_never_reaches_rate_limiter(pool: PgPool) {
 async fn ac4_whoami_golden_json_per_role(pool: PgPool) {
     let server = setup(pool).await;
 
+    // The converted roles resolve exactly the permission sets the legacy
+    // compile-time tables granted — minus the dead `key_manage`, which the
+    // conversion never carries and no handler ever checked.
     let cases = [
         (
             &server.admin_token,
             "admin-key",
-            "admin",
+            "trawl-admin",
             serde_json::json!([
                 "query",
                 "schema_read",
@@ -310,14 +441,13 @@ async fn ac4_whoami_golden_json_per_role(pool: PgPool) {
                 "export",
                 "stream",
                 "query_cancel",
-                "key_manage",
                 "server_manage"
             ]),
         ),
         (
             &server.analyst_token,
             "test-key",
-            "analyst",
+            "trawl-analyst",
             serde_json::json!([
                 "query",
                 "schema_read",
@@ -331,13 +461,13 @@ async fn ac4_whoami_golden_json_per_role(pool: PgPool) {
         (
             &server.reader_token,
             "reader-key",
-            "reader",
+            "trawl-reader",
             serde_json::json!(["query", "schema_read", "query_cancel"]),
         ),
         (
             &server.ingest_token,
             "ingest-key",
-            "ingest",
+            "trawl-ingest",
             serde_json::json!(["ingest"]),
         ),
     ];
@@ -359,7 +489,7 @@ async fn ac4_whoami_golden_json_per_role(pool: PgPool) {
             "prefix": prefix,
             "name": name,
             "kind": "service",
-            "assignments": [{ "app": "trawl", "role": role }],
+            "roles": [role],
             "permissions": permissions,
         });
         assert_eq!(body, expected, "whoami wire shape drifted for {role}");
@@ -430,7 +560,7 @@ async fn ac5_envelope_revoked_and_expired_tokens(pool: PgPool) {
         .create_key(
             "rev",
             PrincipalKind::Service,
-            &trawl_only(Role::Reader),
+            &roles(&["trawl-reader"]),
             None,
         )
         .await
@@ -451,7 +581,7 @@ async fn ac5_envelope_revoked_and_expired_tokens(pool: PgPool) {
         .create_key(
             "exp",
             PrincipalKind::Service,
-            &trawl_only(Role::Reader),
+            &roles(&["trawl-reader"]),
             Some(Duration::from_millis(50)),
         )
         .await
@@ -532,7 +662,7 @@ async fn scheduler_runs_after(
         .create_key(
             "sched-owner",
             PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
+            &roles(&["trawl-analyst"]),
             key_ttl,
         )
         .await
@@ -625,45 +755,36 @@ async fn ac6_scheduler_skips_expired_key(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn ac6_scheduler_skips_grant_stripped_key(pool: PgPool) {
+async fn ac6_scheduler_skips_role_stripped_key(pool: PgPool) {
     let runs = scheduler_runs_after(
         pool,
         None,
         0,
         async |store: &KeyStore, key: &fleet_auth::CreatedKey| {
             store
-                .revoke_assignment(&key.info.prefix, "trawl")
+                .unassign_role(&key.info.prefix, "trawl-analyst")
                 .await
                 .unwrap();
         },
     )
     .await;
-    assert_eq!(runs, 0, "grant-stripped key must not execute schedules");
+    assert_eq!(runs, 0, "role-stripped key must not execute schedules");
 }
 
-/// A live key whose trawl grant is downgraded from analyst to a role lacking
+/// A live key whose role set is downgraded from analyst to a role lacking
 /// saved-query authority must stop running its schedules — otherwise removing
 /// a role leaves durable execution privilege behind.
-async fn assert_downgrade_stops_schedules(pool: PgPool, new_role: &str) {
+async fn assert_downgrade_stops_schedules(pool: PgPool, new_role: &'static str) {
     let runs = scheduler_runs_after(
         pool,
         None,
         0,
         async move |store: &KeyStore, key: &fleet_auth::CreatedKey| {
             store
-                .revoke_assignment(&key.info.prefix, "trawl")
+                .unassign_role(&key.info.prefix, "trawl-analyst")
                 .await
                 .unwrap();
-            store
-                .grant_assignment(
-                    &key.info.prefix,
-                    &fleet_auth::RoleAssignment {
-                        app: "trawl".into(),
-                        role: new_role.into(),
-                    },
-                )
-                .await
-                .unwrap();
+            store.assign_role(&key.info.prefix, new_role).await.unwrap();
         },
     )
     .await;
@@ -677,13 +798,42 @@ async fn assert_downgrade_stops_schedules(pool: PgPool, new_role: &str) {
 async fn ac6_scheduler_skips_analyst_downgraded_to_reader(pool: PgPool) {
     // Reader holds Query but not SavedQuery: it cannot manage saved queries
     // interactively, so it must not keep running them on a schedule.
-    assert_downgrade_stops_schedules(pool, "reader").await;
+    assert_downgrade_stops_schedules(pool, "trawl-reader").await;
 }
 
 #[sqlx::test(migrations = false)]
 async fn ac6_scheduler_skips_analyst_downgraded_to_ingest(pool: PgPool) {
     // Ingest holds neither Query nor SavedQuery.
-    assert_downgrade_stops_schedules(pool, "ingest").await;
+    assert_downgrade_stops_schedules(pool, "trawl-ingest").await;
+}
+
+/// Roles-as-data variant of the downgrade: the key keeps its role, but the
+/// ROLE loses `saved_query`. The scheduler's Query-AND-SavedQuery gate must
+/// observe the mutation on its next liveness poll.
+#[sqlx::test(migrations = false)]
+async fn ac6_scheduler_stops_when_role_loses_saved_query_permission(pool: PgPool) {
+    let runs = scheduler_runs_after(
+        pool,
+        None,
+        0,
+        async |store: &KeyStore, _key: &fleet_auth::CreatedKey| {
+            store
+                .remove_role_permissions(
+                    "trawl-analyst",
+                    &[fleet_auth::RolePermission {
+                        app: "trawl".into(),
+                        permission: "saved_query".into(),
+                    }],
+                )
+                .await
+                .unwrap();
+        },
+    )
+    .await;
+    assert_eq!(
+        runs, 0,
+        "removing saved_query from the ROLE must stop schedules"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -720,7 +870,7 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         .create_key(
             "baseline",
             PrincipalKind::Service,
-            &trawl_only(Role::Reader),
+            &roles(&["trawl-reader"]),
             None,
         )
         .await
@@ -744,7 +894,7 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         .create_key(
             "made-by-fleet-admin",
             PrincipalKind::Human,
-            &trawl_only(Role::Admin),
+            &roles(&["trawl-admin"]),
             None,
         )
         .await
@@ -781,7 +931,7 @@ async fn sse_stream_rejects_revoked_key_at_handshake(pool: PgPool) {
         .create_key(
             "sse",
             PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
+            &roles(&["trawl-analyst"]),
             None,
         )
         .await

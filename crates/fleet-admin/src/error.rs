@@ -24,8 +24,8 @@ pub enum AdminError {
     #[error(transparent)]
     Auth(#[from] AuthError),
 
-    #[error("invalid --grant {input:?}: {reason}")]
-    InvalidGrant { input: String, reason: &'static str },
+    #[error("invalid APP:PERMISSION {input:?}: {reason}")]
+    InvalidPermSpec { input: String, reason: &'static str },
 
     #[error("invalid --expires {input:?}: {reason}")]
     InvalidDuration { input: String, reason: &'static str },
