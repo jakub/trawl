@@ -186,7 +186,7 @@ mod tests {
                 "prefix": "testtest",
                 "name": "alice",
                 "kind": "human",
-                "assignments": [{"app": "trawl", "role": "analyst"}],
+                "roles": ["trawl-analyst"],
                 "permissions": ["query", "schema_read", "validate", "saved_query", "export", "stream", "query_cancel"]
             })))
             .mount(upstream)

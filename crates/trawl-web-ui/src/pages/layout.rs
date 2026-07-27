@@ -67,7 +67,7 @@ pub fn AuthShell() -> impl IntoView {
     provide_context(me);
 
     // Admin-only live stats for the footer. The stream opens only after
-    // `/me` resolves with the admin role — the endpoint is
+    // `/me` resolves with the `server_manage` permission — the endpoint is
     // `ServerManage`-gated upstream, so non-admins never even issue the
     // request. The `StoredValue` bounds the `EventSource` lifetime;
     // dropping it closes the connection.
@@ -76,7 +76,9 @@ pub fn AuthShell() -> impl IntoView {
         StoredValue::new_local(None);
     on_cleanup(move || stats_handle.update_value(|s| *s = None));
     Effect::new(move |_| {
-        let is_admin = me.get().is_some_and(|m| m.role == "admin");
+        let is_admin = me
+            .get()
+            .is_some_and(|m| m.permissions.iter().any(|p| p == "server_manage"));
         // Drop any previous stream first — this Effect re-runs whenever
         // `me` changes, and two live EventSources would double-push.
         stats_handle.update_value(|s| *s = None);
@@ -117,7 +119,7 @@ pub fn AuthShell() -> impl IntoView {
     let user = Signal::derive(move || {
         me.get().map(|m| UserInfo {
             name: m.name,
-            detail: m.role,
+            detail: m.roles.join(", "),
         })
     });
 

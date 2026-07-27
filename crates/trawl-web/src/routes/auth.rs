@@ -13,9 +13,11 @@
 //!    `Domain=` per `shared_domain`).
 //! 3. Browser is redirected client-side by the SPA.
 //!
-//! `role` is deliberately NOT in the cookie (ADR-0004 slice 2): the
-//! payload must be byte-identical across fleet apps for SSO, so `/me`
-//! re-derives the trawl role from upstream `/whoami` on every request.
+//! Roles/permissions are deliberately NOT in the cookie (ADR-0004 slice
+//! 2): the payload must be byte-identical across fleet apps for SSO, so
+//! `/me` re-derives the trawl permission set from upstream `/whoami` on
+//! every request. Under roles-as-data (ADR-0006) the gate is "≥1 resolved
+//! trawl permission" — role names are display/audit only.
 //!
 //! Login and logout validate the `Origin` header (present-only semantics,
 //! same helper as `fleet_auth::login`/`logout`) — with the shared cookie a
@@ -43,7 +45,10 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub name: String,
-    pub role: String,
+    /// Names of every role the key holds (display/audit; cross-app).
+    pub roles: Vec<String>,
+    /// Server-resolved trawl permissions (the SPA's gating currency).
+    pub permissions: Vec<String>,
 }
 
 /// Reject cross-origin browser requests to cookie-authed, state-changing
@@ -89,13 +94,13 @@ pub async fn login(
 
     let whoami = fetch_whoami(&state, &req.api_key).await?;
 
-    // Valid key but no trawl grant → 403 with NO cookie: mirrors upstream
-    // trawld's no-grant semantics (post-slice-1 trawld 403s grantless keys
+    // Valid key but zero trawl permissions → 403 with NO cookie: mirrors
+    // upstream trawld's no-grant semantics (trawld 403s permissionless keys
     // before /whoami anyway; this is the belt-and-suspenders branch). The
     // user never gets a session for an app they can't access.
-    let role = whoami
-        .trawl_role()
-        .ok_or(ProxyError::Upstream(StatusCode::FORBIDDEN))?;
+    if whoami.permissions.is_empty() {
+        return Err(ProxyError::Upstream(StatusCode::FORBIDDEN));
+    }
 
     let now = chrono::Utc::now().timestamp();
     let ttl = i64::try_from(state.session_ttl_secs())
@@ -114,7 +119,8 @@ pub async fn login(
 
     let body = LoginResponse {
         name: whoami.name,
-        role,
+        roles: whoami.roles,
+        permissions: whoami.permissions,
     };
 
     let mut headers = HeaderMap::new();
@@ -129,29 +135,15 @@ pub async fn login(
 }
 
 /// Local view of the upstream `/whoami` payload — only the fields the proxy
-/// actually uses. The proxy never gates anything on non-trawl-app grants,
-/// so we extract just the trawl role here.
+/// actually uses. `permissions` is trawld's resolved trawl-namespace set
+/// (the gate); `roles` are display-only names.
 #[derive(Debug, Deserialize)]
 struct WhoAmI {
     name: String,
     #[serde(default)]
-    assignments: Vec<UpstreamAssignment>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpstreamAssignment {
-    app: String,
-    role: String,
-}
-
-impl WhoAmI {
-    /// Role assigned in the trawl-app namespace, if any.
-    fn trawl_role(&self) -> Option<String> {
-        self.assignments
-            .iter()
-            .find(|a| a.app == "trawl")
-            .map(|a| a.role.clone())
-    }
+    roles: Vec<String>,
+    #[serde(default)]
+    permissions: Vec<String>,
 }
 
 async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyError> {
@@ -186,19 +178,24 @@ async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyErro
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MeResponse {
     pub name: String,
-    pub role: String,
+    /// Names of every role the key holds (display/audit; cross-app).
+    pub roles: Vec<String>,
+    /// Server-resolved trawl permissions (the SPA's gating currency).
+    pub permissions: Vec<String>,
     pub exp: i64,
 }
 
-/// `GET /me` — identity + role for the SPA's auth shell.
+/// `GET /me` — identity + roles/permissions for the SPA's auth shell.
 ///
-/// The role is fetched LIVE from upstream `/whoami` on every call (it no
-/// longer lives in the cookie), so a grant change takes effect on the next
-/// request rather than at cookie expiry. Upstream mapping:
+/// Roles and permissions are fetched LIVE from upstream `/whoami` on every
+/// call (they never live in the cookie), so a role or permission change
+/// takes effect on the next request rather than at cookie expiry. Upstream
+/// mapping:
 /// - `/whoami` 401 (key revoked/expired fleet-wide) → 401 WITH a clear
 ///   cookie — the session is dead everywhere.
-/// - `/whoami` 200 but no trawl grant, or upstream 403 → 403 with the
-///   cookie PRESERVED — the key may still hold grants in sibling apps.
+/// - `/whoami` 200 but zero trawl permissions, or upstream 403 → 403 with
+///   the cookie PRESERVED — the key may still hold capability in sibling
+///   apps.
 pub async fn me(
     State(state): State<AppState>,
     session: Session,
@@ -217,13 +214,14 @@ pub async fn me(
         Err(other) => return Err(other),
     };
 
-    let role = whoami
-        .trawl_role()
-        .ok_or(ProxyError::Upstream(StatusCode::FORBIDDEN))?;
+    if whoami.permissions.is_empty() {
+        return Err(ProxyError::Upstream(StatusCode::FORBIDDEN));
+    }
 
     Ok(Json(MeResponse {
         name: whoami.name,
-        role,
+        roles: whoami.roles,
+        permissions: whoami.permissions,
         exp: session.exp(),
     }))
 }
@@ -267,13 +265,15 @@ mod tests {
         AppState::from_config(cfg).unwrap()
     }
 
-    fn whoami_body(name: &str, app: &str, role: &str) -> serde_json::Value {
+    /// Upstream `/whoami` body for a key with trawl capability. The
+    /// `permissions` list is what the proxy gates on; `roles` is display.
+    fn whoami_body(name: &str, role: &str, permissions: &[&str]) -> serde_json::Value {
         json!({
             "prefix": "abcd1234",
             "name": name,
             "kind": "human",
-            "assignments": [{"app": app, "role": role}],
-            "permissions": ["query"]
+            "roles": [role],
+            "permissions": permissions,
         })
     }
 
@@ -283,9 +283,11 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .and(bearer_token("flt_goodtoken"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(whoami_body("alice", "trawl", "analyst")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
+                "alice",
+                "trawl-analyst",
+                &["query", "export"],
+            )))
             .mount(&upstream)
             .await;
 
@@ -375,8 +377,8 @@ mod tests {
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
                 "bob",
-                "coastwatch",
-                "analyst",
+                "coastwatch-analyst",
+                &[],
             )))
             .mount(&upstream)
             .await;
@@ -405,9 +407,11 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .and(bearer_token("flt_prod"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(whoami_body("prod", "trawl", "admin")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
+                "prod",
+                "trawl-admin",
+                &["query", "server_manage"],
+            )))
             .mount(&upstream)
             .await;
 
@@ -458,9 +462,11 @@ mod tests {
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(whoami_body("alice", "trawl", "analyst")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
+                "alice",
+                "trawl-analyst",
+                &["query", "export"],
+            )))
             .mount(&upstream)
             .await;
 
@@ -515,9 +521,11 @@ mod tests {
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(whoami_body("alice", "trawl", "analyst")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
+                "alice",
+                "trawl-analyst",
+                &["query", "export"],
+            )))
             .mount(&upstream)
             .await;
 
@@ -577,9 +585,11 @@ mod tests {
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(whoami_body("alice", "trawl", "analyst")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
+                "alice",
+                "trawl-analyst",
+                &["query", "export"],
+            )))
             .mount(&upstream)
             .await;
 
@@ -745,9 +755,11 @@ mod tests {
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(whoami_body("alice", "trawl", "analyst")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
+                "alice",
+                "trawl-analyst",
+                &["query", "export"],
+            )))
             .mount(&upstream)
             .await;
 
@@ -791,9 +803,11 @@ mod tests {
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(whoami_body("alice", "trawl", "analyst")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
+                "alice",
+                "trawl-analyst",
+                &["query", "export"],
+            )))
             .mount(&upstream)
             .await;
 
@@ -836,15 +850,16 @@ mod tests {
             .unwrap();
         let body: MeResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body.name, "alice");
-        assert_eq!(body.role, "analyst");
+        assert_eq!(body.roles, ["trawl-analyst"]);
+        assert_eq!(body.permissions, ["query", "export"]);
         assert!(body.exp > chrono::Utc::now().timestamp());
     }
 
     #[tokio::test]
-    async fn me_reflects_upstream_role_change_between_calls() {
-        // AC #4: role lives upstream, not in the cookie. Mutating the mock
-        // /whoami role between two calls on ONE cookie must be reflected —
-        // proving a live fetch, not cookie residue.
+    async fn me_reflects_upstream_permission_change_between_calls() {
+        // AC #4 successor: roles/permissions live upstream, not in the
+        // cookie. Mutating the mock /whoami between two calls on ONE cookie
+        // must be reflected — proving a live fetch, not cookie residue.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
         let me_req = || {
@@ -861,15 +876,18 @@ mod tests {
             .await
             .unwrap();
         let body: MeResponse = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body.role, "analyst");
+        assert_eq!(body.roles, ["trawl-analyst"]);
+        assert!(!body.permissions.contains(&"server_manage".to_owned()));
 
-        // Retype the principal upstream — same cookie, new role.
+        // Promote the principal upstream — same cookie, new role + perms.
         upstream.reset().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(whoami_body("alice", "trawl", "admin")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
+                "alice",
+                "trawl-admin",
+                &["query", "export", "server_manage"],
+            )))
             .mount(&upstream)
             .await;
 
@@ -879,7 +897,15 @@ mod tests {
             .await
             .unwrap();
         let body: MeResponse = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body.role, "admin", "role change must be live, not cached");
+        assert_eq!(
+            body.roles,
+            ["trawl-admin"],
+            "role change must be live, not cached"
+        );
+        assert!(
+            body.permissions.contains(&"server_manage".to_owned()),
+            "permission change must be live, not cached"
+        );
     }
 
     #[tokio::test]
@@ -954,8 +980,8 @@ mod tests {
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
                 "alice",
-                "coastwatch",
-                "analyst",
+                "coastwatch-analyst",
+                &[],
             )))
             .mount(&upstream)
             .await;

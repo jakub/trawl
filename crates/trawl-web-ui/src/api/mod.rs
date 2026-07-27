@@ -51,14 +51,20 @@ pub struct LoginRequest<'a> {
 #[allow(dead_code)] // fields consumed by later commits (search page, admin gating)
 pub struct LoginResponse {
     pub name: String,
-    pub role: String,
+    /// Names of every role the key holds (display only).
+    pub roles: Vec<String>,
+    /// Server-resolved trawl permissions — the gating currency (ADR-0006).
+    pub permissions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)] // `exp` is for client-side expiry countdowns in a later commit
 pub struct MeResponse {
     pub name: String,
-    pub role: String,
+    /// Names of every role the key holds (display only).
+    pub roles: Vec<String>,
+    /// Server-resolved trawl permissions — the gating currency (ADR-0006).
+    pub permissions: Vec<String>,
     pub exp: i64,
 }
 
