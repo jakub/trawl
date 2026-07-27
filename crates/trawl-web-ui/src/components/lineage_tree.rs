@@ -36,11 +36,11 @@ impl From<DescendantView> for LineageNode {
 
 /// Whether the resolved trawl permission set allows writing derivations.
 ///
-/// Keyed on `server_manage` (ADR-0006: role names are operator-defined
-/// display strings; permissions are the gating currency). Behaviour-
-/// preserving: only the trawl admin tier holds `server_manage` today.
+/// Behaviour-preserving: only the trawl admin tier may write derivations
+/// today, so this delegates to [`crate::perms::is_trawl_admin`] rather
+/// than repeating the gating literal.
 pub fn can_write_derivations(permissions: &[String]) -> bool {
-    permissions.iter().any(|p| p == "server_manage")
+    crate::perms::is_trawl_admin(permissions)
 }
 
 pub(crate) fn transformation_color(t: &str) -> &'static str {

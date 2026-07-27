@@ -78,7 +78,7 @@ pub fn AuthShell() -> impl IntoView {
     Effect::new(move |_| {
         let is_admin = me
             .get()
-            .is_some_and(|m| m.permissions.iter().any(|p| p == "server_manage"));
+            .is_some_and(|m| crate::perms::is_trawl_admin(&m.permissions));
         // Drop any previous stream first — this Effect re-runs whenever
         // `me` changes, and two live EventSources would double-push.
         stats_handle.update_value(|s| *s = None);
