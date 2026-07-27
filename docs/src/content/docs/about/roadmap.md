@@ -14,7 +14,7 @@ Complete pipeline DSL with 14 pipe stages, 17 aggregation functions, 12 scalar f
 ndjson/JSON ingest → WAL → hot buffer (visible within milliseconds) → hourly parquet compaction → daily rollup. Event bus with broadcast channel for real-time streaming. Age-based + disk-pressure retention policies.
 
 ### Server
-axum with a full middleware stack: rate limiting per role, CORS, HSTS, concurrency limits, request IDs. TLS with auto-generated self-signed certs and hot-reload. Prometheus metrics. Internal telemetry that feeds server ops back into its own pipeline.
+axum with a full middleware stack: rate limiting per API key, CORS, HSTS, concurrency limits, request IDs. TLS with auto-generated self-signed certs and hot-reload. Prometheus metrics. Internal telemetry that feeds server ops back into its own pipeline.
 
 ### Authentication
 argon2id-hashed API keys with four roles (admin, analyst, reader, ingest), verified against the shared fleet-auth postgres keystore with timing-safe dummy hashes. Query history, saved queries, and schedules live in a dedicated trawl postgres database (boot-migrated, advisory-locked sole writer).

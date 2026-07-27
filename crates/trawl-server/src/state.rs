@@ -271,7 +271,7 @@ pub struct HttpConfig {
     pub cors_allowed_origins: Vec<String>,
     /// Max body size for ingest requests (None if ingest disabled).
     pub ingest_max_body_bytes: Option<usize>,
-    /// Per-role rate limiting config.
+    /// Per-key rate limiting config.
     pub rate_limit: RateLimitConfig,
 }
 

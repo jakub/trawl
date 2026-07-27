@@ -265,16 +265,14 @@ async fn ac3_grantless_key_403_on_every_authenticated_route(pool: PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn ac3_grantless_key_never_reaches_rate_limiter(pool: PgPool) {
-    // Tight bucket for every role. A grantless key never reaches the rate
+    // Tight bucket for every key. A grantless key never reaches the rate
     // limiter (mandatory policy 403s it first) — so no request can ever be
     // 429, and none can succeed.
     let server = common::setup_with_rate_limit(
         pool,
         RateLimitConfig {
-            admin: 1,
-            analyst: 1,
-            reader: 1,
-            ingest: 1,
+            default_rpm: 1,
+            ..RateLimitConfig::default()
         },
     )
     .await;

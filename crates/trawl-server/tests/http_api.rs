@@ -299,10 +299,8 @@ async fn rate_limit_returns_429(pool: sqlx::PgPool) {
     let server = setup_with_rate_limit(
         pool,
         RateLimitConfig {
-            admin: 0,
-            analyst: 2, // burst of 2
-            reader: 0,
-            ingest: 0,
+            default_rpm: 2, // burst of 2
+            ..RateLimitConfig::default()
         },
     )
     .await;
@@ -321,6 +319,159 @@ async fn rate_limit_returns_429(pool: sqlx::PgPool) {
             assert_eq!(status, 429, "expected 429 Too Many Requests");
         }
         other => panic!("expected 429 rate limit error, got: {other:?}"),
+    }
+}
+
+/// The interactive ceiling (`default_rpm`) must never apply to `/ingest`, and
+/// the shipper-sized `ingest_rpm` must never apply to the query routes — the
+/// two route classes hold separate bucket maps. Without the split, one number
+/// has to serve both, and sizing it for vector hands every interactive key the
+/// same budget (the loosening this test exists to catch).
+#[sqlx::test(migrations = false)]
+async fn ingest_rpm_is_independent_of_the_interactive_ceiling(pool: sqlx::PgPool) {
+    let server = setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            default_rpm: 1,
+            ingest_rpm: 10,
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
+    let raw = raw_client();
+
+    // Well past the interactive burst of 1 — the ingest key rides its own
+    // bucket, so every one of these is a 200.
+    for i in 0..5 {
+        let resp = raw
+            .post(format!("{}/api/v1/ingest", server.url))
+            .header("authorization", format!("Bearer {}", server.ingest_token))
+            .header("content-type", "application/x-ndjson")
+            .body(format!(r#"{{"service":"test-svc","message":"batch {i}"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "ingest request {i} must not be limited");
+    }
+
+    // The query routes still enforce default_rpm = 1: second call is 429.
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    client.query_paginated("*", None, None).await.unwrap();
+    let result = client.query_paginated("*", None, None).await;
+    match result.unwrap_err() {
+        trawl_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 429, "interactive routes keep the default_rpm burst");
+        }
+        other => panic!("expected 429 rate limit error, got: {other:?}"),
+    }
+}
+
+/// AC1 (ADR-0006 slice 0): two keys holding the SAME role get independent
+/// buckets — the limiter keys on the keystore id, not on any shared role
+/// bucket. Exhausting key A's quota 429s A while key B still gets 200.
+/// (Role here is test-side policy vocabulary only; the limiter never sees it.)
+#[sqlx::test(migrations = false)]
+async fn rate_limit_isolates_keys_with_same_role(pool: sqlx::PgPool) {
+    let server = setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            default_rpm: 2, // burst of 2 per key
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
+
+    // Two analyst keys with distinct keystore ids.
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let key_a = store
+        .create_key(
+            "noisy",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .await
+        .unwrap();
+    let key_b = store
+        .create_key(
+            "quiet",
+            PrincipalKind::Service,
+            &trawl_only(Role::Analyst),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        key_a.info.id, key_b.info.id,
+        "keys must have distinct keystore ids"
+    );
+
+    let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
+    let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
+
+    // Exhaust A's burst, then confirm A is limited.
+    a.query_paginated("*", None, None).await.unwrap();
+    a.query_paginated("*", None, None).await.unwrap();
+    let err = a.query_paginated("*", None, None).await.unwrap_err();
+    match err {
+        trawl_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 429, "key A must be rate limited");
+        }
+        other => panic!("expected 429 for exhausted key A, got: {other:?}"),
+    }
+
+    // B holds the same role but its own bucket — still 200.
+    b.query_paginated("*", None, None)
+        .await
+        .expect("key B must not be limited by key A's exhaustion");
+}
+
+/// The shipper-sized `ingest_rpm` is earned by `Permission::Ingest`, not by
+/// reaching `/api/v1/ingest`. The handler's permission check runs downstream of
+/// the limiter (axum resolves `body: Bytes` first), so an ungated ingest bucket
+/// would widen every reader/analyst key's throughput on the heaviest endpoint
+/// to the shipper ceiling. A reader must stay on `default_rpm`.
+#[sqlx::test(migrations = false)]
+async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission(pool: sqlx::PgPool) {
+    let server = setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            default_rpm: 1,
+            ingest_rpm: 10,
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
+    let raw = raw_client();
+
+    let post_ingest = async |token: &str| {
+        raw.post(format!("{}/api/v1/ingest", server.url))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/x-ndjson")
+            .body(r#"{"service":"test-svc","message":"probe"}"#)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+
+    // Reader burst is default_rpm (1): rejected on permission first, then on
+    // rate — never the ingest_rpm allowance of 10.
+    assert_eq!(post_ingest(&server.reader_token).await, 401);
+    assert_eq!(
+        post_ingest(&server.reader_token).await,
+        429,
+        "a reader key must ride the interactive bucket on /ingest, not ingest_rpm"
+    );
+
+    // The gate is on the permission, not on the route: a real shipper key
+    // still gets its full ingest_rpm burst.
+    for i in 0..10 {
+        assert_eq!(
+            post_ingest(&server.ingest_token).await,
+            200,
+            "ingest request {i} must not be limited"
+        );
     }
 }
 
@@ -407,10 +558,8 @@ async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
     // Permissive rate limits: the observe/cancel polls below run in a tight
     // window and must not trip the per-minute buckets.
     let permissive = RateLimitConfig {
-        admin: 1_000_000,
-        analyst: 1_000_000,
-        reader: 1_000_000,
-        ingest: 1_000_000,
+        default_rpm: 1_000_000,
+        ..RateLimitConfig::default()
     };
     let server = setup_with_rate_limit(pool, permissive).await;
 

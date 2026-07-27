@@ -63,14 +63,18 @@ HTTPS listener, query limits, TLS, and rate limiting.
 
 #### `[server.rate_limit]`
 
-Per-role rate limiting in requests per minute. Set to `0` to disable for a role.
+Per-key rate limiting in requests per minute. Every API key gets an independent token bucket, sized per route class: `default_rpm` on the interactive API routes, `ingest_rpm` on `/api/v1/ingest`. Set a field to `0` to disable rate limiting for that route class.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `admin` | integer | `100` | Admin role rate limit |
-| `analyst` | integer | `60` | Analyst role rate limit |
-| `reader` | integer | `30` | Reader role rate limit |
-| `ingest` | integer | `1000` | Ingest role rate limit |
+| `default_rpm` | integer | `100` | Requests/minute allowed per API key on the interactive API routes; `0` disables |
+| `ingest_rpm` | integer | `1000` | Requests/minute allowed per ingest-permitted API key on `/api/v1/ingest`; `0` disables |
+
+The shipper-sized ceiling is earned by the `ingest` permission, not by the route: a key without it (reader, analyst, admin) stays on its `default_rpm` bucket when it posts to `/api/v1/ingest`, on top of being rejected with 401.
+
+The two classes need ceilings orders of magnitude apart: vector flushes a batch per 1 MB / 5 s per source and sources commonly share one ingest key, while `/query`, `/export`, and `/stream` each run a DuckDB scan. Raise `ingest_rpm` for large shipper fleets; raise `default_rpm` for dashboard-heavy UI use.
+
+**Migration note**: the per-role keys (`admin`, `analyst`, `reader`, `ingest`) were removed in ADR-0006 slice 0 — a config still carrying them fails validation at boot rather than being silently ignored. Replace `ingest` with `ingest_rpm`, and the interactive roles with `default_rpm`. Per-role class-of-service returns in slice 1 as a `rate_rpm` role attribute.
 
 #### TLS auto-generation
 
@@ -213,10 +217,8 @@ tls_cert_path = "/etc/trawl/tls/cert.pem"
 tls_key_path = "/etc/trawl/tls/key.pem"
 
 [server.rate_limit]
-admin = 100
-analyst = 60
-reader = 30
-ingest = 1000
+default_rpm = 100
+ingest_rpm = 1000
 
 [data]
 path = "/var/lib/trawl/data"

@@ -68,13 +68,16 @@
 # visible via GET /queries (admin only).
 # max_query_history = 1000
 
-# Per-role rate limits (requests per minute). Set to 0 to disable
-# rate limiting for a given role.
+# Per-key rate limit (requests per minute). Every API key gets an
+# independent token bucket: default_rpm on the interactive API routes,
+# ingest_rpm on /api/v1/ingest (shippers need a far higher ceiling than
+# humans running queries); 0 disables that route class. ingest_rpm is
+# earned by the ingest permission — every other key stays on default_rpm
+# there too.
+# Per-role ceilings return as a role rate_rpm attribute (ADR-0006 slice 1).
 # [server.rate_limit]
-# admin = 100
-# analyst = 60
-# reader = 30
-# ingest = 1000
+# default_rpm = 100
+# ingest_rpm = 1000
 
 [data]
 # Directory containing parquet files. Also accepts a glob pattern

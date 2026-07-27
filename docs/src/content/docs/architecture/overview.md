@@ -46,7 +46,7 @@ Outermost to innermost:
 6. `TraceLayer` — structured logging
 7. `RequestBodyLimitLayer` — body size limits
 8. Auth — token validation
-9. Rate limiting — per-role limits
+9. Rate limiting — per-key limits
 10. Handler
 
 ### Authentication
