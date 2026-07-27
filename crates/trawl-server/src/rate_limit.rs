@@ -16,7 +16,9 @@
 //! its own bucket map wired by the router. A log shipper needs orders of
 //! magnitude more requests/minute than a human running `DuckDB` scans, so one
 //! shared number would have to be sized for the shipper — handing every
-//! interactive key that budget.
+//! interactive key that budget. The split, and how slice 1's `rate_rpm` role
+//! attribute takes precedence over these class defaults, are recorded in
+//! ADR-0006's "Slice 0 design decisions".
 //!
 //! The ingest ceiling is additionally gated on [`Permission::Ingest`]: the
 //! handler's permission check runs downstream of this middleware (axum resolves
