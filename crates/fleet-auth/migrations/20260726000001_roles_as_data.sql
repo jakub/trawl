@@ -73,6 +73,31 @@ CREATE TABLE app_permissions (
 -- through the deploy).
 -- ---------------------------------------------------------------------------
 
+-- Pre-flight: v1 allowed far looser role strings than `roles_name_format`
+-- (any 1..=128 bytes without control chars, any case), and even a legal
+-- lowercase role can overflow 64 bytes once `<app>-` is prepended. Name
+-- the offending grants instead of aborting on an opaque CHECK violation —
+-- the operator fixes them in `api_key_role_assignment` (still present at
+-- this point) and re-runs the migration.
+DO $$
+DECLARE
+    offenders TEXT;
+BEGIN
+    SELECT string_agg(format('(app=%L, role=%L)', app, role), ', ' ORDER BY app, role)
+    INTO offenders
+    FROM (SELECT DISTINCT app, role FROM api_key_role_assignment) g
+    WHERE (g.app || '-' || g.role) !~ '^[a-z0-9_-]{1,64}$';
+
+    IF offenders IS NOT NULL THEN
+        RAISE EXCEPTION
+            'roles-as-data conversion: legacy grants whose <app>-<role> name is not a valid role name: %',
+            offenders
+            USING ERRCODE = 'check_violation',
+                  HINT = 'A converted role name must match ^[a-z0-9_-]{1,64}$ (note the <app>- prefix counts toward the 64 bytes). Rename these roles in api_key_role_assignment (UPDATE api_key_role_assignment SET role = ''<new>'' WHERE app = ''<app>'' AND role = ''<old>'') and re-run the migration.';
+    END IF;
+END
+$$;
+
 -- One role per distinct legacy (app, role) pair, named `<app>-<role>`.
 INSERT INTO roles (name)
 SELECT DISTINCT app || '-' || role

@@ -71,6 +71,18 @@ keys. Schedules must be recreated (see below).
    fleet-admin migrate
    ```
 
+   The roles-as-data migration converts each legacy grant into a role named
+   `<app>-<role>`, and v2 role names must match `^[a-z0-9_-]{1,64}$` (the
+   `<app>-` prefix counts toward the 64 bytes). The v1 schema was looser, so
+   a deployment carrying uppercase, spaced, or very long legacy roles aborts
+   the migration — transactionally, nothing is applied — with the offending
+   grants named. Rename them in the still-present legacy table and re-run:
+
+   ```sql
+   UPDATE api_key_role_assignment SET role = 'analyst'
+   WHERE app = 'trawl' AND role = 'ANALYST';
+   ```
+
 2. **Re-mint keys** for every principal — admin, human CLI users, and one
    service key per vector fleet. Since ADR-0006 slice 1, minting is
    role-based: roles are data-defined permission bundles created with

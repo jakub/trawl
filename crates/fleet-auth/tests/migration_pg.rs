@@ -269,6 +269,41 @@ async fn ac1_conversion_preserves_every_legacy_grant(pool: PgPool) {
     );
 }
 
+/// Legacy grants v1 allowed but v2 role names forbid must fail the
+/// pre-flight with the offending pairs named — not with an opaque
+/// `roles_name_format` CHECK violation.
+#[sqlx::test(migrations = false)]
+async fn conversion_names_legacy_grants_it_cannot_convert(pool: PgPool) {
+    sqlx::raw_sql(BASE_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect("base migration");
+
+    // Uppercase (v1 only banned control chars) and a lowercase role that
+    // only overflows 64 bytes once `trawl-` is prepended.
+    let long_role = "r".repeat(60);
+    seed_legacy_key(&pool, "legacy-upper", &[("trawl", "Admin")]).await;
+    seed_legacy_key(&pool, "legacy-long", &[("trawl", &long_role)]).await;
+
+    let err = sqlx::raw_sql(ROLES_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect_err("migration must refuse unconvertible legacy grants");
+    let msg = err.to_string();
+    assert!(msg.contains("Admin"), "offending role not named: {msg}");
+    assert!(msg.contains(&long_role), "overlong role not named: {msg}");
+
+    // Aborting the migration must leave the legacy table intact so the
+    // operator can rename and re-run.
+    let legacy_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE tablename = 'api_key_role_assignment')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(legacy_exists, "failed migration must roll back cleanly");
+}
+
 #[sqlx::test(migrations = false)]
 async fn conversion_dedupes_shared_roles_across_keys(pool: PgPool) {
     sqlx::raw_sql(BASE_MIGRATION)
