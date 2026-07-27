@@ -96,7 +96,11 @@ docker exec fleet-auth-dev createdb -U fleet fleet   # keystore
 docker exec fleet-auth-dev createdb -U fleet trawl   # app state (trawld migrates it at boot)
 export DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet
 cargo run -p fleet-admin -- migrate
-cargo run -p fleet-admin -- keys create --name dev --kind human --grant trawl:admin
+cargo run -p fleet-admin -- roles create --name trawl-admin \
+  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+  --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
+  --perm trawl:query_cancel --perm trawl:server_manage
+cargo run -p fleet-admin -- keys create --name dev --kind human --role trawl-admin
 # token prints to stdout — keep it for the CLI config below
 ```
 

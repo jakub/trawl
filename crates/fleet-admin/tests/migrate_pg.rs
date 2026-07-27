@@ -47,12 +47,20 @@ async fn migrator_creates_expected_tables(pool: sqlx::PgPool) {
     .map(|r| r.try_get::<String, _>("table_name").unwrap())
     .collect();
 
+    for expected in [
+        "api_keys",
+        "roles",
+        "role_permissions",
+        "key_roles",
+        "app_permissions",
+    ] {
+        assert!(
+            tables.iter().any(|t| t == expected),
+            "missing {expected}; tables: {tables:?}"
+        );
+    }
     assert!(
-        tables.iter().any(|t| t == "api_keys"),
-        "missing api_keys; tables: {tables:?}"
-    );
-    assert!(
-        tables.iter().any(|t| t == "api_key_role_assignment"),
-        "missing api_key_role_assignment; tables: {tables:?}"
+        !tables.iter().any(|t| t == "api_key_role_assignment"),
+        "legacy api_key_role_assignment must be dropped by the roles-as-data migration; tables: {tables:?}"
     );
 }

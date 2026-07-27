@@ -100,21 +100,22 @@ impl std::fmt::Debug for SessionState {
     }
 }
 
-/// Axum middleware: require a valid session cookie + namespace grant.
+/// Axum middleware: require a valid session cookie + at least one
+/// permission in the app namespace.
 ///
 /// Flow: parse Cookie header → find `config.cookie_name` → decrypt → check
-/// expiry → `KeyStore::verify_key` → confirm the key has a role in
-/// `config.app_namespace` → insert [`VerifiedKey`] into request extensions
-/// → call inner.
+/// expiry → `KeyStore::verify_key` → confirm the key resolves ≥1 permission
+/// in `config.app_namespace` → insert [`VerifiedKey`] into request
+/// extensions → call inner.
 ///
 /// Failure mapping:
 /// - Missing/malformed/decrypt-fail/expired cookie → 401 (no cookie cleared
 ///   — clearing the shared `fleet_session` cookie from one app's error
 ///   handler logs the user out of every sibling app).
 /// - `verify_key` failure (revoked, retyped, expired-at-DB) → 401.
-/// - Valid session but no grant for `config.app_namespace` → branded 403
-///   HTML page, cookie left intact so the user can navigate back to a
-///   sibling app where they DO have a grant.
+/// - Valid session but zero permissions in `config.app_namespace` → branded
+///   403 HTML page, cookie left intact so the user can navigate back to a
+///   sibling app where they DO have access.
 pub async fn require_session(
     State(state): State<SessionState>,
     mut req: Request,
@@ -152,11 +153,11 @@ pub async fn require_session(
         Err(err) => return classify_verify_error(err, "session"),
     };
 
-    if verified.role_for(state.config.app_namespace()).is_none() {
+    if !verified.has_any_permission(state.config.app_namespace()) {
         tracing::info!(
             app = state.config.app_namespace(),
             name = %verified.name,
-            "auth: session valid but no grant in app namespace (403 no-grant)"
+            "auth: session valid but no permission in app namespace (403 no-grant)"
         );
         return no_grant_response(&verified.name, state.config.app_namespace());
     }
@@ -404,7 +405,7 @@ pub(crate) fn no_grant_response(name: &str, app: &str) -> Response {
          <title>403 Forbidden</title></head>\
          <body>\n\
          <h1>403 Forbidden</h1>\n\
-         <p>You are authenticated as <strong>{name}</strong> but have no role assigned in <strong>{app}</strong>.</p>\n\
+         <p>You are authenticated as <strong>{name}</strong> but have no access in <strong>{app}</strong>.</p>\n\
          <p>Contact your operator to request access.</p>\n\
          </body></html>\n",
         name = html_escape(name),

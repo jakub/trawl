@@ -4,4 +4,5 @@
 
 pub mod keys;
 pub mod migrate;
+pub mod roles;
 pub mod session_key;

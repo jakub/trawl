@@ -45,7 +45,15 @@ In a separate terminal, create a key for yourself:
 ```bash
 # key management lives in fleet-admin (requires DATABASE_URL pointing at
 # the fleet postgres keystore — see the configuration reference)
-fleet-admin keys create --name "my-key" --kind human --grant trawl:admin
+
+# roles are data-defined bundles of permissions (ADR-0006); create the
+# admin tier once per fleet database
+fleet-admin roles create --name trawl-admin \
+  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+  --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
+  --perm trawl:query_cancel --perm trawl:server_manage
+
+fleet-admin keys create --name "my-key" --kind human --role trawl-admin
 ```
 
 This prints the token once:
@@ -53,7 +61,7 @@ This prints the token once:
 ```
 created API key:
   name:    my-key
-  role:    admin
+  roles:   trawl-admin
   prefix:  flt_abc1
   token:   flt_abc1234567890abcdefghijklmnopqrstuvwxyz0123456
 

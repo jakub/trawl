@@ -8,7 +8,7 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 - **ingestion**: vector → parquet (columnar, compressed, partitioned by hour)
 - **query engine**: custom DSL → AST → DuckDB SQL (parameterized)
 - **web ui**: leptos 0.8 CSR SPA (`trawl-web-ui`) served by the `trawl-web` session proxy (cookie sessions → bearer tokens)
-- **shared fleet substrate** (ADR-0030, consumed by coastwatch via sibling path deps): `fleet-auth` (postgres keystore + session AEAD — its `session` feature also backs trawl-web's `fleet_session` SSO cookie in-repo), `fleet-ui` (leptos design system), `fleet-admin` (ops CLI)
+- **shared fleet substrate** (ADR-0030, consumed by coastwatch via sibling path deps): `fleet-auth` (postgres keystore + roles-as-data RBAC + session AEAD — its `session` feature also backs trawl-web's `fleet_session` SSO cookie in-repo), `fleet-ui` (leptos design system), `fleet-admin` (ops CLI)
 - **agent** (v2 scope): signed-template execution on managed endpoints, mTLS, ed25519 signing — not yet started
 
 ## workspace layout
@@ -19,7 +19,7 @@ crates/
   trawl-engine/          # DuckDB integration, query execution
   trawl-api/             # shared wire types (request/response structs)
   trawl-config/          # shared config.toml types (no I/O)
-  trawl-server/          # daemon (axum, HTTPS via tokio-rustls); owns the postgres app-state store (history/saved/schedule + report runs) in its own `trawl` database — sole-writer via session advisory lock, auto-migrated at boot (src/store/, ADR-0004 slice 3; trawl-auth crate deleted)
+  trawl-server/          # daemon (axum, HTTPS via tokio-rustls); owns the postgres app-state store (history/saved/schedule + report runs) in its own `trawl` database — sole-writer via session advisory lock, auto-migrated at boot (src/store/, ADR-0004 slice 3; trawl-auth crate deleted). authz is permission-only (src/policy.rs — no `Role` enum, ADR-0006 slice 1)
   trawl-client/          # typed async HTTP client library
   trawl-cli/             # unified CLI + TUI binary
   trawl-admin/           # admin CLI (TLS cert generation only — key mgmt lives in fleet-admin)
@@ -27,9 +27,9 @@ crates/
   trawl-web-ui/          # leptos 0.8 CSR SPA (wasm32)
   trawl-dashboard/       # shared ratatui dashboard rendering
   trawl-crashdump/       # minidump capture for trawld (linux fatal-signal handler)
-  fleet-auth/            # postgres-backed keystore + session cookie AEAD + present-only origin validation + axum middleware (ADR-0030); session feature = pure primitives (no pg), consumed by trawl-web
+  fleet-auth/            # postgres-backed keystore + roles-as-data RBAC (roles/role_permissions/key_roles/app_permissions tables; `verify_key` resolves key→roles→permissions, ADR-0006) + session cookie AEAD + present-only origin validation + axum middleware (ADR-0030); session feature = pure primitives (no pg), consumed by trawl-web
   fleet-ui/              # shared leptos design tokens + components for fleet apps (wasm32)
-  fleet-admin/           # fleet keystore ops CLI (migrations, session keys, key lifecycle)
+  fleet-admin/           # fleet keystore ops CLI (migrations, session keys, key lifecycle, `roles` subcommands + `keys assign-role`/`unassign-role`)
   coastwatch-api-types/  # vendored coastwatch API wire types
 ```
 
@@ -39,6 +39,8 @@ crates/
 - pipeline-oriented DSL: `service=nginx level=error last=2h | stats count() by host | where count > 10`
 - SQL injection prevention via parameterized queries + field allowlists
 - agent tasks are cryptographically signed offline — compromised server can't create novel execution authority
+- **roles are data, permissions are code** (ADR-0006): a role is a named, cross-app bundle of `app:permission` strings living in the fleet keystore; a key holds any number of roles and its effective permissions are the union. handlers gate on compile-time `Permission` variants only — new role = `fleet-admin roles create`, new permission = deploy. unrecognized permission strings are ignored (fail closed), and a key resolving zero recognized trawl permissions 403s. there is no `Role` enum and no `(app, role)` grant anywhere: `/whoami` carries `roles` (names, display/audit only) + `permissions` (gating), and role names never reach `/metrics` labels since it sits outside the auth stack
+- **per-key rate limiting**: one token bucket per key id per route class (`default_rpm` for interactive routes, `ingest_rpm` for `/api/v1/ingest`, the latter earned by the `ingest` permission). a role's optional `rate_rpm` overrides — never combines with — the class default; effective ceiling = max `rate_rpm` across the key's roles when any role sets it
 - **real-time event bus**: ingested events are published to a `broadcast::channel`-backed bus and stored in a hot buffer, making them queryable within milliseconds of ingest (before WAL compaction to parquet)
 - **hot buffer**: batch-keyed in-memory store that makes fresh events visible to ALL queries via `UNION ALL BY NAME` with the parquet source; drained automatically after compaction
 - **live streaming**: SSE endpoint uses `CompiledFilter` (in-memory DSL matcher) against the event bus for real-time event delivery, with back-pressure notifications via `StreamEvent::Lagged`
@@ -186,7 +188,7 @@ the trawl server exposes a REST API. all routes under `/api/v1` except `/health`
 | `DELETE` | `/api/v1/queries/{id}` | cancel a running query |
 | `GET` | `/api/v1/stats` | server statistics |
 | `GET` | `/api/v1/dashboard` | full dashboard snapshot (admin only) |
-| `GET` | `/api/v1/whoami` | token identity and permissions |
+| `GET` | `/api/v1/whoami` | token identity, role names, and resolved trawl permissions |
 | `GET` | `/api/v1/history` | query execution history |
 | `GET` | `/api/v1/saved` | list saved queries |
 | `POST` | `/api/v1/saved` | create a saved query |

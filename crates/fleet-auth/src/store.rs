@@ -2,12 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Postgres-backed API key store.
+//! Postgres-backed API key store with data-defined roles (ADR-0006).
 //!
 //! [`KeyStore`] is the runtime entry point: construct with [`from_pool`], call
-//! [`verify_key`] on the request path, call the admin operations
-//! (`create_key`, `revoke_key`, `list_keys`, grant management, retype) from
-//! whatever CLI / API surface owns the lifecycle.
+//! [`verify_key`] on the request path, call the admin operations (key
+//! lifecycle, role CRUD, role assignment) from whatever CLI / API surface
+//! owns the lifecycle.
 //!
 //! Construction does NOT run migrations — apply them via [`crate::MIGRATOR`]
 //! from the operational tool that owns deploys (e.g. `fleet-admin migrate`).
@@ -24,10 +24,8 @@ use sqlx::postgres::{PgPool, PgRow};
 use crate::cache::{VerificationCache, VerificationCacheKey, VerificationCacheStats};
 use crate::error::AuthError;
 use crate::token;
-use crate::types::{
-    ApiKeyInfo, CreatedKey, PrincipalKind, RoleAssignment, VerifiedKey, format_assignments,
-};
-use crate::validation::{validate_app_namespace, validate_assignment};
+use crate::types::{ApiKeyInfo, CreatedKey, PrincipalKind, Role, RolePermission, VerifiedKey};
+use crate::validation::{validate_app_namespace, validate_permission, validate_role_name};
 
 /// Run argon2id hashing on the tokio blocking pool.
 ///
@@ -116,41 +114,52 @@ impl KeyStore {
         Ok(())
     }
 
-    /// Create a new API key.
+    // -- key lifecycle --------------------------------------------------------
+
+    /// Create a new API key holding the named roles.
     ///
     /// Returns the metadata AND the plaintext token — the latter must be
     /// shown to the user immediately, it cannot be recovered later. Retries
     /// on prefix collision (UNIQUE constraint), though collisions are
     /// astronomically unlikely with a 48-bit prefix space.
     ///
-    /// `assignments` may be empty (the key authorizes nothing until grants
-    /// are added). Each grant is validated for shape; the entire batch is
-    /// rejected on duplicate apps so a partial set is never persisted.
+    /// `role_names` may be empty (the key authenticates but authorizes
+    /// nothing until roles are assigned). Every named role must pre-exist —
+    /// unknown names error with [`AuthError::RoleNotFound`] rather than
+    /// silently minting a capability-less key. Duplicate names in the batch
+    /// error with [`AuthError::RoleAlreadyAssigned`].
     pub async fn create_key(
         &self,
         name: &str,
         kind: PrincipalKind,
-        assignments: &[RoleAssignment],
+        role_names: &[String],
         expires_in: Option<Duration>,
     ) -> Result<CreatedKey, AuthError> {
         /// Retry attempts for prefix collision (UNIQUE violation).
         const MAX_RETRIES: usize = 3;
 
-        for a in assignments {
-            validate_assignment(a)?;
+        for role in role_names {
+            validate_role_name(role)?;
         }
 
-        // Reject duplicate apps explicitly so the error names the duplicate
-        // instead of relying on the UNIQUE(key_id, app) constraint inside
-        // the transaction.
+        // Reject duplicate role names explicitly so the error names the
+        // duplicate instead of relying on the key_roles PK inside the
+        // transaction.
         let mut seen = std::collections::HashSet::new();
-        for a in assignments {
-            if !seen.insert(&a.app) {
-                return Err(AuthError::GrantExists {
+        for role in role_names {
+            if !seen.insert(role) {
+                return Err(AuthError::RoleAlreadyAssigned {
                     prefix: "(new key)".to_owned(),
-                    app: a.app.clone(),
+                    role: role.clone(),
                 });
             }
+        }
+
+        // Resolve every role name up front — RoleNotFound must name the
+        // missing role before any row is written.
+        let mut role_ids = Vec::with_capacity(role_names.len());
+        for role in role_names {
+            role_ids.push(self.get_role_id(role).await?);
         }
 
         // Set both timestamps client-side so they share the same wall-clock
@@ -201,19 +210,18 @@ impl KeyStore {
 
             let id: i64 = row.try_get("id")?;
 
-            for a in assignments {
-                sqlx::query(
-                    "INSERT INTO api_key_role_assignment (key_id, app, role)
-                     VALUES ($1, $2, $3)",
-                )
-                .bind(id)
-                .bind(&a.app)
-                .bind(&a.role)
-                .execute(&mut *tx)
-                .await?;
+            for role_id in &role_ids {
+                sqlx::query("INSERT INTO key_roles (key_id, role_id) VALUES ($1, $2)")
+                    .bind(id)
+                    .bind(role_id)
+                    .execute(&mut *tx)
+                    .await?;
             }
 
             tx.commit().await?;
+
+            let mut sorted_roles = role_names.to_vec();
+            sorted_roles.sort_unstable();
 
             tracing::info!(
                 event_type = "key_created",
@@ -221,7 +229,7 @@ impl KeyStore {
                 prefix = %generated.prefix,
                 name,
                 kind = %kind,
-                assignments = %format_assignments(assignments),
+                roles = %sorted_roles.join(","),
                 "API key created"
             );
 
@@ -231,7 +239,7 @@ impl KeyStore {
                     prefix: generated.prefix.clone(),
                     name: name.to_owned(),
                     kind,
-                    assignments: assignments.to_vec(),
+                    roles: sorted_roles,
                     active: true,
                     created_at,
                     expires_at,
@@ -308,9 +316,9 @@ impl KeyStore {
         }
 
         // The UPDATE both rechecks liveness and locks the api_keys row until
-        // commit. Grant/revoke operations lock the same row before mutating
-        // assignments, so the assignment SELECT below observes a grant set
-        // that cannot change underneath this in-flight verify.
+        // commit. Role assign/unassign operations lock the same row before
+        // mutating key_roles, so the role resolution below observes a role
+        // set that cannot change underneath this in-flight verify (#11).
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE api_keys
@@ -328,8 +336,9 @@ impl KeyStore {
             return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
-        // Load assignments fresh from the DB — never cache them.
-        let assignments = Self::load_assignments_in_tx(&mut tx, id).await?;
+        // Resolve key → roles → permissions fresh from the DB, in one
+        // snapshot inside the row-lock transaction — never cached.
+        let roles = Self::load_key_roles(&mut *tx, id).await?;
         tx.commit().await?;
 
         let kind: PrincipalKind = kind_str.parse()?;
@@ -338,22 +347,16 @@ impl KeyStore {
         // (prefix, hash, fingerprint) triples that lost a race.
         self.cache.insert(cache_key);
 
-        Ok(VerifiedKey {
-            id,
-            prefix: db_prefix,
-            name,
-            kind,
-            assignments,
-        })
+        Ok(VerifiedKey::from_roles(id, db_prefix, name, kind, roles))
     }
 
     /// Look up a key by database id and return it only if it is *live*:
-    /// active (not revoked) AND unexpired. Assignments are loaded fresh from
-    /// the database on every call — never cached.
+    /// active (not revoked) AND unexpired. Roles + permissions are resolved
+    /// fresh from the database on every call — never cached.
     ///
     /// This is the substrate hook for consumers that gate background work on
     /// key liveness (e.g. trawl's scheduler skipping runs whose owning key
-    /// was revoked, expired, or stripped of its app grant — ADR-0004).
+    /// was revoked, expired, or stripped of its app capability — ADR-0004).
     /// Returns `Ok(None)` for unknown ids, revoked keys, and expired keys;
     /// callers cannot distinguish those cases (they all mean "don't run").
     ///
@@ -379,61 +382,56 @@ impl KeyStore {
 
         let kind_str: String = row.try_get("kind")?;
         let kind: PrincipalKind = kind_str.parse()?;
-        let assignments = self.load_assignments(id).await?;
+        let roles = Self::load_key_roles(&self.pool, id).await?;
 
-        Ok(Some(VerifiedKey {
+        Ok(Some(VerifiedKey::from_roles(
             id,
-            prefix: row.try_get("prefix")?,
-            name: row.try_get("name")?,
+            row.try_get::<String, _>("prefix")?,
+            row.try_get::<String, _>("name")?,
             kind,
-            assignments,
-        }))
+            roles,
+        )))
     }
 
-    /// Load all `(app, role)` grants for a key, ordered by app.
-    async fn load_assignments(&self, key_id: i64) -> Result<Vec<RoleAssignment>, AuthError> {
+    /// Load a key's roles WITH their permission bundles in one snapshot.
+    ///
+    /// A single `key_roles JOIN roles LEFT JOIN role_permissions` statement
+    /// so the resolution is one consistent read (one statement, one
+    /// snapshot under READ COMMITTED). Runs against either the pool or an
+    /// open transaction (`verify_key` passes its row-lock transaction).
+    async fn load_key_roles<'e, E>(executor: E, key_id: i64) -> Result<Vec<Role>, AuthError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
         let rows = sqlx::query(
-            "SELECT app, role
-             FROM api_key_role_assignment
-             WHERE key_id = $1
-             ORDER BY app",
+            "SELECT r.id AS role_id, r.name, r.rate_rpm, rp.app, rp.permission
+             FROM key_roles kr
+             JOIN roles r ON r.id = kr.role_id
+             LEFT JOIN role_permissions rp ON rp.role_id = r.id
+             WHERE kr.key_id = $1
+             ORDER BY r.name, rp.app, rp.permission",
+        )
+        .bind(key_id)
+        .fetch_all(executor)
+        .await?;
+
+        rows_to_roles(rows)
+    }
+
+    /// Load just the sorted role NAMES for a key (admin list/detail views).
+    async fn load_key_role_names(&self, key_id: i64) -> Result<Vec<String>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT r.name
+             FROM key_roles kr
+             JOIN roles r ON r.id = kr.role_id
+             WHERE kr.key_id = $1
+             ORDER BY r.name",
         )
         .bind(key_id)
         .fetch_all(&self.pool)
         .await?;
-
         rows.into_iter()
-            .map(|row| {
-                Ok(RoleAssignment {
-                    app: row.try_get("app")?,
-                    role: row.try_get("role")?,
-                })
-            })
-            .collect()
-    }
-
-    /// Load all `(app, role)` grants within an existing transaction.
-    async fn load_assignments_in_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        key_id: i64,
-    ) -> Result<Vec<RoleAssignment>, AuthError> {
-        let rows = sqlx::query(
-            "SELECT app, role
-             FROM api_key_role_assignment
-             WHERE key_id = $1
-             ORDER BY app",
-        )
-        .bind(key_id)
-        .fetch_all(&mut **tx)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok(RoleAssignment {
-                    app: row.try_get("app")?,
-                    role: row.try_get("role")?,
-                })
-            })
+            .map(|row| Ok(row.try_get("name")?))
             .collect()
     }
 
@@ -453,13 +451,13 @@ impl KeyStore {
         let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
         let mut keys: Vec<ApiKeyInfo> = rows
             .iter()
-            .map(row_to_api_key_info_no_assignments)
+            .map(row_to_api_key_info_no_roles)
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Eager-load assignments. N+1 is fine for admin list views at fleet
+        // Eager-load role names. N+1 is fine for admin list views at fleet
         // scale; a JOIN + group_concat is messier and we don't need streaming.
         for key in &mut keys {
-            key.assignments = self.load_assignments(key.id).await?;
+            key.roles = self.load_key_role_names(key.id).await?;
         }
 
         Ok(keys)
@@ -482,8 +480,8 @@ impl KeyStore {
             });
         };
 
-        let mut info = row_to_api_key_info_no_assignments(&row)?;
-        info.assignments = self.load_assignments(info.id).await?;
+        let mut info = row_to_api_key_info_no_roles(&row)?;
+        info.roles = self.load_key_role_names(info.id).await?;
         Ok(info)
     }
 
@@ -510,93 +508,6 @@ impl KeyStore {
         self.get_key_by_prefix(prefix).await
     }
 
-    /// Grant a `(app, role)` to an existing key.
-    ///
-    /// Errors with [`AuthError::GrantExists`] if the key already has a grant
-    /// for this app — explicit revoke-first prevents accidental privilege
-    /// inflation via silent overwrite.
-    pub async fn grant_assignment(
-        &self,
-        prefix: &str,
-        assignment: &RoleAssignment,
-    ) -> Result<(), AuthError> {
-        validate_assignment(assignment)?;
-        let mut tx = self.pool.begin().await?;
-        let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
-
-        let result = sqlx::query(
-            "INSERT INTO api_key_role_assignment (key_id, app, role)
-             VALUES ($1, $2, $3)",
-        )
-        .bind(key_id)
-        .bind(&assignment.app)
-        .bind(&assignment.role)
-        .execute(&mut *tx)
-        .await;
-
-        match result {
-            Ok(_) => {
-                tx.commit().await?;
-                tracing::info!(
-                    event_type = "grant_added",
-                    prefix,
-                    app = %assignment.app,
-                    role = %assignment.role,
-                    "grant added to key"
-                );
-                Ok(())
-            }
-            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
-                Err(AuthError::GrantExists {
-                    prefix: prefix.to_owned(),
-                    app: assignment.app.clone(),
-                })
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Revoke a key's grant on an app.
-    ///
-    /// Errors with [`AuthError::GrantNotFound`] if no grant exists —
-    /// silently succeeding would mask typos.
-    pub async fn revoke_assignment(&self, prefix: &str, app: &str) -> Result<(), AuthError> {
-        validate_app_namespace(app)?;
-        let mut tx = self.pool.begin().await?;
-        let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
-
-        let removed =
-            sqlx::query("DELETE FROM api_key_role_assignment WHERE key_id = $1 AND app = $2")
-                .bind(key_id)
-                .bind(app)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-
-        if removed == 0 {
-            return Err(AuthError::GrantNotFound {
-                prefix: prefix.to_owned(),
-                app: app.to_owned(),
-            });
-        }
-
-        tx.commit().await?;
-
-        tracing::info!(
-            event_type = "grant_revoked",
-            prefix,
-            app,
-            "grant removed from key"
-        );
-        Ok(())
-    }
-
-    /// List all grants for a key.
-    pub async fn list_assignments(&self, prefix: &str) -> Result<Vec<RoleAssignment>, AuthError> {
-        let key_id = self.get_key_id_by_prefix(prefix).await?;
-        self.load_assignments(key_id).await
-    }
-
     /// Change the kind (human/service) of a non-revoked key.
     ///
     /// Refuses to retype revoked keys — retyping a dead key is likely a typo.
@@ -621,6 +532,363 @@ impl KeyStore {
         self.get_key_by_prefix(prefix).await
     }
 
+    // -- role assignment ------------------------------------------------------
+
+    /// Assign a role to an existing key.
+    ///
+    /// Locks the key row first — an in-flight `verify_key` on the same key
+    /// serializes against this mutation (#11). Errors with
+    /// [`AuthError::RoleAlreadyAssigned`] on a duplicate so assignment is
+    /// never a silent no-op, and [`AuthError::RoleNotFound`] for unknown
+    /// role names.
+    pub async fn assign_role(&self, prefix: &str, role_name: &str) -> Result<(), AuthError> {
+        validate_role_name(role_name)?;
+        let mut tx = self.pool.begin().await?;
+        let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
+        let role_id = Self::get_role_id_in(&mut *tx, role_name).await?;
+
+        let result = sqlx::query("INSERT INTO key_roles (key_id, role_id) VALUES ($1, $2)")
+            .bind(key_id)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await;
+
+        match result {
+            Ok(_) => {
+                tx.commit().await?;
+                tracing::info!(
+                    event_type = "role_assigned",
+                    prefix,
+                    role = role_name,
+                    "role assigned to key"
+                );
+                Ok(())
+            }
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                Err(AuthError::RoleAlreadyAssigned {
+                    prefix: prefix.to_owned(),
+                    role: role_name.to_owned(),
+                })
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove a role from a key.
+    ///
+    /// Locks the key row first (same serialization contract as
+    /// [`Self::assign_role`]). Errors with [`AuthError::RoleNotAssigned`]
+    /// when the key doesn't hold the role — silently succeeding would mask
+    /// typos — and [`AuthError::RoleNotFound`] for unknown role names.
+    pub async fn unassign_role(&self, prefix: &str, role_name: &str) -> Result<(), AuthError> {
+        validate_role_name(role_name)?;
+        let mut tx = self.pool.begin().await?;
+        let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
+        let role_id = Self::get_role_id_in(&mut *tx, role_name).await?;
+
+        let removed = sqlx::query("DELETE FROM key_roles WHERE key_id = $1 AND role_id = $2")
+            .bind(key_id)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        if removed == 0 {
+            return Err(AuthError::RoleNotAssigned {
+                prefix: prefix.to_owned(),
+                role: role_name.to_owned(),
+            });
+        }
+
+        tx.commit().await?;
+
+        tracing::info!(
+            event_type = "role_unassigned",
+            prefix,
+            role = role_name,
+            "role removed from key"
+        );
+        Ok(())
+    }
+
+    // -- role CRUD ------------------------------------------------------------
+
+    /// Create a new role with an optional rate ceiling and initial
+    /// permission bundle.
+    ///
+    /// Errors with [`AuthError::RoleExists`] on a name collision. Every
+    /// `(app, permission)` pair is shape-validated; vocabulary membership is
+    /// NOT enforced here (the registry is warn-only — callers like
+    /// fleet-admin surface the warning).
+    pub async fn create_role(
+        &self,
+        name: &str,
+        rate_rpm: Option<u32>,
+        permissions: &[RolePermission],
+    ) -> Result<Role, AuthError> {
+        validate_role_name(name)?;
+        for rp in permissions {
+            validate_app_namespace(&rp.app)?;
+            validate_permission(&rp.permission)?;
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let insert = sqlx::query("INSERT INTO roles (name, rate_rpm) VALUES ($1, $2) RETURNING id")
+            .bind(name)
+            .bind(rate_rpm.map(i64::from))
+            .fetch_one(&mut *tx)
+            .await;
+
+        let row = match insert {
+            Ok(row) => row,
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                return Err(AuthError::RoleExists {
+                    name: name.to_owned(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let id: i64 = row.try_get("id")?;
+
+        for rp in permissions {
+            sqlx::query(
+                "INSERT INTO role_permissions (role_id, app, permission)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .bind(&rp.app)
+            .bind(&rp.permission)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        tracing::info!(
+            event_type = "role_created",
+            role = name,
+            rate_rpm,
+            permission_count = permissions.len(),
+            "role created"
+        );
+
+        self.get_role(name).await
+    }
+
+    /// Look up a role (with its permission bundle) by name.
+    pub async fn get_role(&self, name: &str) -> Result<Role, AuthError> {
+        let rows = sqlx::query(
+            "SELECT r.id AS role_id, r.name, r.rate_rpm, rp.app, rp.permission
+             FROM roles r
+             LEFT JOIN role_permissions rp ON rp.role_id = r.id
+             WHERE r.name = $1
+             ORDER BY rp.app, rp.permission",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut roles = rows_to_roles(rows)?;
+        roles.pop().ok_or_else(|| AuthError::RoleNotFound {
+            name: name.to_owned(),
+        })
+    }
+
+    /// List every role (with permission bundles), ordered by name.
+    pub async fn list_roles(&self) -> Result<Vec<Role>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT r.id AS role_id, r.name, r.rate_rpm, rp.app, rp.permission
+             FROM roles r
+             LEFT JOIN role_permissions rp ON rp.role_id = r.id
+             ORDER BY r.name, rp.app, rp.permission",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows_to_roles(rows)
+    }
+
+    /// Count keys currently holding a role (by name).
+    pub async fn count_role_assignments(&self, name: &str) -> Result<i64, AuthError> {
+        let role_id = self.get_role_id(name).await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM key_roles WHERE role_id = $1")
+            .bind(role_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// Set (or clear with `None`) a role's `rate_rpm` ceiling, returning the
+    /// updated role.
+    ///
+    /// This is the non-destructive way to re-tier class-of-service: the
+    /// role's permission bundle and every `key_roles` assignment are left
+    /// untouched, so no key loses capability while the ceiling changes.
+    /// Clearing falls the role's keys back to the route-class config
+    /// defaults. Errors with [`AuthError::RoleNotFound`] for an unknown name.
+    pub async fn set_role_rate_rpm(
+        &self,
+        name: &str,
+        rate_rpm: Option<u32>,
+    ) -> Result<Role, AuthError> {
+        validate_role_name(name)?;
+        let updated = sqlx::query("UPDATE roles SET rate_rpm = $1 WHERE name = $2")
+            .bind(rate_rpm.map(i64::from))
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+        if updated == 0 {
+            return Err(AuthError::RoleNotFound {
+                name: name.to_owned(),
+            });
+        }
+
+        tracing::info!(
+            event_type = "role_rate_rpm_set",
+            role = name,
+            rate_rpm,
+            "role rate ceiling updated"
+        );
+        self.get_role(name).await
+    }
+
+    /// Delete a role.
+    ///
+    /// Refuses with [`AuthError::RoleInUse`] (carrying the affected-key
+    /// count) while any key still holds the role, unless `force` — forcing
+    /// unassigns the role from every key first, which strips capability
+    /// from those keys immediately.
+    pub async fn delete_role(&self, name: &str, force: bool) -> Result<(), AuthError> {
+        validate_role_name(name)?;
+        let mut tx = self.pool.begin().await?;
+        let role_id = Self::get_role_id_in(&mut *tx, name).await?;
+
+        let key_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM key_roles WHERE role_id = $1")
+                .bind(role_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        if key_count > 0 {
+            if !force {
+                return Err(AuthError::RoleInUse {
+                    name: name.to_owned(),
+                    key_count,
+                });
+            }
+            sqlx::query("DELETE FROM key_roles WHERE role_id = $1")
+                .bind(role_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        sqlx::query("DELETE FROM roles WHERE id = $1")
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            event_type = "role_deleted",
+            role = name,
+            key_count,
+            forced = force,
+            "role deleted"
+        );
+        Ok(())
+    }
+
+    /// Add `(app, permission)` pairs to an existing role. Duplicates are
+    /// no-ops (idempotent).
+    pub async fn add_role_permissions(
+        &self,
+        name: &str,
+        permissions: &[RolePermission],
+    ) -> Result<Role, AuthError> {
+        for rp in permissions {
+            validate_app_namespace(&rp.app)?;
+            validate_permission(&rp.permission)?;
+        }
+        let role_id = self.get_role_id(name).await?;
+
+        for rp in permissions {
+            sqlx::query(
+                "INSERT INTO role_permissions (role_id, app, permission)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(role_id)
+            .bind(&rp.app)
+            .bind(&rp.permission)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        tracing::info!(
+            event_type = "role_permissions_added",
+            role = name,
+            count = permissions.len(),
+            "permissions added to role"
+        );
+        self.get_role(name).await
+    }
+
+    /// Remove `(app, permission)` pairs from an existing role. Returns the
+    /// number of rows actually removed — callers can warn when a named pair
+    /// wasn't on the role.
+    pub async fn remove_role_permissions(
+        &self,
+        name: &str,
+        permissions: &[RolePermission],
+    ) -> Result<u64, AuthError> {
+        let role_id = self.get_role_id(name).await?;
+
+        let mut removed = 0;
+        for rp in permissions {
+            removed += sqlx::query(
+                "DELETE FROM role_permissions
+                 WHERE role_id = $1 AND app = $2 AND permission = $3",
+            )
+            .bind(role_id)
+            .bind(&rp.app)
+            .bind(&rp.permission)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        }
+
+        tracing::info!(
+            event_type = "role_permissions_removed",
+            role = name,
+            removed,
+            "permissions removed from role"
+        );
+        Ok(removed)
+    }
+
+    /// Whether `(app, permission)` is registered in the `app_permissions`
+    /// vocabulary. The registry is warn-only: an unknown pair is legal to
+    /// persist, but tooling should surface the gap (typo protection).
+    pub async fn is_known_permission(
+        &self,
+        app: &str,
+        permission: &str,
+    ) -> Result<bool, AuthError> {
+        let known: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM app_permissions WHERE app = $1 AND permission = $2)",
+        )
+        .bind(app)
+        .bind(permission)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(known)
+    }
+
+    // -- internals ------------------------------------------------------------
+
     /// Classify a "zero rows affected" UPDATE on `api_keys` by prefix —
     /// distinguishes a not-found prefix from one that exists but is already
     /// revoked. Used by `revoke_key` and `retype_key`, both of which guard
@@ -644,21 +912,29 @@ impl KeyStore {
         })
     }
 
-    /// Internal helper: resolve a prefix to its database row id.
-    async fn get_key_id_by_prefix(&self, prefix: &str) -> Result<i64, AuthError> {
-        let row_opt = sqlx::query("SELECT id FROM api_keys WHERE prefix = $1")
-            .bind(prefix)
-            .fetch_optional(&self.pool)
+    /// Resolve a role name to its row id against the pool.
+    async fn get_role_id(&self, name: &str) -> Result<i64, AuthError> {
+        Self::get_role_id_in(&self.pool, name).await
+    }
+
+    /// Resolve a role name to its row id against any executor.
+    async fn get_role_id_in<'e, E>(executor: E, name: &str) -> Result<i64, AuthError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let row_opt = sqlx::query("SELECT id FROM roles WHERE name = $1")
+            .bind(name)
+            .fetch_optional(executor)
             .await?;
         let Some(row) = row_opt else {
-            return Err(AuthError::KeyNotFound {
-                prefix: prefix.to_owned(),
+            return Err(AuthError::RoleNotFound {
+                name: name.to_owned(),
             });
         };
         Ok(row.try_get("id")?)
     }
 
-    /// Lock the key row for the duration of assignment mutation.
+    /// Lock the key row for the duration of a role-assignment mutation.
     async fn lock_key_id_by_prefix(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -682,10 +958,42 @@ impl KeyStore {
     }
 }
 
-/// Map a row from `api_keys` to [`ApiKeyInfo`] without assignments.
+/// Fold `roles LEFT JOIN role_permissions` rows (ordered by role name) into
+/// [`Role`] values. A role with no permissions yields NULL app/permission
+/// from the LEFT JOIN and an empty bundle here.
+fn rows_to_roles(rows: Vec<PgRow>) -> Result<Vec<Role>, AuthError> {
+    let mut roles: Vec<Role> = Vec::new();
+    for row in rows {
+        let id: i64 = row.try_get("role_id")?;
+        let name: String = row.try_get("name")?;
+        let rate_rpm: Option<i32> = row.try_get("rate_rpm")?;
+        // The CHECK constraint guarantees rate_rpm > 0, so the cast holds.
+        let rate_rpm = rate_rpm.and_then(|v| u32::try_from(v).ok());
+
+        if roles.last().is_none_or(|r| r.id != id) {
+            roles.push(Role {
+                id,
+                name,
+                rate_rpm,
+                permissions: Vec::new(),
+            });
+        }
+
+        let app: Option<String> = row.try_get("app")?;
+        let permission: Option<String> = row.try_get("permission")?;
+        if let (Some(app), Some(permission)) = (app, permission)
+            && let Some(role) = roles.last_mut()
+        {
+            role.permissions.push(RolePermission { app, permission });
+        }
+    }
+    Ok(roles)
+}
+
+/// Map a row from `api_keys` to [`ApiKeyInfo`] without roles.
 ///
-/// Callers populate `assignments` separately.
-fn row_to_api_key_info_no_assignments(row: &PgRow) -> Result<ApiKeyInfo, AuthError> {
+/// Callers populate `roles` separately.
+fn row_to_api_key_info_no_roles(row: &PgRow) -> Result<ApiKeyInfo, AuthError> {
     let kind_str: String = row.try_get("kind")?;
     let kind: PrincipalKind = kind_str.parse()?;
 
@@ -694,7 +1002,7 @@ fn row_to_api_key_info_no_assignments(row: &PgRow) -> Result<ApiKeyInfo, AuthErr
         prefix: row.try_get("prefix")?,
         name: row.try_get("name")?,
         kind,
-        assignments: Vec::new(),
+        roles: Vec::new(),
         active: row.try_get("active")?,
         created_at: row.try_get("created_at")?,
         expires_at: row.try_get("expires_at")?,

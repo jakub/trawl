@@ -17,19 +17,27 @@ API keys are managed with `fleet-admin` against the fleet postgres
 keystore (`DATABASE_URL`):
 
 ```bash
-fleet-admin keys create --name "my-key" --kind human --grant trawl:analyst
+fleet-admin keys create --name "my-key" --kind human --role trawl-analyst
 fleet-admin keys list
 fleet-admin keys revoke <key-prefix>
 ```
 
-### Roles
+### Roles and permissions
 
-| Role | Permissions |
+Roles are data-defined (ADR-0006): named, cross-app bundles of permission
+strings stored in the fleet keystore, managed with `fleet-admin roles`.
+A key holds any number of roles; effective permissions are the union.
+The migration converts the former static tiers into these roles:
+
+| Role | Trawl permissions |
 |------|------------|
-| `admin` | Full API access including dashboard (key management via fleet-admin) |
-| `analyst` | Query, validate, schema, history, saved queries, export |
-| `reader` | Query, schema read, cancel own queries |
-| `ingest` | Ingest endpoint only |
+| `trawl-admin` | `query`, `schema_read`, `validate`, `saved_query`, `export`, `stream`, `query_cancel`, `server_manage` |
+| `trawl-analyst` | `query`, `schema_read`, `validate`, `saved_query`, `export`, `stream`, `query_cancel` |
+| `trawl-reader` | `query`, `schema_read`, `query_cancel` |
+| `trawl-ingest` | `ingest` |
+
+Handlers gate on permissions, never role names — reshape the tiers with
+`fleet-admin roles` without a deploy.
 
 ## Endpoints
 
@@ -113,7 +121,7 @@ Full dashboard snapshot. Admin only.
 GET /api/v1/whoami
 ```
 
-Returns the identity, kind, role grants, and permissions for the current token.
+Returns the identity, kind, role names, and resolved trawl permissions for the current token.
 
 Response shape:
 
@@ -122,10 +130,7 @@ Response shape:
   "prefix": "abcd1234",
   "name": "siem-bot",
   "kind": "service",
-  "assignments": [
-    {"app": "trawl", "role": "analyst"},
-    {"app": "coastwatch", "role": "siem_consumer"}
-  ],
+  "roles": ["coastwatch-siem_consumer", "trawl-analyst"],
   "permissions": ["query", "schema_read", "validate", "saved_query", "export", "stream", "query_cancel"]
 }
 ```
@@ -133,10 +138,12 @@ Response shape:
 Fields:
 
 - `kind` — `"human"` or `"service"`. Distinguishes interactive users from non-interactive principals.
-- `assignments` — every `(app, role)` grant attached to the key, across every app. Apps consume only the grants in their own namespace.
-- `permissions` — the trawl-server-resolved permission set for the `"trawl"` assignment. Empty when the key has no `"trawl"` grant. Other consumers (e.g. coastwatch) read `assignments` and resolve permissions locally.
+- `roles` — the names of every data-defined role the key holds, sorted. Roles are cross-app permission bundles (ADR-0006), so the list is NOT app-scoped — it is display/audit metadata, never a gating input.
+- `permissions` — the trawl-server-resolved permission union for the `trawl` namespace, in canonical order. Only permissions this server recognizes appear (unknown strings stored on a role are ignored, fail closed). Empty is impossible on the wire — a key resolving zero trawl permissions is rejected with 403 before reaching `/whoami`.
 
-Per ADR-0021, trawl-auth acts as a shared identity substrate: a single API key can carry grants for multiple apps simultaneously.
+Per ADR-0006, roles are data: a single key can hold any number of roles, each role can span apps, and effective permissions are the union. Other consumers (e.g. coastwatch) resolve their own namespace from the shared keystore.
+
+**Breaking change (ADR-0006 slice 1)**: the `assignments` array of `(app, role)` grants was replaced by `roles`; the `role_for` client helper is gone.
 
 ### Query history
 
@@ -203,7 +210,7 @@ Content-Type: application/json
 [{"timestamp": "...", "service": "myapp", "level": "info", "message": "..."}]
 ```
 
-Accepts JSON arrays or ndjson. Supports optional gzip compression (`Content-Encoding: gzip`). Requires a token with `ingest` role.
+Accepts JSON arrays or ndjson. Supports optional gzip compression (`Content-Encoding: gzip`). Requires a token whose roles grant the `ingest` permission.
 
 ### Metrics
 

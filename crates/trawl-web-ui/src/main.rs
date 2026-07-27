@@ -9,6 +9,7 @@
 mod facets;
 mod histogram;
 mod offset;
+mod perms;
 mod query_merge;
 mod tone_vocab;
 

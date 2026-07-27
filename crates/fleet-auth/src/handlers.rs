@@ -94,9 +94,9 @@ pub async fn login(
     };
 
     let cfg = state.config();
-    if verified.role_for(cfg.app_namespace()).is_none() {
-        // No-grant: same body as middleware. NO Set-Cookie — the user never
-        // gets a session for an app they can't access.
+    if !verified.has_any_permission(cfg.app_namespace()) {
+        // No-permission: same body as middleware. NO Set-Cookie — the user
+        // never gets a session for an app they can't access.
         return no_grant_response(&verified.name, cfg.app_namespace());
     }
 

@@ -74,7 +74,7 @@ pub async fn query(
     tracing::info!(
         event_type = "query_start",
         user = %verified.name,
-        assignments = %verified.assignments_display(),
+        roles = %verified.roles_display(),
         query = %req.query,
         limit,
         offset,
@@ -96,10 +96,6 @@ pub async fn query(
         .map_err(ServerError::BadRequest)?
         .unwrap_or(0);
 
-    let role_str = verified
-        .trawl_role()
-        .map_or("none", crate::policy::Role::as_str)
-        .to_owned();
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
 
@@ -180,9 +176,14 @@ pub async fn query(
                 "query complete"
             );
 
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "success").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str.clone())
-                .record(duration_secs);
+            // SECURITY: no principal-derived label here — `/metrics` is
+            // unauthenticated (see `transport::http`). Role names are
+            // operator-defined and cross-app since ADR-0006, so labelling by
+            // them would publish fleet role membership to any scraper and
+            // make the series count combinatorial in role sets. Per-principal
+            // attribution lives in the authenticated query log / history.
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "success").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
 
             // Write query debug log entry (success).
             write_query_log(
@@ -208,9 +209,8 @@ pub async fn query(
         Err(ServerError::Timeout) => {
             state.query.tracker.timeout(query_id);
 
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "timeout").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str.clone())
-                .record(duration_secs);
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "timeout").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
 
             tracing::warn!(
                 event_type = "query_timeout",
@@ -240,9 +240,8 @@ pub async fn query(
             let safe_msg = e.safe_message();
             state.query.tracker.fail(query_id, &safe_msg);
 
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "role" => role_str.clone(), "status" => "error").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION, "role" => role_str)
-                .record(duration_secs);
+            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "error").increment(1);
+            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
             match &e {
                 ServerError::Engine(
                     trawl_engine::error::EngineError::Parse(_)
@@ -739,21 +738,22 @@ pub async fn stats(
 /// Available to any authenticated user. No permission check needed — if the
 /// token passed auth middleware, the user is entitled to know their own identity and grants.
 pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIResponse> {
-    // Permissions are server-scoped: only the trawl-app role contributes
-    // to THIS server's permission set. Other-app grants travel via
-    // `assignments` and are interpreted by their owning consumers.
-    let permissions = verified.trawl_role().map_or_else(Vec::new, |r| {
-        r.permissions()
-            .iter()
-            .map(|p| p.as_str().to_owned())
-            .collect()
-    });
+    // Permissions are server-scoped: only RECOGNIZED trawl permissions are
+    // emitted, in canonical order — echoing raw keystore strings would
+    // advertise gates no handler checks, and canonical order keeps the
+    // golden wire tests deterministic. Role names travel unfiltered (roles
+    // are cross-app bundles, not app-scoped).
+    let permissions = verified
+        .trawl_permissions()
+        .into_iter()
+        .map(|p| p.as_str().to_owned())
+        .collect();
 
     Json(WhoAmIResponse {
         prefix: verified.prefix.clone(),
         name: verified.name.clone(),
         kind: crate::policy::wire_kind(verified.kind),
-        assignments: crate::policy::wire_assignments(&verified.assignments),
+        roles: verified.roles().to_vec(),
         permissions,
     })
 }
@@ -1663,7 +1663,7 @@ pub async fn export(
     tracing::info!(
         event_type = "export_start",
         user = %verified.name,
-        assignments = %verified.assignments_display(),
+        roles = %verified.roles_display(),
         query = %req.query,
         %format,
         limit,
@@ -1833,9 +1833,7 @@ fn write_query_log(
     let entry = QueryLogEntry {
         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         user: verified.name.clone(),
-        role: verified
-            .trawl_role()
-            .map_or_else(|| "none".to_owned(), |r| r.to_string()),
+        role: verified.roles_display(),
         dsl: dsl.to_owned(),
         source: SourceDebug {
             computed: debug.computed_source.clone(),

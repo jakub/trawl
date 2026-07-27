@@ -27,16 +27,85 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 
-use fleet_auth::{KeyStore, PrincipalKind, RoleAssignment};
+use fleet_auth::{KeyStore, PrincipalKind, RolePermission};
 use sqlx::{Connection as _, Executor as _, PgPool, postgres::PgConnection};
-use trawl_server::policy::Role;
 
-/// Helper: build a single-grant `trawl:<role>` assignment vector for tests.
-pub fn trawl_only(role: Role) -> Vec<RoleAssignment> {
-    vec![RoleAssignment {
-        app: "trawl".into(),
-        role: role.as_str().into(),
-    }]
+/// Build a `trawl`-namespace [`RolePermission`] list from permission strings.
+pub fn trawl_perms(perms: &[&str]) -> Vec<RolePermission> {
+    perms
+        .iter()
+        .map(|p| RolePermission {
+            app: "trawl".into(),
+            permission: (*p).to_owned(),
+        })
+        .collect()
+}
+
+/// Seed the four converted-shape trawl roles (the exact permission sets the
+/// conversion migration freezes — the legacy compile-time tables minus the
+/// dead `key_manage`) plus a coastwatch-only role for grantless-key tests.
+pub async fn seed_trawl_roles(store: &KeyStore) {
+    store
+        .create_role(
+            "trawl-admin",
+            None,
+            &trawl_perms(&[
+                "query",
+                "schema_read",
+                "validate",
+                "saved_query",
+                "export",
+                "stream",
+                "query_cancel",
+                "server_manage",
+            ]),
+        )
+        .await
+        .expect("seed trawl-admin");
+    store
+        .create_role(
+            "trawl-analyst",
+            None,
+            &trawl_perms(&[
+                "query",
+                "schema_read",
+                "validate",
+                "saved_query",
+                "export",
+                "stream",
+                "query_cancel",
+            ]),
+        )
+        .await
+        .expect("seed trawl-analyst");
+    store
+        .create_role(
+            "trawl-reader",
+            None,
+            &trawl_perms(&["query", "schema_read", "query_cancel"]),
+        )
+        .await
+        .expect("seed trawl-reader");
+    store
+        .create_role("trawl-ingest", None, &trawl_perms(&["ingest"]))
+        .await
+        .expect("seed trawl-ingest");
+    store
+        .create_role(
+            "coastwatch-viewer",
+            None,
+            &[RolePermission {
+                app: "coastwatch".into(),
+                permission: "stories_read".into(),
+            }],
+        )
+        .await
+        .expect("seed coastwatch-viewer");
+}
+
+/// Helper: a single-role name list for `create_key`.
+pub fn roles(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| (*s).to_owned()).collect()
 }
 use trawl_server::config::{
     AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig,
@@ -413,14 +482,15 @@ impl TestServer {
     }
 }
 
-/// Create the standard role keys in the fleet keystore.
+/// Create the standard role keys in the fleet keystore (roles must already
+/// be seeded via [`seed_trawl_roles`]).
 /// Returns (analyst, admin, reader, ingest) plaintext tokens.
 pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String) {
     let analyst = store
         .create_key(
             "test-key",
             PrincipalKind::Service,
-            &trawl_only(Role::Analyst),
+            &roles(&["trawl-analyst"]),
             None,
         )
         .await
@@ -429,7 +499,7 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
         .create_key(
             "admin-key",
             PrincipalKind::Service,
-            &trawl_only(Role::Admin),
+            &roles(&["trawl-admin"]),
             None,
         )
         .await
@@ -438,7 +508,7 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
         .create_key(
             "reader-key",
             PrincipalKind::Service,
-            &trawl_only(Role::Reader),
+            &roles(&["trawl-reader"]),
             None,
         )
         .await
@@ -447,7 +517,7 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
         .create_key(
             "ingest-key",
             PrincipalKind::Service,
-            &trawl_only(Role::Ingest),
+            &roles(&["trawl-ingest"]),
             None,
         )
         .await
@@ -460,14 +530,17 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
     )
 }
 
-/// Migrate the sqlx-provided database with the FLEET schema and return a
-/// keystore on it. (`migrations = false` hands us a bare database.)
+/// Migrate the sqlx-provided database with the FLEET schema, seed the
+/// converted-shape roles, and return a keystore on it.
+/// (`migrations = false` hands us a bare database.)
 pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
     fleet_auth::MIGRATOR
         .run(pool)
         .await
         .expect("apply fleet-auth migrations to per-test database");
-    KeyStore::from_pool(pool.clone())
+    let store = KeyStore::from_pool(pool.clone());
+    seed_trawl_roles(&store).await;
+    store
 }
 
 /// Poll the health endpoint until the server is ready (up to 1s).
@@ -509,14 +582,13 @@ pub async fn setup_in_dir(
     let app_db_url = create_app_database(&pool).await;
 
     let (analyst_token, admin_token, reader_token, ingest_token) = mint_role_keys(&store).await;
+    // Holds a role, but one with zero trawl permissions — the "grantless"
+    // shape under roles-as-data.
     let coastwatch_only = store
         .create_key(
             "coastwatch-only",
             PrincipalKind::Service,
-            &[RoleAssignment {
-                app: "coastwatch".into(),
-                role: "viewer".into(),
-            }],
+            &roles(&["coastwatch-viewer"]),
             None,
         )
         .await

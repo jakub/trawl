@@ -39,7 +39,7 @@ pub fn DerivationsPage() -> impl IntoView {
     let me = use_context::<RwSignal<Option<MeResponse>>>();
     let can_write = Memo::new(move |_| {
         me.and_then(|s| s.get())
-            .map(|m| can_write_derivations(&m.role))
+            .map(|m| can_write_derivations(&m.permissions))
             .unwrap_or(false)
     });
 

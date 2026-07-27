@@ -9,11 +9,11 @@ use std::process;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use fleet_auth::{KeyStore, PrincipalKind, RoleAssignment};
+use fleet_auth::{KeyStore, PrincipalKind, RolePermission};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use fleet_admin::commands;
-use fleet_admin::commands::keys::KeyPrefix;
+use fleet_admin::commands::keys::{KeyPrefix, RoleName};
 use fleet_admin::error::AdminError;
 
 /// Fleet-wide operational CLI.
@@ -35,6 +35,11 @@ enum Command {
         #[command(subcommand)]
         action: KeysAction,
     },
+    /// Manage data-defined roles (cross-app permission bundles, ADR-0006).
+    Roles {
+        #[command(subcommand)]
+        action: RolesAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -48,11 +53,12 @@ enum KeysAction {
         /// non-interactive ones.
         #[arg(long)]
         kind: CliKind,
-        /// Repeatable `app:role` grant (e.g. `--grant trawl:admin
-        /// --grant coastwatch:siem_consumer`). May be empty — a grantless
-        /// key authenticates but authorizes nothing until grants are added.
-        #[arg(long = "grant", value_name = "APP:ROLE", value_parser = commands::keys::parse_grant)]
-        grants: Vec<RoleAssignment>,
+        /// Repeatable role name (e.g. `--role trawl-admin --role
+        /// coastwatch-analyst`). Every role must already exist (`roles
+        /// create`). May be empty — a role-less key authenticates but
+        /// authorizes nothing until roles are assigned.
+        #[arg(long = "role", value_name = "ROLE", value_parser = RoleName::parse)]
+        roles: Vec<RoleName>,
         /// Expiration duration (e.g. `90d`, `24h`, `52w`). Omit for no expiry.
         #[arg(long, value_parser = commands::keys::parse_duration)]
         expires: Option<Duration>,
@@ -72,24 +78,23 @@ enum KeysAction {
         #[arg(long, short)]
         yes: bool,
     },
-    /// Add an `app:role` grant to an existing key.
-    Grant {
+    /// Assign a role to an existing key.
+    AssignRole {
         /// The key prefix (shown in `keys list`).
         #[arg(value_parser = KeyPrefix::parse)]
         prefix: KeyPrefix,
-        /// The `app:role` grant to add.
-        #[arg(value_parser = commands::keys::parse_grant)]
-        grant: RoleAssignment,
+        /// The role name to assign (must exist).
+        #[arg(value_parser = RoleName::parse)]
+        role: RoleName,
     },
-    /// Remove a key's grant on an app.
-    RevokeGrant {
+    /// Remove a role from a key.
+    UnassignRole {
         /// The key prefix (shown in `keys list`).
         #[arg(value_parser = KeyPrefix::parse)]
         prefix: KeyPrefix,
-        /// The app to revoke, as `app` or `app:role` — the role half is
-        /// ignored (grants are keyed by app, whatever role is stored).
-        #[arg(value_name = "APP", value_parser = commands::keys::parse_revoke_grant_app)]
-        app: String,
+        /// The role name to remove.
+        #[arg(value_parser = RoleName::parse)]
+        role: RoleName,
         /// Skip the interactive confirmation prompt.
         #[arg(long, short)]
         yes: bool,
@@ -101,6 +106,80 @@ enum KeysAction {
         prefix: KeyPrefix,
         /// The new principal kind.
         kind: CliKind,
+    },
+}
+
+#[derive(Subcommand)]
+enum RolesAction {
+    /// Create a new role.
+    Create {
+        /// Unique role name (lowercase alnum + underscore + hyphen).
+        #[arg(long, value_parser = RoleName::parse)]
+        name: RoleName,
+        /// Repeatable `APP:PERMISSION` entry (e.g. `--perm trawl:query`).
+        /// Unknown permissions warn but persist (warn-only registry).
+        #[arg(long = "perm", value_name = "APP:PERMISSION", value_parser = commands::roles::parse_perm)]
+        perms: Vec<RolePermission>,
+        /// Per-key requests/minute ceiling for keys holding this role.
+        /// Overrides the route-class config default (max across the key's
+        /// roles wins). Omit to use the config defaults.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        rate_rpm: Option<u32>,
+    },
+    /// List all roles with their permission bundles.
+    List,
+    /// Show one role's details, including how many keys hold it.
+    Show {
+        /// The role name.
+        #[arg(value_parser = RoleName::parse)]
+        name: RoleName,
+    },
+    /// Add `APP:PERMISSION` entries to a role.
+    AddPerm {
+        /// The role name.
+        #[arg(value_parser = RoleName::parse)]
+        name: RoleName,
+        /// One or more `APP:PERMISSION` entries.
+        #[arg(required = true, value_name = "APP:PERMISSION", value_parser = commands::roles::parse_perm)]
+        perms: Vec<RolePermission>,
+    },
+    /// Remove `APP:PERMISSION` entries from a role.
+    RemovePerm {
+        /// The role name.
+        #[arg(value_parser = RoleName::parse)]
+        name: RoleName,
+        /// One or more `APP:PERMISSION` entries.
+        #[arg(required = true, value_name = "APP:PERMISSION", value_parser = commands::roles::parse_perm)]
+        perms: Vec<RolePermission>,
+    },
+    /// Change a role's rate ceiling in place (keys keep the role).
+    SetRate {
+        /// The role name.
+        #[arg(value_parser = RoleName::parse)]
+        name: RoleName,
+        /// New per-key requests/minute ceiling for keys holding this role.
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u32).range(1..),
+            conflicts_with = "default",
+            required_unless_present = "default"
+        )]
+        rate_rpm: Option<u32>,
+        /// Clear the ceiling — keys fall back to the route-class defaults.
+        #[arg(long)]
+        default: bool,
+    },
+    /// Delete a role. Refuses while keys still hold it unless --force.
+    Delete {
+        /// The role name.
+        #[arg(value_parser = RoleName::parse)]
+        name: RoleName,
+        /// Delete even if keys hold the role (they lose it immediately).
+        #[arg(long)]
+        force: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
     },
 }
 
@@ -146,6 +225,10 @@ async fn run() -> Result<(), AdminError> {
             let pool = connect_pool().await?;
             dispatch_keys(KeyStore::from_pool(pool), action).await
         }
+        Command::Roles { action } => {
+            let pool = connect_pool().await?;
+            dispatch_roles(KeyStore::from_pool(pool), action).await
+        }
     }
 }
 
@@ -154,17 +237,51 @@ async fn dispatch_keys(store: KeyStore, action: KeysAction) -> Result<(), AdminE
         KeysAction::Create {
             name,
             kind,
-            grants,
+            roles,
             expires,
-        } => commands::keys::create(&store, &name, kind.into(), &grants, expires).await,
+        } => {
+            let role_names: Vec<String> = roles.iter().map(|r| r.as_str().to_owned()).collect();
+            commands::keys::create(&store, &name, kind.into(), &role_names, expires).await
+        }
         KeysAction::List { all } => commands::keys::list(&store, all).await,
         KeysAction::Revoke { prefix, yes } => commands::keys::revoke(&store, &prefix, yes).await,
-        KeysAction::Grant { prefix, grant } => commands::keys::grant(&store, &prefix, &grant).await,
-        KeysAction::RevokeGrant { prefix, app, yes } => {
-            commands::keys::revoke_grant(&store, &prefix, &app, yes).await
+        KeysAction::AssignRole { prefix, role } => {
+            commands::keys::assign_role(&store, &prefix, &role).await
+        }
+        KeysAction::UnassignRole { prefix, role, yes } => {
+            commands::keys::unassign_role(&store, &prefix, &role, yes).await
         }
         KeysAction::Retype { prefix, kind } => {
             commands::keys::retype(&store, &prefix, kind.into()).await
+        }
+    }
+}
+
+async fn dispatch_roles(store: KeyStore, action: RolesAction) -> Result<(), AdminError> {
+    match action {
+        RolesAction::Create {
+            name,
+            perms,
+            rate_rpm,
+        } => commands::roles::create(&store, &name, &perms, rate_rpm).await,
+        RolesAction::List => commands::roles::list(&store).await,
+        RolesAction::Show { name } => commands::roles::show(&store, &name).await,
+        RolesAction::AddPerm { name, perms } => {
+            commands::roles::add_perm(&store, &name, &perms).await
+        }
+        RolesAction::RemovePerm { name, perms } => {
+            commands::roles::remove_perm(&store, &name, &perms).await
+        }
+        // `--default` only exists to make "clear the ceiling" explicit at
+        // the CLI boundary; clap's conflict/requirement rules already
+        // collapse it into `rate_rpm == None`.
+        RolesAction::SetRate {
+            name,
+            rate_rpm,
+            default: _,
+        } => commands::roles::set_rate(&store, &name, rate_rpm).await,
+        RolesAction::Delete { name, force, yes } => {
+            commands::roles::delete(&store, &name, force, yes).await
         }
     }
 }
@@ -191,5 +308,36 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn set_rate_takes_exactly_one_of_rate_rpm_or_default() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+
+        // Ambiguity is a parse error in both directions — an operator never
+        // gets to guess whether a ceiling was set or cleared.
+        assert!(parse(&["fleet-admin", "roles", "set-rate", "tier"]).is_err());
+        assert!(
+            parse(&[
+                "fleet-admin",
+                "roles",
+                "set-rate",
+                "tier",
+                "--rate-rpm",
+                "60",
+                "--default",
+            ])
+            .is_err()
+        );
+
+        // `--default` is how "clear the ceiling" reaches the store as None.
+        let cli = parse(&["fleet-admin", "roles", "set-rate", "tier", "--default"]).unwrap();
+        let Command::Roles {
+            action: RolesAction::SetRate { rate_rpm, .. },
+        } = cli.command
+        else {
+            panic!("expected roles set-rate");
+        };
+        assert_eq!(rate_rpm, None);
     }
 }

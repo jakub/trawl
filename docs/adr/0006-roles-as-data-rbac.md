@@ -133,3 +133,38 @@ Companion coastwatch arc is prepped separately in that repo after slice 1.
   principals (see "No users table"). If that bites, the escalation path is a
   class-scoped attribute (`rate_rpm_ingest`), *not* a precedence rule layering
   attributes over route-class defaults.
+
+## Slice 1 addendum (2026-07-26 implementation, #44)
+
+- **Log/wire role fields become operator-defined strings; prometheus keeps
+  none.** Everywhere an AUTHENTICATED surface previously carried one of four
+  fixed role names (`trawl_role()`), it now carries the sorted, comma-joined
+  role-NAME list (`roles_display()`, `"none"` fallback; the
+  `ActiveQuerySnapshot.role` wire field keeps its name). The prometheus
+  `role` label on `trawl_queries_total` / `trawl_query_duration_seconds` is
+  DROPPED instead of converted: `/metrics` is unauthenticated, and
+  data-defined role names are operator-chosen and span apps, so the joined
+  list would publish cross-app fleet role membership to any scraper and make
+  the series count combinatorial in distinct role sets (a permanent
+  histogram per new combination). Per-principal query attribution stays on
+  the authenticated surfaces (structured logs, query log, history,
+  `/api/v1/queries`). No principal-derived label may be added to a metric
+  while `/metrics` sits outside the auth stack.
+- **The conversion migration is the runtime cut point for both apps.** The
+  ADR accepted a red coastwatch *build* between the arcs; the shared fleet
+  database makes it a *runtime* window too — `api_key_role_assignment` is
+  dropped in the same migration that creates the new tables, so a running
+  pre-arc coastwatch fails at `fleet-admin migrate` time. Its companion arc
+  ships in the same maintenance window. The migration also freezes
+  coastwatch's permission wire strings as snake_case of its `Permission`
+  variant names (recorded in the cutover runbook); that arc's `as_str` must
+  match them exactly.
+- **Registry seeding is migrate-time only.** trawl's 9 permission strings
+  are seeded by the migration SQL; no boot-time vocabulary registration
+  exists (parked — the warn-only registry makes staleness cosmetic).
+  Coastwatch seeds its own namespace in its arc.
+- **`require_trawl_grant` gates on *recognized* permissions.** "Holds ≥1
+  trawl permission" is evaluated against trawl's compile-time vocabulary:
+  a key whose roles carry only unrecognized `trawl:*` strings resolves no
+  usable capability and 403s — the fail-closed doctrine applied at the
+  door, matching the old unknown-role behaviour.

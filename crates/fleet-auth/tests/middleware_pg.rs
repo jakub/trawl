@@ -24,7 +24,7 @@ use axum::middleware::from_fn_with_state;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use fleet_auth::{
-    KeyStore, PrincipalKind, RoleAssignment, SessionConfig, SessionExpiry, SessionKey,
+    KeyStore, PrincipalKind, RolePermission, SessionConfig, SessionExpiry, SessionKey,
     SessionPayload, SessionState, VerifiedKey, encrypt, require_bearer, require_session,
 };
 use tower::ServiceExt as _;
@@ -38,10 +38,10 @@ use zeroize::Zeroizing;
 /// populated `Extension<VerifiedKey>` before forwarding.
 async fn echo_handler(Extension(key): Extension<VerifiedKey>) -> impl IntoResponse {
     format!(
-        "ok name={} kind={} grants={}",
+        "ok name={} kind={} roles={}",
         key.name,
         key.kind,
-        key.assignments_display()
+        key.roles_display()
     )
 }
 
@@ -82,11 +82,21 @@ fn issue_session_cookie(session_key: &SessionKey, token: &str, ttl_secs: i64) ->
     encrypt(session_key, &payload).expect("encrypt cookie")
 }
 
-fn trawl_grant() -> Vec<RoleAssignment> {
-    vec![RoleAssignment {
-        app: "trawl".into(),
-        role: "analyst".into(),
-    }]
+/// Seed the converted-shape `trawl-analyst` role and return its name as the
+/// role list every test key is created with.
+async fn trawl_role(store: &KeyStore) -> Vec<String> {
+    store
+        .create_role(
+            "trawl-analyst",
+            None,
+            &[RolePermission {
+                app: "trawl".into(),
+                permission: "query".into(),
+            }],
+        )
+        .await
+        .expect("seed trawl-analyst role");
+    vec!["trawl-analyst".to_owned()]
 }
 
 async fn body_string(response: axum::response::Response) -> String {
@@ -103,9 +113,10 @@ async fn body_string(response: axum::response::Response) -> String {
 #[sqlx::test]
 async fn session_valid_cookie_sets_extension(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
+    let roles = trawl_role(&store).await;
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key("alice", PrincipalKind::Human, &roles, None)
         .await
         .unwrap();
 
@@ -134,7 +145,7 @@ async fn session_valid_cookie_sets_extension(pool: sqlx::PgPool) {
     );
     let body = body_string(response).await;
     assert!(body.starts_with("ok name=alice"), "got: {body}");
-    assert!(body.contains("grants=trawl:analyst"), "got: {body}");
+    assert!(body.contains("roles=trawl-analyst"), "got: {body}");
 }
 
 #[sqlx::test]
@@ -161,9 +172,10 @@ async fn session_missing_cookie_returns_401(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn session_expired_cookie_returns_401_keeps_cookie(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
+    let roles = trawl_role(&store).await;
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key("alice", PrincipalKind::Human, &roles, None)
         .await
         .unwrap();
 
@@ -198,9 +210,10 @@ async fn session_expired_cookie_returns_401_keeps_cookie(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn session_tampered_cookie_returns_401(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
+    let roles = trawl_role(&store).await;
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key("alice", PrincipalKind::Human, &roles, None)
         .await
         .unwrap();
 
@@ -230,10 +243,12 @@ async fn session_tampered_cookie_returns_401(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn session_no_grant_returns_403_html_keeps_cookie(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
+    let roles = trawl_role(&store).await;
 
-    // Key has a grant for trawl, but the app is configured as "coastwatch".
+    // Key has trawl permissions only, but the app is configured as
+    // "coastwatch" — zero permissions in the app namespace → 403.
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key("alice", PrincipalKind::Human, &roles, None)
         .await
         .unwrap();
 
@@ -272,13 +287,14 @@ async fn session_no_grant_returns_403_html_keeps_cookie(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn session_grant_revoked_during_session_returns_403(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
+    let roles = trawl_role(&store).await;
 
-    // Key remains active, but the ONLY namespace grant is revoked
-    // after the cookie was issued. The next request must take the
-    // no-grant 403 path, proving middleware re-reads grants from the
-    // DB on each request rather than trusting cached state.
+    // Key remains active, but its ONLY role is unassigned after the
+    // cookie was issued. The next request must take the no-permission
+    // 403 path, proving middleware re-resolves roles from the DB on
+    // each request rather than trusting cached state.
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key("alice", PrincipalKind::Human, &roles, None)
         .await
         .unwrap();
 
@@ -287,7 +303,7 @@ async fn session_grant_revoked_during_session_returns_403(pool: sqlx::PgPool) {
     let app = session_router(state);
 
     store
-        .revoke_assignment(&created.info.prefix, "trawl")
+        .unassign_role(&created.info.prefix, "trawl-analyst")
         .await
         .unwrap();
 
@@ -315,9 +331,10 @@ async fn session_grant_revoked_during_session_returns_403(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn session_revoked_key_returns_401(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
+    let roles = trawl_role(&store).await;
 
     let created = store
-        .create_key("alice", PrincipalKind::Human, &trawl_grant(), None)
+        .create_key("alice", PrincipalKind::Human, &roles, None)
         .await
         .unwrap();
 
@@ -351,9 +368,10 @@ async fn session_revoked_key_returns_401(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn bearer_valid_token_sets_extension(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
+    let roles = trawl_role(&store).await;
 
     let created = store
-        .create_key("svc", PrincipalKind::Service, &trawl_grant(), None)
+        .create_key("svc", PrincipalKind::Service, &roles, None)
         .await
         .unwrap();
 
@@ -448,13 +466,14 @@ async fn bearer_invalid_token_returns_401(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn bearer_does_not_enforce_namespace(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
+    let roles = trawl_role(&store).await;
 
-    // A key with NO grant in "coastwatch" still passes bearer middleware
-    // configured for "coastwatch" — per ADR-0030 cross-app service
-    // principals must be allowed past, and each app gates further with
-    // its own role guard.
+    // A key with NO permission in "coastwatch" still passes bearer
+    // middleware configured for "coastwatch" — per ADR-0030 cross-app
+    // service principals must be allowed past, and each app gates further
+    // with its own permission guard.
     let created = store
-        .create_key("svc", PrincipalKind::Service, &trawl_grant(), None)
+        .create_key("svc", PrincipalKind::Service, &roles, None)
         .await
         .unwrap();
 

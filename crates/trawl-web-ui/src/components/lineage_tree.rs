@@ -34,8 +34,13 @@ impl From<DescendantView> for LineageNode {
     }
 }
 
-pub fn can_write_derivations(role: &str) -> bool {
-    role == "admin"
+/// Whether the resolved trawl permission set allows writing derivations.
+///
+/// Behaviour-preserving: only the trawl admin tier may write derivations
+/// today, so this delegates to [`crate::perms::is_trawl_admin`] rather
+/// than repeating the gating literal.
+pub fn can_write_derivations(permissions: &[String]) -> bool {
+    crate::perms::is_trawl_admin(permissions)
 }
 
 pub(crate) fn transformation_color(t: &str) -> &'static str {
