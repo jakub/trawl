@@ -299,10 +299,8 @@ async fn rate_limit_returns_429(pool: sqlx::PgPool) {
     let server = setup_with_rate_limit(
         pool,
         RateLimitConfig {
-            admin: 0,
-            analyst: 2, // burst of 2
-            reader: 0,
-            ingest: 0,
+            default_rpm: 2, // burst of 2
+            ..RateLimitConfig::default()
         },
     )
     .await;
@@ -407,10 +405,8 @@ async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
     // Permissive rate limits: the observe/cancel polls below run in a tight
     // window and must not trip the per-minute buckets.
     let permissive = RateLimitConfig {
-        admin: 1_000_000,
-        analyst: 1_000_000,
-        reader: 1_000_000,
-        ingest: 1_000_000,
+        default_rpm: 1_000_000,
+        ..RateLimitConfig::default()
     };
     let server = setup_with_rate_limit(pool, permissive).await;
 

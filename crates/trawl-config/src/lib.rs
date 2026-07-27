@@ -119,7 +119,7 @@ pub struct ServerConfig {
     #[serde(default = "default_max_sse_connections")]
     pub max_sse_connections: usize,
 
-    /// Per-role rate limiting (requests per minute). 0 = disabled.
+    /// Per-key rate limiting (requests per minute). 0 = disabled.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
 
@@ -129,24 +129,30 @@ pub struct ServerConfig {
     pub monitor_refresh_ms: u64,
 }
 
-/// Per-role rate limits in requests per minute.
+/// Per-key rate limiting in requests per minute (ADR-0006 slice 0).
 ///
-/// Each role gets an independent rate limiter keyed by API key prefix.
-/// Set a value to 0 to disable rate limiting for that role.
+/// Every API key gets an independent token bucket of `default_rpm`
+/// requests per minute. Per-role class-of-service returns in slice 1 as a
+/// `rate_rpm` role attribute.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
-    /// Admin rate limit (requests/minute). Default: 100.
-    #[serde(default = "default_rate_admin")]
-    pub admin: u32,
-    /// Analyst rate limit (requests/minute). Default: 60.
-    #[serde(default = "default_rate_analyst")]
-    pub analyst: u32,
-    /// Reader rate limit (requests/minute). Default: 30.
-    #[serde(default = "default_rate_reader")]
-    pub reader: u32,
-    /// Ingest rate limit (requests/minute). Default: 1000.
-    #[serde(default = "default_rate_ingest")]
-    pub ingest: u32,
+    /// Requests/minute allowed per API key (default: 1000). 0 = disabled.
+    #[serde(default = "default_rate_limit_rpm")]
+    pub default_rpm: u32,
+    /// Legacy per-role knob, removed in ADR-0006 slice 0. Kept as a
+    /// deserialization sentinel so an old config's tuned value fails loudly
+    /// at validation instead of being silently ignored.
+    #[serde(default)]
+    pub admin: Option<u32>,
+    /// Legacy per-role knob, removed in ADR-0006 slice 0 (sentinel).
+    #[serde(default)]
+    pub analyst: Option<u32>,
+    /// Legacy per-role knob, removed in ADR-0006 slice 0 (sentinel).
+    #[serde(default)]
+    pub reader: Option<u32>,
+    /// Legacy per-role knob, removed in ADR-0006 slice 0 (sentinel).
+    #[serde(default)]
+    pub ingest: Option<u32>,
 }
 
 /// Parquet data source settings.
@@ -690,14 +696,8 @@ pub const DEFAULT_RETENTION_MAX_AGE_DAYS: u64 = 90;
 pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 1_073_741_824;
 /// Default retention check interval (seconds). 1 hour.
 pub const DEFAULT_RETENTION_INTERVAL_SECS: u64 = 3600;
-/// Default admin rate limit (requests/minute).
-pub const DEFAULT_RATE_ADMIN: u32 = 100;
-/// Default analyst rate limit (requests/minute).
-pub const DEFAULT_RATE_ANALYST: u32 = 60;
-/// Default reader rate limit (requests/minute).
-pub const DEFAULT_RATE_READER: u32 = 30;
-/// Default ingest rate limit (requests/minute).
-pub const DEFAULT_RATE_INGEST: u32 = 1000;
+/// Default per-key rate limit (requests/minute).
+pub const DEFAULT_RATE_LIMIT_RPM: u32 = 1000;
 /// Default maximum concurrent SSE connections.
 pub const DEFAULT_MAX_SSE_CONNECTIONS: usize = 32;
 /// Fallback CPU count when `available_parallelism()` fails.
@@ -998,20 +998,8 @@ fn default_monitor_refresh_ms() -> u64 {
     DEFAULT_MONITOR_REFRESH_MS
 }
 
-fn default_rate_admin() -> u32 {
-    DEFAULT_RATE_ADMIN
-}
-
-fn default_rate_analyst() -> u32 {
-    DEFAULT_RATE_ANALYST
-}
-
-fn default_rate_reader() -> u32 {
-    DEFAULT_RATE_READER
-}
-
-fn default_rate_ingest() -> u32 {
-    DEFAULT_RATE_INGEST
+fn default_rate_limit_rpm() -> u32 {
+    DEFAULT_RATE_LIMIT_RPM
 }
 
 fn default_retention_max_age_days() -> u64 {
@@ -1029,10 +1017,11 @@ fn default_retention_interval_secs() -> u64 {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            admin: DEFAULT_RATE_ADMIN,
-            analyst: DEFAULT_RATE_ANALYST,
-            reader: DEFAULT_RATE_READER,
-            ingest: DEFAULT_RATE_INGEST,
+            default_rpm: DEFAULT_RATE_LIMIT_RPM,
+            admin: None,
+            analyst: None,
+            reader: None,
+            ingest: None,
         }
     }
 }
@@ -1173,6 +1162,35 @@ impl Config {
                  sqlite file is not imported — recreate saved queries and schedules"
                     .into(),
             ));
+        }
+
+        // The per-role rate-limit knobs died in ADR-0006 slice 0: rate
+        // limiting is now per API key with a single default_rpm ceiling.
+        // Deb upgrades preserve the old trawld.toml (conffile semantics), so
+        // a leftover per-role key must be a LOUD error naming the migration —
+        // serde would otherwise silently ignore the operator's tuned quotas.
+        {
+            let rl = &self.server.rate_limit;
+            let legacy: Vec<&str> = [
+                ("admin", rl.admin),
+                ("analyst", rl.analyst),
+                ("reader", rl.reader),
+                ("ingest", rl.ingest),
+            ]
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(k, _)| *k)
+            .collect();
+            if !legacy.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "server.rate_limit.{{{}}} removed in ADR-0006 slice 0: rate limiting \
+                     is now per API key, not per role. Replace the per-role keys with a \
+                     single default_rpm (requests/minute per key, 0 disables; default \
+                     {DEFAULT_RATE_LIMIT_RPM}). Per-role class-of-service returns in \
+                     slice 1 as a role rate_rpm attribute",
+                    legacy.join(", "),
+                )));
+            }
         }
 
         if self.server.max_concurrent_queries == 0 {
@@ -1487,10 +1505,8 @@ path = "/data/*.parquet"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.rate_limit.admin, 100);
-        assert_eq!(config.server.rate_limit.analyst, 60);
-        assert_eq!(config.server.rate_limit.reader, 30);
-        assert_eq!(config.server.rate_limit.ingest, 1000);
+        assert_eq!(config.server.rate_limit.default_rpm, 1000);
+        config.validate().unwrap();
     }
 
     #[test]
@@ -1498,19 +1514,40 @@ path = "/data/*.parquet"
         let toml = r#"
 [server]
 [server.rate_limit]
-admin = 200
-analyst = 0
-reader = 10
-ingest = 500
+default_rpm = 250
 [data]
 path = "/data/*.parquet"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.rate_limit.admin, 200);
-        assert_eq!(config.server.rate_limit.analyst, 0);
-        assert_eq!(config.server.rate_limit.reader, 10);
-        assert_eq!(config.server.rate_limit.ingest, 500);
+        assert_eq!(config.server.rate_limit.default_rpm, 250);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_legacy_rate_limit_fields() {
+        // The per-role rate-limit knobs died in ADR-0006 slice 0 (per-key
+        // buckets). Deb conffile upgrades preserve old trawld.toml files, so
+        // a leftover per-role key must be a loud error naming the migration —
+        // never a silent ignore of the operator's tuned quotas.
+        for legacy_key in ["admin", "analyst", "reader", "ingest"] {
+            let toml = format!(
+                r#"
+[server]
+[server.rate_limit]
+{legacy_key} = 100
+[data]
+path = "/data/*.parquet"
+[auth]
+"#
+            );
+            let config: Config = toml::from_str(&toml).unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(legacy_key), "got: {err}");
+            assert!(err.contains("removed"), "got: {err}");
+            assert!(err.contains("default_rpm"), "got: {err}");
+            assert!(err.contains("ADR-0006"), "got: {err}");
+        }
     }
 
     #[test]
