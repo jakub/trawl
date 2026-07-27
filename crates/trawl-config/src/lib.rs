@@ -1036,6 +1036,35 @@ fn expand_tilde(path: &str) -> String {
     shellexpand::tilde(path).into_owned()
 }
 
+/// Reject leftover keys from a superseded config shape.
+///
+/// Package upgrades keep the operator's existing config (deb conffile
+/// semantics, reused helm config maps) and serde silently ignores unknown
+/// keys — so every removed knob has to fail LOUD, naming the migration that
+/// killed it and what replaces it, rather than quietly dropping tuned values.
+///
+/// `fields` pairs each removed key's fully-qualified name with whether the
+/// parsed config still carries a value for it; only the present ones are
+/// named in the error.
+fn reject_removed_fields(
+    fields: &[(&str, bool)],
+    migration: &str,
+    guidance: &str,
+) -> Result<(), ConfigError> {
+    let present: Vec<&str> = fields
+        .iter()
+        .filter(|(_, is_set)| *is_set)
+        .map(|&(name, _)| name)
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigError::Validation(format!(
+        "{} removed in {migration}: {guidance}",
+        present.join(", "),
+    )))
+}
+
 impl Config {
     /// Parse configuration from a TOML string.
     ///
@@ -1150,48 +1179,34 @@ impl Config {
 
         // db_path died in ADR-0004 slice 3: the app-state stores (query
         // history, saved queries, schedules) moved to the dedicated trawl
-        // postgres database. Deb upgrades preserve the old trawld.toml
-        // (conffile semantics), so a leftover db_path must be a LOUD error
-        // naming the migration — serde would otherwise silently ignore it.
-        if self.auth.db_path.is_some() {
-            return Err(ConfigError::Validation(
-                "auth.db_path was removed in the ADR-0004 slice-3 migration: query history, \
-                 saved queries, and schedules now live in the dedicated trawl postgres \
-                 database. Remove db_path from [auth], configure [storage] database_url \
-                 (or TRAWL_DATABASE_URL), and see the fleet-auth cutover runbook. The old \
-                 sqlite file is not imported — recreate saved queries and schedules"
-                    .into(),
-            ));
-        }
+        // postgres database.
+        reject_removed_fields(
+            &[("auth.db_path", self.auth.db_path.is_some())],
+            "the ADR-0004 slice-3 migration",
+            "query history, saved queries, and schedules now live in the dedicated trawl \
+             postgres database. Remove db_path from [auth], configure [storage] database_url \
+             (or TRAWL_DATABASE_URL), and see the fleet-auth cutover runbook. The old sqlite \
+             file is not imported — recreate saved queries and schedules",
+        )?;
 
         // The per-role rate-limit knobs died in ADR-0006 slice 0: rate
         // limiting is now per API key with a single default_rpm ceiling.
-        // Deb upgrades preserve the old trawld.toml (conffile semantics), so
-        // a leftover per-role key must be a LOUD error naming the migration —
-        // serde would otherwise silently ignore the operator's tuned quotas.
-        {
-            let rl = &self.server.rate_limit;
-            let legacy: Vec<&str> = [
-                ("admin", rl.admin),
-                ("analyst", rl.analyst),
-                ("reader", rl.reader),
-                ("ingest", rl.ingest),
-            ]
-            .iter()
-            .filter(|(_, v)| v.is_some())
-            .map(|(k, _)| *k)
-            .collect();
-            if !legacy.is_empty() {
-                return Err(ConfigError::Validation(format!(
-                    "server.rate_limit.{{{}}} removed in ADR-0006 slice 0: rate limiting \
-                     is now per API key, not per role. Replace the per-role keys with a \
-                     single default_rpm (requests/minute per key, 0 disables; default \
-                     {DEFAULT_RATE_LIMIT_RPM}). Per-role class-of-service returns in \
-                     slice 1 as a role rate_rpm attribute",
-                    legacy.join(", "),
-                )));
-            }
-        }
+        let rl = &self.server.rate_limit;
+        reject_removed_fields(
+            &[
+                ("server.rate_limit.admin", rl.admin.is_some()),
+                ("server.rate_limit.analyst", rl.analyst.is_some()),
+                ("server.rate_limit.reader", rl.reader.is_some()),
+                ("server.rate_limit.ingest", rl.ingest.is_some()),
+            ],
+            "ADR-0006 slice 0",
+            &format!(
+                "rate limiting is now per API key, not per role. Replace the per-role keys \
+                 with a single default_rpm (requests/minute per key, 0 disables; default \
+                 {DEFAULT_RATE_LIMIT_RPM}). Per-role class-of-service returns in slice 1 as \
+                 a role rate_rpm attribute"
+            ),
+        )?;
 
         if self.server.max_concurrent_queries == 0 {
             return Err(ConfigError::Validation(
@@ -1326,7 +1341,7 @@ db_path = "/var/lib/trawl/store.db"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("db_path was removed"), "got: {err}");
+        assert!(err.contains("auth.db_path removed"), "got: {err}");
         assert!(err.contains("slice-3"), "got: {err}");
         assert!(err.contains("[storage]"), "got: {err}");
         assert!(err.contains("runbook"), "got: {err}");
