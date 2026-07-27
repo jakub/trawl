@@ -860,13 +860,16 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
     let writer = CaptureWriter(Arc::clone(&buf));
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
+        // Plain text: the assertions below match field names literally, and
+        // ANSI styling splits `permissions=` with escape codes.
+        .with_ansi(false)
         .with_writer(move || writer.clone())
         .try_init();
 
     let key_store = common::fleet_keystore(&pool).await;
 
     // Baseline key so the initial snapshot is non-trivial.
-    key_store
+    let baseline = key_store
         .create_key(
             "baseline",
             PrincipalKind::Service,
@@ -900,6 +903,25 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Privilege escalation with no key mutation at all: the role the baseline
+    // key already holds gains a permission. Plus a role assignment.
+    second
+        .add_role_permissions(
+            "trawl-reader",
+            &[fleet_auth::RolePermission {
+                app: "trawl".into(),
+                permission: "server_manage".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    second
+        .assign_role(&baseline.info.prefix, "trawl-admin")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
     second.revoke_key(&created.info.prefix).await.unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
 
@@ -915,6 +937,32 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
     assert!(
         log.contains("key_revoked"),
         "audit must emit key_revoked; log:\n{log}"
+    );
+    // The effective capability, not just the mutable role name, is recorded.
+    let created_line = log
+        .lines()
+        .find(|l| l.contains("key_created") && l.contains("detected by audit"))
+        .unwrap_or_default();
+    assert!(
+        created_line.contains("permissions=") && created_line.contains("trawl:"),
+        "key_created must record resolved permissions; line:\n{created_line}"
+    );
+    // Mutating a role escalates every key holding it — that must be audited.
+    let role_line = log
+        .lines()
+        .find(|l| l.contains("role_changed"))
+        .unwrap_or_default();
+    assert!(
+        role_line.contains("trawl-reader") && role_line.contains("trawl:server_manage"),
+        "audit must emit role_changed naming the added permission; log:\n{log}"
+    );
+    let assign_line = log
+        .lines()
+        .find(|l| l.contains("key_roles_changed"))
+        .unwrap_or_default();
+    assert!(
+        assign_line.contains(&baseline.info.prefix) && assign_line.contains("trawl-admin"),
+        "audit must emit key_roles_changed for the reassigned key; log:\n{log}"
     );
 }
 
