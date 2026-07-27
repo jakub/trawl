@@ -131,14 +131,23 @@ pub struct ServerConfig {
 
 /// Per-key rate limiting in requests per minute (ADR-0006 slice 0).
 ///
-/// Every API key gets an independent token bucket of `default_rpm`
-/// requests per minute. Per-role class-of-service returns in slice 1 as a
-/// `rate_rpm` role attribute.
+/// Every API key gets an independent token bucket: `default_rpm` on the
+/// interactive API routes, `ingest_rpm` on `/api/v1/ingest`. The split is by
+/// route, not by principal — a log shipper flushing batches and a human
+/// running `DuckDB` scans need ceilings two orders of magnitude apart, and
+/// collapsing both onto one number would either throttle ingest or hand every
+/// interactive key the shipper-sized ceiling. Per-role class-of-service
+/// returns in slice 1 as a `rate_rpm` role attribute.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
-    /// Requests/minute allowed per API key (default: 1000). 0 = disabled.
+    /// Requests/minute allowed per API key on the interactive API routes
+    /// (default: 100). 0 = disabled.
     #[serde(default = "default_rate_limit_rpm")]
     pub default_rpm: u32,
+    /// Requests/minute allowed per API key on `/api/v1/ingest`
+    /// (default: 1000). 0 = disabled.
+    #[serde(default = "default_ingest_rate_limit_rpm")]
+    pub ingest_rpm: u32,
     /// Legacy per-role knob, removed in ADR-0006 slice 0. Kept as a
     /// deserialization sentinel so an old config's tuned value fails loudly
     /// at validation instead of being silently ignored.
@@ -696,8 +705,15 @@ pub const DEFAULT_RETENTION_MAX_AGE_DAYS: u64 = 90;
 pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 1_073_741_824;
 /// Default retention check interval (seconds). 1 hour.
 pub const DEFAULT_RETENTION_INTERVAL_SECS: u64 = 3600;
-/// Default per-key rate limit (requests/minute).
-pub const DEFAULT_RATE_LIMIT_RPM: u32 = 1000;
+/// Default per-key rate limit on the interactive API routes
+/// (requests/minute). Sized as the loosest legacy *interactive* ceiling (the
+/// old admin role), not the ingest one — an upgrade must not silently hand a
+/// reader key a shipper-sized query budget.
+pub const DEFAULT_RATE_LIMIT_RPM: u32 = 100;
+/// Default per-key rate limit on `/api/v1/ingest` (requests/minute).
+/// Unchanged from the legacy ingest-role ceiling: vector flushes a batch per
+/// 1 MB / 5 s per source, and several sources commonly share one ingest key.
+pub const DEFAULT_INGEST_RATE_LIMIT_RPM: u32 = 1000;
 /// Default maximum concurrent SSE connections.
 pub const DEFAULT_MAX_SSE_CONNECTIONS: usize = 32;
 /// Fallback CPU count when `available_parallelism()` fails.
@@ -1002,6 +1018,10 @@ fn default_rate_limit_rpm() -> u32 {
     DEFAULT_RATE_LIMIT_RPM
 }
 
+fn default_ingest_rate_limit_rpm() -> u32 {
+    DEFAULT_INGEST_RATE_LIMIT_RPM
+}
+
 fn default_retention_max_age_days() -> u64 {
     DEFAULT_RETENTION_MAX_AGE_DAYS
 }
@@ -1018,6 +1038,7 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             default_rpm: DEFAULT_RATE_LIMIT_RPM,
+            ingest_rpm: DEFAULT_INGEST_RATE_LIMIT_RPM,
             admin: None,
             analyst: None,
             reader: None,
@@ -1202,9 +1223,10 @@ impl Config {
             "ADR-0006 slice 0",
             &format!(
                 "rate limiting is now per API key, not per role. Replace the per-role keys \
-                 with a single default_rpm (requests/minute per key, 0 disables; default \
-                 {DEFAULT_RATE_LIMIT_RPM}). Per-role class-of-service returns in slice 1 as \
-                 a role rate_rpm attribute"
+                 with default_rpm for the interactive API routes (requests/minute per key, \
+                 0 disables; default {DEFAULT_RATE_LIMIT_RPM}) and ingest_rpm for \
+                 /api/v1/ingest (default {DEFAULT_INGEST_RATE_LIMIT_RPM}). Per-role \
+                 class-of-service returns in slice 1 as a role rate_rpm attribute"
             ),
         )?;
 
@@ -1520,7 +1542,11 @@ path = "/data/*.parquet"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.rate_limit.default_rpm, 1000);
+        // Interactive keys default to the loosest legacy *interactive*
+        // ceiling (old admin = 100), not the ingest one — the untuned upgrade
+        // path must not quietly widen a reader's query budget to 1000/min.
+        assert_eq!(config.server.rate_limit.default_rpm, 100);
+        assert_eq!(config.server.rate_limit.ingest_rpm, 1000);
         config.validate().unwrap();
     }
 
@@ -1530,12 +1556,14 @@ path = "/data/*.parquet"
 [server]
 [server.rate_limit]
 default_rpm = 250
+ingest_rpm = 5000
 [data]
 path = "/data/*.parquet"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.rate_limit.default_rpm, 250);
+        assert_eq!(config.server.rate_limit.ingest_rpm, 5000);
         config.validate().unwrap();
     }
 
@@ -1561,6 +1589,7 @@ path = "/data/*.parquet"
             assert!(err.contains(legacy_key), "got: {err}");
             assert!(err.contains("removed"), "got: {err}");
             assert!(err.contains("default_rpm"), "got: {err}");
+            assert!(err.contains("ingest_rpm"), "got: {err}");
             assert!(err.contains("ADR-0006"), "got: {err}");
         }
     }

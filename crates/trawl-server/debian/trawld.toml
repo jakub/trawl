@@ -50,10 +50,12 @@ http_addr = "0.0.0.0:5514"
 # max_query_history = 1000
 
 # Per-key rate limit (requests per minute). Every API key gets an
-# independent bucket of default_rpm requests/minute; 0 = disabled.
-# Per-class ceilings return as a role rate_rpm attribute (ADR-0006 slice 1).
+# independent bucket: default_rpm on the interactive API routes,
+# ingest_rpm on /api/v1/ingest; 0 = disabled for that route class.
+# Per-role ceilings return as a role rate_rpm attribute (ADR-0006 slice 1).
 # [server.rate_limit]
-# default_rpm = 1000
+# default_rpm = 100
+# ingest_rpm = 1000
 
 [data]
 # Directory containing parquet files.

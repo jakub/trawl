@@ -63,13 +63,16 @@ HTTPS listener, query limits, TLS, and rate limiting.
 
 #### `[server.rate_limit]`
 
-Per-key rate limiting in requests per minute. Every API key gets an independent token bucket of `default_rpm` requests per minute. Set to `0` to disable rate limiting entirely.
+Per-key rate limiting in requests per minute. Every API key gets an independent token bucket, sized per route class: `default_rpm` on the interactive API routes, `ingest_rpm` on `/api/v1/ingest`. Set a field to `0` to disable rate limiting for that route class.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `default_rpm` | integer | `1000` | Requests/minute allowed per API key; `0` disables |
+| `default_rpm` | integer | `100` | Requests/minute allowed per API key on the interactive API routes; `0` disables |
+| `ingest_rpm` | integer | `1000` | Requests/minute allowed per API key on `/api/v1/ingest`; `0` disables |
 
-**Migration note**: the per-role keys (`admin`, `analyst`, `reader`, `ingest`) were removed in ADR-0006 slice 0 — a config still carrying them fails validation at boot rather than being silently ignored. Replace them with a single `default_rpm`. Per-role class-of-service returns in slice 1 as a `rate_rpm` role attribute.
+The two classes need ceilings orders of magnitude apart: vector flushes a batch per 1 MB / 5 s per source and sources commonly share one ingest key, while `/query`, `/export`, and `/stream` each run a DuckDB scan. Raise `ingest_rpm` for large shipper fleets; raise `default_rpm` for dashboard-heavy UI use.
+
+**Migration note**: the per-role keys (`admin`, `analyst`, `reader`, `ingest`) were removed in ADR-0006 slice 0 — a config still carrying them fails validation at boot rather than being silently ignored. Replace `ingest` with `ingest_rpm`, and the interactive roles with `default_rpm`. Per-role class-of-service returns in slice 1 as a `rate_rpm` role attribute.
 
 #### TLS auto-generation
 
@@ -212,7 +215,8 @@ tls_cert_path = "/etc/trawl/tls/cert.pem"
 tls_key_path = "/etc/trawl/tls/key.pem"
 
 [server.rate_limit]
-default_rpm = 1000
+default_rpm = 100
+ingest_rpm = 1000
 
 [data]
 path = "/var/lib/trawl/data"

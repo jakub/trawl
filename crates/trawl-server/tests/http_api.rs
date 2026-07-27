@@ -322,6 +322,50 @@ async fn rate_limit_returns_429(pool: sqlx::PgPool) {
     }
 }
 
+/// The interactive ceiling (`default_rpm`) must never apply to `/ingest`, and
+/// the shipper-sized `ingest_rpm` must never apply to the query routes — the
+/// two route classes hold separate bucket maps. Without the split, one number
+/// has to serve both, and sizing it for vector hands every interactive key the
+/// same budget (the loosening this test exists to catch).
+#[sqlx::test(migrations = false)]
+async fn ingest_rpm_is_independent_of_the_interactive_ceiling(pool: sqlx::PgPool) {
+    let server = setup_with_rate_limit(
+        pool,
+        RateLimitConfig {
+            default_rpm: 1,
+            ingest_rpm: 10,
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
+    let raw = raw_client();
+
+    // Well past the interactive burst of 1 — the ingest key rides its own
+    // bucket, so every one of these is a 200.
+    for i in 0..5 {
+        let resp = raw
+            .post(format!("{}/api/v1/ingest", server.url))
+            .header("authorization", format!("Bearer {}", server.ingest_token))
+            .header("content-type", "application/x-ndjson")
+            .body(format!(r#"{{"service":"test-svc","message":"batch {i}"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "ingest request {i} must not be limited");
+    }
+
+    // The query routes still enforce default_rpm = 1: second call is 429.
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    client.query_paginated("*", None, None).await.unwrap();
+    let result = client.query_paginated("*", None, None).await;
+    match result.unwrap_err() {
+        trawl_client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 429, "interactive routes keep the default_rpm burst");
+        }
+        other => panic!("expected 429 rate limit error, got: {other:?}"),
+    }
+}
+
 /// AC1 (ADR-0006 slice 0): two keys holding the SAME role get independent
 /// buckets — the limiter keys on the keystore id, not on any shared role
 /// bucket. Exhausting key A's quota 429s A while key B still gets 200.

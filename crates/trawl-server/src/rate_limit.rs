@@ -5,11 +5,18 @@
 //! Per-key rate limiting middleware using the governor crate (GCRA algorithm).
 //!
 //! Every API key gets an independent token bucket keyed by its keystore row
-//! id (`VerifiedKey.id`) with a single config-default RPM ceiling (ADR-0006
-//! slice 0). Buckets are created lazily on first request and never evicted:
-//! the map is bounded by the keystore's key count (dozens in this deployment
-//! class), the same bound the old prefix-keyed store had. Per-role
-//! class-of-service returns in slice 1 as a `rate_rpm` role attribute.
+//! id (`VerifiedKey.id`) with a config-default RPM ceiling (ADR-0006 slice 0).
+//! Buckets are created lazily on first request and never evicted: the map is
+//! bounded by the keystore's key count (dozens in this deployment class), the
+//! same bound the old prefix-keyed store had. Per-role class-of-service
+//! returns in slice 1 as a `rate_rpm` role attribute.
+//!
+//! The ceiling is per *route class*, not per principal: the interactive API
+//! routes use `default_rpm` and `/api/v1/ingest` uses `ingest_rpm`, each with
+//! its own bucket map wired by the router. A log shipper needs orders of
+//! magnitude more requests/minute than a human running `DuckDB` scans, so one
+//! shared number would have to be sized for the shipper — handing every
+//! interactive key that budget.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -44,10 +51,20 @@ fn make_limiter(rpm: u32) -> Option<Arc<KeyedLimiter>> {
 }
 
 impl RateLimitState {
-    /// Build the rate limiter from config. A `default_rpm` of 0 disables limiting.
-    pub fn from_config(config: &RateLimitConfig) -> Self {
+    /// Limiter for the interactive API routes (query, export, stream, …).
+    /// A `default_rpm` of 0 disables limiting.
+    pub fn interactive(config: &RateLimitConfig) -> Self {
         Self {
             limiter: make_limiter(config.default_rpm),
+        }
+    }
+
+    /// Limiter for `/api/v1/ingest`, on its own bucket map so a shipper-sized
+    /// ceiling never leaks onto the query routes. An `ingest_rpm` of 0
+    /// disables limiting.
+    pub fn ingest(config: &RateLimitConfig) -> Self {
+        Self {
+            limiter: make_limiter(config.ingest_rpm),
         }
     }
 }
@@ -100,13 +117,13 @@ mod tests {
 
     #[test]
     fn zero_rpm_disables_limiter() {
-        let state = RateLimitState::from_config(&config_with_rpm(0));
+        let state = RateLimitState::interactive(&config_with_rpm(0));
         assert!(state.limiter.is_none());
     }
 
     #[test]
     fn rate_limit_rejects_after_burst() {
-        let state = RateLimitState::from_config(&config_with_rpm(5));
+        let state = RateLimitState::interactive(&config_with_rpm(5));
         let limiter = state.limiter.as_ref().unwrap();
 
         let key_id: i64 = 42;
@@ -124,8 +141,38 @@ mod tests {
     }
 
     #[test]
+    fn ingest_ceiling_is_separate_from_the_interactive_one() {
+        let config = RateLimitConfig {
+            default_rpm: 1,
+            ingest_rpm: 5,
+            ..RateLimitConfig::default()
+        };
+        let interactive = RateLimitState::interactive(&config);
+        let ingest = RateLimitState::ingest(&config);
+        let key_id: i64 = 7;
+
+        // Same key, same id: exhausting the interactive bucket must not touch
+        // the ingest one, and the ingest ceiling must not leak the other way.
+        let interactive_limiter = interactive.limiter.as_ref().unwrap();
+        assert!(interactive_limiter.check_key(&key_id).is_ok());
+        assert!(
+            interactive_limiter.check_key(&key_id).is_err(),
+            "interactive burst is default_rpm (1), not ingest_rpm"
+        );
+
+        let ingest_limiter = ingest.limiter.as_ref().unwrap();
+        let mut accepted = 0;
+        for _ in 0..20 {
+            if ingest_limiter.check_key(&key_id).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 5, "ingest burst is ingest_rpm (5)");
+    }
+
+    #[test]
     fn different_key_ids_have_independent_limits() {
-        let state = RateLimitState::from_config(&config_with_rpm(2));
+        let state = RateLimitState::interactive(&config_with_rpm(2));
         let limiter = state.limiter.as_ref().unwrap();
 
         // Exhaust key id 1's bucket.
