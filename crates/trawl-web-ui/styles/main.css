@@ -380,9 +380,18 @@
  * the base theme hard-codes so the editor inverts with the rest of the
  * app; 3-class specificity for the reason above. (No
  * `.cm-activeLineGutter` rule: the bundle installs `highlightActiveLine`
- * but not `highlightActiveLineGutter`, so that class never renders.) */
+ * but not `highlightActiveLineGutter`, so that class never renders.)
+ *
+ * The rail must stay OPAQUE: `.cm-gutters` is `position: sticky` with
+ * `z-index: 200` inside the horizontally scrollable `.cm-scroller`, and
+ * the vendored bundle installs no `lineWrapping`, so a query wider than
+ * the frame scrolls its text UNDER the pinned rail. `transparent` would
+ * let that text bleed through the digits. Reproduce the frame's own
+ * resting surface as an opaque slab instead — `--fill` (translucent) as
+ * a gradient layer over the `--panel` the `.editor-wrap` paints — so the
+ * rail reads the editor body's colour in both themes and still masks. */
 .dsl-editor .cm-editor .cm-gutters {
-  background: transparent;
+  background: linear-gradient(var(--fill), var(--fill)), var(--panel);
   border-right: 1px solid var(--line);
   color: var(--ink-4);
 }
