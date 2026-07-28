@@ -234,3 +234,33 @@ fn no_custom_property_defined_in_both_stylesheets() {
          (collisions risk cross-stylesheet override drift): {dups:?}"
     );
 }
+
+#[test]
+fn app_control_fills_read_the_fill_token() {
+    // fleet-ui's dark `--line` is a 10%-alpha white overlay and
+    // `color-mix(<colour>, transparent)` multiplies alphas, so an app-side
+    // fill written as `color-mix(in oklab, var(--line) N%, transparent)`
+    // renders at .10 x N in dark mode — the DSL editor and the range
+    // trigger shipped at ~2% that way. App fills read fleet-ui's per-theme
+    // `--fill` / `--fill-2` tokens instead.
+    assert!(
+        APP_CSS.contains("var(--fill)"),
+        "expected the app control fills to read fleet-ui's --fill token"
+    );
+    let strays: Vec<&str> = APP_CSS
+        .match_indices("var(--line) ")
+        .filter_map(|(i, m)| {
+            let rest = &APP_CSS[i + m.len()..];
+            let end = rest.find(')')?;
+            rest[..end]
+                .contains("transparent")
+                .then(|| APP_CSS[i..i + m.len() + end].trim())
+        })
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "these mix fleet-ui's alpha dark `--line` against `transparent`, \
+         collapsing the fill to a few percent in dark mode — read \
+         `var(--fill)` / `var(--fill-2)` instead: {strays:#?}"
+    );
+}

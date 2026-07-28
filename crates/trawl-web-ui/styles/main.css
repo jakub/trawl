@@ -350,7 +350,7 @@
   flex: 1 1 auto;
   min-width: 0;
   height: 140px;
-  background: color-mix(in oklab, var(--line) 14%, transparent);
+  background: var(--fill);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   overflow: hidden;
@@ -394,7 +394,7 @@
   gap: 6px;
   height: 28px;
   padding: 0 10px;
-  background: color-mix(in oklab, var(--line) 20%, transparent);
+  background: var(--fill);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   color: var(--ink-2);
@@ -411,7 +411,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.dr-trigger:hover { color: var(--ink); background: color-mix(in oklab, var(--line) 45%, transparent); }
+.dr-trigger:hover { color: var(--ink); background: var(--fill-2); }
 .dr-trigger.open {
   color: var(--accent);
   background: var(--accent-wash);

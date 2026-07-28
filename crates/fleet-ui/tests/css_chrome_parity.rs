@@ -382,6 +382,47 @@ fn mira_blue_tokens_declared() {
 }
 
 #[test]
+fn control_fills_route_through_the_per_theme_token() {
+    // Dark `--line` is ITSELF a 10%-alpha white overlay, and
+    // `color-mix(<colour>, transparent)` MULTIPLIES alphas: a fill spelled
+    // `color-mix(in oklab, var(--line) 20%, transparent)` renders at
+    // .10 x .20 = 2% in dark mode — nothing on an oklch(18%) panel, so
+    // dark inputs would ship effectively unfilled while the light theme
+    // looked correct. Fills therefore read the per-theme `--fill` /
+    // `--fill-2` tokens (light mixes the opaque line; dark states the
+    // overlay alpha directly), and the ONLY `--line`-against-transparent
+    // mixes left in the file are those two light declarations.
+    // Declarations only — anchored on the newline + indent so prose in the
+    // surrounding comments never counts.
+    for token in ["\n  --fill:", "\n  --fill-2:"] {
+        assert_eq!(
+            CSS.matches(token).count(),
+            2,
+            "`{}` must be declared exactly once per theme block",
+            token.trim()
+        );
+    }
+    let dark = CSS
+        .find("[data-theme=\"dark\"] {")
+        .expect("dark theme token block present");
+    let strays: Vec<&str> = CSS
+        .match_indices("var(--line) ")
+        .filter_map(|(i, m)| {
+            let rest = &CSS[i + m.len()..];
+            let end = rest.find(')')?;
+            (rest[..end].contains("transparent") && i > dark)
+                .then(|| CSS[i..i + m.len() + end].trim())
+        })
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "these mix the alpha dark `--line` against `transparent`, which \
+         multiplies alphas and collapses the fill to a few percent — read \
+         `var(--fill)` / `var(--fill-2)` instead: {strays:#?}"
+    );
+}
+
+#[test]
 fn chrome_keyframes_present() {
     for name in [
         "blink",

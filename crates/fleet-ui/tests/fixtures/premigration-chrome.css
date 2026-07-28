@@ -10,7 +10,9 @@
  * deliberate: the radius tokens (--radius-ctl/-sm) replace px
  * literals, .btn-sm becomes the Mira outline treatment (transparent
  * fill, weight 500, neutral panel-3 hover), inputs (.m-field input,
- * .reason-input) take the translucent line-20% fill and the shared
+ * .reason-input) take the translucent --fill wash (per-theme token:
+ * the light line-20% mix, an explicit white overlay in dark, since
+ * mixing the alpha dark --line collapses it) and the shared
  * --shadow-glow 2px ring focus, .sd-scrim neutralizes onto the oklch
  * ink scale, and .sd-x / .modal .m-hd .ic round on --radius-sm.
  * Structure (layout, spacing, transitions) is otherwise unchanged —
@@ -89,7 +91,7 @@
 }
 
 .modal .m-field input {
-  background: color-mix(in oklab, var(--line) 20%, transparent);
+  background: var(--fill);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
   padding: 6px 10px; font-family: var(--font-ui); font-size: var(--fs-base);
   color: var(--ink); outline: none; height: 30px;
@@ -165,7 +167,7 @@
 
 .reason-input {
   width: 100%; min-height: 60px; padding: 6px 8px;
-  background: color-mix(in oklab, var(--line) 20%, transparent); color: var(--ink);
+  background: var(--fill); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
   font-family: var(--font-mono); font-size: var(--fs-base);
   resize: vertical;

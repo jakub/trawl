@@ -89,6 +89,15 @@
   --line-2:    oklch(94.8% 0 0);
   --selection: rgba(0,0,0,.08);
 
+  /* Control fills (ADR-0007): the translucent wash under inputs, the
+   * app DSL editor and the range trigger. --fill is the resting fill —
+   * the ADR's "~20% of the border color" — and --fill-2 the hover step.
+   * Every such fill reads these tokens; a literal `color-mix(var(--line)
+   * N%, transparent)` at the call site is theme-blind, and the dark
+   * --line is an alpha overlay (see the dark block). */
+  --fill:      color-mix(in oklab, var(--line) 20%, transparent);
+  --fill-2:    color-mix(in oklab, var(--line) 45%, transparent);
+
   --accent:      #2a5c8a;
   --accent-2:    color-mix(in oklab, #2a5c8a 85%, white);
   --accent-soft: #4a7cab;
@@ -131,6 +140,16 @@
   --line:      oklch(100% 0 0 / .10);
   --line-2:    oklch(100% 0 0 / .06);
   --selection: rgba(255,255,255,.14);
+
+  /* Dark control fills are stated as white-alpha overlays instead of
+   * mixed from --line: --line is ITSELF a 10%-alpha white here, and
+   * `color-mix(..., transparent)` MULTIPLIES alphas, so the light
+   * recipe would resolve to .10 x .20 = 2% — a wash of nothing on an
+   * oklch(18%) panel. These are the dark counterparts of the light
+   * --line mixes (ADR-0007's "~30% dark"), expressed in the same
+   * overlay system the lines use. */
+  --fill:      oklch(100% 0 0 / .06);
+  --fill-2:    oklch(100% 0 0 / .11);
 
   --accent:      #5a9fd4;
   --accent-2:    color-mix(in oklab, #5a9fd4 85%, white);
@@ -314,7 +333,7 @@ textarea:focus-visible,
 .field input[type="text"] {
   width: 100%;
   padding: 8px 10px;
-  background: color-mix(in oklab, var(--line) 20%, transparent);
+  background: var(--fill);
   color: var(--ink);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
@@ -372,15 +391,18 @@ textarea:focus-visible,
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-full { width: 100%; }
 
-/* Dark outline buttons carry a faint line-tint fill (Mira): the
- * white-alpha --line at 30% reads as a whisper of surface, keeping
- * the outline pair visible on dark panels. It out-specifies the
- * `.btn-sec` / `.btn-sm` base fills (0,2,0 vs 0,1,0), so it must sit
- * BEFORE their `:hover` rules — `.btn-sec:hover` is also (0,2,0) and
- * only wins on source order. */
+/* Dark outline buttons carry a whisper of surface (Mira), keeping the
+ * outline pair visible on dark panels. Deliberately fainter than the
+ * shared --fill token — the `:hover` fill is `--panel-3` at 55%, which
+ * composites to roughly a 4% white lift over --panel, so a resting
+ * fill at --fill's 6% would out-lighten its own hover. 4% keeps the
+ * hover a lift rather than a dip. It out-specifies the `.btn-sec` /
+ * `.btn-sm` base fills (0,2,0 vs 0,1,0), so it must sit BEFORE their
+ * `:hover` rules — `.btn-sec:hover` is also (0,2,0) and only wins on
+ * source order. */
 [data-theme="dark"] .btn-sec,
 [data-theme="dark"] .btn-sm {
-  background: color-mix(in oklab, var(--line) 30%, transparent);
+  background: oklch(100% 0 0 / .04);
 }
 
 .btn-sec {
@@ -535,7 +557,7 @@ textarea:focus-visible,
   letter-spacing: var(--label-spacing); color: var(--ink-3);
 }
 .modal .m-field input {
-  background: color-mix(in oklab, var(--line) 20%, transparent);
+  background: var(--fill);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
   padding: 6px 10px; font-family: var(--font-ui); font-size: var(--fs-base);
   color: var(--ink); outline: none; height: 30px;
@@ -546,7 +568,7 @@ textarea:focus-visible,
 
 .reason-input {
   width: 100%; min-height: 60px; padding: 6px 8px;
-  background: color-mix(in oklab, var(--line) 20%, transparent); color: var(--ink);
+  background: var(--fill); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
   font-family: var(--font-mono); font-size: var(--fs-base);
   resize: vertical;
@@ -817,7 +839,7 @@ textarea:focus-visible,
   gap: 8px;
   height: 26px;
   padding: 0 8px 0 10px;
-  background: color-mix(in oklab, var(--line) 20%, transparent);
+  background: var(--fill);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   width: 280px;
@@ -1173,7 +1195,7 @@ textarea:focus-visible,
 .inp-wrap {
   display: flex; align-items: center; gap: 6px;
   padding: 4px 10px;
-  background: color-mix(in oklab, var(--line) 20%, transparent);
+  background: var(--fill);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl); color: var(--ink-3); min-width: 200px;
 }

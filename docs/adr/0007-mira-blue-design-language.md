@@ -42,8 +42,11 @@ Key points:
 - **Controls**: buttons weight 500 (was 600), transparent 1px border,
   `color-mix` tint hovers, `translate: 0 1px` press (replaces
   `scale(0.96)`); destructive buttons are tinted (red text on ~10% red wash),
-  never solid; inputs get translucent fills (`color-mix` of the border color,
-  ~20% light / ~30% dark) and ring focus.
+  never solid; inputs get translucent fills and ring focus. The fill is a
+  per-theme `--fill` token: light mixes the border color at ~20%, dark states
+  the equivalent white overlay (~6%) directly, because the dark border color
+  is *itself* a 10%-alpha overlay and `color-mix(…, transparent)` multiplies
+  alphas — mixing it would collapse the fill to ~2%.
 - **Fonts**: Geist / Geist Mono replace Open Sans / Fira Code. Loaded by the
   consumer's `index.html` from Google Fonts, same mechanism as before;
   self-hosting remains deferred.
