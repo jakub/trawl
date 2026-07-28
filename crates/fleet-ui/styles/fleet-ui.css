@@ -2,9 +2,10 @@
  * fleet-ui — shared design system (ADR-0030, step 2)
  *
  * Tokens, reset, base styles, and component CSS for fleet apps.
- * Extracted verbatim from trawl-web-ui's "Herring" main.css, then
- * restyled by the design-workbench pass (ADR-0005): slate/blue
- * palette, Open Sans/Fira Code, --fs-* type rhythm. App
+ * Extracted verbatim from trawl-web-ui's "Herring" main.css, restyled
+ * by the design-workbench pass (ADR-0005), then ported to the Mira
+ * Blue design language (ADR-0007): neutral OKLCH surfaces, blue
+ * accent, Geist/Geist Mono, tokenized radii, --fs-* type rhythm. App
  * consumers reach this file via Trunk's `data-trunk rel="css"`
  * directive; Trunk resolves the href relative to the consumer's
  * index.html location. The two current consumers:
@@ -64,91 +65,113 @@
 /* ─────────────────────────────────────────────────────────────────
  *  Design tokens
  * ─────────────────────────────────────────────────────────────── */
-/* Slate/blue direction (design-workbench pass, ADR-0005): cool grey
- * surfaces + blue accent replaced the original warm paper + amber.
- * The accent hue deliberately equals --blue today; the tokens stay
- * separate because they name different ROLES (brand accent vs info
- * semantic) that merely share a value. */
+/* Mira Blue direction (ADR-0007): Basecoat Mira's neutral zero-chroma
+ * OKLCH surface ramp with fleet's blue accent retained. Dark lines are
+ * white-alpha overlays, not solid greys. --on-accent carries button
+ * text (dark mode keeps Mira's inversion: near-black on light blue);
+ * --ring drives the 2px solid focus ring via --shadow-glow, and
+ * --accent-glow aliases it for the brand text-shadow. The accent hue
+ * deliberately equals --blue today; the tokens stay separate because
+ * they name different ROLES (brand accent vs info semantic) that
+ * merely share a value. */
 :root, [data-theme="light"] {
-  --bg:        #f1f2f4;
-  --panel:     #fcfcfd;
-  --panel-2:   #e6e8ec;
-  --panel-3:   #dadde3;
-  --ink:       #0f1012;
-  --ink-2:     #35383d;
-  --ink-3:     #545860;
-  --ink-4:     #82868e;
-  --line:      #d8dbe1;
-  --line-2:    #e8eaee;
-  --selection: rgba(42,92,138,.20);
+  color-scheme: light;
 
-  --accent:     #2a5c8a;
-  --accent-2:   color-mix(in oklab, #2a5c8a 80%, #000);
-  --accent-soft:#7ea6cc;
-  --accent-glow:rgba(42,92,138,.28);
-  --accent-wash:rgba(42,92,138,.10);
+  --bg:        oklch(98.5% 0 0);
+  --panel:     oklch(100% 0 0);
+  --panel-2:   oklch(97% 0 0);
+  --panel-3:   oklch(93.5% 0 0);
+  --ink:       oklch(14.5% 0 0);
+  --ink-2:     oklch(37% 0 0);
+  --ink-3:     oklch(55.6% 0 0);
+  --ink-4:     oklch(70.8% 0 0);
+  --line:      oklch(92.2% 0 0);
+  --line-2:    oklch(94.8% 0 0);
+  --selection: rgba(0,0,0,.08);
+
+  --accent:      #2a5c8a;
+  --accent-2:    color-mix(in oklab, #2a5c8a 85%, white);
+  --accent-soft: #4a7cab;
+  --on-accent:   oklch(98.5% 0 0);
+  --ring:        color-mix(in oklab, #2a5c8a 45%, oklch(80% 0 0));
+  --accent-glow: var(--ring);
+  --accent-wash: color-mix(in oklab, #2a5c8a 9%, transparent);
 
   --teal:       #0e8b7a;
   --teal-wash:  rgba(14,139,122,.10);
-  --red:        #b43a2a;
-  --red-2:      #9a2f23;
-  --red-wash:   rgba(180,58,42,.08);
+  --red:        oklch(57.7% .245 27.325);
+  --red-2:      oklch(50% .22 27.325);
+  --red-wash:   color-mix(in oklab, var(--red) 10%, transparent);
   --yellow:     #a68210;
   --yellow-wash:rgba(166,130,16,.10);
   --green:      #4a7d3f;
   --green-wash: rgba(74,125,63,.10);
   --blue:       #2a5c8a;
 
-  --shadow-1:    0 1px 0 rgba(0,0,0,.03);
-  --shadow-2:    0 1px 2px rgba(0,0,0,.06), 0 2px 6px rgba(0,0,0,.04);
-  --shadow-3:    0 4px 16px rgba(0,0,0,.08), 0 1px 3px rgba(0,0,0,.06);
-  --shadow-glow: 0 0 0 3px var(--accent-glow);
+  --shadow-1:    0 1px 2px rgba(0,0,0,.04);
+  --shadow-2:    0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.04);
+  --shadow-3:    0 8px 24px rgba(0,0,0,.10), 0 2px 6px rgba(0,0,0,.05);
+  --shadow-glow: 0 0 0 2px var(--ring);
 }
 
-/* Dark mirror of the slate/blue pass — derived, not from the workbench
- * (the handoff changed light only). Surfaces/lines were already cool
- * and stay; the warm cream ink ramp is neutralized and the accent
- * follows the dark --blue hue, matching how the light accent tracks
- * the light --blue. */
+/* Dark theme — Mira's dark neutrals. Lines are white-alpha overlays so
+ * they read as the same "ink on surface" system at any panel depth;
+ * the accent inverts: light-blue surfaces carry near-black text. */
 [data-theme="dark"] {
-  --bg:        #0f1216;
-  --panel:     #141820;
-  --panel-2:   #1a1f28;
-  --panel-3:   #242b36;
-  --ink:       #e8eaed;
-  --ink-2:     #9ba1ab;
-  --ink-3:     #6b7280;
-  --ink-4:     #4a505a;
-  --line:      #242a34;
-  --line-2:    #1c212b;
-  --selection: rgba(90,159,212,.24);
+  color-scheme: dark;
 
-  --accent:     #5a9fd4;
-  --accent-2:   color-mix(in oklab, #5a9fd4 80%, #000);
-  --accent-soft:#8fb8dc;
-  --accent-glow:rgba(90,159,212,.30);
-  --accent-wash:rgba(90,159,212,.12);
+  --bg:        oklch(14.5% 0 0);
+  --panel:     oklch(18% 0 0);
+  --panel-2:   oklch(22% 0 0);
+  --panel-3:   oklch(26.9% 0 0);
+  --ink:       oklch(98.5% 0 0);
+  --ink-2:     oklch(82% 0 0);
+  --ink-3:     oklch(70.8% 0 0);
+  --ink-4:     oklch(50% 0 0);
+  --line:      oklch(100% 0 0 / .10);
+  --line-2:    oklch(100% 0 0 / .06);
+  --selection: rgba(255,255,255,.14);
+
+  --accent:      #5a9fd4;
+  --accent-2:    color-mix(in oklab, #5a9fd4 85%, white);
+  --accent-soft: #8fb8dc;
+  --on-accent:   oklch(16% 0 0);
+  --ring:        color-mix(in oklab, #5a9fd4 55%, oklch(40% 0 0));
+  --accent-glow: var(--ring);
+  --accent-wash: color-mix(in oklab, #5a9fd4 14%, transparent);
 
   --teal:       #4ec9b0;
   --teal-wash:  rgba(78,201,176,.12);
-  --red:        #e05a4a;
-  --red-2:      #c44434;
-  --red-wash:   rgba(224,90,74,.12);
+  --red:        oklch(70.4% .191 22.216);
+  --red-2:      oklch(62% .19 22.216);
+  --red-wash:   color-mix(in oklab, var(--red) 15%, transparent);
   --yellow:     #d4b04a;
   --yellow-wash:rgba(212,176,74,.14);
   --green:      #7bbd6a;
   --green-wash: rgba(123,189,106,.12);
   --blue:       #5a9fd4;
 
-  --shadow-1:    0 1px 0 rgba(0,0,0,.3);
-  --shadow-2:    0 1px 2px rgba(0,0,0,.4), 0 2px 6px rgba(0,0,0,.3);
-  --shadow-3:    0 4px 16px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
-  --shadow-glow: 0 0 0 3px var(--accent-glow);
+  --shadow-1:    0 1px 2px rgba(0,0,0,.4);
+  --shadow-2:    0 1px 2px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.35);
+  --shadow-3:    0 8px 24px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.35);
+  --shadow-glow: 0 0 0 2px var(--ring);
 }
 
 :root {
-  --font-ui:   "Open Sans", system-ui, -apple-system, sans-serif;
-  --font-mono: "Fira Code", "SF Mono", ui-monospace, Menlo, monospace;
+  --font-ui:   "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, Menlo, monospace;
+
+  /* Radius scale (ADR-0007): every border-radius in fleet-ui.css and
+   * app stylesheets reads one of these — no px literals. panel/ctl/sm
+   * are the Mira trio; xs pins the hairline bar/meter/swatch
+   * roundings, pill/round close out the scale so the no-literals rule
+   * (issue #47 AC2) holds file-wide. */
+  --radius-panel: 10px;  /* cards, modals, popovers, menus */
+  --radius-ctl: 8px;     /* buttons, inputs, editor, segmented, rail items */
+  --radius-sm: 6px;      /* chips, badges, ghost affordances, facet rows */
+  --radius-xs: 1px;      /* hairline bars, meters, swatches */
+  --radius-pill: 999px;  /* full-round pills (toggle track, count chips) */
+  --radius-round: 50%;   /* circles (dots, avatar, toggle knob) */
 
   /* Type rhythm (workbench pass): one base size drives every level.
    * Up-steps are golden ratio, down-steps interpolate geometrically
@@ -218,6 +241,9 @@
  * ─────────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
+/* Firefox scrollbars follow the theme (color-scheme is declared per
+ * theme block above); WebKit keeps the slim thumbs styled below. */
+html { scrollbar-color: var(--panel-3) transparent; }
 body {
   background: var(--bg);
   color: var(--ink);
