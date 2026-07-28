@@ -29,6 +29,13 @@
 //! Reading the shipped stylesheet at test time turns those prose claims
 //! into a `cargo nextest` guard, mirroring the `ToastKind` / `Btn`
 //! variant native contract tests.
+//!
+//! Baseline: **Mira Blue (ADR-0007, issue #47)**. The golden fixture was
+//! re-captured from the shipped CSS after the Mira Blue port (the
+//! ADR-0005-sanctioned mechanism), and the targeted `rule_body` pins
+//! below enforce the Mira control recipes — weight-500 buttons, tinted
+//! destructive, `--on-accent` text, 2px `--ring` focus, tokenized radii
+//! — so the new values are the guarded baseline, not a casualty.
 
 const CSS: &str = include_str!("../styles/fleet-ui.css");
 
@@ -173,8 +180,9 @@ fn btn_size_classes_shipped_with_crate() {
         ".btn-sm padding moved verbatim"
     );
     assert!(
-        sm.contains("background: var(--panel-2)"),
-        ".btn-sm is a self-contained style (own background), not a modifier"
+        sm.contains("background: transparent"),
+        ".btn-sm is the Mira outline treatment (ADR-0007): transparent \
+         fill, 1px line border — still self-contained, not a modifier"
     );
     assert!(
         rule_body(".btn-sm:disabled").contains("opacity: 0.4"),
@@ -286,6 +294,69 @@ fn drawer_shell_classes_shipped_with_crate() {
             "drawer keyframe `@keyframes {name}` missing from fleet-ui.css"
         );
     }
+}
+
+#[test]
+fn mira_blue_button_recipes_pinned() {
+    // ADR-0007: buttons are weight 500 (was 600) — the single most
+    // visible Mira control delta. Pinned per variant so a font-weight
+    // regression on any one of them turns red.
+    for sel in [".btn", ".btn-pri", ".btn-danger"] {
+        assert!(
+            rule_body(sel).contains("font-weight: 500"),
+            "`{sel}` must carry the Mira Blue weight-500 button treatment"
+        );
+    }
+    // Destructive is TINTED (red text on the red wash), never solid red.
+    let danger = rule_body(".btn-danger");
+    assert!(
+        danger.contains("background: var(--red-wash)"),
+        ".btn-danger must be tinted: red text on var(--red-wash)"
+    );
+    assert!(
+        !danger.contains("background: var(--red)"),
+        ".btn-danger must never regress to a solid red fill"
+    );
+    // Press feedback is a 1px translate; the scale press is retired.
+    assert!(
+        !CSS.contains("scale: 0.96"),
+        "the scale(0.96) press is retired — Mira presses are `translate: 0 1px`"
+    );
+    // Accent surfaces read their text from the token, never a literal.
+    assert!(
+        !CSS.contains("color: #fff"),
+        "hard-coded #fff text is retired — accent surfaces use var(--on-accent)"
+    );
+}
+
+#[test]
+fn mira_blue_tokens_declared() {
+    // The ADR-0007 radius scale lives in fleet-ui.css :root — main.css
+    // consumes it but never declares tokens (css_move_invariant).
+    for decl in [
+        "--radius-panel: 10px",
+        "--radius-ctl: 8px",
+        "--radius-sm: 6px",
+        "--on-accent:",
+    ] {
+        assert!(
+            CSS.contains(decl),
+            "expected `{decl}` declared in fleet-ui.css (ADR-0007 token contract)"
+        );
+    }
+    // --on-accent is per-theme: light near-white, dark near-black
+    // (Mira's dark-mode inversion) — one declaration per theme block.
+    assert_eq!(
+        CSS.matches("--on-accent:").count(),
+        2,
+        "--on-accent must be declared exactly once per theme block"
+    );
+    // Focus is the 2px solid ring in BOTH themes (was a 3px soft glow).
+    assert_eq!(
+        CSS.matches("--shadow-glow: 0 0 0 2px var(--ring)").count(),
+        2,
+        "--shadow-glow must be the 2px var(--ring) ring in both theme blocks"
+    );
 }
 
 #[test]
