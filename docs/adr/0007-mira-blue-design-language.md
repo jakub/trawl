@@ -39,7 +39,14 @@ Key points:
   `--accent-soft` deliberately keeps its pre-Mira value (`#7ea6cc` light):
   the skin's companion move would land it .031 from the new `--accent-2` in
   oklab, and those two are the INT and NUM arcs of the schema drawer's
-  field-type donut, where colour is the only encoding.
+  field-type donut, where colour is the only encoding. For the same reason
+  the tint mixes toward **white in light and black in dark**: the dark
+  accent is already light-valued, so a white mix compresses the arc scale to
+  .050 / .045 gaps — one flat light blue — where the black mix restores a
+  monotonic `--accent-2` / `--blue` / `--accent-soft` ramp with no pair
+  closer than .095 (light's tightest is .081). The direction inverts with
+  `--on-accent`, not against it: dark steps the accent away from a dark
+  surface.
 - **Focus**: 2px solid ring (`--ring`, accent-tinted) replaces the 3px soft
   glow, via the existing `--shadow-glow` token and `:focus-visible` rule.
 - **Radius**: tokenized — `--radius-ctl: 8px` (buttons, inputs, editor),

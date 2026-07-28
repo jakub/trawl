@@ -99,15 +99,21 @@
   --fill-2:    color-mix(in oklab, var(--line) 45%, transparent);
 
   --accent:      #2a5c8a;
+  /* The blue arc scale is --blue / --accent-2 / --accent-soft: the STR,
+   * INT and NUM arcs of the schema drawer's field-type donut
+   * (trawl-web-ui service_card_fmt.rs `type_bucket`) plus their legend
+   * swatches, where colour is the only encoding. Neither --accent-2 nor
+   * --accent-soft has any other consumer, so the three must stay
+   * mutually separable in EVERY theme — the gaps below are measured per
+   * block, in oklab, and the dark block states its own (see there).
+   *
+   * Light: ADR-0007 flips --accent-2 from a DARKER accent to a tint
+   * mixed toward white, which on light mode's dark accent still lands
+   * .081 above --blue. --accent-soft therefore keeps its pre-Mira value
+   * rather than the skin's companion move (soft → #4a7cab), which would
+   * sit .031 from the new --accent-2; holding soft at #7ea6cc keeps the
+   * scale monotonic in both L and C (gaps .081 / .167). */
   --accent-2:    color-mix(in oklab, #2a5c8a 85%, white);
-  /* --accent-soft keeps its pre-Mira value. ADR-0007 flips --accent-2
-   * from a DARKER accent to a lighter tint, and the skin's companion
-   * move (soft → #4a7cab) would land it .031 away from --accent-2 in
-   * oklab — the two are the INT and NUM arcs of the schema drawer's
-   * field-type donut, where colour is the only encoding, so they must
-   * stay separable. Neither token has a CSS consumer; holding soft at
-   * #7ea6cc keeps the blue arc scale --blue / --accent-2 / --accent-soft
-   * monotonic in both L and C (gaps .082 / .167). */
   --accent-soft: #7ea6cc;
   --on-accent:   oklch(98.5% 0 0);
   --ring:        color-mix(in oklab, #2a5c8a 45%, oklch(80% 0 0));
@@ -169,7 +175,18 @@
   --fill-2:    oklch(100% 0 0 / .11);
 
   --accent:      #5a9fd4;
-  --accent-2:    color-mix(in oklab, #5a9fd4 85%, white);
+  /* --accent-2 mixes toward BLACK here, not white. The Mira recipe is
+   * "step the accent one notch away from the surface"; dark inverts
+   * that direction, exactly as --on-accent inverts. Mixing the already
+   * light dark accent toward white compresses near the top of the L
+   * range: it lands only .050 from --blue and .045 from --accent-soft,
+   * collapsing the donut's STR/INT/NUM arcs (and their .ft-legend .sw
+   * swatches) into one light blue — well under the light block's .081
+   * smallest gap. The same 85% mix toward black instead orders the
+   * scale --accent-2 / --blue / --accent-soft in L (.577 / .679 / .766,
+   * the dark-first ordering the pre-Mira tokens had), with no pair
+   * closer than .095. */
+  --accent-2:    color-mix(in oklab, #5a9fd4 85%, black);
   --accent-soft: #8fb8dc;
   --on-accent:   oklch(16% 0 0);
   --ring:        color-mix(in oklab, #5a9fd4 55%, oklch(40% 0 0));
