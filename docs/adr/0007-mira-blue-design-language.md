@@ -28,7 +28,16 @@ Key points:
 
 - **Surfaces**: neutral zero-chroma OKLCH ramp. Light: `--bg` 98.5%, panels
   100%/97%/93.5%, lines 92.2%. Dark: `--bg` 14.5%, panels 18%/22%/26.9%,
-  lines as white-alpha overlays (10% / 6%) rather than solid greys.
+  lines as white-alpha overlays (10% / 6%) rather than solid greys. The ink
+  ramp follows the skin except at light `--ink-4`, which is contrast-bound
+  the way `--red` is: it is a TEXT colour (the `--fs-micro` DEBUG level pill,
+  the DSL editor's gutter numbers, `.editor-hd .dim`, `.divider`), and the
+  skin's `oklch(70.8%)` measures 2.59:1 on `--panel` and 2.48:1 on the
+  editor's `--fill` wash — under even the 3:1 non-text floor, and a
+  regression on ADR-0005's `#82868e` (3.56:1). Light `--ink-4` therefore
+  holds that tone's luminance as a neutral, `oklch(62%)` (3.64:1 / 3.48:1,
+  and >=3.01:1 on every other light surface). Dark `--ink-4` takes the
+  skin's step, which raises it 2.19:1 -> 3.12:1.
 - **Accent**: fleet's blues stay — `#2a5c8a` light, `#5a9fd4` dark — with a
   new `--on-accent` token replacing hard-coded `#fff` button text. Dark mode
   keeps Mira's inversion: light-blue accent surfaces carry near-black

@@ -417,6 +417,18 @@ fn mira_blue_tokens_declared() {
         2,
         "--shadow-glow must be the 2px var(--ring) ring in both theme blocks"
     );
+    // Light --ink-4 is contrast-bound: it paints TEXT (the --fs-micro
+    // DEBUG level pill, the DSL editor gutter numbers, .editor-hd .dim,
+    // .divider), so it holds the pre-Mira tone's luminance rather than the
+    // skin's oklch(70.8%), which measures 2.59:1 on --panel and 2.48:1 on
+    // the editor's --fill wash. Re-measure the composited pixels before
+    // lightening it.
+    assert!(
+        CSS.contains("--ink-4:     oklch(62% 0 0)"),
+        "the light `--ink-4` is toned for the 3:1 floor as a text colour \
+         (3.64:1 on --panel, 3.48:1 on the editor fill) — a lighter step \
+         drops the DEBUG pill and the gutter rule below it"
+    );
 }
 
 #[test]
