@@ -260,9 +260,16 @@
  * ─────────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
-/* Firefox scrollbars follow the theme (color-scheme is declared per
- * theme block above); WebKit keeps the slim thumbs styled below. */
-html { scrollbar-color: var(--panel-3) transparent; }
+/* Firefox scrollbars follow the theme (color-scheme is declared per theme
+ * block above). `scrollbar-color` is inherited, and Blink ignores the legacy
+ * ::-webkit-scrollbar pseudos on any element that sets it — declaring this
+ * unscoped voids the slim-thumb block below on every scroller in Chromium,
+ * so it is fenced to Gecko. (`@supports not selector(::-webkit-scrollbar)`
+ * is not a usable fence: Gecko parses unknown -webkit- pseudo-elements for
+ * web compat and reports that selector as supported.) */
+@supports (-moz-appearance: none) {
+  html { scrollbar-color: var(--panel-3) transparent; }
+}
 body {
   background: var(--bg);
   color: var(--ink);
