@@ -371,6 +371,23 @@
  * (injected <style> comes after this sheet in source order). Re-state
  * the stack at higher specificity so Geist Mono actually renders. */
 .dsl-editor .cm-editor .cm-scroller { overflow: auto; font-family: var(--font-mono); }
+/* Same story for the gutter. CM6's base theme paints the line-number
+ * rail with an unconditional LIGHT palette — `#f5f5f5` rail, `#ddd`
+ * divider, `#cceeff44` active-line band, `caret-color: black` — and we
+ * install no CM dark theme, so in dark mode the rail rendered as a
+ * near-white slab against the `oklch(14.5%)` editor body with a
+ * light-grey band across the active line. Tokenize the three surfaces
+ * the base theme hard-codes so the editor inverts with the rest of the
+ * app; 3-class specificity for the reason above. (No
+ * `.cm-activeLineGutter` rule: the bundle installs `highlightActiveLine`
+ * but not `highlightActiveLineGutter`, so that class never renders.) */
+.dsl-editor .cm-editor .cm-gutters {
+  background: transparent;
+  border-right: 1px solid var(--line);
+  color: var(--ink-4);
+}
+.dsl-editor .cm-editor .cm-activeLine { background: var(--fill); }
+.dsl-editor .cm-editor .cm-content { caret-color: var(--ink); }
 
 /* Right column beside the editor: date-range trigger stacked over Run.
  * The old 2×3 pill strip is gone — both rows are plain 28px controls. */
