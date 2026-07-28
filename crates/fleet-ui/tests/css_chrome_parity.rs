@@ -330,6 +330,28 @@ fn mira_blue_button_recipes_pinned() {
 }
 
 #[test]
+fn dark_outline_fill_precedes_its_hover_rules() {
+    // The dark line-tint fill is `[data-theme="dark"] .btn-sec` — (0,2,0),
+    // exactly the specificity of `.btn-sec:hover`. Source order is the
+    // only tie-breaker, so the fill must be declared BEFORE the hover
+    // rules or the neutral secondary button loses its hover feedback in
+    // dark mode entirely.
+    let fill = CSS
+        .find("[data-theme=\"dark\"] .btn-sec,")
+        .expect("dark outline line-tint fill present");
+    for hover in [".btn-sec:hover {", ".btn-sm:hover:not(:disabled) {"] {
+        let hpos = CSS
+            .find(hover)
+            .unwrap_or_else(|| panic!("`{hover}` present"));
+        assert!(
+            fill < hpos,
+            "the `[data-theme=\"dark\"]` outline fill must precede `{hover}` — \
+             equal-or-lower specificity means a later fill would kill the hover"
+        );
+    }
+}
+
+#[test]
 fn mira_blue_tokens_declared() {
     // The ADR-0007 radius scale lives in fleet-ui.css :root — main.css
     // consumes it but never declares tokens (css_move_invariant).

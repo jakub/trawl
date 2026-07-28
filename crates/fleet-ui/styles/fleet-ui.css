@@ -372,6 +372,17 @@ textarea:focus-visible,
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-full { width: 100%; }
 
+/* Dark outline buttons carry a faint line-tint fill (Mira): the
+ * white-alpha --line at 30% reads as a whisper of surface, keeping
+ * the outline pair visible on dark panels. It out-specifies the
+ * `.btn-sec` / `.btn-sm` base fills (0,2,0 vs 0,1,0), so it must sit
+ * BEFORE their `:hover` rules — `.btn-sec:hover` is also (0,2,0) and
+ * only wins on source order. */
+[data-theme="dark"] .btn-sec,
+[data-theme="dark"] .btn-sm {
+  background: color-mix(in oklab, var(--line) 30%, transparent);
+}
+
 .btn-sec {
   padding: 5px 11px;
   font-size: var(--fs-control);
@@ -447,14 +458,6 @@ textarea:focus-visible,
 .btn-sm:disabled {
   opacity: 0.4;
   cursor: not-allowed;
-}
-
-/* Dark outline buttons carry a faint line-tint fill (Mira): the
- * white-alpha --line at 30% reads as a whisper of surface, keeping
- * the outline pair visible on dark panels. */
-[data-theme="dark"] .btn-sec,
-[data-theme="dark"] .btn-sm {
-  background: color-mix(in oklab, var(--line) 30%, transparent);
 }
 
 .btn-xs { font-size: var(--fs-small); padding: 3px 8px; }
