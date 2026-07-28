@@ -341,23 +341,50 @@ fn mira_blue_button_recipes_pinned() {
 }
 
 #[test]
-fn dark_outline_fill_precedes_its_hover_rules() {
-    // The dark line-tint fill is `[data-theme="dark"] .btn-sec` — (0,2,0),
-    // exactly the specificity of `.btn-sec:hover`. Source order is the
-    // only tie-breaker, so the fill must be declared BEFORE the hover
-    // rules or the neutral secondary button loses its hover feedback in
-    // dark mode entirely.
+fn dark_outline_hover_is_a_backdrop_independent_lift() {
+    // The shared hover fill — `color-mix(in oklab, var(--panel-3) 55%,
+    // transparent)` — is TRANSLUCENT, so what it renders depends on the
+    // backdrop it composites over, while the dark resting fill is a fixed
+    // white-alpha overlay. Measured in headless Chrome with the shipped
+    // CSS at the old .04 resting alpha: over `--panel` the hover landed on
+    // rgb(29) against a rgb(27) rest (a 2/255 delta — no feedback), and
+    // inside a `--panel-2` container it landed DARKER than rest, rgb(33)
+    // under rgb(36) — an inverted hover. Real `--panel-2` containers hold
+    // secondary buttons (`.tl-bar`, `.sd-card`), so dark mode restates
+    // BOTH ends in the overlay system: `--fill` -> `--fill-2` is the same
+    // step on every surface (rgb(32)->rgb(44) on `--panel`,
+    // rgb(41)->rgb(52) on `--panel-2`).
+    let rest = rule_body("[data-theme=\"dark\"] .btn-sec,\n[data-theme=\"dark\"] .btn-sm");
+    assert!(
+        rest.contains("background: var(--fill)"),
+        "the dark outline resting fill must be the backdrop-independent \
+         `var(--fill)` overlay, got:{rest}"
+    );
+    let hover = rule_body(
+        "[data-theme=\"dark\"] .btn-sec:hover,\n[data-theme=\"dark\"] .btn-sm:hover:not(:disabled)",
+    );
+    assert!(
+        hover.contains("background: var(--fill-2)"),
+        "the dark outline hover must step to `var(--fill-2)` — inheriting \
+         the shared backdrop-dependent `--panel-3` hover makes the lift \
+         imperceptible on `--panel` and a DIP on `--panel-2`, got:{hover}"
+    );
+    // The resting fill is (0,2,0), exactly `.btn-sec:hover`, so source
+    // order is the only tie-breaker: it must still be declared BEFORE the
+    // shared hover rules. (The dark hover pair above is (0,3,0) and wins
+    // on specificity regardless of where it sits.)
     let fill = CSS
         .find("[data-theme=\"dark\"] .btn-sec,")
-        .expect("dark outline line-tint fill present");
-    for hover in [".btn-sec:hover {", ".btn-sm:hover:not(:disabled) {"] {
+        .expect("dark outline resting fill present");
+    for shared in ["\n.btn-sec:hover {", "\n.btn-sm:hover:not(:disabled) {"] {
         let hpos = CSS
-            .find(hover)
-            .unwrap_or_else(|| panic!("`{hover}` present"));
+            .find(shared)
+            .unwrap_or_else(|| panic!("`{}` present", shared.trim()));
         assert!(
             fill < hpos,
-            "the `[data-theme=\"dark\"]` outline fill must precede `{hover}` — \
-             equal-or-lower specificity means a later fill would kill the hover"
+            "the `[data-theme=\"dark\"]` resting fill must precede `{}` — \
+             equal specificity means a later fill would kill the hover",
+            shared.trim()
         );
     }
 }

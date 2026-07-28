@@ -408,17 +408,29 @@ textarea:focus-visible,
 .btn-full { width: 100%; }
 
 /* Dark outline buttons carry a whisper of surface (Mira), keeping the
- * outline pair visible on dark panels. Deliberately fainter than the
- * shared --fill token — the `:hover` fill is `--panel-3` at 55%, which
- * composites to roughly a 4% white lift over --panel, so a resting
- * fill at --fill's 6% would out-lighten its own hover. 4% keeps the
- * hover a lift rather than a dip. It out-specifies the `.btn-sec` /
- * `.btn-sm` base fills (0,2,0 vs 0,1,0), so it must sit BEFORE their
- * `:hover` rules — `.btn-sec:hover` is also (0,2,0) and only wins on
- * source order. */
+ * outline pair visible on dark panels — the same white-alpha overlay
+ * every other dark control fill uses, so both the rest and the hover
+ * step are backdrop-INDEPENDENT.
+ *
+ * The shared `:hover` fill (`--panel-3` at 55%) is backdrop-dependent:
+ * it only lifts where the backdrop is darker than --panel-3. Measured
+ * on --panel that is rgb(27)->rgb(29), no perceptible feedback; inside
+ * a --panel-2 container (.tl-bar, .sd-card — both hold Variant::
+ * Secondary buttons) it renders rgb(36)->rgb(33), a DIP. So dark mode
+ * overrides the hover too: --fill -> --fill-2 is a fixed +5% white lift
+ * on every surface.
+ *
+ * The resting fill out-specifies the `.btn-sec` / `.btn-sm` base fills
+ * (0,2,0 vs 0,1,0) but ties with `.btn-sec:hover`, so it must stay
+ * BEFORE the hover rules; the dark hover pair is (0,3,0) and wins on
+ * specificity. */
 [data-theme="dark"] .btn-sec,
 [data-theme="dark"] .btn-sm {
-  background: oklch(100% 0 0 / .04);
+  background: var(--fill);
+}
+[data-theme="dark"] .btn-sec:hover,
+[data-theme="dark"] .btn-sm:hover:not(:disabled) {
+  background: var(--fill-2);
 }
 
 .btn-sec {
