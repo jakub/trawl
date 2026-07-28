@@ -317,6 +317,17 @@ fn mira_blue_button_recipes_pinned() {
         !danger.contains("background: var(--red)"),
         ".btn-danger must never regress to a solid red fill"
     );
+    // Tinting makes `--red` a FOREGROUND over its own wash, so the light
+    // tone is contrast-bound: Mira's oklch(57.7% .245) measures 3.97:1
+    // there (3.31:1 on the 20% hover wash), under the 4.5:1 AA floor for
+    // normal text. The shipped light tone is the measured one — re-measure
+    // the composited pixels before changing it.
+    assert!(
+        CSS.contains("--red:        oklch(48% .177 27.325)"),
+        "the light `--red` is toned for AA over `--red-wash` (6.03:1 resting, \
+         5.06:1 hover) — a lighter tone drops the tinted destructive recipe \
+         below 4.5:1"
+    );
     // Press feedback is a 1px translate; the scale press is retired.
     assert!(
         !CSS.contains("scale: 0.96"),

@@ -108,8 +108,17 @@
 
   --teal:       #0e8b7a;
   --teal-wash:  rgba(14,139,122,.10);
-  --red:        oklch(57.7% .245 27.325);
-  --red-2:      oklch(50% .22 27.325);
+  /* Light --red is toned for the TINTED destructive recipe, not for a
+   * solid fill: it is the FOREGROUND over --red-wash (.btn-danger,
+   * .lvl-error, .meta .chip.excl), so its contrast is measured against
+   * the wash composited on the panel, not against the panel. Mira's
+   * oklch(57.7% .245) renders 3.97:1 there (3.31:1 on the 20% hover
+   * wash) — below the 4.5:1 AA floor for normal text. This deeper tone
+   * measures 6.03:1 / 5.06:1, and 6.88:1 for --on-accent on the solid
+   * red (.chip.excl .x:hover). Dark mode keeps Mira's lighter red: it
+   * sits on dark panels and already clears AA. */
+  --red:        oklch(48% .177 27.325);
+  --red-2:      oklch(41% .155 27.325);
   --red-wash:   color-mix(in oklab, var(--red) 10%, transparent);
   --yellow:     #a68210;
   --yellow-wash:rgba(166,130,16,.10);

@@ -46,7 +46,12 @@ Key points:
   per-theme `--fill` token: light mixes the border color at ~20%, dark states
   the equivalent white overlay (~6%) directly, because the dark border color
   is *itself* a 10%-alpha overlay and `color-mix(…, transparent)` multiplies
-  alphas — mixing it would collapse the fill to ~2%.
+  alphas — mixing it would collapse the fill to ~2%. Tinting also makes
+  `--red` a *foreground* over its own wash, so the light tone is
+  contrast-bound rather than free: Mira's `oklch(57.7% .245)` measures
+  3.97:1 on the resting wash and 3.31:1 on the hover wash, under the 4.5:1
+  AA floor, so light `--red` is deepened to `oklch(48% .177)` (6.03:1 /
+  5.06:1). Dark `--red` sits on dark panels and keeps Mira's lighter tone.
 - **Fonts**: Geist / Geist Mono replace Open Sans / Fira Code. Loaded by the
   consumer's `index.html` from Google Fonts, same mechanism as before;
   self-hosting remains deferred.
