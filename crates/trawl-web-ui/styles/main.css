@@ -1038,40 +1038,22 @@
    and friends) is retired; only the drawer-side classes remain.
    ============================================================ */
 
-/* Field-type blue scale. The donut arcs, their legend swatches and the
- * numeric pills all sit in the accent's blue family and have to stay
- * mutually separable — which --accent / --accent-2 / --accent-soft no
- * longer are: the ADR-0007 remap turned --accent-2 into a LIGHTER
- * control-hover tint and darkened --accent-soft, collapsing the two to
- * dL .03 (oklab) in light. These are component-scoped properties, not
- * design tokens, so they stay app-side rather than in fleet-ui's :root;
- * both derive from --accent and therefore follow the theme.
- *   --ft-int  INT arc + swatch, and the numeric pills' TEXT. Mixes
- *             toward --ink, so it darkens in light (L .374) and lightens
- *             in dark (L .765) — 7.6:1 / 6.9:1 on the pill wash either
- *             way. Reading --accent here can't work: --accent === --blue,
- *             which would make the INT and STR pills byte-identical.
- *   --ft-num  NUM arc + swatch, fill-only (never text). Mixes toward
- *             --panel, i.e. the opposite direction, so it clears both
- *             --ft-int and --blue in BOTH themes (L .651 / .504).
- * STR keeps --blue, so its arc, swatch and pill share one value. Worst
- * neighbouring gap across the three is dL .086, vs .028 when the arcs
- * read --accent-2 / --accent-soft. */
-.tp, .ft-donut {
-  --ft-int: color-mix(in oklab, var(--accent) 72%, var(--ink));
-  --ft-num: color-mix(in oklab, var(--accent) 65%, var(--panel));
-}
-
 /* Shared field-type pill (used on cards, Overview top-fields,
-   Fields table rows, and donut legend). */
+   Fields table rows, and donut legend). The numeric rows read
+   var(--accent) rather than the old var(--accent-2): ADR-0007 turns
+   --accent-2 into a light tint that measures 3.67:1 on this wash, under
+   the AA floor, while --accent measures 5.19:1 light / 5.02:1 dark.
+   That collapses them onto .tp-keyword's colour (--accent === --blue),
+   which is fine — the pill carries its own label, and the donut legend
+   still separates the buckets by swatch. */
 .tp { display:inline-block; font-family: var(--font-mono); font-size: var(--fs-tiny); font-weight: 600;
       padding: 1px 5px; border-radius: var(--radius-sm); background: var(--panel-3); color: var(--ink-2); letter-spacing: .02em; }
 .tp-keyword   { background: color-mix(in oklab, var(--blue)   14%, var(--panel-2)); color: var(--blue); }
 .tp-text      { background: color-mix(in oklab, var(--green)  14%, var(--panel-2)); color: var(--green); }
-.tp-integer   { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--ft-int); }
-.tp-bigint    { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--ft-int); }
+.tp-integer   { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
+.tp-bigint    { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
 .tp-bool      { background: color-mix(in oklab, var(--teal)   18%, var(--panel-2)); color: var(--teal); }
-.tp-float     { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--ft-int); }
+.tp-float     { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
 .tp-ip        { background: color-mix(in oklab, var(--teal)   14%, var(--panel-2)); color: var(--teal); }
 .tp-timestamp { background: color-mix(in oklab, var(--ink-3)  18%, var(--panel-2)); color: var(--ink-2); }
 

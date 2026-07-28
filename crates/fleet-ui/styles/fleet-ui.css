@@ -100,7 +100,15 @@
 
   --accent:      #2a5c8a;
   --accent-2:    color-mix(in oklab, #2a5c8a 85%, white);
-  --accent-soft: #4a7cab;
+  /* --accent-soft keeps its pre-Mira value. ADR-0007 flips --accent-2
+   * from a DARKER accent to a lighter tint, and the skin's companion
+   * move (soft → #4a7cab) would land it .031 away from --accent-2 in
+   * oklab — the two are the INT and NUM arcs of the schema drawer's
+   * field-type donut, where colour is the only encoding, so they must
+   * stay separable. Neither token has a CSS consumer; holding soft at
+   * #7ea6cc keeps the blue arc scale --blue / --accent-2 / --accent-soft
+   * monotonic in both L and C (gaps .082 / .167). */
+  --accent-soft: #7ea6cc;
   --on-accent:   oklch(98.5% 0 0);
   --ring:        color-mix(in oklab, #2a5c8a 45%, oklch(80% 0 0));
   --accent-glow: var(--ring);

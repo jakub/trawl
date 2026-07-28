@@ -32,7 +32,14 @@ Key points:
 - **Accent**: fleet's blues stay — `#2a5c8a` light, `#5a9fd4` dark — with a
   new `--on-accent` token replacing hard-coded `#fff` button text. Dark mode
   keeps Mira's inversion: light-blue accent surfaces carry near-black
-  (`oklch(16% 0 0)`) text.
+  (`oklch(16% 0 0)`) text. `--accent-2` flips role from a darker shade to a
+  lighter tint (`color-mix(accent 85%, white)`), so the nine sites that used
+  it as TEXT move to `--accent` — on the field-type pill wash the new tint
+  measures 3.67:1, under the AA floor, against `--accent`'s 5.19:1.
+  `--accent-soft` deliberately keeps its pre-Mira value (`#7ea6cc` light):
+  the skin's companion move would land it .031 from the new `--accent-2` in
+  oklab, and those two are the INT and NUM arcs of the schema drawer's
+  field-type donut, where colour is the only encoding.
 - **Focus**: 2px solid ring (`--ring`, accent-tinted) replaces the 3px soft
   glow, via the existing `--shadow-glow` token and `:focus-visible` rule.
 - **Radius**: tokenized — `--radius-ctl: 8px` (buttons, inputs, editor),

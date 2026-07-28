@@ -214,12 +214,6 @@ pub fn type_pill(data_type: &str) -> (&'static str, String) {
 /// `(display_label, css_color, pill_class)`. The three string slices
 /// are `'static` so the donut can reference them in a SVG stroke
 /// without owning a `String`.
-///
-/// `css_color` names the same custom properties the matching `.tp-*`
-/// pill reads (`main.css`, "Field-type blue scale"). The blue-family
-/// buckets deliberately avoid `--accent-2` / `--accent-soft`: ADR-0007
-/// re-toned both into a control-hover tint and a mid blue that sit dL
-/// .03 apart, which made the INT and NUM arcs indistinguishable.
 #[must_use]
 pub fn type_bucket(data_type: &str) -> (&'static str, &'static str, &'static str) {
     let t = data_type.to_ascii_uppercase();
@@ -234,10 +228,10 @@ pub fn type_bucket(data_type: &str) -> (&'static str, &'static str, &'static str
         || t == "SMALLINT"
         || t == "TINYINT"
     {
-        return ("INT", "var(--ft-int)", "tp-bigint");
+        return ("INT", "var(--accent-2)", "tp-bigint");
     }
     if t == "DOUBLE" || t == "FLOAT" || t == "REAL" || t == "DECIMAL" {
-        return ("NUM", "var(--ft-num)", "tp-float");
+        return ("NUM", "var(--accent-soft)", "tp-float");
     }
     if t == "BOOLEAN" || t == "BOOL" {
         return ("BOOL", "var(--teal)", "tp-bool");
