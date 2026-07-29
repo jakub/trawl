@@ -306,7 +306,7 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Editor wrap (header + DslEditor + date range + run button)
+ *  Editor wrap (DslEditor + date range + run button + tools)
  * ─────────────────────────────────────────────────────────────── */
 .editor-wrap {
   background: var(--panel);
@@ -314,31 +314,27 @@
   padding: 10px 12px 8px;
   flex-shrink: 0;
 }
-.editor-hd {
+/* Save / Share / Format, third row of the right-hand column. The old
+ * `.editor-hd` header band (❯ Query + these tools) is gone so the query
+ * box spans the full width; the tools moved under the Run button. */
+.editor-tools {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 6px;
+  justify-content: space-between;
+  gap: 2px;
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
   color: var(--ink-3);
 }
-.editor-hd .anch { color: var(--accent); }
-.editor-hd .title { color: var(--ink-2); font-weight: 500; }
-.editor-hd .dim { color: var(--ink-4); }
-.editor-hd .sp { flex: 1; }
-.editor-hd .tool {
+.editor-tools .tool {
   cursor: pointer;
   padding: 2px 6px;
   border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
   gap: 4px;
-  /* One step up from the header's --fs-dense base — the tools are the
-   * header's primary actions, not metadata. */
-  font-size: var(--fs-ui);
 }
-.editor-hd .tool:hover { background: var(--panel-2); color: var(--ink-2); }
+.editor-tools .tool:hover { background: var(--panel-2); color: var(--ink-2); }
 
 .editor-row { display: flex; gap: 10px; align-items: stretch; }
 
@@ -905,16 +901,7 @@
   color: var(--ink-2);
   line-height: 1.4;
 }
-.dr-pop .rt-hint p { margin: 0 0 6px; }
-.dr-pop .rt-hint .dim { color: var(--ink-3); font-size: var(--fs-dense); }
-.dr-pop .rt-hint code {
-  font-family: var(--font-mono);
-  font-size: var(--fs-dense);
-  padding: 0 4px;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-}
+.dr-pop .rt-hint p { margin: 0 0 10px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Full-page chrome (history, schema, settings etc.)

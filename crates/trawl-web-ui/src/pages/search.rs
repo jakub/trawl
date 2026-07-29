@@ -113,6 +113,23 @@ pub fn Search() -> impl IntoView {
         })
     };
 
+    // "Live Tail" in the date-range popover: same query, SSE mode. Reads
+    // the editor buffer (not `executed_q`) so an unsubmitted edit streams
+    // rather than silently tailing the previously-run query.
+    let on_live = {
+        let goto = goto.clone();
+        Callback::new(move |()| {
+            goto(
+                &query_text.get_untracked(),
+                0,
+                Mode::Live,
+                &filters.get_untracked(),
+                &range.get_untracked(),
+                false,
+            );
+        })
+    };
+
     let on_paginate = {
         let goto = goto.clone();
         Callback::new(move |new_page: usize| {
@@ -319,6 +336,7 @@ pub fn Search() -> impl IntoView {
                     on_range_change=on_range_change
                     running=running
                     on_save=on_save
+                    on_live=on_live
                 />
                 <MetaStrip
                     truncated=truncated
@@ -396,7 +414,7 @@ fn LiveRawTable(#[prop(into)] result: Signal<QueryResult>) -> impl IntoView {
                 let r = result.get();
                 if r.columns.is_empty() {
                     view! {
-                        <div class="results-empty">"streaming — waiting for first event…"</div>
+                        <div class="results-empty">"Streaming — waiting for first event…"</div>
                     }.into_any()
                 } else {
                     let columns: Vec<String> = r.columns.iter().map(|c| c.name.clone()).collect();

@@ -2,10 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<EditorWrap/>` — header (anchor + title + tools) wrapped around the
-//! DSL editor, with the date-range picker and Run button on the right.
+//! `<EditorWrap/>` — the DSL editor with the date-range picker, Run
+//! button, and query tools stacked in a column on its right.
 //!
-//! The right column is a stack: date range above, Run button below.
+//! The right column is a stack: date range, then Run, then the
+//! Save / Share / Format tool row. There is no header band — the
+//! editor frame is its own label, so the query box gets the full width.
 //! Run mirrors ⌘⏎ in the editor — both call the parent's submit
 //! callback.
 
@@ -38,6 +40,9 @@ pub fn EditorWrap(
     running: Signal<bool>,
     /// Bubbles "save" click to the parent so it can open the save modal.
     on_save: Callback<()>,
+    /// Fired by the date-range popover's Real-time tab — the parent
+    /// re-runs the current query in SSE live mode.
+    on_live: Callback<()>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let on_run = on_submit;
@@ -75,28 +80,10 @@ pub fn EditorWrap(
 
     view! {
         <div class="editor-wrap">
-            <div class="editor-hd">
-                <span class="anch">"❯"</span>
-                <span class="title">"Query"</span>
-                <span class="sp"></span>
-                <span
-                    class="tool"
-                    on:click=move |_| on_save.run(())
-                >"Save"</span>
-                <CopyButton
-                    class="tool"
-                    text=share_text
-                    success_detail="Search URL copied to clipboard."
-                >"Share"</CopyButton>
-                <span
-                    class="tool"
-                    on:click=do_format
-                >"Format"</span>
-            </div>
             <div class="editor-row">
                 <DslEditor query=query on_submit=on_submit format_trigger=format_trigger/>
                 <div class="editor-right">
-                    <DateRange value=range on_change=on_range_change/>
+                    <DateRange value=range on_change=on_range_change on_live=on_live/>
                     <button
                         class="run"
                         class:running=move || running.get()
@@ -112,6 +99,21 @@ pub fn EditorWrap(
                             }.into_any()
                         }}
                     </button>
+                    <div class="editor-tools">
+                        <span
+                            class="tool"
+                            on:click=move |_| on_save.run(())
+                        >"Save"</span>
+                        <CopyButton
+                            class="tool"
+                            text=share_text
+                            success_detail="Search URL copied to clipboard."
+                        >"Share"</CopyButton>
+                        <span
+                            class="tool"
+                            on:click=do_format
+                        >"Format"</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -126,6 +128,7 @@ pub fn EditorWrap(
 fn DateRange(
     #[prop(into)] value: Signal<RangeSpec>,
     on_change: Callback<RangeSpec>,
+    on_live: Callback<()>,
 ) -> impl IntoView {
     let open = RwSignal::new(false);
 
@@ -146,18 +149,19 @@ fn DateRange(
                 <IconView icon=Icon::Chevron size=10 stroke_width=1.5/>
             </div>
             <Show when=move || open.get()>
-                <DateRangePopover value=value on_change=on_change open=open/>
+                <DateRangePopover value=value on_change=on_change on_live=on_live open=open/>
             </Show>
         </div>
     }
 }
 
 /// Popover body: Relative (quick presets grid), Absolute (from/to inputs),
-/// Real-time (stub). Click-outside via a fullscreen scrim closes it.
+/// Real-time (Live Tail). Click-outside via a fullscreen scrim closes it.
 #[component]
 fn DateRangePopover(
     #[prop(into)] value: Signal<RangeSpec>,
     on_change: Callback<RangeSpec>,
+    on_live: Callback<()>,
     open: RwSignal<bool>,
 ) -> impl IntoView {
     let tab = RwSignal::new(Tab::Relative);
@@ -257,7 +261,14 @@ fn DateRangePopover(
                 Tab::RealTime => view! {
                     <div class="rt-hint">
                         <p>"Real-time mode streams events as they arrive."</p>
-                        <p class="dim">"Append "<code>"?mode=live"</code>" to the URL to start streaming."</p>
+                        <Btn
+                            variant=Variant::Primary
+                            full=true
+                            on_click=Callback::new(move |()| {
+                                on_live.run(());
+                                close();
+                            })
+                        >"Live Tail"</Btn>
                     </div>
                 }.into_any(),
             }}
