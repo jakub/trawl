@@ -10,6 +10,36 @@
 # (TRAWL_DATABASE_URL), both on the homelab cnpg dev cluster. resolution
 # mirrors coastwatch/bin/dev: a set env var wins wholesale; otherwise creds
 # come from 1password. point both vars at a local postgres to skip op.
+#
+# host/port overrides (all optional, all default to today's behaviour):
+#
+#   TRAWL_DEV_HOST         hostname the BROWSER uses. also becomes trunk's
+#                          proxy backend authority, which trunk stamps as the
+#                          Host header on /api/* — fleet-auth compares it to
+#                          the request Origin, so these two must be the same
+#                          name or login 403s. default trawl.fleet.localhost
+#   TRAWL_DEV_BIND         address trawl-web binds, and an extra address for
+#                          trunk when it isn't loopback. must be an address
+#                          TRAWL_DEV_HOST resolves to. default 127.0.0.1
+#   TRAWL_DEV_SPA_PORT     trunk serve port. default 8080
+#   TRAWL_DEV_WEB_PORT     trawl-web port. default 8090
+#   TRAWL_DEV_SERVER_PORT  trawld port (loopback only — nothing but trawl-web
+#                          talks to it). default: whatever trawld.toml says
+#   TRAWL_DEV_LOGIN_URL    URL printed in the login pane, when the SPA is
+#                          reached through something else (e.g. tailscale
+#                          serve terminating TLS on :443)
+#
+# remote dev over tailscale, viewing from a phone/tablet — `tailscale serve
+# --bg 8080` proxies https://<magicdns-name>/ to trunk on loopback, so only
+# trawl-web needs a reachable bind:
+#
+#   TRAWL_DEV_HOST=fractal.reverse-manta.ts.net \
+#   TRAWL_DEV_BIND=$(tailscale ip -4) \
+#   TRAWL_DEV_LOGIN_URL=https://fractal.reverse-manta.ts.net/login bin/dev
+#
+# TLS from tailscale also keeps the session cookie's Secure attribute
+# satisfied; plain http to a non-localhost host would silently drop it
+# unless [web] allow_insecure_cookies is set in trawld.toml.
 
 set -euo pipefail
 
@@ -36,32 +66,76 @@ command -v openssl >/dev/null || die "openssl not found."
 # Origin guard compares Origin host against it — a 127.0.0.1 origin mismatches
 # and login/logout 403. Mirrors coastwatch/bin/dev; requires a
 # `127.0.0.1 trawl.fleet.localhost` resolver entry (checked below).
-dev_host="trawl.fleet.localhost"
-dev_login_url="http://${dev_host}:8080/login"
+default_dev_host="trawl.fleet.localhost"
+default_dev_bind="127.0.0.1"
+default_spa_port="8080"
+default_web_port="8090"
 
-# Resolve a hostname and report whether it maps to a loopback address.
-# Portable across Linux (getent) and macOS (dscacheutil); returns failure
-# when neither exists so the caller warns rather than blocks.
-host_resolves_loopback() {
-    local host="$1" out=""
+dev_host="${TRAWL_DEV_HOST:-$default_dev_host}"
+dev_bind="${TRAWL_DEV_BIND:-$default_dev_bind}"
+spa_port="${TRAWL_DEV_SPA_PORT:-$default_spa_port}"
+web_port="${TRAWL_DEV_WEB_PORT:-$default_web_port}"
+dev_login_url="${TRAWL_DEV_LOGIN_URL:-http://${dev_host}:${spa_port}/login}"
+
+# Resolve a hostname to its addresses, one per line. Portable across Linux
+# (getent) and macOS (dscacheutil); prints nothing when neither resolver
+# exists so the caller warns rather than blocks.
+host_addresses() {
+    local host="$1"
     if command -v getent >/dev/null 2>&1; then
-        out=$(getent hosts "$host" 2>/dev/null) || return 1
+        getent hosts "$host" 2>/dev/null | awk '{print $1}'
     elif command -v dscacheutil >/dev/null 2>&1; then
-        out=$(dscacheutil -q host -a name "$host" 2>/dev/null)
-    else
-        return 1
+        dscacheutil -q host -a name "$host" 2>/dev/null \
+            | awk -F': ' '/^ipv?6?_address/ {print $2}'
     fi
-    [[ "$out" == *127.0.0.1* || "$out" == *::1* ]]
 }
 
-if ! host_resolves_loopback "$dev_host"; then
-    printf 'bin/dev: WARNING — %s does not resolve to loopback.\n' "$dev_host" >&2
-    printf '  trunk proxies /api/* to this host and fleet-auth rejects logins whose\n' >&2
-    printf '  Origin host differs from it, so the SPA 403s. add the hosts entry, then\n' >&2
-    printf '  open %s:\n' "$dev_login_url" >&2
-    # leading \n guards against a hosts file with no trailing newline —
-    # a bare append glues the entry onto the last line and breaks BOTH.
-    printf "    printf '\\\\n127.0.0.1 %s\\\\n' | sudo tee -a /etc/hosts\n" "$dev_host" >&2
+# `|| true`: an unresolvable host makes getent exit non-zero, which under
+# `set -o pipefail` would abort the script — precisely the case these
+# warnings exist to explain.
+dev_addrs="$(host_addresses "$dev_host" || true)"
+
+if [[ "$dev_host" == "$default_dev_host" ]]; then
+    if [[ "$dev_addrs" != *127.0.0.1* && "$dev_addrs" != *::1* ]]; then
+        printf 'bin/dev: WARNING — %s does not resolve to loopback.\n' "$dev_host" >&2
+        printf '  trunk proxies /api/* to this host and fleet-auth rejects logins whose\n' >&2
+        printf '  Origin host differs from it, so the SPA 403s. add the hosts entry, then\n' >&2
+        printf '  open %s:\n' "$dev_login_url" >&2
+        # leading \n guards against a hosts file with no trailing newline —
+        # a bare append glues the entry onto the last line and breaks BOTH.
+        printf "    printf '\\\\n127.0.0.1 %s\\\\n' | sudo tee -a /etc/hosts\n" "$dev_host" >&2
+    fi
+elif [[ -z "$dev_addrs" ]]; then
+    printf 'bin/dev: WARNING — TRAWL_DEV_HOST=%s does not resolve.\n' "$dev_host" >&2
+    printf '  trunk proxies /api/* to it, so every authenticated request will fail.\n' >&2
+elif [[ "$dev_bind" != "0.0.0.0" && "$dev_bind" != "::" && "$dev_addrs" != *"$dev_bind"* ]]; then
+    # The proxy hop is host-based (it must be, for the Origin check), so
+    # binding trawl-web somewhere that hostname doesn't point at yields a
+    # connection-refused on /api/* with an otherwise healthy-looking stack.
+    printf 'bin/dev: WARNING — TRAWL_DEV_BIND=%s is not an address %s resolves to (%s).\n' \
+        "$dev_bind" "$dev_host" "$(printf '%s' "$dev_addrs" | tr '\n' ' ')" >&2
+    printf '  trunk proxies /api/* to %s:%s and will get connection refused.\n' \
+        "$dev_host" "$web_port" >&2
+fi
+
+# trawld serves HTTPS with an auto-generated self-signed cert in dev, so the
+# proxy's upstream client has no chain to verify and every /api/* call fails
+# TLS verification without this. Dev-only escape hatch — the debian/helm units
+# never set it. `${VAR-1}` (not `:-`) so an explicitly empty value still turns
+# it off, matching how trawl-web reads the var.
+export TRAWL_WEB_INSECURE_UPSTREAM="${TRAWL_WEB_INSECURE_UPSTREAM-1}"
+
+# --- listener overrides ------------------------------------------------------
+# Exported only when the knob was actually set, so an unset run leaves both
+# binaries reading trawld.toml exactly as they did before these existed.
+if [[ -n "${TRAWL_DEV_BIND:-}" || -n "${TRAWL_DEV_WEB_PORT:-}" ]]; then
+    export TRAWL_WEB_BIND_ADDR="${dev_bind}:${web_port}"
+fi
+if [[ -n "${TRAWL_DEV_SERVER_PORT:-}" ]]; then
+    # trawld stays on loopback whatever TRAWL_DEV_BIND says — nothing but
+    # trawl-web talks to it, and trawl-web resolves its upstream through this
+    # same variable, so the two can't drift apart.
+    export TRAWL_HTTP_ADDR="127.0.0.1:${TRAWL_DEV_SERVER_PORT}"
 fi
 
 cookie_file="${HOME}/.trawl/dev-cookie-secret"
@@ -167,7 +241,7 @@ procs:
   trawl-web:
     shell: cargo run -p trawl-web
   trunk:
-    shell: trunk serve
+    shell: ${trunk_cmd}
     cwd: crates/trawl-web-ui
 YAML
     # `exec mprocs` enters the alternate screen and wipes pre-launch output,
@@ -189,6 +263,36 @@ cleanup() {
     done
 }
 trap cleanup EXIT
+
+# --- trunk invocation --------------------------------------------------------
+# Port and address ARE overridable from the command line (--address replaces
+# the config's list rather than adding to it), but the proxy backend is not:
+# TRUNK_SERVE_PROXY_BACKEND / --proxy-backend register a SECOND proxy
+# alongside Trunk.toml's `[[proxy]]`, and trunk panics on the duplicate
+# `/api/` route. Changing the backend therefore means handing trunk a
+# rewritten copy of the config — which has to sit beside the original, since
+# trunk resolves `target`/`dist` relative to the config file's directory.
+trunk_cmd="trunk serve"
+trunk_backend="http://${dev_host}:${web_port}/api/"
+
+if [[ "$trunk_backend" != "http://${default_dev_host}:${default_web_port}/api/" ]]; then
+    generated_trunk_config="$repo_root/crates/trawl-web-ui/.Trunk.dev.toml"
+    sed "s|^backend = .*|backend = \"${trunk_backend}\"|" \
+        "$repo_root/crates/trawl-web-ui/Trunk.toml" > "$generated_trunk_config"
+    cleanup_paths+=("$generated_trunk_config")
+    trunk_cmd+=" --config .Trunk.dev.toml"
+    printf 'bin/dev: trunk proxies /api/* -> %s\n' "$trunk_backend"
+fi
+
+if [[ "$spa_port" != "$default_spa_port" ]]; then
+    trunk_cmd+=" --port $spa_port"
+fi
+
+if [[ "$dev_bind" != "$default_dev_bind" ]]; then
+    # --address REPLACES Trunk.toml's list, so re-state both loopback
+    # families: a local browser and `tailscale serve` both arrive that way.
+    trunk_cmd+=" --address 127.0.0.1 --address ::1 --address $dev_bind"
+fi
 
 # Two hard constraints collide on the config filename: BSD mktemp only
 # substitutes trailing Xs (no suffix after them), while mprocs rejects any

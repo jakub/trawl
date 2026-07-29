@@ -129,6 +129,35 @@ pub struct ServerConfig {
     pub monitor_refresh_ms: u64,
 }
 
+impl ServerConfig {
+    /// Resolve the HTTPS listen address: the `TRAWL_HTTP_ADDR` environment
+    /// variable first, then `[server] http_addr` from the config file.
+    /// Empty values count as unset.
+    ///
+    /// The env override exists so a listener can be moved without editing
+    /// (or templating) the shared `trawld.toml` — `bin/dev` uses it to shift
+    /// ports off a collision, and container images can repoint the bind
+    /// without a config volume. [`Config::from_toml`] applies it at parse
+    /// time, so trawld's own call sites read the already-resolved field;
+    /// trawl-web deserializes the file itself and calls this directly when
+    /// deriving its upstream URL.
+    #[must_use]
+    pub fn resolve_http_addr(&self) -> String {
+        Self::resolve_http_addr_from(
+            std::env::var("TRAWL_HTTP_ADDR").ok().as_deref(),
+            &self.http_addr,
+        )
+    }
+
+    /// Pure resolution core, split out for testability (mutating process
+    /// env in tests is forbidden under `unsafe_code = "forbid"`).
+    fn resolve_http_addr_from(env_value: Option<&str>, configured: &str) -> String {
+        env_value
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| configured.to_owned(), str::to_owned)
+    }
+}
+
 /// Per-key rate limiting in requests per minute (ADR-0006 slice 0).
 ///
 /// Every API key gets an independent token bucket: `default_rpm` on the
@@ -1096,6 +1125,11 @@ impl Config {
             source: e,
         })?;
         config.resolve_paths();
+        // Applied before validation so an env-supplied address is held to the
+        // same checks as a configured one, and so every downstream reader of
+        // `server.http_addr` (bind, log line, dashboard snapshot) sees one
+        // resolved value instead of each remembering to consult the env.
+        config.server.http_addr = config.server.resolve_http_addr();
         config.validate()?;
         Ok(config)
     }
@@ -2072,6 +2106,34 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
             let err = config.storage.resolve_database_url().unwrap_err();
             assert!(err.to_string().contains("[storage]"), "got: {err}");
         }
+    }
+
+    // -- [server] http_addr env override: TRAWL_HTTP_ADDR --------------------
+
+    #[test]
+    fn http_addr_env_wins_over_config() {
+        assert_eq!(
+            ServerConfig::resolve_http_addr_from(Some("0.0.0.0:9999"), "127.0.0.1:5514"),
+            "0.0.0.0:9999"
+        );
+    }
+
+    #[test]
+    fn http_addr_falls_back_to_config() {
+        assert_eq!(
+            ServerConfig::resolve_http_addr_from(None, "127.0.0.1:5514"),
+            "127.0.0.1:5514"
+        );
+    }
+
+    #[test]
+    fn http_addr_empty_env_counts_as_unset() {
+        // An exported-but-blank var is a shell accident (`FOO= cmd`), not a
+        // request to bind the empty string.
+        assert_eq!(
+            ServerConfig::resolve_http_addr_from(Some(""), "127.0.0.1:5514"),
+            "127.0.0.1:5514"
+        );
     }
 
     // -- [auth] env contract: FLEET_DATABASE_URL, not DATABASE_URL -----------

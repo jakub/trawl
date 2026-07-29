@@ -31,6 +31,12 @@ pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
 /// Dev-only escape hatch; MUST NOT be set in production.
 pub const ENV_INSECURE_UPSTREAM: &str = "TRAWL_WEB_INSECURE_UPSTREAM";
 
+/// Env var name overriding `[web] bind_addr`. Lets a listener move without
+/// editing the `trawld.toml` shared with the daemon — `bin/dev` uses it to
+/// bind an address the browser's hostname resolves to (remote dev over a
+/// tailnet) or to shift off a port collision.
+pub const ENV_BIND_ADDR: &str = "TRAWL_WEB_BIND_ADDR";
+
 /// All runtime settings the proxy needs, with defaults applied.
 #[derive(Debug)]
 pub struct ResolvedConfig {
@@ -115,10 +121,10 @@ impl ResolvedConfig {
             .clone()
             .unwrap_or_else(|| default_upstream_from_server(server));
         Ok(Self {
-            bind_addr: web
-                .bind_addr
-                .clone()
-                .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned()),
+            bind_addr: resolve_bind_addr(
+                std::env::var(ENV_BIND_ADDR).ok().as_deref(),
+                web.bind_addr.as_deref(),
+            ),
             upstream_url,
             coastwatch_url: web.coastwatch_url.clone(),
             session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
@@ -133,6 +139,18 @@ impl ResolvedConfig {
     }
 }
 
+/// Pick the listen address: [`ENV_BIND_ADDR`] first, then `[web] bind_addr`,
+/// then [`DEFAULT_BIND_ADDR`]. Empty values count as unset at both levels.
+///
+/// Split from `from_parsed` so the precedence is testable without mutating
+/// process env (forbidden under `unsafe_code = "forbid"`).
+fn resolve_bind_addr(env_value: Option<&str>, configured: Option<&str>) -> String {
+    let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
+    pick(env_value)
+        .or_else(|| pick(configured))
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned())
+}
+
 /// Build the default upstream URL from the trawld `[server].http_addr`.
 ///
 /// Trawld always speaks HTTPS (it auto-generates a self-signed cert if
@@ -140,12 +158,17 @@ impl ResolvedConfig {
 /// Wildcard bind addresses (`0.0.0.0`, `::`, `[::]`) are rewritten to
 /// loopback — the proxy reaches trawld on the same host, never across
 /// the wire. IPv6 literals are wrapped in brackets per RFC 3986.
+///
+/// Reads the address through [`ServerConfig::resolve_http_addr`] rather than
+/// the raw field: trawld honours `TRAWL_HTTP_ADDR`, and a proxy still aiming
+/// at the file's port would talk to nothing.
 fn default_upstream_from_server(server: Option<&ServerConfig>) -> String {
     let Some(srv) = server else {
         return FALLBACK_UPSTREAM_URL.to_owned();
     };
 
-    let addr = srv.http_addr.trim();
+    let resolved = srv.resolve_http_addr();
+    let addr = resolved.trim();
     let (host, port_suffix) = split_addr(addr);
     let is_ipv6 = host.contains(':');
     let host = match host {
@@ -265,6 +288,26 @@ mod tests {
         assert_eq!(resolved.upstream_url, "https://trawld:5514");
         assert_eq!(resolved.session_ttl_secs, 3600);
         assert!(resolved.allow_insecure_cookies);
+    }
+
+    #[test]
+    fn bind_addr_precedence_env_then_config_then_default() {
+        assert_eq!(
+            resolve_bind_addr(Some("100.87.180.64:8090"), Some("127.0.0.1:9000")),
+            "100.87.180.64:8090"
+        );
+        assert_eq!(
+            resolve_bind_addr(None, Some("127.0.0.1:9000")),
+            "127.0.0.1:9000"
+        );
+        assert_eq!(resolve_bind_addr(None, None), DEFAULT_BIND_ADDR);
+        // Exported-but-blank is a shell accident, not a bind request — at
+        // either level.
+        assert_eq!(
+            resolve_bind_addr(Some(""), Some("127.0.0.1:9000")),
+            "127.0.0.1:9000"
+        );
+        assert_eq!(resolve_bind_addr(Some(""), Some("")), DEFAULT_BIND_ADDR);
     }
 
     #[test]

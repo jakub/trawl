@@ -66,5 +66,12 @@ port = 8080
 # this authority as the proxied request's Host, and it must match the
 # browser origin's host or fleet-auth's Origin guard 403s login/logout
 # (see the Mode A note above).
+#
+# To browse the dev SPA under a different hostname (remote dev from a
+# phone/tablet over tailscale, say), this line has to follow — the CLI and
+# env forms of `--proxy-backend` register a SECOND proxy rather than
+# replacing this one, and trunk panics on the duplicate `/api/` route.
+# `bin/dev` handles that by generating a rewritten copy of this file; see
+# TRAWL_DEV_HOST there.
 [[proxy]]
 backend = "http://trawl.fleet.localhost:8090/api/"
