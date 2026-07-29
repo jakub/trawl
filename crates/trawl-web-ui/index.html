@@ -17,7 +17,12 @@
       since rust 1.82. revisit when we pin a newer wasm-opt.
     -->
     <link data-trunk rel="rust" data-bin="trawl-web-ui" data-wasm-opt="0"/>
-    <!-- fleet-ui design system FIRST so app-specific selectors in
+    <!-- uPlot's own chrome first — it positions the legend, cursor and
+         axis layers, and both sheets below need to be able to override
+         it. It was previously only `copy-file`d into dist/, i.e. shipped
+         but never loaded, which left every chart's legend unstyled. -->
+    <link data-trunk rel="css" href="vendor/uplot.css"/>
+    <!-- fleet-ui design system next so app-specific selectors in
          main.css keep cascade priority. -->
     <link data-trunk rel="css" href="../fleet-ui/styles/fleet-ui.css"/>
     <link data-trunk rel="css" href="styles/main.css"/>
@@ -26,7 +31,6 @@
     <link data-trunk rel="copy-file" href="vendor/codemirror.js" data-target-path="vendor"/>
     <link data-trunk rel="copy-file" href="vendor/cytoscape.js" data-target-path="vendor"/>
     <link data-trunk rel="copy-file" href="vendor/uplot.js" data-target-path="vendor"/>
-    <link data-trunk rel="copy-file" href="vendor/uplot.css" data-target-path="vendor"/>
 </head>
 <body>
 </body>

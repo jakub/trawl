@@ -1090,19 +1090,25 @@
 .sd-card.types { grid-area: types; }
 .sd-card.top   { grid-area: top; }
 
-.ig-chart { position: relative; height: 110px; }
-.ig-grid { position: absolute; inset: 0; }
-.ig-grid .ln {
-  position: absolute; left: 0; right: 0;
-  border-top: 1px dashed var(--line-2); opacity: .8;
+/* Ingest chart — a uPlot column chart. The canvas paints its own axes
+ * and grid from tokens read in vendor/src/uplot.ts; what's left here is
+ * the surrounding DOM chrome uPlot builds (legend, cursor), which the
+ * vendored uPlot.css positions but does not theme. */
+.ig-chart { width: 100%; }
+.ig-chart .u-legend {
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-tiny);
+  color: var(--ink-3);
 }
-.ig-bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 1px; }
-.ig-bars .bar { display: block; min-height: 1px; border-radius: var(--radius-xs) var(--radius-xs) 0 0; background: var(--accent); flex: 1; }
-.ig-axis {
-  display: flex; justify-content: space-between;
-  margin-top: 4px;
-  font-family: var(--font-mono); font-size: var(--fs-tiny); color: var(--ink-3);
-}
+/* The series marker doubles as a colour key; uPlot draws it as a bordered
+ * box, which reads as an empty checkbox against our fills. */
+.ig-chart .u-legend .u-marker { border-radius: var(--radius-xs); }
+.ig-chart .u-legend .u-label { color: var(--ink-3); }
+.ig-chart .u-legend .u-value { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+/* Hover crosshair — uPlot's default is a hard black hairline. */
+.ig-chart .u-cursor-x,
+.ig-chart .u-cursor-y { border-color: var(--ink-4); }
 
 .ft-donut { display: flex; align-items: center; gap: 14px; }
 .ft-legend { display: grid; grid-template-columns: 1fr; gap: 3px; flex: 1; min-width: 0; }

@@ -26,7 +26,11 @@ use leptos::prelude::*;
 use trawl_api::value::{QueryResult, Value};
 use trawl_api::{QueryResponse, ServiceColumnStats, ServiceSchema};
 
+use wasm_bindgen::{JsCast, JsValue};
+
 use crate::api;
+use crate::histogram::{Slot, align_buckets, parse_bucket_ms};
+use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
 use fleet_ui::{
     Btn, Drawer, Icon, IconView, LoadState, Loaded, TabItem, ToastBus, ToastKind, Variant,
@@ -39,6 +43,17 @@ const TAIL_DISPLAY_MAX: usize = 150;
 
 /// Fields shown in the Overview "Top fields by cardinality" card.
 const TOP_CARDINALITY_ROWS: usize = 6;
+
+/// Ingest chart grid: 24 hourly slots, matching the `last=24h |
+/// timechart span=1h` query that feeds it.
+const INGEST_SLOT_MS: i64 = 3_600_000;
+const INGEST_SLOTS: usize = 24;
+
+/// Ingest chart canvas size. uPlot needs explicit pixels — height is
+/// fixed by the card's slot in the overview grid; width is measured off
+/// the mounted div, with this as the unmeasurable-ancestor fallback.
+const INGEST_CHART_H: f64 = 132.0;
+const INGEST_CHART_W: f64 = 360.0;
 
 #[component]
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
@@ -700,47 +715,107 @@ fn top_cardinality_rows(
 #[component]
 fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>) -> impl IntoView {
     view! {
-        <div class="ig-chart">
-            <Loaded
-                state=Signal::derive(move || LoadState::from_resource(resource.get()))
-                label="histogram"
-                render=Box::new(move |resp: QueryResponse| {
-                    let bars = build_histogram(&resp);
-                    if bars.is_empty() {
-                        return view! {
-                            <div class="sc-more">"No events in the last 24h"</div>
-                        }.into_any();
-                    }
-                    let max = bars.iter().map(|b| b.1).max().unwrap_or(1).max(1);
-                    view! {
-                        <>
-                            <div class="ig-grid">
-                                <div class="ln" style="top:0"></div>
-                                <div class="ln" style="top:50%"></div>
-                                <div class="ln" style="top:100%"></div>
-                            </div>
-                            <div class="ig-bars">
-                                {bars.into_iter().map(|(_label, count)| {
-                                    #[allow(clippy::cast_precision_loss)]
-                                    let h = (count as f64 / max as f64) * 100.0;
-                                    let style = format!("height:{h:.1}%");
-                                    view! { <span class="bar" style=style title=count.to_string()></span> }
-                                }).collect::<Vec<_>>()}
-                            </div>
-                            <div class="ig-axis">
-                                <span>"-24h"</span>
-                                <span>"-12h"</span>
-                                <span>"now"</span>
-                            </div>
-                        </>
-                    }.into_any()
-                })
-            />
-        </div>
+        <Loaded
+            state=Signal::derive(move || LoadState::from_resource(resource.get()))
+            label="histogram"
+            render=Box::new(move |resp: QueryResponse| {
+                let slots = build_histogram(&resp);
+                if slots.is_empty() {
+                    return view! {
+                        <div class="sc-more">"No events in the last 24h"</div>
+                    }.into_any();
+                }
+                view! { <IngestChart slots=slots/> }.into_any()
+            })
+        />
     }
 }
 
-fn build_histogram(resp: &QueryResponse) -> Vec<(String, u64)> {
+/// uPlot column chart over the filled hourly grid — real time axis,
+/// hover readout, and zero-anchored y scale.
+///
+/// Replaces a hand-rolled strip of flex `<span>`s that had no notion of
+/// time: it gave every returned row an equal-width bar, so gaps in
+/// ingest silently collapsed instead of showing as gaps.
+#[component]
+fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
+    let node_ref = NodeRef::<leptos::html::Div>::new();
+    // `ChartHandle` wraps a JS object — not Send/Sync, so it needs the
+    // single-threaded storage, same as the search-page chart.
+    let handle: StoredValue<Option<ChartHandle>, LocalStorage> = StoredValue::new_local(None);
+
+    Effect::new(move |_| {
+        let Some(element) = node_ref.get() else {
+            return;
+        };
+        let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
+        let data = slots_to_aligned(&slots);
+
+        handle.update_value(|stored| {
+            if let Some(h) = stored.as_ref() {
+                h.set_data(data);
+            } else {
+                // The drawer lays out before this effect runs, so the
+                // measured width is real; the fallback only guards a
+                // display:none ancestor.
+                let measured = f64::from(html_el.client_width());
+                let labels = ["events".to_string()];
+                let opts = Opts {
+                    width: if measured > 0.0 {
+                        measured
+                    } else {
+                        INGEST_CHART_W
+                    },
+                    height: INGEST_CHART_H,
+                    series: &labels,
+                    y_label: None,
+                    bars: true,
+                    // x values were built from trawld's already-shifted
+                    // display timestamps — see `align_buckets`.
+                    utc: true,
+                };
+                *stored = Some(create_chart(&html_el, data, opts.to_js()));
+            }
+        });
+    });
+
+    on_cleanup(move || {
+        handle.update_value(|stored| {
+            if let Some(h) = stored.take() {
+                h.destroy();
+            }
+        });
+    });
+
+    view! { <div class="ig-chart" node_ref=node_ref></div> }
+}
+
+/// uPlot `AlignedData`: `[xs, ys]`, xs in seconds-since-epoch.
+fn slots_to_aligned(slots: &[Slot]) -> JsValue {
+    let xs = js_sys::Array::new();
+    let ys = js_sys::Array::new();
+    for slot in slots {
+        // Bucket starts and event counts are both far below 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        {
+            xs.push(&JsValue::from_f64(slot.start_ms as f64 / 1000.0));
+            ys.push(&JsValue::from_f64(slot.count as f64));
+        }
+    }
+    let aligned = js_sys::Array::new();
+    aligned.push(&xs);
+    aligned.push(&ys);
+    aligned.into()
+}
+
+/// Pull `(bucket_start_ms, count)` out of a `timechart span=1h` response
+/// and lay it on a full 24-slot hourly grid.
+///
+/// The server only emits rows for buckets that HAVE events, and the bar
+/// strip gives every row equal width — so a service that ingested during
+/// two hours of the day rendered as two half-width bars. Filling the
+/// grid puts each bar back at its real position.
+fn build_histogram(resp: &QueryResponse) -> Vec<Slot> {
     let cols = &resp.result.columns;
     let ti = cols.iter().position(|c| {
         matches!(
@@ -754,15 +829,17 @@ fn build_histogram(resp: &QueryResponse) -> Vec<(String, u64)> {
     let (Some(ti), Some(ci)) = (ti, ci) else {
         return Vec::new();
     };
-    resp.result
+    let rows: Vec<(i64, u64)> = resp
+        .result
         .rows
         .iter()
         .filter_map(|row| {
-            let label = row.get(ti).map(value_as_display)?;
+            let ts = parse_bucket_ms(&row.get(ti).map(value_as_display)?)?;
             let count = row.get(ci).and_then(value_as_u64)?;
-            Some((label, count))
+            Some((ts, count))
         })
-        .collect()
+        .collect();
+    align_buckets(&rows, INGEST_SLOT_MS, INGEST_SLOTS)
 }
 
 // ───────────────────────── Field-type donut ─────────────────────────

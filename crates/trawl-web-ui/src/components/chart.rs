@@ -9,7 +9,7 @@ use trawl_api::display::extract_series;
 use trawl_api::value::QueryResult;
 use wasm_bindgen::JsValue;
 
-use crate::interop::uplot::{ChartHandle, create_chart};
+use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 
 /// uPlot `AlignedData` is `[xs, ys1, ys2, ...]` where every inner array
 /// is equal length. All values are `f64`; xs are seconds-since-epoch.
@@ -60,18 +60,6 @@ fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>) {
     (aligned.into(), labels)
 }
 
-fn build_opts(width: f64, height: f64, labels: &[String]) -> JsValue {
-    let obj = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&obj, &"width".into(), &JsValue::from_f64(width));
-    let _ = js_sys::Reflect::set(&obj, &"height".into(), &JsValue::from_f64(height));
-    let series_arr = js_sys::Array::new();
-    for label in labels {
-        series_arr.push(&JsValue::from_str(label));
-    }
-    let _ = js_sys::Reflect::set(&obj, &"series".into(), &series_arr.into());
-    obj.into()
-}
-
 #[component]
 pub fn Chart(#[prop(into)] snapshot: Signal<Option<QueryResult>>) -> impl IntoView {
     let node_ref = NodeRef::<leptos::html::Div>::new();
@@ -93,9 +81,17 @@ pub fn Chart(#[prop(into)] snapshot: Signal<Option<QueryResult>>) -> impl IntoVi
             if let Some(h) = slot.as_ref() {
                 h.set_data(data);
             } else {
-                // First snapshot — construct the chart.
-                let opts = build_opts(f64::from(html_el.client_width()), 320.0, &labels);
-                let h = create_chart(&html_el, data, opts);
+                // First snapshot — construct the chart. x values here are
+                // row indices, not real instants, so `utc` stays off.
+                let opts = Opts {
+                    width: f64::from(html_el.client_width()),
+                    height: 320.0,
+                    series: &labels,
+                    y_label: None,
+                    bars: false,
+                    utc: false,
+                };
+                let h = create_chart(&html_el, data, opts.to_js());
                 *slot = Some(h);
             }
         });

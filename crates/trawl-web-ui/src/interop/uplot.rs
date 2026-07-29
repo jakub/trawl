@@ -12,6 +12,52 @@
 
 use wasm_bindgen::prelude::*;
 
+/// Rust mirror of `ChartOpts` in `vendor/src/uplot.ts`. Built here rather
+/// than at each call site so the two chart surfaces (the search-page
+/// snapshot line and the service drawer's ingest bars) can't drift on
+/// field names the JS side reads by string key.
+pub struct Opts<'a> {
+    pub width: f64,
+    pub height: f64,
+    /// One label per y-series; the x-series is named by the wrapper.
+    pub series: &'a [String],
+    pub y_label: Option<&'a str>,
+    /// Column chart instead of a line.
+    pub bars: bool,
+    /// Format the time axis as UTC. Set when x values were derived from
+    /// trawld's already-timezone-shifted `_time` strings.
+    pub utc: bool,
+}
+
+impl Opts<'_> {
+    #[must_use]
+    pub fn to_js(&self) -> JsValue {
+        let obj = js_sys::Object::new();
+        let set = |k: &str, v: &JsValue| {
+            let _ = js_sys::Reflect::set(&obj, &k.into(), v);
+        };
+        set("width", &JsValue::from_f64(self.width));
+        set("height", &JsValue::from_f64(self.height));
+
+        let series = js_sys::Array::new();
+        for label in self.series {
+            series.push(&JsValue::from_str(label));
+        }
+        set("series", &series.into());
+
+        if let Some(label) = self.y_label {
+            set("yLabel", &JsValue::from_str(label));
+        }
+        if self.bars {
+            set("kind", &JsValue::from_str("bars"));
+        }
+        if self.utc {
+            set("utc", &JsValue::TRUE);
+        }
+        obj.into()
+    }
+}
+
 #[wasm_bindgen(module = "/vendor/uplot.js")]
 extern "C" {
     pub type ChartHandle;
