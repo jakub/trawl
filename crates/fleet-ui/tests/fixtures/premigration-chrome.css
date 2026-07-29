@@ -4,13 +4,19 @@
  * into fleet-ui.css, pinned so an accidental edit turns a test red.
  * Originally captured verbatim from
  * `git show f4a3b45^:crates/trawl-web-ui/styles/main.css` (the commit
- * before slice B); re-captured from the shipped fleet-ui.css after the
- * ADR-0005 design-workbench pass, whose deltas were deliberate:
- * --amber* → --accent* rename, font-size literals → --fs-* rhythm
- * tokens, and .m-field label reading the --label-* treatment tokens.
- * Structure (layout, spacing, weights, transitions) is unchanged from
- * the pre-migration bytes — the byte-parity guarantee now anchors on
- * THIS baseline.
+ * before slice B); re-captured after the ADR-0005 design-workbench
+ * pass, and re-captured again from the shipped fleet-ui.css after the
+ * **Mira Blue port (ADR-0007, issue #47)**, whose deltas were
+ * deliberate: the radius tokens (--radius-ctl/-sm) replace px
+ * literals, .btn-sm becomes the Mira outline treatment (transparent
+ * fill, weight 500, neutral panel-3 hover), inputs (.m-field input,
+ * .reason-input) take the translucent --fill wash (per-theme token:
+ * the light line-20% mix, an explicit white overlay in dark, since
+ * mixing the alpha dark --line collapses it) and the shared
+ * --shadow-glow 2px ring focus, .sd-scrim neutralizes onto the oklch
+ * ink scale, and .sd-x / .modal .m-hd .ic round on --radius-sm.
+ * Structure (layout, spacing, transitions) is otherwise unchanged —
+ * the byte-parity guarantee now anchors on THIS baseline.
  *
  * The four DELIBERATE pre-ADR-0005 deltas (rail/mode anchor underline
  * suppression, .login-card .error respacing, .shell auto footer row)
@@ -21,18 +27,19 @@
 
 .btn-sm {
   padding: 3px 10px;
-  background: var(--panel-2);
+  background: transparent;
   color: var(--ink-2);
   border: 1px solid var(--line);
-  border-radius: 2px;
+  border-radius: var(--radius-ctl);
   font-size: var(--fs-small);
   font-family: var(--font-ui);
+  font-weight: 500;
   cursor: pointer;
 }
 
 .btn-sm:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--accent);
+  background: color-mix(in oklab, var(--panel-3) 55%, transparent);
+  color: var(--ink);
 }
 
 .btn-sm:disabled {
@@ -72,7 +79,7 @@
 .modal .m-hd .ic {
   width: 22px; height: 22px; display: grid; place-items: center;
   color: var(--accent);
-  background: var(--accent-wash); border-radius: 3px;
+  background: var(--accent-wash); border-radius: var(--radius-sm);
 }
 
 .modal .m-field { display: flex; flex-direction: column; gap: 4px; }
@@ -84,17 +91,18 @@
 }
 
 .modal .m-field input {
-  background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+  background: var(--fill);
+  border: 1px solid var(--line); border-radius: var(--radius-ctl);
   padding: 6px 10px; font-family: var(--font-ui); font-size: var(--fs-base);
   color: var(--ink); outline: none; height: 30px;
 }
 
 .modal .m-field input:focus {
-  border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow);
+  border-color: var(--accent); box-shadow: var(--shadow-glow);
 }
 
 .sd-scrim {
-  position: fixed; inset: 0; background: rgba(20,15,5,.18);
+  position: fixed; inset: 0; background: oklch(14.5% 0 0 / .18);
   z-index: 50; animation: sd-fade-in 140ms ease-out;
   backdrop-filter: blur(1px);
 }
@@ -125,7 +133,7 @@
 
 .sd-x {
   background: none; border: 1px solid transparent; cursor: pointer;
-  width: 28px; height: 28px; border-radius: 3px;
+  width: 28px; height: 28px; border-radius: var(--radius-sm);
   font-size: 18px; color: var(--ink-3); line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
 }
@@ -159,13 +167,13 @@
 
 .reason-input {
   width: 100%; min-height: 60px; padding: 6px 8px;
-  background: var(--panel-2); color: var(--ink);
-  border: 1px solid var(--line); border-radius: 3px;
+  background: var(--fill); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius-ctl);
   font-family: var(--font-mono); font-size: var(--fs-base);
   resize: vertical;
 }
 
 .reason-input:focus {
-  outline: none; box-shadow: 0 0 0 3px var(--accent-glow);
+  outline: none; box-shadow: var(--shadow-glow);
   border-color: var(--accent);
 }

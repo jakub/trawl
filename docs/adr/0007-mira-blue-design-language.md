@@ -28,11 +28,38 @@ Key points:
 
 - **Surfaces**: neutral zero-chroma OKLCH ramp. Light: `--bg` 98.5%, panels
   100%/97%/93.5%, lines 92.2%. Dark: `--bg` 14.5%, panels 18%/22%/26.9%,
-  lines as white-alpha overlays (10% / 6%) rather than solid greys.
+  lines as white-alpha overlays (10% / 6%) rather than solid greys. The ink
+  ramp follows the skin except at light `--ink-4`, which is contrast-bound
+  the way `--red` is: it is a TEXT colour (the `--fs-micro` DEBUG level pill,
+  the DSL editor's gutter numbers, `.editor-hd .dim`, `.divider`), and the
+  skin's `oklch(70.8%)` measures 2.59:1 on `--panel` and 2.48:1 on the
+  editor's `--fill` wash — under even the 3:1 non-text floor, and a
+  regression on ADR-0005's `#82868e` (3.56:1). Light `--ink-4` therefore
+  holds that tone's luminance as a neutral, `oklch(62%)` (3.64:1 / 3.48:1,
+  and >=3.01:1 on every other light surface). Dark `--ink-4` is bound the
+  same way: the skin's step (`oklch(50%)`) measures 3.12:1 on `--panel`,
+  but the gutter digits actually sit on the `--fill`-composited editor
+  surface, where it drops to 2.72:1 — under the floor. Dark `--ink-4`
+  therefore holds `oklch(56%)` (3.51:1 on the composited fill, higher on
+  every plain panel).
 - **Accent**: fleet's blues stay — `#2a5c8a` light, `#5a9fd4` dark — with a
   new `--on-accent` token replacing hard-coded `#fff` button text. Dark mode
   keeps Mira's inversion: light-blue accent surfaces carry near-black
-  (`oklch(16% 0 0)`) text.
+  (`oklch(16% 0 0)`) text. `--accent-2` flips role from a darker shade to a
+  lighter tint (`color-mix(accent 85%, white)`), so the nine sites that used
+  it as TEXT move to `--accent` — on the field-type pill wash the new tint
+  measures 3.67:1, under the AA floor, against `--accent`'s 5.19:1.
+  `--accent-soft` deliberately keeps its pre-Mira value (`#7ea6cc` light):
+  the skin's companion move would land it .031 from the new `--accent-2` in
+  oklab, and those two are the INT and NUM arcs of the schema drawer's
+  field-type donut, where colour is the only encoding. For the same reason
+  the tint mixes toward **white in light and black in dark**: the dark
+  accent is already light-valued, so a white mix compresses the arc scale to
+  .050 / .045 gaps — one flat light blue — where the black mix restores a
+  monotonic `--accent-2` / `--blue` / `--accent-soft` ramp with no pair
+  closer than .095 (light's tightest is .081). The direction inverts with
+  `--on-accent`, not against it: dark steps the accent away from a dark
+  surface.
 - **Focus**: 2px solid ring (`--ring`, accent-tinted) replaces the 3px soft
   glow, via the existing `--shadow-glow` token and `:focus-visible` rule.
 - **Radius**: tokenized — `--radius-ctl: 8px` (buttons, inputs, editor),
@@ -42,8 +69,16 @@ Key points:
 - **Controls**: buttons weight 500 (was 600), transparent 1px border,
   `color-mix` tint hovers, `translate: 0 1px` press (replaces
   `scale(0.96)`); destructive buttons are tinted (red text on ~10% red wash),
-  never solid; inputs get translucent fills (`color-mix` of the border color,
-  ~20% light / ~30% dark) and ring focus.
+  never solid; inputs get translucent fills and ring focus. The fill is a
+  per-theme `--fill` token: light mixes the border color at ~20%, dark states
+  the equivalent white overlay (~6%) directly, because the dark border color
+  is *itself* a 10%-alpha overlay and `color-mix(…, transparent)` multiplies
+  alphas — mixing it would collapse the fill to ~2%. Tinting also makes
+  `--red` a *foreground* over its own wash, so the light tone is
+  contrast-bound rather than free: Mira's `oklch(57.7% .245)` measures
+  3.97:1 on the resting wash and 3.31:1 on the hover wash, under the 4.5:1
+  AA floor, so light `--red` is deepened to `oklch(48% .177)` (6.03:1 /
+  5.06:1). Dark `--red` sits on dark panels and keeps Mira's lighter tone.
 - **Fonts**: Geist / Geist Mono replace Open Sans / Fira Code. Loaded by the
   consumer's `index.html` from Google Fonts, same mechanism as before;
   self-hosting remains deferred.

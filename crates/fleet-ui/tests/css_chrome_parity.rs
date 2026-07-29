@@ -29,6 +29,13 @@
 //! Reading the shipped stylesheet at test time turns those prose claims
 //! into a `cargo nextest` guard, mirroring the `ToastKind` / `Btn`
 //! variant native contract tests.
+//!
+//! Baseline: **Mira Blue (ADR-0007, issue #47)**. The golden fixture was
+//! re-captured from the shipped CSS after the Mira Blue port (the
+//! ADR-0005-sanctioned mechanism), and the targeted `rule_body` pins
+//! below enforce the Mira control recipes — weight-500 buttons, tinted
+//! destructive, `--on-accent` text, 2px `--ring` focus, tokenized radii
+//! — so the new values are the guarded baseline, not a casualty.
 
 const CSS: &str = include_str!("../styles/fleet-ui.css");
 
@@ -173,8 +180,9 @@ fn btn_size_classes_shipped_with_crate() {
         ".btn-sm padding moved verbatim"
     );
     assert!(
-        sm.contains("background: var(--panel-2)"),
-        ".btn-sm is a self-contained style (own background), not a modifier"
+        sm.contains("background: transparent"),
+        ".btn-sm is the Mira outline treatment (ADR-0007): transparent \
+         fill, 1px line border — still self-contained, not a modifier"
     );
     assert!(
         rule_body(".btn-sm:disabled").contains("opacity: 0.4"),
@@ -286,6 +294,182 @@ fn drawer_shell_classes_shipped_with_crate() {
             "drawer keyframe `@keyframes {name}` missing from fleet-ui.css"
         );
     }
+}
+
+#[test]
+fn mira_blue_button_recipes_pinned() {
+    // ADR-0007: buttons are weight 500 (was 600) — the single most
+    // visible Mira control delta. Pinned per variant so a font-weight
+    // regression on any one of them turns red.
+    for sel in [".btn", ".btn-pri", ".btn-danger"] {
+        assert!(
+            rule_body(sel).contains("font-weight: 500"),
+            "`{sel}` must carry the Mira Blue weight-500 button treatment"
+        );
+    }
+    // Destructive is TINTED (red text on the red wash), never solid red.
+    let danger = rule_body(".btn-danger");
+    assert!(
+        danger.contains("background: var(--red-wash)"),
+        ".btn-danger must be tinted: red text on var(--red-wash)"
+    );
+    assert!(
+        !danger.contains("background: var(--red)"),
+        ".btn-danger must never regress to a solid red fill"
+    );
+    // Tinting makes `--red` a FOREGROUND over its own wash, so the light
+    // tone is contrast-bound: Mira's oklch(57.7% .245) measures 3.97:1
+    // there (3.31:1 on the 20% hover wash), under the 4.5:1 AA floor for
+    // normal text. The shipped light tone is the measured one — re-measure
+    // the composited pixels before changing it.
+    assert!(
+        CSS.contains("--red:        oklch(48% .177 27.325)"),
+        "the light `--red` is toned for AA over `--red-wash` (6.03:1 resting, \
+         5.06:1 hover) — a lighter tone drops the tinted destructive recipe \
+         below 4.5:1"
+    );
+    // Press feedback is a 1px translate; the scale press is retired.
+    assert!(
+        !CSS.contains("scale: 0.96"),
+        "the scale(0.96) press is retired — Mira presses are `translate: 0 1px`"
+    );
+    // Accent surfaces read their text from the token, never a literal.
+    assert!(
+        !CSS.contains("color: #fff"),
+        "hard-coded #fff text is retired — accent surfaces use var(--on-accent)"
+    );
+}
+
+#[test]
+fn dark_outline_hover_is_a_backdrop_independent_lift() {
+    // The shared hover fill — `color-mix(in oklab, var(--panel-3) 55%,
+    // transparent)` — is TRANSLUCENT, so what it renders depends on the
+    // backdrop it composites over, while the dark resting fill is a fixed
+    // white-alpha overlay. Measured in headless Chrome with the shipped
+    // CSS at the old .04 resting alpha: over `--panel` the hover landed on
+    // rgb(29) against a rgb(27) rest (a 2/255 delta — no feedback), and
+    // inside a `--panel-2` container it landed DARKER than rest, rgb(33)
+    // under rgb(36) — an inverted hover. Real `--panel-2` containers hold
+    // secondary buttons (`.tl-bar`, `.sd-card`), so dark mode restates
+    // BOTH ends in the overlay system: `--fill` -> `--fill-2` is the same
+    // step on every surface (rgb(32)->rgb(44) on `--panel`,
+    // rgb(41)->rgb(52) on `--panel-2`).
+    let rest = rule_body("[data-theme=\"dark\"] .btn-sec,\n[data-theme=\"dark\"] .btn-sm");
+    assert!(
+        rest.contains("background: var(--fill)"),
+        "the dark outline resting fill must be the backdrop-independent \
+         `var(--fill)` overlay, got:{rest}"
+    );
+    let hover = rule_body(
+        "[data-theme=\"dark\"] .btn-sec:hover,\n[data-theme=\"dark\"] .btn-sm:hover:not(:disabled)",
+    );
+    assert!(
+        hover.contains("background: var(--fill-2)"),
+        "the dark outline hover must step to `var(--fill-2)` — inheriting \
+         the shared backdrop-dependent `--panel-3` hover makes the lift \
+         imperceptible on `--panel` and a DIP on `--panel-2`, got:{hover}"
+    );
+    // The resting fill is (0,2,0), exactly `.btn-sec:hover`, so source
+    // order is the only tie-breaker: it must still be declared BEFORE the
+    // shared hover rules. (The dark hover pair above is (0,3,0) and wins
+    // on specificity regardless of where it sits.)
+    let fill = CSS
+        .find("[data-theme=\"dark\"] .btn-sec,")
+        .expect("dark outline resting fill present");
+    for shared in ["\n.btn-sec:hover {", "\n.btn-sm:hover:not(:disabled) {"] {
+        let hpos = CSS
+            .find(shared)
+            .unwrap_or_else(|| panic!("`{}` present", shared.trim()));
+        assert!(
+            fill < hpos,
+            "the `[data-theme=\"dark\"]` resting fill must precede `{}` — \
+             equal specificity means a later fill would kill the hover",
+            shared.trim()
+        );
+    }
+}
+
+#[test]
+fn mira_blue_tokens_declared() {
+    // The ADR-0007 radius scale lives in fleet-ui.css :root — main.css
+    // consumes it but never declares tokens (css_move_invariant).
+    for decl in [
+        "--radius-panel: 10px",
+        "--radius-ctl: 8px",
+        "--radius-sm: 6px",
+        "--on-accent:",
+    ] {
+        assert!(
+            CSS.contains(decl),
+            "expected `{decl}` declared in fleet-ui.css (ADR-0007 token contract)"
+        );
+    }
+    // --on-accent is per-theme: light near-white, dark near-black
+    // (Mira's dark-mode inversion) — one declaration per theme block.
+    assert_eq!(
+        CSS.matches("--on-accent:").count(),
+        2,
+        "--on-accent must be declared exactly once per theme block"
+    );
+    // Focus is the 2px solid ring in BOTH themes (was a 3px soft glow).
+    assert_eq!(
+        CSS.matches("--shadow-glow: 0 0 0 2px var(--ring)").count(),
+        2,
+        "--shadow-glow must be the 2px var(--ring) ring in both theme blocks"
+    );
+    // Light --ink-4 is contrast-bound: it paints TEXT (the --fs-micro
+    // DEBUG level pill, the DSL editor gutter numbers, .editor-hd .dim,
+    // .divider), so it holds the pre-Mira tone's luminance rather than the
+    // skin's oklch(70.8%), which measures 2.59:1 on --panel and 2.48:1 on
+    // the editor's --fill wash. Re-measure the composited pixels before
+    // lightening it.
+    assert!(
+        CSS.contains("--ink-4:     oklch(62% 0 0)"),
+        "the light `--ink-4` is toned for the 3:1 floor as a text colour \
+         (3.64:1 on --panel, 3.48:1 on the editor fill) — a lighter step \
+         drops the DEBUG pill and the gutter rule below it"
+    );
+}
+
+#[test]
+fn control_fills_route_through_the_per_theme_token() {
+    // Dark `--line` is ITSELF a 10%-alpha white overlay, and
+    // `color-mix(<colour>, transparent)` MULTIPLIES alphas: a fill spelled
+    // `color-mix(in oklab, var(--line) 20%, transparent)` renders at
+    // .10 x .20 = 2% in dark mode — nothing on an oklch(18%) panel, so
+    // dark inputs would ship effectively unfilled while the light theme
+    // looked correct. Fills therefore read the per-theme `--fill` /
+    // `--fill-2` tokens (light mixes the opaque line; dark states the
+    // overlay alpha directly), and the ONLY `--line`-against-transparent
+    // mixes left in the file are those two light declarations.
+    // Declarations only — anchored on the newline + indent so prose in the
+    // surrounding comments never counts.
+    for token in ["\n  --fill:", "\n  --fill-2:"] {
+        assert_eq!(
+            CSS.matches(token).count(),
+            2,
+            "`{}` must be declared exactly once per theme block",
+            token.trim()
+        );
+    }
+    let dark = CSS
+        .find("[data-theme=\"dark\"] {")
+        .expect("dark theme token block present");
+    let strays: Vec<&str> = CSS
+        .match_indices("var(--line) ")
+        .filter_map(|(i, m)| {
+            let rest = &CSS[i + m.len()..];
+            let end = rest.find(')')?;
+            (rest[..end].contains("transparent") && i > dark)
+                .then(|| CSS[i..i + m.len() + end].trim())
+        })
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "these mix the alpha dark `--line` against `transparent`, which \
+         multiplies alphas and collapses the fill to a few percent — read \
+         `var(--fill)` / `var(--fill-2)` instead: {strays:#?}"
+    );
 }
 
 #[test]
