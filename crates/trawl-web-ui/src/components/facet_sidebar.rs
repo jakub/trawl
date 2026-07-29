@@ -48,10 +48,10 @@ pub fn FacetSidebar(
                     <div
                         class="clear"
                         on:click=move |_| on_clear.run(())
-                    >"clear all"</div>
+                    >"Clear all"</div>
                 </Show>
             </div>
-            <SearchInput value=needle placeholder="filter field values"/>
+            <SearchInput value=needle placeholder="Filter field values"/>
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 // Deliberate quiet-error override (issue #31 C4): the

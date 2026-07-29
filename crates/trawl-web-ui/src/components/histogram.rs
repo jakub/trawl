@@ -62,7 +62,7 @@ pub fn Histogram(
                                 let ok_h = pct(b.ok, max);
                                 let err_h = pct(b.err, max);
                                 let tip = format!(
-                                    "bucket {i} · {total} events{}",
+                                    "Bucket {i} · {total} events{}",
                                     if b.err > 0 { format!(" · {} errors", b.err) } else { String::new() }
                                 );
                                 view! {

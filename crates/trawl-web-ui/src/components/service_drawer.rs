@@ -93,7 +93,7 @@ pub fn ServiceDrawer(
             tabs=vec![
                 TabItem::new("overview", "Overview"),
                 TabItem::new("fields", "Fields"),
-                TabItem::new("tail", "Live tail"),
+                TabItem::new("tail", "Live Tail"),
             ]
             active_tab=eff_tab
             on_tab_change=on_tab_change
@@ -114,7 +114,7 @@ pub fn ServiceDrawer(
                     <IconView icon=Icon::Search size=11 stroke_width=1.5/> " Search this service"
                 </Btn>
                 <Btn variant=Variant::Secondary on_click=on_tail_click>
-                    <IconView icon=Icon::Bolt size=11 stroke_width=1.5/> " Tail live"
+                    <IconView icon=Icon::Bolt size=11 stroke_width=1.5/> " Live Tail"
                 </Btn>
             }.into_any())
         >
@@ -190,7 +190,7 @@ fn OverviewPane(
                         let rows = top_cardinality_rows(&columns_for_top, &card_map, TOP_CARDINALITY_ROWS);
                         if rows.is_empty() {
                             return view! {
-                                <div class="sc-more">"no distinct values observed yet"</div>
+                                <div class="sc-more">"No distinct values observed yet"</div>
                             }.into_any();
                         }
                         let max = rows.iter().map(|r| r.2).max().unwrap_or(1).max(1);
@@ -410,7 +410,7 @@ fn FieldDetail(
                         let rows = parse_top_values(&resp, &field_name);
                         if rows.is_empty() {
                             return view! {
-                                <div class="sc-more">"no values"</div>
+                                <div class="sc-more">"No values"</div>
                             }.into_any();
                         }
                         let max = rows.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
@@ -506,7 +506,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
         <div class="sd-tail">
             <div class="tl-bar">
                 <span class=move || if paused.get() { "pulse off" } else { "pulse" }><span></span></span>
-                <span class="lbl">{move || if paused.get() { "paused" } else { "tailing" }}</span>
+                <span class="lbl">{move || if paused.get() { "Paused" } else { "Tailing" }}</span>
                 <span class="sp"></span>
                 {move || lagged_label().map(|l| view! {
                     <span class="lbl" style="color:var(--yellow)">{l}</span>
@@ -524,7 +524,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
                     let rb = ring.read();
                     let total = rb.events.len();
                     if total == 0 {
-                        return view! { <div class="sc-more">"waiting for events…"</div> }.into_any();
+                        return view! { <div class="sc-more">"Waiting for events…"</div> }.into_any();
                     }
                     let skip = total.saturating_sub(TAIL_DISPLAY_MAX);
                     rb.events.iter().skip(skip).map(|ev| {
@@ -708,7 +708,7 @@ fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>)
                     let bars = build_histogram(&resp);
                     if bars.is_empty() {
                         return view! {
-                            <div class="sc-more">"no events in the last 24h"</div>
+                            <div class="sc-more">"No events in the last 24h"</div>
                         }.into_any();
                     }
                     let max = bars.iter().map(|b| b.1).max().unwrap_or(1).max(1);
@@ -799,7 +799,7 @@ fn donut_breakdown(columns: &[ServiceColumnStats]) -> Vec<DonutSegment> {
 #[component]
 fn FieldTypeDonut(segments: Vec<DonutSegment>, total: usize) -> impl IntoView {
     if total == 0 {
-        return view! { <div class="ft-donut">"no fields"</div> }.into_any();
+        return view! { <div class="ft-donut">"No fields"</div> }.into_any();
     }
     let r = 28.0_f64;
     let circ = 2.0 * std::f64::consts::PI * r;

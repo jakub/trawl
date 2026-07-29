@@ -124,7 +124,7 @@ pub fn StatusBar(
                 <>
                     <span class="divider">"·"</span>
                     <div class="grp" title="Hot buffer (events / bytes)">
-                        <span>"hot "</span>
+                        <span>"Hot "</span>
                         <span class="strong">
                             {format_count(u64::try_from(s.hot_buffer_events).unwrap_or_default())}
                         </span>
@@ -134,18 +134,18 @@ pub fn StatusBar(
                     </div>
                     <span class="divider">"·"</span>
                     <div class="grp" title="WAL backlog (files / bytes)">
-                        <span>"wal "</span>
+                        <span>"WAL "</span>
                         <span class="strong">{s.wal_files.to_string()}</span>
                         <span>{format!(" / {}", format_bytes(s.wal_bytes))}</span>
                     </div>
                     <span class="divider">"·"</span>
                     <div class="grp" title="Active queries">
-                        <span>"queries "</span>
+                        <span>"Queries "</span>
                         <span class="strong">{s.active_queries.len().to_string()}</span>
                     </div>
                     <span class="divider">"·"</span>
                     <div class="grp" title="Server uptime">
-                        <span>"up "</span>
+                        <span>"Up "</span>
                         <span class="accent">{format_uptime(s.uptime_secs)}</span>
                     </div>
                 </>
@@ -153,7 +153,7 @@ pub fn StatusBar(
             <span class="divider">"·"</span>
             <div class="grp">
                 <span>
-                    "last "
+                    "Last "
                     <span class="strong">
                         {move || count.get().map_or_else(|| "—".to_string(), |c| c.to_string())}
                     </span>

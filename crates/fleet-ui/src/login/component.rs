@@ -54,7 +54,7 @@ pub fn Login(
                 <h1>
                     <span>{brand}</span><span class="accent">{brand_accent}</span>
                 </h1>
-                <p class="subtitle">"sign in with your API key"</p>
+                <p class="subtitle">"Sign in with your API key"</p>
 
                 // Dogfooding (issue #28): ErrorBanner absorbs the
                 // conditional error strip (adds role="alert" — the only

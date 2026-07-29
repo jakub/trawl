@@ -162,7 +162,7 @@ pub(crate) fn render_derivation_meta(
     }
 
     let reason_el = redaction_reason.map(|reason| {
-        let display = format!("reason: {}", truncate(&reason, 30));
+        let display = format!("Reason: {}", truncate(&reason, 30));
         view! {
             <span
                 style="font-size:9px;color:var(--ink-3);font-style:italic"
@@ -213,7 +213,7 @@ pub fn LineageTree(
             <div class="lineage-section">
                 <div class="intel-section-hd">{label}</div>
                 <p class="mono" style="font-size:11px;color:var(--ink-3);margin:4px 0">
-                    "none"
+                    "None"
                 </p>
             </div>
         }
@@ -285,7 +285,7 @@ pub fn LineageTree(
                                             }
                                         })
                                     >
-                                        "invalidate"
+                                        "Invalidate"
                                     </Btn>
                                 }
                             })}
@@ -295,9 +295,9 @@ pub fn LineageTree(
                                         variant=Variant::Secondary
                                         size=Size::Xs
                                         disabled=true
-                                        attr:title="requires DerivationWrite permission"
+                                        attr:title="Requires DerivationWrite permission"
                                     >
-                                        "invalidate"
+                                        "Invalidate"
                                     </Btn>
                                 }
                             })}

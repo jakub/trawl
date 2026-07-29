@@ -151,7 +151,7 @@ pub fn SchemaPage() -> impl IntoView {
                     <p class="sub">"Click a service to inspect fields, ingest rate, and tail live."</p>
                 </div>
                 <div class="actions">
-                    <SearchInput value=filter placeholder="filter services…"/>
+                    <SearchInput value=filter placeholder="Filter services…"/>
                 </div>
             </div>
 
@@ -185,9 +185,9 @@ pub fn SchemaPage() -> impl IntoView {
                                 return view! {
                                     <div class="tbl-empty">
                                         {if resp.services.is_empty() {
-                                            "no services yet — ingest some logs and they'll appear here"
+                                            "No services yet — ingest some logs and they'll appear here"
                                         } else {
-                                            "no services match that filter"
+                                            "No services match that filter"
                                         }}
                                     </div>
                                 }.into_any();
@@ -290,7 +290,7 @@ pub fn SchemaPage() -> impl IntoView {
                                             </span>
                                             <span
                                                 class="qa"
-                                                title="Live tail"
+                                                title="Live Tail"
                                                 on:click=move |e: web_sys::MouseEvent| {
                                                     e.stop_propagation();
                                                     on_tail.run(name_tail.clone());

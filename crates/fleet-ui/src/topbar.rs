@@ -138,10 +138,10 @@ pub fn TopBar(
                             <div class="name">{move || user.get().map(|u| u.name).unwrap_or_default()}</div>
                             <div class="mail">{move || user.get().map(|u| u.detail).unwrap_or_default()}</div>
                         </div>
-                        <div class="item disabled" title="coming soon">
+                        <div class="item disabled" title="Coming soon">
                             <span>"Profile"</span>
                         </div>
-                        <div class="item disabled" title="coming soon">
+                        <div class="item disabled" title="Coming soon">
                             <span>"API tokens"</span>
                         </div>
                         <div class="item" on:click=toggle_theme>

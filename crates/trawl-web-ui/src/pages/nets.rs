@@ -189,7 +189,7 @@ pub fn NetsPage() -> impl IntoView {
                     <p class="sub">"Manage saved queries, attach schedules, and inspect run history."</p>
                 </div>
                 <div class="actions">
-                    <SearchInput value=filter placeholder="filter nets…"/>
+                    <SearchInput value=filter placeholder="Filter nets…"/>
                 </div>
             </div>
 
@@ -220,9 +220,9 @@ pub fn NetsPage() -> impl IntoView {
                                     return view! {
                                         <div class="tbl-empty">
                                             {if resp.queries.is_empty() {
-                                                "no nets yet — save a query from the search page to get started"
+                                                "No nets yet — save a query from the search page to get started"
                                             } else {
-                                                "no nets match that filter"
+                                                "No nets match that filter"
                                             }}
                                         </div>
                                     }.into_any();
@@ -284,7 +284,7 @@ pub fn NetsPage() -> impl IntoView {
                                                 None => {
                                                     if sched.enabled {
                                                         view! {
-                                                            <span class="mono" style="color:var(--ink-3); font-size:10px">"pending…"</span>
+                                                            <span class="mono" style="color:var(--ink-3); font-size:10px">"Pending…"</span>
                                                         }.into_any()
                                                     } else {
                                                         view! {

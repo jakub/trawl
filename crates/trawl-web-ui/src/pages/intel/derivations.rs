@@ -203,7 +203,7 @@ pub fn DerivationsPage() -> impl IntoView {
                         prop:value=move || obj_type.get()
                         on:change=move |e| obj_type.set(event_target_value(&e))
                     >
-                        <option value="">"select\u{2026}"</option>
+                        <option value="">"Select\u{2026}"</option>
                         {OBJECT_TYPES.iter().map(|t| {
                             let label = t.replace('_', " ");
                             view! { <option value=*t>{label}</option> }
@@ -329,7 +329,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                     has_more=Signal::derive(move || edges_cursor.get().is_some())
                                     busy=loading
                                     empty=Signal::derive(move || edges.get().is_empty())
-                                    empty_text="no derivation edges yet"
+                                    empty_text="No derivation edges yet"
                                     on_load=Callback::new(on_load_more_edges)
                                 />
                             </Pager>
@@ -368,7 +368,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                 <Btn
                                     variant=Variant::Danger
                                     disabled=true
-                                    attr:title="requires DerivationWrite permission"
+                                    attr:title="Requires DerivationWrite permission"
                                 >
                                     "Retract source object"
                                 </Btn>
@@ -396,7 +396,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                 spawn_local(async move {
                                     match api::intel::invalidate_derivation(&id, &reason).await {
                                         Ok(()) => {
-                                            bus.push(ToastKind::Success, format!("invalidated {id}"), None);
+                                            bus.push(ToastKind::Success, format!("Invalidated {id}"), None);
                                             refresh.update(|r| *r += 1);
                                         }
                                         Err(e) => bus.push(ToastKind::Error, e.to_string(), None),
@@ -433,7 +433,7 @@ pub fn DerivationsPage() -> impl IntoView {
                                             let rev = body.data.requires_review_ids.len();
                                             bus.push(
                                                 ToastKind::Success,
-                                                format!("retracted: {inv} invalidated, {rev} for review"),
+                                                format!("Retracted: {inv} invalidated, {rev} for review"),
                                                 None,
                                             );
                                             refresh.update(|r| *r += 1);

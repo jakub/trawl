@@ -59,7 +59,7 @@ pub fn RunsPage() -> impl IntoView {
                     <p class="sub">"Recent scheduled runs across all nets."</p>
                 </div>
                 <div class="actions">
-                    <SearchInput value=filter placeholder="filter by net…"/>
+                    <SearchInput value=filter placeholder="Filter by net…"/>
                 </div>
             </div>
 
@@ -123,7 +123,7 @@ pub fn RunsPage() -> impl IntoView {
                                 if resp.runs.is_empty() {
                                     return view! {
                                         <div class="tbl-empty">
-                                            "no runs yet — attach a schedule to a net to get started"
+                                            "No runs yet — attach a schedule to a net to get started"
                                         </div>
                                     }.into_any();
                                 }

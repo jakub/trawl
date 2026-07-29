@@ -162,7 +162,7 @@ fn ResultsTableBody(
             </div>
             <Pager
                 summary=format!(
-                    "page {} · showing {} {}{}",
+                    "Page {} · showing {} {}{}",
                     cur_page + 1,
                     returned,
                     if returned == 1 { "row" } else { "rows" },

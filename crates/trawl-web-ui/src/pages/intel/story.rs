@@ -208,9 +208,9 @@ fn StoryHeader(
                     }
                     if !m.product_names.is_empty() {
                         parts.push(if m.has_fix {
-                            "fix available".into()
+                            "Fix available".into()
                         } else {
-                            "no fix available".into()
+                            "No fix available".into()
                         });
                     }
                     (!parts.is_empty()).then(|| view! {
@@ -220,15 +220,15 @@ fn StoryHeader(
                     })
                 }}
                 <p class="sub" style="margin:0;color:var(--ink-3);font-size:11px">
-                    <span title=created_at>{"created "}{created_ago}</span>
+                    <span title=created_at>{"Created "}{created_ago}</span>
                     " \u{00b7} "
-                    <span title=updated_at>{"updated "}{updated_ago}</span>
+                    <span title=updated_at>{"Updated "}{updated_ago}</span>
                 </p>
                 {parent_story_id.map(|pid| {
                     let href = format!("/intel/stories/{pid}");
                     view! {
                         <p class="sub" style="margin:0">
-                            "parent: "
+                            "Parent: "
                             <a class="link" href=href>{pid}</a>
                         </p>
                     }
@@ -245,7 +245,7 @@ fn StorySummary(summary: Option<String>) -> impl IntoView {
     } else {
         "--ink-3"
     };
-    let text = summary.unwrap_or_else(|| "no summary available".into());
+    let text = summary.unwrap_or_else(|| "No summary available".into());
     view! {
         <div style="padding:0 var(--pad);margin-bottom:16px">
             <p style=format!("color:var({color}); margin:0; line-height:1.5")>
@@ -379,7 +379,7 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                 render=Box::new(move |rows: Vec<TimelineEventView>| {
                 if rows.is_empty() {
                     return view! {
-                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no timeline events yet"</p>
+                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"No timeline events yet"</p>
                     }.into_any();
                 }
                 let has_more = next_cursor.get().is_some();
@@ -420,7 +420,7 @@ fn VerticalTimeline(story_id: String, now_ms: i64) -> impl IntoView {
                         has_more=has_more
                         busy=loading
                         on_load=Callback::new(on_load_more)
-                        label="load older"
+                        label="Load older"
                         full=true
                         attr:style="margin-top:8px"
                     />
@@ -490,7 +490,7 @@ fn StoryLineage(story_id: String, now_ms: i64) -> impl IntoView {
                 render=Box::new(move |(anc, desc): (Vec<LineageNode>, Vec<LineageNode>)| {
                     if anc.is_empty() && desc.is_empty() {
                         return view! {
-                            <p class="mono" style="font-size:11px;color:var(--ink-3);margin:4px 0">"no derivation history"</p>
+                            <p class="mono" style="font-size:11px;color:var(--ink-3);margin:4px 0">"No derivation history"</p>
                         }.into_any();
                     }
                     view! {
@@ -671,7 +671,7 @@ fn ClaimsSection(
                 render=Box::new(move |rows: Vec<StoryClaimView>| {
                 if rows.is_empty() {
                     return view! {
-                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"no claims yet"</p>
+                        <p class="mono" style="color:var(--ink-3);font-size:var(--table-fs)">"No claims yet"</p>
                     }.into_any();
                 }
                 let groups = group_claims_by_source(rows);
@@ -933,7 +933,7 @@ fn claim_row(
                             render=Box::new(move |evs: Vec<ClaimEvidenceView>| {
                     if evs.is_empty() {
                         return view! {
-                            <span class="mono" style="color:var(--ink-3)">"no evidence records"</span>
+                            <span class="mono" style="color:var(--ink-3)">"No evidence records"</span>
                         }.into_any();
                     }
                         let lineage = lineage_cache.get();
@@ -969,15 +969,15 @@ fn claim_row(
                                     view! {
                                         <div style="margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--line)">
                                             <div style="font-size:var(--table-fs);margin-bottom:2px">
-                                                <strong>"factual: "</strong>{factual}
+                                                <strong>"Factual: "</strong>{factual}
                                             </div>
                                             <div style="font-size:var(--table-fs);color:var(--ink-2)">
-                                                <strong>"claim: "</strong>{claim_s}
+                                                <strong>"Claim: "</strong>{claim_s}
                                             </div>
                                             <div class="mono" style="font-size:10px;color:var(--ink-4);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap">
-                                                <span>{format!("post {}", ev.post_id)}</span>
-                                                <span>{format!("fragment #{} span {}\u{2013}{}", ev.fragment_index, ev.span_start, ev.span_end)}</span>
-                                                <span title=ev.created_at.clone()>{format!("ingested {ingested}")}</span>
+                                                <span>{format!("Post {}", ev.post_id)}</span>
+                                                <span>{format!("Fragment #{} span {}\u{2013}{}", ev.fragment_index, ev.span_start, ev.span_end)}</span>
+                                                <span title=ev.created_at.clone()>{format!("Ingested {ingested}")}</span>
                                             </div>
                                         </div>
                                     }
@@ -1080,30 +1080,30 @@ fn build_claim_meta(claim: &StoryClaimView, now_ms: i64) -> Vec<String> {
     }
 
     if let Some(ref ts) = claim.asserted_at {
-        parts.push(format!("asserted {}", time_ago(ts, now_ms)));
+        parts.push(format!("Asserted {}", time_ago(ts, now_ms)));
     }
     if let Some(ref ts) = claim.disclosed_at {
-        parts.push(format!("disclosed {}", time_ago(ts, now_ms)));
+        parts.push(format!("Disclosed {}", time_ago(ts, now_ms)));
     }
     if let Some(ref tr) = claim.event_time_range {
-        let label = format_time_range("event", tr, now_ms);
+        let label = format_time_range("Event", tr, now_ms);
         if !label.is_empty() {
             parts.push(label);
         }
     }
     if let Some(ref tr) = claim.observed_time_range {
-        let label = format_time_range("observed", tr, now_ms);
+        let label = format_time_range("Observed", tr, now_ms);
         if !label.is_empty() {
             parts.push(label);
         }
     }
     if let Some(conf) = claim.confidence {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        parts.push(format!("attach: {:.0}%", conf * 100.0));
+        parts.push(format!("Attach: {:.0}%", conf * 100.0));
     }
     if let Some(conf) = claim.attribution_confidence {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        parts.push(format!("attrib: {:.0}%", conf * 100.0));
+        parts.push(format!("Attrib: {:.0}%", conf * 100.0));
     }
     if let Some(ref by) = claim.attached_by {
         parts.push(by.clone());
@@ -1344,7 +1344,7 @@ fn group_claims_by_source(
 
     if !unknown.is_empty() {
         groups.push((
-            "unknown source".into(),
+            "Unknown source".into(),
             String::new(),
             String::new(),
             unknown,

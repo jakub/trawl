@@ -116,7 +116,7 @@ pub fn HistoryPage() -> impl IntoView {
                     <p class="sub">"Every query you've run. Re-cast the net anytime or create a scheduled search."</p>
                 </div>
                 <div class="actions">
-                    <SearchInput value=filter placeholder="filter history…"/>
+                    <SearchInput value=filter placeholder="Filter history…"/>
                     <Btn variant=Variant::Secondary on_click=on_export>"Export"</Btn>
                     <Btn variant=Variant::Secondary on_click=on_clear>"Clear history"</Btn>
                 </div>
@@ -148,9 +148,9 @@ pub fn HistoryPage() -> impl IntoView {
                                 <div class="tbl-row" style="cursor:default">
                                     <span class="mono" style="color:var(--ink-3)">
                                         {if resp.entries.is_empty() {
-                                            "no queries yet — run one in /search to see it here"
+                                            "No queries yet — run one in /search to see it here"
                                         } else {
-                                            "no history rows match that filter"
+                                            "No history rows match that filter"
                                         }}
                                     </span>
                                 </div>

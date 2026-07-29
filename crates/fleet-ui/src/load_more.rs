@@ -69,9 +69,9 @@ mod component {
         #[prop(into)] busy: Signal<bool>,
         on_load: Callback<()>,
         #[prop(into, optional)] empty: Signal<bool>,
-        #[prop(into, default = String::from("end of list"))] end_text: String,
-        #[prop(into, default = String::from("nothing here yet"))] empty_text: String,
-        #[prop(into, default = String::from("load more"))] label: String,
+        #[prop(into, default = String::from("End of list"))] end_text: String,
+        #[prop(into, default = String::from("Nothing here yet"))] empty_text: String,
+        #[prop(into, default = String::from("Load more"))] label: String,
         #[prop(default = false)] full: bool,
     ) -> impl IntoView {
         view! {

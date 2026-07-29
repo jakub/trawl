@@ -379,7 +379,7 @@ fn QuerySchedulePane(
                             <input
                                 class="mono"
                                 style="margin-top:6px; width:80px; font-size:12px; padding:4px 6px; background:var(--panel-2); border:1px solid var(--line); border-radius:3px; color:var(--ink)"
-                                placeholder="custom…"
+                                placeholder="Custom…"
                                 prop:value=move || {
                                     let v = interval_buf.get();
                                     if INTERVAL_PRESETS.contains(&v.as_str()) { String::new() } else { v }
@@ -489,7 +489,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                         let now = now_ms();
                         if resp.runs.is_empty() {
                             return view! {
-                                <div style="padding:12px; color:var(--ink-3)">"no runs yet — attach a schedule to start."</div>
+                                <div style="padding:12px; color:var(--ink-3)">"No runs yet — attach a schedule to start."</div>
                             }.into_any();
                         }
                         let total = resp.total;
@@ -588,7 +588,7 @@ fn RunResultPreview(
                 render=Box::new(move |resp: trawl_api::ReportRunResponse| {
                     match resp.result {
                         None => view! {
-                            <span style="color:var(--ink-3)">"no result data (error or still running)"</span>
+                            <span style="color:var(--ink-3)">"No result data (error or still running)"</span>
                         }.into_any(),
                         Some(qr) => {
                             let query = resp.summary.query.clone();
@@ -640,7 +640,7 @@ fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
         </table>
         {truncated.then(|| view! {
             <div style="font-size:11px; color:var(--ink-3); margin-top:4px">
-                {format!("showing {RESULT_PREVIEW_ROWS} of {total_rows} rows")}
+                {format!("Showing {RESULT_PREVIEW_ROWS} of {total_rows} rows")}
             </div>
         })}
     }

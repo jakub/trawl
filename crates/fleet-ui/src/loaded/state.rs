@@ -90,8 +90,8 @@ impl<T> LoadState<T> {
 #[must_use]
 pub fn loading_copy(label: Option<&str>) -> String {
     match label {
-        Some(what) => format!("loading {what}\u{2026}"),
-        None => "loading\u{2026}".to_string(),
+        Some(what) => format!("Loading {what}\u{2026}"),
+        None => "Loading\u{2026}".to_string(),
     }
 }
 
@@ -100,8 +100,8 @@ pub fn loading_copy(label: Option<&str>) -> String {
 #[must_use]
 pub fn error_copy(label: Option<&str>, msg: &str) -> String {
     match label {
-        Some(what) => format!("couldn't load {what}: {msg}"),
-        None => format!("couldn't load: {msg}"),
+        Some(what) => format!("Couldn't load {what}: {msg}"),
+        None => format!("Couldn't load: {msg}"),
     }
 }
 
@@ -111,7 +111,7 @@ pub fn error_copy(label: Option<&str>, msg: &str) -> String {
 pub fn missing_copy(label: Option<&str>) -> String {
     match label {
         Some(what) => format!("{what} not found"),
-        None => "not found".to_string(),
+        None => "Not found".to_string(),
     }
 }
 
@@ -159,10 +159,10 @@ mod tests {
 
     #[test]
     fn canonical_copy_strings() {
-        assert_eq!(loading_copy(None), "loading\u{2026}");
-        assert_eq!(loading_copy(Some("nets")), "loading nets\u{2026}");
-        assert_eq!(error_copy(None, "boom"), "couldn't load: boom");
-        assert_eq!(error_copy(Some("nets"), "boom"), "couldn't load nets: boom");
+        assert_eq!(loading_copy(None), "Loading\u{2026}");
+        assert_eq!(loading_copy(Some("nets")), "Loading nets\u{2026}");
+        assert_eq!(error_copy(None, "boom"), "Couldn't load: boom");
+        assert_eq!(error_copy(Some("nets"), "boom"), "Couldn't load nets: boom");
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn missing_copy_strings() {
-        assert_eq!(missing_copy(None), "not found");
+        assert_eq!(missing_copy(None), "Not found");
         assert_eq!(missing_copy(Some("story")), "story not found");
     }
 }

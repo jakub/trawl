@@ -50,7 +50,7 @@ pub fn MetaStrip(
                     }).collect::<Vec<_>>()}
                 </div>
                 <Show when=move || truncated.get()>
-                    <span class="dim">"truncated"</span>
+                    <span class="dim">"Truncated"</span>
                 </Show>
             </div>
         </Show>

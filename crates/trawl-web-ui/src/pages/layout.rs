@@ -174,7 +174,7 @@ pub fn RedirectTo(#[prop(into)] path: String) -> impl IntoView {
             let _ = win.location().set_href(&path);
         }
     });
-    view! { <p>"redirecting…"</p> }
+    view! { <p>"Redirecting…"</p> }
 }
 
 /// 404 page — rendered by the router fallback.
@@ -184,7 +184,7 @@ pub fn NotFound() -> impl IntoView {
         <div class="login-shell">
             <div class="login-card">
                 <h1>"404"</h1>
-                <p class="subtitle">"that page does not exist."</p>
+                <p class="subtitle">"That page does not exist."</p>
             </div>
         </div>
     }

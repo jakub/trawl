@@ -87,7 +87,7 @@ pub fn StoriesPage() -> impl IntoView {
                         <div class="tbl">
                             <div class="tbl-body">
                                 <div class="tbl-row" style="cursor:default">
-                                    <span class="mono" style="color:var(--ink-3)">"no stories yet"</span>
+                                    <span class="mono" style="color:var(--ink-3)">"No stories yet"</span>
                                 </div>
                             </div>
                         </div>
@@ -154,14 +154,14 @@ pub fn StoriesPage() -> impl IntoView {
                                                 }.into_any(),
                                                 None => view! {
                                                     <span class="story-list-summary" style="color:var(--ink-4);font-style:italic">
-                                                        "no summary yet"
+                                                        "No summary yet"
                                                     </span>
                                                 }.into_any(),
                                             }}
                                             <span class="story-list-times">
-                                                <span title=story.updated_at>{format!("updated {updated}")}</span>
+                                                <span title=story.updated_at>{format!("Updated {updated}")}</span>
                                                 " \u{00b7} "
-                                                <span title=story.created_at>{format!("created {created}")}</span>
+                                                <span title=story.created_at>{format!("Created {created}")}</span>
                                             </span>
                                         </div>
                                     </div>
