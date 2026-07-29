@@ -99,9 +99,12 @@ dsn_from_op() {
 }
 
 if [[ -z "${FLEET_DATABASE_URL:-}" || -z "${TRAWL_DATABASE_URL:-}" ]]; then
-    command -v op >/dev/null || die "1password cli (op) not found — install from 1password.com/downloads/mac"
-    command -v jq >/dev/null || die "jq not found (url-encodes db creds). install with 'brew install jq'."
-    op whoami >/dev/null 2>&1 || die "not signed in to 1password — run 'op signin' first"
+    command -v op >/dev/null || die "1password cli (op) not found — https://developer.1password.com/docs/cli/get-started/"
+    command -v jq >/dev/null || die "jq not found (url-encodes db creds). install it via your package manager."
+    # Two auth paths satisfy this gate. The desktop app integration prompts for
+    # biometrics on the local session, so it is unusable over ssh — headless
+    # shells want a service account token scoped to the Homelab vault instead.
+    op whoami >/dev/null 2>&1 || die "1password cli not authenticated — run 'op signin' on a desktop session, or export OP_SERVICE_ACCOUNT_TOKEN for headless/ssh use (https://developer.1password.com/docs/service-accounts/)"
 fi
 [[ -n "${FLEET_DATABASE_URL:-}" ]] || FLEET_DATABASE_URL="$(dsn_from_op fleet_dev fleet_dev)"
 [[ -n "${TRAWL_DATABASE_URL:-}" ]] || TRAWL_DATABASE_URL="$(dsn_from_op trawl_dev trawl_dev)"
