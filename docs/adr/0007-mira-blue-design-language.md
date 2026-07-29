@@ -36,8 +36,12 @@ Key points:
   editor's `--fill` wash — under even the 3:1 non-text floor, and a
   regression on ADR-0005's `#82868e` (3.56:1). Light `--ink-4` therefore
   holds that tone's luminance as a neutral, `oklch(62%)` (3.64:1 / 3.48:1,
-  and >=3.01:1 on every other light surface). Dark `--ink-4` takes the
-  skin's step, which raises it 2.19:1 -> 3.12:1.
+  and >=3.01:1 on every other light surface). Dark `--ink-4` is bound the
+  same way: the skin's step (`oklch(50%)`) measures 3.12:1 on `--panel`,
+  but the gutter digits actually sit on the `--fill`-composited editor
+  surface, where it drops to 2.72:1 — under the floor. Dark `--ink-4`
+  therefore holds `oklch(56%)` (3.51:1 on the composited fill, higher on
+  every plain panel).
 - **Accent**: fleet's blues stay — `#2a5c8a` light, `#5a9fd4` dark — with a
   new `--on-accent` token replacing hard-coded `#fff` button text. Dark mode
   keeps Mira's inversion: light-blue accent surfaces carry near-black
