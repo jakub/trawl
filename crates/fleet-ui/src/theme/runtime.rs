@@ -5,8 +5,8 @@
 //! Wasm-only `localStorage` + `<html data-*>` glue around the pure
 //! parsers in [`super::prefs`].
 //!
-//! The CSS in `styles/fleet-ui.css` reads `[data-theme]`,
-//! `[data-density]`, `[data-rowstyle]` selectors. Writing them on
+//! The CSS in `styles/fleet-ui.css` reads `[data-theme]` and
+//! `[data-rowstyle]` selectors. Writing them on
 //! `<html>` (not `<body>`) matches the design spec and keeps the
 //! cascade authoritative for `:root` token overrides.
 //!
@@ -17,14 +17,14 @@
 use leptos::prelude::*;
 use wasm_bindgen::JsValue;
 
-use super::prefs::{Density, ParseOutcome, RowStyle, Stored, Theme, parse_stored};
+use super::prefs::{ParseOutcome, RowStyle, Stored, Theme, parse_stored};
 
 /// Reactive UI preference signals + an effect that mirrors them onto
 /// `<html data-*>` and persists them to `localStorage`.
 ///
 /// Construction is sealed: [`install`] is the only way to get a
-/// `UiPrefs`. The signals are exposed via [`UiPrefs::theme`],
-/// [`UiPrefs::density`], and [`UiPrefs::rowstyle`] — each returns the
+/// `UiPrefs`. The signals are exposed via [`UiPrefs::theme`]
+/// and [`UiPrefs::rowstyle`] — each returns the
 /// underlying [`RwSignal`] so consumers can read with `.get()`, write
 /// with `.set()`, and feed into derived signals or effects.
 ///
@@ -33,7 +33,6 @@ use super::prefs::{Density, ParseOutcome, RowStyle, Stored, Theme, parse_stored}
 #[derive(Debug, Clone, Copy)]
 pub struct UiPrefs {
     pub(crate) theme: RwSignal<Theme>,
-    pub(crate) density: RwSignal<Density>,
     pub(crate) rowstyle: RwSignal<RowStyle>,
 }
 
@@ -41,11 +40,6 @@ impl UiPrefs {
     #[must_use]
     pub fn theme(self) -> RwSignal<Theme> {
         self.theme
-    }
-
-    #[must_use]
-    pub fn density(self) -> RwSignal<Density> {
-        self.density
     }
 
     #[must_use]
@@ -67,7 +61,6 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
     let stored = load(storage_key);
     let prefs = UiPrefs {
         theme: RwSignal::new(stored.theme),
-        density: RwSignal::new(stored.density),
         rowstyle: RwSignal::new(stored.rowstyle),
     };
 
@@ -81,7 +74,6 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
     Effect::new(move |_| {
         let snap = Stored {
             theme: prefs.theme.get(),
-            density: prefs.density.get(),
             rowstyle: prefs.rowstyle.get(),
         };
         apply_to_dom(snap);
@@ -114,7 +106,6 @@ fn write_stored(storage_key: &str, s: Stored) {
     };
     let payload = serde_json::json!({
         "theme":    s.theme.as_attr(),
-        "density":  s.density.as_attr(),
         "rowstyle": s.rowstyle.as_attr(),
     });
     if let Err(err) = storage.set_item(storage_key, &payload.to_string()) {
@@ -136,7 +127,6 @@ fn apply_to_dom(s: Stored) {
         return;
     };
     let _ = html.set_attribute("data-theme", s.theme.as_attr());
-    let _ = html.set_attribute("data-density", s.density.as_attr());
     let _ = html.set_attribute("data-rowstyle", s.rowstyle.as_attr());
 }
 

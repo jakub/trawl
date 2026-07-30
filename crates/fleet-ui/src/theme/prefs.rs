@@ -21,7 +21,7 @@ pub struct ParseThemeError(pub String);
 
 impl fmt::Display for ParseThemeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown theme/density/rowstyle value: `{}`", self.0)
+        write!(f, "unknown theme/rowstyle value: `{}`", self.0)
     }
 }
 
@@ -58,42 +58,6 @@ impl FromStr for Theme {
         match s {
             "dark" => Ok(Self::Dark),
             "light" => Ok(Self::Light),
-            _ => Err(ParseThemeError(s.to_owned())),
-        }
-    }
-}
-
-/// Row density — compact is the default ops-tool feel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Density {
-    Compact,
-    Comfortable,
-}
-
-impl Density {
-    #[must_use]
-    pub fn as_attr(self) -> &'static str {
-        match self {
-            Self::Compact => "compact",
-            Self::Comfortable => "comfortable",
-        }
-    }
-
-    #[must_use]
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Compact => Self::Comfortable,
-            Self::Comfortable => Self::Compact,
-        }
-    }
-}
-
-impl FromStr for Density {
-    type Err = ParseThemeError;
-    fn from_str(s: &str) -> Result<Self, ParseThemeError> {
-        match s {
-            "comfortable" => Ok(Self::Comfortable),
-            "compact" => Ok(Self::Compact),
             _ => Err(ParseThemeError(s.to_owned())),
         }
     }
@@ -142,7 +106,6 @@ impl FromStr for RowStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stored {
     pub(crate) theme: Theme,
-    pub(crate) density: Density,
     pub(crate) rowstyle: RowStyle,
 }
 
@@ -150,7 +113,6 @@ impl Default for Stored {
     fn default() -> Self {
         Self {
             theme: Theme::Light,
-            density: Density::Compact,
             rowstyle: RowStyle::Bordered,
         }
     }
@@ -190,7 +152,6 @@ pub(crate) fn parse_stored(raw: &str) -> ParseOutcome {
     };
     let mut out = Stored::default();
     parse_field(&value, "theme", &mut warnings, |t| out.theme = t);
-    parse_field(&value, "density", &mut warnings, |d| out.density = d);
     parse_field(&value, "rowstyle", &mut warnings, |r| out.rowstyle = r);
     ParseOutcome {
         stored: out,
@@ -223,13 +184,6 @@ mod tests {
     fn theme_round_trips() {
         for v in [Theme::Light, Theme::Dark] {
             assert_eq!(Theme::from_str(v.as_attr()), Ok(v));
-        }
-    }
-
-    #[test]
-    fn density_round_trips() {
-        for v in [Density::Compact, Density::Comfortable] {
-            assert_eq!(Density::from_str(v.as_attr()), Ok(v));
         }
     }
 
@@ -282,25 +236,32 @@ mod tests {
 
     #[test]
     fn parse_stored_unknown_variant_preserves_other_fields() {
-        let out = parse_stored(r#"{"theme":"midnight","density":"comfortable"}"#);
+        let out = parse_stored(r#"{"theme":"midnight","rowstyle":"plain"}"#);
         assert_eq!(out.stored.theme, Theme::Light, "rejected, default kept");
         assert_eq!(
-            out.stored.density,
-            Density::Comfortable,
+            out.stored.rowstyle,
+            RowStyle::Plain,
             "valid sibling field must still apply"
         );
-        assert_eq!(out.stored.rowstyle, RowStyle::Bordered);
+    }
+
+    #[test]
+    fn parse_stored_ignores_retired_density_field() {
+        // Older blobs carry a `density` field from before the pref was
+        // removed; it must be skipped silently, not warned about.
+        let out = parse_stored(r#"{"theme":"dark","density":"compact"}"#);
+        assert_eq!(out.stored.theme, Theme::Dark);
+        assert!(out.warnings.is_empty(), "retired field must not warn");
     }
 
     #[test]
     fn parse_stored_full_payload_round_trips() {
-        let raw = r#"{"theme":"dark","density":"comfortable","rowstyle":"plain"}"#;
+        let raw = r#"{"theme":"dark","rowstyle":"plain"}"#;
         let out = parse_stored(raw);
         assert_eq!(
             out.stored,
             Stored {
                 theme: Theme::Dark,
-                density: Density::Comfortable,
                 rowstyle: RowStyle::Plain,
             }
         );

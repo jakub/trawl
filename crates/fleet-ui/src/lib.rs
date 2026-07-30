@@ -87,7 +87,7 @@ pub use modal::ConfirmState;
 pub use segmented::{SegmentedOption, segmented_class};
 pub use sparkline::SparkPath;
 pub use status_dot::StatusTone;
-pub use theme::{Density, RowStyle, Theme};
+pub use theme::{RowStyle, Theme};
 pub use toast::{Toast, ToastKind, ToastStack};
 
 #[cfg(target_arch = "wasm32")]

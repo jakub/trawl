@@ -11,10 +11,6 @@
 //!   closes the drawer.
 //! - `stab=overview|fields|tail` — which drawer tab is active
 //!   (default: overview).
-//!
-//! Density comes from the global statusbar toggle
-//! (`<html data-density>`) like every other table — the old
-//! page-local Comfy/Compact control is gone.
 
 use leptos::prelude::*;
 use leptos::web_sys;

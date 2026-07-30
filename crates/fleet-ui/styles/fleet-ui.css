@@ -27,7 +27,6 @@
  * What this file ships:
  *   - Design tokens: :root + [data-theme="light"] + [data-theme="dark"]
  *   - Typography + spacing custom properties
- *   - [data-density="comfortable"] overrides
  *   - Reset + base styles (box-sizing, fonts via font-family only,
  *     focus ring, scrollbars, ::selection)
  *   - Universal keyframes: blink, spin, toastIn, fadeIn, modalFadeIn,
@@ -253,12 +252,11 @@
   /* Dense sub-scale: data-dense surfaces (tables, facets, chips,
    * axes) that sit BELOW the 13px readability floor by design —
    * the same exemption --table-fs/--editor-fs already claim. 1px
-   * steps; scales +1px under [data-density="comfortable"] alongside
-   * the two exempt tokens. Don't use these for prose or controls. */
-  --fs-ui:     12px;   /* compact ui text: meta strips, buttons, group titles */
-  --fs-dense:  11px;   /* dense data rows: facet values, chips, hints */
-  --fs-micro:  10px;   /* table headers, badges, pills, secondary counts */
-  --fs-tiny:   9px;    /* axis labels, sort arrows — smallest legible */
+   * steps. Don't use these for prose or controls. */
+  --fs-ui:     13px;   /* compact ui text: meta strips, buttons, group titles */
+  --fs-dense:  12px;   /* dense data rows: facet values, chips, hints */
+  --fs-micro:  11px;   /* table headers, badges, pills, secondary counts */
+  --fs-tiny:   10px;   /* axis labels, sort arrows — smallest legible */
 
   /* Label + title treatment: sentence case (the uppercase-mono label
    * treatment was rejected in the workbench pass). */
@@ -270,32 +268,18 @@
   --title-transform: none;
   --title-spacing:   -.4px;
 
-  --row-h:      24px;
-  --row-pad-y:  3px;
-  --row-pad-x:  10px;
-  --ui-gap:     10px;
-  --pad:        10px;
-  --editor-fs:  12.5px;
-  --table-fs:   11.5px;
+  --row-h:      30px;
+  --row-pad-y:  5px;
+  --row-pad-x:  14px;
+  --ui-gap:     14px;
+  --pad:        14px;
+  --editor-fs:  13px;
+  --table-fs:   12.5px;
 
   --topbar-h:   40px;
   --statusbar-h: 26px;
   --rail-w:     84px;
   --facets-w:   224px;
-}
-
-[data-density="comfortable"] {
-  --row-h:     30px;
-  --row-pad-y: 5px;
-  --row-pad-x: 14px;
-  --ui-gap:    14px;
-  --pad:       14px;
-  --editor-fs: 13px;
-  --table-fs:  12.5px;
-  --fs-ui:     13px;
-  --fs-dense:  12px;
-  --fs-micro:  11px;
-  --fs-tiny:   10px;
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -1056,7 +1040,7 @@ textarea:focus-visible,
   text-decoration: none;
 }
 /* Labels use the dense sub-scale, and --rail-w is sized so the widest
- * shipped label ("Users & API", 66px at comfortable-density 12px) fits
+ * shipped label ("Users & API", 66px at --fs-dense 12px) fits
  * the item box; anything longer ellipsizes instead of overflowing the
  * highlight. */
 .rail .it .lb {

@@ -3,18 +3,16 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<StatusBar/>` — 26px footer with status, last-search summary,
-//! admin stats, and corner theme + density toggles.
+//! admin stats, and a corner theme toggle.
 //!
 //! The stats cluster (hot buffer / WAL backlog / active queries /
 //! uptime) renders only while the `stats` signal carries a
 //! [`DashboardSnapshot`] — AuthShell feeds it from the admin-only
 //! `/api/v1/dashboard/stream` SSE stream, so non-admins never see the
-//! group. Theme/density toggles call
-//! `UiPrefs::theme()`/`UiPrefs::density()` `.update()` and fleet-ui's
-//! install effect re-projects to `<html data-theme>` /
-//! `<html data-density>`.
+//! group. The theme toggle calls `UiPrefs::theme()` `.update()` and
+//! fleet-ui's install effect re-projects to `<html data-theme>`.
 
-use fleet_ui::{Density, Theme, UiPrefs};
+use fleet_ui::{Theme, UiPrefs};
 use leptos::prelude::*;
 use leptos::web_sys;
 use trawl_api::DashboardSnapshot;
@@ -63,19 +61,6 @@ pub fn StatusBar(
         prefs.map_or("light", |p| match p.theme().get() {
             Theme::Light => "light",
             Theme::Dark => "dark",
-        })
-    };
-
-    let toggle_density = move |_| {
-        if let Some(p) = prefs {
-            p.density().update(|d| *d = d.toggled());
-        }
-    };
-
-    let density_label = move || {
-        prefs.map_or("compact", |p| match p.density().get() {
-            Density::Compact => "compact",
-            Density::Comfortable => "comfortable",
         })
     };
 
@@ -162,10 +147,6 @@ pub fn StatusBar(
             <div class="sp"></div>
             <div class="grp clickable" on:click=toggle_theme title="Switch theme">
                 <span>{theme_label}</span>
-            </div>
-            <span class="divider">"·"</span>
-            <div class="grp clickable" on:click=toggle_density title="Switch density">
-                <span>{density_label}</span>
             </div>
         </div>
     }

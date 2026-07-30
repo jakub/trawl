@@ -1,7 +1,7 @@
 /*
  * trawl app styles — "Herring" design system, app-specific half.
  *
- * Tokens ([data-theme], [data-density], geometry custom properties),
+ * Tokens ([data-theme], geometry custom properties),
  * reset/base, keyframes, and shared chrome (.shell/.topbar/.rail,
  * login, buttons, modal scaffolding, toasts) live in fleet-ui:
  * crates/fleet-ui/styles/fleet-ui.css, linked BEFORE this file in
