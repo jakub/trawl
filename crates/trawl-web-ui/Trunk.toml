@@ -6,9 +6,9 @@
 #
 # Mode A — trunk serve with proxy (SPA hot reload):
 #   trunk serve
-#   browse http://trawl.fleet.localhost:8080/login
+#   browse http://trawl.fleet.localhost:8081/login
 #
-#   Trunk serves compiled wasm + index.html at :8080 and proxies only
+#   Trunk serves compiled wasm + index.html at :8081 and proxies only
 #   /api/* to the trawl-web backend at :8090. SPA routes (/login,
 #   /search, etc.) are served by trunk's index.html fallback so the
 #   wasm router can interpret them. Editing .rs files in trawl-web-ui
@@ -21,7 +21,7 @@
 #   browser's original Host — and fleet-auth's present-only Origin
 #   guard compares Origin against Host (ports stripped). Pointing the
 #   proxy backend at the SAME hostname the browser uses is what keeps
-#   login/logout from 403ing; it also means browsing via 127.0.0.1:8080
+#   login/logout from 403ing; it also means browsing via 127.0.0.1:8081
 #   does NOT work in this mode (Origin host mismatch → 403).
 #
 #   Cookies set by trawl-web on /api/auth/login are host-only on
@@ -48,11 +48,14 @@ dist = "dist"
 
 # Bind BOTH loopback families: macOS resolves *.localhost to ::1 and
 # 127.0.0.1 regardless of /etc/hosts, and IPv6-first clients (curl,
-# Safari) would otherwise land on whatever squats [::]:8080 — on stock
+# Safari) would otherwise land on whatever squats [::]:8081 — on stock
 # macOS that's Apache's wildcard bind, which answers 404.
+#
+# Port 8081, not the more obvious 8080: code-server owns 8080 on the dev
+# box, and trunk aborts rather than sharing the port.
 [serve]
 addresses = ["127.0.0.1", "::1"]
-port = 8080
+port = 8081
 
 # Trunk 0.21.14 panics on root-mounted proxies (axum no longer allows
 # `nest_service` at "/"). Both the legacy `proxy_backend = "..."` +

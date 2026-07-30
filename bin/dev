@@ -21,7 +21,8 @@
 #   TRAWL_DEV_BIND         address trawl-web binds, and an extra address for
 #                          trunk when it isn't loopback. must be an address
 #                          TRAWL_DEV_HOST resolves to. default 127.0.0.1
-#   TRAWL_DEV_SPA_PORT     trunk serve port. default 8080
+#   TRAWL_DEV_SPA_PORT     trunk serve port. default 8081 (8080 is taken by
+#                          code-server on the dev box)
 #   TRAWL_DEV_WEB_PORT     trawl-web port. default 8090
 #   TRAWL_DEV_SERVER_PORT  trawld port (loopback only — nothing but trawl-web
 #                          talks to it). default: whatever trawld.toml says
@@ -30,7 +31,7 @@
 #                          serve terminating TLS on :443)
 #
 # remote dev over tailscale, viewing from a phone/tablet — `tailscale serve
-# --bg 8080` proxies https://<magicdns-name>/ to trunk on loopback, so only
+# --bg 8081` proxies https://<magicdns-name>/ to trunk on loopback, so only
 # trawl-web needs a reachable bind:
 #
 #   TRAWL_DEV_HOST=fractal.reverse-manta.ts.net \
@@ -68,7 +69,9 @@ command -v openssl >/dev/null || die "openssl not found."
 # `127.0.0.1 trawl.fleet.localhost` resolver entry (checked below).
 default_dev_host="trawl.fleet.localhost"
 default_dev_bind="127.0.0.1"
-default_spa_port="8080"
+# Must match Trunk.toml's `[serve] port`: the trunk invocation below only
+# passes --port when spa_port differs from this default.
+default_spa_port="8081"
 default_web_port="8090"
 
 dev_host="${TRAWL_DEV_HOST:-$default_dev_host}"
