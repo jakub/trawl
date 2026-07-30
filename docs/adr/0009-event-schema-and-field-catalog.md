@@ -1,6 +1,6 @@
 # A declared event schema, and a catalog that makes column types authoritative at write time
 
-status: accepted (2026-07-29)
+status: accepted (2026-07-29), amended (2026-07-29) after adversarial review — see Amendment
 
 trawl has no data model. `validate_event` requires exactly one field — `service` —
 and every other top-level JSON key becomes a physical parquet column whose type
@@ -87,7 +87,8 @@ late-arriving data. Nothing records what the server changed about an event.
   rewritten every affected file, and the pin then flips atomically. There is no
   window in which the invariant is broken. Rollup already rewrites files, so no
   new subsystem is required. A repin is therefore not instantaneous, which is the
-  correct cost.
+  correct cost. **[Superseded by the Amendment: this mechanism is unsound —
+  repin moves to a shadow-generation rewrite in its own issue.]**
 - **The event schema is declared, and `_` marks handling.** The namespace rule is
   that a leading underscore denotes metadata about how the record was handled, and
   no prefix denotes data about the event. Client-settability is declared per field
@@ -229,7 +230,9 @@ late-arriving data. Nothing records what the server changed about an event.
   the history-drop fix *and* for the schema cutover, so it is built first and once.
   The column-drop fix rides with it, because both touch the same
   `read_wal_to_table` / `build_wal_batch` seam. The cutover lands last, when the
-  catalog beneath it is proven.
+  catalog beneath it is proven. **[Superseded by the Amendment: the cutover now
+  lands first — #49 → #52 → #50 → #51 — because the dependency actually runs
+  the other way.]**
 - `/api/v1/schema` stops being a corpus-wide `DESCRIBE` behind a TTL cache and
   becomes a `SELECT`. It gains the per-service answer it cannot give today, which
   is the question a schema browser is actually for.
@@ -248,3 +251,77 @@ late-arriving data. Nothing records what the server changed about an event.
   available. It makes all three defect classes structurally impossible rather
   than prevented by invariant, and the catalog is its prerequisite. Choosing the
   catalog now keeps that door open without a second migration.
+
+## Amendment (2026-07-29): adversarial review round
+
+An outside review (codex / gpt-5.6-sol) challenged the slice specs. Every claim
+was verified — the engine claims by execution against the bundled DuckDB (1.5.5,
+crate `duckdb 1.10505.0`) — and all held. Four decisions change; the schema
+itself is untouched.
+
+- **Resequenced: #49 → #52 (schema cutover) → #50 (catalog) → #51 (surface).**
+  The original order made #50's guarantees circular: conflict nulling claimed
+  `_raw` recoverability before `_raw` existed, and the conformance invariant
+  was claimed over a legacy corpus only #52 would drop. Cutover-first means one
+  destructive reset, `_raw` before any nulling, and an invariant true from
+  birth. In this order the cutover touches no postgres state (the catalog does
+  not exist yet), so "legacy data is dropped" gains a concrete mechanism: a
+  filesystem-only, restartable EPOCH-marker protocol with a tested
+  boot-decision table, the old root set aside (never deleted by trawl) for the
+  operator. The residual gap — files written between #52 and #50 are unpinned —
+  is closed by a boot conformance pass in #50 (seed pins, rewrite nonconforming
+  files, gate query serving until done), deliberately built as the embryo of
+  the repin rewriter.
+- **Repin via deferred activation is withdrawn as unsound.** Rewriting visible
+  files one at a time creates the old/new type mixture the invariant forbids,
+  for the whole rewrite window, regardless of when the pin flips; and the daily
+  rollup structurally cannot do the rewriting — it skips today
+  (`compaction.rs:261`) and skips already-consolidated days
+  (`compaction.rs:291`), so consolidated daily files would never be rewritten.
+  "Rollup already rewrites files, so no new subsystem" was false. The correct
+  design is a **shadow-generation rewrite** — build the conformed dataset
+  invisibly (hardlink unaffected files, rewrite affected), catch up, switch the
+  active root and pin atomically — split to its own issue (#53) pending its own
+  design pass. Until it ships a wrong pin has no supported remedy; the pin
+  algorithm below makes one rare.
+- **"Pin on first complete batch" is now an explicit algorithm**, because the
+  engine disproved the delegation: DuckDB 1.5.5 infers `JSON` for a mixed
+  string/int column **and for an all-null column**, and `HUGEINT` for
+  `u64::MAX` — none representable in the catalog. Canonical types are exactly
+  five (`BOOLEAN | BIGINT | DOUBLE | TIMESTAMP | VARCHAR`) with a normalization
+  table from DuckDB's inferences; mixed or out-of-range batches pin via a
+  deterministic candidate ladder (`TRY_CAST` success ≥90% over non-null values,
+  `BIGINT → DOUBLE → TIMESTAMP → BOOLEAN`, else `VARCHAR`); an all-null column
+  under an unpinned field defers the pin and is omitted from the file
+  (`union_by_name` reads absence as NULL). `merge_with_existing`'s cast
+  fallback joins the read-time patches on the deletion list.
+- **Path encoding is injective by validation, and `env` is allowlisted.**
+  `sanitize_service_for_filename` was lossy (`.` and space collapse to `_`),
+  and `env` would have added a second client-controlled path component on top
+  of it. The sanitizer is deleted: `env` must match `[a-z0-9_-]{1,32}` and be a
+  member of a configured allowlist (`[ingest] envs`, implicitly
+  `[default_env]` when omitted — zero-config preserved); a present-but-unlisted
+  env **hard-rejects**, because repairing it into `default_env` would misfile
+  data in the wrong path root permanently — path placement, unlike a column,
+  cannot be re-attributed later — and rejection is loud and proximate where
+  repair is quiet and permanent. The allowlist also catches typos, which a
+  cardinality cap never would. The service charset drops space and keeps dots;
+  filenames carry the name verbatim. The allowlist gates writes only; existing
+  directories stay readable.
+- Smaller corrections, folded into the slices: `_raw` is the client's string
+  `_raw` verbatim when supplied, else the **canonical pre-repair
+  serialization** — "exactly as it arrived on the wire" was false (the WAL
+  re-serializes, and array-batched events have no per-event wire form);
+  client-sent `_ingested` / `_repairs` are stripped with a `meta.stripped`
+  repair code; the severity contract carries exact token→number and inverted
+  syslog→number tables with single-letter aliases, and `level` is declared in
+  the derivation chain (consumed at ingest, not stored — the DSL alias would
+  shadow it); `field_services` rows are ever-observed and consumers window on
+  `last_seen`; `_ingested` makes late data *detectable* — ingest-time report
+  windowing is future work, and "makes scheduled reports correct" overclaimed.
+  In #49, execution confirmed all four trigger variants say `Conversion Error`,
+  so the suspected warning-free degradation path does not exist; the ingest
+  timestamp grammar is chrono-parsed RFC 3339 canonicalized to UTC, fallback
+  provenance is per-row via `read_json(filename=true)`, and an unexpected query
+  failure with cold files present returns an error rather than hot-only
+  success.
