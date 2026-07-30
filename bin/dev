@@ -3,6 +3,7 @@
 # pass --with-coastwatch to also run coastwatch's web api + worker + SPA; in
 # that mode trawl delegates the coastwatch service list to
 # `../coastwatch/bin/dev --joined-mprocs` and merges the YAML it produces.
+# pass --tailscale to serve the SPA to other devices on the tailnet.
 # run from anywhere — resolves repo root via git.
 #
 # trawld hard-requires two postgres DSNs since ADR-0004 slice 3: the fleet
@@ -33,31 +34,35 @@
 #                          reached through something else (e.g. tailscale
 #                          serve terminating TLS on :443)
 #
-# remote dev over tailscale, viewing from a phone/tablet — `tailscale serve
-# --bg 8081` proxies https://<magicdns-name>/ to trunk on loopback, so only
-# trawl-web needs a reachable bind:
+# REMOTE DEV — viewing the SPA from a phone/tablet/laptop.
 #
-#   TRAWL_DEV_HOST=fractal.reverse-manta.ts.net \
-#   TRAWL_DEV_BIND=$(tailscale ip -4) \
-#   TRAWL_DEV_LOGIN_URL=https://fractal.reverse-manta.ts.net/login bin/dev
+#   bin/dev --tailscale
 #
-# TLS from tailscale also keeps the session cookie's Secure attribute
-# satisfied; plain http to a non-localhost host would silently drop it
-# unless [web] allow_insecure_cookies is set in trawld.toml.
+# reads the three knobs above off the running tailscale daemon: the magicdns
+# name, the tailnet address to bind trawl-web to, and the https port an
+# existing `tailscale serve` mapping already points at trunk. Set up that
+# mapping once (any free https port; 8444 by convention here):
 #
-# remote dev over the plain LAN, every interface — TRAWL_DEV_HOST must be the
-# name the OTHER machine types into its address bar, since trunk stamps it as
-# the proxied Host and fleet-auth matches it against the browser's Origin:
+#   tailscale serve --bg --https 8444 8081
+#
+# Prefer this over hand-rolling TRAWL_DEV_HOST/BIND. Tailscale terminates TLS,
+# which is not just convenience: the session cookie is Secure, and browsers
+# only exempt localhost from that, so plain http to any other host makes login
+# appear to succeed and then silently drops the cookie. Reaching the SPA over
+# http from another machine therefore also needs `[web] allow_insecure_cookies
+# = true` in ~/.trawl/trawld.toml — the file both daemons actually read;
+# config/trawld.toml in this repo is only a commented template.
+#
+# Non-tailnet clients still work the manual way, e.g. every interface on the
+# LAN. TRAWL_DEV_HOST must be the name the OTHER machine types into its
+# address bar, since trunk stamps it as the proxied Host and fleet-auth
+# matches that against the browser's Origin:
 #
 #   TRAWL_DEV_HOST=fractal TRAWL_DEV_BIND=0.0.0.0 bin/dev
 #
-# then browse http://fractal:8081/login from the other machine (that name has
-# to resolve on BOTH boxes — mDNS `fractal.local` or an /etc/hosts entry).
-# This path is plain http on a non-loopback host, so it needs
-# `[web] allow_insecure_cookies = true` in ~/.trawl/trawld.toml (the file
-# both daemons actually read; config/trawld.toml in this repo is only a
-# commented template) — otherwise login succeeds and the browser then
-# silently drops the Secure session cookie.
+# then browse http://fractal:8081/login (that name has to resolve on BOTH
+# boxes — mDNS `fractal.local` or an /etc/hosts entry), with the
+# allow_insecure_cookies caveat above.
 
 set -euo pipefail
 
@@ -67,9 +72,11 @@ cd "$repo_root"
 die() { printf 'bin/dev: %s\n' "$*" >&2; exit 1; }
 
 with_coastwatch=false
+via_tailscale=false
 for arg in "$@"; do
     case "$arg" in
         --with-coastwatch) with_coastwatch=true ;;
+        --tailscale) via_tailscale=true ;;
         *) die "unknown flag: $arg" ;;
     esac
 done
@@ -91,10 +98,51 @@ default_dev_bind="127.0.0.1"
 default_spa_port="8081"
 default_web_port="8090"
 
-dev_host="${TRAWL_DEV_HOST:-$default_dev_host}"
-dev_bind="${TRAWL_DEV_BIND:-$default_dev_bind}"
 spa_port="${TRAWL_DEV_SPA_PORT:-$default_spa_port}"
 web_port="${TRAWL_DEV_WEB_PORT:-$default_web_port}"
+
+# --- tailscale (--tailscale) -------------------------------------------------
+# Serve the dev SPA to other tailnet devices. `tailscale serve` terminates TLS
+# on the magicdns name and proxies to trunk on loopback, so trunk needs no
+# wider bind — but trawl-web does: trunk's /api/* hop is host-based (it has to
+# be, for the Origin check), so it dials TRAWL_DEV_HOST:web_port, which is the
+# tailnet name and therefore the tailnet address.
+#
+# Everything is discovered from the running daemon rather than hardcoded — the
+# magicdns name and the serve port are per-machine. Explicit TRAWL_DEV_* still
+# wins, so this is a preset, not an override.
+if $via_tailscale; then
+    command -v tailscale >/dev/null || die "tailscale not found."
+    command -v jq >/dev/null || die "jq not found (parses tailscale serve status). install it via your package manager."
+
+    ts_serve_json="$(tailscale serve status --json 2>/dev/null)" \
+        || die "'tailscale serve status' failed — is tailscaled running and this node logged in?"
+
+    # The serve origin whose "/" handler already proxies to trunk's port. Keyed
+    # host:port, e.g. "fractal.reverse-manta.ts.net:8444".
+    ts_origin="$(printf '%s' "$ts_serve_json" | jq -r --arg t "http://127.0.0.1:${spa_port}" '
+        (.Web // {}) | to_entries
+        | map(select(.value.Handlers["/"].Proxy == $t))
+        | if length == 0 then empty else .[0].key end
+    ')"
+
+    if [[ -z "$ts_origin" ]]; then
+        printf 'bin/dev: no tailscale serve mapping proxies to 127.0.0.1:%s.\n' "$spa_port" >&2
+        printf '  create one (pick any free https port, 8444 by convention here):\n' >&2
+        printf '    tailscale serve --bg --https 8444 %s\n' "$spa_port" >&2
+        die "--tailscale needs that mapping to know the browser's origin."
+    fi
+
+    ts_ip="$(tailscale ip -4)" || die "'tailscale ip -4' failed."
+    : "${TRAWL_DEV_HOST:=${ts_origin%:*}}"
+    : "${TRAWL_DEV_BIND:=$ts_ip}"
+    : "${TRAWL_DEV_LOGIN_URL:=https://${ts_origin}/login}"
+    printf 'bin/dev: tailscale — SPA at https://%s, trawl-web bound to %s\n' \
+        "$ts_origin" "$TRAWL_DEV_BIND"
+fi
+
+dev_host="${TRAWL_DEV_HOST:-$default_dev_host}"
+dev_bind="${TRAWL_DEV_BIND:-$default_dev_bind}"
 dev_login_url="${TRAWL_DEV_LOGIN_URL:-http://${dev_host}:${spa_port}/login}"
 
 # Resolve a hostname to its addresses, one per line. Portable across Linux
