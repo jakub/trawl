@@ -3,9 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Workspace task runner:
-//! - `build-web` — the two-step SPA-into-binary build in the right order:
+//! - `build-web` — the SPA-into-binary build in the right order:
 //!   1. `trunk build [--release]` inside `crates/trawl-web-ui/`
-//!   2. `cargo build [--release] -p trawl-web`
+//!   2. release builds precompress + enforce the wire-size budget
+//!   3. `cargo build [--release] -p trawl-web`
+//! - `compress-web` — precompress an existing release SPA and enforce
+//!   the gzip/Brotli wire-size budgets (used by cross-build CI).
 //! - `design-cards` — emit static fleet-ui preview cards for
 //!   claude.ai/design (see `design_cards` module).
 //!
@@ -13,10 +16,22 @@
 
 mod design_cards;
 
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use brotli::CompressorWriter;
 use clap::{Parser, Subcommand};
+use flate2::{Compression, GzBuilder};
+
+const GZIP_BUDGET: u64 = 4 * 1024 * 1024;
+const BROTLI_BUDGET: u64 = 5 * 1024 * 1024 / 2;
+const BROTLI_QUALITY: u32 = 9;
+const BROTLI_WINDOW: u32 = 22;
+const COMPRESSIBLE_EXTENSIONS: &[&str] = &[
+    "css", "html", "js", "json", "map", "svg", "txt", "wasm", "xml",
+];
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "trawl workspace task runner")]
@@ -33,6 +48,12 @@ enum Cmd {
         #[arg(long)]
         release: bool,
     },
+    /// Precompress an existing release SPA and enforce its wire-size budget.
+    CompressWeb {
+        /// SPA distribution directory, relative to the workspace root.
+        #[arg(long, default_value = "crates/trawl-web-ui/dist")]
+        dist: PathBuf,
+    },
     /// Emit static fleet-ui HTML preview cards (derived from the
     /// component class contracts; regenerate, never hand-edit).
     DesignCards {
@@ -46,6 +67,24 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::BuildWeb { release } => build_web(release),
+        Cmd::CompressWeb { dist } => {
+            let root = workspace_root();
+            let dist = if dist.is_absolute() {
+                dist
+            } else {
+                root.join(dist)
+            };
+            match compress_web(&dist) {
+                Ok(sizes) => {
+                    report_sizes(sizes);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("xtask: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Cmd::DesignCards { out } => {
             let root = workspace_root();
             let css = root.join("crates/fleet-ui/styles/fleet-ui.css");
@@ -77,6 +116,16 @@ fn build_web(release: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if release {
+        match compress_web(&web_ui.join("dist")) {
+            Ok(sizes) => report_sizes(sizes),
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let mut cargo = Command::new(env!("CARGO"));
     cargo.current_dir(&root).args(["build", "-p", "trawl-web"]);
     if release {
@@ -91,6 +140,162 @@ fn build_web(release: bool) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BundleSizes {
+    raw: u64,
+    gzip_wire: u64,
+    brotli_wire: u64,
+}
+
+fn compress_web(dist: &Path) -> Result<BundleSizes, String> {
+    if !dist.join("index.html").is_file() {
+        return Err(format!(
+            "{} has no index.html; run `trunk build --release` first",
+            dist.display()
+        ));
+    }
+
+    let mut files = Vec::new();
+    collect_files(dist, &mut files).map_err(|e| format!("scan {}: {e}", dist.display()))?;
+    files.sort();
+
+    // A release build normally replaces dist atomically, but deleting old
+    // sidecars here makes this command safe after manual/incremental builds too.
+    for path in &files {
+        if is_sidecar(path)
+            && let Err(e) = fs::remove_file(path)
+        {
+            return Err(format!("remove stale {}: {e}", path.display()));
+        }
+    }
+    files.retain(|path| !is_sidecar(path));
+
+    let mut sizes = BundleSizes::default();
+    for path in files {
+        let raw = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let raw_len =
+            u64::try_from(raw.len()).map_err(|_| format!("{} is too large", path.display()))?;
+        sizes.raw = sizes.raw.saturating_add(raw_len);
+
+        if is_compressible(&path) {
+            let gzip = gzip(&raw).map_err(|e| format!("gzip {}: {e}", path.display()))?;
+            let brotli = brotli(&raw).map_err(|e| format!("brotli {}: {e}", path.display()))?;
+            sizes.gzip_wire = sizes
+                .gzip_wire
+                .saturating_add(write_if_smaller(&path, "gz", &raw, &gzip)?);
+            sizes.brotli_wire = sizes
+                .brotli_wire
+                .saturating_add(write_if_smaller(&path, "br", &raw, &brotli)?);
+        } else {
+            sizes.gzip_wire = sizes.gzip_wire.saturating_add(raw_len);
+            sizes.brotli_wire = sizes.brotli_wire.saturating_add(raw_len);
+        }
+    }
+
+    if sizes.gzip_wire > GZIP_BUDGET {
+        return Err(format!(
+            "gzip wire size {} exceeds {} budget",
+            human_bytes(sizes.gzip_wire),
+            human_bytes(GZIP_BUDGET)
+        ));
+    }
+    if sizes.brotli_wire > BROTLI_BUDGET {
+        return Err(format!(
+            "Brotli wire size {} exceeds {} budget",
+            human_bytes(sizes.brotli_wire),
+            human_bytes(BROTLI_BUDGET)
+        ));
+    }
+
+    Ok(sizes)
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_sidecar(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("br" | "gz")
+    )
+}
+
+fn is_compressible(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| COMPRESSIBLE_EXTENSIONS.contains(&ext))
+}
+
+fn gzip(raw: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut writer = GzBuilder::new()
+        .mtime(0)
+        .write(Vec::new(), Compression::best());
+    writer.write_all(raw)?;
+    writer.finish()
+}
+
+fn brotli(raw: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut writer = CompressorWriter::new(Vec::new(), 64 * 1024, BROTLI_QUALITY, BROTLI_WINDOW);
+    writer.write_all(raw)?;
+    writer.flush()?;
+    Ok(writer.into_inner())
+}
+
+fn write_if_smaller(
+    source: &Path,
+    extension: &str,
+    raw: &[u8],
+    compressed: &[u8],
+) -> Result<u64, String> {
+    if compressed.len() >= raw.len() {
+        return u64::try_from(raw.len()).map_err(|_| format!("{} is too large", source.display()));
+    }
+
+    let sidecar = append_extension(source, extension);
+    let temporary = append_extension(source, &format!("{extension}.tmp"));
+    fs::write(&temporary, compressed).map_err(|e| format!("write {}: {e}", temporary.display()))?;
+    fs::rename(&temporary, &sidecar).map_err(|e| {
+        format!(
+            "publish {} as {}: {e}",
+            temporary.display(),
+            sidecar.display()
+        )
+    })?;
+    u64::try_from(compressed.len()).map_err(|_| format!("{} is too large", sidecar.display()))
+}
+
+fn append_extension(path: &Path, extension: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(".");
+    value.push(extension);
+    PathBuf::from(value)
+}
+
+fn report_sizes(sizes: BundleSizes) {
+    eprintln!(
+        "xtask: web bundle raw={}, gzip={}, brotli={} (budgets: gzip {}, brotli {})",
+        human_bytes(sizes.raw),
+        human_bytes(sizes.gzip_wire),
+        human_bytes(sizes.brotli_wire),
+        human_bytes(GZIP_BUDGET),
+        human_bytes(BROTLI_BUDGET)
+    );
+}
+
+fn human_bytes(bytes: u64) -> String {
+    let hundredths = u128::from(bytes) * 100 / (1024 * 1024);
+    format!("{}.{:02} MiB", hundredths / 100, hundredths % 100)
 }
 
 fn run(mut cmd: Command) -> bool {
@@ -113,4 +318,31 @@ fn workspace_root() -> PathBuf {
     manifest
         .parent()
         .map_or_else(|| manifest.to_path_buf(), Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_extension_keeps_the_original_extension() {
+        assert_eq!(
+            append_extension(Path::new("app.wasm"), "br"),
+            PathBuf::from("app.wasm.br")
+        );
+    }
+
+    #[test]
+    fn compression_is_deterministic_and_smaller_for_wasm_like_input() {
+        let raw = vec![0_u8; 128 * 1024];
+        let gzip_a = gzip(&raw).unwrap();
+        let gzip_b = gzip(&raw).unwrap();
+        let brotli_a = brotli(&raw).unwrap();
+        let brotli_b = brotli(&raw).unwrap();
+
+        assert_eq!(gzip_a, gzip_b);
+        assert_eq!(brotli_a, brotli_b);
+        assert!(gzip_a.len() < raw.len());
+        assert!(brotli_a.len() < raw.len());
+    }
 }

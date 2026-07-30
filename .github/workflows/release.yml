@@ -87,6 +87,8 @@ jobs:
       - name: Build web UI SPA
         working-directory: crates/trawl-web-ui
         run: trunk build --release
+      - name: Precompress SPA + enforce wire-size budgets
+        run: cargo xtask compress-web
 
       # `cargo build --release` alone honors workspace default-members,
       # which excludes trawl-web. `--workspace --exclude trawl-web-ui`

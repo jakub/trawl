@@ -14,7 +14,6 @@ use axum::Router;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::routing::{any, get, post};
-use tower_http::services::ServeDir;
 
 use crate::assets;
 use crate::middleware::security_headers;
@@ -52,18 +51,28 @@ pub fn build(state: AppState) -> Router {
     // (hot-iterate flow); otherwise the embedded bundle takes over.
     let router = if let Ok(dir) = std::env::var(ENV_SPA_DIR) {
         let path = PathBuf::from(shellexpand::tilde(&dir).into_owned());
-        let index = path.join("index.html");
         tracing::info!(spa_dir = %path.display(), "SPA static-file fallback (env override)");
-        // Classic SPA fallback: serve the requested file if it exists,
-        // otherwise hand back index.html so the client-side router can
-        // interpret the path.
-        let serve = ServeDir::new(&path)
-            .append_index_html_on_directories(true)
-            .fallback(tower_http::services::ServeFile::new(index));
-        router.fallback_service(serve)
+        router.fallback(move |req: Request| {
+            let path = path.clone();
+            async move {
+                assets::serve_from_dir(
+                    &path,
+                    req.uri().path(),
+                    req.headers(),
+                    req.method() == axum::http::Method::HEAD,
+                )
+                .await
+            }
+        })
     } else {
         tracing::info!("SPA fallback: embedded bundle");
-        router.fallback(|req: Request| async move { assets::serve(req.uri().path()) })
+        router.fallback(|req: Request| async move {
+            assets::serve_embedded(
+                req.uri().path(),
+                req.headers(),
+                req.method() == axum::http::Method::HEAD,
+            )
+        })
     };
 
     router

@@ -193,6 +193,8 @@ jobs:
       - name: Build SPA
         working-directory: crates/trawl-web-ui
         run: trunk build --release
+      - name: Precompress SPA + enforce wire-size budgets
+        run: cargo xtask compress-web
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: trawl-web-ui-dist

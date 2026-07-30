@@ -4,6 +4,8 @@
 # that mode trawl delegates the coastwatch service list to
 # `../coastwatch/bin/dev --joined-mprocs` and merges the YAML it produces.
 # pass --tailscale to serve the SPA to other devices on the tailnet.
+# pass --release-spa to trade slower Rust rebuilds for the release-sized
+# wasm bundle — useful when the browser reaches trunk over the tailnet.
 # run from anywhere — resolves repo root via git.
 #
 # trawld hard-requires two postgres DSNs since ADR-0004 slice 3: the fleet
@@ -37,6 +39,12 @@
 # REMOTE DEV — viewing the SPA from a phone/tablet/laptop.
 #
 #   bin/dev --tailscale
+#
+#   bin/dev --tailscale --release-spa
+#     builds the trawl SPA with optimizations, reducing the wasm transferred
+#     by trunk from the ~145 MiB debug artifact to the release-sized bundle.
+#     This affects only trawl's SPA; a joined coastwatch stack keeps its own
+#     development profile.
 #
 # reads the three knobs above off the running tailscale daemon: the magicdns
 # name, the tailnet address to bind trawl-web to, and the https port an
@@ -73,10 +81,12 @@ die() { printf 'bin/dev: %s\n' "$*" >&2; exit 1; }
 
 with_coastwatch=false
 via_tailscale=false
+release_spa=false
 for arg in "$@"; do
     case "$arg" in
         --with-coastwatch) with_coastwatch=true ;;
         --tailscale) via_tailscale=true ;;
+        --release-spa) release_spa=true ;;
         *) die "unknown flag: $arg" ;;
     esac
 done
@@ -342,6 +352,11 @@ trap cleanup EXIT
 # trunk resolves `target`/`dist` relative to the config file's directory.
 trunk_cmd="trunk serve"
 trunk_backend="http://${dev_host}:${web_port}/api/"
+
+if $release_spa; then
+    trunk_cmd+=" --release"
+    printf 'bin/dev: trawl SPA uses the optimized release profile (slower rebuilds)\n'
+fi
 
 if [[ "$trunk_backend" != "http://${default_dev_host}:${default_web_port}/api/" ]]; then
     generated_trunk_config="$repo_root/crates/trawl-web-ui/.Trunk.dev.toml"

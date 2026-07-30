@@ -79,8 +79,13 @@ rustup target add wasm32-unknown-unknown   # web UI only
 lefthook install                           # fmt/clippy pre-commit, tests pre-push
 
 cargo build                                # first build compiles DuckDB — go get coffee
-cargo xtask build-web --release            # trawl-web with the SPA embedded (optional)
+cargo xtask build-web --release            # optimized + precompressed SPA embedded in trawl-web
 ```
+
+Release web builds emit deterministic `.br`/`.gz` sidecars and fail if the
+complete SPA exceeds its 2.5 MiB Brotli or 4 MiB gzip wire-size budget.
+For remote `bin/dev` sessions, add `--release-spa` to avoid serving the much
+larger debug Wasm artifact through Tailscale or across the LAN.
 
 ### Run a dev server
 

@@ -71,6 +71,8 @@ jobs:
       - name: Build web UI SPA
         working-directory: crates/trawl-web-ui
         run: trunk build --release
+      - name: Precompress SPA + enforce wire-size budgets
+        run: cargo xtask compress-web
 
       # No CARGO_PROFILE_RELEASE_STRIP=false / --build-id override here (unlike
       # release.yml): a dev image publishes no breakpad symbols, so the default

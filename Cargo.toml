@@ -34,6 +34,7 @@ async-stream = "0.3"
 axum = "0.8"
 base64ct = "1"
 blake3 = "1.8"
+brotli = "8"
 chacha20poly1305 = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cookie = "0.18"
