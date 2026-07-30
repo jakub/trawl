@@ -20,7 +20,10 @@
 #                          name or login 403s. default trawl.fleet.localhost
 #   TRAWL_DEV_BIND         address trawl-web binds, and an extra address for
 #                          trunk when it isn't loopback. must be an address
-#                          TRAWL_DEV_HOST resolves to. default 127.0.0.1
+#                          TRAWL_DEV_HOST resolves to, or a wildcard (0.0.0.0
+#                          / ::), which binds every interface and replaces
+#                          rather than adds to trunk's loopback addresses.
+#                          default 127.0.0.1
 #   TRAWL_DEV_SPA_PORT     trunk serve port. default 8081 (8080 is taken by
 #                          code-server on the dev box)
 #   TRAWL_DEV_WEB_PORT     trawl-web port. default 8090
@@ -41,6 +44,20 @@
 # TLS from tailscale also keeps the session cookie's Secure attribute
 # satisfied; plain http to a non-localhost host would silently drop it
 # unless [web] allow_insecure_cookies is set in trawld.toml.
+#
+# remote dev over the plain LAN, every interface — TRAWL_DEV_HOST must be the
+# name the OTHER machine types into its address bar, since trunk stamps it as
+# the proxied Host and fleet-auth matches it against the browser's Origin:
+#
+#   TRAWL_DEV_HOST=fractal TRAWL_DEV_BIND=0.0.0.0 bin/dev
+#
+# then browse http://fractal:8081/login from the other machine (that name has
+# to resolve on BOTH boxes — mDNS `fractal.local` or an /etc/hosts entry).
+# This path is plain http on a non-loopback host, so it needs
+# `[web] allow_insecure_cookies = true` in ~/.trawl/trawld.toml (the file
+# both daemons actually read; config/trawld.toml in this repo is only a
+# commented template) — otherwise login succeeds and the browser then
+# silently drops the Secure session cookie.
 
 set -euo pipefail
 
@@ -294,7 +311,15 @@ fi
 if [[ "$dev_bind" != "$default_dev_bind" ]]; then
     # --address REPLACES Trunk.toml's list, so re-state both loopback
     # families: a local browser and `tailscale serve` both arrive that way.
-    trunk_cmd+=" --address 127.0.0.1 --address ::1 --address $dev_bind"
+    #
+    # Except for wildcards. A wildcard already covers loopback, and the
+    # kernel refuses the overlapping bind — 0.0.0.0:PORT after 127.0.0.1:PORT
+    # is EADDRINUSE even with SO_REUSEADDR — so re-stating loopback here
+    # would abort trunk on startup rather than widen it.
+    case "$dev_bind" in
+        0.0.0.0|::) trunk_cmd+=" --address $dev_bind" ;;
+        *)          trunk_cmd+=" --address 127.0.0.1 --address ::1 --address $dev_bind" ;;
+    esac
 fi
 
 # Two hard constraints collide on the config filename: BSD mktemp only
