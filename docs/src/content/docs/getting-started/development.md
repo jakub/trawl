@@ -39,7 +39,10 @@ bin/dev --release-spa
 ```
 
 `plan` is pure: it does not read token files, resolve credentials, connect to a
-database, or change Tailscale configuration.
+database, or change Tailscale configuration. Under Tailscale exposure it does
+make two read-only queries to the local daemon, for the node's MagicDNS name
+and tailnet IPv4 — so `plan` needs a running, logged-in `tailscaled` unless you
+pin both values (see below).
 
 ## Machine profile
 
@@ -112,6 +115,16 @@ bin/fleet-dev setup trawl --exposure tailscale --force
 The generated Trunk backend authority uses the same MagicDNS hostname as the
 browser origin. This preserves Fleet's same-host Origin/Host CSRF check; the
 controller does not weaken it for development.
+
+The node's identity is discovered from `tailscaled` with `tailscale status
+--json` and `tailscale ip -4`. Pin both in the profile to skip discovery
+entirely, which lets `plan` and `doctor` run with no daemon at all:
+
+```toml
+[tailscale]
+hostname = "fractal.example.ts.net"
+ipv4 = "100.64.0.10"
+```
 
 All apps exposed on that one development hostname form a single browser trust
 boundary: cookies and the same-host Origin check are host-scoped, not
