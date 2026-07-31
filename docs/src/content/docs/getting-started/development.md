@@ -117,6 +117,21 @@ All apps exposed on that one development hostname form a single browser trust
 boundary: cookies and the same-host Origin check are host-scoped, not
 port-scoped. Do not expose an untrusted sibling frontend on another port.
 
+Matching those hostnames also means the backend binds the node's tailnet
+address, not loopback. `https://<node>:8444` is the front door, but
+`<node>:8090` is reachable directly by every tailnet peer without passing
+through Serve. Authentication still applies; use tailnet ACLs if that matters.
+The controller prints this on every Tailscale launch.
+
+Serve mappings are persistent and are **not** removed when the stack exits:
+`:8444` keeps pointing at `127.0.0.1:8081` afterwards, so anything that later
+binds 8081 is published tailnet-wide. Remove a mapping explicitly when you are
+done with it:
+
+```bash
+tailscale serve --https 8444 off
+```
+
 ## Persistent state and recovery
 
 Provider-scoped controller state lives below

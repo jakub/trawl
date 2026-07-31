@@ -53,6 +53,20 @@ validation. Because that validation and host-only cookies intentionally span
 ports, all development apps on the shared hostname are one browser trust
 boundary.
 
+Tailscale exposure publishes more than the Serve front door. Trunk stamps the
+proxy backend authority into `Host`, and the present-only guard requires that
+host to equal the browser Origin host, so the application's API listener binds
+the node's tailnet address rather than loopback. Every tailnet peer can reach
+it directly on the backend port, bypassing Serve's TLS termination.
+Authentication still applies and transport to remote peers is WireGuard
+-encrypted, but the backend port is tailnet-visible: tailnet ACLs, not Serve,
+are the access boundary. The controller says so on every Tailscale launch.
+
+Serve mappings are persistent by design and survive the stack that created
+them. A configured public port keeps pointing at the SPA's loopback port after
+the controller exits, so whatever binds that port next is published tailnet
+-wide until the mapping is explicitly removed.
+
 ## Consequences
 
 Local startup is now one command and is viable for non-interactive agents.

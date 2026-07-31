@@ -125,7 +125,9 @@ impl ResolvedConfig {
     /// # Errors
     /// Returns a [`ConfigError`] when a common Fleet runtime override is
     /// invalid or an explicitly configured production key cannot be loaded.
-    /// With neither source, the existing ephemeral-key fallback is preserved.
+    /// Returns [`ConfigError::NoKey`] when neither `FLEET_SESSION_AEAD_KEY`
+    /// nor a `[web]` cookie-secret source is configured, since cookies would
+    /// not survive a restart.
     pub fn from_parsed(
         web: &WebConfig,
         server: Option<&ServerConfig>,
@@ -139,6 +141,7 @@ impl ResolvedConfig {
         server: Option<&ServerConfig>,
         runtime: SessionRuntimeOverrides,
     ) -> Result<Self, ConfigError> {
+        warn_on_runtime_override(web, &runtime);
         let cookie_key = runtime.key.map_or_else(|| load_key(web), Ok)?;
         let upstream_url = web
             .upstream_url
@@ -170,6 +173,42 @@ impl ResolvedConfig {
             cookie_key,
             shared_domain,
         })
+    }
+}
+
+/// Announce every runtime override that displaces deployed configuration.
+///
+/// The `FLEET_SESSION_*` variables exist for `fleet-dev`, but this is the
+/// production binary and it reads them unconditionally. Silently clearing
+/// `Secure` or swapping the cookie key out from under a configured deployment
+/// is exactly the accident `load_key` already warns about for the far less
+/// dangerous env-versus-path ambiguity.
+fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) {
+    if runtime.key.is_some()
+        && (web.cookie_secret_env.is_some() || web.cookie_secret_path.is_some())
+    {
+        tracing::warn!(
+            event_type = "session_key_runtime_override",
+            env = ENV_SESSION_AEAD_KEY,
+            cookie_secret_env = ?web.cookie_secret_env,
+            cookie_secret_path = ?web.cookie_secret_path,
+            "FLEET_SESSION_AEAD_KEY overrides the configured cookie secret"
+        );
+    }
+    if runtime.secure == Some(false) && !web.allow_insecure_cookies {
+        tracing::warn!(
+            event_type = "session_cookie_secure_downgraded",
+            env = ENV_SESSION_COOKIE_SECURE,
+            "the environment is clearing Secure on the session cookie"
+        );
+    }
+    if !matches!(runtime.domain, RuntimeDomain::PreserveConfigured) && web.shared_domain.is_some() {
+        tracing::warn!(
+            event_type = "session_cookie_domain_override",
+            env = ENV_SESSION_COOKIE_DOMAIN,
+            configured = ?web.shared_domain,
+            "the environment overrides the configured shared cookie domain"
+        );
     }
 }
 

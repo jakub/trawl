@@ -72,6 +72,7 @@ pub async fn run(cli: Cli, runner: &dyn CommandRunner) -> Result<i32> {
             let _lock = GlobalLock::acquire(&state_root)?;
             if let Some(node) = tailscale.as_ref() {
                 crate::tailscale::verify(runner, node, &selected_manifests(&selection))?;
+                warn_tailnet_backend_exposure(&plan);
             }
             let prepared = prepare_launch(runner, &profile, &selection, &state_root).await;
             run_attached(runner, &selection, &plan, prepared).await
@@ -471,6 +472,21 @@ fn finish_without_supervisor(
         prepared.state.api_key_path().display()
     );
     Ok(())
+}
+
+/// Say out loud what Tailscale exposure actually publishes.
+///
+/// Serve is the front door on the SPA port, but the API listener binds the
+/// node's tailnet address so that Trunk's proxied `Host` matches the browser
+/// Origin. Every tailnet peer can therefore reach the backend directly.
+fn warn_tailnet_backend_exposure(plan: &DevelopmentPlan) {
+    for app in &plan.apps {
+        eprintln!(
+            "fleet-dev: warning: {} binds its API on {}, which every tailnet peer \
+             can reach directly without passing through Tailscale Serve",
+            app.app, app.topology.api_bind
+        );
+    }
 }
 
 fn selected_manifests(selection: &AppSelection) -> BTreeMap<App, AppManifest> {

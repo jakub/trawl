@@ -88,6 +88,11 @@ pub fn resolve(
                 browser_origin: format!("https://{host}:{}", web.tailscale_port),
                 login_url: format!("https://{host}:{}{}", web.tailscale_port, web.login_path),
                 backend_authority: format!("{host}:{}", web.backend_port),
+                // Not loopback: Trunk stamps the proxy backend authority into
+                // `Host`, and fleet-auth's present-only guard requires it to
+                // equal the browser Origin host, so the backend must answer on
+                // the MagicDNS name. The cost is that every tailnet peer can
+                // reach it directly, bypassing Serve. See ADR-0010.
                 api_bind: format!("{}:{}", node.ipv4, web.backend_port),
                 // Serve terminates TLS and reaches Trunk over loopback.
                 spa_bind: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
