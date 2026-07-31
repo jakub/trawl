@@ -27,6 +27,8 @@ pub const DOCKER_COMPOSE_FILE: &str = "fleet-dev.compose.yml";
 pub const DOCKER_PROJECT: &str = "fleet-dev";
 pub const DOCKER_SERVICE: &str = "fleet-dev-postgres";
 pub const DOCKER_IMAGE: &str = "pgvector/pgvector:pg18";
+/// The only container port the development provider may publish.
+const DOCKER_CONTRACT_PORT: &str = "5432/tcp";
 pub const FLEET_DATABASE: &str = "fleet_dev";
 pub const REQUIRED_DOCKER_DATABASES: [&str; 3] = [FLEET_DATABASE, "trawl_dev", "coastwatch_dev"];
 
@@ -376,21 +378,42 @@ fn validate_docker_container(runner: &dyn CommandRunner) -> Result<()> {
         ))
     })?;
     let image = value.pointer("/Config/Image").and_then(Value::as_str);
-    let binding = value
-        .pointer("/HostConfig/PortBindings/5432~1tcp/0")
-        .and_then(Value::as_object);
-    let host_ip = binding
-        .and_then(|entry| entry.get("HostIp"))
-        .and_then(Value::as_str);
-    let host_port = binding
-        .and_then(|entry| entry.get("HostPort"))
-        .and_then(Value::as_str);
-    if image != Some(DOCKER_IMAGE) || host_ip != Some(DOCKER_HOST) || host_port != Some("5435") {
+    // The container may predate this controller, so inspect the whole
+    // publishing surface: every binding on the contracted port must be
+    // loopback, and no other container port may be published at all. Checking
+    // only the first binding would accept a container that also published the
+    // same port on a wildcard address.
+    let expected_port = DOCKER_PORT.to_string();
+    let contract_ok = value
+        .pointer("/HostConfig/PortBindings")
+        .and_then(Value::as_object)
+        .is_some_and(|ports| {
+            ports
+                .iter()
+                .all(|(port, bindings)| port == DOCKER_CONTRACT_PORT || is_unpublished(bindings))
+                && ports
+                    .get(DOCKER_CONTRACT_PORT)
+                    .and_then(Value::as_array)
+                    .is_some_and(|bindings| {
+                        !bindings.is_empty()
+                            && bindings.iter().all(|entry| {
+                                entry.get("HostIp").and_then(Value::as_str) == Some(DOCKER_HOST)
+                                    && entry.get("HostPort").and_then(Value::as_str)
+                                        == Some(expected_port.as_str())
+                            })
+                    })
+        });
+    if image != Some(DOCKER_IMAGE) || !contract_ok {
         return Err(Error::InvalidArgument(format!(
             "container {DOCKER_SERVICE} does not match the fixed image/loopback-port contract"
         )));
     }
     Ok(())
+}
+
+/// Docker records an exposed-but-unpublished port as `null` or `[]`.
+fn is_unpublished(bindings: &Value) -> bool {
+    bindings.is_null() || bindings.as_array().is_some_and(Vec::is_empty)
 }
 
 fn compose_spec(trawl_root: &Path) -> CommandSpec {
@@ -520,6 +543,54 @@ mod tests {
             seen: std::sync::Mutex::new(Vec::new()),
         };
         assert!(validate_docker_container(&exposed).is_err());
+    }
+
+    #[test]
+    fn a_second_binding_or_an_extra_published_port_is_rejected() {
+        for document in [
+            // Loopback first, wildcard second: the whole publishing surface
+            // has to be inspected, not just the first entry.
+            br#"{"Config":{"Image":"pgvector/pgvector:pg18"},
+                 "HostConfig":{"PortBindings":{"5432/tcp":[
+                     {"HostIp":"127.0.0.1","HostPort":"5435"},
+                     {"HostIp":"0.0.0.0","HostPort":"5435"}]}}}"#
+                .as_slice(),
+            // Contracted port is fine, but a second port is published.
+            br#"{"Config":{"Image":"pgvector/pgvector:pg18"},
+                 "HostConfig":{"PortBindings":{
+                     "5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"5435"}],
+                     "9999/tcp":[{"HostIp":"0.0.0.0","HostPort":"9999"}]}}}"#
+                .as_slice(),
+            // The contracted port is not published at all.
+            br#"{"Config":{"Image":"pgvector/pgvector:pg18"},
+                 "HostConfig":{"PortBindings":{}}}"#
+                .as_slice(),
+        ] {
+            let runner = OneOutput {
+                stdout: document.to_vec(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            };
+            assert!(
+                validate_docker_container(&runner).is_err(),
+                "{}",
+                String::from_utf8_lossy(document)
+            );
+        }
+    }
+
+    #[test]
+    fn exposed_but_unpublished_sibling_ports_are_tolerated() {
+        // `EXPOSE` without a host publish is not reachable, so it must not
+        // fail an otherwise contract-conforming container.
+        let runner = OneOutput {
+            stdout: br#"{"Config":{"Image":"pgvector/pgvector:pg18"},
+                 "HostConfig":{"PortBindings":{
+                     "5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"5435"}],
+                     "9999/tcp":null}}}"#
+                .to_vec(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        validate_docker_container(&runner).unwrap();
     }
 
     #[tokio::test]
