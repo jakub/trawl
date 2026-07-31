@@ -71,7 +71,12 @@ pub async fn prepare(
 }
 
 pub fn docker_setup(runner: &dyn CommandRunner, trawl_root: &Path) -> Result<()> {
-    let spec = compose_spec(trawl_root).args(["pull"]);
+    // Half a gigabyte of image over a home link outlasts the default deadline,
+    // and a silent multi-minute pull is indistinguishable from a hang.
+    let spec = compose_spec(trawl_root)
+        .args(["pull"])
+        .timeout(crate::command::BUILD_TIMEOUT)
+        .stream_output();
     let output = runner.output(&spec)?;
     require_success(
         &spec,
@@ -81,7 +86,11 @@ pub fn docker_setup(runner: &dyn CommandRunner, trawl_root: &Path) -> Result<()>
 }
 
 pub fn stop_owned_docker(runner: &dyn CommandRunner, trawl_root: &Path) -> Result<()> {
-    let spec = compose_spec(trawl_root).args(["stop", DOCKER_SERVICE]);
+    // This is the unwind path for an interrupted preparation, so it must be
+    // exempt from the interrupt latch that aborted the preparation.
+    let spec = compose_spec(trawl_root)
+        .args(["stop", DOCKER_SERVICE])
+        .runs_after_interrupt();
     let output = runner.output(&spec)?;
     require_success(
         &spec,
@@ -120,8 +129,12 @@ async fn prepare_docker(
         // Compose may create/start the container before `up --wait` returns,
         // including on a later health failure or controller timeout.
         docker_owned.store(true, Ordering::Release);
-        let start_spec =
-            compose_spec(trawl_root).args(["up", "--detach", "--wait", DOCKER_SERVICE]);
+        // `up` pulls the image on a machine that never ran `setup`, so this
+        // needs the same deadline and live progress as an explicit pull.
+        let start_spec = compose_spec(trawl_root)
+            .args(["up", "--detach", "--wait", DOCKER_SERVICE])
+            .timeout(crate::command::BUILD_TIMEOUT)
+            .stream_output();
         let start = runner.output(&start_spec).and_then(|output| {
             require_success(
                 &start_spec,

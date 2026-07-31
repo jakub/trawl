@@ -18,7 +18,7 @@ async fn main() {
     if let Err(error) = cli.validate_usage() {
         error.exit();
     }
-    match fleet_dev::controller::run(cli, &SystemCommandRunner).await {
+    match fleet_dev::controller::run(cli, &SystemCommandRunner::default()).await {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("fleet-dev: {error}");

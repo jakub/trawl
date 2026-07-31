@@ -14,8 +14,15 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(5);
+/// Deadline for children that compile code or pull container images.
+///
+/// A cold `cargo build -p trawl-server` compiles the bundled `DuckDB`
+/// amalgamation and a first `compose up` pulls roughly half a gigabyte;
+/// neither fits inside the default.
+pub const BUILD_TIMEOUT: Duration = Duration::from_mins(30);
 const DEFAULT_STDOUT_LIMIT: usize = 1024 * 1024;
 const DEFAULT_STDERR_LIMIT: usize = 256 * 1024;
+const INTERRUPTED: &str = "the operator interrupted development preparation";
 
 /// Fully specified subprocess request.
 ///
@@ -31,7 +38,30 @@ pub struct CommandSpec {
     pub timeout: Duration,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
-    pub report_stderr: bool,
+    pub output_mode: OutputMode,
+    /// Run even once the operator interrupt has latched.
+    ///
+    /// Cleanup children exist precisely to unwind an interrupted preparation,
+    /// so the latch must not refuse them.
+    pub runs_after_interrupt: bool,
+}
+
+/// How a child's stdout and stderr are handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    /// Capture within the byte limits and keep failures free of child output.
+    #[default]
+    Captured,
+    /// Capture within the byte limits and append trimmed stderr to failures.
+    ///
+    /// Only for children whose stderr cannot carry secret material.
+    CapturedReportingStderr,
+    /// Inherit the controller's stdio; nothing is captured or limited.
+    ///
+    /// Only valid for children whose output is never parsed. Streamed children
+    /// bypass the byte limits entirely, so build and pull progress reaches the
+    /// developer live and a failure carries the tool's own diagnostics.
+    Streamed,
 }
 
 impl CommandSpec {
@@ -46,7 +76,8 @@ impl CommandSpec {
             timeout: DEFAULT_TIMEOUT,
             stdout_limit: DEFAULT_STDOUT_LIMIT,
             stderr_limit: DEFAULT_STDERR_LIMIT,
-            report_stderr: false,
+            output_mode: OutputMode::Captured,
+            runs_after_interrupt: false,
         }
     }
 
@@ -93,7 +124,28 @@ impl CommandSpec {
 
     #[must_use]
     pub const fn report_stderr(mut self) -> Self {
-        self.report_stderr = true;
+        self.output_mode = OutputMode::CapturedReportingStderr;
+        self
+    }
+
+    /// Stream this child's output to the controller's terminal.
+    ///
+    /// Callers must not read the captured stdout/stderr afterwards; both come
+    /// back empty. Streaming subsumes [`Self::report_stderr`] — the child has
+    /// already written its diagnostics to the same terminal.
+    #[must_use]
+    pub const fn stream_output(mut self) -> Self {
+        self.output_mode = OutputMode::Streamed;
+        self
+    }
+
+    /// Exempt this child from the operator-interrupt latch.
+    ///
+    /// Reserved for cleanup that must still run after an interrupt, such as
+    /// stopping a container the controller started moments earlier.
+    #[must_use]
+    pub const fn runs_after_interrupt(mut self) -> Self {
+        self.runs_after_interrupt = true;
         self
     }
 
@@ -117,21 +169,44 @@ impl std::fmt::Debug for CommandSpec {
             .field("timeout", &self.timeout)
             .field("stdout_limit", &self.stdout_limit)
             .field("stderr_limit", &self.stderr_limit)
-            .field("report_stderr", &self.report_stderr)
+            .field("output_mode", &self.output_mode)
+            .field("runs_after_interrupt", &self.runs_after_interrupt)
             .finish()
     }
 }
 
 pub trait CommandRunner: std::fmt::Debug + Send + Sync {
     fn output(&self, spec: &CommandSpec) -> Result<Output>;
+
+    /// Flag a signal watcher can set to abort an in-flight child.
+    ///
+    /// Returns `None` for test doubles that never spawn anything.
+    fn interrupt_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemCommandRunner;
+#[derive(Debug, Clone, Default)]
+pub struct SystemCommandRunner {
+    interrupted: Arc<AtomicBool>,
+}
 
 impl CommandRunner for SystemCommandRunner {
+    fn interrupt_flag(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.interrupted))
+    }
+
     #[allow(clippy::too_many_lines)] // Keep spawn, limits, reaping, and capture in one audit boundary.
     fn output(&self, spec: &CommandSpec) -> Result<Output> {
+        if self.aborted(spec) {
+            return Err(Error::CommandLimit {
+                program: spec.display_program(),
+                reason: INTERRUPTED.to_owned(),
+            });
+        }
+        if spec.output_mode == OutputMode::Streamed {
+            return self.streamed(spec);
+        }
         let mut command = std::process::Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -177,6 +252,10 @@ impl CommandRunner for SystemCommandRunner {
         let deadline = Instant::now() + spec.timeout;
         let mut exited_at = None;
         let (status, mut limit_error) = loop {
+            if self.aborted(spec) {
+                terminate_process_tree(&mut child)?;
+                break (child.wait()?, Some(INTERRUPTED.to_owned()));
+            }
             if overflow.load(Ordering::Acquire) {
                 terminate_process_tree(&mut child)?;
                 break (
@@ -236,6 +315,67 @@ impl CommandRunner for SystemCommandRunner {
             stdout,
             stderr,
         })
+    }
+}
+
+impl SystemCommandRunner {
+    fn aborted(&self, spec: &CommandSpec) -> bool {
+        !spec.runs_after_interrupt && self.interrupted.load(Ordering::Acquire)
+    }
+
+    /// Run a child with inherited stdio.
+    ///
+    /// There is nothing to drain, so the loop only watches for exit, operator
+    /// interrupt, and the deadline.
+    fn streamed(&self, spec: &CommandSpec) -> Result<Output> {
+        let mut command = std::process::Command::new(&spec.program);
+        command
+            .args(&spec.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if spec.clear_environment {
+            command.env_clear();
+        }
+        command.envs(&spec.environment);
+        if let Some(cwd) = &spec.cwd {
+            command.current_dir(cwd);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(|source| Error::Spawn {
+            program: spec.display_program(),
+            source,
+        })?;
+        let deadline = Instant::now() + spec.timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            let reason = if self.aborted(spec) {
+                Some(INTERRUPTED.to_owned())
+            } else if Instant::now() >= deadline {
+                Some(format!("deadline of {:?} expired", spec.timeout))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                terminate_process_tree(&mut child)?;
+                child.wait()?;
+                return Err(Error::CommandLimit {
+                    program: spec.display_program(),
+                    reason,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
 
@@ -335,7 +475,7 @@ pub fn require_success(
         Ok(())
     } else {
         let mut message = controlled_message.into();
-        if spec.report_stderr {
+        if spec.output_mode == OutputMode::CapturedReportingStderr {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stderr = stderr.trim();
             if !stderr.is_empty() {
@@ -373,7 +513,7 @@ mod tests {
     #[test]
     fn system_runner_replaces_instead_of_extending_the_ambient_environment() {
         let spec = CommandSpec::new("env").env("FLEET_DEV_VISIBLE", "yes");
-        let output = SystemCommandRunner.output(&spec).unwrap();
+        let output = SystemCommandRunner::default().output(&spec).unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert_eq!(stdout, "FLEET_DEV_VISIBLE=yes\n");
@@ -390,7 +530,7 @@ mod tests {
             ])
             .timeout(Duration::from_secs(2))
             .output_limits(1024, 1024);
-        let error = SystemCommandRunner.output(&spec).unwrap_err();
+        let error = SystemCommandRunner::default().output(&spec).unwrap_err();
         assert!(matches!(error, Error::CommandLimit { .. }));
     }
 
@@ -399,7 +539,7 @@ mod tests {
         let spec = CommandSpec::new("sh")
             .args(["-c", "head -c 8192 /dev/zero"])
             .output_limits(1024, 1024);
-        let error = SystemCommandRunner.output(&spec).unwrap_err();
+        let error = SystemCommandRunner::default().output(&spec).unwrap_err();
         assert!(matches!(error, Error::CommandLimit { .. }));
     }
 
@@ -409,7 +549,7 @@ mod tests {
             .args(["-c", "sleep 30 &"])
             .timeout(Duration::from_secs(2));
         let started = Instant::now();
-        let error = SystemCommandRunner.output(&spec).unwrap_err();
+        let error = SystemCommandRunner::default().output(&spec).unwrap_err();
         assert!(matches!(error, Error::CommandLimit { .. }));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
@@ -419,7 +559,64 @@ mod tests {
         let spec = CommandSpec::new("sh")
             .args(["-c", "sleep 30"])
             .timeout(Duration::from_millis(25));
-        let error = SystemCommandRunner.output(&spec).unwrap_err();
+        let error = SystemCommandRunner::default().output(&spec).unwrap_err();
         assert!(matches!(error, Error::CommandLimit { .. }));
+    }
+
+    #[test]
+    fn streamed_children_ignore_output_limits_and_return_the_real_status() {
+        // The captured limits would reject this volume; a build or image pull
+        // must not be killed for being chatty.
+        let spec = CommandSpec::new("sh")
+            .args(["-c", "head -c 65536 /dev/zero >/dev/null; exit 7"])
+            .output_limits(16, 16)
+            .stream_output();
+        let output = SystemCommandRunner::default().output(&spec).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn streamed_children_still_honour_the_deadline() {
+        let spec = CommandSpec::new("sh")
+            .args(["-c", "sleep 30"])
+            .timeout(Duration::from_millis(25))
+            .stream_output();
+        let error = SystemCommandRunner::default().output(&spec).unwrap_err();
+        assert!(matches!(error, Error::CommandLimit { .. }));
+    }
+
+    #[test]
+    fn an_interrupt_aborts_the_running_child_and_refuses_the_next_one() {
+        for spec in [
+            CommandSpec::new("sh").args(["-c", "sleep 30"]),
+            CommandSpec::new("sh")
+                .args(["-c", "sleep 30"])
+                .stream_output(),
+        ] {
+            let runner = SystemCommandRunner::default();
+            let flag = runner.interrupt_flag().unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::Release);
+            });
+            let started = Instant::now();
+            let error = runner.output(&spec).unwrap_err();
+            assert!(
+                matches!(&error, Error::CommandLimit { reason, .. } if reason == INTERRUPTED),
+                "got: {error}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+
+            // A latched interrupt must also stop the controller from starting
+            // the next stage of preparation.
+            let error = runner.output(&CommandSpec::new("true")).unwrap_err();
+            assert!(matches!(&error, Error::CommandLimit { reason, .. } if reason == INTERRUPTED));
+
+            // ...but must not block the cleanup that unwinds it.
+            let cleanup = CommandSpec::new("true").runs_after_interrupt();
+            assert!(runner.output(&cleanup).unwrap().status.success());
+        }
     }
 }

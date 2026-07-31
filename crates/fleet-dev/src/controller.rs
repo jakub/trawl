@@ -155,18 +155,28 @@ async fn prepare_launch(
     selection: &AppSelection,
     state_root: &Path,
 ) -> Result<PreparedLaunch> {
-    let docker_owned = AtomicBool::new(false);
-    let preparation = prepare_launch_inner(runner, profile, selection, state_root, &docker_owned);
-    tokio::pin!(preparation);
-    tokio::select! {
-        result = &mut preparation => result,
-        () = preparation_signal() => {
-            if docker_owned.swap(false, Ordering::AcqRel) {
-                database::stop_owned_docker(runner, &selection.trawl_root)?;
-            }
-            Err(Error::InvalidArgument("development preparation was interrupted".to_owned()))
+    // Install the OS handlers before the first subprocess. `signal()` registers
+    // synchronously, so an interrupt arriving during a blocking `cargo build`
+    // is queued rather than killing the controller outright and orphaning a
+    // container we just started.
+    let mut signals = InterruptSignals::install()?;
+    let flag = runner.interrupt_flag();
+    // A spawned task, not a `select!` arm: preparation blocks its worker thread
+    // inside `CommandRunner::output`, so a co-selected branch would never be
+    // polled while a child is in flight.
+    let watcher = tokio::spawn(async move {
+        signals.recv().await;
+        eprintln!("fleet-dev: interrupt received; stopping development preparation");
+        if let Some(flag) = flag {
+            flag.store(true, Ordering::Release);
         }
-    }
+    });
+    let docker_owned = AtomicBool::new(false);
+    // An aborted child surfaces as `Error::CommandLimit`, so the ordinary error
+    // path below performs the owned-Docker cleanup.
+    let result = prepare_launch_inner(runner, profile, selection, state_root, &docker_owned).await;
+    watcher.abort();
+    result
 }
 
 async fn prepare_launch_inner(
@@ -219,24 +229,49 @@ async fn prepare_launch_inner(
     }
 }
 
+/// Termination signals, with their OS handlers installed at construction.
 #[cfg(unix)]
-async fn preparation_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut interrupt = signal(SignalKind::interrupt()).expect("signal handler installs");
-    let mut terminate = signal(SignalKind::terminate()).expect("signal handler installs");
-    let mut hangup = signal(SignalKind::hangup()).expect("signal handler installs");
-    let mut quit = signal(SignalKind::quit()).expect("signal handler installs");
-    tokio::select! {
-        _ = interrupt.recv() => {}
-        _ = terminate.recv() => {}
-        _ = hangup.recv() => {}
-        _ = quit.recv() => {}
+struct InterruptSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl InterruptSignals {
+    fn install() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+            quit: signal(SignalKind::quit())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+            _ = self.hangup.recv() => {}
+            _ = self.quit.recv() => {}
+        }
     }
 }
 
 #[cfg(not(unix))]
-async fn preparation_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+struct InterruptSignals;
+
+#[cfg(not(unix))]
+impl InterruptSignals {
+    const fn install() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn prepare_after_database(
@@ -381,7 +416,12 @@ fn run_command_manifest(
     let spec = CommandSpec::new(program)
         .args(args)
         .cwd(cwd)
-        .environment(child_environment);
+        .environment(child_environment)
+        // Preparation compiles the app and migration runs its schema tool.
+        // Both need a build-shaped deadline, and both are useless without
+        // their own diagnostics, so they stream to the developer's terminal.
+        .timeout(crate::command::BUILD_TIMEOUT)
+        .stream_output();
     let output = runner.output(&spec)?;
     require_success(&spec, &output, format!("{app} {kind} command failed"))
 }

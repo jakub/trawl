@@ -69,6 +69,9 @@ fn resolve_docker(
         ])
         .cwd(trawl_root)
         .environment(environment::sanitized_base())
+        // The key arrives on stdout, so this one cannot stream; give it a
+        // build-shaped deadline because `cargo run` may compile from cold.
+        .timeout(crate::command::BUILD_TIMEOUT)
         .report_stderr();
     let output = runner.output(&spec)?;
     require_success(&spec, &output, "fleet-admin generate-session-key failed")?;

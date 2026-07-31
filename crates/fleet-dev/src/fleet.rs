@@ -34,7 +34,11 @@ pub fn migrate(
     let build_spec = CommandSpec::new("cargo")
         .args(["build", "--quiet", "-p", "fleet-admin"])
         .cwd(trawl_root)
-        .environment(environment::sanitized_base());
+        .environment(environment::sanitized_base())
+        // The build carries no secrets, so stream it: a cold compile outlasts
+        // the default deadline and its errors are worth reading.
+        .timeout(crate::command::BUILD_TIMEOUT)
+        .stream_output();
     let output = runner.output(&build_spec)?;
     require_success(
         &build_spec,
