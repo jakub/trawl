@@ -812,7 +812,12 @@ impl KeyStore {
             validate_app_namespace(&rp.app)?;
             validate_permission(&rp.permission)?;
         }
-        let role_id = self.get_role_id(name).await?;
+        // Reconcile the whole additive bundle transactionally. A controller
+        // retry after a database/network failure must observe either the old
+        // bundle or the complete requested bundle, never a silently-partial
+        // subset.
+        let mut tx = self.pool.begin().await?;
+        let role_id = Self::get_role_id_in(&mut *tx, name).await?;
 
         for rp in permissions {
             sqlx::query(
@@ -823,9 +828,10 @@ impl KeyStore {
             .bind(role_id)
             .bind(&rp.app)
             .bind(&rp.permission)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
 
         tracing::info!(
             event_type = "role_permissions_added",

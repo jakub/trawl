@@ -8,11 +8,19 @@
 //! `[web]` section. Fields absent from that section fall back to sensible
 //! defaults picked here so operators can drop the proxy into an existing
 //! deployment without touching the daemon's config.
+//!
+//! When present, the common `FLEET_SESSION_*` runtime variables override only
+//! their corresponding cookie settings. When absent, existing production
+//! `[web]` key, domain, and secure-cookie configuration remains authoritative.
 
 use std::path::{Path, PathBuf};
 
-use fleet_auth::{KEY_LEN, SessionKey};
+use fleet_auth::{
+    ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN, ENV_SESSION_COOKIE_PATH,
+    ENV_SESSION_COOKIE_SECURE, KEY_LEN, SessionKey,
+};
 use trawl_config::{Config, ServerConfig, WebConfig};
+use zeroize::Zeroizing;
 
 /// Default bind address for the proxy HTTP listener.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -80,6 +88,12 @@ pub enum ConfigError {
     #[error("cookie secret file error: {0}")]
     KeyFile(String),
 
+    #[error("env var {name} has an invalid Fleet session value: {reason}")]
+    SessionEnvValue {
+        name: &'static str,
+        reason: &'static str,
+    },
+
     #[error(
         "no cookie secret configured: set `web.cookie_secret_path` or `web.cookie_secret_env` in config.toml (a random key will otherwise be generated on every startup, invalidating sessions)"
     )]
@@ -109,17 +123,39 @@ impl ResolvedConfig {
     /// absent — pass `None` in tests that don't need that resolution.
     ///
     /// # Errors
-    /// Returns `ConfigError::NoKey` if neither `cookie_secret_path` nor
-    /// `cookie_secret_env` is set (cookies would not survive restart).
+    /// Returns a [`ConfigError`] when a common Fleet runtime override is
+    /// invalid or an explicitly configured production key cannot be loaded.
+    /// With neither source, the existing ephemeral-key fallback is preserved.
     pub fn from_parsed(
         web: &WebConfig,
         server: Option<&ServerConfig>,
     ) -> Result<Self, ConfigError> {
-        let cookie_key = load_key(web)?;
+        let runtime = SessionRuntimeOverrides::from_process_env()?;
+        Self::from_parsed_with_runtime(web, server, runtime)
+    }
+
+    fn from_parsed_with_runtime(
+        web: &WebConfig,
+        server: Option<&ServerConfig>,
+        runtime: SessionRuntimeOverrides,
+    ) -> Result<Self, ConfigError> {
+        let cookie_key = runtime.key.map_or_else(|| load_key(web), Ok)?;
         let upstream_url = web
             .upstream_url
             .clone()
             .unwrap_or_else(|| default_upstream_from_server(server));
+        let allow_insecure_cookies = runtime
+            .secure
+            .map_or(web.allow_insecure_cookies, |secure| !secure);
+        let shared_domain = match runtime.domain {
+            RuntimeDomain::PreserveConfigured => {
+                // Empty string == unset == standalone mode, so an operator can
+                // "comment out" SSO by blanking the value.
+                web.shared_domain.clone().filter(|s| !s.is_empty())
+            }
+            RuntimeDomain::HostOnly => None,
+            RuntimeDomain::Explicit(domain) => Some(domain),
+        };
         Ok(Self {
             bind_addr: resolve_bind_addr(
                 std::env::var(ENV_BIND_ADDR).ok().as_deref(),
@@ -128,13 +164,136 @@ impl ResolvedConfig {
             upstream_url,
             coastwatch_url: web.coastwatch_url.clone(),
             session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
-            allow_insecure_cookies: web.allow_insecure_cookies,
+            allow_insecure_cookies,
             insecure_upstream_tls: std::env::var(ENV_INSECURE_UPSTREAM)
                 .is_ok_and(|v| !v.is_empty()),
             cookie_key,
-            // Empty string == unset == standalone mode, so an operator can
-            // "comment out" SSO by blanking the value.
-            shared_domain: web.shared_domain.clone().filter(|s| !s.is_empty()),
+            shared_domain,
+        })
+    }
+}
+
+/// Parsed common Fleet session environment.
+///
+/// `domain` deliberately has three states; see [`RuntimeDomain`].
+#[derive(Debug)]
+struct SessionRuntimeOverrides {
+    key: Option<SessionKey>,
+    domain: RuntimeDomain,
+    secure: Option<bool>,
+}
+
+#[derive(Debug)]
+enum RuntimeDomain {
+    /// Runtime variable absent: preserve application configuration.
+    PreserveConfigured,
+    /// Runtime variable present and empty: force a host-only cookie.
+    HostOnly,
+    /// Runtime variable supplies an explicit `Domain=` value.
+    Explicit(String),
+}
+
+impl SessionRuntimeOverrides {
+    fn from_process_env() -> Result<Self, ConfigError> {
+        Self::parse(
+            read_optional_env(ENV_SESSION_AEAD_KEY)?,
+            read_optional_env(ENV_SESSION_COOKIE_DOMAIN)?,
+            read_optional_env(ENV_SESSION_COOKIE_PATH)?,
+            read_optional_env(ENV_SESSION_COOKIE_SECURE)?,
+        )
+    }
+
+    fn parse(
+        key: Option<String>,
+        domain: Option<String>,
+        path: Option<String>,
+        secure: Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let key = key
+            .map(Zeroizing::new)
+            .map(|raw| {
+                SessionKey::from_base64(raw.as_str()).map_err(|_| ConfigError::EnvKey {
+                    name: ENV_SESSION_AEAD_KEY.to_owned(),
+                })
+            })
+            .transpose()?;
+
+        if let Some(path) = path
+            && path != "/"
+        {
+            return Err(ConfigError::SessionEnvValue {
+                name: ENV_SESSION_COOKIE_PATH,
+                reason: "only the fleet-wide path `/` is supported",
+            });
+        }
+
+        let secure = secure
+            .map(|value| match value.as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(ConfigError::SessionEnvValue {
+                    name: ENV_SESSION_COOKIE_SECURE,
+                    reason: "expected exactly `true` or `false`",
+                }),
+            })
+            .transpose()?;
+
+        let domain = match domain {
+            None => RuntimeDomain::PreserveConfigured,
+            Some(domain) if domain.is_empty() => RuntimeDomain::HostOnly,
+            Some(domain) => {
+                validate_runtime_cookie_domain(&domain)?;
+                RuntimeDomain::Explicit(domain)
+            }
+        };
+
+        Ok(Self {
+            key,
+            domain,
+            secure,
+        })
+    }
+}
+
+fn read_optional_env(name: &'static str) -> Result<Option<String>, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::EnvUtf8 {
+            name: name.to_owned(),
+        }),
+    }
+}
+
+/// Validate a runtime-provided cookie domain before it can reach a response
+/// header. The leading dot accepted by existing production configuration is
+/// permitted; the remaining value must be a conventional ASCII DNS name.
+fn validate_runtime_cookie_domain(domain: &str) -> Result<(), ConfigError> {
+    let bare = domain.strip_prefix('.').unwrap_or(domain);
+    let valid = !bare.is_empty()
+        && bare.len() <= 253
+        && !bare.ends_with('.')
+        && bare.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(ConfigError::SessionEnvValue {
+            name: ENV_SESSION_COOKIE_DOMAIN,
+            reason: "expected empty for host-only or an ASCII DNS domain",
         })
     }
 }
@@ -288,6 +447,159 @@ mod tests {
         assert_eq!(resolved.upstream_url, "https://trawld:5514");
         assert_eq!(resolved.session_ttl_secs, 3600);
         assert!(resolved.allow_insecure_cookies);
+    }
+
+    #[test]
+    fn fleet_runtime_key_is_base64_parsed_and_wins_over_production_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("production.key");
+        std::fs::write(&key_path, [0x11; KEY_LEN]).unwrap();
+        let web = WebConfig {
+            cookie_secret_path: Some(key_path),
+            // The canonical runtime key must win before this indirect
+            // production source is inspected.
+            cookie_secret_env: Some("TRAWL_TEST_MUST_NOT_BE_READ".into()),
+            ..WebConfig::default()
+        };
+        let expected = SessionKey::from_bytes([0x42; KEY_LEN]);
+        let encoded = expected.to_base64url();
+        let runtime =
+            SessionRuntimeOverrides::parse(Some(encoded.to_string()), None, Some("/".into()), None)
+                .unwrap();
+
+        let resolved = ResolvedConfig::from_parsed_with_runtime(&web, None, runtime).unwrap();
+        assert_eq!(
+            resolved.cookie_key.to_base64url().as_str(),
+            encoded.as_str()
+        );
+    }
+
+    #[test]
+    fn absent_fleet_runtime_values_preserve_production_cookie_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("production.key");
+        std::fs::write(&key_path, [0x24; KEY_LEN]).unwrap();
+        let web = WebConfig {
+            cookie_secret_path: Some(key_path),
+            allow_insecure_cookies: false,
+            shared_domain: Some(".fleet.lab.ktle.net".into()),
+            ..WebConfig::default()
+        };
+        let runtime = SessionRuntimeOverrides::parse(None, None, None, None).unwrap();
+
+        let resolved = ResolvedConfig::from_parsed_with_runtime(&web, None, runtime).unwrap();
+        assert!(!resolved.allow_insecure_cookies);
+        assert_eq!(
+            resolved.shared_domain.as_deref(),
+            Some(".fleet.lab.ktle.net")
+        );
+        assert_eq!(
+            resolved.cookie_key.to_base64url().as_str(),
+            SessionKey::from_bytes([0x24; KEY_LEN])
+                .to_base64url()
+                .as_str()
+        );
+    }
+
+    #[test]
+    fn localhost_runtime_is_insecure_and_explicitly_host_only() {
+        let web = WebConfig {
+            // Prove that an empty runtime domain actively clears a production
+            // parent-domain setting rather than behaving like "unset".
+            shared_domain: Some(".fleet.lab.ktle.net".into()),
+            allow_insecure_cookies: false,
+            ..WebConfig::default()
+        };
+        let runtime = SessionRuntimeOverrides::parse(
+            None,
+            Some(String::new()),
+            Some("/".into()),
+            Some("false".into()),
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfig::from_parsed_with_runtime(&web, None, runtime).unwrap();
+        assert!(resolved.allow_insecure_cookies);
+        assert!(resolved.shared_domain.is_none());
+    }
+
+    #[test]
+    fn tailscale_runtime_is_secure_and_host_only() {
+        let web = WebConfig {
+            shared_domain: Some(".fleet.lab.ktle.net".into()),
+            allow_insecure_cookies: true,
+            ..WebConfig::default()
+        };
+        let runtime = SessionRuntimeOverrides::parse(
+            None,
+            Some(String::new()),
+            Some("/".into()),
+            Some("true".into()),
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfig::from_parsed_with_runtime(&web, None, runtime).unwrap();
+        assert!(!resolved.allow_insecure_cookies);
+        assert!(resolved.shared_domain.is_none());
+    }
+
+    #[test]
+    fn runtime_domain_can_explicitly_override_production_domain() {
+        let web = WebConfig {
+            shared_domain: Some(".old.example".into()),
+            ..WebConfig::default()
+        };
+        let runtime = SessionRuntimeOverrides::parse(
+            None,
+            Some(".new.example".into()),
+            Some("/".into()),
+            None,
+        )
+        .unwrap();
+
+        let resolved = ResolvedConfig::from_parsed_with_runtime(&web, None, runtime).unwrap();
+        assert_eq!(resolved.shared_domain.as_deref(), Some(".new.example"));
+    }
+
+    #[test]
+    fn invalid_fleet_session_runtime_values_fail_closed() {
+        let bad_key = SessionRuntimeOverrides::parse(Some("not-base64".into()), None, None, None)
+            .unwrap_err();
+        assert!(matches!(bad_key, ConfigError::EnvKey { name } if name == ENV_SESSION_AEAD_KEY));
+
+        for path in ["", "/app", "//"] {
+            let err =
+                SessionRuntimeOverrides::parse(None, None, Some(path.into()), None).unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::SessionEnvValue { name, .. } if name == ENV_SESSION_COOKIE_PATH
+            ));
+        }
+
+        for secure in ["TRUE", "1", "", "yes"] {
+            let err =
+                SessionRuntimeOverrides::parse(None, None, None, Some(secure.into())).unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::SessionEnvValue { name, .. } if name == ENV_SESSION_COOKIE_SECURE
+            ));
+        }
+
+        for domain in [
+            ".",
+            "https://fleet.example",
+            "-fleet.example",
+            "fleet..example",
+            "fleet.example:8444",
+            "fleet.example\r\nx-injected: yes",
+        ] {
+            let err =
+                SessionRuntimeOverrides::parse(None, Some(domain.into()), None, None).unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::SessionEnvValue { name, .. } if name == ENV_SESSION_COOKIE_DOMAIN
+            ));
+        }
     }
 
     #[test]

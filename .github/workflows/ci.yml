@@ -121,7 +121,7 @@ jobs:
     runs-on: k8s-small
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@98e1b82157cd469e843cb7f524c1313b4ad9492c # 1.88.0
+      - uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40 # 1.94.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: msrv

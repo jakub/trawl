@@ -1,0 +1,50 @@
+schema = 1
+name = "trawl"
+
+[web]
+local_port = 8081
+tailscale_port = 8444
+backend_port = 8090
+login_path = "/login"
+
+[database]
+name = "trawl_dev"
+migration_mode = "application-startup"
+
+[auth]
+permissions = [
+  "trawl:query",
+  "trawl:schema_read",
+  "trawl:validate",
+  "trawl:saved_query",
+  "trawl:export",
+  "trawl:stream",
+  "trawl:query_cancel",
+  "trawl:server_manage",
+]
+
+[preparation]
+command = ["cargo", "build", "-p", "trawl-server", "-p", "trawl-web"]
+
+[[processes]]
+name = "trawld"
+command = ["target/debug/trawld"]
+
+[processes.resolved_env]
+FLEET_DATABASE_URL = "fleet.database_url"
+TRAWL_DATABASE_URL = "app.database_url"
+
+[[processes]]
+name = "trawl-web"
+command = ["target/debug/trawl-web"]
+
+[processes.env]
+TRAWL_WEB_INSECURE_UPSTREAM = "1"
+
+[processes.resolved_env]
+FLEET_SESSION_AEAD_KEY = "fleet.session_aead_key"
+
+[[processes]]
+name = "web-ui"
+command = ["trunk", "serve"]
+cwd = "crates/trawl-web-ui"
