@@ -14,6 +14,8 @@ pub const PROFILE_KIND: &str = "machine profile";
 pub const MANIFEST_KIND: &str = "app manifest";
 pub const DEFAULT_PROFILE_PATH: &str = "~/.config/fleet/dev.toml";
 pub const MANIFEST_FILE: &str = "fleet-dev.toml";
+/// Manifest process name of the Trunk-served SPA, identical across apps.
+pub const WEB_UI_PROCESS: &str = "web-ui";
 const OP_SERVICE_ACCOUNT_TOKEN: &str = "OP_SERVICE_ACCOUNT_TOKEN";
 pub const TRAWL_DEV_PERMISSIONS: [&str; 8] = [
     "trawl:query",
@@ -378,10 +380,7 @@ impl AppManifest {
         if self.processes.is_empty() {
             return invalid(MANIFEST_KIND, path, "at least one process is required");
         }
-        let web_process_name = match self.name {
-            App::Trawl => "trawl-web",
-            App::Coastwatch => "web",
-        };
+        let web_process_name = self.name.web_process_name();
         let web_process = self
             .processes
             .iter()
@@ -414,12 +413,15 @@ impl AppManifest {
         let web_ui = self
             .processes
             .iter()
-            .find(|process| process.name == "web-ui")
+            .find(|process| process.name == WEB_UI_PROCESS)
             .ok_or_else(|| {
                 invalid_error(
                     MANIFEST_KIND,
                     path,
-                    format!("{} manifest requires a \"web-ui\" process", self.name),
+                    format!(
+                        "{} manifest requires a {WEB_UI_PROCESS:?} process",
+                        self.name
+                    ),
                 )
             })?;
         if web_ui.command.first().map(String::as_str) != Some("trunk") {

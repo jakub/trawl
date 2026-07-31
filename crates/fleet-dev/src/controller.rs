@@ -435,7 +435,6 @@ async fn run_attached(
 ) -> Result<i32> {
     let prepared = prepared?;
     let runtime = crate::runtime::render(
-        selection,
         plan,
         &prepared.values,
         &prepared.developer_key,

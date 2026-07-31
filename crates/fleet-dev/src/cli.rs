@@ -101,6 +101,28 @@ impl App {
             Self::Coastwatch => "coastwatch",
         }
     }
+
+    /// Manifest process name of this app's browser-facing backend.
+    ///
+    /// The single source of truth for the convention: manifest validation
+    /// requires the process to exist and map the shared session key, and the
+    /// plan uses it to classify processes.
+    #[must_use]
+    pub const fn web_process_name(self) -> &'static str {
+        match self {
+            Self::Trawl => "trawl-web",
+            Self::Coastwatch => "web",
+        }
+    }
+
+    /// Runtime environment variable carrying this app's API bind address.
+    #[must_use]
+    pub const fn bind_variable(self) -> &'static str {
+        match self {
+            Self::Trawl => "TRAWL_WEB_BIND_ADDR",
+            Self::Coastwatch => "COASTWATCH_WEB_ADDR",
+        }
+    }
 }
 
 impl Cli {

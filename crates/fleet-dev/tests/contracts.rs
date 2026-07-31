@@ -188,7 +188,7 @@ fn rendered_runtime_is_private_isolated_and_ephemeral() {
     let key_file = state.path().join("dev-api-key");
     std::fs::write(&key_file, key.token.expose()).unwrap();
 
-    let runtime = runtime::render(&selection, &plan, &values, &key, &key_file).unwrap();
+    let runtime = runtime::render(&plan, &values, &key, &key_file).unwrap();
     let runtime_dir = runtime.mprocs_config.parent().unwrap().to_owned();
     let document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&runtime.mprocs_config).unwrap()).unwrap();

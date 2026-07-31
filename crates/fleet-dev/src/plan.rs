@@ -37,10 +37,40 @@ pub struct AppPlan {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProcessPlan {
     pub name: String,
+    pub role: ProcessRole,
     pub command: Vec<String>,
     pub cwd: String,
     pub static_environment: BTreeMap<String, String>,
     pub resolved_environment: BTreeMap<String, String>,
+}
+
+/// The controller-recognized role a manifest process plays.
+///
+/// Classified once, here, where the app and its manifest are both in hand. The
+/// runtime renderer then reads the role off the plan instead of re-deriving it
+/// by pairing two collections positionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProcessRole {
+    /// Browser-facing backend that mints and consumes Fleet sessions.
+    WebBackend,
+    /// Trunk-served SPA.
+    WebUi,
+    /// Everything else; receives no topology injection.
+    Opaque,
+}
+
+impl ProcessRole {
+    #[must_use]
+    pub fn classify(app: App, process: &str) -> Self {
+        if process == app.web_process_name() {
+            Self::WebBackend
+        } else if process == crate::config::WEB_UI_PROCESS {
+            Self::WebUi
+        } else {
+            Self::Opaque
+        }
+    }
 }
 
 pub fn build(
@@ -58,16 +88,18 @@ pub fn build(
             .processes
             .iter()
             .map(|process| {
+                let role = ProcessRole::classify(*app, &process.name);
                 let mut command = process.command.clone();
                 if selection.release_spa
                     && *app == App::Trawl
-                    && process.name == "web-ui"
+                    && role == ProcessRole::WebUi
                     && !command.iter().any(|arg| arg == "--release")
                 {
                     command.push("--release".to_owned());
                 }
                 ProcessPlan {
                     name: format!("{}-{}", app.as_str(), process.name),
+                    role,
                     command,
                     cwd: process.cwd.as_ref().map_or_else(
                         || checkout.root.display().to_string(),
@@ -235,6 +267,32 @@ mod tests {
             selected,
             registered,
             release_spa: false,
+        }
+    }
+
+    #[test]
+    fn process_roles_are_classified_per_app() {
+        // The backend name differs per app, so a role must never be inferred
+        // from the name alone.
+        assert_eq!(
+            ProcessRole::classify(App::Trawl, "trawl-web"),
+            ProcessRole::WebBackend
+        );
+        assert_eq!(
+            ProcessRole::classify(App::Trawl, "web"),
+            ProcessRole::Opaque
+        );
+        assert_eq!(
+            ProcessRole::classify(App::Coastwatch, "web"),
+            ProcessRole::WebBackend
+        );
+        assert_eq!(
+            ProcessRole::classify(App::Coastwatch, "trawl-web"),
+            ProcessRole::Opaque
+        );
+        for app in [App::Trawl, App::Coastwatch] {
+            assert_eq!(ProcessRole::classify(app, "web-ui"), ProcessRole::WebUi);
+            assert_eq!(ProcessRole::classify(app, "trawld"), ProcessRole::Opaque);
         }
     }
 

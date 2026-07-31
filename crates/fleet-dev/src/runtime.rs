@@ -15,9 +15,8 @@ use crate::cli::App;
 use crate::environment;
 use crate::error::{Error, Result};
 use crate::fleet::DeveloperKey;
-use crate::plan::DevelopmentPlan;
+use crate::plan::{DevelopmentPlan, ProcessRole};
 use crate::resolver::SecretValue;
-use crate::selection::AppSelection;
 
 #[derive(Debug)]
 pub struct RuntimeValues {
@@ -60,7 +59,6 @@ struct MprocsProcess {
 }
 
 pub fn render(
-    selection: &AppSelection,
     plan: &DevelopmentPlan,
     values: &RuntimeValues,
     developer_key: &DeveloperKey,
@@ -70,13 +68,7 @@ pub fn render(
     set_directory_mode(directory.path())?;
     let mut procs = BTreeMap::new();
     for app_plan in &plan.apps {
-        let checkout = selection
-            .selected
-            .get(&app_plan.app)
-            .expect("plan app came from selection");
-        for (process_plan, process_manifest) in
-            app_plan.processes.iter().zip(&checkout.manifest.processes)
-        {
+        for process_plan in &app_plan.processes {
             let mut environment = process_plan.static_environment.clone();
             for (destination, source) in &process_plan.resolved_environment {
                 environment.insert(
@@ -86,13 +78,12 @@ pub fn render(
             }
             let mut command = process_plan.command.clone();
             apply_topology_runtime(
-                &process_manifest.name,
+                process_plan.role,
                 &mut command,
                 &mut environment,
                 app_plan,
                 Path::new(&process_plan.cwd),
                 directory.path(),
-                checkout.manifest.web.local_port,
             )?;
             procs.insert(
                 process_plan.name.clone(),
@@ -108,20 +99,23 @@ pub fn render(
             login_process(
                 &app_plan.topology.login_url,
                 key_file,
-                checkout.root.as_path(),
+                Path::new(&app_plan.root),
             ),
         );
     }
 
-    // Keep the key alive until after rendering has consumed the path, while
-    // proving the plaintext itself was never copied into the JSON.
-    let _ = &developer_key.prefix;
+    let token = developer_key.token.expose().as_bytes();
+    if token.is_empty() {
+        // `windows(0)` panics, and an empty key would make the leak check
+        // below vacuously pass. Both are unreachable today; neither should be
+        // a surprise if a key source ever regresses.
+        return Err(Error::InvalidArgument(
+            "internal error: developer API key is empty".to_owned(),
+        ));
+    }
     let document =
         serde_json::to_vec_pretty(&MprocsConfig { procs }).expect("runtime config serializes");
-    if document
-        .windows(developer_key.token.expose().len())
-        .any(|window| window == developer_key.token.expose().as_bytes())
-    {
+    if document.windows(token.len()).any(|window| window == token) {
         return Err(Error::InvalidArgument(
             "internal error: developer API key leaked into mprocs config".to_owned(),
         ));
@@ -181,36 +175,28 @@ async fn run_mprocs_program(runtime: &RuntimeFiles, program: &Path) -> Result<Ex
 }
 
 fn apply_topology_runtime(
-    process_name: &str,
+    role: ProcessRole,
     command: &mut Vec<String>,
     environment: &mut BTreeMap<String, String>,
     app: &crate::plan::AppPlan,
     process_root: &Path,
     runtime_dir: &Path,
-    local_port: u16,
 ) -> Result<()> {
-    match process_name {
-        "trawl-web" if app.app == App::Trawl => {
+    match role {
+        ProcessRole::WebBackend => {
             insert_web_topology(environment, &app.topology);
             environment.insert(
-                "TRAWL_WEB_BIND_ADDR".to_owned(),
+                app.app.bind_variable().to_owned(),
                 app.topology.api_bind.clone(),
             );
         }
-        "web" if app.app == App::Coastwatch => {
-            insert_web_topology(environment, &app.topology);
-            environment.insert(
-                "COASTWATCH_WEB_ADDR".to_owned(),
-                app.topology.api_bind.clone(),
-            );
-        }
-        "web-ui" => {
+        ProcessRole::WebUi => {
             let trunk_config = runtime_dir.join(format!("{}.Trunk.toml", app.app.as_str()));
-            render_trunk_config(&trunk_config, process_root, &app.topology, local_port)?;
+            render_trunk_config(&trunk_config, process_root, &app.topology)?;
             command.push("--config".to_owned());
             command.push(trunk_config.display().to_string());
         }
-        _ => {}
+        ProcessRole::Opaque => {}
     }
     Ok(())
 }
@@ -247,7 +233,6 @@ fn render_trunk_config(
     path: &Path,
     ui_root: &Path,
     topology: &crate::topology::AppTopology,
-    local_port: u16,
 ) -> Result<()> {
     let source = ui_root.join("Trunk.toml");
     let raw = std::fs::read_to_string(&source).map_err(|source_error| Error::ReadFile {
@@ -286,7 +271,7 @@ fn render_trunk_config(
     serve.insert("addresses".to_owned(), toml::Value::Array(addresses));
     serve.insert(
         "port".to_owned(),
-        toml::Value::Integer(i64::from(local_port)),
+        toml::Value::Integer(i64::from(topology.spa_port)),
     );
     let proxies = document
         .get_mut("proxy")
@@ -459,6 +444,34 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_developer_key_is_refused_rather_than_panicking() {
+        // `windows(0)` panics, and an empty needle would make the leak check
+        // vacuously pass.
+        let plan = DevelopmentPlan {
+            schema: 1,
+            exposure: crate::cli::Exposure::Localhost,
+            database: crate::cli::DatabaseMode::Docker,
+            state_scope: "docker".to_owned(),
+            requires_onepassword: false,
+            apps: vec![],
+            actions: vec![],
+        };
+        let values = RuntimeValues {
+            fleet: BTreeMap::new(),
+            apps: BTreeMap::new(),
+        };
+        let key = DeveloperKey {
+            token: SecretValue::new(String::new()),
+            prefix: "flt_prefix".to_owned(),
+        };
+        let error = render(&plan, &values, &key, Path::new("/state/dev-api-key")).unwrap_err();
+        assert!(
+            error.to_string().contains("developer API key is empty"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
     fn coastwatch_shaped_trunk_config_preserves_app_specific_security_settings() {
         let directory = tempfile::tempdir().unwrap();
         let ui = directory.path().join("web-ui");
@@ -495,7 +508,7 @@ no_redirect = true
             cookie_path: "/".to_owned(),
             cookie_secure: true,
         };
-        render_trunk_config(&output, &ui, &topology, 8082).unwrap();
+        render_trunk_config(&output, &ui, &topology).unwrap();
         let rendered: toml::Value =
             toml::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
         assert_eq!(rendered["build"]["create_nonce"].as_bool(), Some(true));
