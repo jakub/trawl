@@ -7,7 +7,7 @@ use std::fmt;
 
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
@@ -32,12 +32,6 @@ impl SecretValue {
 impl std::fmt::Debug for SecretValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<redacted>")
-    }
-}
-
-impl Drop for SecretValue {
-    fn drop(&mut self) {
-        self.0.zeroize();
     }
 }
 
@@ -114,20 +108,18 @@ pub fn parse_output(app: &str, bytes: &[u8]) -> Result<BTreeMap<String, SecretVa
             ),
         });
     }
+    // Wrap every value before the first fallible step, so a rejected field
+    // name still leaves the rest zeroized on the way out.
+    let parsed: BTreeMap<String, SecretValue> = std::mem::take(&mut document.values.0)
+        .into_iter()
+        .map(|(name, value)| (name, SecretValue::new(value)))
+        .collect();
     let mut output = BTreeMap::new();
-    for (name, mut value) in std::mem::take(&mut document.values.0) {
+    for (name, value) in parsed {
         validate_name(app, &name)?;
-        let namespaced = format!("app.{name}");
-        if output
-            .insert(namespaced, SecretValue::new(std::mem::take(&mut value)))
-            .is_some()
-        {
-            return Err(Error::ResolverProtocol {
-                app: app.to_owned(),
-                message: format!("duplicate resolver field {name:?}"),
-            });
-        }
-        value.zeroize();
+        // Source names are unique and `app.` prefixing is injective, so the
+        // destination cannot collide.
+        output.insert(format!("app.{name}"), value);
     }
     Ok(output)
 }
