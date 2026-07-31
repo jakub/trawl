@@ -43,6 +43,31 @@ fn allowed_name(name: &OsStr) -> bool {
             | "CARGO_HOME"
             | "RUSTUP_HOME"
             | "RUSTC_WRAPPER"
+            // Docker is the default database provider. Without these the CLI
+            // silently targets the wrong daemon on rootless, colima, Desktop,
+            // or any remote context.
+            | "DOCKER_HOST"
+            | "DOCKER_CONTEXT"
+            | "DOCKER_CONFIG"
+            | "DOCKER_CERT_PATH"
+            | "DOCKER_TLS_VERIFY"
+            // Trust anchors and egress policy for `op`, `docker`, and `cargo`
+            // behind a private CA or a proxy. Proxy URLs can embed credentials,
+            // which is a deliberate exception to "no secrets in children": the
+            // tools that need them are the ones that would otherwise fail, and
+            // the value is already in the controller's own environment.
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "NO_PROXY"
+            | "http_proxy"
+            | "https_proxy"
+            | "no_proxy"
+            // Build shaping the developer already chose for this checkout.
+            | "CARGO_TARGET_DIR"
+            | "CARGO_BUILD_JOBS"
+            | "RUSTFLAGS"
             | "NO_COLOR"
             | "CLICOLOR"
             | "FORCE_COLOR"
@@ -75,5 +100,21 @@ mod tests {
         assert!(!base.contains_key(OsStr::new("DATABASE_URL")));
         assert!(!base.contains_key(OsStr::new("SSH_AUTH_SOCK")));
         assert!(!base.contains_key(OsStr::new("AWS_SECRET_ACCESS_KEY")));
+    }
+
+    #[test]
+    fn allowlist_keeps_the_tool_configuration_the_children_need() {
+        for name in [
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "SSL_CERT_FILE",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "CARGO_TARGET_DIR",
+            "RUSTFLAGS",
+        ] {
+            let base = sanitized_base_from([(OsString::from(name), OsString::from("value"))]);
+            assert!(base.contains_key(OsStr::new(name)), "{name}");
+        }
     }
 }
