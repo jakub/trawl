@@ -168,3 +168,78 @@ impl std::fmt::Debug for AppState {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn state(cookie_secure: bool) -> AppState {
+        AppState::from_config(ResolvedConfig {
+            bind_addr: "127.0.0.1:8090".into(),
+            upstream_url: "http://127.0.0.1:5514".into(),
+            coastwatch_url: None,
+            session_ttl_secs: 3_600,
+            allow_insecure_cookies: !cookie_secure,
+            insecure_upstream_tls: false,
+            cookie_key: SessionKey::from_bytes([0x42; fleet_auth::KEY_LEN]),
+            shared_domain: None,
+        })
+        .unwrap()
+    }
+
+    fn scope_attributes(header: &str) -> BTreeSet<String> {
+        header
+            .split(';')
+            .skip(1)
+            .map(str::trim)
+            .filter(|attribute| !attribute.starts_with("Max-Age="))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn assert_issue_and_clear_scope_match(state: &AppState) -> (String, String) {
+        let issued = state.build_session_cookie("encrypted-value".into());
+        let cleared = state
+            .build_clear_cookie()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(scope_attributes(&issued), scope_attributes(&cleared));
+        assert!(issued.starts_with("fleet_session=encrypted-value;"));
+        assert!(cleared.starts_with("fleet_session=;"));
+        (issued, cleared)
+    }
+
+    #[test]
+    fn localhost_cookie_shape_is_insecure_and_host_only() {
+        let (issued, cleared) = assert_issue_and_clear_scope_match(&state(false));
+        for header in [&issued, &cleared] {
+            assert!(header.contains("HttpOnly"), "got: {header}");
+            assert!(header.contains("SameSite=Lax"), "got: {header}");
+            assert!(header.contains("Path=/"), "got: {header}");
+            assert!(!header.contains("Secure"), "got: {header}");
+            assert!(
+                !header.to_ascii_lowercase().contains("domain="),
+                "got: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn tailscale_cookie_shape_is_secure_and_host_only() {
+        let (issued, cleared) = assert_issue_and_clear_scope_match(&state(true));
+        for header in [&issued, &cleared] {
+            assert!(header.contains("HttpOnly"), "got: {header}");
+            assert!(header.contains("SameSite=Lax"), "got: {header}");
+            assert!(header.contains("Path=/"), "got: {header}");
+            assert!(header.contains("Secure"), "got: {header}");
+            assert!(
+                !header.to_ascii_lowercase().contains("domain="),
+                "got: {header}"
+            );
+        }
+    }
+}

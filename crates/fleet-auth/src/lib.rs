@@ -41,8 +41,9 @@ pub use store::KeyStore;
 
 #[cfg(feature = "session")]
 pub use session::{
-    DEFAULT_COOKIE_NAME, DEFAULT_TTL_SECS, KEY_LEN, NONCE_LEN, OriginRejected, SessionConfig,
-    SessionConfigBuilder, SessionError, SessionExpiry, SessionKey, SessionPayload,
+    DEFAULT_COOKIE_NAME, DEFAULT_TTL_SECS, ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN,
+    ENV_SESSION_COOKIE_PATH, ENV_SESSION_COOKIE_SECURE, KEY_LEN, NONCE_LEN, OriginRejected,
+    SessionConfig, SessionConfigBuilder, SessionError, SessionExpiry, SessionKey, SessionPayload,
     build_clear_cookie_header, build_session_cookie_header, check_origin, decrypt, encrypt,
     is_expired, origin_allowed, request_host,
 };

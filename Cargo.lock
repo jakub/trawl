@@ -1918,6 +1918,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-dev"
+version = "0.4.0"
+dependencies = [
+ "clap",
+ "fleet-auth",
+ "fs4",
+ "nix",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "fleet-ui"
 version = "0.4.0"
 dependencies = [

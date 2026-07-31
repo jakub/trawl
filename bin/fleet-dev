@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+trawl_root="$(CDPATH= cd -- "$script_dir/.." && pwd -P)"
+
+exec cargo run \
+    --manifest-path "$trawl_root/Cargo.toml" \
+    --quiet \
+    -p fleet-dev \
+    -- \
+    --trawl-root "$trawl_root" \
+    "$@"
