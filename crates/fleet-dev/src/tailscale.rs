@@ -234,10 +234,14 @@ fn parse_serve_status(bytes: &[u8]) -> Result<Vec<ServeMapping>> {
         mappings.iter().filter_map(mapping_port).collect();
     if let Some(tcp) = document.get("TCP").and_then(Value::as_object) {
         for (port_key, value) in tcp {
-            let port = port_key
-                .trim_start_matches(':')
+            // Keys are bare (`"8445"`) today, but the `:port` and `host:port`
+            // forms must not silently drop an occupant: this conflict check is
+            // the only thing standing between `setup` and clobbering an
+            // unrelated Serve handler. Fall back to the *trimmed* key.
+            let trimmed = port_key.trim_start_matches(':');
+            let port = trimmed
                 .rsplit_once(':')
-                .map_or(port_key.as_str(), |(_, port)| port)
+                .map_or(trimmed, |(_, port)| port)
                 .parse::<u16>()
                 .ok();
             if let Some(port) = port.filter(|port| !web_ports.contains(port)) {
@@ -496,6 +500,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("non-proxy Serve handler"));
+        assert_eq!(runner.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tcp_keys_are_parsed_in_every_serve_form() {
+        let mappings = parse_serve_status(
+            br#"{"TCP":{
+                "8445":{"TCPForward":"127.0.0.1:1"},
+                ":8446":{"TCPForward":"127.0.0.1:2"},
+                "fractal.example.ts.net:8447":{"TCPForward":"127.0.0.1:3"}
+            }}"#,
+        )
+        .unwrap();
+        let ports: Vec<_> = mappings.iter().filter_map(mapping_port).collect();
+        assert_eq!(ports, [8445, 8446, 8447]);
+    }
+
+    #[test]
+    fn a_colon_prefixed_tcp_occupant_still_blocks_setup() {
+        let runner =
+            FakeRunner::new([br#"{"TCP":{":8444":{"TCPForward":"127.0.0.1:9"}}}"#.as_slice()]);
+        let error = setup(
+            &runner,
+            &node(),
+            &BTreeMap::from([(App::Trawl, manifest())]),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing to replace"));
         assert_eq!(runner.seen.lock().unwrap().len(), 1);
     }
 
