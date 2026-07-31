@@ -1,0 +1,31 @@
+# Persistent, loopback-only interactive development database.
+#
+# This is intentionally separate from docker-compose.dev.yml, whose tmpfs
+# clusters are disposable test infrastructure. Reset only with the documented
+# explicit command:
+#
+#   docker compose --project-name fleet-dev \
+#     --file fleet-dev.compose.yml down --volumes
+
+services:
+  fleet-dev-postgres:
+    image: pgvector/pgvector:pg18
+    container_name: fleet-dev-postgres
+    ports:
+      - "127.0.0.1:5435:5432"
+    environment:
+      POSTGRES_USER: fleet_dev
+      POSTGRES_PASSWORD: fleet_dev
+      POSTGRES_DB: fleet_dev
+    volumes:
+      - fleet-dev-postgres-data:/var/lib/postgresql
+      - ./support/fleet-dev/init-databases.sql:/docker-entrypoint-initdb.d/10-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fleet_dev -d fleet_dev"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  fleet-dev-postgres-data:
+    name: fleet-dev-postgres-data

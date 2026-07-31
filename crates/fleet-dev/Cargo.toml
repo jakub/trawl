@@ -1,0 +1,37 @@
+[package]
+name = "fleet-dev"
+description = "Opinionated local development controller for Trawl and Coastwatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "fleet_dev"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fleet-dev"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+fleet-auth = { workspace = true, features = ["keystore", "session"] }
+fs4 = { workspace = true }
+nix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shellexpand = { workspace = true }
+sqlx = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

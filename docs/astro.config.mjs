@@ -24,6 +24,7 @@ export default defineConfig({
           label: 'Getting Started',
           items: [
             { slug: 'getting-started' },
+            { slug: 'getting-started/development' },
             { slug: 'getting-started/first-query' },
             { slug: 'getting-started/vector-integration' },
           ],

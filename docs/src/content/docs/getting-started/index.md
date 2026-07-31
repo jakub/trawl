@@ -52,7 +52,7 @@ sudo mv trawl-*/trawl trawl-*/trawld trawl-*/trawl-admin /usr/local/bin/
 
 ## Build from source
 
-Requires Rust 1.88+ (edition 2024).
+Requires Rust 1.94+ (edition 2024).
 
 ```bash
 git clone https://github.com/jakub/trawl.git

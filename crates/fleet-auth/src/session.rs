@@ -43,6 +43,33 @@ pub const DEFAULT_COOKIE_NAME: &str = "fleet_session";
 /// Default session TTL in seconds (24 hours).
 pub const DEFAULT_TTL_SECS: u64 = 86_400;
 
+/// Canonical Fleet runtime environment variable carrying the shared session
+/// AEAD key as base64.
+///
+/// Development orchestration injects this only into browser-facing processes
+/// that mint or consume Fleet sessions. Application workers and API daemons
+/// that do not handle the cookie must not receive it.
+pub const ENV_SESSION_AEAD_KEY: &str = "FLEET_SESSION_AEAD_KEY";
+
+/// Canonical Fleet runtime environment variable for the cookie `Domain=`
+/// attribute.
+///
+/// An explicitly empty value means a host-only cookie (omit `Domain=`). An
+/// absent variable leaves each application's production configuration
+/// untouched.
+pub const ENV_SESSION_COOKIE_DOMAIN: &str = "FLEET_SESSION_COOKIE_DOMAIN";
+
+/// Canonical Fleet runtime environment variable for the cookie `Path=`
+/// attribute.
+///
+/// Fleet sessions currently require `/`; consumers must reject other values
+/// instead of silently issuing and clearing cookies with different scopes.
+pub const ENV_SESSION_COOKIE_PATH: &str = "FLEET_SESSION_COOKIE_PATH";
+
+/// Canonical Fleet runtime environment variable for the positive cookie
+/// `Secure` flag. The only valid values are `true` and `false`.
+pub const ENV_SESSION_COOKIE_SECURE: &str = "FLEET_SESSION_COOKIE_SECURE";
+
 /// Errors produced while creating or consuming session cookies.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -815,6 +842,14 @@ pub(crate) mod zeroizing_string {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_session_runtime_environment_names_are_frozen() {
+        assert_eq!(ENV_SESSION_AEAD_KEY, "FLEET_SESSION_AEAD_KEY");
+        assert_eq!(ENV_SESSION_COOKIE_DOMAIN, "FLEET_SESSION_COOKIE_DOMAIN");
+        assert_eq!(ENV_SESSION_COOKIE_PATH, "FLEET_SESSION_COOKIE_PATH");
+        assert_eq!(ENV_SESSION_COOKIE_SECURE, "FLEET_SESSION_COOKIE_SECURE");
+    }
 
     fn sample_payload() -> SessionPayload {
         SessionPayload {

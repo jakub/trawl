@@ -72,6 +72,7 @@ macOS works the same (the hooks and scripts are portable to both).
 postgres), [cargo-nextest](https://nexte.st) (tests),
 [trunk](https://trunkrs.dev) (web UI — it fetches the lockfile-matching
 `wasm-bindgen` itself), and [lefthook](https://lefthook.dev) (git hooks).
+The attached development stack also uses [mprocs](https://github.com/pvolok/mprocs).
 The bundled DuckDB build needs a C/C++ toolchain (`gcc`/`clang` + `cmake`).
 
 ```bash
@@ -84,66 +85,30 @@ cargo xtask build-web --release            # trawl-web with the SPA embedded (op
 
 ### Run a dev server
 
-Auth and app state live in postgres. The dev compose file runs two
-throwaway clusters (tmpfs, fsync off — a restart wipes them, repeat the
-bootstrap after one):
+`fleet-dev` owns local database preparation, Fleet migrations, the persistent
+development role/key, session configuration, Trunk proxying, and the attached
+`mprocs` stack. With no machine profile, it uses the dedicated persistent
+Docker Postgres provider on `127.0.0.1:5435`:
 
 ```bash
-docker compose -f docker-compose.dev.yml up -d
-
-# one-time bootstrap: databases, keystore schema, an API key
-docker exec fleet-auth-dev createdb -U fleet fleet   # keystore
-docker exec fleet-auth-dev createdb -U fleet trawl   # app state (trawld migrates it at boot)
-export DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet
-cargo run -p fleet-admin -- migrate
-cargo run -p fleet-admin -- roles create --name trawl-admin \
-  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
-  --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
-  --perm trawl:query_cancel --perm trawl:server_manage
-cargo run -p fleet-admin -- keys create --name dev --kind human --role trawl-admin
-# token prints to stdout — keep it for the CLI config below
+bin/fleet-dev doctor trawl
+bin/dev
+# browse http://localhost:8081/login and paste the key shown in mprocs
 ```
 
-Point trawld at the cluster (`~/.trawl/trawld.toml`; TLS is
-auto-generated self-signed):
-
-```toml
-[server]
-http_addr = "127.0.0.1:5514"
-
-[auth]
-database_url = "postgres://fleet:fleet@localhost:5433/fleet"
-
-[storage]
-database_url = "postgres://fleet:fleet@localhost:5433/trawl"
-
-[ingest]
-enabled = true
-internal_telemetry = true   # trawld's own events become queryable — instant test data
-```
-
-Give the CLI a dev profile (`~/.config/trawl/config.toml`):
-
-```toml
-[profiles.dev]
-url = "https://localhost:5514"
-insecure = true             # self-signed cert
-token = "<token from keys create>"
-```
-
-Run and query:
-
-```bash
-cargo run -p trawl-server &
-cargo run -p trawl-cli -- -p dev query -f table \
-  "service=trawld last=10m | stats count() by event_type | sort -count"
-```
+`bin/dev --release-spa` keeps the same stack with an optimized SPA.
+`bin/dev --tailscale` verifies the persistent Tailscale Serve mapping before
+launch; configure it explicitly with `bin/fleet-dev setup trawl --exposure
+tailscale`. See [Local development](docs/src/content/docs/getting-started/development.md)
+for CNPG profiles, 1Password service accounts, state paths, and recovery.
 
 ### Tests
 
-The pg-backed suites need `DATABASE_URL` pointing at the dev cluster
-(`#[sqlx::test]` creates ephemeral databases per test — never point it at
-real data):
+The separate `docker-compose.dev.yml` remains disposable test infrastructure;
+`fleet-dev.compose.yml` is only for interactive development. The pg-backed
+suites need `DATABASE_URL` pointing at a disposable cluster
+(`#[sqlx::test]` creates ephemeral databases per test—never point it at real
+data):
 
 ```bash
 DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet_test cargo nextest run --workspace
