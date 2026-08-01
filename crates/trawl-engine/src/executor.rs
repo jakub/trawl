@@ -263,7 +263,7 @@ impl Executor {
         // Describe the hot side with the same timestamp cast the union
         // applies, so the always-TIMESTAMP key isn't flagged as a conflict.
         let hot = self.describe_types(&format!(
-            "SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") FROM {hot_reader}"
+            "SELECT * REPLACE (TRY_CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") FROM {hot_reader}"
         ))?;
 
         let hot_types: std::collections::HashMap<String, String> = hot.into_iter().collect();

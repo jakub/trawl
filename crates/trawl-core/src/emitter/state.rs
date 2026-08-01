@@ -169,11 +169,14 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
 /// Build the body of a `REPLACE (...)` clause casting `varchar_cols` to
 /// VARCHAR. When `with_timestamp` is set, the canonical timestamp cast is
 /// prepended (the hot side always needs it to match parquet's TIMESTAMP).
-/// `timestamp` is never coerced to VARCHAR — it is the sort/partition key.
+/// `timestamp` is never coerced to VARCHAR — it is the sort/partition key —
+/// and never hard-CAST either (ADR-0008): `TRY_CAST` degrades one malformed
+/// hot row to NULL instead of throwing the whole hot+cold union (which
+/// previously fell back to hot-only, silently dropping every cold row).
 fn varchar_replace_list(varchar_cols: &[String], with_timestamp: bool) -> String {
     let mut parts = Vec::with_capacity(varchar_cols.len() + 1);
     if with_timestamp {
-        parts.push("CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\"".to_string());
+        parts.push("TRY_CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\"".to_string());
     }
     for col in varchar_cols {
         if col == "timestamp" {

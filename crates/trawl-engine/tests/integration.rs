@@ -561,3 +561,44 @@ fn hot_cold_type_conflict_keeps_both_rows() {
         "both cold (struct meta) and hot (string meta) rows must survive the coerced retry"
     );
 }
+
+#[test]
+fn hot_cold_malformed_timestamp_keeps_cold_data() {
+    // A malformed timestamp in the hot buffer must not throw the hot+cold
+    // union (ADR-0008: the partition key is never hard-CAST). Pre-fix this
+    // raised a Conversion Error that was misread as a schema conflict and
+    // silently degraded the query to hot-only — dropping the entire parquet
+    // history. With TRY_CAST on the union's hot side, both rows survive.
+    use duckdb::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cold = dir.path().join("cold.parquet");
+    let hot = dir.path().join("hot.ndjson");
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                      'svc' AS service, 'cold row' AS message) \
+         TO '{}' (FORMAT PARQUET)",
+        cold.display()
+    ))
+    .unwrap();
+
+    std::fs::write(
+        &hot,
+        "{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"hot row\"}\n",
+    )
+    .unwrap();
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!("{}/*.parquet", dir.path().display());
+    let result = exec
+        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+        .expect("hot+cold query must not error on a malformed hot timestamp");
+
+    assert_eq!(
+        result.row_count(),
+        2,
+        "the cold parquet row must survive alongside the malformed-timestamp hot row"
+    );
+}

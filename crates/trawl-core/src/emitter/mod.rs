@@ -1114,10 +1114,11 @@ mod tests {
             sql.contains(r#"CAST("containerID" AS VARCHAR) AS "containerID""#),
             "should cast containerID: {sql}"
         );
-        // Hot side keeps the timestamp cast and adds the VARCHAR casts.
+        // Hot side keeps the timestamp cast (TRY_CAST — the partition key
+        // is never hard-CAST, ADR-0008) and adds the VARCHAR casts.
         assert!(
-            sql.contains(r#"CAST("timestamp" AS TIMESTAMP) AS "timestamp""#),
-            "hot side keeps timestamp cast: {sql}"
+            sql.contains(r#"TRY_CAST("timestamp" AS TIMESTAMP) AS "timestamp""#),
+            "hot side keeps timestamp TRY_CAST: {sql}"
         );
     }
 
