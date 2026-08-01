@@ -258,6 +258,14 @@ fn render_trunk_config(
         "dist".to_owned(),
         toml::Value::String(ui_root.join("dist").display().to_string()),
     );
+    // An app may opt into `create_nonce` for its release pipeline, where its
+    // web binary substitutes the placeholder per-request and emits the full
+    // CSP header. Under `trunk serve` (verified on 0.21.14) the same flag
+    // makes Trunk emit a nonce-only development CSP — `style-src 'nonce-…'`
+    // — that blocks the app's own stylesheets and any font origins. The
+    // controller serves the SPA through Trunk, so force it off here; the
+    // source Trunk.toml keeps the release behavior.
+    build.insert("create_nonce".to_owned(), toml::Value::Boolean(false));
     let serve = document
         .get_mut("serve")
         .and_then(toml::Value::as_table_mut)
@@ -472,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn coastwatch_shaped_trunk_config_preserves_app_specific_security_settings() {
+    fn coastwatch_shaped_trunk_config_disables_the_serve_mode_nonce_csp() {
         let directory = tempfile::tempdir().unwrap();
         let ui = directory.path().join("web-ui");
         std::fs::create_dir(&ui).unwrap();
@@ -508,13 +516,18 @@ no_redirect = true
             cookie_path: "/".to_owned(),
             cookie_secure: true,
         };
+        let source_before = std::fs::read_to_string(ui.join("Trunk.toml")).unwrap();
         render_trunk_config(&output, &ui, &topology).unwrap();
         let rendered: toml::Value =
             toml::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
-        assert_eq!(rendered["build"]["create_nonce"].as_bool(), Some(true));
+        // Trunk's serve-mode nonce CSP blocks the app's own stylesheets
+        // (#301 follow-up), so the generated config must always disable it…
+        assert_eq!(rendered["build"]["create_nonce"].as_bool(), Some(false));
+        // …while the app's source Trunk.toml keeps the release-build nonce
+        // pipeline untouched.
         assert_eq!(
-            rendered["build"]["nonce_placeholder"].as_str(),
-            Some("__CSP_NONCE__")
+            std::fs::read_to_string(ui.join("Trunk.toml")).unwrap(),
+            source_before
         );
         assert_eq!(rendered["proxy"][0]["no_redirect"].as_bool(), Some(true));
         assert_eq!(
