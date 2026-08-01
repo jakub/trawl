@@ -21,6 +21,12 @@ Vector (gzip JSON batch, 1MB / 5s)
 
 Each ingest batch produces one WAL file per service. Writes are atomic via tmp-file-then-rename. Filename format: `{service}_{unix_millis}_{4_hex_random}.ndjson`. Service names are validated against `[a-zA-Z0-9\-_.]` to prevent path traversal.
 
+### Timestamp canonicalization
+
+A present `timestamp` is valid iff it is a JSON string that parses as RFC 3339 or as the space-separated `YYYY-MM-DD HH:MM:SS[.fff]` naive variant (read as UTC). Valid values are canonicalized at ingest to RFC 3339 UTC at microsecond precision (DuckDB's native `TIMESTAMP` resolution), so the WAL and hot buffer only ever contain well-formed timestamps.
+
+Anything else — an unparseable string, a nested object, a bare number — is **substituted, never fatal and never dropped**: `timestamp` is overwritten with the request-arrival time (the same default an absent timestamp gets) and the original value is preserved verbatim in `timestamp_invalid` (truncated to 256 chars). The event still counts as accepted; repairs are visible via the `trawl_ingest_events_repaired_total` counter and an `ingest_repairs` warn with sampled originals. `timestamp_invalid` is a sparse column, absent from the vast majority of parquet files.
+
 ### Hot buffer
 
 An in-memory `RwLock<IndexMap>` keyed by batch ID, holding `Arc<IngestBatch>`. Events are inserted synchronously during ingest (not via an async consumer) to eliminate the query-visibility race — events are visible to queries immediately.
@@ -40,11 +46,19 @@ Every 10 seconds, the compaction task:
 1. Scans the WAL directory for `.ndjson` files older than 10 seconds
 2. Groups them by service
 3. For each service, spawns a blocking task with an ephemeral DuckDB connection:
-   - `read_json_auto([wal files])` → cast timestamps
+   - `read_json_auto([wal files])` → repair timestamps (below)
    - `UNION ALL BY NAME` with existing parquet (if any)
    - `COPY TO data/YYYY-MM-DD/HH/service.parquet` (atomic rename)
 4. Drains the hot buffer entries for compacted batches
 5. Deletes processed WAL files
+
+### Timestamp repair
+
+The partition key is never hard-CAST in emitted SQL (ADR-0008) — one malformed value must never wedge a batch. Compaction resolves each row's `timestamp` through a three-arm `COALESCE`:
+
+1. `TRY_CAST` of the raw value — always succeeds for post-canonicalization data;
+2. the ingest instant recovered from the row's **own** WAL filename (`{service}_{unix_millis}_...`), read per-row via `read_json(..., filename=...)` — this drains WAL written before the ingest fix with no operator step;
+3. the compaction instant — so no parquet row ever carries a NULL timestamp (a NULL partition key would sort first and fall outside every `last=` filter).
 
 ### Daily rollup
 
@@ -73,7 +87,7 @@ data/
     ...
 ```
 
-Schema is fully dynamic — no predefined columns. `union_by_name=true` handles heterogeneous schemas across services. Timestamps are cast to native `TIMESTAMP` during compaction for predicate pushdown.
+Schema is fully dynamic — no predefined columns. `union_by_name=true` handles heterogeneous schemas across services. Timestamps are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
 
 ### App-state store
 
@@ -108,7 +122,9 @@ A pool of N connections (default: `num_cpus`) sharing one in-memory DuckDB datab
 
 ### Hot buffer integration
 
-All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is written to a temp ndjson file and read by DuckDB alongside the parquet files. This ensures freshly ingested events (not yet compacted) are always visible.
+All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is written to a temp ndjson file and read by DuckDB alongside the parquet files. This ensures freshly ingested events (not yet compacted) are always visible. The union applies `TRY_CAST` to the hot side's `timestamp` — a malformed hot value degrades that one row, never the whole union.
+
+A hot-only fallback is permitted only when it cannot hide cold data: on a genuine cold start (the glob matches no parquet files) or a missing-column user error. Any other database failure with cold files present returns an error — a cold-data drop is never a silent HTTP 200 (ADR-0008).
 
 ## SSE streaming
 
