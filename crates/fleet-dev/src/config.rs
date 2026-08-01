@@ -450,6 +450,24 @@ impl AppManifest {
             }
             validate_environment(&preparation.env, &preparation.resolved_env)
                 .map_err(|message| invalid_error(MANIFEST_KIND, path, message))?;
+            // Preparation runs before the app resolver so it can build the
+            // resolver binary; `app.*` values other than the provider-supplied
+            // database URL do not exist yet. Restrict to `fleet.*` outright —
+            // a build step has no business holding an app DSN either.
+            if let Some(source) = preparation
+                .resolved_env
+                .values()
+                .find(|source| !source.starts_with("fleet."))
+            {
+                return invalid(
+                    MANIFEST_KIND,
+                    path,
+                    format!(
+                        "preparation resolved source {source:?} must be `fleet.`-namespaced; \
+                         preparation runs before the app resolver"
+                    ),
+                );
+            }
         }
         validate_environment(&self.migration.env, &self.migration.resolved_env)
             .map_err(|message| invalid_error(MANIFEST_KIND, path, message))?;
@@ -811,6 +829,34 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn preparation_cannot_reference_resolver_produced_values() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let mut manifest = load_manifest(root).unwrap();
+        let preparation = manifest.preparation.as_mut().unwrap();
+        preparation
+            .resolved_env
+            .insert("API_KEY".to_owned(), "app.api_key".to_owned());
+        let error = manifest.validate(Path::new("fleet-dev.toml")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("preparation runs before the app resolver"),
+            "got: {error}"
+        );
+
+        // `fleet.*` values exist before the resolver and stay allowed.
+        let mut manifest = load_manifest(root).unwrap();
+        manifest.preparation.as_mut().unwrap().resolved_env.insert(
+            "FLEET_DATABASE_URL".to_owned(),
+            "fleet.database_url".to_owned(),
+        );
+        manifest.validate(Path::new("fleet-dev.toml")).unwrap();
     }
 
     #[test]

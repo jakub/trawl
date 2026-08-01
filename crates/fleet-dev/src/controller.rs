@@ -300,6 +300,13 @@ async fn prepare_after_database(
             .collect(),
     };
 
+    // Preparation runs before the resolvers so a manifest can build its
+    // resolver (and migration) binaries first — handing the 1Password service
+    // token to a `cargo run` resolver would expose it to every build script
+    // and proc-macro in the dependency graph. Manifest validation restricts
+    // preparation's resolved sources to `fleet.*`, which all exist here.
+    run_app_preparations(runner, selection, &values)?;
+
     for (app, checkout) in &selection.selected {
         if let Some(resolver) = &checkout.manifest.resolver {
             let token = token.ok_or_else(|| {
@@ -340,7 +347,7 @@ async fn prepare_after_database(
         }
     }
 
-    run_app_preparation_and_migrations(runner, selection, &values)?;
+    run_app_migrations(runner, selection, &values)?;
     let registered = selection
         .registered
         .iter()
@@ -356,7 +363,7 @@ async fn prepare_after_database(
     })
 }
 
-fn run_app_preparation_and_migrations(
+fn run_app_preparations(
     runner: &dyn CommandRunner,
     selection: &AppSelection,
     values: &RuntimeValues,
@@ -372,6 +379,16 @@ fn run_app_preparation_and_migrations(
                 "preparation",
             )?;
         }
+    }
+    Ok(())
+}
+
+fn run_app_migrations(
+    runner: &dyn CommandRunner,
+    selection: &AppSelection,
+    values: &RuntimeValues,
+) -> Result<()> {
+    for (app, checkout) in &selection.selected {
         if checkout.manifest.database.migration_mode == crate::config::MigrationMode::Command {
             let command = CommandManifest {
                 command: checkout.manifest.database.migration_command.clone(),
@@ -632,7 +649,10 @@ mod tests {
             )]),
         };
         let runner = RecordingRunner::default();
-        run_app_preparation_and_migrations(&runner, &selection, &values).unwrap();
+        // The controller calls these in this order: preparation runs before
+        // the resolver would, migration after it.
+        run_app_preparations(&runner, &selection, &values).unwrap();
+        run_app_migrations(&runner, &selection, &values).unwrap();
         let seen = runner.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].program, "prepare");
