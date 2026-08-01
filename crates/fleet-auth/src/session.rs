@@ -70,6 +70,160 @@ pub const ENV_SESSION_COOKIE_PATH: &str = "FLEET_SESSION_COOKIE_PATH";
 /// `Secure` flag. The only valid values are `true` and `false`.
 pub const ENV_SESSION_COOKIE_SECURE: &str = "FLEET_SESSION_COOKIE_SECURE";
 
+/// Errors from parsing the `FLEET_SESSION_*` runtime environment.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionRuntimeError {
+    #[error("env var {name} is set but not valid UTF-8")]
+    NotUnicode { name: &'static str },
+
+    #[error("env var {name} holds an AEAD key that isn't valid base64 or wrong length")]
+    InvalidKey { name: &'static str },
+
+    #[error("env var {name} has an invalid Fleet session value: {reason}")]
+    InvalidValue {
+        name: &'static str,
+        reason: &'static str,
+    },
+}
+
+/// Cookie `Domain=` state from the runtime environment.
+///
+/// Deliberately three-valued so development orchestration can force a
+/// host-only cookie without disturbing production configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeCookieDomain {
+    /// Runtime variable absent: preserve application configuration.
+    PreserveConfigured,
+    /// Runtime variable present and empty: force a host-only cookie.
+    HostOnly,
+    /// Runtime variable supplies an explicit, validated `Domain=` value.
+    Explicit(String),
+}
+
+/// Parsed common Fleet session runtime environment.
+///
+/// This is the single shared implementation of the `FLEET_SESSION_*`
+/// contract; consuming applications map it onto their own configuration
+/// rather than re-implementing the parsing and drifting.
+#[derive(Debug)]
+pub struct SessionRuntimeOverrides {
+    pub key: Option<SessionKey>,
+    pub domain: RuntimeCookieDomain,
+    pub secure: Option<bool>,
+}
+
+impl SessionRuntimeOverrides {
+    /// Read and validate the `FLEET_SESSION_*` variables from the process
+    /// environment.
+    ///
+    /// # Errors
+    /// Fails closed on any present-but-invalid value.
+    pub fn from_process_env() -> Result<Self, SessionRuntimeError> {
+        Self::parse(
+            read_optional_env(ENV_SESSION_AEAD_KEY)?,
+            read_optional_env(ENV_SESSION_COOKIE_DOMAIN)?,
+            read_optional_env(ENV_SESSION_COOKIE_PATH)?,
+            read_optional_env(ENV_SESSION_COOKIE_SECURE)?,
+        )
+    }
+
+    /// Validate already-read variable values (`None` = absent).
+    ///
+    /// # Errors
+    /// Fails closed on any present-but-invalid value.
+    pub fn parse(
+        key: Option<String>,
+        domain: Option<String>,
+        path: Option<String>,
+        secure: Option<String>,
+    ) -> Result<Self, SessionRuntimeError> {
+        let key = key
+            .map(Zeroizing::new)
+            .map(|raw| {
+                SessionKey::from_base64(raw.as_str()).map_err(|_| SessionRuntimeError::InvalidKey {
+                    name: ENV_SESSION_AEAD_KEY,
+                })
+            })
+            .transpose()?;
+
+        if let Some(path) = path
+            && path != "/"
+        {
+            return Err(SessionRuntimeError::InvalidValue {
+                name: ENV_SESSION_COOKIE_PATH,
+                reason: "only the fleet-wide path `/` is supported",
+            });
+        }
+
+        let secure = secure
+            .map(|value| match value.as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(SessionRuntimeError::InvalidValue {
+                    name: ENV_SESSION_COOKIE_SECURE,
+                    reason: "expected exactly `true` or `false`",
+                }),
+            })
+            .transpose()?;
+
+        let domain = match domain {
+            None => RuntimeCookieDomain::PreserveConfigured,
+            Some(domain) if domain.is_empty() => RuntimeCookieDomain::HostOnly,
+            Some(domain) => {
+                validate_runtime_cookie_domain(&domain)?;
+                RuntimeCookieDomain::Explicit(domain)
+            }
+        };
+
+        Ok(Self {
+            key,
+            domain,
+            secure,
+        })
+    }
+}
+
+fn read_optional_env(name: &'static str) -> Result<Option<String>, SessionRuntimeError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(SessionRuntimeError::NotUnicode { name }),
+    }
+}
+
+/// Validate a runtime-provided cookie domain before it can reach a response
+/// header. A leading dot is permitted for parity with existing production
+/// configuration; the remaining value must be a conventional ASCII DNS name.
+fn validate_runtime_cookie_domain(domain: &str) -> Result<(), SessionRuntimeError> {
+    let bare = domain.strip_prefix('.').unwrap_or(domain);
+    let valid = !bare.is_empty()
+        && bare.len() <= 253
+        && !bare.ends_with('.')
+        && bare.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(SessionRuntimeError::InvalidValue {
+            name: ENV_SESSION_COOKIE_DOMAIN,
+            reason: "expected empty for host-only or an ASCII DNS domain",
+        })
+    }
+}
+
 /// Errors produced while creating or consuming session cookies.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -849,6 +1003,77 @@ mod tests {
         assert_eq!(ENV_SESSION_COOKIE_DOMAIN, "FLEET_SESSION_COOKIE_DOMAIN");
         assert_eq!(ENV_SESSION_COOKIE_PATH, "FLEET_SESSION_COOKIE_PATH");
         assert_eq!(ENV_SESSION_COOKIE_SECURE, "FLEET_SESSION_COOKIE_SECURE");
+    }
+
+    #[test]
+    fn runtime_overrides_parse_the_valid_shapes() {
+        let absent = SessionRuntimeOverrides::parse(None, None, None, None).unwrap();
+        assert!(absent.key.is_none());
+        assert_eq!(absent.domain, RuntimeCookieDomain::PreserveConfigured);
+        assert_eq!(absent.secure, None);
+
+        let key = SessionKey::from_bytes([0x42; KEY_LEN]).to_base64url();
+        let full = SessionRuntimeOverrides::parse(
+            Some(key.to_string()),
+            Some(String::new()),
+            Some("/".into()),
+            Some("true".into()),
+        )
+        .unwrap();
+        assert_eq!(full.key.unwrap().to_base64url().as_str(), key.as_str());
+        assert_eq!(full.domain, RuntimeCookieDomain::HostOnly);
+        assert_eq!(full.secure, Some(true));
+
+        let explicit =
+            SessionRuntimeOverrides::parse(None, Some(".fleet.example".into()), None, None)
+                .unwrap();
+        assert_eq!(
+            explicit.domain,
+            RuntimeCookieDomain::Explicit(".fleet.example".into())
+        );
+    }
+
+    #[test]
+    fn invalid_runtime_values_fail_closed() {
+        let bad_key = SessionRuntimeOverrides::parse(Some("not-base64".into()), None, None, None)
+            .unwrap_err();
+        assert!(
+            matches!(bad_key, SessionRuntimeError::InvalidKey { name } if name == ENV_SESSION_AEAD_KEY)
+        );
+
+        for path in ["", "/app", "//"] {
+            let err =
+                SessionRuntimeOverrides::parse(None, None, Some(path.into()), None).unwrap_err();
+            assert!(matches!(
+                err,
+                SessionRuntimeError::InvalidValue { name, .. } if name == ENV_SESSION_COOKIE_PATH
+            ));
+        }
+
+        for secure in ["TRUE", "1", "", "yes"] {
+            let err =
+                SessionRuntimeOverrides::parse(None, None, None, Some(secure.into())).unwrap_err();
+            assert!(matches!(
+                err,
+                SessionRuntimeError::InvalidValue { name, .. } if name == ENV_SESSION_COOKIE_SECURE
+            ));
+        }
+
+        for domain in [
+            ".",
+            "https://fleet.example",
+            "-fleet.example",
+            "fleet..example",
+            "fleet.example:8444",
+            "fleet.example\r\nx-injected: yes",
+        ] {
+            let err =
+                SessionRuntimeOverrides::parse(None, Some(domain.into()), None, None).unwrap_err();
+            assert!(matches!(
+                err,
+                SessionRuntimeError::InvalidValue { name, .. } if name == ENV_SESSION_COOKIE_DOMAIN
+            ));
+        }
     }
 
     fn sample_payload() -> SessionPayload {
