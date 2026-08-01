@@ -107,21 +107,15 @@ impl Executor {
 
         // A column type conflict between the hot and cold sources (e.g. a
         // field that is BIGINT in parquet but VARCHAR in the hot snapshot)
-        // would otherwise fall through to the hot-only path below and
-        // silently drop every cold row. Detect the conflicting columns and
-        // retry the union with them coerced to VARCHAR on both sides,
-        // preserving hot AND cold data. A false positive (no conflicts found)
-        // or a describe failure degrades to the hot-only path below — but if
-        // a conflict was detected and the coerced retry still failed, that
-        // degradation drops cold/parquet rows and is now logged at warn
-        // (`event_type = "query_cold_drop"`), distinct from a legitimate
-        // cold-start hot-only path (where `type_conflict` is false).
-        let type_conflict = matches!(
+        // would otherwise fail the union. Detect the conflicting columns and
+        // retry with them coerced to VARCHAR on both sides, preserving hot
+        // AND cold data. If the retry still fails, the outcome policy below
+        // returns the error whenever cold files exist — a cold-data drop is
+        // never silent (ADR-0008).
+        if matches!(
             &outcome,
             Err(EngineError::Database(e)) if is_union_type_conflict(e)
-        );
-        if type_conflict
-            && let Ok(cols) = self.hot_cold_conflicts(source, hot_source)
+        ) && let Ok(cols) = self.hot_cold_conflicts(source, hot_source)
             && !cols.is_empty()
         {
             let coerced = emitter::emit_with_hot_source_coerced(&ast, source, hot_source, &cols)?;
@@ -129,41 +123,39 @@ impl Executor {
         }
 
         // Classify the (possibly retried) outcome, then route on the pure
-        // `cold_action` decision so the cold-drop warn stays testable.
+        // `cold_action` decision so the outcome policy stays unit-testable.
         let class = match &outcome {
             // Columns present → real result (possibly empty rows).
             Ok(r) if !r.columns.is_empty() => HotColdOutcome::Columns,
-            // No columns (no parquet source files), database error (UNION
-            // fails on missing source), or binder error remapped to Emit
-            // (column not found in empty parquet) → fall back to hot-only.
-            // ResultTooLarge is excluded: the query worked, just too many rows.
-            Ok(_) | Err(EngineError::Database(_) | EngineError::Emit(_)) => {
-                HotColdOutcome::FallBack
-            }
+            // No columns: execute_emitted mapped a "no files match the glob"
+            // error to an empty result — the genuine cold-start case.
+            Ok(_) => HotColdOutcome::NoColdFiles,
+            // A binder error remapped to Emit (querying a nonexistent field)
+            // — a user error, safe to keep the empty-result UX.
+            Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
+            // Any other database failure is only provably safe to mask when
+            // no cold files exist.
+            Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
+            // ResultTooLarge, parse, etc. — propagate.
             Err(_) => HotColdOutcome::Fatal,
         };
-        let mut result = match cold_action(class, type_conflict) {
-            ColdAction::ReturnOutcome => outcome?,
-            ColdAction::HotOnly { warn_cold_drop } => {
-                if warn_cold_drop {
-                    // A hot/cold column type conflict was detected but the
-                    // coerced retry did not resolve it (conflict-detection
-                    // failed, found no columns, or the retry itself errored).
-                    // We are about to return HOT-ONLY results, silently
-                    // omitting all cold/parquet rows.
-                    tracing::warn!(
-                        event_type = "query_cold_drop",
-                        "hot/cold type conflict survived coercion; returning hot-only results, cold/parquet rows dropped"
-                    );
-                }
-                let hot_emitted = emitter::emit(&ast, hot_source)?;
-                match self.execute_emitted(&hot_emitted, max_rows, utc_offset_secs) {
-                    // Hot-only also hit a binder/emit error (e.g. empty ndjson
-                    // between compaction cycles). Treat as empty, not error.
-                    Err(EngineError::Emit(_)) => QueryResult::empty(),
-                    other => other?,
-                }
+        let hot_only = match cold_action(class) {
+            ColdAction::ReturnOutcome => false,
+            ColdAction::HotOnly => true,
+            // Evaluated only on this error path: hot-only is permitted
+            // exactly when there is no cold data it could hide.
+            ColdAction::HotOnlyIfNoColdFiles => !self.cold_files_present(source),
+        };
+        let mut result = if hot_only {
+            let hot_emitted = emitter::emit(&ast, hot_source)?;
+            match self.execute_emitted(&hot_emitted, max_rows, utc_offset_secs) {
+                // Hot-only also hit a binder/emit error (e.g. empty ndjson
+                // between compaction cycles). Treat as empty, not error.
+                Err(EngineError::Emit(_)) => QueryResult::empty(),
+                other => other?,
             }
+        } else {
+            outcome?
         };
         if !emitted.rust_stages.is_empty() {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
@@ -231,6 +223,25 @@ impl Executor {
         }
 
         Ok(QueryResult { columns, rows })
+    }
+
+    /// Whether the cold source has any concrete files behind it.
+    ///
+    /// Consulted only on the error path of the hot+cold outcome policy: a
+    /// hot-only fallback after an unexpected failure is permitted exactly
+    /// when there is no cold data it could hide. List sources (`['...']`)
+    /// are present by construction; a glob is counted via `glob(?)`. Errs on
+    /// the side of "present" so an unexpected failure surfaces as an error
+    /// rather than degrading to hot-only success.
+    fn cold_files_present(&self, source: &str) -> bool {
+        if source.trim_start().starts_with('[') {
+            return true;
+        }
+        self.conn
+            .query_row("SELECT count(*)::BIGINT FROM glob(?)", [source], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_or(true, |n| n > 0)
     }
 
     /// Describe the `(name, type)` of every column produced by `query`.
@@ -574,6 +585,10 @@ impl Executor {
     }
 
     /// Export with hot buffer union, falling back to hot-only on cold start.
+    ///
+    /// Routes through the same outcome gate as [`Self::run_query_with_hot`]:
+    /// a database failure over an existing cold corpus returns the error
+    /// instead of silently exporting hot-only data (ADR-0008).
     pub fn export_parquet_with_hot(
         &self,
         dsl: &str,
@@ -585,8 +600,11 @@ impl Executor {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
         match self.export_parquet_from_emitted(&emitted, output_path, max_rows) {
-            // No columns / no parquet files → fall back to hot-only.
-            Err(EngineError::Database(_) | EngineError::Emit(_)) => {
+            // No parquet files / binder-shaped failure → hot-only is only
+            // permitted when there is no cold data it could hide.
+            Err(EngineError::Database(_) | EngineError::Emit(_))
+                if !self.cold_files_present(source) =>
+            {
                 let hot_emitted = emitter::emit(&ast, hot_source)?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
             }
@@ -795,23 +813,35 @@ fn is_binder_column_error(e: &duckdb::Error) -> bool {
     msg.contains(DUCKDB_BINDER_ERROR_MSG) && (msg.contains("column") || msg.contains("not found"))
 }
 
+/// Leading `"<Class> Error"` token of a `DuckDB` message — `"Conversion"`
+/// for `"Conversion Error: ..."`, `"Binder"` for `"Binder Error: ..."`.
+///
+/// `DuckDB` prefixes every exception with its class, so the token is
+/// structured information carried through the message. Returns `None` when
+/// the message does not lead with a class token (e.g. non-database
+/// `duckdb::Error` variants).
+fn error_class(msg: &str) -> Option<&str> {
+    msg.split(':').next()?.strip_suffix(" Error")
+}
+
 /// Check if a `DuckDB` error is a column type conflict raised when a
 /// `UNION ALL BY NAME` (or `read_parquet(..., union_by_name=true)`) cannot
 /// reconcile a column's type across sources — e.g. JSON/STRUCT vs `VARCHAR`.
 ///
-/// Matches two real `DuckDB` 1.4.x strings:
-/// - the union path raises a `"Conversion"` error;
-/// - the `read_parquet(union_by_name)` path raises a Binder
-///   `"Struct remap can only remap nested types, not 'VARCHAR'"` error
-///   (the `"remap"` substring), plus the generic `"type mismatch"`.
+/// Keys off the error's class token (never a substring match anywhere in
+/// the body — ADR-0008): both the `UNION ALL BY NAME` path and the
+/// `read_parquet(union_by_name)` per-file remap path raise
+/// `Conversion`-class errors on the bundled `DuckDB` 1.5.5 (verified by the
+/// live-error tests below).
 ///
-/// Deliberately does NOT match `"too small to be a Parquet file"`: that is a
-/// corruption error, handled by quarantining the file, not by the cast
-/// fallback. False positives are harmless — the caller retries conflict
-/// detection, finds none, and falls through unchanged.
+/// Deliberately does NOT match corruption ("too small to be a Parquet
+/// file") or missing-column binder errors: those are handled by quarantine
+/// and the benign-binder carve-out respectively. A false positive is
+/// harmless for the coerced retry (conflict detection finds no columns and
+/// falls through) and can no longer cause a silent cold drop — the outcome
+/// policy returns errors whenever cold files exist.
 pub fn is_union_type_conflict(e: &duckdb::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("Conversion") || msg.contains("remap") || msg.contains("type mismatch")
+    error_class(&e.to_string()) == Some("Conversion")
 }
 
 /// Classification of the hot+cold union outcome that `run_query_with_hot`
@@ -821,9 +851,15 @@ enum HotColdOutcome {
     /// The union produced columns (rows may be empty) — an authoritative
     /// result; return it as-is.
     Columns,
-    /// No columns (no parquet files) or a recoverable `Database`/`Emit` error
-    /// (missing source / binder-remapped column) — fall back to a hot-only read.
-    FallBack,
+    /// The cold glob matched no files (the cold-start case, mapped to an
+    /// empty result by `execute_emitted`) — hot-only cannot hide anything.
+    NoColdFiles,
+    /// A binder error remapped to `Emit` (querying a nonexistent field) — a
+    /// user error; hot-only keeps the established empty-result UX.
+    BenignBinder,
+    /// Any other database failure — hot-only is only provably safe when a
+    /// cold-file presence check says no cold files exist.
+    Recoverable,
     /// A non-recoverable error (e.g. `ResultTooLarge`, parse) — propagate it.
     Fatal,
 }
@@ -831,28 +867,26 @@ enum HotColdOutcome {
 /// What `run_query_with_hot` should do with a classified outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColdAction {
-    /// Return the union outcome unchanged.
+    /// Return the union outcome unchanged (result or error).
     ReturnOutcome,
-    /// Read hot-only. `warn_cold_drop` is true when a hot/cold type conflict
-    /// was detected but survived coercion, so the hot-only fallback now
-    /// silently drops cold/parquet rows — worth a `query_cold_drop` warn.
-    HotOnly { warn_cold_drop: bool },
+    /// Read hot-only — structurally safe, no cold data can be hidden.
+    HotOnly,
+    /// Read hot-only ONLY if no cold files exist; otherwise return the
+    /// error. A cold-data drop must never be silent, and an arbitrary
+    /// database failure must never masquerade as success (ADR-0008).
+    HotOnlyIfNoColdFiles,
 }
 
 /// Decide the next step for a classified hot+cold union outcome.
 ///
-/// Split out as a pure function so the `query_cold_drop`-warn contract is
-/// unit-testable without constructing a live `DuckDB` conflict that survives
-/// VARCHAR coercion (the seam that triggers it is hard to provoke
-/// deterministically). The warn fires exactly when we fall back to hot-only
-/// AND a hot/cold type conflict was detected — never on a legitimate
-/// cold-start hot-only path (`type_conflict == false`).
-fn cold_action(outcome: HotColdOutcome, type_conflict: bool) -> ColdAction {
+/// Split out as a pure function so the outcome policy — hot-only fallback
+/// is permitted only when it cannot hide cold data — is unit-testable
+/// without provoking every failure class against a live `DuckDB`.
+fn cold_action(outcome: HotColdOutcome) -> ColdAction {
     match outcome {
         HotColdOutcome::Columns | HotColdOutcome::Fatal => ColdAction::ReturnOutcome,
-        HotColdOutcome::FallBack => ColdAction::HotOnly {
-            warn_cold_drop: type_conflict,
-        },
+        HotColdOutcome::NoColdFiles | HotColdOutcome::BenignBinder => ColdAction::HotOnly,
+        HotColdOutcome::Recoverable => ColdAction::HotOnlyIfNoColdFiles,
     }
 }
 
@@ -1103,7 +1137,8 @@ mod tests {
     use duckdb::Connection;
 
     use super::{
-        ColdAction, Executor, HotColdOutcome, cold_action, is_complex_type, is_union_type_conflict,
+        ColdAction, Executor, HotColdOutcome, cold_action, error_class, is_complex_type,
+        is_union_type_conflict,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -1312,37 +1347,178 @@ mod tests {
     }
 
     #[test]
-    fn cold_action_warns_only_on_conflict_fallback() {
-        // The contract: the query_cold_drop warn (and hot-only drop of cold
-        // rows) happens iff we fall back to hot-only AND a hot/cold type
-        // conflict was detected. This is the seam that's near-impossible to
-        // provoke live (a conflict that survives VARCHAR coercion), so assert
-        // it directly on the pure decision.
+    fn duckdb_error_classes_parsed_from_live_errors() {
+        // The classifier keys off DuckDB's leading "<Class> Error" token, so
+        // pin the class each live-provoked error actually carries (verified
+        // against the bundled crate — the four ADR-0008 trigger variants all
+        // produce this Conversion class, see conversion_error_class below).
+        let dir = tempfile::tempdir().unwrap();
+
+        // On the bundled 1.5.5 the per-file remap variant is ALSO a
+        // Conversion-class error ("failed to cast column ..."), not the
+        // legacy Binder "Struct remap" string — which is why the classifier
+        // needs no Binder arm at all.
+        let remap_msg = read_parquet_remap_error(dir.path()).to_string();
         assert_eq!(
-            cold_action(HotColdOutcome::FallBack, true),
-            ColdAction::HotOnly {
-                warn_cold_drop: true
-            },
-            "fallback after a detected conflict must warn + drop cold rows"
+            error_class(&remap_msg),
+            Some("Conversion"),
+            "read_parquet remap error carries the Conversion class: {remap_msg}"
         );
+
+        let conversion_msg = union_conversion_error().to_string();
         assert_eq!(
-            cold_action(HotColdOutcome::FallBack, false),
-            ColdAction::HotOnly {
-                warn_cold_drop: false
-            },
-            "a legitimate cold-start fallback (no conflict) must NOT warn"
+            error_class(&conversion_msg),
+            Some("Conversion"),
+            "UNION ALL BY NAME conflict carries the Conversion class: {conversion_msg}"
         );
-        // Columns present, or a fatal error: return the outcome unchanged
-        // regardless of whether a conflict was flagged — never a cold-drop.
+
+        let corrupt_msg = corruption_error(dir.path()).to_string();
+        assert_ne!(
+            error_class(&corrupt_msg),
+            Some("Conversion"),
+            "corruption must not carry the Conversion class: {corrupt_msg}"
+        );
+
+        let benign_msg = benign_binder_error().to_string();
         assert_eq!(
-            cold_action(HotColdOutcome::Columns, true),
+            error_class(&benign_msg),
+            Some("Binder"),
+            "missing-column error carries the Binder class: {benign_msg}"
+        );
+    }
+
+    /// The four ADR-0008 trigger variants under a hard CAST all produce a
+    /// `Conversion Error`-class message — the evidence (verified by execution
+    /// against the bundled crate) behind the classifier keying off the class
+    /// token. Post-fix these variants never reach a hard CAST, but the
+    /// assertion pins the `DuckDB` behavior the design relies on.
+    #[test]
+    fn trigger_variants_produce_conversion_class_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let variants = [
+            r#""not-a-date""#,
+            r#""2026-13-45T99:99:99Z""#,
+            r#"{"nested":1}"#,
+            "12345",
+        ];
+        for (i, variant) in variants.iter().enumerate() {
+            let f = dir.path().join(format!("trig{i}.ndjson"));
+            std::fs::write(&f, format!(r#"{{"timestamp":{variant},"service":"svc"}}"#)).unwrap();
+            let err = conn
+                .prepare(&format!(
+                    "SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
+                     FROM read_json(['{}'], format='newline_delimited', records=true, \
+                     auto_detect=true, union_by_name=true, field_appearance_threshold=0, \
+                     maximum_depth=2)",
+                    f.display()
+                ))
+                .and_then(|mut stmt| {
+                    let mut rows = stmt.query([])?;
+                    while rows.next()?.is_some() {}
+                    Ok(())
+                })
+                .expect_err("a hard CAST over a malformed timestamp must error");
+            let msg = err.to_string();
+            assert_eq!(
+                error_class(&msg),
+                Some("Conversion"),
+                "variant {variant} must carry the Conversion class: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_action_routes_by_outcome_class() {
+        // The outcome policy: hot-only fallback is permitted only when it
+        // cannot hide cold data. Columns and Fatal return the outcome;
+        // cold-start and benign missing-column errors go hot-only; any other
+        // failure may go hot-only ONLY if a cold-file presence check proves
+        // there is nothing to hide (ADR-0008: a cold-data drop is never
+        // silent, and an arbitrary database failure never masquerades as
+        // success).
+        assert_eq!(
+            cold_action(HotColdOutcome::Columns),
             ColdAction::ReturnOutcome,
             "an authoritative columnful result is returned as-is"
         );
         assert_eq!(
-            cold_action(HotColdOutcome::Fatal, true),
+            cold_action(HotColdOutcome::Fatal),
             ColdAction::ReturnOutcome,
             "a non-recoverable error is propagated, not masked by a hot-only read"
+        );
+        assert_eq!(
+            cold_action(HotColdOutcome::NoColdFiles),
+            ColdAction::HotOnly,
+            "a genuine cold start (glob matched nothing) stays hot-only"
+        );
+        assert_eq!(
+            cold_action(HotColdOutcome::BenignBinder),
+            ColdAction::HotOnly,
+            "a missing-column user error keeps the empty-result UX"
+        );
+        assert_eq!(
+            cold_action(HotColdOutcome::Recoverable),
+            ColdAction::HotOnlyIfNoColdFiles,
+            "an unexpected failure may go hot-only only when no cold files exist"
+        );
+    }
+
+    #[test]
+    fn unexpected_cold_failure_returns_error_not_hot_only() {
+        // An unreadable parquet file (valid magic, truncated body) inside the
+        // cold glob, with hot rows present: the query must return an error —
+        // never HTTP-200-shaped hot-only success that silently drops the
+        // (unreadable but existing) cold data.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("truncated.parquet");
+        std::fs::write(&bad, b"PAR1\x00\x00").unwrap();
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+
+        let exec = Executor::new().unwrap();
+        let source = format!("{}/*.parquet", dir.path().display());
+        let result = exec.run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0);
+        assert!(
+            result.is_err(),
+            "an unreadable cold file must surface as an error, not hot-only success"
+        );
+    }
+
+    #[test]
+    fn missing_column_with_cold_files_returns_empty_not_error() {
+        // A query on a nonexistent field with cold files present keeps the
+        // current empty-result UX (the BenignBinder carve-out): the binder
+        // error is a user error, not a cold-data drop.
+        let dir = tempfile::tempdir().unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &dir.path().join("cold.parquet"), "'plain'");
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+
+        let exec = Executor::new().unwrap();
+        let source = format!("{}/*.parquet", dir.path().display());
+        let result = exec
+            .run_query_with_hot(
+                "nonexistent_field=value",
+                &source,
+                hot.to_str().unwrap(),
+                usize::MAX,
+                0,
+            )
+            .expect("a missing-column query must stay a benign empty result");
+        assert_eq!(
+            result.row_count(),
+            0,
+            "querying a nonexistent field returns empty, not an error"
         );
     }
 
