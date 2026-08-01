@@ -1070,6 +1070,34 @@ fn read_wal_to_table(
     Ok(survivors.len())
 }
 
+/// Synthetic column carrying each row's source WAL file path
+/// (`read_json(..., filename='_trawl_wal_file')`). Named — not the literal
+/// `filename=true` form — so a user event legitimately carrying a `filename`
+/// field cannot trip the "Duplicate name" fallback, and excluded from
+/// `wal_batch` so it never reaches parquet.
+const WAL_FILE_COL: &str = "_trawl_wal_file";
+
+/// SQL expression producing a never-NULL `timestamp` for a WAL row
+/// (ADR-0008: the partition key is never hard-CAST).
+///
+/// Three arms: `TRY_CAST` the raw value (always succeeds on post-fix data,
+/// which ingest canonicalizes); else recover the ingest instant from the
+/// row's own WAL filename (`{service}_{unix_millis}_{4_hex}`), which drains
+/// pre-fix wedged WAL with no operator step; else the compaction instant —
+/// a NULL partition key would sort first and fall outside every `last=Xh`
+/// filter, a silent failure of its own.
+fn timestamp_repair_expr() -> String {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
+    format!(
+        "COALESCE(\
+             TRY_CAST(\"timestamp\" AS TIMESTAMP), \
+             epoch_ms(TRY_CAST(regexp_extract({WAL_FILE_COL}, \
+                 '_([0-9]+)_[0-9a-f]{{4}}\\.ndjson$', 1) AS BIGINT)), \
+             TIMESTAMP '{now}'\
+         ) AS \"timestamp\""
+    )
+}
+
 /// Build the `wal_batch` table from a multi-file `read_json`.
 ///
 /// Tries auto-detection first (`maximum_depth=2`). If `DuckDB` hits a
@@ -1077,6 +1105,8 @@ fn read_wal_to_table(
 /// falls back to an explicit column list with `json` typed as opaque JSON.
 /// Any other read error is returned so the caller can isolate the offending
 /// file.
+///
+/// A malformed `timestamp` is never fatal here: see [`timestamp_repair_expr`].
 fn build_wal_batch(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -1087,14 +1117,16 @@ fn build_wal_batch(
         .map(|p| format!("'{}'", p.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(", ");
+    let repair = timestamp_repair_expr();
 
     // Primary path: auto-detect with union_by_name to handle heterogeneous schemas.
     let result = conn.execute_batch(&format!(
         "CREATE TABLE wal_batch AS \
-         SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
+         SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
          FROM read_json([{file_list_sql}], format='newline_delimited', \
          records=true, auto_detect=true, union_by_name=true, \
-         field_appearance_threshold=0, maximum_depth=2)"
+         field_appearance_threshold=0, maximum_depth=2, \
+         filename='{WAL_FILE_COL}')"
     ));
 
     match result {
@@ -1110,9 +1142,10 @@ fn build_wal_batch(
             // opaque JSON to prevent struct flattening that causes collisions.
             conn.execute_batch(&format!(
                 "CREATE TABLE wal_batch AS \
-                 SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
+                 SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
                  FROM read_json([{file_list_sql}], format='newline_delimited', \
-                 records=true, union_by_name=true, columns={{\
+                 records=true, union_by_name=true, filename='{WAL_FILE_COL}', \
+                 columns={{\
                  host: 'VARCHAR', json: 'JSON', \
                  k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
                  k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR', \
@@ -3165,6 +3198,290 @@ mod tests {
         assert!(
             !marker.exists(),
             "marker must be removed after recovery completes"
+        );
+    }
+
+    // --- malformed-timestamp repair tests (ADR-0008) -----------------------
+
+    /// Read a single-column query over a parquet file into strings.
+    fn read_strings(parquet: &Path, select: &str) -> Vec<String> {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {select} FROM read_parquet('{}')",
+                parquet.display()
+            ))
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+
+    /// A hand-written legacy WAL file with a malformed timestamp (simulating
+    /// pre-fix on-disk state) compacts, and the row's timestamp comes from
+    /// the filename's unix-millis segment — draining wedged WAL on deploy.
+    #[test]
+    fn compact_repairs_malformed_timestamp_from_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Known instant: 2024-10-27 03:33:20 UTC.
+        let known_millis: i64 = 1_730_000_000_000;
+        let wal = wal_dir.join(format!("svc_{known_millis}_abcd.ndjson"));
+        std::fs::write(
+            &wal,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"wedged\"}\n",
+        )
+        .unwrap();
+
+        let quarantined =
+            compact_service_blocking(&[wal], &data_dir, "svc", "2GB").expect("must not wedge");
+        assert_eq!(quarantined, 0, "a bad timestamp is repair, not quarantine");
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let ts = read_strings(&parquet[0], "CAST(\"timestamp\" AS VARCHAR)");
+        assert_eq!(
+            ts,
+            vec!["2024-10-27 03:33:20".to_owned()],
+            "timestamp must be recovered from the WAL filename's unix millis"
+        );
+    }
+
+    /// Each row's filename fallback comes from its OWN WAL file, never a
+    /// batch-level value: one batch spanning two files with different
+    /// unix-millis values recovers two different instants.
+    #[test]
+    fn compact_filename_fallback_is_per_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let a = wal_dir.join("svc_1730000000000_aaaa.ndjson");
+        let b = wal_dir.join("svc_1730000060000_bbbb.ndjson");
+        std::fs::write(
+            &a,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"a\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"b\"}\n",
+        )
+        .unwrap();
+
+        compact_service_blocking(&[a, b], &data_dir, "svc", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let rows = read_strings(
+            &parquet[0],
+            "message || '@' || CAST(\"timestamp\" AS VARCHAR)",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                "a@2024-10-27 03:33:20".to_owned(),
+                "b@2024-10-27 03:34:20".to_owned(),
+            ],
+            "each row must recover its own file's ingest instant"
+        );
+    }
+
+    /// All four trigger variants from the issue compact without error and
+    /// land with a non-NULL timestamp.
+    #[test]
+    fn compact_repairs_all_trigger_variants() {
+        let variants = [
+            r#""not-a-date""#,
+            r#""2026-13-45T99:99:99Z""#,
+            r#"{"nested":1}"#,
+            "12345",
+        ];
+        for (i, variant) in variants.iter().enumerate() {
+            let tmp = tempfile::tempdir().unwrap();
+            let wal_dir = tmp.path().join("wal");
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&wal_dir).unwrap();
+
+            let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
+            std::fs::write(
+                &wal,
+                format!(r#"{{"timestamp":{variant},"service":"svc","message":"v{i}"}}"#),
+            )
+            .unwrap();
+
+            compact_service_blocking(&[wal], &data_dir, "svc", "2GB")
+                .unwrap_or_else(|e| panic!("variant {variant} must compact: {e}"));
+
+            let parquet = find_files_by_ext(&data_dir, "parquet");
+            assert_eq!(parquet.len(), 1, "variant {variant} must produce parquet");
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            let nulls: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*)::BIGINT FROM read_parquet('{}') WHERE \"timestamp\" IS NULL",
+                        parquet[0].display()
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                nulls, 0,
+                "variant {variant}: no parquet row may have a NULL timestamp"
+            );
+        }
+    }
+
+    /// One bad event does not affect its batch-mates: 1 bad + 2 good in one
+    /// WAL file all land, the WAL directory drains, and `compact_once`
+    /// reports zero errors — no poison pill.
+    #[tokio::test]
+    async fn compact_once_drains_bad_timestamp_without_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let good1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"good1"}"#;
+        let bad = r#"{"timestamp":"not-a-date","service":"nginx","message":"bad"}"#;
+        let good2 = r#"{"timestamp":"2026-01-01T00:00:02Z","service":"nginx","message":"good2"}"#;
+        let wal = wal_dir.join("nginx_1730000000000_abcd.ndjson");
+        std::fs::write(&wal, [good1, bad, good2].join("\n")).unwrap();
+
+        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")
+            .await
+            .expect("compaction tick must succeed");
+        assert_eq!(errors, 0, "a bad timestamp must not count as an error");
+
+        assert!(!wal.exists(), "consumed WAL file must be deleted");
+        let leftover = find_files_by_ext(&wal_dir, "ndjson");
+        assert!(leftover.is_empty(), "WAL directory must be empty");
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "all three events (incl. the repaired one) land");
+    }
+
+    /// A user event legitimately carrying a field named `filename` keeps all
+    /// its columns — the synthetic WAL-provenance column uses a reserved
+    /// name precisely so it cannot collide.
+    #[test]
+    fn compact_keeps_user_field_named_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
+        std::fs::write(
+            &wal,
+            b"{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\"filename\":\"user.txt\",\"message\":\"m\"}\n",
+        )
+        .unwrap();
+
+        compact_service_blocking(&[wal], &data_dir, "svc", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let filenames = read_strings(&parquet[0], "\"filename\"");
+        assert_eq!(
+            filenames,
+            vec!["user.txt".to_owned()],
+            "the user's own `filename` column must survive"
+        );
+    }
+
+    /// The synthetic `_trawl_wal_file` provenance column never reaches the
+    /// parquet schema.
+    #[test]
+    fn compact_excludes_wal_provenance_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
+        std::fs::write(
+            &wal,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"m\"}\n",
+        )
+        .unwrap();
+
+        compact_service_blocking(&[wal], &data_dir, "svc", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "DESCRIBE SELECT * FROM read_parquet('{}')",
+                parquet[0].display()
+            ))
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !cols.iter().any(|c| c == "_trawl_wal_file"),
+            "provenance column must be excluded from parquet, got {cols:?}"
+        );
+    }
+
+    /// A WAL filename that does not conform to `{service}_{millis}_{hex4}`
+    /// degrades to the compaction-instant arm — never a NULL timestamp.
+    #[test]
+    fn compact_nonconforming_filename_falls_back_to_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let wal = wal_dir.join("svc_oddname.ndjson");
+        std::fs::write(
+            &wal,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"m\"}\n",
+        )
+        .unwrap();
+
+        let before = chrono::Utc::now() - chrono::Duration::minutes(5);
+        compact_service_blocking(&[wal], &data_dir, "svc", "2GB").unwrap();
+        let after = chrono::Utc::now() + chrono::Duration::minutes(5);
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let ts = read_strings(
+            &parquet[0],
+            "strftime(\"timestamp\", '%Y-%m-%dT%H:%M:%S.%fZ')",
+        );
+        assert_eq!(ts.len(), 1);
+        let got = chrono::DateTime::parse_from_rfc3339(&ts[0])
+            .unwrap_or_else(|e| panic!("parquet timestamp {} must parse: {e}", ts[0]))
+            .with_timezone(&chrono::Utc);
+        assert!(
+            got > before && got < after,
+            "non-conforming filename must land at compaction time, got {got}"
         );
     }
 
