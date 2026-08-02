@@ -194,7 +194,7 @@ fn apply_tz_to_event(event: &mut serde_json::Map<String, serde_json::Value>, utc
     if utc_offset_secs == 0 {
         return;
     }
-    for key in &["timestamp", "_time"] {
+    for key in &["timestamp", "_time", "_ingested"] {
         if let Some(serde_json::Value::String(ts)) = event.get(*key) {
             let converted = trawl_engine::timezone::reformat_rfc3339(ts, utc_offset_secs);
             event.insert((*key).to_owned(), serde_json::Value::String(converted));
