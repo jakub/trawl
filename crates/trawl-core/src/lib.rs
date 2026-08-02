@@ -26,6 +26,12 @@ pub mod eval;
 /// In-memory event filter compiled from the search stage.
 pub mod filter;
 
+/// The declared event envelope: field names, reserved keys, wire aliases.
+pub mod schema;
+
+/// OTel severity ladder: token tables, bands, syslog inversion.
+pub mod severity;
+
 /// Streaming pipeline compiler and executor.
 pub mod stream;
 
