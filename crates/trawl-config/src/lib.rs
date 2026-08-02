@@ -320,6 +320,58 @@ pub struct IngestConfig {
     /// Accepts `DuckDB` memory strings like `"2GB"`, `"512MB"`. Default: `"2GB"`.
     #[serde(default = "default_compaction_memory_limit")]
     pub compaction_memory_limit: String,
+
+    /// Fills a missing `env` on ingested events (recorded as the
+    /// `env.defaulted` repair). Must be a member of the effective env
+    /// allowlist and pass the env charset. Default: `"prod"` (ADR-0009).
+    #[serde(default = "default_env_name")]
+    pub default_env: String,
+
+    /// Environment allowlist: an event whose `env` is not listed here
+    /// hard-rejects with a typed reason — repairing it into `default_env`
+    /// would misfile data in the wrong path root permanently. Omitted or
+    /// empty means implicitly `[default_env]` (see
+    /// [`IngestConfig::effective_envs`]). Every entry must match
+    /// `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved (ADR-0009).
+    #[serde(default)]
+    pub envs: Vec<String>,
+
+    /// CIDR blocks of trusted relays/collectors. An event with no `host`
+    /// from a peer inside any of these blocks is rejected instead of
+    /// repaired — behind a relay the peer address is confidently wrong.
+    /// Parsed (boot-fatal on a bad entry) by the server at startup.
+    #[serde(default)]
+    pub trusted_relays: Vec<String>,
+}
+
+impl IngestConfig {
+    /// The effective env allowlist: `envs` when non-empty, else
+    /// `[default_env]` — zero-config ingestion works out of the box and
+    /// envs are declared at the moment they start being used.
+    pub fn effective_envs(&self) -> Vec<String> {
+        if self.envs.is_empty() {
+            vec![self.default_env.clone()]
+        } else {
+            self.envs.clone()
+        }
+    }
+}
+
+/// Env names reserved for sibling directories under the data root.
+pub const RESERVED_ENV_NAMES: &[&str] = &["wal", "scheduled"];
+
+/// Whether `name` is a valid environment name: `[a-z0-9_-]{1,32}`.
+///
+/// Path encoding is injective by validation (ADR-0009): env is a path
+/// segment and is never rewritten on the way to disk, so the charset is
+/// the whole safety argument — no dots (dot-leading names), no slashes,
+/// no uppercase (case-colliding filesystems).
+pub fn is_valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 impl Default for IngestConfig {
@@ -338,8 +390,16 @@ impl Default for IngestConfig {
             telemetry_flush_interval_secs: DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS,
             compaction_chunk_size: DEFAULT_COMPACTION_CHUNK_SIZE,
             compaction_memory_limit: DEFAULT_COMPACTION_MEMORY_LIMIT.to_string(),
+            default_env: default_env_name(),
+            envs: Vec::new(),
+            trusted_relays: Vec::new(),
         }
     }
+}
+
+/// Default environment name for zero-config deployments.
+fn default_env_name() -> String {
+    "prod".to_string()
 }
 
 /// Data retention policy settings.
@@ -1274,6 +1334,47 @@ impl Config {
             return Err(ConfigError::Validation(
                 "tls_cert_path and tls_key_path must both be set or both omitted".into(),
             ));
+        }
+
+        // Env allowlist (ADR-0009): validated at load, refuse to start
+        // otherwise — env is a path segment and the charset is the whole
+        // injectivity argument.
+        for env in &self.ingest.envs {
+            if !is_valid_env_name(env) {
+                return Err(ConfigError::Validation(format!(
+                    "ingest.envs entry {env:?} is not a valid env name \
+                     (must match [a-z0-9_-]{{1,32}})"
+                )));
+            }
+            if RESERVED_ENV_NAMES.contains(&env.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "ingest.envs entry {env:?} is reserved — `wal/` and \
+                     `scheduled/` live alongside env directories under the \
+                     data root"
+                )));
+            }
+        }
+        if !is_valid_env_name(&self.ingest.default_env) {
+            return Err(ConfigError::Validation(format!(
+                "ingest.default_env {:?} is not a valid env name \
+                 (must match [a-z0-9_-]{{1,32}})",
+                self.ingest.default_env
+            )));
+        }
+        if RESERVED_ENV_NAMES.contains(&self.ingest.default_env.as_str()) {
+            return Err(ConfigError::Validation(format!(
+                "ingest.default_env {:?} is reserved — `wal/` and \
+                 `scheduled/` live alongside env directories under the data \
+                 root",
+                self.ingest.default_env
+            )));
+        }
+        if !self.ingest.envs.is_empty() && !self.ingest.envs.contains(&self.ingest.default_env) {
+            return Err(ConfigError::Validation(format!(
+                "ingest.default_env {:?} must be a member of ingest.envs \
+                 ({:?})",
+                self.ingest.default_env, self.ingest.envs
+            )));
         }
 
         if self.syslog.enabled {
@@ -2224,5 +2325,135 @@ path = "/data/*.parquet"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.web.shared_domain.is_none());
+    }
+
+    // -- [ingest] env allowlist (ADR-0009) --------------------------------
+
+    fn config_with_ingest(ingest: &str) -> Config {
+        let toml = format!(
+            r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[ingest]
+{ingest}
+"#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn ingest_env_zero_config_defaults() {
+        // Zero-config ingestion works out of the box: default_env fills a
+        // missing env, and an omitted `envs` behaves as `[default_env]`.
+        let config = config_with_ingest("");
+        assert_eq!(config.ingest.default_env, "prod");
+        assert!(config.ingest.envs.is_empty());
+        assert_eq!(config.ingest.effective_envs(), vec!["prod".to_string()]);
+        assert!(config.ingest.trusted_relays.is_empty());
+        config.validate().expect("zero-config ingest must validate");
+    }
+
+    #[test]
+    fn ingest_envs_omitted_behaves_as_default_env() {
+        let config = config_with_ingest(r#"default_env = "lab""#);
+        assert_eq!(config.ingest.effective_envs(), vec!["lab".to_string()]);
+        config.validate().expect("default_env alone must validate");
+    }
+
+    #[test]
+    fn ingest_explicit_envs_parse_and_validate() {
+        let config = config_with_ingest(
+            r#"
+default_env = "prod"
+envs = ["prod", "lab"]
+trusted_relays = ["10.0.4.0/24"]
+"#,
+        );
+        assert_eq!(
+            config.ingest.effective_envs(),
+            vec!["prod".to_string(), "lab".to_string()]
+        );
+        assert_eq!(config.ingest.trusted_relays, vec!["10.0.4.0/24"]);
+        config.validate().expect("explicit envs must validate");
+    }
+
+    #[test]
+    fn validation_rejects_default_env_not_in_envs() {
+        let config = config_with_ingest(
+            r#"
+default_env = "dev"
+envs = ["prod", "lab"]
+"#,
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("default_env"), "got: {err}");
+        assert!(err.contains("dev"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_env_charset_violations() {
+        // `[a-z0-9_-]{1,32}` — uppercase, dots, slashes, spaces, empty, and
+        // over-length names are all path-placement hazards.
+        for bad in [
+            "Prod",
+            "pro.d",
+            "pro/d",
+            "pro d",
+            "",
+            "..",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 33 chars
+        ] {
+            let config = config_with_ingest(&format!(r#"envs = ["prod", "{bad}"]"#));
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("env"),
+                "env name {bad:?} must fail validation; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_bad_default_env_charset() {
+        let config = config_with_ingest(r#"default_env = "Prod""#);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("default_env"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_reserved_env_names() {
+        // `wal/` (default wal_dir) and `scheduled/` (report runs) live under
+        // the data root — an env with either name would collide with them.
+        for reserved in ["wal", "scheduled"] {
+            let config = config_with_ingest(&format!(r#"envs = ["prod", "{reserved}"]"#));
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("reserved"),
+                "env name {reserved:?} must be rejected as reserved; got: {err}"
+            );
+
+            let config = config_with_ingest(&format!(r#"default_env = "{reserved}""#));
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("reserved"),
+                "default_env {reserved:?} must be rejected as reserved; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_name_charset_helper() {
+        assert!(is_valid_env_name("prod"));
+        assert!(is_valid_env_name("lab-2"));
+        assert!(is_valid_env_name("a_b_c"));
+        assert!(is_valid_env_name("x"));
+        assert!(!is_valid_env_name(""));
+        assert!(!is_valid_env_name("Prod"));
+        assert!(!is_valid_env_name("pro.d"));
+        assert!(!is_valid_env_name("pro/d"));
+        assert!(!is_valid_env_name("pro\\d"));
+        assert!(!is_valid_env_name(&"a".repeat(33)));
+        assert!(is_valid_env_name(&"a".repeat(32)));
     }
 }
