@@ -229,16 +229,26 @@ impl Executor {
     ///
     /// Consulted only on the error path of the hot+cold outcome policy: a
     /// hot-only fallback after an unexpected failure is permitted exactly
-    /// when there is no cold data it could hide. List sources (`['...']`)
-    /// are present by construction; a glob is counted via `glob(?)`. Errs on
-    /// the side of "present" so an unexpected failure surfaces as an error
-    /// rather than degrading to hot-only success.
+    /// when there is no cold data it could hide. A plain glob is counted via
+    /// `glob(?)`; a list source (`['a', 'b']`) is counted by globbing each
+    /// element — its members are globs over hours that may hold no file yet,
+    /// so membership alone proves nothing. Errs on the side of "present" so
+    /// an unexpected failure surfaces as an error rather than degrading to
+    /// hot-only success.
     fn cold_files_present(&self, source: &str) -> bool {
-        if source.trim_start().starts_with('[') {
-            return true;
+        match glob_list_items(source) {
+            // Unparseable list → assume present (fail closed).
+            Some(items) if items.is_empty() => true,
+            Some(items) => items.iter().any(|item| self.glob_has_match(item)),
+            None => self.glob_has_match(source),
         }
+    }
+
+    /// Whether `pattern` matches at least one file on disk. Errs on the side
+    /// of "matches" when the `glob` call itself fails.
+    fn glob_has_match(&self, pattern: &str) -> bool {
         self.conn
-            .query_row("SELECT count(*)::BIGINT FROM glob(?)", [source], |row| {
+            .query_row("SELECT count(*)::BIGINT FROM glob(?)", [pattern], |row| {
                 row.get::<_, i64>(0)
             })
             .map_or(true, |n| n > 0)
@@ -890,6 +900,37 @@ fn cold_action(outcome: HotColdOutcome) -> ColdAction {
     }
 }
 
+/// Split a `DuckDB` list-of-globs source (`['a', 'b']`, as built by the
+/// server's source resolver) into its quoted elements.
+///
+/// Returns `None` when `source` is not list-shaped (a plain glob), and
+/// `Some(vec![])` when it is list-shaped but cannot be parsed — the caller
+/// treats that as "assume cold files exist" so a parse gap never turns into
+/// a silent cold-data drop.
+///
+/// Kept as a pure function so the list handling is unit-testable without a
+/// live `DuckDB` connection.
+fn glob_list_items(source: &str) -> Option<Vec<&str>> {
+    let trimmed = source.trim();
+    let inner = trimmed.strip_prefix('[')?;
+    let Some(inner) = inner.strip_suffix(']') else {
+        return Some(Vec::new());
+    };
+
+    let mut items = Vec::new();
+    let mut rest = inner;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        // An unterminated quote means we don't understand the source.
+        let Some(close) = after.find('\'') else {
+            return Some(Vec::new());
+        };
+        items.push(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    Some(items)
+}
+
 /// Whether a `DuckDB` type name (as reported by `DESCRIBE`) is a complex
 /// (nested) type — `STRUCT`/`MAP`/`LIST`/array `[]`/`UNION`/`JSON`. These are
 /// the types that, when the same column is `VARCHAR` in another file, raise a
@@ -1137,8 +1178,8 @@ mod tests {
     use duckdb::Connection;
 
     use super::{
-        ColdAction, Executor, HotColdOutcome, cold_action, error_class, is_complex_type,
-        is_union_type_conflict,
+        ColdAction, Executor, HotColdOutcome, cold_action, error_class, glob_list_items,
+        is_complex_type, is_union_type_conflict,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -1520,6 +1561,87 @@ mod tests {
             0,
             "querying a nonexistent field returns empty, not an error"
         );
+    }
+
+    #[test]
+    fn glob_list_items_splits_list_sources() {
+        assert_eq!(glob_list_items("/data/**/*.parquet"), None);
+        assert_eq!(
+            glob_list_items("['/data/2024-01-15/10/*.parquet']"),
+            Some(vec!["/data/2024-01-15/10/*.parquet"])
+        );
+        assert_eq!(
+            glob_list_items(" ['/a/*.parquet', '/b/*.parquet'] "),
+            Some(vec!["/a/*.parquet", "/b/*.parquet"])
+        );
+        // Commas inside a quoted element stay part of that element.
+        assert_eq!(
+            glob_list_items("['/a,b/*.parquet']"),
+            Some(vec!["/a,b/*.parquet"])
+        );
+        // Unparseable list shapes yield an empty vec → "assume present".
+        assert_eq!(glob_list_items("['/a/*.parquet"), Some(Vec::new()));
+        assert_eq!(glob_list_items("['/a/*.parquet]"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn cold_files_present_globs_list_elements() {
+        // A list source is not "present by construction": the server emits a
+        // list of per-hour globs for essentially every time-filtered query,
+        // and an hour directory can exist while holding no parquet yet.
+        let dir = tempfile::tempdir().unwrap();
+        let empty_hour = dir.path().join("10");
+        std::fs::create_dir_all(&empty_hour).unwrap();
+        let exec = Executor::new().unwrap();
+
+        let absent = format!("['{}/*.parquet']", empty_hour.display());
+        assert!(
+            !exec.cold_files_present(&absent),
+            "a list whose globs match no file must report no cold files"
+        );
+
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &empty_hour.join("cold.parquet"), "'plain'");
+        assert!(
+            exec.cold_files_present(&absent),
+            "a list whose globs match a file must report cold files present"
+        );
+    }
+
+    #[test]
+    fn export_with_hot_falls_back_to_hot_only_for_empty_list_source() {
+        // Cold start with a list source (the shape the server builds for a
+        // time-filtered query): no parquet exists yet, so the export must
+        // fall back to the hot buffer instead of surfacing the cold "No files
+        // found" error.
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+        let out = dir.path().join("export.parquet");
+
+        let exec = Executor::new().unwrap();
+        let source = format!("['{}/*.parquet']", hour.display());
+        exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
+            .expect("hot-only export must succeed when the cold list matches no file");
+
+        let rows: i64 = exec
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    out.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "the exported parquet must carry the hot row");
     }
 
     #[test]
