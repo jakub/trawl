@@ -17,7 +17,7 @@ max-threads = 4
 max-threads = 8
 
 [[profile.default.overrides]]
-filter = 'binary(http_api) | binary(hot_query)'
+filter = 'binary(http_api) | binary(hot_query) | binary(timestamp_repair)'
 test-group = 'server-integration'
 
 [[profile.default.overrides]]

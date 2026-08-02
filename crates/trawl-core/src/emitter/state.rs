@@ -144,6 +144,9 @@ fn build_reader(source: &str) -> Result<String, super::EmitError> {
             // when events have heterogeneous schemas where most fields appear in
             // less than 10% of records (e.g. internal telemetry with 64 keys
             // mixed with external events that only have 5 keys).
+            // Schema detection stays on DuckDB's bounded default sample — see
+            // `hot_reader` below for why whole-file detection is not the way to
+            // keep sparse columns alive.
             Ok(format!(
                 "read_json('{source}', format='newline_delimited', records=true, \
                  auto_detect=true, field_appearance_threshold=0)"
@@ -158,6 +161,15 @@ fn build_reader(source: &str) -> Result<String, super::EmitError> {
 ///
 /// `field_appearance_threshold=0` prevents `DuckDB` from collapsing
 /// heterogeneous-schema events into a single MAP column.
+///
+/// Schema detection deliberately keeps `DuckDB`'s bounded default sample.
+/// A sparse column — `timestamp_invalid`, which only repaired events carry
+/// (ADR-0008) — first appearing past that prefix throws an `unknown key`
+/// error for the whole query, but `sample_size=-1` is the wrong cure: it
+/// re-parses the entire snapshot on *every* query and SSE poll (~2.7x the
+/// read cost, and it grows with the buffer). The snapshot writer instead
+/// hoists one event per novel key to the front of the file, so the whole key
+/// set is inside the prefix (see `HotBuffer::build_snapshot`).
 fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
     validate_source_path(hot)?;
     Ok(format!(
@@ -169,11 +181,14 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
 /// Build the body of a `REPLACE (...)` clause casting `varchar_cols` to
 /// VARCHAR. When `with_timestamp` is set, the canonical timestamp cast is
 /// prepended (the hot side always needs it to match parquet's TIMESTAMP).
-/// `timestamp` is never coerced to VARCHAR — it is the sort/partition key.
+/// `timestamp` is never coerced to VARCHAR — it is the sort/partition key —
+/// and never hard-CAST either (ADR-0008): `TRY_CAST` degrades one malformed
+/// hot row to NULL instead of throwing the whole hot+cold union (which
+/// previously fell back to hot-only, silently dropping every cold row).
 fn varchar_replace_list(varchar_cols: &[String], with_timestamp: bool) -> String {
     let mut parts = Vec::with_capacity(varchar_cols.len() + 1);
     if with_timestamp {
-        parts.push("CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\"".to_string());
+        parts.push("TRY_CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\"".to_string());
     }
     for col in varchar_cols {
         if col == "timestamp" {

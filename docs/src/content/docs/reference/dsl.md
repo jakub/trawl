@@ -301,7 +301,7 @@ Available in `let`/`eval` and `where` expressions.
 
 ### Date and time functions
 
-Date/time functions operate on **timestamps** — the `timestamp` field is stored as a timezone-naive `TIMESTAMP` in both the batch and streaming paths (any timezone offset is discarded at ingest, keeping wall-clock components).
+Date/time functions operate on **timestamps** — the `timestamp` field is stored as a timezone-naive `TIMESTAMP` in both the batch and streaming paths. Ingest first canonicalizes the value to UTC, so an incoming offset is *applied* (`12:00:00+05:30` becomes `06:30:00Z`) rather than dropped in favour of its wall-clock components; the naive timestamp everything downstream sees is therefore UTC. See [Data flow](/architecture/data-flow/#timestamp-canonicalization) for the accepted input grammar.
 
 | Function | Description |
 |----------|-------------|

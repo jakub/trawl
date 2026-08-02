@@ -468,6 +468,9 @@ pub struct TestServer {
     pub fleet_db_url: String,
     /// DSN of the sibling trawl app-state database.
     pub app_db_url: String,
+    /// The server's shared state — e.g. to reach the hot buffer when a test
+    /// drives compaction directly against the server's WAL/data dirs.
+    pub state: AppState,
 }
 
 impl TestServer {
@@ -569,10 +572,22 @@ pub async fn setup_with_rate_limit(pool: PgPool, rate_limit: RateLimitConfig) ->
 }
 
 /// Set up a test server whose WAL lives under the given directory (which
-/// must outlive the server).
+/// must outlive the server), querying the shared parquet fixtures.
 pub async fn setup_in_dir(
     pool: PgPool,
     dir: &std::path::Path,
+    rate_limit: RateLimitConfig,
+) -> TestServer {
+    setup_in_dir_with_data(pool, dir, ensure_fixtures(), rate_limit).await
+}
+
+/// Like [`setup_in_dir`], but with an explicit cold-data glob — for tests
+/// that compact into a per-test data directory instead of the shared
+/// fixtures.
+pub async fn setup_in_dir_with_data(
+    pool: PgPool,
+    dir: &std::path::Path,
+    data_path: String,
     rate_limit: RateLimitConfig,
 ) -> TestServer {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -620,9 +635,7 @@ pub async fn setup_in_dir(
             rate_limit,
             monitor_refresh_ms: 1000,
         },
-        data: DataConfig {
-            path: ensure_fixtures(),
-        },
+        data: DataConfig { path: data_path },
         auth: AuthConfig {
             db_path: None,
             database_url: Some(fleet_db_url.clone()),
@@ -661,10 +674,17 @@ pub async fn setup_in_dir(
 
     let server_config = config.server.clone();
     let state_dir = config.state_dir();
+    let spawned_state = state.clone();
     tokio::spawn(async move {
-        http::serve(state, &http_config, &server_config, &state_dir, None)
-            .await
-            .unwrap();
+        http::serve(
+            spawned_state,
+            &http_config,
+            &server_config,
+            &state_dir,
+            None,
+        )
+        .await
+        .unwrap();
     });
     wait_for_ready(&addr).await;
 
@@ -678,6 +698,7 @@ pub async fn setup_in_dir(
         fleet_pool: pool,
         fleet_db_url,
         app_db_url,
+        state,
     }
 }
 

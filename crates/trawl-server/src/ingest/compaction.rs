@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
-use trawl_engine::{is_complex_type, is_union_type_conflict};
+use trawl_engine::{is_complex_type, is_conversion_error};
 
 use crate::hot_buffer::HotBuffer;
 use crate::state::CompactionStats;
@@ -805,7 +805,11 @@ fn rollup_day_inner(
     ));
     match fast {
         Ok(()) => {}
-        Err(e) if is_union_type_conflict(&e) => {
+        // A conversion-class failure is the trigger, not the verdict: the
+        // fallback per-file-describes the inputs and only casts columns that
+        // genuinely carry more than one type, so a failure that is not a
+        // schema conflict simply re-raises from there (ADR-0008).
+        Err(e) if is_conversion_error(&e) => {
             tracing::warn!(
                 event_type = "rollup_fallback",
                 compact_service = %service,
@@ -1070,13 +1074,90 @@ fn read_wal_to_table(
     Ok(survivors.len())
 }
 
+/// Synthetic column carrying each row's source WAL file path
+/// (`read_json(..., filename='_trawl_wal_file')`). Named — not the literal
+/// `filename=true` form — so a user event legitimately carrying a `filename`
+/// field cannot trip the "Duplicate name" fallback, and excluded from
+/// `wal_batch` so it never reaches parquet.
+///
+/// The name is reserved, not unreachable: ingest strips it from incoming
+/// events (`fill_defaults`) so no client can plant it, and pre-fix WAL that
+/// already carries it drains losslessly through a renamed provenance column
+/// (see [`build_wal_batch`]) instead of wedging forever.
+pub(super) const WAL_FILE_COL: &str = "_trawl_wal_file";
+
+/// SQL expression producing a never-NULL `timestamp` for a WAL row
+/// (ADR-0008: the partition key is never hard-CAST).
+///
+/// Three arms: `TRY_CAST` the raw value (always succeeds on post-fix data,
+/// which ingest canonicalizes); else recover the ingest instant from the
+/// row's own WAL filename (`{service}_{unix_millis}_{4_hex}`), which drains
+/// pre-fix wedged WAL with no operator step; else the compaction instant —
+/// a NULL partition key would sort first and fall outside every `last=Xh`
+/// filter, a silent failure of its own.
+fn timestamp_repair_expr(prov_col: &str) -> String {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
+    format!(
+        "COALESCE(\
+             TRY_CAST(\"timestamp\" AS TIMESTAMP), \
+             epoch_ms(TRY_CAST(regexp_extract({prov_col}, \
+                 '_([0-9]+)_[0-9a-f]{{4}}\\.ndjson$', 1) AS BIGINT)), \
+             TIMESTAMP '{now}'\
+         ) AS \"timestamp\""
+    )
+}
+
+/// Does this `read_json` error mean a projected column collided, rather than
+/// that the data is unreadable? Neither shape is a reason to quarantine:
+///
+/// - `Duplicate name` — nested JSON keys that collide when flattened.
+///   Resolved by the explicit-columns fallback.
+/// - `Option filename adds column "…", but a column with this name is also in
+///   the file` — a WAL row literally carrying [`WAL_FILE_COL`]. Ingest strips
+///   that key now, but WAL written before it did would otherwise fail this
+///   read on every tick forever: never drained, never quarantined (the
+///   isolation path's `probe_ndjson` omits `filename=`, so the file parses
+///   cleanly and survives), taking every batch-mate for the service with it.
+///   Resolved losslessly by retrying under a renamed provenance column
+///   ([`is_filename_collision`]).
+fn is_column_collision(e: &duckdb::Error) -> bool {
+    is_filename_collision(e) || e.to_string().contains("Duplicate name")
+}
+
+/// The [`is_column_collision`] shape specific to the `filename=` option: the
+/// data itself carries a column named like the synthetic provenance column.
+fn is_filename_collision(e: &duckdb::Error) -> bool {
+    e.to_string().contains("adds column")
+}
+
 /// Build the `wal_batch` table from a multi-file `read_json`.
 ///
-/// Tries auto-detection first (`maximum_depth=2`). If `DuckDB` hits a
-/// "Duplicate name" error (nested JSON keys that collide when flattened),
-/// falls back to an explicit column list with `json` typed as opaque JSON.
+/// A three-step ladder, lossless until the last resort:
+///
+/// 1. Auto-detection (`maximum_depth=2`) with [`WAL_FILE_COL`] as the
+///    provenance column.
+/// 2. On a `filename=` collision ([`is_filename_collision`] — legacy WAL
+///    written before ingest reserved the key), the same auto-detect read under
+///    a randomized provenance name. Lossless: every user field survives, and
+///    the row's literal `_trawl_wal_file` value lands in parquet as ordinary
+///    data — it never feeds [`timestamp_repair_expr`].
+/// 3. On a flatten collision (`Duplicate name`), an explicit column list with
+///    `json` typed as opaque JSON. This keeps only the stable vector envelope
+///    (plus `timestamp_invalid`): user fields outside it are dropped for the
+///    whole batch — the disclosed price of draining a batch whose flattened
+///    keys collide, and the pre-existing behavior for that shape.
+///
 /// Any other read error is returned so the caller can isolate the offending
-/// file.
+/// file. A malformed `timestamp` is never fatal here: see
+/// [`timestamp_repair_expr`].
+///
+/// `sample_size=-1` (schema detection over every row, not `DuckDB`'s default
+/// ~20480-row prefix) is what keeps `timestamp_invalid` alive: it is sparse
+/// by construction — only repaired events carry it — so on any WAL file
+/// bigger than the sample it fell outside the inferred schema and
+/// `union_by_name` dropped it with no error at all, losing the evidence
+/// ADR-0008 promises to preserve. Any other sparse user field was equally
+/// exposed. The explicit-columns fallback lists it for the same reason.
 fn build_wal_batch(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -1087,42 +1168,64 @@ fn build_wal_batch(
         .map(|p| format!("'{}'", p.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(", ");
+    let auto_read = |prov_col: &str| {
+        let repair = timestamp_repair_expr(prov_col);
+        conn.execute_batch(&format!(
+            "CREATE TABLE wal_batch AS \
+             SELECT * EXCLUDE ({prov_col}) REPLACE ({repair}) \
+             FROM read_json([{file_list_sql}], format='newline_delimited', \
+             records=true, auto_detect=true, union_by_name=true, \
+             field_appearance_threshold=0, maximum_depth=2, sample_size=-1, \
+             filename='{prov_col}')"
+        ))
+    };
 
-    // Primary path: auto-detect with union_by_name to handle heterogeneous schemas.
-    let result = conn.execute_batch(&format!(
-        "CREATE TABLE wal_batch AS \
-         SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
-         FROM read_json([{file_list_sql}], format='newline_delimited', \
-         records=true, auto_detect=true, union_by_name=true, \
-         field_appearance_threshold=0, maximum_depth=2)"
-    ));
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if e.to_string().contains("Duplicate name") => {
+    let collision = match auto_read(WAL_FILE_COL) {
+        Ok(()) => return Ok(()),
+        Err(e) if is_filename_collision(&e) => {
+            // Randomized so legacy data cannot collide with it too; if it
+            // somehow does, the explicit-columns rung below still drains.
+            let alt = format!("{WAL_FILE_COL}_{:08x}", rand::random::<u32>());
             tracing::warn!(
-                event_type = "compaction_fallback",
+                event_type = "compaction_provenance_rename",
                 compact_service = %service,
                 error = %e,
-                "falling back to explicit columns to avoid duplicate key collision"
+                "WAL data carries the provenance column name; retrying under a renamed column"
             );
-            // Explicit columns: the stable vector envelope, with `json` as
-            // opaque JSON to prevent struct flattening that causes collisions.
-            conn.execute_batch(&format!(
-                "CREATE TABLE wal_batch AS \
-                 SELECT * REPLACE (CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") \
-                 FROM read_json([{file_list_sql}], format='newline_delimited', \
-                 records=true, union_by_name=true, columns={{\
-                 host: 'VARCHAR', json: 'JSON', \
-                 k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
-                 k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR', \
-                 level: 'VARCHAR', message: 'VARCHAR', \
-                 service: 'VARCHAR', timestamp: 'VARCHAR'}})"
-            ))
-            .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
+            match auto_read(&alt) {
+                Ok(()) => return Ok(()),
+                Err(e2) if is_column_collision(&e2) => e2,
+                Err(e2) => return Err(format!("read_json (renamed provenance) failed: {e2}")),
+            }
         }
-        Err(e) => Err(format!("read_json failed: {e}")),
-    }
+        Err(e) if is_column_collision(&e) => e,
+        Err(e) => return Err(format!("read_json failed: {e}")),
+    };
+
+    tracing::warn!(
+        event_type = "compaction_fallback",
+        compact_service = %service,
+        error = %collision,
+        "falling back to explicit columns to avoid a column-name collision; \
+         user fields outside the envelope are dropped for this batch"
+    );
+    // Explicit columns: the stable vector envelope, with `json` as
+    // opaque JSON to prevent struct flattening that causes collisions.
+    let repair = timestamp_repair_expr(WAL_FILE_COL);
+    conn.execute_batch(&format!(
+        "CREATE TABLE wal_batch AS \
+         SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
+         FROM read_json([{file_list_sql}], format='newline_delimited', \
+         records=true, union_by_name=true, filename='{WAL_FILE_COL}', \
+         columns={{\
+         host: 'VARCHAR', json: 'JSON', \
+         k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
+         k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR', \
+         level: 'VARCHAR', message: 'VARCHAR', \
+         service: 'VARCHAR', timestamp: 'VARCHAR', \
+         timestamp_invalid: 'VARCHAR'}})"
+    ))
+    .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
 }
 
 /// Probe a single WAL file by fully scanning it through `read_json`.
@@ -1271,7 +1374,11 @@ fn merge_with_existing(
 
     match result {
         Ok(()) => Ok(()),
-        Err(e) if is_union_type_conflict(&e) => {
+        // Trigger, not verdict: the fallback below describes both sides and
+        // re-raises the original error when they hold no conflicting column
+        // — so a genuine data-conversion error is not treated as a schema
+        // conflict here either (ADR-0008).
+        Err(e) if is_conversion_error(&e) => {
             tracing::warn!(
                 event_type = "compaction_fallback",
                 compact_service = %service,
@@ -3165,6 +3272,425 @@ mod tests {
         assert!(
             !marker.exists(),
             "marker must be removed after recovery completes"
+        );
+    }
+
+    // --- malformed-timestamp repair tests (ADR-0008) -----------------------
+
+    /// Read a single-column query over a parquet file into strings.
+    fn read_strings(parquet: &Path, select: &str) -> Vec<String> {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {select} FROM read_parquet('{}')",
+                parquet.display()
+            ))
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+
+    /// A hand-written legacy WAL file with a malformed timestamp (simulating
+    /// pre-fix on-disk state) compacts, and the row's timestamp comes from
+    /// the filename's unix-millis segment — draining wedged WAL on deploy.
+    #[test]
+    fn compact_repairs_malformed_timestamp_from_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Known instant: 2024-10-27 03:33:20 UTC.
+        let known_millis: i64 = 1_730_000_000_000;
+        let wal = wal_dir.join(format!("svc_{known_millis}_abcd.ndjson"));
+        std::fs::write(
+            &wal,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"wedged\"}\n",
+        )
+        .unwrap();
+
+        let quarantined =
+            compact_service_blocking(&[wal], &data_dir, "svc", "2GB").expect("must not wedge");
+        assert_eq!(quarantined, 0, "a bad timestamp is repair, not quarantine");
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let ts = read_strings(&parquet[0], "CAST(\"timestamp\" AS VARCHAR)");
+        assert_eq!(
+            ts,
+            vec!["2024-10-27 03:33:20".to_owned()],
+            "timestamp must be recovered from the WAL filename's unix millis"
+        );
+    }
+
+    /// Each row's filename fallback comes from its OWN WAL file, never a
+    /// batch-level value: one batch spanning two files with different
+    /// unix-millis values recovers two different instants.
+    #[test]
+    fn compact_filename_fallback_is_per_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let a = wal_dir.join("svc_1730000000000_aaaa.ndjson");
+        let b = wal_dir.join("svc_1730000060000_bbbb.ndjson");
+        std::fs::write(
+            &a,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"a\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"b\"}\n",
+        )
+        .unwrap();
+
+        compact_service_blocking(&[a, b], &data_dir, "svc", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let rows = read_strings(
+            &parquet[0],
+            "message || '@' || CAST(\"timestamp\" AS VARCHAR)",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                "a@2024-10-27 03:33:20".to_owned(),
+                "b@2024-10-27 03:34:20".to_owned(),
+            ],
+            "each row must recover its own file's ingest instant"
+        );
+    }
+
+    /// All four trigger variants from the issue compact without error and
+    /// land with a non-NULL timestamp.
+    #[test]
+    fn compact_repairs_all_trigger_variants() {
+        let variants = [
+            r#""not-a-date""#,
+            r#""2026-13-45T99:99:99Z""#,
+            r#"{"nested":1}"#,
+            "12345",
+        ];
+        for (i, variant) in variants.iter().enumerate() {
+            let tmp = tempfile::tempdir().unwrap();
+            let wal_dir = tmp.path().join("wal");
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&wal_dir).unwrap();
+
+            let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
+            std::fs::write(
+                &wal,
+                format!(r#"{{"timestamp":{variant},"service":"svc","message":"v{i}"}}"#),
+            )
+            .unwrap();
+
+            compact_service_blocking(&[wal], &data_dir, "svc", "2GB")
+                .unwrap_or_else(|e| panic!("variant {variant} must compact: {e}"));
+
+            let parquet = find_files_by_ext(&data_dir, "parquet");
+            assert_eq!(parquet.len(), 1, "variant {variant} must produce parquet");
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            let nulls: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*)::BIGINT FROM read_parquet('{}') WHERE \"timestamp\" IS NULL",
+                        parquet[0].display()
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                nulls, 0,
+                "variant {variant}: no parquet row may have a NULL timestamp"
+            );
+        }
+    }
+
+    /// A repaired event past `DuckDB`'s default JSON sample window still
+    /// reaches parquet with its `timestamp_invalid` intact.
+    ///
+    /// `timestamp_invalid` is sparse by construction — only repaired events
+    /// carry it. Auto-detection over a bounded sample never saw it on a WAL
+    /// file bigger than the sample, so the preserved original was dropped
+    /// with no error at all, defeating ADR-0008's promise that the evidence
+    /// survives to the operator.
+    #[test]
+    fn compact_preserves_repair_column_past_the_sample_window() {
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Larger than DuckDB's default JSON sample (~20480 rows), with the
+        // only repaired event as the very last line.
+        let mut lines = String::new();
+        for i in 0..30_000 {
+            writeln!(
+                lines,
+                "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
+            )
+            .unwrap();
+        }
+        lines.push_str(
+            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\
+             \"message\":\"repaired\",\"timestamp_invalid\":\"not-a-date\"}\n",
+        );
+        let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
+        std::fs::write(&wal, lines).unwrap();
+
+        compact_service_blocking(&[wal], &data_dir, "svc", "2GB").expect("must compact");
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let preserved = read_strings(
+            &parquet[0],
+            "COALESCE(string_agg(timestamp_invalid), 'MISSING')",
+        );
+        assert_eq!(
+            preserved,
+            vec!["not-a-date".to_owned()],
+            "the preserved original must survive a WAL file larger than the \
+             JSON sample window"
+        );
+    }
+
+    /// One bad event does not affect its batch-mates: 1 bad + 2 good in one
+    /// WAL file all land, the WAL directory drains, and `compact_once`
+    /// reports zero errors — no poison pill.
+    #[tokio::test]
+    async fn compact_once_drains_bad_timestamp_without_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let good1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"good1"}"#;
+        let bad = r#"{"timestamp":"not-a-date","service":"nginx","message":"bad"}"#;
+        let good2 = r#"{"timestamp":"2026-01-01T00:00:02Z","service":"nginx","message":"good2"}"#;
+        let wal = wal_dir.join("nginx_1730000000000_abcd.ndjson");
+        std::fs::write(&wal, [good1, bad, good2].join("\n")).unwrap();
+
+        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")
+            .await
+            .expect("compaction tick must succeed");
+        assert_eq!(errors, 0, "a bad timestamp must not count as an error");
+
+        assert!(!wal.exists(), "consumed WAL file must be deleted");
+        let leftover = find_files_by_ext(&wal_dir, "ndjson");
+        assert!(leftover.is_empty(), "WAL directory must be empty");
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "all three events (incl. the repaired one) land");
+    }
+
+    /// A user event legitimately carrying a field named `filename` keeps all
+    /// its columns — the synthetic WAL-provenance column uses a reserved
+    /// name precisely so it cannot collide.
+    #[test]
+    fn compact_keeps_user_field_named_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
+        std::fs::write(
+            &wal,
+            b"{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\"filename\":\"user.txt\",\"message\":\"m\"}\n",
+        )
+        .unwrap();
+
+        compact_service_blocking(&[wal], &data_dir, "svc", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let filenames = read_strings(&parquet[0], "\"filename\"");
+        assert_eq!(
+            filenames,
+            vec!["user.txt".to_owned()],
+            "the user's own `filename` column must survive"
+        );
+    }
+
+    /// WAL written before ingest stripped the reserved key still drains, and
+    /// drains LOSSLESSLY: a row literally carrying `_trawl_wal_file` collides
+    /// with the synthetic provenance column, which must route to the renamed
+    /// provenance retry rather than failing the read forever (the isolation
+    /// path cannot save it — `probe_ndjson` omits `filename=`, so the file
+    /// parses cleanly and is kept as a survivor). Its innocent batch-mate
+    /// must land too, and every user field outside the vector envelope must
+    /// survive — the whole point of the rename over the explicit-columns
+    /// fallback, which would drop them for the entire batch.
+    #[tokio::test]
+    async fn compact_once_drains_wal_carrying_reserved_provenance_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Malformed timestamp on the poison row: the repair must fall back to
+        // the file's OWN name — never to the client-controlled value.
+        let poison = r#"{"timestamp":"not-a-date","service":"nginx","message":"poison","_trawl_wal_file":"/etc/passwd","request_id":"deadbeef"}"#;
+        let innocent = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"nginx","message":"innocent","trace_id":"t1"}"#;
+        let wal = wal_dir.join("nginx_1730000000000_abcd.ndjson");
+        std::fs::write(&wal, [poison, innocent].join("\n")).unwrap();
+
+        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")
+            .await
+            .expect("compaction tick must succeed");
+        assert_eq!(errors, 0, "a reserved-key row must not count as an error");
+
+        assert!(!wal.exists(), "consumed WAL file must be deleted");
+        assert!(
+            find_files_by_ext(&wal_dir, "ndjson").is_empty(),
+            "WAL directory must drain"
+        );
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let mut messages = read_strings(&parquet[0], "message");
+        messages.sort();
+        assert_eq!(
+            messages,
+            vec!["innocent".to_owned(), "poison".to_owned()],
+            "both events land, including the batch-mate"
+        );
+
+        // Non-envelope user fields survive on both rows.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let (request_id, wal_file_val, trace_id): (String, String, String) = conn
+            .query_row(
+                &format!(
+                    "SELECT max(request_id), max({WAL_FILE_COL}), max(trace_id) \
+                     FROM read_parquet('{}')",
+                    parquet[0].display()
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("non-envelope user fields must survive the drain");
+        assert_eq!(request_id, "deadbeef");
+        assert_eq!(trace_id, "t1");
+        assert_eq!(
+            wal_file_val, "/etc/passwd",
+            "the client's literal column is preserved as ordinary data"
+        );
+
+        // The malformed timestamp was repaired from the file's own name, not
+        // from the client-controlled `_trawl_wal_file` value.
+        let repaired: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}') \
+                     WHERE message = 'poison' \
+                       AND \"timestamp\" = epoch_ms(1730000000000)",
+                    parquet[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            repaired, 1,
+            "the poison row's timestamp must come from its WAL filename"
+        );
+    }
+
+    /// The synthetic `_trawl_wal_file` provenance column never reaches the
+    /// parquet schema.
+    #[test]
+    fn compact_excludes_wal_provenance_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
+        std::fs::write(
+            &wal,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"m\"}\n",
+        )
+        .unwrap();
+
+        compact_service_blocking(&[wal], &data_dir, "svc", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "DESCRIBE SELECT * FROM read_parquet('{}')",
+                parquet[0].display()
+            ))
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !cols.iter().any(|c| c == "_trawl_wal_file"),
+            "provenance column must be excluded from parquet, got {cols:?}"
+        );
+    }
+
+    /// A WAL filename that does not conform to `{service}_{millis}_{hex4}`
+    /// degrades to the compaction-instant arm — never a NULL timestamp.
+    #[test]
+    fn compact_nonconforming_filename_falls_back_to_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let wal = wal_dir.join("svc_oddname.ndjson");
+        std::fs::write(
+            &wal,
+            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"m\"}\n",
+        )
+        .unwrap();
+
+        let before = chrono::Utc::now() - chrono::Duration::minutes(5);
+        compact_service_blocking(&[wal], &data_dir, "svc", "2GB").unwrap();
+        let after = chrono::Utc::now() + chrono::Duration::minutes(5);
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let ts = read_strings(
+            &parquet[0],
+            "strftime(\"timestamp\", '%Y-%m-%dT%H:%M:%S.%fZ')",
+        );
+        assert_eq!(ts.len(), 1);
+        let got = chrono::DateTime::parse_from_rfc3339(&ts[0])
+            .unwrap_or_else(|e| panic!("parquet timestamp {} must parse: {e}", ts[0]))
+            .with_timezone(&chrono::Utc);
+        assert!(
+            got > before && got < after,
+            "non-conforming filename must land at compaction time, got {got}"
         );
     }
 

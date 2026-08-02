@@ -321,7 +321,12 @@ itself is untouched.
   windowing is future work, and "makes scheduled reports correct" overclaimed.
   In #49, execution confirmed all four trigger variants say `Conversion Error`,
   so the suspected warning-free degradation path does not exist; the ingest
-  timestamp grammar is chrono-parsed RFC 3339 canonicalized to UTC, fallback
-  provenance is per-row via `read_json(filename=true)`, and an unexpected query
+  timestamp grammar is chrono-parsed and canonicalized to UTC — as shipped it is
+  wider than strict RFC 3339 (ISO 8601 basic offsets, offset-less date-times,
+  bare dates, space separator, `YYYY/MM/DD`), so ADR-0008 holds the normative
+  grammar and the cutover carries it forward rather than narrowing it; fallback
+  provenance is per-row via `read_json(filename=true)` and travels as a reserved
+  `_trawl_wal_file` column that ingest strips from client events (retired at the
+  cutover alongside `timestamp_invalid`), and an unexpected query
   failure with cold files present returns an error rather than hot-only
   success.

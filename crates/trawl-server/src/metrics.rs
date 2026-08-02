@@ -18,6 +18,7 @@ pub const QUERIES_TOTAL: &str = "trawl_queries_total";
 pub const QUERY_DURATION: &str = "trawl_query_duration_seconds";
 pub const INGEST_EVENTS_TOTAL: &str = "trawl_ingest_events_total";
 pub const INGEST_EVENTS_REJECTED_TOTAL: &str = "trawl_ingest_events_rejected_total";
+pub const INGEST_EVENTS_REPAIRED_TOTAL: &str = "trawl_ingest_events_repaired_total";
 pub const HOT_BUFFER_EVENTS: &str = "trawl_hot_buffer_events";
 pub const HOT_BUFFER_BYTES: &str = "trawl_hot_buffer_bytes";
 pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";
@@ -41,6 +42,11 @@ pub fn describe_metrics() {
     describe_counter!(
         INGEST_EVENTS_REJECTED_TOTAL,
         "Total number of rejected ingest events"
+    );
+    describe_counter!(
+        INGEST_EVENTS_REPAIRED_TOTAL,
+        "Total number of accepted events whose malformed timestamp was \
+         substituted with the arrival time (original preserved in timestamp_invalid)"
     );
     describe_gauge!(
         HOT_BUFFER_EVENTS,

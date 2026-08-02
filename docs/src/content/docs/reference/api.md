@@ -212,6 +212,10 @@ Content-Type: application/json
 
 Accepts JSON arrays or ndjson. Supports optional gzip compression (`Content-Encoding: gzip`). Requires a token whose roles grant the `ingest` permission.
 
+`timestamp` handling: a valid value is canonicalized to RFC 3339 UTC at microsecond precision. Valid means, after trimming surrounding whitespace: an RFC 3339 string; a date-time carrying an ISO 8601 *basic* offset (`+0530`, `+02`), as Java and Go encoders emit; or an offset-less date-time, read as UTC. Date and time may be separated by `T` or a space, the date may be `YYYY-MM-DD` or `YYYY/MM/DD`, seconds and their fraction are optional (`HH:MM` is accepted), and a bare date with no time reads as midnight UTC. An absent timestamp defaults to the request-arrival time. A present but malformed value (unparseable string, object, number, etc.) is **substituted, not rejected**: `timestamp` becomes the arrival time and the original value is preserved in a `timestamp_invalid` field (truncated to 256 chars), queryable like any other field. Repairs are counted in `trawl_ingest_events_repaired_total` and do not affect the `accepted`/`rejected` counts in the response.
+
+Reserved field: `_trawl_wal_file` is trawl's own, used internally to carry each row's source WAL file through compaction. If an event supplies it, the key is silently dropped before the event is written — the rest of the event is accepted unchanged.
+
 ### Metrics
 
 ```

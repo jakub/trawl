@@ -24,6 +24,9 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::bus::IngestBatch;
 
+/// One buffered event, as stored in [`IngestBatch::events`].
+type Event = serde_json::Map<String, serde_json::Value>;
+
 /// Configuration for the hot buffer.
 #[derive(Debug, Clone)]
 pub struct HotBufferConfig {
@@ -177,43 +180,53 @@ impl HotBuffer {
     }
 
     /// Build a fresh snapshot file from the current buffer contents.
+    ///
+    /// Events are written schema-pioneers-first (see [`schema_pioneers`]) so
+    /// that the reader can rely on `DuckDB`'s cheap default schema sample.
     fn build_snapshot(&self) -> Option<tempfile::NamedTempFile> {
         let map = self.batches.read();
         if map.is_empty() {
             return None;
         }
 
+        let events: Vec<(&Arc<str>, &Event)> = map
+            .values()
+            .flat_map(|batch| batch.events.iter().map(move |e| (&batch.batch_id, e)))
+            .collect();
+        let pioneer = schema_pioneers(events.iter().map(|(_, e)| *e));
+
         let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
         let mut wrote_any = false;
 
-        for batch in map.values() {
-            for event in &batch.events {
-                // Coerce object/array values to their JSON text so the
-                // snapshot's read_json infers them as VARCHAR (see
-                // `coerce_complex_values`). Returns None when there is
-                // nothing to coerce, avoiding a clone on the common path.
-                let coerced = coerce_complex_values(event);
-                let event = coerced.as_ref().unwrap_or(event);
+        let order = (0..events.len())
+            .filter(|&i| pioneer[i])
+            .chain((0..events.len()).filter(|&i| !pioneer[i]));
+        for (batch_id, event) in order.map(|i| events[i]) {
+            // Coerce object/array values to their JSON text so the
+            // snapshot's read_json infers them as VARCHAR (see
+            // `coerce_complex_values`). Returns None when there is
+            // nothing to coerce, avoiding a clone on the common path.
+            let coerced = coerce_complex_values(event);
+            let event = coerced.as_ref().unwrap_or(event);
 
-                // Serialization failure here is very unlikely (we parsed it
-                // successfully during ingest), but log and skip rather than
-                // poisoning the entire snapshot.
-                match serde_json::to_writer(&mut tmpfile, event) {
-                    Ok(()) => {
-                        if let Err(e) = tmpfile.write_all(b"\n") {
-                            tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot write failed");
-                            return None;
-                        }
-                        wrote_any = true;
+            // Serialization failure here is very unlikely (we parsed it
+            // successfully during ingest), but log and skip rather than
+            // poisoning the entire snapshot.
+            match serde_json::to_writer(&mut tmpfile, event) {
+                Ok(()) => {
+                    if let Err(e) = tmpfile.write_all(b"\n") {
+                        tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot write failed");
+                        return None;
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            event_type = "hot_buffer_error",
-                            batch_id = %batch.batch_id,
-                            error = %e,
-                            "failed to serialize event in hot buffer snapshot"
-                        );
-                    }
+                    wrote_any = true;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        event_type = "hot_buffer_error",
+                        batch_id = %batch_id,
+                        error = %e,
+                        "failed to serialize event in hot buffer snapshot"
+                    );
                 }
             }
         }
@@ -250,6 +263,41 @@ impl HotBuffer {
     pub fn config(&self) -> &HotBufferConfig {
         &self.config
     }
+}
+
+/// Flag the events that introduce a key no earlier event carried — the
+/// "schema pioneers" of the snapshot.
+///
+/// `DuckDB`'s `read_json` auto-detection infers the schema from a bounded
+/// prefix of the file (~20480 records) and then hard-errors — `unknown key`
+/// — on any later record carrying a key outside it. `timestamp_invalid` is
+/// sparse by construction (only repaired events carry it, ADR-0008) and the
+/// buffer holds up to `max_events` (100k by default), so one repaired event
+/// past the prefix used to break every query touching the hot buffer.
+///
+/// Making the reader detect over the whole file (`sample_size=-1`) cures
+/// that at the cost of re-parsing the entire snapshot on every query and SSE
+/// poll: ~2.7x the read (+135ms measured on a full 100k-event / 100 MiB
+/// buffer, ~1s at half a million records), growing with the configured
+/// buffer size. Writing the pioneers first instead puts the complete key set inside the
+/// detection prefix for the price of one pass over the buffer, and does it
+/// with the events' real values: an always-emitted null placeholder column
+/// would be inferred as JSON, so `timestamp_invalid` would come back quoted
+/// and numeric fields would stop being numbers.
+///
+/// A homogeneous buffer has exactly one pioneer (the first event), so the
+/// snapshot order is unchanged in the common case.
+fn schema_pioneers<'a>(events: impl Iterator<Item = &'a Event>) -> Vec<bool> {
+    let mut seen: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
+    events
+        .map(|event| {
+            let mut novel = false;
+            for key in event.keys() {
+                novel |= seen.insert(key.as_str());
+            }
+            novel
+        })
+        .collect()
 }
 
 /// Replace top-level object/array values in an event with their JSON-text
@@ -384,6 +432,137 @@ mod tests {
             "scalar field must not be stringified"
         );
         assert!(parsed["service"].is_string());
+    }
+
+    /// Build `n` plain events plus one carrying the sparse `timestamp_invalid`
+    /// key, with the sparse one last — the shape that used to break queries.
+    fn events_with_trailing_sparse_key(n: usize) -> Vec<Event> {
+        let mut events: Vec<Event> = (0..n)
+            .map(|i| {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "timestamp".into(),
+                    serde_json::Value::String("2024-01-15T10:00:00Z".into()),
+                );
+                m.insert("service".into(), serde_json::Value::String("svc".into()));
+                m.insert("message".into(), serde_json::Value::String(format!("m{i}")));
+                m
+            })
+            .collect();
+        let mut repaired = serde_json::Map::new();
+        repaired.insert(
+            "timestamp".into(),
+            serde_json::Value::String("2024-01-15T10:00:00Z".into()),
+        );
+        repaired.insert("service".into(), serde_json::Value::String("svc".into()));
+        repaired.insert(
+            "message".into(),
+            serde_json::Value::String("repaired".into()),
+        );
+        repaired.insert(
+            "timestamp_invalid".into(),
+            serde_json::Value::String("not-a-date".into()),
+        );
+        events.push(repaired);
+        events
+    }
+
+    #[test]
+    fn snapshot_hoists_schema_pioneers_to_the_front() {
+        // DuckDB infers the snapshot's schema from a bounded prefix and then
+        // hard-errors on a later record with a key outside it. `timestamp_invalid`
+        // is sparse by construction (ADR-0008), so the writer moves the events
+        // that introduce a new key to the front — cheaper than making every
+        // query re-detect over the whole file.
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        });
+        let events = events_with_trailing_sparse_key(50);
+        buf.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 100,
+            events,
+        }));
+
+        let tmpfile = buf.snapshot().expect("should have events");
+        let content = std::fs::read_to_string(tmpfile.path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        assert_eq!(
+            lines.len(),
+            51,
+            "hoisting must not drop or duplicate events"
+        );
+        let sparse_at = lines
+            .iter()
+            .position(|l| l.contains("timestamp_invalid"))
+            .expect("the repaired event must still be in the snapshot");
+        assert!(
+            sparse_at < 2,
+            "the only event carrying the sparse key must be hoisted into the \
+             schema-detection prefix, found at line {sparse_at}"
+        );
+        let messages: std::collections::HashSet<String> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["message"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(messages.len(), 51, "every event must survive reordering");
+    }
+
+    #[test]
+    fn sparse_key_survives_a_snapshot_larger_than_the_detection_prefix() {
+        // End-to-end: a buffer bigger than DuckDB's ~20480-record JSON sample
+        // whose only repaired event is the last one inserted. Both hot reader
+        // call sites are exercised — the hot-only reader (no parquet yet) and
+        // the hot+cold union.
+        use trawl_engine::executor::Executor;
+
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 100_000,
+            max_bytes: 100 * 1024 * 1024,
+        });
+        buf.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 1000,
+            events: events_with_trailing_sparse_key(30_000),
+        }));
+        let snapshot = buf.snapshot().expect("should have events");
+        let hot = snapshot.path().to_str().unwrap();
+
+        for with_cold in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            if with_cold {
+                let conn = duckdb::Connection::open_in_memory().unwrap();
+                conn.execute_batch(&format!(
+                    "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                                  'svc' AS service, 'cold row' AS message) \
+                     TO '{}' (FORMAT PARQUET)",
+                    dir.path().join("cold.parquet").display()
+                ))
+                .unwrap();
+            }
+
+            let exec = Executor::new().expect("executor should initialize");
+            let source = format!("{}/*.parquet", dir.path().display());
+            let result = exec
+                .run_query_with_hot("*", &source, hot, usize::MAX, 0)
+                .expect("hot query must succeed");
+
+            let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+            assert!(
+                col_names.contains(&"timestamp_invalid"),
+                "the preserved original must survive (with_cold={with_cold}); \
+                 got columns {col_names:?}"
+            );
+        }
     }
 
     #[test]

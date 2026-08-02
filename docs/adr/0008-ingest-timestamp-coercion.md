@@ -52,17 +52,41 @@ outlier.
   value. This keeps rows inside `last=Xh` ranges and — the reason it matters
   operationally — drains WAL already wedged on disk from before this change with
   no manual recovery step.
-- **Error classification does not sniff strings.** `is_union_type_conflict`
-  matched on `msg.contains("Conversion")`, which both misfires on data errors
-  and misses the STRUCT/BIGINT cast failures entirely — the latter taking a path
-  that drops cold data with no warning logged at all. A cold-data drop must never
-  be silent, so classification keys off structured error information and the
-  no-warning path is removed.
+- **Error classification does not sniff strings, and a data error is not a
+  schema conflict.** `is_union_type_conflict` matched on
+  `msg.contains("Conversion")`, which both misfires on data errors and misses
+  the STRUCT/BIGINT cast failures entirely — the latter taking a path that drops
+  cold data with no warning logged at all. Classification now keys off
+  structured error information: DuckDB's leading `"<Class> Error"` token. That
+  token is necessary but not sufficient, because an irreconcilable *schema* and
+  an unconvertible *value* are both `Conversion`-class on the bundled 1.5.5 and
+  no substring of the body separates them either (both name a "source column",
+  both talk about a "destination type"). So a union type conflict additionally
+  requires **evidence** — at least one column the two sources describe
+  differently. A data error yields none and is never misread as a conflict; it
+  falls through to the outcome policy, which returns an error whenever cold
+  files exist. A cold-data drop is never silent, and the no-warning path is
+  removed.
 
 ## Consequences
 
-- `timestamp_invalid` is a sparse column, which `union_by_name=true` already
-  handles; it is absent from the vast majority of files.
+- `timestamp_invalid` is a sparse column; it is absent from the vast majority
+  of files. `union_by_name=true` reconciles it across files, but only if
+  `DuckDB` detected it at all: JSON schema detection samples a bounded prefix
+  (~20480 rows) by default, and a repaired event past that prefix is dropped
+  from the inferred schema (WAL, where the read unions by name) or fails the
+  query outright with `unknown key` (a hot-buffer snapshot). Two different
+  cures, because the two reads have different cost profiles. Compaction's WAL
+  read runs once per batch on a background task and sets `sample_size=-1`.
+  The hot-buffer snapshot is read by *every* query and SSE poll, where
+  whole-file detection costs ~2.7x the read (+135ms on a full default-size
+  buffer, and it grows with `hot_buffer_max_bytes`), so the writer
+  instead hoists one event per novel key to the front of the snapshot: the
+  full key set lands inside the default prefix, with real values, and the
+  reader stays on the cheap default sample. An always-emitted null
+  placeholder would be simpler but wrong — a column that is null throughout
+  the sample is inferred as JSON, which returns `timestamp_invalid` quoted
+  and turns sparse numeric fields into non-numbers.
 - A malformed timestamp is now visible three ways: the preserved field, an
   ingest counter, and normal queryability at roughly the right time — rather
   than as a `compaction_error` line repeating every 10s with no indication of

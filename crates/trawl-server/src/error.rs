@@ -167,6 +167,15 @@ impl IntoResponse for ServerError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),
             ),
+            // The hot+cold read raced a file move while cold data exists —
+            // transient and retryable, never a silent empty 200 (ADR-0008).
+            Self::Engine(EngineError::ColdDataUnread) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(
+                    ErrorCode::ServiceUnavailable,
+                    "cold data temporarily unreadable; retry the query",
+                ),
+            ),
             // App-state store errors follow the ADR-0004 table. Backend
             // trouble is a 503 with pg diagnostics redacted from the wire
             // (they are logged server-side); conflicts are 409 with their

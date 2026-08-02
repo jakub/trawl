@@ -20,6 +20,7 @@ use indexmap::IndexMap;
 use serde_json::json;
 
 use crate::error::ServerError;
+use crate::ingest::compaction;
 use crate::ingest::pipeline::{self, ServiceBatch};
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
@@ -140,6 +141,13 @@ struct ParsedEvents {
     errors: Vec<IngestEventError>,
     /// Per-reason rejection counts for prometheus labels.
     reject_counts: RejectCounts,
+    /// Events whose malformed `timestamp` was substituted with the arrival
+    /// default and preserved in `timestamp_invalid` (ADR-0008). The events
+    /// still count as accepted.
+    repaired: u64,
+    /// Up to [`MAX_REPAIR_SAMPLES`] preserved originals, for the
+    /// `ingest_repairs` warn.
+    repair_samples: Vec<String>,
 }
 
 /// Validate a single event object, returning the service name or a typed error.
@@ -199,21 +207,150 @@ struct IngestDefaults {
     host: String,
 }
 
-/// Fill mandatory fields on an event map if they are missing.
+/// Maximum preserved length of a malformed `timestamp` original (chars).
+const MAX_TIMESTAMP_INVALID_CHARS: usize = 256;
+
+/// Maximum number of preserved originals sampled for the `ingest_repairs` warn.
+const MAX_REPAIR_SAMPLES: usize = 5;
+
+/// Date-time formats carrying an explicit UTC offset, tried after RFC 3339.
+///
+/// `chrono::DateTime::parse_from_rfc3339` only accepts the extended offset
+/// spelling (`+05:30`), but the ISO 8601 *basic* spelling (`+0530`, `+05`) is
+/// what Java's default logging encoders and Go's `-0700` layouts emit, and the
+/// hard `CAST` this path replaces accepted it. `%#z` is chrono's parse-only
+/// offset that takes `+HH`, `+HHMM` and `+HH:MM` alike.
+const OFFSET_TIMESTAMP_FORMATS: [&str; 6] = [
+    "%Y-%m-%dT%H:%M:%S%.f%#z",
+    "%Y-%m-%d %H:%M:%S%.f%#z",
+    "%Y/%m/%d %H:%M:%S%.f%#z",
+    "%Y-%m-%dT%H:%M%#z",
+    "%Y-%m-%d %H:%M%#z",
+    "%Y/%m/%d %H:%M%#z",
+];
+
+/// Offset-less date-time formats accepted alongside RFC 3339, read as UTC.
+///
+/// `%.f` matches an optional fractional-second suffix, so each second-precision
+/// entry covers both the with- and without-fraction spelling; the `%H:%M`
+/// entries cover minute precision. The slash-dated spellings are what Go's
+/// standard `log` package emits.
+const NAIVE_TIMESTAMP_FORMATS: [&str; 6] = [
+    "%Y-%m-%dT%H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y/%m/%d %H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M",
+];
+
+/// Date-only formats, read as midnight UTC.
+const DATE_ONLY_TIMESTAMP_FORMATS: [&str; 2] = ["%Y-%m-%d", "%Y/%m/%d"];
+
+/// Canonicalize a present `timestamp` value per the ADR-0008 grammar.
+///
+/// A value is valid iff it is a JSON string that — after trimming surrounding
+/// whitespace — chrono parses as RFC 3339, as one of
+/// [`OFFSET_TIMESTAMP_FORMATS`], [`NAIVE_TIMESTAMP_FORMATS`] or
+/// [`DATE_ONLY_TIMESTAMP_FORMATS`]. Valid values are rewritten to RFC 3339 UTC
+/// at microsecond precision (`DuckDB`'s native TIMESTAMP resolution) so
+/// compaction's `TRY_CAST` succeeds on post-fix data by construction. Returns
+/// `None` for anything malformed.
+///
+/// The grammar covers the shapes real log producers emit, and is a superset of
+/// what the in-memory matcher (`trawl_core::filter::parse_timestamp`) accepts
+/// on the live path apart from bare epoch numbers — ingest must not be the
+/// narrower of the two, or a producer emitting `LocalDateTime` /
+/// `datetime.isoformat()` silently loses its event time to the arrival
+/// substitution. It is deliberately *not* literal parity with the hard `CAST`
+/// it replaces: `DuckDB`'s timestamp parser is looser still (e.g. `infinity`,
+/// named month forms), and anything outside this grammar is preserved in
+/// `timestamp_invalid` rather than guessed at.
+fn canonical_timestamp(v: &serde_json::Value) -> Option<String> {
+    let s = v.as_str()?.trim();
+    let utc: chrono::DateTime<chrono::Utc> = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+    {
+        dt.with_timezone(&chrono::Utc)
+    } else if let Some(dt) = OFFSET_TIMESTAMP_FORMATS
+        .iter()
+        .find_map(|fmt| chrono::DateTime::parse_from_str(s, fmt).ok())
+    {
+        dt.with_timezone(&chrono::Utc)
+    } else if let Some(naive) = NAIVE_TIMESTAMP_FORMATS
+        .iter()
+        .find_map(|fmt| chrono::NaiveDateTime::parse_from_str(s, fmt).ok())
+    {
+        naive.and_utc()
+    } else {
+        DATE_ONLY_TIMESTAMP_FORMATS
+            .iter()
+            .find_map(|fmt| chrono::NaiveDate::parse_from_str(s, fmt).ok())?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc()
+    };
+    Some(utc.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+}
+
+/// Render a malformed `timestamp` original for preservation: strings
+/// verbatim, non-strings as their JSON text, truncated to
+/// [`MAX_TIMESTAMP_INVALID_CHARS`] on a char boundary.
+fn preserve_invalid_timestamp(v: &serde_json::Value) -> String {
+    let raw = match v.as_str() {
+        Some(s) => s.to_owned(),
+        None => v.to_string(),
+    };
+    if raw.chars().count() > MAX_TIMESTAMP_INVALID_CHARS {
+        raw.chars().take(MAX_TIMESTAMP_INVALID_CHARS).collect()
+    } else {
+        raw
+    }
+}
+
+/// Fill mandatory fields on an event map if they are missing, canonicalize
+/// or repair the `timestamp` (ADR-0008), and drop reserved keys.
 ///
 /// Events without these fields are effectively invisible to most queries
 /// (time filters, bare text search, host grouping), so we fill sensible
-/// defaults at ingest time rather than silently dropping them.
-fn fill_defaults(obj: &mut serde_json::Map<String, serde_json::Value>, defaults: &IngestDefaults) {
-    if !obj.contains_key("timestamp") {
-        obj.insert("timestamp".into(), json!(&defaults.timestamp));
-    }
+/// defaults at ingest time rather than silently dropping them. A present
+/// but malformed `timestamp` gets the same treatment: it is substituted
+/// with the arrival default (the original preserved in `timestamp_invalid`)
+/// rather than poisoning compaction's batch CAST downstream.
+///
+/// [`compaction::WAL_FILE_COL`] is stripped for the same reason: compaction
+/// projects it as a synthetic provenance column, and a row carrying it makes
+/// `read_json` fail to bind — a request-controlled wedge that would stall
+/// the service's whole WAL. The key is trawl's, not the client's.
+///
+/// Returns the preserved original when a malformed timestamp was repaired.
+fn fill_defaults(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    defaults: &IngestDefaults,
+) -> Option<String> {
+    obj.remove(compaction::WAL_FILE_COL);
+    let repaired = match obj.get("timestamp") {
+        None => {
+            obj.insert("timestamp".into(), json!(&defaults.timestamp));
+            None
+        }
+        Some(v) => {
+            if let Some(canonical) = canonical_timestamp(v) {
+                obj.insert("timestamp".into(), json!(canonical));
+                None
+            } else {
+                let preserved = preserve_invalid_timestamp(v);
+                obj.insert("timestamp_invalid".into(), json!(&preserved));
+                obj.insert("timestamp".into(), json!(&defaults.timestamp));
+                Some(preserved)
+            }
+        }
+    };
     if !obj.contains_key("host") {
         obj.insert("host".into(), json!(&defaults.host));
     }
     if !obj.contains_key("message") {
         obj.insert("message".into(), json!(""));
     }
+    repaired
 }
 
 /// `POST /api/v1/ingest` — accept ndjson events into the WAL.
@@ -383,6 +520,20 @@ fn finalize_ingest(
         );
     }
 
+    if parsed.repaired > 0 {
+        metrics::counter!(crate::metrics::INGEST_EVENTS_REPAIRED_TOTAL).increment(parsed.repaired);
+        // Sample up to MAX_REPAIR_SAMPLES preserved originals so the bad
+        // upstream clock values are diagnosable without per-event log spam.
+        let samples = parsed.repair_samples.join("; ");
+        tracing::warn!(
+            event_type = "ingest_repairs",
+            user = %verified.name,
+            repaired = parsed.repaired,
+            samples,
+            "malformed timestamps substituted with arrival time (originals in timestamp_invalid)"
+        );
+    }
+
     // Publish each successfully-written batch to hot buffer + event bus
     // so events are visible to queries and SSE streams immediately.
     if let Some(pipeline) = &state.ingest.pipeline {
@@ -489,6 +640,8 @@ fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvent
     let mut batches: IndexMap<String, ServiceBatch> = IndexMap::new();
     let mut errors = Vec::new();
     let mut reject_counts = RejectCounts::default();
+    let mut repaired: u64 = 0;
+    let mut repair_samples: Vec<String> = Vec::new();
 
     for (i, event) in arr.iter().enumerate() {
         let Some(obj) = event.as_object() else {
@@ -513,7 +666,12 @@ fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvent
         };
 
         let mut obj = obj.clone();
-        fill_defaults(&mut obj, defaults);
+        if let Some(original) = fill_defaults(&mut obj, defaults) {
+            repaired += 1;
+            if repair_samples.len() < MAX_REPAIR_SAMPLES {
+                repair_samples.push(original);
+            }
+        }
 
         let batch = batches.entry(svc).or_default();
         serde_json::to_writer(&mut batch.ndjson, &obj)
@@ -526,6 +684,8 @@ fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvent
         batches,
         errors,
         reject_counts,
+        repaired,
+        repair_samples,
     })
 }
 
@@ -538,6 +698,8 @@ fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, S
     let mut batches: IndexMap<String, ServiceBatch> = IndexMap::new();
     let mut errors = Vec::new();
     let mut reject_counts = RejectCounts::default();
+    let mut repaired: u64 = 0;
+    let mut repair_samples: Vec<String> = Vec::new();
 
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -579,7 +741,12 @@ fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, S
         };
 
         let mut obj = obj.clone();
-        fill_defaults(&mut obj, defaults);
+        if let Some(original) = fill_defaults(&mut obj, defaults) {
+            repaired += 1;
+            if repair_samples.len() < MAX_REPAIR_SAMPLES {
+                repair_samples.push(original);
+            }
+        }
 
         let batch = batches.entry(svc).or_default();
         serde_json::to_writer(&mut batch.ndjson, &obj)
@@ -592,6 +759,8 @@ fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, S
         batches,
         errors,
         reject_counts,
+        repaired,
+        repair_samples,
     })
 }
 
@@ -967,9 +1136,11 @@ mod tests {
         let parsed = parse_events(data, &defaults).unwrap();
         let maps = service_maps(&parsed, "test");
         let event = &maps[0];
+        // A valid timestamp is canonicalized (RFC 3339 UTC, microsecond
+        // precision) — same instant, not necessarily the same bytes.
         assert_eq!(
             event.get("timestamp").and_then(serde_json::Value::as_str),
-            Some("2025-06-01T12:00:00Z")
+            Some("2025-06-01T12:00:00.000000Z")
         );
         assert_eq!(
             event.get("host").and_then(serde_json::Value::as_str),
@@ -978,6 +1149,215 @@ mod tests {
         assert_eq!(
             event.get("message").and_then(serde_json::Value::as_str),
             Some("hello")
+        );
+    }
+
+    // --- timestamp canonicalization & repair tests (ADR-0008) ---
+
+    /// Valid grammar values are canonicalized to RFC 3339 UTC at microsecond
+    /// precision — same instant, sub-second precision preserved.
+    #[test]
+    fn timestamp_valid_values_canonicalized() {
+        let cases = [
+            // RFC 3339 UTC, no fraction.
+            ("2025-06-01T12:00:00Z", "2025-06-01T12:00:00.000000Z"),
+            // RFC 3339 with a +05:30 offset → same instant in UTC.
+            (
+                "2025-06-01T17:30:00.123456+05:30",
+                "2025-06-01T12:00:00.123456Z",
+            ),
+            // Nanosecond input truncates to microseconds.
+            (
+                "2025-06-01T12:00:00.123456789Z",
+                "2025-06-01T12:00:00.123456Z",
+            ),
+            // Space-separated naive variant, read as UTC.
+            ("2025-06-01 12:00:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01 12:00:00.5", "2025-06-01T12:00:00.500000Z"),
+            // Offset-less `T` form (Python isoformat, Java LocalDateTime).
+            ("2025-06-01T12:00:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01T12:00:00.123", "2025-06-01T12:00:00.123000Z"),
+            // Date-only, read as midnight UTC.
+            ("2025-06-01", "2025-06-01T00:00:00.000000Z"),
+            // ISO 8601 *basic* offsets (no colon) — logback's default encoder,
+            // Go's `-0700` layouts. RFC 3339 parsing alone rejects these.
+            (
+                "2025-06-01T12:00:00.000+0000",
+                "2025-06-01T12:00:00.000000Z",
+            ),
+            ("2025-06-01T17:30:00+0530", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01 14:00:00+02", "2025-06-01T12:00:00.000000Z"),
+            // Minute precision, offset-less and with an offset.
+            ("2025-06-01T12:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01 12:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01T14:00+02:00", "2025-06-01T12:00:00.000000Z"),
+            // Slash-dated (Go's standard `log` package).
+            ("2025/06/01 12:00:00", "2025-06-01T12:00:00.000000Z"),
+            (
+                "2025/06/01 12:00:00.25+00:00",
+                "2025-06-01T12:00:00.250000Z",
+            ),
+            ("2025/06/01", "2025-06-01T00:00:00.000000Z"),
+            // Surrounding whitespace is trimmed before parsing.
+            ("  2025-06-01T12:00:00Z  ", "2025-06-01T12:00:00.000000Z"),
+            (" 2025-06-01 12:00:00 ", "2025-06-01T12:00:00.000000Z"),
+        ];
+        let defaults = test_defaults();
+        for (input, expected) in cases {
+            let data = format!(r#"{{"service":"test","timestamp":"{input}"}}"#);
+            let parsed = parse_events(data.as_bytes(), &defaults).unwrap();
+            let event = &service_maps(&parsed, "test")[0];
+            assert_eq!(
+                event.get("timestamp").and_then(serde_json::Value::as_str),
+                Some(expected),
+                "input {input:?} should canonicalize"
+            );
+            assert!(
+                !event.contains_key("timestamp_invalid"),
+                "valid input {input:?} must not set timestamp_invalid"
+            );
+            assert_eq!(parsed.repaired, 0, "valid input {input:?} is not a repair");
+        }
+    }
+
+    /// Malformed values are substituted with the arrival default and the
+    /// original preserved verbatim in `timestamp_invalid`.
+    #[test]
+    fn timestamp_malformed_substituted_and_preserved() {
+        let cases = [
+            // Unparseable string.
+            (r#""not-a-date""#, "not-a-date"),
+            // Well-shaped but out-of-range.
+            (r#""2026-13-45T99:99:99Z""#, "2026-13-45T99:99:99Z"),
+            // Date-shaped but out-of-range date-only value.
+            (r#""2025-06-31""#, "2025-06-31"),
+            // Bare epoch strings are not in the grammar (ADR-0008).
+            (r#""1748779200""#, "1748779200"),
+            // Non-string JSON values, preserved via to_string().
+            (r#"{"nested":1}"#, r#"{"nested":1}"#),
+            ("12345", "12345"),
+            ("true", "true"),
+            ("null", "null"),
+            // Empty string.
+            (r#""""#, ""),
+        ];
+        let defaults = test_defaults();
+        for (input, preserved) in cases {
+            let data = format!(r#"{{"service":"test","timestamp":{input}}}"#);
+            let parsed = parse_events(data.as_bytes(), &defaults).unwrap();
+            let event = &service_maps(&parsed, "test")[0];
+            assert_eq!(
+                event.get("timestamp").and_then(serde_json::Value::as_str),
+                Some("2026-01-01T00:00:00.000Z"),
+                "malformed input {input} must be substituted with the arrival default"
+            );
+            assert_eq!(
+                event
+                    .get("timestamp_invalid")
+                    .and_then(serde_json::Value::as_str),
+                Some(preserved),
+                "original {input} must be preserved in timestamp_invalid"
+            );
+            assert_eq!(parsed.repaired, 1, "input {input} counts as one repair");
+            assert_eq!(parsed.errors.len(), 0, "repair is not a rejection");
+        }
+    }
+
+    /// Absent timestamp keeps the existing default-fill path: no repair,
+    /// no `timestamp_invalid` (regression).
+    #[test]
+    fn timestamp_absent_is_defaulted_not_repaired() {
+        let data = br#"{"service":"test"}"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let event = &service_maps(&parsed, "test")[0];
+        assert_eq!(
+            event.get("timestamp").and_then(serde_json::Value::as_str),
+            Some("2026-01-01T00:00:00.000Z")
+        );
+        assert!(!event.contains_key("timestamp_invalid"));
+        assert_eq!(parsed.repaired, 0);
+    }
+
+    /// Oversized malformed values are truncated to 256 chars on a char
+    /// boundary before preservation.
+    #[test]
+    fn timestamp_invalid_truncated_on_char_boundary() {
+        // 300 two-byte chars — byte-index 256 would split a char.
+        let big: String = "é".repeat(300);
+        let data = format!(r#"{{"service":"test","timestamp":"{big}"}}"#);
+        let parsed = parse_events(data.as_bytes(), &test_defaults()).unwrap();
+        let event = &service_maps(&parsed, "test")[0];
+        let preserved = event
+            .get("timestamp_invalid")
+            .and_then(serde_json::Value::as_str)
+            .expect("timestamp_invalid present");
+        assert_eq!(preserved.chars().count(), 256);
+        assert_eq!(preserved, "é".repeat(256));
+    }
+
+    /// The JSON-array parse path counts repairs identically to ndjson.
+    #[test]
+    fn timestamp_repaired_counted_in_json_array_path() {
+        let data = br#"[{"service":"test","timestamp":"not-a-date"},{"service":"test","timestamp":"2025-06-01T12:00:00Z"},{"service":"test","timestamp":12345}]"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert_eq!(parsed.repaired, 2);
+        assert_eq!(total_accepted(&parsed), 3);
+        assert!(parsed.errors.is_empty());
+    }
+
+    /// Repair samples are capped at 5 even when more events are repaired.
+    #[test]
+    fn timestamp_repair_samples_capped_at_five() {
+        let lines: Vec<String> = (0..7)
+            .map(|i| format!(r#"{{"service":"test","timestamp":"bad-{i}"}}"#))
+            .collect();
+        let data = lines.join("\n");
+        let parsed = parse_events(data.as_bytes(), &test_defaults()).unwrap();
+        assert_eq!(parsed.repaired, 7);
+        assert_eq!(parsed.repair_samples.len(), 5);
+        assert_eq!(parsed.repair_samples[0], "bad-0");
+        assert_eq!(parsed.repair_samples[4], "bad-4");
+    }
+
+    /// The substituted timestamp and preserved original reach the WAL bytes
+    /// (mirror of `defaults_appear_in_wal_ndjson`).
+    #[test]
+    fn substituted_timestamp_appears_in_wal_ndjson() {
+        let data = br#"{"service":"test","timestamp":"not-a-date"}"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let ndjson = &parsed.batches["test"].ndjson;
+        let wal_text = std::str::from_utf8(ndjson).unwrap();
+        let wal_event: serde_json::Value = serde_json::from_str(wal_text.trim()).unwrap();
+        assert_eq!(wal_event["timestamp"], "2026-01-01T00:00:00.000Z");
+        assert_eq!(wal_event["timestamp_invalid"], "not-a-date");
+    }
+
+    /// A client-supplied `_trawl_wal_file` never reaches the WAL: compaction
+    /// projects that name as its synthetic provenance column, so a row
+    /// carrying it makes `read_json` fail to bind and wedges the service's
+    /// whole WAL. The event itself is still accepted.
+    #[test]
+    fn reserved_wal_file_key_stripped_from_events() {
+        let data = br#"{"service":"test","timestamp":"2025-06-01T12:00:00Z","_trawl_wal_file":"x","keep":"me"}"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.errors.is_empty(), "stripping is not a rejection");
+        assert_eq!(total_accepted(&parsed), 1);
+
+        let event = &service_maps(&parsed, "test")[0];
+        assert!(
+            !event.contains_key(compaction::WAL_FILE_COL),
+            "reserved key must be stripped, got {event:?}"
+        );
+        assert_eq!(
+            event.get("keep").and_then(serde_json::Value::as_str),
+            Some("me"),
+            "other user fields are untouched"
+        );
+
+        let wal_text = std::str::from_utf8(&parsed.batches["test"].ndjson).unwrap();
+        assert!(
+            !wal_text.contains(compaction::WAL_FILE_COL),
+            "reserved key must not reach the WAL bytes: {wal_text}"
         );
     }
 
