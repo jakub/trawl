@@ -124,6 +124,8 @@ A pool of N connections (default: `num_cpus`) sharing one in-memory DuckDB datab
 
 All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is written to a temp ndjson file and read by DuckDB alongside the parquet files. This ensures freshly ingested events (not yet compacted) are always visible. The union applies `TRY_CAST` to the hot side's `timestamp` — a malformed hot value degrades that one row, never the whole union.
 
+When the two sides disagree on a column's type, the union is retried with the conflicting columns cast to `VARCHAR` on both sides, preserving hot **and** cold rows. What counts as such a conflict is decided from evidence, not from the error text: DuckDB reports both an irreconcilable schema and an unconvertible value as `Conversion`-class errors, so the retry only fires when describing the two sources actually turns up a column they type differently. A genuine data-conversion error turns up none, is not misread as a schema conflict, and falls through to the policy below.
+
 A hot-only fallback is permitted only when it cannot hide cold data: on a genuine cold start (the glob matches no parquet files) or a missing-column user error. Any other database failure with cold files present returns an error — a cold-data drop is never a silent HTTP 200 (ADR-0008).
 
 ## SSE streaming

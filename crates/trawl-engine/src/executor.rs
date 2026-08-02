@@ -112,15 +112,25 @@ impl Executor {
         // field that is BIGINT in parquet but VARCHAR in the hot snapshot)
         // would otherwise fail the union. Detect the conflicting columns and
         // retry with them coerced to VARCHAR on both sides, preserving hot
-        // AND cold data. If the retry still fails, the outcome policy below
-        // returns the error whenever cold files exist — a cold-data drop is
-        // never silent (ADR-0008).
-        if matches!(
-            &outcome,
-            Err(EngineError::Database(e)) if is_union_type_conflict(e)
-        ) && let Ok(cols) = self.hot_cold_conflicts(source, hot_source)
-            && !cols.is_empty()
-        {
+        // AND cold data.
+        //
+        // The `Conversion` class is only the cheap pre-filter: a genuine
+        // data-conversion error carries it too. What makes this a *schema*
+        // conflict is the evidence — at least one column the two sources
+        // describe differently — so the conflicting columns are gathered
+        // first and `is_union_type_conflict` is asked with them in hand. A
+        // data error yields none, is not misread as a conflict, and skips
+        // the retry that could not have helped it (ADR-0008). Either way, a
+        // failure that survives to the outcome policy below returns the
+        // error whenever cold files exist — a cold-data drop is never silent.
+        let conflicts = match &outcome {
+            Err(EngineError::Database(e)) if is_conversion_error(e) => self
+                .hot_cold_conflicts(source, hot_source)
+                .ok()
+                .filter(|cols| is_union_type_conflict(e, cols)),
+            _ => None,
+        };
+        if let Some(cols) = conflicts {
             let coerced = emitter::emit_with_hot_source_coerced(&ast, source, hot_source, &cols)?;
             outcome = self.execute_emitted(&coerced, max_rows, utc_offset_secs);
         }
@@ -389,9 +399,11 @@ impl Executor {
             // time, so steady-state parquet is all-scalar and takes the fast path
             // above; this branch only fires on un-migrated/external parquet.
             Ok(cols) => self.describe_schema_columns_coerced(source, cols)?,
-            // Insurance: some paths/versions raise the conflict at describe. We
-            // have no fast-path baseline here, so reconcile from scratch.
-            Err(EngineError::Database(e)) if is_union_type_conflict(&e) => {
+            // Insurance: some paths/versions raise the conflict at describe.
+            // There is no second source to gather conflict evidence against
+            // here — the per-file reconcile below IS the evidence gathering —
+            // so the conversion class is the right (and only) trigger.
+            Err(EngineError::Database(e)) if is_conversion_error(&e) => {
                 self.describe_schema_columns_coerced(source, Vec::new())?
             }
             Err(e) => return Err(e),
@@ -881,24 +893,47 @@ fn error_class(msg: &str) -> Option<&str> {
     msg.split(':').next()?.strip_suffix(" Error")
 }
 
-/// Check if a `DuckDB` error is a column type conflict raised when a
-/// `UNION ALL BY NAME` (or `read_parquet(..., union_by_name=true)`) cannot
-/// reconcile a column's type across sources — e.g. JSON/STRUCT vs `VARCHAR`.
+/// Check if a `DuckDB` error carries the `Conversion` class — the class every
+/// failed cast reports, whether its cause is a *schema* the sources cannot
+/// reconcile or a *value* that cannot be converted.
 ///
-/// Keys off the error's class token (never a substring match anywhere in
-/// the body — ADR-0008): both the `UNION ALL BY NAME` path and the
-/// `read_parquet(union_by_name)` per-file remap path raise
-/// `Conversion`-class errors on the bundled `DuckDB` 1.5.5 (verified by the
-/// live-error tests below).
+/// Keys off the error's class token (never a substring match anywhere in the
+/// body — ADR-0008). Every irreconcilable kind mix raises this class on the
+/// bundled `DuckDB` 1.5.5, on both the `UNION ALL BY NAME` path and the
+/// `read_parquet(union_by_name)` per-file remap path (pinned by
+/// `conflicting_kind_mixes_all_carry_the_conversion_class`), so it is the
+/// right trigger for a cast-to-`VARCHAR` schema-reconciling fallback — the
+/// use compaction's rollup and merge paths make of it.
+///
+/// It is a *necessary but not sufficient* condition for a union type
+/// conflict: a genuine data-conversion error (`CAST('abc' AS INTEGER)`)
+/// carries the very same class, and no substring of the body separates the
+/// two either — both shapes say a value "can't be cast to the destination
+/// type" and both name a "source column". Callers that must not confuse the
+/// two ask [`is_union_type_conflict`], which additionally requires schema
+/// evidence.
 ///
 /// Deliberately does NOT match corruption ("too small to be a Parquet
 /// file") or missing-column binder errors: those are handled by quarantine
-/// and the benign-binder carve-out respectively. A false positive is
-/// harmless for the coerced retry (conflict detection finds no columns and
-/// falls through) and can no longer cause a silent cold drop — the outcome
-/// policy returns errors whenever cold files exist.
-pub fn is_union_type_conflict(e: &duckdb::Error) -> bool {
+/// and the benign-binder carve-out respectively.
+pub fn is_conversion_error(e: &duckdb::Error) -> bool {
     error_class(&e.to_string()) == Some("Conversion")
+}
+
+/// Check if a `DuckDB` failure is a union *type conflict*: two sources
+/// disagreeing on a column's type, which a cast-to-`VARCHAR` retry can fix.
+///
+/// The error class alone cannot decide this — a genuine data-conversion
+/// error (a VALUE that cannot be converted, e.g. `CAST('abc' AS INTEGER)`)
+/// is `Conversion`-class too, and the message body does not separate them
+/// (ADR-0008). So the classifier requires *evidence*: `conflicting_columns`
+/// is the set of columns whose described type actually differs between the
+/// two sources being unioned. A schema conflict always produces at least
+/// one; a data error produces none, so it is never misread as a schema
+/// conflict — it falls through to the caller's outcome policy, which returns
+/// the error rather than silently dropping cold data.
+fn is_union_type_conflict(e: &duckdb::Error, conflicting_columns: &[String]) -> bool {
+    is_conversion_error(e) && !conflicting_columns.is_empty()
 }
 
 /// Classification of the hot+cold union outcome that `run_query_with_hot`
@@ -1229,7 +1264,7 @@ mod tests {
 
     use super::{
         ColdAction, Executor, HotColdOutcome, cold_action, error_class, glob_list_items,
-        is_complex_type, is_union_type_conflict,
+        is_complex_type, is_conversion_error, is_union_type_conflict,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -1305,33 +1340,189 @@ mod tests {
             .expect_err("missing-column query must error")
     }
 
+    /// Provoke a live *data*-conversion error: a value that cannot be
+    /// converted, with no schema disagreement anywhere in sight.
+    fn data_conversion_error() -> duckdb::Error {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.prepare("SELECT CAST(x AS INTEGER) FROM (SELECT unnest(['1', 'abc']) AS x)")
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            })
+            .expect_err("casting 'abc' to INTEGER must error")
+    }
+
     #[test]
-    fn is_union_type_conflict_matches_real_strings() {
+    fn is_conversion_error_matches_real_strings() {
         let dir = tempfile::tempdir().unwrap();
 
         let remap = read_parquet_remap_error(dir.path());
         assert!(
-            is_union_type_conflict(&remap),
-            "read_parquet remap error should classify as a union type conflict: {remap}"
+            is_conversion_error(&remap),
+            "read_parquet remap error should classify as a conversion error: {remap}"
         );
 
         let conversion = union_conversion_error();
         assert!(
-            is_union_type_conflict(&conversion),
-            "UNION ALL BY NAME conversion error should classify as a union type conflict: {conversion}"
+            is_conversion_error(&conversion),
+            "UNION ALL BY NAME conversion error should classify as a conversion error: {conversion}"
         );
 
         let corrupt = corruption_error(dir.path());
         assert!(
-            !is_union_type_conflict(&corrupt),
-            "corruption error must NOT classify as a type conflict (handled by quarantine): {corrupt}"
+            !is_conversion_error(&corrupt),
+            "corruption error must NOT classify as a conversion error (handled by quarantine): {corrupt}"
         );
 
         let benign = benign_binder_error();
         assert!(
-            !is_union_type_conflict(&benign),
-            "benign missing-column error must NOT classify as a type conflict: {benign}"
+            !is_conversion_error(&benign),
+            "benign missing-column error must NOT classify as a conversion error: {benign}"
         );
+    }
+
+    #[test]
+    fn genuine_data_conversion_error_is_not_misread_as_a_union_type_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = data_conversion_error();
+
+        // The premise: neither the class token nor the message body can tell
+        // a value that cannot be converted from a schema that cannot be
+        // reconciled. Both are `Conversion`-class, and on the bundled 1.5.5
+        // both bodies name a "source column" and talk about casting to a
+        // "destination type". Anything keying off the error ALONE misreads
+        // this data error as a union type conflict.
+        assert_eq!(
+            error_class(&data.to_string()),
+            Some("Conversion"),
+            "a genuine data-conversion error is Conversion-class too: {data}"
+        );
+        assert!(is_conversion_error(&data));
+        assert!(is_conversion_error(&union_conversion_error()));
+
+        // So the classifier requires EVIDENCE — the columns the two sources
+        // actually describe differently. A data error has none, and is
+        // therefore never misread as a union type conflict (ADR-0008).
+        assert!(
+            !is_union_type_conflict(&data, &[]),
+            "a data-conversion error with no conflicting column must NOT \
+             classify as a union type conflict: {data}"
+        );
+
+        // The same evidence classifies a real schema conflict as one...
+        let conflict = union_conversion_error();
+        assert!(
+            is_union_type_conflict(&conflict, &["meta".to_string()]),
+            "a conversion error over a genuinely drifted column IS a union \
+             type conflict: {conflict}"
+        );
+
+        // ...and evidence alone is not enough either: an unrelated failure
+        // does not become a type conflict just because the schemas drift.
+        let corrupt = corruption_error(dir.path());
+        assert!(
+            !is_union_type_conflict(&corrupt, &["meta".to_string()]),
+            "corruption is not a type conflict even with drifted columns: {corrupt}"
+        );
+    }
+
+    #[test]
+    fn hot_cold_conflicts_separate_a_data_error_from_a_schema_conflict() {
+        // The evidence `is_union_type_conflict` consumes is not hand-made:
+        // prove it is empty for hot/cold sources that agree on every column
+        // (the situation a genuine data-conversion error arises in) and
+        // non-empty for sources that genuinely drift.
+        let dir = tempfile::tempdir().unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        setup
+            .execute_batch(&format!(
+                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                 'svc' AS service, 'abc' AS duration) TO '{}' (FORMAT PARQUET)",
+                dir.path().join("cold.parquet").display()
+            ))
+            .unwrap();
+        let exec = Executor::new().unwrap();
+        let source = format!("{}/*.parquet", dir.path().display());
+
+        // `duration` is VARCHAR on both sides — schemas agree.
+        let agreed = dir.path().join("agreed.ndjson");
+        std::fs::write(
+            &agreed,
+            "{\"timestamp\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":\"7\"}\n",
+        )
+        .unwrap();
+        assert!(
+            exec.hot_cold_conflicts(&source, agreed.to_str().unwrap())
+                .expect("describing matched sources must succeed")
+                .is_empty(),
+            "sources that agree on every column yield no conflict evidence"
+        );
+
+        // `duration` is VARCHAR cold but BIGINT hot — a real schema conflict.
+        let drifted = dir.path().join("drifted.ndjson");
+        std::fs::write(
+            &drifted,
+            "{\"timestamp\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":7}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            exec.hot_cold_conflicts(&source, drifted.to_str().unwrap())
+                .expect("describing drifted sources must succeed"),
+            vec!["duration".to_string()],
+            "a column typed differently on each side is the conflict evidence"
+        );
+    }
+
+    #[test]
+    fn conflicting_kind_mixes_all_carry_the_conversion_class() {
+        // Compaction's rollup and merge fallbacks trigger on the conversion
+        // class alone (there is no second source to describe until the
+        // fallback runs), so the class must cover every cross-file mix the
+        // old "remap"/"type mismatch" substrings used to catch. Pin the full
+        // kind matrix on both the read_parquet and UNION ALL BY NAME paths.
+        let mixes = [
+            ("{'a': 1}", "'plain'"),
+            ("{'a': 1}", "[1, 2]"),
+            ("{'a': 1}", "42"),
+            ("[1, 2]", "'plain'"),
+            ("'plain'", "{'a': 1}"),
+        ];
+        for (a, b) in mixes {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            write_meta_parquet(&conn, &dir.path().join("a.parquet"), a);
+            write_meta_parquet(&conn, &dir.path().join("b.parquet"), b);
+            let glob = format!("{}/*.parquet", dir.path().display());
+
+            let pq = conn
+                .prepare("SELECT * FROM read_parquet(?, union_by_name=true)")
+                .and_then(|mut stmt| {
+                    let mut rows = stmt.query([glob.as_str()])?;
+                    while rows.next()?.is_some() {}
+                    Ok(())
+                })
+                .expect_err("an irreconcilable kind mix must error on read_parquet");
+            assert!(
+                is_conversion_error(&pq),
+                "read_parquet mix {a} vs {b} must trigger the cast fallback: {pq}"
+            );
+
+            let un = conn
+                .prepare(&format!(
+                    "SELECT {a} AS meta UNION ALL BY NAME SELECT {b} AS meta"
+                ))
+                .and_then(|mut stmt| {
+                    let mut rows = stmt.query([])?;
+                    while rows.next()?.is_some() {}
+                    Ok(())
+                })
+                .expect_err("an irreconcilable kind mix must error on UNION ALL BY NAME");
+            assert!(
+                is_conversion_error(&un),
+                "union mix {a} vs {b} must trigger the cast fallback: {un}"
+            );
+        }
     }
 
     #[test]

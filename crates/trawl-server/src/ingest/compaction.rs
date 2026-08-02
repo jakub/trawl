@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
-use trawl_engine::{is_complex_type, is_union_type_conflict};
+use trawl_engine::{is_complex_type, is_conversion_error};
 
 use crate::hot_buffer::HotBuffer;
 use crate::state::CompactionStats;
@@ -805,7 +805,11 @@ fn rollup_day_inner(
     ));
     match fast {
         Ok(()) => {}
-        Err(e) if is_union_type_conflict(&e) => {
+        // A conversion-class failure is the trigger, not the verdict: the
+        // fallback per-file-describes the inputs and only casts columns that
+        // genuinely carry more than one type, so a failure that is not a
+        // schema conflict simply re-raises from there (ADR-0008).
+        Err(e) if is_conversion_error(&e) => {
             tracing::warn!(
                 event_type = "rollup_fallback",
                 compact_service = %service,
@@ -1334,7 +1338,11 @@ fn merge_with_existing(
 
     match result {
         Ok(()) => Ok(()),
-        Err(e) if is_union_type_conflict(&e) => {
+        // Trigger, not verdict: the fallback below describes both sides and
+        // re-raises the original error when they hold no conflicting column
+        // — so a genuine data-conversion error is not treated as a schema
+        // conflict here either (ADR-0008).
+        Err(e) if is_conversion_error(&e) => {
             tracing::warn!(
                 event_type = "compaction_fallback",
                 compact_service = %service,
