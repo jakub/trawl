@@ -94,6 +94,8 @@ pub struct WalLayer {
 }
 
 struct WalLayerInner {
+    /// Env stamped onto telemetry events (`default_env`).
+    env: String,
     handle: WalHandle,
     buffer: Mutex<Vec<u8>>,
     /// Cached hostname, resolved once at layer creation.
@@ -118,8 +120,10 @@ impl std::fmt::Debug for WalLayer {
 }
 
 impl WalLayer {
-    /// Create a new layer backed by the given handle.
-    pub fn new(handle: WalHandle) -> Self {
+    /// Create a new layer backed by the given handle. `env` is the env
+    /// telemetry events are stamped with (`default_env`) — the records
+    /// carry it as a column, matching where the WAL handle files them.
+    pub fn new(handle: WalHandle, env: &str) -> Self {
         let host = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -129,6 +133,7 @@ impl WalLayer {
                 handle,
                 buffer: Mutex::new(Vec::with_capacity(8192)),
                 host,
+                env: env.to_owned(),
                 dropped_bytes: AtomicU64::new(0),
                 bus: OnceLock::new(),
                 hot_buffer: OnceLock::new(),
@@ -358,17 +363,20 @@ where
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| message_to_event_type(&message));
 
-        let mut record = serde_json::Map::with_capacity(8 + span_fields.len());
-        record.insert(
-            "timestamp".into(),
-            json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
-        );
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let level = metadata.level().as_str().to_ascii_lowercase();
+        let mut record = serde_json::Map::with_capacity(12 + span_fields.len());
+        record.insert("_time".into(), json!(&now));
+        record.insert("_ingested".into(), json!(&now));
+        record.insert("env".into(), json!(&self.inner.env));
         record.insert("service".into(), json!("trawld"));
         record.insert("host".into(), json!(&self.inner.host));
-        record.insert(
-            "level".into(),
-            json!(metadata.level().as_str().to_ascii_lowercase()),
-        );
+        // The server is the producer, so severity maps directly from the
+        // tracing level onto the OTel ladder (ADR-0009).
+        if let Some(n) = trawl_core::severity::number_for_token(&level) {
+            record.insert("severity".into(), json!(n));
+        }
+        record.insert("severity_text".into(), json!(&level));
         record.insert("target".into(), json!(metadata.target()));
         record.insert("event_type".into(), json!(event_type));
         record.insert("message".into(), json!(message));
@@ -377,6 +385,12 @@ where
         for (k, v) in span_fields {
             record.entry(k).or_insert(v);
         }
+
+        // `_raw` is required by the envelope: for server-generated events
+        // the canonical serialization of the record IS the most original
+        // form available.
+        let raw = serde_json::Value::Object(record.clone()).to_string();
+        record.insert("_raw".into(), json!(raw));
 
         // Clone the map for event bus publishing (before moving into Value).
         self.inner.event_maps.lock().push(record.clone());
@@ -511,7 +525,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
 
         let handle = WalHandle::new();
-        let layer = WalLayer::new(handle.clone());
+        let layer = WalLayer::new(handle.clone(), "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -557,7 +571,7 @@ mod tests {
         let handle = WalHandle::new();
         handle.set(Arc::clone(&writer), "prod");
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -599,7 +613,7 @@ mod tests {
         let handle = WalHandle::new();
         handle.set(Arc::clone(&writer), "prod");
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -635,8 +649,12 @@ mod tests {
         assert_eq!(parsed["user"], "alice");
         assert_eq!(parsed["rows"], 42);
         assert_eq!(parsed["message"], "test complete");
-        assert!(parsed["timestamp"].is_string());
-        assert!(parsed["level"].is_string());
+        assert!(parsed["_time"].is_string());
+        assert!(parsed["_ingested"].is_string());
+        assert!(parsed["_raw"].is_string());
+        assert_eq!(parsed["env"], "prod");
+        assert_eq!(parsed["severity"], 9, "tracing info maps to OTel 9");
+        assert_eq!(parsed["severity_text"], "info");
         assert!(parsed["target"].is_string());
     }
 
@@ -651,7 +669,7 @@ mod tests {
         let handle = WalHandle::new();
         handle.set(Arc::clone(&writer), "prod");
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -700,7 +718,7 @@ mod tests {
         let handle = WalHandle::new();
         handle.set(Arc::clone(&writer), "prod");
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -739,7 +757,7 @@ mod tests {
         let bus = Arc::new(LocalEventBus::new(16));
         let mut sub = bus.subscribe();
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         layer.set_bus(Arc::clone(&bus));
         let layer_ref = layer.clone();
 

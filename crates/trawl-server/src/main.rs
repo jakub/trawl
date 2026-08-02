@@ -171,6 +171,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handles = trawl_server::syslog::spawn_syslog(
             &config.syslog,
+            config.ingest.default_env.as_str().into(),
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
             state.ingest.syslog_stats.clone(),
             shutdown_rx,
@@ -437,7 +438,7 @@ fn init_tracing(
     if use_telemetry {
         // WAL layer replaces the JSON file logger.
         let handle = WalHandle::new();
-        let wal_layer = WalLayer::new(handle.clone());
+        let wal_layer = WalLayer::new(handle.clone(), &config.ingest.default_env);
         let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>
 
         if monitor_active {

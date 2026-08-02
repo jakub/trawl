@@ -33,6 +33,7 @@ use self::batch::SyslogBatcher;
 /// have shut down. Send `true` on `shutdown_tx` to initiate graceful shutdown.
 pub fn spawn_syslog(
     config: &SyslogConfig,
+    default_env: Arc<str>,
     pipeline: Arc<PipelineWriter>,
     syslog_stats: Option<Arc<SyslogStats>>,
     shutdown_rx: watch::Receiver<bool>,
@@ -53,14 +54,21 @@ pub fn spawn_syslog(
     // Spawn UDP listener.
     if config.udp_enabled {
         let udp_config = config.clone();
+        let udp_env = Arc::clone(&default_env);
         let udp_sender = sender.clone();
         let udp_shutdown = shutdown_rx.clone();
         let udp_cidrs = cidrs.clone();
         let udp_stats = syslog_stats.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) =
-                udp::run_udp_listener(&udp_config, udp_sender, udp_cidrs, udp_stats, udp_shutdown)
-                    .await
+            if let Err(e) = udp::run_udp_listener(
+                &udp_config,
+                &udp_env,
+                udp_sender,
+                udp_cidrs,
+                udp_stats,
+                udp_shutdown,
+            )
+            .await
             {
                 tracing::error!(event_type = "syslog_udp_error", error = %e, "UDP syslog listener failed");
             }
@@ -70,14 +78,21 @@ pub fn spawn_syslog(
     // Spawn TCP listener.
     if config.tcp_enabled {
         let tcp_config = config.clone();
+        let tcp_env = default_env;
         let tcp_sender = sender;
         let tcp_shutdown = shutdown_rx;
         let tcp_cidrs = cidrs;
         let tcp_stats = syslog_stats;
         handles.push(tokio::spawn(async move {
-            if let Err(e) =
-                tcp::run_tcp_listener(&tcp_config, tcp_sender, tcp_cidrs, tcp_stats, tcp_shutdown)
-                    .await
+            if let Err(e) = tcp::run_tcp_listener(
+                &tcp_config,
+                &tcp_env,
+                tcp_sender,
+                tcp_cidrs,
+                tcp_stats,
+                tcp_shutdown,
+            )
+            .await
             {
                 tracing::error!(event_type = "syslog_tcp_error", error = %e, "TCP syslog listener failed");
             }
