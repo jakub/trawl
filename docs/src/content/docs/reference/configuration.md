@@ -137,6 +137,9 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `hot_buffer_max_bytes` | byte size | `"100M"` | Max hot buffer size (serialized) |
 | `stats_interval_secs` | integer | `60` | Server stats telemetry interval; `0` disables |
 | `telemetry_flush_interval_secs` | integer | `1` | Telemetry WAL flush interval |
+| `default_env` | string | `"prod"` | Fills a missing `env` on ingested events (repair code `env.defaulted`). Must pass the env charset and be a member of `envs` |
+| `envs` | string list | `[default_env]` | Environment allowlist (ADR-0009). Events with an unlisted `env` hard-reject. Entries must match `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved. Validated at load — trawld refuses to start otherwise. The allowlist gates writes, not reads: removing an env stops new ingest but its directories stay queryable and age out normally |
+| `trusted_relays` | CIDR list | `[]` | Peers (collectors/relays) whose address must never be stamped as an event's `host`: a host-less event from one of these is rejected instead of peer-repaired. Invalid entries are boot-fatal |
 
 ### `[retention]`
 

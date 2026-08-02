@@ -89,13 +89,13 @@ if !exists(.hostname) || to_string(.hostname) ?? "" == "" {
 severity = to_string(.severity) ?? "informational"
 sev = downcase(severity)
 if sev == "emergency" || sev == "alert" || sev == "critical" || sev == "error" {
-  .level = "error"
+  .severity_text = "error"
 } else if sev == "warning" {
-  .level = "warn"
+  .severity_text = "warn"
 } else if sev == "debug" {
-  .level = "debug"
+  .severity_text = "debug"
 } else {
-  .level = "info"
+  .severity_text = "info"
 }
 
 # --- preserve syslog metadata ---
@@ -107,6 +107,7 @@ del(.appname)
 del(.facility)
 del(.severity)
 del(.source_ip)
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.hostname)
 del(.procid)

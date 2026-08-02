@@ -43,22 +43,22 @@ A `tokio::sync::broadcast` channel (capacity 4096) publishing `Arc<IngestBatch>`
 
 Every 10 seconds, the compaction task:
 
-1. Scans the WAL directory for `.ndjson` files older than 10 seconds
+1. Scans each env directory (`wal/{env}/`) for `.ndjson` files older than 10 seconds
 2. Groups them by service
 3. For each service, spawns a blocking task with an ephemeral DuckDB connection:
-   - `read_json_auto([wal files])` → repair timestamps (below)
+   - `read_json_auto([wal files])` → repair `_time`/`_ingested` (below)
    - `UNION ALL BY NAME` with existing parquet (if any)
-   - `COPY TO data/YYYY-MM-DD/HH/service.parquet` (atomic rename)
-4. Drains the hot buffer entries for compacted batches
+   - `COPY TO data/{env}/YYYY-MM-DD/HH/{service}.parquet` (atomic rename)
+4. Drains the hot buffer entries for compacted batches (drain keys are `{env}/{wal-stem}`)
 5. Deletes processed WAL files
 
 ### Timestamp repair
 
-The partition key is never hard-CAST in emitted SQL (ADR-0008) — one malformed value must never wedge a batch. Compaction resolves each row's `timestamp` through a three-arm `COALESCE`:
+The partition key is never hard-CAST in emitted SQL (ADR-0008) — one malformed value must never wedge a batch. Compaction resolves each row's `_time` (and `_ingested`, same ladder) through a three-arm `COALESCE`:
 
 1. `TRY_CAST` of the raw value — always succeeds for post-canonicalization data;
 2. the ingest instant recovered from the row's **own** WAL filename (`{service}_{unix_millis}_...`), read per-row via `read_json(..., filename=...)` — this drains WAL written before the ingest fix with no operator step;
-3. the compaction instant — so no parquet row ever carries a NULL timestamp (a NULL partition key would sort first and fall outside every `last=` filter).
+3. the compaction instant — so no parquet row ever carries a NULL `_time` (a NULL partition key would sort first and fall outside every `last=` filter).
 
 ### Daily rollup
 
@@ -66,28 +66,37 @@ Once per day, hourly parquets are merged into a single daily parquet per service
 
 ### Retention
 
-Age-based (default 90 days) + disk pressure (minimum 1 GiB free). The unit of deletion is a full date directory.
+Age-based (default 90 days) + disk pressure (minimum 1 GiB free). The unit of deletion is a full date directory inside one env (`data/{env}/{date}/`) — per-env deletion is O(1) and never touches sibling envs. Disk-pressure candidates are merged oldest-first across envs.
 
 ## Storage layout
 
-Three-tier storage hierarchy:
+Two path dimensions besides time (ADR-0009): `env` outermost, `service` as the filename. Path encoding is injective by validation — both values are constrained at ingest and written verbatim, so `api.v2` and `api_v2` are distinct files and pruning is exact.
 
 ```
 data/
-  2026-03-14/
-    00/
-      nginx.parquet          # hourly partition
+  EPOCH                      # storage epoch marker, content "2"
+  prod/
+    2026-03-14/
+      00/
+        nginx.parquet        # hourly partition
+        sshd.parquet
+      01/
+        nginx.parquet
+      ...
+      nginx.parquet          # daily rollup (merged hourly files)
       sshd.parquet
-    01/
-      nginx.parquet
-    ...
-    nginx.parquet            # daily rollup (merged hourly files)
-    sshd.parquet
-  2026-03-13/
-    ...
+    2026-03-13/
+      ...
+  lab/
+    2026-03-14/
+      ...
 ```
 
-Schema is fully dynamic — no predefined columns. `union_by_name=true` handles heterogeneous schemas across services. Timestamps are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
+The envelope columns (`_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message`) are declared and enforced at ingest; user fields beyond them stay fully dynamic — `union_by_name=true` handles heterogeneous schemas across services. `_time`/`_ingested` are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
+
+### The epoch cutover
+
+`data/EPOCH` (content `2`) marks the post-ADR-0009 layout; the legacy layout has none. At boot trawld runs a restartable, filesystem-only decision table: a fresh install creates the marked root; an epoch-2 root boots normally; a legacy root is renamed to `data.pre-schema-v2/` (an external `wal_dir` moves to `{wal_dir}.pre-schema-v2` with it) and a fresh marked root is created; a root with no marker AND an existing set-aside refuses to start with instructions. trawl never deletes the set-aside directory — remove it manually to reclaim disk.
 
 ### App-state store
 

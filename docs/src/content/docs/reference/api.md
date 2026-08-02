@@ -212,7 +212,16 @@ Content-Type: application/json
 
 Accepts JSON arrays or ndjson. Supports optional gzip compression (`Content-Encoding: gzip`). Requires a token whose roles grant the `ingest` permission.
 
-`timestamp` handling: a valid value is canonicalized to RFC 3339 UTC at microsecond precision. Valid means, after trimming surrounding whitespace: an RFC 3339 string; a date-time carrying an ISO 8601 *basic* offset (`+0530`, `+02`), as Java and Go encoders emit; or an offset-less date-time, read as UTC. Date and time may be separated by `T` or a space, the date may be `YYYY-MM-DD` or `YYYY/MM/DD`, seconds and their fraction are optional (`HH:MM` is accepted), and a bare date with no time reads as midnight UTC. An absent timestamp defaults to the request-arrival time. A present but malformed value (unparseable string, object, number, etc.) is **substituted, not rejected**: `timestamp` becomes the arrival time and the original value is preserved in a `timestamp_invalid` field (truncated to 256 chars), queryable like any other field. Repairs are counted in `trawl_ingest_events_repaired_total` and do not affect the `accepted`/`rejected` counts in the response.
+Every accepted event is canonicalized into the declared envelope (ADR-0009) — see the [Vector integration guide](/getting-started/vector-integration/) for the full field table, accepted wire aliases (`timestamp`/`@timestamp` → `_time`, `level` → severity derivation), and the severity token table. The policy is **repair when the server has an honest answer; reject when it would guess**:
+
+- `_time` missing or unparseable → arrival time, repair code `time.from_ingest`; parseable but implausible (>10y past / >1d future) → kept, flagged `time.out_of_range`
+- `env` missing → `default_env` (`env.defaulted`); present but not in the configured allowlist → **rejected** with a typed reason
+- `host` missing → filled from the peer IP (`host.from_peer`) — **rejected** instead when the peer is in `trusted_relays`
+- `service` missing, non-string, empty, over 128 bytes, containing invalid characters, or dot-leading → **rejected** with a typed reason
+- unmappable severity → `severity` NULL, `severity.unmapped`, never a rejection
+- client-sent `_ingested`/`_repairs` or a non-string `_raw` → stripped and replaced (`meta.stripped`)
+
+Repairs are recorded per-event in `_repairs` (comma-separated codes, NULL when untouched) and counted in `trawl_ingest_repairs_total{code, service}`; they do not affect the `accepted`/`rejected` counts in the response. Rejections are per-event: valid siblings in the same batch still land.
 
 Reserved field: `_trawl_wal_file` is trawl's own, used internally to carry each row's source WAL file through compaction. If an event supplies it, the key is silently dropped before the event is written — the rest of the event is accepted unchanged.
 

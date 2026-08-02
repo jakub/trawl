@@ -90,17 +90,17 @@ if compose_project != "" {
 # stderr → error, otherwise try to detect from message content
 stream = to_string(.stream) ?? ""
 if stream == "stderr" {
-  .level = "error"
+  .severity_text = "error"
 } else {
   msg = downcase(to_string(.message) ?? "")
   if match(msg, r'\b(?:error|fatal|panic|crit)\b') {
-    .level = "error"
+    .severity_text = "error"
   } else if match(msg, r'\b(?:warn|warning)\b') {
-    .level = "warn"
+    .severity_text = "warn"
   } else if match(msg, r'\b(?:debug|trace)\b') {
-    .level = "debug"
+    .severity_text = "debug"
   } else {
-    .level = "info"
+    .severity_text = "info"
   }
 }
 
@@ -113,5 +113,6 @@ if stream == "stderr" {
 del(.label)
 del(.stream)
 del(.container_created_at)
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 '''

@@ -25,10 +25,42 @@ status=200,301,404              # IN list (comma-separated)
 status>=400                     # comparison
 path=/api/*                     # glob pattern
 message=/error.*/               # regex pattern (slash-delimited)
-service="Activity Monitor"      # quoted values for spaces/special chars
+host="db host"                  # quoted values for spaces/special chars
+env=prod                        # environment (path-pruned)
 ```
 
 **Operators:** `=`, `!=`, `>`, `>=`, `<`, `<=`
+
+### Severity: the `level` alias
+
+`level` is a **query alias for the numeric `severity` column** (OTel
+SeverityNumber 1-24). Name tokens are matched case-insensitively and
+compile to band predicates:
+
+```
+level=error                     # severity BETWEEN 17 AND 20 (the ERROR band)
+level!=info                     # NOT BETWEEN 9 AND 12, or severity IS NULL
+level=warn,error                # either band
+level>=warn                     # severity >= 13 (the token's exact number)
+```
+
+- Equality/IN match the whole band containing the token (`notice` falls
+  inside the INFO band).
+- Ordered comparisons use the token's exact number (`warn` = 13,
+  `error` = 17, ...).
+- Valid tokens: `trace`/`t`, `debug`/`d`, `info`/`i`, `notice`,
+  `warn`/`warning`/`w`, `error`/`err`/`e`, `fatal`/`critical`/`crit`/`f`,
+  `alert`, `emerg`/`panic`. Anything else (or a glob/regex on `level`) is
+  a query error — match the original spelling with
+  `severity_text="..."` instead.
+- `level` works only in search-stage filters; in projections, `stats by`,
+  or `sort` use `severity`/`severity_text` (there is no stored `level`
+  column).
+
+### Time aliases
+
+`timestamp` and `@timestamp` are query aliases for the physical `_time`
+column — all three resolve identically.
 
 ### Text search
 
@@ -37,6 +69,10 @@ error                           # bare word — substring match
 -debug                          # negated — exclude matches
 "connection refused"            # exact phrase
 ```
+
+Bare-word and phrase search match the `message` column **and** `_raw`
+(the preserved original), so content that was parsed away is still
+findable. Negation excludes an event only when neither matches.
 
 ### Time filters
 
