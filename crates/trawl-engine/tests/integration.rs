@@ -280,6 +280,99 @@ fn timechart_minute_buckets() {
 }
 
 #[test]
+fn timechart_bucket_values_group_by_full_expression() {
+    // The bucket is aliased AS "_time" — the same name as the source column
+    // it is derived from. Grouping must reference the full time_bucket
+    // expression, not the ambiguous alias, or DuckDB groups by the raw
+    // source column and the aggregation is silently wrong (one output row
+    // per input row). Pin actual bucket values and counts, not SQL text.
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("* | timechart span=1m count()", &glob)
+        .unwrap();
+    assert_eq!(result.row_count(), 3, "three distinct minute buckets");
+    let buckets: Vec<(String, i64)> = result
+        .rows
+        .iter()
+        .map(|r| {
+            let Value::String(t) = &r[0] else {
+                panic!("bucket must format as a timestamp string, got {:?}", r[0])
+            };
+            let Value::Integer(c) = r[1] else {
+                panic!("count must be an integer, got {:?}", r[1])
+            };
+            (t.clone(), c)
+        })
+        .collect();
+    assert_eq!(
+        buckets,
+        vec![
+            ("2024-01-15 10:00:00".to_string(), 6),
+            ("2024-01-15 10:01:00".to_string(), 4),
+            ("2024-01-15 10:02:00".to_string(), 3),
+        ],
+        "rows must aggregate into whole-minute buckets"
+    );
+}
+
+#[test]
+fn level_gte_warn_returns_only_warn_and_above() {
+    // `level>=warn` compiles to `severity >= 13`; only WARN-and-above rows
+    // (severity 13 and 17 in the fixture) come back.
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("level>=warn", &glob).unwrap();
+    assert_eq!(result.row_count(), 7, "4 warn + 3 error rows");
+    let sev_idx = result
+        .columns
+        .iter()
+        .position(|c| c.name == "severity")
+        .expect("severity column present");
+    for row in &result.rows {
+        let Value::Integer(sev) = row[sev_idx] else {
+            panic!("severity must be an integer, got {:?}", row[sev_idx])
+        };
+        assert!(sev >= 13, "row below the WARN band leaked through: {sev}");
+    }
+}
+
+#[test]
+fn level_eq_error_matches_the_error_band() {
+    // `level=error` compiles to `severity BETWEEN 17 AND 20`.
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("level=error", &glob).unwrap();
+    assert_eq!(result.row_count(), 3, "exactly the three ERROR-band rows");
+}
+
+#[test]
+fn bare_word_matches_content_only_in_raw() {
+    // "gateway-detail" appears only in one row's `_raw`, never in `message`
+    // — bare-word search must cover both columns.
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("gateway-detail", &glob).unwrap();
+    assert_eq!(result.row_count(), 1, "the _raw-only term must match");
+
+    // And a message-only term still matches (that row's _raw is "raw4").
+    let result = exec.run_query_max("redirect", &glob).unwrap();
+    assert_eq!(result.row_count(), 1, "message-only terms keep matching");
+}
+
+#[test]
+fn well_known_fields_match_core_schema() {
+    // trawl-api duplicates the envelope ordering constants because it does
+    // not depend on trawl-core; this pins the two in sync.
+    assert_eq!(
+        trawl_api::value::WELL_KNOWN_LOG_FIELDS,
+        trawl_core::schema::LEADING_LOG_FIELDS,
+        "WELL_KNOWN_LOG_FIELDS must mirror trawl_core::schema::LEADING_LOG_FIELDS"
+    );
+    assert_eq!(
+        trawl_api::value::TRAILING_LOG_FIELDS,
+        trawl_core::schema::TRAILING_LOG_FIELDS,
+        "TRAILING_LOG_FIELDS must mirror trawl_core::schema::TRAILING_LOG_FIELDS"
+    );
+}
+
+#[test]
 fn pivot_on_service() {
     let (exec, glob) = setup();
     let result = exec
@@ -350,10 +443,13 @@ fn describe_schema_returns_columns() {
     let schema = exec.describe_schema(&glob).unwrap();
 
     let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
-    assert!(names.contains(&"timestamp"), "missing timestamp column");
+    assert!(names.contains(&"_time"), "missing _time column");
+    assert!(names.contains(&"_ingested"), "missing _ingested column");
+    assert!(names.contains(&"_raw"), "missing _raw column");
+    assert!(names.contains(&"env"), "missing env column");
     assert!(names.contains(&"host"), "missing host column");
     assert!(names.contains(&"service"), "missing service column");
-    assert!(names.contains(&"level"), "missing level column");
+    assert!(names.contains(&"severity"), "missing severity column");
     assert!(names.contains(&"message"), "missing message column");
     assert!(schema.file_count > 0, "should find fixture files");
 }
@@ -381,7 +477,7 @@ fn setup_kv() -> (Executor, String) {
         std::fs::create_dir_all(&dir).unwrap();
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE kv_logs (timestamp TIMESTAMP, host VARCHAR, message VARCHAR);
+            "CREATE TABLE kv_logs (_time TIMESTAMP, host VARCHAR, message VARCHAR);
              INSERT INTO kv_logs VALUES
              ('2024-01-15 10:00:00', 'web01', 'method=GET status=200 path=/api duration=0.045'),
              ('2024-01-15 10:00:01', 'web01', 'method=POST status=500 path=/api/create duration=1.234'),
@@ -536,7 +632,7 @@ fn hot_cold_type_conflict_keeps_both_rows() {
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
         cold.display()
@@ -545,7 +641,7 @@ fn hot_cold_type_conflict_keeps_both_rows() {
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
 
@@ -582,7 +678,7 @@ fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
         full.join("cold.parquet").display()
@@ -591,7 +687,7 @@ fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
 
@@ -628,7 +724,7 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows() {
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
         cold.display()
@@ -637,7 +733,7 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows() {
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
 
@@ -680,7 +776,7 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_sourc
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
         full.join("cold.parquet").display()
@@ -689,7 +785,7 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_sourc
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
 
@@ -733,7 +829,7 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, 'cold row' AS message) \
          TO '{}' (FORMAT PARQUET)",
         cold.display()
@@ -742,7 +838,7 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"hot row\"}\n",
+        "{\"_time\":\"not-a-date\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hot row\"}\n",
     )
     .unwrap();
 
@@ -761,8 +857,8 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 
 #[test]
 fn hot_sparse_repair_column_survives_inside_the_sample_window() {
-    // `timestamp_invalid` is by construction sparse — it appears only on
-    // repaired events (ADR-0008). DuckDB's JSON auto-detection samples a
+    // `_repairs` is by construction sparse — it appears only on repaired
+    // events (ADR-0009). DuckDB's JSON auto-detection samples a
     // bounded prefix by default (~20480 rows) and then errors on any later
     // record carrying a key outside the inferred schema, so the hot-buffer
     // snapshot writer hoists one event per novel key to the front of the
@@ -781,13 +877,13 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
         let hot = dir.path().join("hot.ndjson");
 
         let mut lines = String::from(
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\
-             \"message\":\"repaired\",\"timestamp_invalid\":\"not-a-date\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\
+             \"message\":\"repaired\",\"_repairs\":\"time.from_ingest\"}\n",
         );
         for i in 0..30_000 {
             writeln!(
                 lines,
-                "{{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
+                "{{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
             )
             .unwrap();
         }
@@ -796,7 +892,7 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
         if with_cold {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(&format!(
-                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                               'svc' AS service, 'cold row' AS message) \
                  TO '{}' (FORMAT PARQUET)",
                 dir.path().join("cold.parquet").display()
@@ -812,9 +908,18 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
 
         let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
         assert!(
-            col_names.contains(&"timestamp_invalid"),
-            "the preserved original must survive a hot snapshot larger than the \
-             JSON sample window (with_cold={with_cold}); got columns {col_names:?}"
+            col_names.contains(&"_repairs"),
+            "the sparse repair column must survive a hot snapshot larger than \
+             the JSON sample window (with_cold={with_cold}); got columns {col_names:?}"
+        );
+        // Row counts pin that this rode the real union (with cold present)
+        // rather than a silent hot-only fallback.
+        let expected = 30_001 + usize::from(with_cold);
+        assert_eq!(
+            result.row_count(),
+            expected,
+            "every hot row (and the cold row when present) must survive \
+             (with_cold={with_cold})"
         );
     }
 }

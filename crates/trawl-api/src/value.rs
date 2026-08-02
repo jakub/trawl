@@ -165,12 +165,30 @@ impl fmt::Display for Value {
     }
 }
 
-/// Fields that appear first in reordered query results.
+/// Fields that appear first in reordered query results (ADR-0009 envelope).
 ///
 /// When a query has no explicit column selection (`table`/`fields`) and no
 /// aggregation (`stats`/`top`/etc.), columns are reordered so these appear
-/// first in this order, followed by remaining columns in their original order.
-pub const WELL_KNOWN_LOG_FIELDS: &[&str] = &["timestamp", "host", "service", "level", "message"];
+/// first in this order, followed by remaining columns in their original
+/// order, with [`TRAILING_LOG_FIELDS`] demoted to the very end.
+///
+/// Kept in sync with `trawl_core::schema::LEADING_LOG_FIELDS` (duplicated
+/// because trawl-api does not depend on trawl-core; a trawl-engine test
+/// asserts parity).
+pub const WELL_KNOWN_LOG_FIELDS: &[&str] = &[
+    "_time",
+    "env",
+    "service",
+    "host",
+    "severity",
+    "severity_text",
+    "message",
+];
+
+/// Envelope metadata columns demoted to the end of reordered results.
+///
+/// Kept in sync with `trawl_core::schema::TRAILING_LOG_FIELDS`.
+pub const TRAILING_LOG_FIELDS: &[&str] = &["_raw", "_ingested", "_repairs"];
 
 /// Column metadata from a query result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -208,6 +226,13 @@ impl QueryResult {
         self.rows.is_empty()
     }
 
+    /// Reorder columns for log display: [`WELL_KNOWN_LOG_FIELDS`] first,
+    /// [`TRAILING_LOG_FIELDS`] last, everything else in between in its
+    /// original order.
+    pub fn reorder_log_columns(&mut self) {
+        self.reorder_columns_full(WELL_KNOWN_LOG_FIELDS, TRAILING_LOG_FIELDS);
+    }
+
     /// Reorder columns so `preferred` field names appear first.
     ///
     /// Fields in `preferred` that exist in the result are moved to the front
@@ -216,6 +241,12 @@ impl QueryResult {
     ///
     /// Both `columns` and every row in `rows` are permuted together.
     pub fn reorder_columns(&mut self, preferred: &[&str]) {
+        self.reorder_columns_full(preferred, &[]);
+    }
+
+    /// Reorder columns: `preferred` first, `trailing` demoted to the end,
+    /// remaining columns in their original order between them.
+    pub fn reorder_columns_full(&mut self, preferred: &[&str], trailing: &[&str]) {
         if self.columns.is_empty() {
             return;
         }
@@ -232,8 +263,16 @@ impl QueryResult {
             }
         }
         for (i, &u) in used.iter().enumerate() {
-            if !u {
+            if !u && !trailing.contains(&self.columns[i].name.as_str()) {
                 order.push(i);
+            }
+        }
+        for &tr in trailing {
+            if let Some(idx) = self.columns.iter().position(|c| c.name == tr)
+                && !used[idx]
+            {
+                order.push(idx);
+                used[idx] = true;
             }
         }
 
@@ -326,7 +365,7 @@ mod tests {
                 col("pid"),
                 col("host"),
                 col("message"),
-                col("timestamp"),
+                col("_time"),
                 col("status"),
             ],
             rows: vec![vec![
@@ -341,13 +380,59 @@ mod tests {
         result.reorder_columns(WELL_KNOWN_LOG_FIELDS);
 
         let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["timestamp", "host", "message", "pid", "status"]);
+        assert_eq!(names, vec!["_time", "host", "message", "pid", "status"]);
         // Row data must follow the same permutation.
         assert_eq!(result.rows[0][0], Value::String("2026-01-01".into()));
         assert_eq!(result.rows[0][1], Value::String("web-1".into()));
         assert_eq!(result.rows[0][2], Value::String("ok".into()));
         assert_eq!(result.rows[0][3], Value::Integer(1));
         assert_eq!(result.rows[0][4], Value::Integer(200));
+    }
+
+    /// The full log ordering: leading envelope first, `_raw`/`_ingested`/
+    /// `_repairs` demoted to the very end, user fields in between.
+    #[test]
+    fn reorder_log_columns_demotes_trailing() {
+        let mut result = QueryResult {
+            columns: vec![
+                col("_raw"),
+                col("pid"),
+                col("_ingested"),
+                col("host"),
+                col("_repairs"),
+                col("message"),
+                col("_time"),
+            ],
+            rows: vec![vec![
+                Value::String("raw".into()),
+                Value::Integer(1),
+                Value::String("ing".into()),
+                Value::String("web-1".into()),
+                Value::Null,
+                Value::String("ok".into()),
+                Value::String("t".into()),
+            ]],
+        };
+
+        result.reorder_log_columns();
+
+        let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "_time",
+                "host",
+                "message",
+                "pid",
+                "_raw",
+                "_ingested",
+                "_repairs"
+            ]
+        );
+        // Rows permute with the columns.
+        assert_eq!(result.rows[0][0], Value::String("t".into()));
+        assert_eq!(result.rows[0][4], Value::String("raw".into()));
+        assert_eq!(result.rows[0][6], Value::Null);
     }
 
     #[test]
@@ -366,7 +451,7 @@ mod tests {
     #[test]
     fn reorder_columns_noop_when_already_ordered() {
         let mut result = QueryResult {
-            columns: vec![col("timestamp"), col("host"), col("extra")],
+            columns: vec![col("_time"), col("host"), col("extra")],
             rows: vec![vec![
                 Value::String("t".into()),
                 Value::String("h".into()),
@@ -377,7 +462,7 @@ mod tests {
         result.reorder_columns(WELL_KNOWN_LOG_FIELDS);
 
         let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["timestamp", "host", "extra"]);
+        assert_eq!(names, vec!["_time", "host", "extra"]);
     }
 
     #[test]

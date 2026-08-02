@@ -80,7 +80,7 @@ impl Executor {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
         }
         if emitted.needs_column_reorder {
-            result.reorder_columns(trawl_api::value::WELL_KNOWN_LOG_FIELDS);
+            result.reorder_log_columns();
         }
         Ok(result)
     }
@@ -192,7 +192,7 @@ impl Executor {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
         }
         if emitted.needs_column_reorder {
-            result.reorder_columns(trawl_api::value::WELL_KNOWN_LOG_FIELDS);
+            result.reorder_log_columns();
         }
         Ok(result)
     }
@@ -373,10 +373,17 @@ impl Executor {
         let hot_reader = emitter::hot_source_reader(hot_source)?;
 
         let cold = self.describe_types(&format!("SELECT * FROM {cold_reader}"))?;
-        // Describe the hot side with the same timestamp cast the union
-        // applies, so the always-TIMESTAMP key isn't flagged as a conflict.
+        // Describe the hot side with the same timestamp casts the union
+        // applies — BOTH envelope TIMESTAMP columns (`_time`, `_ingested`,
+        // trawl_core::schema::TIMESTAMP_COLUMNS) — so the always-TIMESTAMP
+        // keys aren't flagged as conflicts.
+        let replace_list = trawl_core::schema::TIMESTAMP_COLUMNS
+            .iter()
+            .map(|col| format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         let hot = self.describe_types(&format!(
-            "SELECT * REPLACE (TRY_CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") FROM {hot_reader}"
+            "SELECT * REPLACE ({replace_list}) FROM {hot_reader}"
         ))?;
 
         let hot_types: std::collections::HashMap<String, String> = hot.into_iter().collect();
@@ -1355,7 +1362,7 @@ mod tests {
     /// `VARCHAR`). Mirrors the cold-fixture shape used in `integration.rs`.
     fn write_meta_parquet(conn: &Connection, path: &Path, meta_expr: &str) {
         conn.execute_batch(&format!(
-            "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+            "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                           'svc' AS service, {meta_expr} AS meta) \
              TO '{}' (FORMAT PARQUET)",
             path.display()
@@ -1520,7 +1527,7 @@ mod tests {
         let setup = Connection::open_in_memory().unwrap();
         setup
             .execute_batch(&format!(
-                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                  'svc' AS service, 'abc' AS duration) TO '{}' (FORMAT PARQUET)",
                 dir.path().join("cold.parquet").display()
             ))
@@ -1532,7 +1539,7 @@ mod tests {
         let agreed = dir.path().join("agreed.ndjson");
         std::fs::write(
             &agreed,
-            "{\"timestamp\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":\"7\"}\n",
+            "{\"_time\":\"2024-01-15T11:00:00Z\",\"_ingested\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":\"7\"}\n",
         )
         .unwrap();
         assert!(
@@ -1546,7 +1553,7 @@ mod tests {
         let drifted = dir.path().join("drifted.ndjson");
         std::fs::write(
             &drifted,
-            "{\"timestamp\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":7}\n",
+            "{\"_time\":\"2024-01-15T11:00:00Z\",\"_ingested\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":7}\n",
         )
         .unwrap();
         assert_eq!(
@@ -1694,7 +1701,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
 
@@ -1842,7 +1849,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
 
@@ -1866,7 +1873,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
 
@@ -1953,7 +1960,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
 
@@ -2012,7 +2019,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
         let out = dir.path().join("export.parquet");
@@ -2055,7 +2062,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
         let out = dir.path().join("export.parquet");
