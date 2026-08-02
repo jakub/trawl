@@ -213,23 +213,41 @@ const MAX_TIMESTAMP_INVALID_CHARS: usize = 256;
 /// Maximum number of preserved originals sampled for the `ingest_repairs` warn.
 const MAX_REPAIR_SAMPLES: usize = 5;
 
+/// Offset-less date-time formats accepted alongside RFC 3339, read as UTC.
+///
+/// `%.f` matches an optional fractional-second suffix, so each entry covers
+/// both the with- and without-fraction spelling. Together with RFC 3339 and
+/// the date-only form these are shapes the hard `CAST` this replaces accepted,
+/// and shapes the in-memory matcher (`trawl_core::filter::parse_timestamp`)
+/// accepts on the live path — ingest must not be the narrower of the two, or a
+/// producer emitting `LocalDateTime` / `datetime.isoformat()` silently loses
+/// its event time to the arrival substitution.
+const NAIVE_TIMESTAMP_FORMATS: [&str; 2] = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"];
+
 /// Canonicalize a present `timestamp` value per the ADR-0008 grammar.
 ///
-/// A value is valid iff it is a JSON string chrono parses as RFC 3339, or as
-/// the space-separated `%Y-%m-%d %H:%M:%S%.f` naive variant read as UTC —
-/// nothing else (no date-only, no offset-less `T` form). Valid values are
-/// rewritten to RFC 3339 UTC at microsecond precision (`DuckDB`'s native
-/// TIMESTAMP resolution) so compaction's `TRY_CAST` succeeds on post-fix
-/// data by construction. Returns `None` for anything malformed.
+/// A value is valid iff it is a JSON string chrono parses as RFC 3339, as one
+/// of [`NAIVE_TIMESTAMP_FORMATS`], or as a bare `%Y-%m-%d` date (midnight
+/// UTC). Valid values are rewritten to RFC 3339 UTC at microsecond precision
+/// (`DuckDB`'s native TIMESTAMP resolution) so compaction's `TRY_CAST`
+/// succeeds on post-fix data by construction. Returns `None` for anything
+/// malformed.
 fn canonical_timestamp(v: &serde_json::Value) -> Option<String> {
     let s = v.as_str()?;
-    let utc: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                .map(|naive| naive.and_utc())
-        })
-        .ok()?;
+    let utc: chrono::DateTime<chrono::Utc> = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+    {
+        dt.with_timezone(&chrono::Utc)
+    } else if let Some(naive) = NAIVE_TIMESTAMP_FORMATS
+        .iter()
+        .find_map(|fmt| chrono::NaiveDateTime::parse_from_str(s, fmt).ok())
+    {
+        naive.and_utc()
+    } else {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc()
+    };
     Some(utc.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
@@ -1116,6 +1134,11 @@ mod tests {
             // Space-separated naive variant, read as UTC.
             ("2025-06-01 12:00:00", "2025-06-01T12:00:00.000000Z"),
             ("2025-06-01 12:00:00.5", "2025-06-01T12:00:00.500000Z"),
+            // Offset-less `T` form (Python isoformat, Java LocalDateTime).
+            ("2025-06-01T12:00:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01T12:00:00.123", "2025-06-01T12:00:00.123000Z"),
+            // Date-only, read as midnight UTC.
+            ("2025-06-01", "2025-06-01T00:00:00.000000Z"),
         ];
         let defaults = test_defaults();
         for (input, expected) in cases {
@@ -1144,10 +1167,10 @@ mod tests {
             (r#""not-a-date""#, "not-a-date"),
             // Well-shaped but out-of-range.
             (r#""2026-13-45T99:99:99Z""#, "2026-13-45T99:99:99Z"),
-            // Offset-less T form is NOT in the grammar.
-            (r#""2025-06-01T12:00:00""#, "2025-06-01T12:00:00"),
-            // Date-only is NOT in the grammar.
-            (r#""2025-06-01""#, "2025-06-01"),
+            // Date-shaped but out-of-range date-only value.
+            (r#""2025-06-31""#, "2025-06-31"),
+            // Bare epoch strings are not in the grammar (ADR-0008).
+            (r#""1748779200""#, "1748779200"),
             // Non-string JSON values, preserved via to_string().
             (r#"{"nested":1}"#, r#"{"nested":1}"#),
             ("12345", "12345"),

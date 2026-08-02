@@ -147,7 +147,8 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
 
 /// Canonicalization acceptance criterion at the API level: an RFC 3339
 /// value with a +05:30 offset lands as the same instant in UTC with
-/// sub-second precision preserved.
+/// sub-second precision preserved, and an offset-less ISO 8601 value keeps
+/// its event time instead of being repaired to arrival time.
 #[sqlx::test(migrations = false)]
 async fn offset_timestamp_canonicalized_to_utc_instant(pool: sqlx::PgPool) {
     let server = setup(pool).await;
@@ -176,5 +177,31 @@ async fn offset_timestamp_canonicalized_to_utc_instant(pool: sqlx::PgPool) {
         first_row_string(&result.result, "timestamp_invalid"),
         None,
         "a valid offset timestamp is canonicalized, not repaired"
+    );
+
+    // Offset-less ISO 8601 (Python `datetime.isoformat()`, Java
+    // `LocalDateTime`) is read as UTC, not demoted to arrival time.
+    let record = json!({
+        "service": "canon-naive",
+        "timestamp": "2026-01-01T04:30:00.123456",
+        "message": "offset-less input",
+    });
+    let resp = ingest_client.ingest(&[record]).await.expect("ingest ok");
+    assert_eq!(resp.accepted, 1);
+
+    let result = query_client
+        .query_paginated("service=canon-naive", None, None)
+        .await
+        .expect("query ok");
+    assert_eq!(result.result.row_count(), 1);
+    assert_eq!(
+        first_row_string(&result.result, "timestamp").as_deref(),
+        Some("2026-01-01 04:30:00.123456"),
+        "an offset-less ISO 8601 value must keep its event time, read as UTC"
+    );
+    assert_eq!(
+        first_row_string(&result.result, "timestamp_invalid"),
+        None,
+        "an offset-less ISO 8601 value is canonicalized, not repaired"
     );
 }
