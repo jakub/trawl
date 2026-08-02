@@ -6,14 +6,12 @@ use super::SqlValue;
 
 /// Map system field names to their storage column names.
 ///
-/// `@timestamp` and `_time` → `timestamp`, everything else passes through.
-/// `_time` is the Splunk-style alias so users can write `| table _time`
-/// or `sort _time` and it resolves to the canonical `timestamp` column.
+/// `timestamp` and `@timestamp` → `_time` (ADR-0009: `_time` is the
+/// physical event-time column; the pre-cutover names remain as aliases so
+/// `sort timestamp` and `| table @timestamp` keep working). Everything
+/// else passes through.
 pub fn map_field_name(name: &str) -> &str {
-    match name {
-        "@timestamp" | "_time" => "timestamp",
-        other => other,
-    }
+    crate::schema::resolve_field_alias(name)
 }
 
 /// Double-quote a field name for safe use in SQL.
@@ -47,13 +45,18 @@ mod tests {
     }
 
     #[test]
-    fn quote_field_maps_timestamp() {
-        assert_eq!(quote_field("@timestamp"), "\"timestamp\"");
+    fn quote_field_maps_at_timestamp() {
+        assert_eq!(quote_field("@timestamp"), "\"_time\"");
     }
 
     #[test]
-    fn quote_field_maps_time_alias() {
-        assert_eq!(quote_field("_time"), "\"timestamp\"");
+    fn quote_field_maps_timestamp_alias() {
+        assert_eq!(quote_field("timestamp"), "\"_time\"");
+    }
+
+    #[test]
+    fn quote_field_time_passthrough() {
+        assert_eq!(quote_field("_time"), "\"_time\"");
     }
 
     #[test]

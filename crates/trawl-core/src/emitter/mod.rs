@@ -12,6 +12,7 @@ mod fields;
 mod functions;
 mod pipeline;
 mod search;
+mod severity;
 mod state;
 mod validate;
 
@@ -371,6 +372,87 @@ mod tests {
     fn search_or_with_time_filter() {
         // Time filter should be emitted as top-level WHERE, outside OR parens.
         assert_snapshot!(emit_dsl("service=nginx last=2h OR service=postgres"));
+    }
+
+    // -----------------------------------------------------------------------
+    // level → severity band alias (ADR-0009)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_level_eq_band() {
+        assert_snapshot!(emit_dsl("level=error"));
+    }
+
+    #[test]
+    fn search_level_gte_number() {
+        assert_snapshot!(emit_dsl("level>=warn"));
+    }
+
+    #[test]
+    fn search_level_ne_band() {
+        assert_snapshot!(emit_dsl("level!=info"));
+    }
+
+    #[test]
+    fn search_level_in_list() {
+        assert_snapshot!(emit_dsl("level=error,fatal"));
+    }
+
+    #[test]
+    fn search_level_case_insensitive_token() {
+        assert_snapshot!(emit_dsl("level=WARN"));
+    }
+
+    #[test]
+    fn error_level_unknown_token() {
+        assert_snapshot!(emit_dsl_err("level=spicy"));
+    }
+
+    #[test]
+    fn error_level_glob() {
+        assert_snapshot!(emit_dsl_err("level=glob:err*"));
+    }
+
+    #[test]
+    fn where_level_eq_band() {
+        assert_snapshot!(emit_dsl(r#"* | where level == "error""#));
+    }
+
+    #[test]
+    fn where_level_gte_number() {
+        assert_snapshot!(emit_dsl(r#"* | where level >= "warn""#));
+    }
+
+    // -----------------------------------------------------------------------
+    // _time alias inversion (ADR-0009)
+    // -----------------------------------------------------------------------
+
+    /// `timestamp`, `@timestamp` and `_time` all resolve to the physical
+    /// `_time` column.
+    #[test]
+    fn time_aliases_resolve_identically() {
+        let canonical = emit_dsl("* | sort _time");
+        assert_eq!(emit_dsl("* | sort timestamp"), canonical);
+        assert_eq!(emit_dsl("* | sort @timestamp"), canonical);
+        assert!(canonical.contains("\"_time\""));
+        assert!(!canonical.contains("\"timestamp\""));
+    }
+
+    #[test]
+    fn time_filter_uses_time_column() {
+        let sql = emit_dsl("last=1h");
+        assert!(
+            sql.contains(r#"TRY_CAST("_time" AS TIMESTAMP)"#),
+            "time filter must target _time: {sql}"
+        );
+    }
+
+    /// Bare search covers `message` OR `_raw`.
+    #[test]
+    fn bare_search_covers_raw() {
+        let sql = emit_dsl("error");
+        assert!(sql.contains(r#""message""#), "message side: {sql}");
+        assert!(sql.contains(r#""_raw""#), "_raw side: {sql}");
     }
 
     // -----------------------------------------------------------------------
@@ -1114,11 +1196,16 @@ mod tests {
             sql.contains(r#"CAST("containerID" AS VARCHAR) AS "containerID""#),
             "should cast containerID: {sql}"
         );
-        // Hot side keeps the timestamp cast (TRY_CAST — the partition key
-        // is never hard-CAST, ADR-0008) and adds the VARCHAR casts.
+        // Hot side keeps the casts for BOTH envelope timestamp columns
+        // (TRY_CAST — the partition key is never hard-CAST, ADR-0008)
+        // and adds the VARCHAR casts.
         assert!(
-            sql.contains(r#"TRY_CAST("timestamp" AS TIMESTAMP) AS "timestamp""#),
-            "hot side keeps timestamp TRY_CAST: {sql}"
+            sql.contains(r#"TRY_CAST("_time" AS TIMESTAMP) AS "_time""#),
+            "hot side keeps _time TRY_CAST: {sql}"
+        );
+        assert!(
+            sql.contains(r#"TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested""#),
+            "hot side keeps _ingested TRY_CAST: {sql}"
         );
     }
 

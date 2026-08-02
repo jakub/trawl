@@ -55,11 +55,16 @@ impl Rng {
 
 /// Fields referenced in generated search terms.
 /// All are present in every generated event to avoid `DuckDB` binder errors.
-const FIELDS: &[&str] = &["service", "level", "status", "host", "path"];
+/// (`level` is no longer a physical field — it aliases the numeric
+/// `severity` column via band predicates, generated separately.)
+const FIELDS: &[&str] = &["service", "status", "host", "path", "severity"];
 
-/// String-typed fields (excludes `status` which is numeric in events).
+/// String-typed fields (excludes numeric `status`/`severity`).
 /// Used when the filter value is a string to avoid `DuckDB` conversion errors.
-const STRING_FIELDS: &[&str] = &["service", "level", "host", "path"];
+const STRING_FIELDS: &[&str] = &["service", "host", "path"];
+
+/// Severity tokens exercised through the `level` alias.
+const LEVEL_TOKENS: &[&str] = &["trace", "debug", "info", "notice", "warn", "error", "fatal"];
 
 const STRING_VALS: &[&str] = &[
     "nginx", "apache", "postgres", "redis", "error", "warn", "info", "debug", "web-1", "web-2",
@@ -102,13 +107,32 @@ fn random_dsl(rng: &mut Rng) -> String {
 }
 
 fn random_token(rng: &mut Rng) -> String {
-    match rng.range(6) {
+    match rng.range(7) {
         0 => random_field_eq(rng),
         1 => random_field_compare(rng),
         2 => random_field_list(rng),
         3 => random_text_search(rng),
         4 => random_quoted_search(rng),
         5 => random_field_glob(rng),
+        6 => random_level_filter(rng),
+        _ => unreachable!(),
+    }
+}
+
+/// Generate a `level` alias filter: eq / ordered / ne / list of tokens.
+fn random_level_filter(rng: &mut Rng) -> String {
+    let tok = rng.pick(LEVEL_TOKENS);
+    match rng.range(4) {
+        0 => format!("level={tok}"),
+        1 => {
+            let op = rng.pick(&[">", ">=", "<", "<="]);
+            format!("level{op}{tok}")
+        }
+        2 => format!("level!={tok}"),
+        3 => {
+            let tok2 = rng.pick(LEVEL_TOKENS);
+            format!("level={tok},{tok2}")
+        }
         _ => unreachable!(),
     }
 }
@@ -193,6 +217,14 @@ fn random_event(rng: &mut Rng) -> Map<String, Value> {
         event.insert("message".to_string(), Value::Null);
     }
 
+    // `_raw` present ~70% of the time (bare search covers message OR _raw);
+    // null otherwise to exercise the COALESCE semantics.
+    if rng.range(10) < 7 {
+        event.insert("_raw".to_string(), Value::String(random_message(rng)));
+    } else {
+        event.insert("_raw".to_string(), Value::Null);
+    }
+
     // Always include all filterable fields to avoid DuckDB binder errors.
     for &field in FIELDS {
         event.insert(field.to_string(), random_event_value(rng, field));
@@ -209,6 +241,16 @@ fn random_message(rng: &mut Rng) -> String {
 
 fn random_event_value(rng: &mut Rng, field: &str) -> Value {
     match field {
+        "severity" => {
+            // OTel SeverityNumber 1-24, or null ~20% of the time to
+            // exercise the `!=` NULL-inclusion semantics.
+            if rng.range(5) == 0 {
+                Value::Null
+            } else {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                Value::Number(((rng.range(24) + 1) as i64).into())
+            }
+        }
         "status" => {
             // Status is typically numeric — always use a number to avoid
             // DuckDB conversion errors on comparison operators.
@@ -327,4 +369,120 @@ fn filter_matches_sql_parity() {
         passed >= 800,
         "too many skipped iterations: {skipped} skipped, {passed} passed"
     );
+}
+
+// ── Deterministic parity cases (ADR-0009) ─────────────────────────────
+
+/// Assert filter and SQL agree for one (dsl, event) pair.
+fn assert_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>) {
+    let query = parser::parse(dsl).expect("dsl parses");
+    let filter = CompiledFilter::compile(&query.search);
+    let filter_result = filter.matches(event);
+
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+    tmp.flush().unwrap();
+    let emitted = emitter::emit(&query, tmp.path().to_str().unwrap()).expect("emit succeeds");
+    let sql_result = sql_matches(conn, &emitted);
+
+    assert_eq!(
+        filter_result, sql_result,
+        "parity mismatch
+dsl: {dsl:?}
+event: {:?}
+sql: {}",
+        event, emitted.sql
+    );
+}
+
+fn envelope_event(severity: Option<i64>, message: &str, raw: Option<&str>) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("_time".into(), Value::String("2026-01-01T12:00:00Z".into()));
+    m.insert("service".into(), Value::String("nginx".into()));
+    m.insert("host".into(), Value::String("web-1".into()));
+    m.insert("message".into(), Value::String(message.into()));
+    m.insert(
+        "_raw".into(),
+        raw.map_or(Value::Null, |r| Value::String(r.into())),
+    );
+    m.insert(
+        "severity".into(),
+        severity.map_or(Value::Null, |n| Value::Number(n.into())),
+    );
+    m
+}
+
+/// `level` band predicates agree between SQL and the in-memory filter for
+/// every severity number and NULL.
+#[test]
+fn level_band_parity_exhaustive() {
+    let conn = Connection::open_in_memory().unwrap();
+    let dsls = [
+        "level=error",
+        "level>=warn",
+        "level>warn",
+        "level<info",
+        "level<=info",
+        "level!=info",
+        "level=error,fatal",
+        "level=trace,notice",
+    ];
+    for dsl in dsls {
+        for sev in (1..=24).map(Some).chain([None]) {
+            let event = envelope_event(sev, "hello", None);
+            assert_parity(&conn, dsl, &event);
+        }
+    }
+}
+
+/// A bare term matching only `_raw` content returns the event; negation
+/// respects `_raw` too.
+#[test]
+fn bare_search_raw_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let cases: &[(&str, Option<i64>, &str, Option<&str>)] = &[
+        // term only in _raw
+        ("connection", None, "clean text", Some("connection refused")),
+        // term only in message
+        ("connection", None, "connection ok", Some("other")),
+        // term in neither
+        ("connection", None, "clean", Some("other")),
+        // _raw null
+        ("connection", None, "clean", None),
+        ("connection", None, "connection", None),
+        // negated: term in _raw only → excluded
+        ("-connection", None, "clean", Some("connection refused")),
+        // negated: term nowhere → included
+        ("-connection", None, "clean", Some("other")),
+        // negated with null _raw → included when message clean
+        ("-connection", None, "clean", None),
+        // quoted phrase in _raw only
+        (
+            "\"connection refused\"",
+            None,
+            "clean",
+            Some("xx connection refused yy"),
+        ),
+    ];
+    for &(dsl, sev, message, raw) in cases {
+        let event = envelope_event(sev, message, raw);
+        assert_parity(&conn, dsl, &event);
+    }
+}
+
+/// `last=` windows evaluate against `_time` identically in SQL and the
+/// in-memory filter (times chosen far from the boundary — no race).
+#[test]
+fn time_filter_parity_on_time_column() {
+    let conn = Connection::open_in_memory().unwrap();
+    for (age_secs, dsl) in [(10, "last=1h"), (10 * 3600, "last=1h"), (30, "last=2m")] {
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(age_secs))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let mut event = envelope_event(Some(9), "hello", None);
+        event.insert("_time".into(), Value::String(ts));
+        assert_parity(&conn, dsl, &event);
+    }
 }

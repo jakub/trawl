@@ -4,7 +4,8 @@ expression: "emit_dsl(\"error\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE "message" ILIKE ?
+WHERE ("message" ILIKE ? OR "_raw" ILIKE ?)
 ---
 params:
   0: '%error%'
+  1: '%error%'

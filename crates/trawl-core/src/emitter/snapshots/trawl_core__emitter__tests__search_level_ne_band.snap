@@ -1,7 +1,7 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"last=7d\")"
+expression: "emit_dsl(\"level!=info\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '7 days'
+WHERE ("severity" NOT BETWEEN 9 AND 12 OR "severity" IS NULL)

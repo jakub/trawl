@@ -1,10 +1,10 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"service:nginx last:2h OR service:postgres\")"
+expression: "emit_dsl(\"service=nginx last=2h OR service=postgres\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND (("service" = ?) OR ("service" = ?))
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND (("service" = ?) OR ("service" = ?))
 ---
 params:
   0: 'nginx'

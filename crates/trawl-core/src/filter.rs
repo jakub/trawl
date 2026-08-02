@@ -49,9 +49,84 @@ struct TimeMatcher {
 
 enum TokenMatcher {
     Field(FieldMatcher),
+    Severity(SeverityMatcher),
     Text(TextMatcher),
     Not(Box<TokenMatcher>),
     OrGroup(Vec<Vec<TokenMatcher>>),
+}
+
+/// In-memory mirror of the SQL `level` → severity band predicates
+/// (`emitter::severity`). SSE and SQL must agree on every event.
+enum SeverityMatcher {
+    /// `level=tok` — severity within the band; NULL/absent → no match.
+    Band { lo: u8, hi: u8 },
+    /// `level=a,b` — severity within any listed band.
+    Bands { bands: Vec<(u8, u8)> },
+    /// `level!=tok` — severity outside the band OR NULL/absent
+    /// (mirrors the SQL `... OR "severity" IS NULL`).
+    NotBand { lo: u8, hi: u8 },
+    /// Ordered comparison against the token's exact number.
+    Ordered { op: CompareOp, number: u8 },
+    /// Glob/regex/unknown token — the SQL emitter rejects the query, so
+    /// this matcher never fires (the stream endpoint validates via emit
+    /// before compiling a filter).
+    Never,
+}
+
+impl SeverityMatcher {
+    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
+        let sev = event.get("severity").and_then(extract_i64);
+        match self {
+            Self::Band { lo, hi } => {
+                sev.is_some_and(|n| n >= i64::from(*lo) && n <= i64::from(*hi))
+            }
+            Self::Bands { bands } => sev.is_some_and(|n| {
+                bands
+                    .iter()
+                    .any(|(lo, hi)| n >= i64::from(*lo) && n <= i64::from(*hi))
+            }),
+            Self::NotBand { lo, hi } => {
+                sev.is_none_or(|n| n < i64::from(*lo) || n > i64::from(*hi))
+            }
+            Self::Ordered { op, number } => {
+                sev.is_some_and(|n| apply_ord(n.cmp(&i64::from(*number)), *op))
+            }
+            Self::Never => false,
+        }
+    }
+}
+
+/// Compile a `level` field filter into a severity matcher.
+fn compile_level(op: FilterOp, value: &FilterValue) -> SeverityMatcher {
+    let band =
+        |token: &str| crate::severity::number_for_token(token).and_then(crate::severity::band_of);
+    match (op, value) {
+        (FilterOp::Eq, FilterValue::Literal(v)) => {
+            band(v).map_or(SeverityMatcher::Never, |(lo, hi)| SeverityMatcher::Band {
+                lo,
+                hi,
+            })
+        }
+        (FilterOp::Ne, FilterValue::Literal(v)) => band(v)
+            .map_or(SeverityMatcher::Never, |(lo, hi)| {
+                SeverityMatcher::NotBand { lo, hi }
+            }),
+        (FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte, FilterValue::Literal(v)) => {
+            crate::severity::number_for_token(v).map_or(SeverityMatcher::Never, |number| {
+                SeverityMatcher::Ordered {
+                    op: compile_op(op),
+                    number,
+                }
+            })
+        }
+        (_, FilterValue::List(vs)) => {
+            let bands: Option<Vec<(u8, u8)>> = vs.iter().map(|v| band(v)).collect();
+            bands.map_or(SeverityMatcher::Never, |bands| SeverityMatcher::Bands {
+                bands,
+            })
+        }
+        _ => SeverityMatcher::Never,
+    }
 }
 
 struct FieldMatcher {
@@ -199,6 +274,10 @@ impl CompiledFilter {
 fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
     match token {
         SearchToken::FieldFilter(ff) => {
+            // `level` is the severity band alias — mirror the SQL emitter.
+            if ff.field == "level" {
+                return Some(TokenMatcher::Severity(compile_level(ff.op, &ff.value)));
+            }
             let predicate = match (&ff.op, &ff.value) {
                 (FilterOp::Glob, FilterValue::Literal(pattern)) => {
                     let regex = Regex::new(&glob_to_regex(pattern)).ok()?;
@@ -217,7 +296,9 @@ fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
                 },
             };
             Some(TokenMatcher::Field(FieldMatcher {
-                field: ff.field.clone(),
+                // `timestamp`/`@timestamp` alias the physical `_time` key,
+                // matching the SQL emitter's quote_field mapping.
+                field: crate::schema::resolve_field_alias(&ff.field).to_owned(),
                 predicate,
             }))
         }
@@ -309,6 +390,7 @@ impl TokenMatcher {
     fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
         match self {
             Self::Field(fm) => fm.matches(event),
+            Self::Severity(sm) => sm.matches(event),
             Self::Text(tm) => tm.matches(event),
             Self::Not(inner) => !inner.matches(event),
             Self::OrGroup(groups) => groups
@@ -339,14 +421,28 @@ impl FieldMatcher {
 }
 
 impl TextMatcher {
+    /// Bare-word search hits `message` and additionally `_raw` where
+    /// present (ADR-0009). Mirrors the SQL exactly:
+    ///
+    /// - positive: `("message" ILIKE p OR "_raw" ILIKE p)` — a match in
+    ///   either column passes; both missing/null → no match.
+    /// - negated: `("message" NOT ILIKE p AND COALESCE("_raw" NOT ILIKE p,
+    ///   TRUE))` — `message` must be present and term-free, and `_raw`
+    ///   (when present) term-free too.
     fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
-        let Some(Value::String(msg)) = event.get("message") else {
-            // Missing/null message → no match (matches SQL NULL semantics).
-            // DuckDB: NULL ILIKE/NOT ILIKE → NULL → excluded from results.
-            return false;
+        let msg = match event.get("message") {
+            Some(Value::String(s)) => Some(self.searcher.is_match(s)),
+            _ => None,
         };
-        let found = self.searcher.is_match(msg);
-        if self.negated { !found } else { found }
+        let raw = match event.get("_raw") {
+            Some(Value::String(s)) => Some(self.searcher.is_match(s)),
+            _ => None,
+        };
+        if self.negated {
+            msg == Some(false) && raw != Some(true)
+        } else {
+            msg == Some(true) || raw == Some(true)
+        }
     }
 }
 
@@ -451,7 +547,7 @@ fn apply_f64(a: f64, b: f64, op: CompareOp) -> bool {
 fn extract_event_timestamp(
     event: &serde_json::Map<String, Value>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let ts_val = event.get("timestamp")?;
+    let ts_val = event.get("_time")?;
     match ts_val {
         Value::String(s) => parse_timestamp(s),
         Value::Number(n) => {
@@ -472,7 +568,7 @@ fn matches_time_filter_at(
     tf: &TimeMatcher,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    let Some(ts_val) = event.get("timestamp") else {
+    let Some(ts_val) = event.get("_time") else {
         return false;
     };
 
@@ -913,17 +1009,17 @@ mod tests {
         // Group 2: service=apache AND level=warn
         assert!(matches_event(
             "service=nginx level=error OR service=apache level=warn",
-            r#"{"service": "nginx", "level": "error", "message": "ok"}"#
+            r#"{"service": "nginx", "severity": 17, "message": "ok"}"#
         ));
         // Matches group 2.
         assert!(matches_event(
             "service=nginx level=error OR service=apache level=warn",
-            r#"{"service": "apache", "level": "warn", "message": "ok"}"#
+            r#"{"service": "apache", "severity": 13, "message": "ok"}"#
         ));
-        // Neither group fully matches (service=nginx but level=warn).
+        // Neither group fully matches (service=nginx but severity=WARN band).
         assert!(!matches_event(
             "service=nginx level=error OR service=apache level=warn",
-            r#"{"service": "nginx", "level": "warn", "message": "ok"}"#
+            r#"{"service": "nginx", "severity": 13, "message": "ok"}"#
         ));
     }
 
@@ -1062,7 +1158,7 @@ mod tests {
     /// Helper: create an event with the given RFC 3339 timestamp.
     fn event_with_timestamp(ts: &str) -> serde_json::Map<String, Value> {
         let mut m = serde_json::Map::new();
-        m.insert("timestamp".into(), Value::String(ts.to_string()));
+        m.insert("_time".into(), Value::String(ts.to_string()));
         m.insert("message".into(), Value::String("test".into()));
         m
     }
@@ -1071,7 +1167,7 @@ mod tests {
     fn event_with_epoch_secs(secs: i64) -> serde_json::Map<String, Value> {
         let mut m = serde_json::Map::new();
         m.insert(
-            "timestamp".into(),
+            "_time".into(),
             Value::Number(serde_json::Number::from(secs)),
         );
         m.insert("message".into(), Value::String("test".into()));

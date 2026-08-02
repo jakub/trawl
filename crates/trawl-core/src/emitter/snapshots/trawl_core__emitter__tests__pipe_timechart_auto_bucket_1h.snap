@@ -1,9 +1,9 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"last:1h | timechart count()\")"
+expression: "emit_dsl(\"last=1h | timechart count()\")"
 ---
-SELECT time_bucket(INTERVAL '1 minutes', CAST("timestamp" AS TIMESTAMP)) AS "_time", COUNT(*) AS "count"
+SELECT time_bucket(INTERVAL '1 minutes', TRY_CAST("_time" AS TIMESTAMP)) AS "_time", COUNT(*) AS "count"
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '1 hours'
-GROUP BY "_time"
-ORDER BY "_time" ASC
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '1 hours'
+GROUP BY time_bucket(INTERVAL '1 minutes', TRY_CAST("_time" AS TIMESTAMP))
+ORDER BY time_bucket(INTERVAL '1 minutes', TRY_CAST("_time" AS TIMESTAMP)) ASC

@@ -179,19 +179,24 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
 }
 
 /// Build the body of a `REPLACE (...)` clause casting `varchar_cols` to
-/// VARCHAR. When `with_timestamp` is set, the canonical timestamp cast is
-/// prepended (the hot side always needs it to match parquet's TIMESTAMP).
-/// `timestamp` is never coerced to VARCHAR — it is the sort/partition key —
-/// and never hard-CAST either (ADR-0008): `TRY_CAST` degrades one malformed
+/// VARCHAR. When `with_timestamp` is set, the canonical casts for BOTH
+/// envelope TIMESTAMP columns (`_time`, `_ingested`) are prepended — the
+/// hot side always needs them to match parquet's TIMESTAMP, and a second
+/// TIMESTAMP column left VARCHAR would trip the union-conflict path on
+/// every query with a non-empty hot buffer. The timestamp columns are
+/// never coerced to VARCHAR — `_time` is the sort/partition key — and
+/// never hard-CAST either (ADR-0008): `TRY_CAST` degrades one malformed
 /// hot row to NULL instead of throwing the whole hot+cold union (which
 /// previously fell back to hot-only, silently dropping every cold row).
 fn varchar_replace_list(varchar_cols: &[String], with_timestamp: bool) -> String {
-    let mut parts = Vec::with_capacity(varchar_cols.len() + 1);
+    let mut parts = Vec::with_capacity(varchar_cols.len() + crate::schema::TIMESTAMP_COLUMNS.len());
     if with_timestamp {
-        parts.push("TRY_CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\"".to_string());
+        for col in crate::schema::TIMESTAMP_COLUMNS {
+            parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
+        }
     }
     for col in varchar_cols {
-        if col == "timestamp" {
+        if crate::schema::TIMESTAMP_COLUMNS.contains(&col.as_str()) {
             continue;
         }
         let q = super::fields::quote_field(col);

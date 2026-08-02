@@ -1106,8 +1106,8 @@ fn make_group_key(group_by: &[String], event: &Map<String, Value>) -> GroupKey {
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
 fn event_time_bucket(event: &Map<String, Value>, span_secs: u64) -> i64 {
-    // Try to parse timestamp field as RFC3339
-    if let Some(Value::String(ts)) = event.get("timestamp")
+    // Try to parse the _time field as RFC3339
+    if let Some(Value::String(ts)) = event.get("_time")
         && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
     {
         return dt.timestamp() / span_secs as i64;
@@ -1368,8 +1368,8 @@ mod tests {
         };
         assert_eq!(
             fields,
-            &["timestamp", "event_type", "target", "message"],
-            "Table stage must store fields in user-specified order"
+            &["_time", "event_type", "target", "message"],
+            "Table stage must store fields in user-specified order (aliases mapped)"
         );
     }
 
@@ -1379,9 +1379,9 @@ mod tests {
             fields: vec!["_time".into(), "host".into()],
             keyword: "table",
         });
-        let mut ev = event(&json!({"timestamp": "2026-01-01", "host": "web-1", "message": "hi"}));
+        let mut ev = event(&json!({"_time": "2026-01-01", "host": "web-1", "message": "hi"}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert!(ev.contains_key("timestamp"));
+        assert!(ev.contains_key("_time"));
         assert!(ev.contains_key("host"));
         assert!(!ev.contains_key("message"));
     }

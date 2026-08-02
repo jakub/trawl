@@ -22,6 +22,13 @@ pub(crate) fn emit_expr(
         Expr::Literal(lit) => Ok(emit_literal(lit, state)),
         Expr::FieldRef(name) => Ok(quote_field(name)),
         Expr::Binary { lhs, op, rhs } => {
+            // `level` comparisons route through the severity band helper
+            // (ADR-0009): `where level == "error"` means the ERROR band on
+            // the numeric severity column, exactly like `level=error` in
+            // the search stage.
+            if let Some(clause) = try_level_comparison(lhs, *op, rhs)? {
+                return Ok(clause);
+            }
             let l = emit_expr(lhs, state)?;
             let r = emit_expr(rhs, state)?;
             Ok(emit_binary(&l, *op, &r))
@@ -85,6 +92,38 @@ pub(crate) fn emit_expr(
             Ok(format!("({lhs} IN ({}))", items.join(", ")))
         }
     }
+}
+
+/// Detect `level <cmp> "token"` (either operand order) and emit the
+/// severity band predicate. Returns `Ok(None)` when the expression is not
+/// a level comparison and should take the generic path.
+fn try_level_comparison(
+    lhs: &Spanned<Expr>,
+    op: BinaryOp,
+    rhs: &Spanned<Expr>,
+) -> Result<Option<String>, EmitError> {
+    use crate::ast::FilterOp;
+
+    let filter_op = match op {
+        BinaryOp::Eq => FilterOp::Eq,
+        BinaryOp::Ne => FilterOp::Ne,
+        BinaryOp::Gt => FilterOp::Gt,
+        BinaryOp::Gte => FilterOp::Gte,
+        BinaryOp::Lt => FilterOp::Lt,
+        BinaryOp::Lte => FilterOp::Lte,
+        _ => return Ok(None),
+    };
+
+    let token = match (&lhs.node, &rhs.node) {
+        (Expr::FieldRef(name), Expr::Literal(LiteralValue::String(s)))
+            if name == super::severity::LEVEL_FIELD =>
+        {
+            s
+        }
+        _ => return Ok(None),
+    };
+
+    super::severity::level_predicate(filter_op, token).map(Some)
 }
 
 fn emit_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {

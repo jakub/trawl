@@ -1390,7 +1390,7 @@ mod tests {
 
     #[test]
     fn field_ref_timestamp_mapping() {
-        let ev = event(&json!({"timestamp": "2026-01-01T00:00:00Z"}));
+        let ev = event(&json!({"_time": "2026-01-01T00:00:00Z"}));
         assert_eq!(
             eval_expr(&field("@timestamp"), &ev),
             EvalValue::Str("2026-01-01T00:00:00Z".to_string())
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     fn field_ref_time_alias() {
-        let ev = event(&json!({"timestamp": "2026-01-01T00:00:00Z"}));
+        let ev = event(&json!({"_time": "2026-01-01T00:00:00Z"}));
         assert_eq!(
             eval_expr(&field("_time"), &ev),
             EvalValue::Str("2026-01-01T00:00:00Z".to_string())
@@ -1589,7 +1589,7 @@ mod tests {
     #[test]
     fn where_timestamp_gt_now_for_future_event() {
         // Event with far-future timestamp: `timestamp > now()` should be true.
-        let ev = event(&json!({"timestamp": "2999-12-31 23:59:59"}));
+        let ev = event(&json!({"_time": "2999-12-31 23:59:59"}));
         let expr = binary(field("timestamp"), BinaryOp::Gt, call("now", vec![]));
         assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(true));
     }
@@ -1597,7 +1597,7 @@ mod tests {
     #[test]
     fn where_timestamp_gt_now_for_past_event() {
         // Event with past timestamp: `timestamp > now()` should be false.
-        let ev = event(&json!({"timestamp": "2000-01-01 00:00:00"}));
+        let ev = event(&json!({"_time": "2000-01-01 00:00:00"}));
         let expr = binary(field("timestamp"), BinaryOp::Gt, call("now", vec![]));
         assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(false));
     }
