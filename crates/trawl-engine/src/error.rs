@@ -25,6 +25,13 @@ pub enum EngineError {
     #[error("result too large: query returned more than {0} rows")]
     ResultTooLarge(usize),
 
+    /// The hot+cold union read matched no files even though cold parquet
+    /// exists on disk — the substituted empty result would silently drop the
+    /// cold data, which ADR-0008 forbids. Transient by nature: the read raced
+    /// retention/compaction moving a file, or the hot snapshot vanished.
+    #[error("query matched no files while cold data exists on disk; retry the query")]
+    ColdDataUnread,
+
     /// Filesystem I/O error (e.g. writing temp files for parquet export).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

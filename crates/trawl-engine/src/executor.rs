@@ -178,6 +178,13 @@ impl Executor {
                 Err(EngineError::Emit(_)) => QueryResult::empty(),
                 other => other?,
             }
+        } else if class == HotColdOutcome::NoColumns {
+            // NoColumns reaches this branch only when cold files exist. The
+            // outcome held here is the empty result `execute_emitted`
+            // substituted for a "no files" read error — returning it would be
+            // exactly the silent cold-data drop ADR-0008 forbids, so surface
+            // an explicit, retryable error instead.
+            return Err(EngineError::ColdDataUnread);
         } else {
             outcome?
         };
@@ -1041,7 +1048,10 @@ enum ColdAction {
     HotOnly,
     /// Read hot-only ONLY if no cold files exist; otherwise return the
     /// error. A cold-data drop must never be silent, and an arbitrary
-    /// database failure must never masquerade as success (ADR-0008).
+    /// database failure must never masquerade as success (ADR-0008). For
+    /// [`HotColdOutcome::NoColumns`] the held outcome is itself a substituted
+    /// empty *success*, so the caller synthesizes
+    /// [`EngineError::ColdDataUnread`] rather than returning it.
     HotOnlyIfNoColdFiles,
 }
 
@@ -1961,6 +1971,32 @@ mod tests {
             2,
             "the cold row behind the matching glob element must survive an \
              empty sibling element, alongside the hot row"
+        );
+    }
+
+    #[test]
+    fn no_files_outcome_with_cold_data_errors_instead_of_empty_success() {
+        // A "no files" read error with cold parquet on disk must NOT surface
+        // as the substituted empty success: that would silently drop the
+        // entire cold history (ADR-0008). Provoked here the same way it
+        // happens in production — the hot snapshot path matches no file while
+        // a sibling cold element still does — so the prune retry cannot
+        // rescue it and the outcome policy is the last line of defense.
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &hour.join("cold.parquet"), "'plain'");
+        let missing_hot = dir.path().join("hot.ndjson"); // never written
+
+        let exec = Executor::new().unwrap();
+        let source = format!("['{}/*.parquet']", hour.display());
+        let result =
+            exec.run_query_with_hot("*", &source, missing_hot.to_str().unwrap(), usize::MAX, 0);
+        assert!(
+            matches!(result, Err(crate::error::EngineError::ColdDataUnread)),
+            "cold data on disk plus a no-files union must be an explicit \
+             error, not an empty success; got {result:?}"
         );
     }
 
