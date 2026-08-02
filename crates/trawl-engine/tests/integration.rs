@@ -563,6 +563,56 @@ fn hot_cold_type_conflict_keeps_both_rows() {
 }
 
 #[test]
+fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
+    // Same STRUCT-vs-VARCHAR `meta` conflict as above, but behind the LIST
+    // source shape the server emits for every time-filtered query, with one
+    // element pointing at an hour dir holding no file (routine for a
+    // sparse-traffic service). The first read of that list reports "no files"
+    // — so the conflict cannot surface until the empty element is pruned, and
+    // the pruned read must get the coerced retry too. Pre-fix it did not, and
+    // the repairable conflict fell through the outcome policy as a hard error.
+    use duckdb::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::create_dir_all(&empty).unwrap();
+    let hot = dir.path().join("hot.ndjson");
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                      'svc' AS service, {{'a': 1}} AS meta) \
+         TO '{}' (FORMAT PARQUET)",
+        full.join("cold.parquet").display()
+    ))
+    .unwrap();
+
+    std::fs::write(
+        &hot,
+        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+    )
+    .unwrap();
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!(
+        "['{}/*.parquet', '{}/*.parquet']",
+        full.display(),
+        empty.display()
+    );
+    let result = exec
+        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+        .expect("a repairable hot/cold conflict must not hard-error on a pruned list source");
+
+    assert_eq!(
+        result.row_count(),
+        2,
+        "both cold (struct meta) and hot (string meta) rows must survive the coerced retry"
+    );
+}
+
+#[test]
 fn hot_cold_malformed_timestamp_keeps_cold_data() {
     // A malformed timestamp in the hot buffer must not throw the hot+cold
     // union (ADR-0008: the partition key is never hard-CAST). Pre-fix this

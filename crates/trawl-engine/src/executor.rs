@@ -110,27 +110,11 @@ impl Executor {
 
         // A column type conflict between the hot and cold sources (e.g. a
         // field that is BIGINT in parquet but VARCHAR in the hot snapshot)
-        // would otherwise fail the union. Detect the conflicting columns and
-        // retry with them coerced to VARCHAR on both sides, preserving hot
-        // AND cold data.
-        //
-        // The `Conversion` class is only the cheap pre-filter: a genuine
-        // data-conversion error carries it too. What makes this a *schema*
-        // conflict is the evidence — at least one column the two sources
-        // describe differently — so the conflicting columns are gathered
-        // first and `is_union_type_conflict` is asked with them in hand. A
-        // data error yields none, is not misread as a conflict, and skips
-        // the retry that could not have helped it (ADR-0008). Either way, a
-        // failure that survives to the outcome policy below returns the
-        // error whenever cold files exist — a cold-data drop is never silent.
-        let conflicts = match &outcome {
-            Err(EngineError::Database(e)) if is_conversion_error(e) => self
-                .hot_cold_conflicts(source, hot_source)
-                .ok()
-                .filter(|cols| is_union_type_conflict(e, cols)),
-            _ => None,
-        };
-        if let Some(cols) = conflicts {
+        // would otherwise fail the union. Retry with the conflicting columns
+        // coerced to VARCHAR on both sides, preserving hot AND cold data. A
+        // failure that survives to the outcome policy below returns the error
+        // whenever cold files exist — a cold-data drop is never silent.
+        if let Some(cols) = self.hot_cold_conflict_columns(&outcome, source, hot_source) {
             let coerced = emitter::emit_with_hot_source_coerced(&ast, source, hot_source, &cols)?;
             outcome = self.execute_emitted(&coerced, max_rows, utc_offset_secs);
         }
@@ -144,11 +128,21 @@ impl Executor {
         // pointing at hour dirs holding no file of its own. Retry over just
         // the elements that match a file, so the cold rows that do exist are
         // never silently dropped (ADR-0008).
+        //
+        // The pruned read is the FIRST one that actually touches the cold
+        // files, so it is also the first that can hit a hot/cold schema
+        // conflict — it gets the same coerced retry, or a repairable conflict
+        // would fall through to the outcome policy and hard-error.
         if matches!(&outcome, Ok(r) if r.columns.is_empty())
             && let Some(pruned) = self.pruned_cold_source(source)
         {
             let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source)?;
             outcome = self.execute_emitted(&pruned_emitted, max_rows, utc_offset_secs);
+            if let Some(cols) = self.hot_cold_conflict_columns(&outcome, &pruned, hot_source) {
+                let coerced =
+                    emitter::emit_with_hot_source_coerced(&ast, &pruned, hot_source, &cols)?;
+                outcome = self.execute_emitted(&coerced, max_rows, utc_offset_secs);
+            }
         }
 
         // Classify the (possibly retried) outcome, then route on the pure
@@ -320,6 +314,36 @@ impl Executor {
             out.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
         }
         Ok(out)
+    }
+
+    /// The columns to coerce when `outcome` failed on a repairable hot/cold
+    /// schema conflict, or `None` when it is not one.
+    ///
+    /// The `Conversion` class is only the cheap pre-filter: a genuine
+    /// data-conversion error carries it too. What makes this a *schema*
+    /// conflict is the evidence — at least one column the two sources describe
+    /// differently — so the conflicting columns are gathered first and
+    /// `is_union_type_conflict` is asked with them in hand. A data error yields
+    /// none, is not misread as a conflict, and skips the retry that could not
+    /// have helped it (ADR-0008).
+    ///
+    /// Asked of every cold source the union is executed over — the original one
+    /// and, when the list prune narrows it, the pruned one too: the pruned read
+    /// is the first that actually touches the cold files, so it is the first
+    /// that can raise the conflict at all.
+    fn hot_cold_conflict_columns(
+        &self,
+        outcome: &Result<QueryResult, EngineError>,
+        source: &str,
+        hot_source: &str,
+    ) -> Option<Vec<String>> {
+        match outcome {
+            Err(EngineError::Database(e)) if is_conversion_error(e) => self
+                .hot_cold_conflicts(source, hot_source)
+                .ok()
+                .filter(|cols| is_union_type_conflict(e, cols)),
+            _ => None,
+        }
     }
 
     /// Find columns shared by the cold (parquet) and hot (ndjson) sources
