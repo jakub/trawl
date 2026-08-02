@@ -331,9 +331,13 @@ impl Executor {
     /// and, when the list prune narrows it, the pruned one too: the pruned read
     /// is the first that actually touches the cold files, so it is the first
     /// that can raise the conflict at all.
-    fn hot_cold_conflict_columns(
+    ///
+    /// Generic over the success type so the query path (`QueryResult`) and the
+    /// parquet export path (`()`) share one classifier: only the error arm is
+    /// inspected, and both paths must repair the same conflict.
+    fn hot_cold_conflict_columns<T>(
         &self,
-        outcome: &Result<QueryResult, EngineError>,
+        outcome: &Result<T, EngineError>,
         source: &str,
         hot_source: &str,
     ) -> Option<Vec<String>> {
@@ -679,9 +683,12 @@ impl Executor {
 
     /// Export with hot buffer union, falling back to hot-only on cold start.
     ///
-    /// Routes through the same outcome gate as [`Self::run_query_with_hot`]:
-    /// a database failure over an existing cold corpus returns the error
-    /// instead of silently exporting hot-only data (ADR-0008).
+    /// Routes through the same retries and the same outcome gate as
+    /// [`Self::run_query_with_hot`]: a repairable hot/cold type conflict is
+    /// retried with the conflicting columns coerced to VARCHAR, a partial
+    /// list-source miss is retried over the pruned list, and a database failure
+    /// over an existing cold corpus returns the error instead of silently
+    /// exporting hot-only data (ADR-0008).
     pub fn export_parquet_with_hot(
         &self,
         dsl: &str,
@@ -694,6 +701,18 @@ impl Executor {
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
         let mut outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
+        // Same coerced retry as `run_query_with_hot`: a column typed
+        // differently in parquet and in the hot snapshot fails the union with a
+        // `Conversion` error. Retry with the conflicting columns cast to
+        // VARCHAR on both sides so the export keeps hot AND cold data. Without
+        // it the outcome gate below returns the error whenever cold files exist
+        // — the same query would succeed as CSV/JSON (which route through the
+        // query path) and fail as parquet.
+        if let Some(cols) = self.hot_cold_conflict_columns(&outcome, source, hot_source) {
+            let coerced = emitter::emit_with_hot_source_coerced(&ast, source, hot_source, &cols)?;
+            outcome = self.export_parquet_from_emitted(&coerced, output_path, max_rows);
+        }
+
         // Same prune retry as `run_query_with_hot`: `read_parquet` rejects a
         // LIST source wholesale when a SINGLE element matches nothing, even
         // when its siblings hold data. The server emits one glob per hour in
@@ -705,11 +724,21 @@ impl Executor {
         // matching sibling makes `cold_files_present` true). Retry over just
         // the elements that match a file so the cold rows that do exist are
         // exported (ADR-0008).
+        //
+        // The pruned read is the FIRST one that actually touches the cold
+        // files, so it is also the first that can hit a hot/cold schema
+        // conflict — it gets the same coerced retry, or a repairable conflict
+        // would fall through to the outcome gate and hard-error.
         if matches!(&outcome, Err(EngineError::Database(e)) if is_no_files_error(e))
             && let Some(pruned) = self.pruned_cold_source(source)
         {
             let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source)?;
             outcome = self.export_parquet_from_emitted(&pruned_emitted, output_path, max_rows);
+            if let Some(cols) = self.hot_cold_conflict_columns(&outcome, &pruned, hot_source) {
+                let coerced =
+                    emitter::emit_with_hot_source_coerced(&ast, &pruned, hot_source, &cols)?;
+                outcome = self.export_parquet_from_emitted(&coerced, output_path, max_rows);
+            }
         }
 
         match outcome {

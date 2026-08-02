@@ -613,6 +613,112 @@ fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
 }
 
 #[test]
+fn export_parquet_hot_cold_type_conflict_keeps_both_rows() {
+    // The export lane of `hot_cold_type_conflict_keeps_both_rows`: same
+    // STRUCT-vs-VARCHAR `meta` conflict, exported instead of queried. The
+    // conflict is repairable, so the coerced retry must keep BOTH rows.
+    // Pre-fix only the query path retried, so the very same query succeeded as
+    // CSV/JSON (which route through the query path) and 500'd as parquet.
+    use duckdb::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cold = dir.path().join("cold.parquet");
+    let hot = dir.path().join("hot.ndjson");
+    let out = dir.path().join("export.parquet");
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                      'svc' AS service, {{'a': 1}} AS meta) \
+         TO '{}' (FORMAT PARQUET)",
+        cold.display()
+    ))
+    .unwrap();
+
+    std::fs::write(
+        &hot,
+        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+    )
+    .unwrap();
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!("{}/*.parquet", dir.path().display());
+    exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
+        .expect("a repairable hot/cold conflict must not hard-error the parquet export");
+
+    let rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                out.display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 2,
+        "both cold (struct meta) and hot (string meta) rows must land in the exported parquet"
+    );
+}
+
+#[test]
+fn export_parquet_hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
+    // The export lane of the pruned-list conflict: the first read of the list
+    // reports "no files" because one element points at an hour dir holding no
+    // file, so the conflict cannot surface until the empty element is pruned —
+    // and the pruned export must get the coerced retry too.
+    use duckdb::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::create_dir_all(&empty).unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    let out = dir.path().join("export.parquet");
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                      'svc' AS service, {{'a': 1}} AS meta) \
+         TO '{}' (FORMAT PARQUET)",
+        full.join("cold.parquet").display()
+    ))
+    .unwrap();
+
+    std::fs::write(
+        &hot,
+        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+    )
+    .unwrap();
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!(
+        "['{}/*.parquet', '{}/*.parquet']",
+        full.display(),
+        empty.display()
+    );
+    exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
+        .expect("a repairable conflict behind a pruned list source must not fail the export");
+
+    let rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                out.display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 2,
+        "both cold (struct meta) and hot (string meta) rows must land in the exported parquet"
+    );
+}
+
+#[test]
 fn hot_cold_malformed_timestamp_keeps_cold_data() {
     // A malformed timestamp in the hot buffer must not throw the hot+cold
     // union (ADR-0008: the partition key is never hard-CAST). Pre-fix this
