@@ -4,7 +4,6 @@
 
 //! HTTP handler for the `POST /api/v1/ingest` endpoint.
 
-use std::fmt;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,52 +16,17 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use fleet_auth::VerifiedKey;
 use indexmap::IndexMap;
-use serde_json::json;
 
 use crate::error::ServerError;
-use crate::ingest::compaction;
-use crate::ingest::pipeline::{self, ServiceBatch};
+use crate::ingest::envelope::{self, EnvelopeContext, RejectReason};
+use crate::ingest::pipeline::ServiceBatch;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
 use trawl_api::{IngestEventError, IngestResponse};
 
-/// Why an event was rejected — used as a prometheus label value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RejectReason {
-    MissingService,
-    EmptyService,
-    ServiceTooLong,
-    InvalidChars,
-    NotObject,
-    InvalidJson,
-    WalFailure,
-}
-
-impl fmt::Display for RejectReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::MissingService => "missing_service",
-            Self::EmptyService => "empty_service",
-            Self::ServiceTooLong => "service_too_long",
-            Self::InvalidChars => "invalid_chars",
-            Self::NotObject => "not_object",
-            Self::InvalidJson => "invalid_json",
-            Self::WalFailure => "wal_failure",
-        })
-    }
-}
-
 /// Per-reason rejection counts for labeled prometheus metrics.
 #[derive(Debug, Default)]
-struct RejectCounts {
-    missing_service: u64,
-    empty_service: u64,
-    service_too_long: u64,
-    invalid_chars: u64,
-    not_object: u64,
-    invalid_json: u64,
-    wal_failure: u64,
-}
+struct RejectCounts(IndexMap<RejectReason, u64>);
 
 impl RejectCounts {
     fn increment(&mut self, reason: RejectReason) {
@@ -70,42 +34,24 @@ impl RejectCounts {
     }
 
     fn increment_by(&mut self, reason: RejectReason, n: u64) {
-        match reason {
-            RejectReason::MissingService => self.missing_service += n,
-            RejectReason::EmptyService => self.empty_service += n,
-            RejectReason::ServiceTooLong => self.service_too_long += n,
-            RejectReason::InvalidChars => self.invalid_chars += n,
-            RejectReason::NotObject => self.not_object += n,
-            RejectReason::InvalidJson => self.invalid_json += n,
-            RejectReason::WalFailure => self.wal_failure += n,
-        }
+        *self.0.entry(reason).or_default() += n;
+    }
+
+    #[cfg(test)]
+    fn get(&self, reason: RejectReason) -> u64 {
+        self.0.get(&reason).copied().unwrap_or(0)
     }
 
     #[cfg(test)]
     fn total(&self) -> u64 {
-        self.missing_service
-            + self.empty_service
-            + self.service_too_long
-            + self.invalid_chars
-            + self.not_object
-            + self.invalid_json
-            + self.wal_failure
+        self.0.values().sum()
     }
 
     /// Format non-zero counts as a compact summary (e.g. `"invalid_chars:3, missing_service:1"`).
     fn summary(&self) -> String {
-        let pairs: &[(u64, &str)] = &[
-            (self.missing_service, "missing_service"),
-            (self.empty_service, "empty_service"),
-            (self.service_too_long, "service_too_long"),
-            (self.invalid_chars, "invalid_chars"),
-            (self.not_object, "not_object"),
-            (self.invalid_json, "invalid_json"),
-            (self.wal_failure, "wal_failure"),
-        ];
         let mut parts = Vec::new();
-        for &(count, reason) in pairs {
-            if count > 0 {
+        for (reason, count) in &self.0 {
+            if *count > 0 {
                 parts.push(format!("{reason}:{count}"));
             }
         }
@@ -114,243 +60,77 @@ impl RejectCounts {
 
     /// Emit non-zero counts as labeled prometheus counters.
     fn emit_metrics(&self) {
-        let pairs: &[(u64, &str)] = &[
-            (self.missing_service, "missing_service"),
-            (self.empty_service, "empty_service"),
-            (self.service_too_long, "service_too_long"),
-            (self.invalid_chars, "invalid_chars"),
-            (self.not_object, "not_object"),
-            (self.invalid_json, "invalid_json"),
-            (self.wal_failure, "wal_failure"),
-        ];
-        for &(count, reason) in pairs {
-            if count > 0 {
-                metrics::counter!(crate::metrics::INGEST_EVENTS_REJECTED_TOTAL, "reason" => reason)
-                    .increment(count);
+        for (reason, count) in &self.0 {
+            if *count > 0 {
+                metrics::counter!(
+                    crate::metrics::INGEST_EVENTS_REJECTED_TOTAL,
+                    "reason" => reason.as_str()
+                )
+                .increment(*count);
             }
         }
     }
 }
 
-/// Parsed ingest payload, grouped by service.
+/// The batch key: `(env, service)` — two envs must never share a WAL
+/// batch, a hot-buffer drain key, or a parquet partition (ADR-0009).
+type BatchKey = (String, String);
+
+/// Parsed ingest payload, grouped by `(env, service)`.
 #[derive(Debug)]
 struct ParsedEvents {
-    /// Service batches keyed by service name, insertion-order preserved.
-    batches: IndexMap<String, ServiceBatch>,
+    /// Service batches keyed by `(env, service)`, insertion-order preserved.
+    batches: IndexMap<BatchKey, ServiceBatch>,
     /// Per-event validation errors accumulated during parsing.
     errors: Vec<IngestEventError>,
     /// Per-reason rejection counts for prometheus labels.
     reject_counts: RejectCounts,
-    /// Events whose malformed `timestamp` was substituted with the arrival
-    /// default and preserved in `timestamp_invalid` (ADR-0008). The events
-    /// still count as accepted.
-    repaired: u64,
-    /// Up to [`MAX_REPAIR_SAMPLES`] preserved originals, for the
-    /// `ingest_repairs` warn.
-    repair_samples: Vec<String>,
+    /// Per-`(code, service)` repair counts (ADR-0009): accepted events the
+    /// server modified, feeding `trawl_ingest_repairs_total{code,service}`.
+    repairs: IndexMap<(&'static str, String), u64>,
 }
 
-/// Validate a single event object, returning the service name or a typed error.
-///
-/// Checks: has `service` field, service passes charset/length validation.
-/// No cross-event validation — mixed services are accepted.
-fn validate_event(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<String, (String, RejectReason)> {
-    let svc = obj
-        .get("service")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            (
-                "missing 'service' field".to_owned(),
-                RejectReason::MissingService,
-            )
-        })?;
-
-    if svc.is_empty() {
-        return Err((
-            "service name cannot be empty".into(),
-            RejectReason::EmptyService,
-        ));
-    }
-    if svc.len() > pipeline::MAX_SERVICE_NAME_LEN {
-        return Err((
-            format!(
-                "service name too long ({} chars, max {})",
-                svc.len(),
-                pipeline::MAX_SERVICE_NAME_LEN,
-            ),
-            RejectReason::ServiceTooLong,
-        ));
-    }
-    if !svc.bytes().all(pipeline::is_valid_service_char) {
-        return Err((
-            format!(
-                "service '{svc}' contains invalid characters \
-                 (only alphanumeric, dash, underscore, dot, space allowed)"
-            ),
-            RejectReason::InvalidChars,
-        ));
-    }
-
-    Ok(svc.to_owned())
-}
-
-/// Per-request defaults for fields that must always be present in WAL events.
-///
-/// Constructed once per ingest request (before `spawn_blocking`) so all events
-/// in the batch share the same request-scoped timestamp and peer address.
-struct IngestDefaults {
-    /// RFC 3339 timestamp with millisecond precision (from request arrival).
-    timestamp: String,
-    /// Peer IP address as a string (from the TCP connection).
-    host: String,
-}
-
-/// Maximum preserved length of a malformed `timestamp` original (chars).
-const MAX_TIMESTAMP_INVALID_CHARS: usize = 256;
-
-/// Maximum number of preserved originals sampled for the `ingest_repairs` warn.
-const MAX_REPAIR_SAMPLES: usize = 5;
-
-/// Date-time formats carrying an explicit UTC offset, tried after RFC 3339.
-///
-/// `chrono::DateTime::parse_from_rfc3339` only accepts the extended offset
-/// spelling (`+05:30`), but the ISO 8601 *basic* spelling (`+0530`, `+05`) is
-/// what Java's default logging encoders and Go's `-0700` layouts emit, and the
-/// hard `CAST` this path replaces accepted it. `%#z` is chrono's parse-only
-/// offset that takes `+HH`, `+HHMM` and `+HH:MM` alike.
-const OFFSET_TIMESTAMP_FORMATS: [&str; 6] = [
-    "%Y-%m-%dT%H:%M:%S%.f%#z",
-    "%Y-%m-%d %H:%M:%S%.f%#z",
-    "%Y/%m/%d %H:%M:%S%.f%#z",
-    "%Y-%m-%dT%H:%M%#z",
-    "%Y-%m-%d %H:%M%#z",
-    "%Y/%m/%d %H:%M%#z",
-];
-
-/// Offset-less date-time formats accepted alongside RFC 3339, read as UTC.
-///
-/// `%.f` matches an optional fractional-second suffix, so each second-precision
-/// entry covers both the with- and without-fraction spelling; the `%H:%M`
-/// entries cover minute precision. The slash-dated spellings are what Go's
-/// standard `log` package emits.
-const NAIVE_TIMESTAMP_FORMATS: [&str; 6] = [
-    "%Y-%m-%dT%H:%M:%S%.f",
-    "%Y-%m-%d %H:%M:%S%.f",
-    "%Y/%m/%d %H:%M:%S%.f",
-    "%Y-%m-%dT%H:%M",
-    "%Y-%m-%d %H:%M",
-    "%Y/%m/%d %H:%M",
-];
-
-/// Date-only formats, read as midnight UTC.
-const DATE_ONLY_TIMESTAMP_FORMATS: [&str; 2] = ["%Y-%m-%d", "%Y/%m/%d"];
-
-/// Canonicalize a present `timestamp` value per the ADR-0008 grammar.
-///
-/// A value is valid iff it is a JSON string that — after trimming surrounding
-/// whitespace — chrono parses as RFC 3339, as one of
-/// [`OFFSET_TIMESTAMP_FORMATS`], [`NAIVE_TIMESTAMP_FORMATS`] or
-/// [`DATE_ONLY_TIMESTAMP_FORMATS`]. Valid values are rewritten to RFC 3339 UTC
-/// at microsecond precision (`DuckDB`'s native TIMESTAMP resolution) so
-/// compaction's `TRY_CAST` succeeds on post-fix data by construction. Returns
-/// `None` for anything malformed.
-///
-/// The grammar covers the shapes real log producers emit, and is a superset of
-/// what the in-memory matcher (`trawl_core::filter::parse_timestamp`) accepts
-/// on the live path apart from bare epoch numbers — ingest must not be the
-/// narrower of the two, or a producer emitting `LocalDateTime` /
-/// `datetime.isoformat()` silently loses its event time to the arrival
-/// substitution. It is deliberately *not* literal parity with the hard `CAST`
-/// it replaces: `DuckDB`'s timestamp parser is looser still (e.g. `infinity`,
-/// named month forms), and anything outside this grammar is preserved in
-/// `timestamp_invalid` rather than guessed at.
-fn canonical_timestamp(v: &serde_json::Value) -> Option<String> {
-    let s = v.as_str()?.trim();
-    let utc: chrono::DateTime<chrono::Utc> = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
-    {
-        dt.with_timezone(&chrono::Utc)
-    } else if let Some(dt) = OFFSET_TIMESTAMP_FORMATS
-        .iter()
-        .find_map(|fmt| chrono::DateTime::parse_from_str(s, fmt).ok())
-    {
-        dt.with_timezone(&chrono::Utc)
-    } else if let Some(naive) = NAIVE_TIMESTAMP_FORMATS
-        .iter()
-        .find_map(|fmt| chrono::NaiveDateTime::parse_from_str(s, fmt).ok())
-    {
-        naive.and_utc()
-    } else {
-        DATE_ONLY_TIMESTAMP_FORMATS
-            .iter()
-            .find_map(|fmt| chrono::NaiveDate::parse_from_str(s, fmt).ok())?
-            .and_hms_opt(0, 0, 0)?
-            .and_utc()
-    };
-    Some(utc.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-}
-
-/// Render a malformed `timestamp` original for preservation: strings
-/// verbatim, non-strings as their JSON text, truncated to
-/// [`MAX_TIMESTAMP_INVALID_CHARS`] on a char boundary.
-fn preserve_invalid_timestamp(v: &serde_json::Value) -> String {
-    let raw = match v.as_str() {
-        Some(s) => s.to_owned(),
-        None => v.to_string(),
-    };
-    if raw.chars().count() > MAX_TIMESTAMP_INVALID_CHARS {
-        raw.chars().take(MAX_TIMESTAMP_INVALID_CHARS).collect()
-    } else {
-        raw
-    }
-}
-
-/// Fill mandatory fields on an event map if they are missing, canonicalize
-/// or repair the `timestamp` (ADR-0008), and drop reserved keys.
-///
-/// Events without these fields are effectively invisible to most queries
-/// (time filters, bare text search, host grouping), so we fill sensible
-/// defaults at ingest time rather than silently dropping them. A present
-/// but malformed `timestamp` gets the same treatment: it is substituted
-/// with the arrival default (the original preserved in `timestamp_invalid`)
-/// rather than poisoning compaction's batch CAST downstream.
-///
-/// [`compaction::WAL_FILE_COL`] is stripped for the same reason: compaction
-/// projects it as a synthetic provenance column, and a row carrying it makes
-/// `read_json` fail to bind — a request-controlled wedge that would stall
-/// the service's whole WAL. The key is trawl's, not the client's.
-///
-/// Returns the preserved original when a malformed timestamp was repaired.
-fn fill_defaults(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    defaults: &IngestDefaults,
-) -> Option<String> {
-    obj.remove(compaction::WAL_FILE_COL);
-    let repaired = match obj.get("timestamp") {
-        None => {
-            obj.insert("timestamp".into(), json!(&defaults.timestamp));
-            None
+impl ParsedEvents {
+    fn new() -> Self {
+        Self {
+            batches: IndexMap::new(),
+            errors: Vec::new(),
+            reject_counts: RejectCounts::default(),
+            repairs: IndexMap::new(),
         }
-        Some(v) => {
-            if let Some(canonical) = canonical_timestamp(v) {
-                obj.insert("timestamp".into(), json!(canonical));
-                None
-            } else {
-                let preserved = preserve_invalid_timestamp(v);
-                obj.insert("timestamp_invalid".into(), json!(&preserved));
-                obj.insert("timestamp".into(), json!(&defaults.timestamp));
-                Some(preserved)
+    }
+
+    /// Canonicalize one parsed object and either batch it or record the
+    /// rejection. Shared by the ndjson and JSON-array parse paths.
+    fn add_event(
+        &mut self,
+        index: usize,
+        obj: &serde_json::Map<String, serde_json::Value>,
+        ctx: &EnvelopeContext<'_>,
+    ) {
+        match envelope::canonicalize(obj, ctx) {
+            Ok(canonical) => {
+                for code in &canonical.repairs {
+                    *self
+                        .repairs
+                        .entry((code.as_str(), canonical.service.clone()))
+                        .or_default() += 1;
+                }
+                let key = (canonical.env, canonical.service);
+                self.batches.entry(key).or_default().push(canonical.obj);
+            }
+            Err((message, reason)) => {
+                self.errors.push(IngestEventError { index, message });
+                self.reject_counts.increment(reason);
             }
         }
-    };
-    if !obj.contains_key("host") {
-        obj.insert("host".into(), json!(&defaults.host));
     }
-    if !obj.contains_key("message") {
-        obj.insert("message".into(), json!(""));
+
+    /// Total repaired-event... repairs applied (a single event may carry
+    /// several codes; this counts code applications, for the log line).
+    fn total_repairs(&self) -> u64 {
+        self.repairs.values().sum()
     }
-    repaired
 }
 
 /// `POST /api/v1/ingest` — accept ndjson events into the WAL.
@@ -380,14 +160,28 @@ pub async fn ingest(
     let wire_bytes = body.len();
     let wal_writer = Arc::clone(wal_writer);
 
-    // Capture request-scoped defaults before moving into blocking task.
-    let defaults = IngestDefaults {
-        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        host: peer_addr.ip().to_string(),
-    };
+    // Capture request-scoped context before moving into the blocking task.
+    let arrival_instant = chrono::Utc::now();
+    let arrival = arrival_instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let peer_host = peer_addr.ip().to_string();
+    let peer_is_trusted_relay = state
+        .ingest
+        .trusted_relays
+        .iter()
+        .any(|c| c.contains(peer_addr.ip()));
+    let envs = Arc::clone(&state.ingest.envs);
+    let default_env = Arc::clone(&state.ingest.default_env);
 
     let (mut parsed, wal_paths, body_bytes, decompress_ms, parse_ms, wal_ms) =
         tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+            let ctx = EnvelopeContext {
+                arrival: &arrival,
+                arrival_instant,
+                peer_host: &peer_host,
+                peer_is_trusted_relay,
+                envs: envs.as_ref(),
+                default_env: default_env.as_ref(),
+            };
             let t0 = std::time::Instant::now();
             let raw = if compressed {
                 decompress_gzip(&body, body.len())?
@@ -402,46 +196,12 @@ pub async fn ingest(
             }
 
             let t1 = std::time::Instant::now();
-            let mut parsed = parse_events(&raw, &defaults)?;
+            let mut parsed = parse_events(&raw, &ctx)?;
             let parse_ms = t1.elapsed().as_millis();
 
-            // Write one WAL file per service group. Partial failures are
-            // reported as per-event errors — successful services are durable.
             let t2 = std::time::Instant::now();
-            let mut wal_paths: Vec<(String, PathBuf)> = Vec::new();
-            let mut wal_failures: Vec<(String, usize)> = Vec::new();
-
-            for (svc, batch) in &parsed.batches {
-                match wal_writer.write(svc, &batch.ndjson) {
-                    Ok(path) => wal_paths.push((svc.clone(), path)),
-                    Err(e) => {
-                        tracing::warn!(
-                            event_type = "wal_write_failed",
-                            service = %svc,
-                            events_lost = batch.maps.len(),
-                            error = %e,
-                            "WAL write failed for service group"
-                        );
-                        let event_count = batch.maps.len();
-                        parsed.errors.push(IngestEventError {
-                            index: 0,
-                            message: format!(
-                                "WAL write failed for service '{svc}': {e} ({event_count} events lost)"
-                            ),
-                        });
-                        parsed
-                            .reject_counts
-                            .increment_by(RejectReason::WalFailure, event_count as u64);
-                        wal_failures.push((svc.clone(), event_count));
-                    }
-                }
-            }
+            let wal_paths = write_wal_batches(&wal_writer, &mut parsed);
             let wal_ms = t2.elapsed().as_millis();
-
-            // Remove failed service groups from batches so we don't publish them.
-            for (svc, _) in &wal_failures {
-                parsed.batches.shift_remove(svc);
-            }
 
             Ok((
                 parsed,
@@ -471,12 +231,61 @@ pub async fn ingest(
     Ok(Json(result))
 }
 
+/// Write one WAL file per `(env, service)` group. Partial failures are
+/// reported as per-event errors — successful groups are durable. Failed
+/// groups are removed from `parsed.batches` so they are never published.
+///
+/// The per-env WAL directory layout lands with the storage cutover; until
+/// then the env travels in the event rows.
+fn write_wal_batches(
+    wal_writer: &crate::ingest::wal::WalWriter,
+    parsed: &mut ParsedEvents,
+) -> Vec<(BatchKey, PathBuf)> {
+    let mut wal_paths: Vec<(BatchKey, PathBuf)> = Vec::new();
+    let mut wal_failures: Vec<BatchKey> = Vec::new();
+
+    for (key, batch) in &parsed.batches {
+        let (env, svc) = key;
+        match wal_writer.write(svc, &batch.ndjson) {
+            Ok(path) => wal_paths.push((key.clone(), path)),
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "wal_write_failed",
+                    env = %env,
+                    service = %svc,
+                    events_lost = batch.maps.len(),
+                    error = %e,
+                    "WAL write failed for service group"
+                );
+                let event_count = batch.maps.len();
+                parsed.errors.push(IngestEventError {
+                    index: 0,
+                    message: format!(
+                        "WAL write failed for service '{svc}': {e} ({event_count} events lost)"
+                    ),
+                });
+                parsed
+                    .reject_counts
+                    .increment_by(RejectReason::WalFailure, event_count as u64);
+                wal_failures.push(key.clone());
+            }
+        }
+    }
+
+    // Remove failed service groups from batches so we don't publish them.
+    for key in &wal_failures {
+        parsed.batches.shift_remove(key);
+    }
+
+    wal_paths
+}
+
 /// Post-blocking-task: update metrics, publish to event bus, log, and build response.
 #[allow(clippy::too_many_arguments)]
 fn finalize_ingest(
     state: &AppState,
     parsed: &mut ParsedEvents,
-    wal_paths: &[(String, PathBuf)],
+    wal_paths: &[(BatchKey, PathBuf)],
     verified: &VerifiedKey,
     wire_bytes: usize,
     compressed: bool,
@@ -520,26 +329,36 @@ fn finalize_ingest(
         );
     }
 
-    if parsed.repaired > 0 {
-        metrics::counter!(crate::metrics::INGEST_EVENTS_REPAIRED_TOTAL).increment(parsed.repaired);
-        // Sample up to MAX_REPAIR_SAMPLES preserved originals so the bad
-        // upstream clock values are diagnosable without per-event log spam.
-        let samples = parsed.repair_samples.join("; ");
+    if !parsed.repairs.is_empty() {
+        for ((code, service), count) in &parsed.repairs {
+            metrics::counter!(
+                crate::metrics::INGEST_REPAIRS_TOTAL,
+                "code" => *code,
+                "service" => service.clone()
+            )
+            .increment(*count);
+        }
+        let summary = parsed
+            .repairs
+            .iter()
+            .map(|((code, service), count)| format!("{service}/{code}:{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         tracing::warn!(
             event_type = "ingest_repairs",
             user = %verified.name,
-            repaired = parsed.repaired,
-            samples,
-            "malformed timestamps substituted with arrival time (originals in timestamp_invalid)"
+            repairs = parsed.total_repairs(),
+            summary,
+            "accepted events were repaired (codes recorded in _repairs)"
         );
     }
 
     // Publish each successfully-written batch to hot buffer + event bus
     // so events are visible to queries and SSE streams immediately.
     if let Some(pipeline) = &state.ingest.pipeline {
-        for (svc, wal_path) in wal_paths {
-            if let Some(batch) = parsed.batches.swap_remove(svc) {
-                pipeline.publish(svc, batch, wal_path);
+        for (key, wal_path) in wal_paths {
+            if let Some(batch) = parsed.batches.swap_remove(key) {
+                pipeline.publish(&key.1, batch, wal_path);
             }
         }
     }
@@ -603,10 +422,10 @@ fn decompress_gzip(data: &[u8], wire_bytes: usize) -> Result<Vec<u8>, ServerErro
 
 /// Parse events from either ndjson or JSON array format.
 ///
-/// Returns parsed events with service name, JSON maps, and ndjson bytes.
-/// The ndjson bytes are always ndjson regardless of input format, ready
-/// for the WAL.
-fn parse_events(data: &[u8], defaults: &IngestDefaults) -> Result<ParsedEvents, ServerError> {
+/// Returns parsed events grouped by `(env, service)` with canonical maps
+/// and ndjson bytes. The ndjson bytes are always ndjson regardless of
+/// input format, ready for the WAL.
+fn parse_events(data: &[u8], ctx: &EnvelopeContext<'_>) -> Result<ParsedEvents, ServerError> {
     let text = std::str::from_utf8(data)
         .map_err(|e| ServerError::Ingest(format!("body is not valid UTF-8: {e}")))?;
 
@@ -614,18 +433,18 @@ fn parse_events(data: &[u8], defaults: &IngestDefaults) -> Result<ParsedEvents, 
 
     // Detect format: JSON array (vector batches) vs ndjson (line-delimited).
     if trimmed.starts_with('[') {
-        parse_json_array(trimmed, defaults)
+        parse_json_array(trimmed, ctx)
     } else {
-        parse_ndjson(trimmed, defaults)
+        Ok(parse_ndjson(trimmed, ctx))
     }
 }
 
 /// Parse a JSON array of events (vector's default batch format).
 ///
-/// Groups events by service, converting to ndjson per service for WAL storage.
-/// Invalid events are accumulated as per-event errors rather than aborting
-/// the entire batch — valid events are still accepted.
-fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, ServerError> {
+/// Groups events by `(env, service)`, converting to ndjson per group for
+/// WAL storage. Invalid events are accumulated as per-event errors rather
+/// than aborting the entire batch — valid events are still accepted.
+fn parse_json_array(text: &str, ctx: &EnvelopeContext<'_>) -> Result<ParsedEvents, ServerError> {
     let parsed: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| ServerError::Ingest(format!("invalid JSON array: {e}")))?;
 
@@ -637,69 +456,30 @@ fn parse_json_array(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvent
         return Err(ServerError::Ingest("empty event array".into()));
     }
 
-    let mut batches: IndexMap<String, ServiceBatch> = IndexMap::new();
-    let mut errors = Vec::new();
-    let mut reject_counts = RejectCounts::default();
-    let mut repaired: u64 = 0;
-    let mut repair_samples: Vec<String> = Vec::new();
+    let mut events = ParsedEvents::new();
 
     for (i, event) in arr.iter().enumerate() {
         let Some(obj) = event.as_object() else {
-            errors.push(IngestEventError {
+            events.errors.push(IngestEventError {
                 index: i,
                 message: "expected JSON object".into(),
             });
-            reject_counts.increment(RejectReason::NotObject);
+            events.reject_counts.increment(RejectReason::NotObject);
             continue;
         };
-
-        let svc = match validate_event(obj) {
-            Ok(svc) => svc,
-            Err((msg, reason)) => {
-                errors.push(IngestEventError {
-                    index: i,
-                    message: msg,
-                });
-                reject_counts.increment(reason);
-                continue;
-            }
-        };
-
-        let mut obj = obj.clone();
-        if let Some(original) = fill_defaults(&mut obj, defaults) {
-            repaired += 1;
-            if repair_samples.len() < MAX_REPAIR_SAMPLES {
-                repair_samples.push(original);
-            }
-        }
-
-        let batch = batches.entry(svc).or_default();
-        serde_json::to_writer(&mut batch.ndjson, &obj)
-            .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
-        batch.ndjson.push(b'\n');
-        batch.maps.push(obj);
+        events.add_event(i, obj, ctx);
     }
 
-    Ok(ParsedEvents {
-        batches,
-        errors,
-        reject_counts,
-        repaired,
-        repair_samples,
-    })
+    Ok(events)
 }
 
 /// Parse ndjson (newline-delimited JSON objects).
 ///
-/// Groups events by service, re-serializing to ndjson per service for
-/// consistent WAL bytes (trimmed, one object per line). Invalid lines
+/// Groups events by `(env, service)`, re-serializing to ndjson per group
+/// for consistent WAL bytes (trimmed, one object per line). Invalid lines
 /// are accumulated as per-event errors rather than aborting the batch.
-fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, ServerError> {
-    let mut batches: IndexMap<String, ServiceBatch> = IndexMap::new();
-    let mut errors = Vec::new();
-    let mut reject_counts = RejectCounts::default();
-    let mut repaired: u64 = 0;
-    let mut repair_samples: Vec<String> = Vec::new();
+fn parse_ndjson(text: &str, ctx: &EnvelopeContext<'_>) -> ParsedEvents {
+    let mut events = ParsedEvents::new();
 
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -710,70 +490,55 @@ fn parse_ndjson(text: &str, defaults: &IngestDefaults) -> Result<ParsedEvents, S
         let parsed: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                errors.push(IngestEventError {
+                events.errors.push(IngestEventError {
                     index: i,
                     message: format!("invalid JSON: {e}"),
                 });
-                reject_counts.increment(RejectReason::InvalidJson);
+                events.reject_counts.increment(RejectReason::InvalidJson);
                 continue;
             }
         };
 
         let Some(obj) = parsed.as_object() else {
-            errors.push(IngestEventError {
+            events.errors.push(IngestEventError {
                 index: i,
                 message: "expected JSON object".into(),
             });
-            reject_counts.increment(RejectReason::NotObject);
+            events.reject_counts.increment(RejectReason::NotObject);
             continue;
         };
 
-        let svc = match validate_event(obj) {
-            Ok(svc) => svc,
-            Err((msg, reason)) => {
-                errors.push(IngestEventError {
-                    index: i,
-                    message: msg,
-                });
-                reject_counts.increment(reason);
-                continue;
-            }
-        };
-
-        let mut obj = obj.clone();
-        if let Some(original) = fill_defaults(&mut obj, defaults) {
-            repaired += 1;
-            if repair_samples.len() < MAX_REPAIR_SAMPLES {
-                repair_samples.push(original);
-            }
-        }
-
-        let batch = batches.entry(svc).or_default();
-        serde_json::to_writer(&mut batch.ndjson, &obj)
-            .map_err(|e| ServerError::Internal(format!("failed to serialize event: {e}")))?;
-        batch.ndjson.push(b'\n');
-        batch.maps.push(obj);
+        events.add_event(i, obj, ctx);
     }
 
-    Ok(ParsedEvents {
-        batches,
-        errors,
-        reject_counts,
-        repaired,
-        repair_samples,
-    })
+    events
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingest::compaction;
 
-    /// Construct test defaults for use in parse tests.
-    fn test_defaults() -> IngestDefaults {
-        IngestDefaults {
-            timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
-            host: "127.0.0.1".to_owned(),
-        }
+    const ARRIVAL: &str = "2026-01-01T00:00:00.000000Z";
+
+    /// Parse with a default single-env ("prod") context, no trusted relay.
+    fn parse(data: &[u8]) -> Result<ParsedEvents, ServerError> {
+        parse_with(data, &["prod"], false)
+    }
+
+    fn parse_with(data: &[u8], envs: &[&str], relay: bool) -> Result<ParsedEvents, ServerError> {
+        let envs: Vec<String> = envs.iter().map(|s| (*s).to_string()).collect();
+        let ctx = EnvelopeContext {
+            arrival: ARRIVAL,
+            arrival_instant: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            peer_host: "127.0.0.1",
+            peer_is_trusted_relay: relay,
+            envs: &envs,
+            default_env: &envs[0],
+        };
+        parse_events(data, &ctx)
     }
 
     /// Total accepted event count across all service batches.
@@ -781,16 +546,23 @@ mod tests {
         parsed.batches.values().map(|b| b.maps.len()).sum()
     }
 
-    /// Get the maps for a specific service, panicking if absent.
-    fn service_maps<'a>(
+    /// Get the maps for `(env, service)`, panicking if absent.
+    fn batch_maps<'a>(
         parsed: &'a ParsedEvents,
+        env: &str,
         svc: &str,
     ) -> &'a [serde_json::Map<String, serde_json::Value>] {
         &parsed
             .batches
-            .get(svc)
-            .unwrap_or_else(|| panic!("no batch for service '{svc}'"))
+            .get(&(env.to_string(), svc.to_string()))
+            .unwrap_or_else(|| panic!("no batch for ({env}, {svc})"))
             .maps
+    }
+
+    fn has_batch(parsed: &ParsedEvents, env: &str, svc: &str) -> bool {
+        parsed
+            .batches
+            .contains_key(&(env.to_string(), svc.to_string()))
     }
 
     // --- happy path tests ---
@@ -800,8 +572,8 @@ mod tests {
         let data = br#"{"service":"nginx","message":"ok"}
 {"service":"nginx","message":"error"}
 "#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert!(parsed.batches.contains_key("nginx"));
+        let parsed = parse(data).unwrap();
+        assert!(has_batch(&parsed, "prod", "nginx"));
         assert_eq!(total_accepted(&parsed), 2);
         assert!(parsed.errors.is_empty());
     }
@@ -809,12 +581,12 @@ mod tests {
     #[test]
     fn parse_json_array_format() {
         let data = br#"[{"service":"nginx","message":"ok"},{"service":"nginx","message":"error"}]"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert!(parsed.batches.contains_key("nginx"));
+        let parsed = parse(data).unwrap();
+        assert!(has_batch(&parsed, "prod", "nginx"));
         assert_eq!(total_accepted(&parsed), 2);
         assert!(parsed.errors.is_empty());
         // WAL output should be ndjson, not a JSON array.
-        let ndjson = &parsed.batches["nginx"].ndjson;
+        let ndjson = &parsed.batches[&("prod".to_string(), "nginx".to_string())].ndjson;
         let text = std::str::from_utf8(ndjson).unwrap();
         assert!(!text.starts_with('['));
         assert_eq!(text.lines().count(), 2);
@@ -827,26 +599,18 @@ mod tests {
 
 {"service":"test","message":"world"}
 "#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert!(parsed.batches.contains_key("test"));
+        let parsed = parse(data).unwrap();
+        assert!(has_batch(&parsed, "prod", "test"));
         assert_eq!(total_accepted(&parsed), 2);
         assert!(parsed.errors.is_empty());
     }
 
     #[test]
     fn parse_accepts_valid_service_names() {
-        let defaults = test_defaults();
-        for name in [
-            "nginx",
-            "my-app",
-            "app_v2",
-            "host.name.prod",
-            "A1-B2_c3.d",
-            "Activity Monitor",
-        ] {
+        for name in ["nginx", "my-app", "app_v2", "host.name.prod", "A1-B2_c3.d"] {
             let data = format!(r#"{{"service":"{name}","message":"ok"}}"#);
-            let parsed = parse_events(data.as_bytes(), &defaults).unwrap();
-            assert!(parsed.batches.contains_key(name));
+            let parsed = parse(data.as_bytes()).unwrap();
+            assert!(has_batch(&parsed, "prod", name));
             assert_eq!(total_accepted(&parsed), 1);
             assert!(parsed.errors.is_empty());
         }
@@ -857,8 +621,8 @@ mod tests {
         let data = br#"{"service":"nginx","message":"hello","status":200}
 {"service":"nginx","message":"world","status":404}
 "#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        let maps = service_maps(&parsed, "nginx");
+        let parsed = parse(data).unwrap();
+        let maps = batch_maps(&parsed, "prod", "nginx");
         assert_eq!(maps.len(), 2);
         assert_eq!(
             maps[0].get("message").and_then(serde_json::Value::as_str),
@@ -871,17 +635,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_array_retains_maps() {
+    fn parse_json_array_derives_severity() {
+        // `level` is consumed at ingest: derived onto the OTel ladder,
+        // original spelling in severity_text.
         let data = br#"[{"service":"nginx","level":"error"},{"service":"nginx","level":"warn"}]"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        let maps = service_maps(&parsed, "nginx");
+        let parsed = parse(data).unwrap();
+        let maps = batch_maps(&parsed, "prod", "nginx");
         assert_eq!(maps.len(), 2);
+        assert!(!maps[0].contains_key("level"));
         assert_eq!(
-            maps[0].get("level").and_then(serde_json::Value::as_str),
-            Some("error")
+            maps[0].get("severity").and_then(serde_json::Value::as_i64),
+            Some(17)
         );
         assert_eq!(
-            maps[1].get("level").and_then(serde_json::Value::as_str),
+            maps[1].get("severity").and_then(serde_json::Value::as_i64),
+            Some(13)
+        );
+        assert_eq!(
+            maps[1]
+                .get("severity_text")
+                .and_then(serde_json::Value::as_str),
             Some("warn")
         );
     }
@@ -891,7 +664,7 @@ mod tests {
     #[test]
     fn parse_empty_json_array_rejected() {
         let data = b"[]";
-        let err = parse_events(data, &test_defaults()).unwrap_err();
+        let err = parse(data).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
@@ -900,16 +673,34 @@ mod tests {
     #[test]
     fn parse_missing_service() {
         let data = br#"{"message":"no service field"}"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
         assert_eq!(parsed.errors.len(), 1);
-        assert!(parsed.errors[0].message.contains("missing 'service'"));
+        assert!(parsed.errors[0].message.contains("service"));
+        assert_eq!(parsed.reject_counts.get(RejectReason::MissingService), 1);
+    }
+
+    #[test]
+    fn parse_non_string_service_typed_reason() {
+        for data in [
+            br#"{"service":{"name":"x"}}"#.as_slice(),
+            br#"{"service":42}"#.as_slice(),
+        ] {
+            let parsed = parse(data).unwrap();
+            assert!(parsed.batches.is_empty());
+            assert_eq!(
+                parsed.reject_counts.get(RejectReason::ServiceNotString),
+                1,
+                "non-string service must carry the type-specific reason"
+            );
+            assert_eq!(parsed.reject_counts.get(RejectReason::MissingService), 0);
+        }
     }
 
     #[test]
     fn parse_invalid_json() {
         let data = b"not json at all";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
         assert_eq!(parsed.errors.len(), 1);
         assert!(parsed.errors[0].message.contains("invalid JSON"));
@@ -918,7 +709,7 @@ mod tests {
     #[test]
     fn parse_rejects_path_traversal_service() {
         let data = br#"{"service":"../../etc/passwd","message":"pwned"}"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
         assert_eq!(parsed.errors.len(), 1);
         assert!(parsed.errors[0].message.contains("invalid characters"));
@@ -927,16 +718,25 @@ mod tests {
     #[test]
     fn parse_rejects_slash_in_service() {
         let data = br#"{"service":"foo/bar","message":"nope"}"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
         assert_eq!(parsed.errors.len(), 1);
         assert!(parsed.errors[0].message.contains("invalid characters"));
     }
 
     #[test]
+    fn parse_rejects_space_in_service() {
+        // Spaces died with the verbatim-filename cutover (ADR-0009).
+        let data = br#"{"service":"Activity Monitor","message":"nope"}"#;
+        let parsed = parse(data).unwrap();
+        assert!(parsed.batches.is_empty());
+        assert_eq!(parsed.reject_counts.get(RejectReason::InvalidChars), 1);
+    }
+
+    #[test]
     fn parse_rejects_empty_service_name() {
         let data = br#"{"service":"","message":"empty"}"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
         assert_eq!(parsed.errors.len(), 1);
         assert!(parsed.errors[0].message.contains("cannot be empty"));
@@ -946,7 +746,7 @@ mod tests {
     fn parse_rejects_long_service_name() {
         let name = "a".repeat(129);
         let data = format!(r#"{{"service":"{name}","message":"long"}}"#);
-        let parsed = parse_events(data.as_bytes(), &test_defaults()).unwrap();
+        let parsed = parse(data.as_bytes()).unwrap();
         assert!(parsed.batches.is_empty());
         assert_eq!(parsed.errors.len(), 1);
         assert!(parsed.errors[0].message.contains("too long"));
@@ -955,10 +755,69 @@ mod tests {
     #[test]
     fn parse_json_array_rejects_bad_service() {
         let data = br#"[{"service":"../evil","message":"nope"}]"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
         assert_eq!(parsed.errors.len(), 1);
         assert!(parsed.errors[0].message.contains("invalid characters"));
+    }
+
+    // --- env allowlist (ADR-0009) ---
+
+    #[test]
+    fn parse_unlisted_env_rejected_per_event() {
+        // The sibling with a good env still lands; the batch never gains a
+        // (nope, svc) key, so no data/nope/ path can ever be created.
+        let data = br#"{"service":"svc","env":"nope","message":"bad"}
+{"service":"svc","env":"lab","message":"good"}"#;
+        let parsed = parse_with(data, &["prod", "lab"], false).unwrap();
+        assert_eq!(total_accepted(&parsed), 1);
+        assert!(has_batch(&parsed, "lab", "svc"));
+        assert!(!has_batch(&parsed, "nope", "svc"));
+        assert_eq!(parsed.reject_counts.get(RejectReason::EnvNotAllowed), 1);
+    }
+
+    #[test]
+    fn parse_missing_env_defaults_with_repair() {
+        let data = br#"{"service":"svc","message":"ok"}"#;
+        let parsed = parse_with(data, &["prod", "lab"], false).unwrap();
+        assert!(has_batch(&parsed, "prod", "svc"));
+        let event = &batch_maps(&parsed, "prod", "svc")[0];
+        assert_eq!(event["env"], "prod");
+        assert_eq!(
+            parsed.repairs.get(&("env.defaulted", "svc".to_string())),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn parse_same_service_in_two_envs_separate_batches() {
+        let data = br#"{"service":"svc","env":"prod","message":"a"}
+{"service":"svc","env":"lab","message":"b"}"#;
+        let parsed = parse_with(data, &["prod", "lab"], false).unwrap();
+        assert_eq!(parsed.batches.len(), 2);
+        assert!(has_batch(&parsed, "prod", "svc"));
+        assert!(has_batch(&parsed, "lab", "svc"));
+    }
+
+    // --- trusted relay ---
+
+    #[test]
+    fn parse_hostless_event_from_trusted_relay_rejected() {
+        let data = br#"{"service":"svc","message":"no host"}"#;
+        let parsed = parse_with(data, &["prod"], true).unwrap();
+        assert!(parsed.batches.is_empty());
+        assert_eq!(
+            parsed.reject_counts.get(RejectReason::HostMissingFromRelay),
+            1
+        );
+
+        // The same event from a non-relay peer lands with host.from_peer.
+        let parsed = parse_with(data, &["prod"], false).unwrap();
+        assert_eq!(total_accepted(&parsed), 1);
+        assert_eq!(
+            parsed.repairs.get(&("host.from_peer", "svc".to_string())),
+            Some(&1)
+        );
     }
 
     // --- partial-success tests ---
@@ -966,7 +825,7 @@ mod tests {
     #[test]
     fn parse_partial_ndjson_bad_middle() {
         let data = b"{\"service\":\"nginx\",\"message\":\"one\"}\nnot json\n{\"service\":\"nginx\",\"message\":\"three\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert_eq!(total_accepted(&parsed), 2);
         assert_eq!(parsed.errors.len(), 1);
         assert_eq!(parsed.errors[0].index, 1);
@@ -976,7 +835,7 @@ mod tests {
     #[test]
     fn parse_partial_array_non_object() {
         let data = br#"[{"service":"nginx","message":"ok"},"just a string",{"service":"nginx","message":"also ok"}]"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert_eq!(total_accepted(&parsed), 2);
         assert_eq!(parsed.errors.len(), 1);
         assert_eq!(parsed.errors[0].index, 1);
@@ -986,51 +845,37 @@ mod tests {
     #[test]
     fn parse_mixed_services_accepted() {
         let data = b"{\"service\":\"nginx\",\"message\":\"one\"}\n{\"service\":\"apache\",\"message\":\"two\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert_eq!(total_accepted(&parsed), 2);
         assert!(parsed.errors.is_empty());
         assert_eq!(parsed.batches.len(), 2);
-        assert!(parsed.batches.contains_key("nginx"));
-        assert!(parsed.batches.contains_key("apache"));
-        assert_eq!(service_maps(&parsed, "nginx").len(), 1);
-        assert_eq!(service_maps(&parsed, "apache").len(), 1);
+        assert!(has_batch(&parsed, "prod", "nginx"));
+        assert!(has_batch(&parsed, "prod", "apache"));
     }
 
     #[test]
     fn parse_first_event_bad_scans_forward() {
         let data = b"{\"message\":\"no service\"}\n{\"service\":\"nginx\",\"message\":\"good\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert_eq!(total_accepted(&parsed), 1);
         assert_eq!(parsed.errors.len(), 1);
         assert_eq!(parsed.errors[0].index, 0);
-        assert!(parsed.errors[0].message.contains("missing 'service'"));
-        assert!(parsed.batches.contains_key("nginx"));
+        assert!(has_batch(&parsed, "prod", "nginx"));
     }
 
     #[test]
     fn parse_all_events_bad() {
         let data = b"not json\nalso not json\n{\"no_service\":true}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
         assert_eq!(parsed.errors.len(), 3);
-    }
-
-    #[test]
-    fn parse_bad_service_name_scans_forward() {
-        let data = b"{\"service\":\"../../evil\",\"message\":\"bad\"}\n{\"service\":\"nginx\",\"message\":\"good\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert_eq!(total_accepted(&parsed), 1);
-        assert_eq!(parsed.errors.len(), 1);
-        assert_eq!(parsed.errors[0].index, 0);
-        assert!(parsed.errors[0].message.contains("invalid characters"));
-        assert!(parsed.batches.contains_key("nginx"));
     }
 
     #[test]
     fn parse_ndjson_mixed_validity() {
         // 5 lines: index 0 good, 1 bad json, 2 good, 3 missing service, 4 good
         let data = b"{\"service\":\"nginx\",\"message\":\"a\"}\nnot json\n{\"service\":\"nginx\",\"message\":\"c\"}\n{\"no_service\":true}\n{\"service\":\"nginx\",\"message\":\"e\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert_eq!(total_accepted(&parsed), 3);
         assert_eq!(parsed.errors.len(), 2);
         assert_eq!(parsed.errors[0].index, 1);
@@ -1057,7 +902,7 @@ mod tests {
         const DEPTH: usize = 1000; // well past serde_json's 128 limit
         let deep = format!("{}1{}", "{\"a\":".repeat(DEPTH), "}".repeat(DEPTH));
         let data = format!("{deep}\n{{\"service\":\"nginx\",\"message\":\"ok\"}}");
-        let parsed = parse_events(data.as_bytes(), &test_defaults()).unwrap();
+        let parsed = parse(data.as_bytes()).unwrap();
         // Deep line (index 0) rejected; good line (index 1) accepted.
         assert_eq!(total_accepted(&parsed), 1);
         assert_eq!(parsed.errors.len(), 1);
@@ -1076,8 +921,7 @@ mod tests {
         const DEPTH: usize = 1000;
         let deep = format!("{}1{}", "{\"a\":".repeat(DEPTH), "}".repeat(DEPTH));
         let data = format!("[{deep}]");
-        let err = parse_events(data.as_bytes(), &test_defaults())
-            .expect_err("deeply-nested array event must be rejected");
+        let err = parse(data.as_bytes()).expect_err("deeply-nested array event must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("recursion"),
@@ -1085,251 +929,83 @@ mod tests {
         );
     }
 
-    // --- defaults tests ---
+    // --- envelope stamping through the parse paths ---
 
     #[test]
-    fn defaults_filled_when_missing_ndjson() {
+    fn envelope_stamped_when_missing_ndjson() {
         let data = br#"{"service":"test"}"#;
-        let defaults = test_defaults();
-        let parsed = parse_events(data, &defaults).unwrap();
-        let maps = service_maps(&parsed, "test");
-        let event = &maps[0];
-        assert_eq!(
-            event.get("timestamp").and_then(serde_json::Value::as_str),
-            Some("2026-01-01T00:00:00.000Z")
-        );
-        assert_eq!(
-            event.get("host").and_then(serde_json::Value::as_str),
-            Some("127.0.0.1")
-        );
-        assert_eq!(
-            event.get("message").and_then(serde_json::Value::as_str),
-            Some("")
+        let parsed = parse(data).unwrap();
+        let event = &batch_maps(&parsed, "prod", "test")[0];
+        assert_eq!(event["_time"], ARRIVAL);
+        assert_eq!(event["_ingested"], ARRIVAL);
+        assert_eq!(event["host"], "127.0.0.1");
+        assert_eq!(event["env"], "prod");
+        assert!(event.contains_key("_raw"));
+        assert!(
+            !event.contains_key("message"),
+            "message is convention, not server-filled (ADR-0009)"
         );
     }
 
     #[test]
-    fn defaults_filled_when_missing_json_array() {
+    fn envelope_stamped_when_missing_json_array() {
         let data = br#"[{"service":"test"}]"#;
-        let defaults = test_defaults();
-        let parsed = parse_events(data, &defaults).unwrap();
-        let maps = service_maps(&parsed, "test");
-        let event = &maps[0];
+        let parsed = parse(data).unwrap();
+        let event = &batch_maps(&parsed, "prod", "test")[0];
+        assert_eq!(event["_time"], ARRIVAL);
+        assert_eq!(event["_ingested"], ARRIVAL);
+        assert_eq!(event["host"], "127.0.0.1");
+    }
+
+    #[test]
+    fn client_values_not_overwritten() {
+        let data = br#"{"service":"test","timestamp":"2025-12-31T12:00:00Z","host":"myhost","message":"hello"}"#;
+        let parsed = parse(data).unwrap();
+        let event = &batch_maps(&parsed, "prod", "test")[0];
+        // The timestamp wire alias is consumed into a canonicalized _time.
+        assert_eq!(event["_time"], "2025-12-31T12:00:00.000000Z");
+        assert!(!event.contains_key("timestamp"));
+        assert_eq!(event["host"], "myhost");
+        assert_eq!(event["message"], "hello");
+    }
+
+    /// The repair ledger counts per (code, service) across the batch.
+    #[test]
+    fn repairs_counted_per_code_and_service() {
+        let data = br#"{"service":"a","timestamp":"bad"}
+{"service":"a","timestamp":"also-bad"}
+{"service":"b","timestamp":"bad"}"#;
+        let parsed = parse(data).unwrap();
         assert_eq!(
-            event.get("timestamp").and_then(serde_json::Value::as_str),
-            Some("2026-01-01T00:00:00.000Z")
+            parsed.repairs.get(&("time.from_ingest", "a".to_string())),
+            Some(&2)
         );
         assert_eq!(
-            event.get("host").and_then(serde_json::Value::as_str),
-            Some("127.0.0.1")
+            parsed.repairs.get(&("time.from_ingest", "b".to_string())),
+            Some(&1)
         );
-        assert_eq!(
-            event.get("message").and_then(serde_json::Value::as_str),
-            Some("")
-        );
+        assert_eq!(parsed.errors.len(), 0, "repair is not a rejection");
     }
 
+    /// The substituted time and canonical `_raw` reach the WAL bytes.
     #[test]
-    fn defaults_not_overwritten_when_present() {
-        let data = br#"{"service":"test","timestamp":"2025-06-01T12:00:00Z","host":"myhost","message":"hello"}"#;
-        let defaults = test_defaults();
-        let parsed = parse_events(data, &defaults).unwrap();
-        let maps = service_maps(&parsed, "test");
-        let event = &maps[0];
-        // A valid timestamp is canonicalized (RFC 3339 UTC, microsecond
-        // precision) — same instant, not necessarily the same bytes.
-        assert_eq!(
-            event.get("timestamp").and_then(serde_json::Value::as_str),
-            Some("2025-06-01T12:00:00.000000Z")
-        );
-        assert_eq!(
-            event.get("host").and_then(serde_json::Value::as_str),
-            Some("myhost")
-        );
-        assert_eq!(
-            event.get("message").and_then(serde_json::Value::as_str),
-            Some("hello")
-        );
-    }
-
-    // --- timestamp canonicalization & repair tests (ADR-0008) ---
-
-    /// Valid grammar values are canonicalized to RFC 3339 UTC at microsecond
-    /// precision — same instant, sub-second precision preserved.
-    #[test]
-    fn timestamp_valid_values_canonicalized() {
-        let cases = [
-            // RFC 3339 UTC, no fraction.
-            ("2025-06-01T12:00:00Z", "2025-06-01T12:00:00.000000Z"),
-            // RFC 3339 with a +05:30 offset → same instant in UTC.
-            (
-                "2025-06-01T17:30:00.123456+05:30",
-                "2025-06-01T12:00:00.123456Z",
-            ),
-            // Nanosecond input truncates to microseconds.
-            (
-                "2025-06-01T12:00:00.123456789Z",
-                "2025-06-01T12:00:00.123456Z",
-            ),
-            // Space-separated naive variant, read as UTC.
-            ("2025-06-01 12:00:00", "2025-06-01T12:00:00.000000Z"),
-            ("2025-06-01 12:00:00.5", "2025-06-01T12:00:00.500000Z"),
-            // Offset-less `T` form (Python isoformat, Java LocalDateTime).
-            ("2025-06-01T12:00:00", "2025-06-01T12:00:00.000000Z"),
-            ("2025-06-01T12:00:00.123", "2025-06-01T12:00:00.123000Z"),
-            // Date-only, read as midnight UTC.
-            ("2025-06-01", "2025-06-01T00:00:00.000000Z"),
-            // ISO 8601 *basic* offsets (no colon) — logback's default encoder,
-            // Go's `-0700` layouts. RFC 3339 parsing alone rejects these.
-            (
-                "2025-06-01T12:00:00.000+0000",
-                "2025-06-01T12:00:00.000000Z",
-            ),
-            ("2025-06-01T17:30:00+0530", "2025-06-01T12:00:00.000000Z"),
-            ("2025-06-01 14:00:00+02", "2025-06-01T12:00:00.000000Z"),
-            // Minute precision, offset-less and with an offset.
-            ("2025-06-01T12:00", "2025-06-01T12:00:00.000000Z"),
-            ("2025-06-01 12:00", "2025-06-01T12:00:00.000000Z"),
-            ("2025-06-01T14:00+02:00", "2025-06-01T12:00:00.000000Z"),
-            // Slash-dated (Go's standard `log` package).
-            ("2025/06/01 12:00:00", "2025-06-01T12:00:00.000000Z"),
-            (
-                "2025/06/01 12:00:00.25+00:00",
-                "2025-06-01T12:00:00.250000Z",
-            ),
-            ("2025/06/01", "2025-06-01T00:00:00.000000Z"),
-            // Surrounding whitespace is trimmed before parsing.
-            ("  2025-06-01T12:00:00Z  ", "2025-06-01T12:00:00.000000Z"),
-            (" 2025-06-01 12:00:00 ", "2025-06-01T12:00:00.000000Z"),
-        ];
-        let defaults = test_defaults();
-        for (input, expected) in cases {
-            let data = format!(r#"{{"service":"test","timestamp":"{input}"}}"#);
-            let parsed = parse_events(data.as_bytes(), &defaults).unwrap();
-            let event = &service_maps(&parsed, "test")[0];
-            assert_eq!(
-                event.get("timestamp").and_then(serde_json::Value::as_str),
-                Some(expected),
-                "input {input:?} should canonicalize"
-            );
-            assert!(
-                !event.contains_key("timestamp_invalid"),
-                "valid input {input:?} must not set timestamp_invalid"
-            );
-            assert_eq!(parsed.repaired, 0, "valid input {input:?} is not a repair");
-        }
-    }
-
-    /// Malformed values are substituted with the arrival default and the
-    /// original preserved verbatim in `timestamp_invalid`.
-    #[test]
-    fn timestamp_malformed_substituted_and_preserved() {
-        let cases = [
-            // Unparseable string.
-            (r#""not-a-date""#, "not-a-date"),
-            // Well-shaped but out-of-range.
-            (r#""2026-13-45T99:99:99Z""#, "2026-13-45T99:99:99Z"),
-            // Date-shaped but out-of-range date-only value.
-            (r#""2025-06-31""#, "2025-06-31"),
-            // Bare epoch strings are not in the grammar (ADR-0008).
-            (r#""1748779200""#, "1748779200"),
-            // Non-string JSON values, preserved via to_string().
-            (r#"{"nested":1}"#, r#"{"nested":1}"#),
-            ("12345", "12345"),
-            ("true", "true"),
-            ("null", "null"),
-            // Empty string.
-            (r#""""#, ""),
-        ];
-        let defaults = test_defaults();
-        for (input, preserved) in cases {
-            let data = format!(r#"{{"service":"test","timestamp":{input}}}"#);
-            let parsed = parse_events(data.as_bytes(), &defaults).unwrap();
-            let event = &service_maps(&parsed, "test")[0];
-            assert_eq!(
-                event.get("timestamp").and_then(serde_json::Value::as_str),
-                Some("2026-01-01T00:00:00.000Z"),
-                "malformed input {input} must be substituted with the arrival default"
-            );
-            assert_eq!(
-                event
-                    .get("timestamp_invalid")
-                    .and_then(serde_json::Value::as_str),
-                Some(preserved),
-                "original {input} must be preserved in timestamp_invalid"
-            );
-            assert_eq!(parsed.repaired, 1, "input {input} counts as one repair");
-            assert_eq!(parsed.errors.len(), 0, "repair is not a rejection");
-        }
-    }
-
-    /// Absent timestamp keeps the existing default-fill path: no repair,
-    /// no `timestamp_invalid` (regression).
-    #[test]
-    fn timestamp_absent_is_defaulted_not_repaired() {
-        let data = br#"{"service":"test"}"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        let event = &service_maps(&parsed, "test")[0];
-        assert_eq!(
-            event.get("timestamp").and_then(serde_json::Value::as_str),
-            Some("2026-01-01T00:00:00.000Z")
-        );
-        assert!(!event.contains_key("timestamp_invalid"));
-        assert_eq!(parsed.repaired, 0);
-    }
-
-    /// Oversized malformed values are truncated to 256 chars on a char
-    /// boundary before preservation.
-    #[test]
-    fn timestamp_invalid_truncated_on_char_boundary() {
-        // 300 two-byte chars — byte-index 256 would split a char.
-        let big: String = "é".repeat(300);
-        let data = format!(r#"{{"service":"test","timestamp":"{big}"}}"#);
-        let parsed = parse_events(data.as_bytes(), &test_defaults()).unwrap();
-        let event = &service_maps(&parsed, "test")[0];
-        let preserved = event
-            .get("timestamp_invalid")
-            .and_then(serde_json::Value::as_str)
-            .expect("timestamp_invalid present");
-        assert_eq!(preserved.chars().count(), 256);
-        assert_eq!(preserved, "é".repeat(256));
-    }
-
-    /// The JSON-array parse path counts repairs identically to ndjson.
-    #[test]
-    fn timestamp_repaired_counted_in_json_array_path() {
-        let data = br#"[{"service":"test","timestamp":"not-a-date"},{"service":"test","timestamp":"2025-06-01T12:00:00Z"},{"service":"test","timestamp":12345}]"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert_eq!(parsed.repaired, 2);
-        assert_eq!(total_accepted(&parsed), 3);
-        assert!(parsed.errors.is_empty());
-    }
-
-    /// Repair samples are capped at 5 even when more events are repaired.
-    #[test]
-    fn timestamp_repair_samples_capped_at_five() {
-        let lines: Vec<String> = (0..7)
-            .map(|i| format!(r#"{{"service":"test","timestamp":"bad-{i}"}}"#))
-            .collect();
-        let data = lines.join("\n");
-        let parsed = parse_events(data.as_bytes(), &test_defaults()).unwrap();
-        assert_eq!(parsed.repaired, 7);
-        assert_eq!(parsed.repair_samples.len(), 5);
-        assert_eq!(parsed.repair_samples[0], "bad-0");
-        assert_eq!(parsed.repair_samples[4], "bad-4");
-    }
-
-    /// The substituted timestamp and preserved original reach the WAL bytes
-    /// (mirror of `defaults_appear_in_wal_ndjson`).
-    #[test]
-    fn substituted_timestamp_appears_in_wal_ndjson() {
+    fn substituted_time_appears_in_wal_ndjson() {
         let data = br#"{"service":"test","timestamp":"not-a-date"}"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        let ndjson = &parsed.batches["test"].ndjson;
+        let parsed = parse(data).unwrap();
+        let ndjson = &parsed.batches[&("prod".to_string(), "test".to_string())].ndjson;
         let wal_text = std::str::from_utf8(ndjson).unwrap();
         let wal_event: serde_json::Value = serde_json::from_str(wal_text.trim()).unwrap();
-        assert_eq!(wal_event["timestamp"], "2026-01-01T00:00:00.000Z");
-        assert_eq!(wal_event["timestamp_invalid"], "not-a-date");
+        assert_eq!(wal_event["_time"], ARRIVAL);
+        assert!(
+            wal_event["_repairs"]
+                .as_str()
+                .unwrap()
+                .contains("time.from_ingest")
+        );
+        assert!(
+            wal_event["_raw"].as_str().unwrap().contains("not-a-date"),
+            "the malformed original is findable in _raw"
+        );
     }
 
     /// A client-supplied `_trawl_wal_file` never reaches the WAL: compaction
@@ -1338,12 +1014,12 @@ mod tests {
     /// whole WAL. The event itself is still accepted.
     #[test]
     fn reserved_wal_file_key_stripped_from_events() {
-        let data = br#"{"service":"test","timestamp":"2025-06-01T12:00:00Z","_trawl_wal_file":"x","keep":"me"}"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let data = br#"{"service":"test","timestamp":"2025-12-31T12:00:00Z","_trawl_wal_file":"x","keep":"me"}"#;
+        let parsed = parse(data).unwrap();
         assert!(parsed.errors.is_empty(), "stripping is not a rejection");
         assert_eq!(total_accepted(&parsed), 1);
 
-        let event = &service_maps(&parsed, "test")[0];
+        let event = &batch_maps(&parsed, "prod", "test")[0];
         assert!(
             !event.contains_key(compaction::WAL_FILE_COL),
             "reserved key must be stripped, got {event:?}"
@@ -1354,99 +1030,93 @@ mod tests {
             "other user fields are untouched"
         );
 
-        let wal_text = std::str::from_utf8(&parsed.batches["test"].ndjson).unwrap();
-        assert!(
-            !wal_text.contains(compaction::WAL_FILE_COL),
-            "reserved key must not reach the WAL bytes: {wal_text}"
-        );
+        let wal_text =
+            std::str::from_utf8(&parsed.batches[&("prod".to_string(), "test".to_string())].ndjson)
+                .unwrap();
+        // The stripped key survives only inside the _raw string (escaped),
+        // never as a JSON key of the WAL event.
+        let wal_event: serde_json::Value = serde_json::from_str(wal_text.trim()).unwrap();
+        assert!(wal_event.get(compaction::WAL_FILE_COL).is_none());
     }
 
     #[test]
-    fn defaults_appear_in_wal_ndjson() {
+    fn envelope_appears_in_wal_ndjson() {
         let data = br#"{"service":"test"}"#;
-        let defaults = test_defaults();
-        let parsed = parse_events(data, &defaults).unwrap();
-        let ndjson = &parsed.batches["test"].ndjson;
+        let parsed = parse(data).unwrap();
+        let ndjson = &parsed.batches[&("prod".to_string(), "test".to_string())].ndjson;
         let wal_text = std::str::from_utf8(ndjson).unwrap();
         let wal_event: serde_json::Value = serde_json::from_str(wal_text.trim()).unwrap();
-        assert_eq!(wal_event["timestamp"], "2026-01-01T00:00:00.000Z");
+        assert_eq!(wal_event["_time"], ARRIVAL);
+        assert_eq!(wal_event["_ingested"], ARRIVAL);
         assert_eq!(wal_event["host"], "127.0.0.1");
-        assert_eq!(wal_event["message"], "");
+        assert_eq!(wal_event["env"], "prod");
     }
 
-    // --- mixed-service tests (new) ---
+    // --- mixed-service tests ---
 
     #[test]
     fn parse_three_services_ndjson() {
         let data = b"{\"service\":\"nginx\",\"message\":\"a\"}\n{\"service\":\"redis\",\"message\":\"b\"}\n{\"service\":\"postgres\",\"message\":\"c\"}\n{\"service\":\"nginx\",\"message\":\"d\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert_eq!(parsed.batches.len(), 3);
         assert_eq!(total_accepted(&parsed), 4);
         assert!(parsed.errors.is_empty());
         // nginx gets 2 events, redis and postgres each get 1.
-        assert_eq!(service_maps(&parsed, "nginx").len(), 2);
-        assert_eq!(service_maps(&parsed, "redis").len(), 1);
-        assert_eq!(service_maps(&parsed, "postgres").len(), 1);
+        assert_eq!(batch_maps(&parsed, "prod", "nginx").len(), 2);
+        assert_eq!(batch_maps(&parsed, "prod", "redis").len(), 1);
+        assert_eq!(batch_maps(&parsed, "prod", "postgres").len(), 1);
     }
 
     #[test]
     fn parse_three_services_json_array() {
         let data = br#"[{"service":"a","m":"1"},{"service":"b","m":"2"},{"service":"c","m":"3"}]"#;
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         assert_eq!(parsed.batches.len(), 3);
         assert_eq!(total_accepted(&parsed), 3);
         assert!(parsed.errors.is_empty());
     }
 
     #[test]
-    fn parse_mixed_valid_invalid_across_services() {
-        // nginx valid, bad json, apache valid, missing service, nginx valid
-        let data = b"{\"service\":\"nginx\",\"message\":\"ok\"}\nnot json\n{\"service\":\"apache\",\"message\":\"ok\"}\n{\"no_svc\":true}\n{\"service\":\"nginx\",\"message\":\"ok2\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert_eq!(parsed.batches.len(), 2);
-        assert_eq!(total_accepted(&parsed), 3);
-        assert_eq!(parsed.errors.len(), 2);
-        assert_eq!(service_maps(&parsed, "nginx").len(), 2);
-        assert_eq!(service_maps(&parsed, "apache").len(), 1);
-    }
-
-    #[test]
     fn parse_insertion_order_preserved() {
         let data = b"{\"service\":\"charlie\",\"message\":\"1\"}\n{\"service\":\"alpha\",\"message\":\"2\"}\n{\"service\":\"bravo\",\"message\":\"3\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        let keys: Vec<&String> = parsed.batches.keys().collect();
+        let parsed = parse(data).unwrap();
+        let keys: Vec<&str> = parsed.batches.keys().map(|(_, s)| s.as_str()).collect();
         assert_eq!(keys, &["charlie", "alpha", "bravo"]);
     }
 
     #[test]
     fn parse_ndjson_per_service_wal_bytes() {
         let data = b"{\"service\":\"a\",\"x\":1}\n{\"service\":\"b\",\"x\":2}\n{\"service\":\"a\",\"x\":3}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
+        let parsed = parse(data).unwrap();
         // Each service batch's ndjson should only contain its own events.
-        let a_lines: Vec<_> = std::str::from_utf8(&parsed.batches["a"].ndjson)
-            .unwrap()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .collect();
-        let b_lines: Vec<_> = std::str::from_utf8(&parsed.batches["b"].ndjson)
-            .unwrap()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .collect();
+        let a_lines: Vec<_> =
+            std::str::from_utf8(&parsed.batches[&("prod".to_string(), "a".to_string())].ndjson)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .collect();
+        let b_lines: Vec<_> =
+            std::str::from_utf8(&parsed.batches[&("prod".to_string(), "b".to_string())].ndjson)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .collect();
         assert_eq!(a_lines.len(), 2);
         assert_eq!(b_lines.len(), 1);
     }
 
     #[test]
     fn reject_counts_accuracy() {
-        // 1 invalid json, 1 missing service, 1 empty service, 1 bad chars, 1 valid
-        let data = b"not json\n{\"no_svc\":1}\n{\"service\":\"\",\"m\":\"x\"}\n{\"service\":\"a/b\",\"m\":\"x\"}\n{\"service\":\"ok\",\"m\":\"x\"}";
-        let parsed = parse_events(data, &test_defaults()).unwrap();
-        assert_eq!(parsed.reject_counts.invalid_json, 1);
-        assert_eq!(parsed.reject_counts.missing_service, 1);
-        assert_eq!(parsed.reject_counts.empty_service, 1);
-        assert_eq!(parsed.reject_counts.invalid_chars, 1);
-        assert_eq!(parsed.reject_counts.total(), 4);
+        // 1 invalid json, 1 missing service, 1 empty service, 1 bad chars,
+        // 1 non-string service, 1 valid
+        let data = b"not json\n{\"no_svc\":1}\n{\"service\":\"\",\"m\":\"x\"}\n{\"service\":\"a/b\",\"m\":\"x\"}\n{\"service\":7,\"m\":\"x\"}\n{\"service\":\"ok\",\"m\":\"x\"}";
+        let parsed = parse(data).unwrap();
+        assert_eq!(parsed.reject_counts.get(RejectReason::InvalidJson), 1);
+        assert_eq!(parsed.reject_counts.get(RejectReason::MissingService), 1);
+        assert_eq!(parsed.reject_counts.get(RejectReason::EmptyService), 1);
+        assert_eq!(parsed.reject_counts.get(RejectReason::InvalidChars), 1);
+        assert_eq!(parsed.reject_counts.get(RejectReason::ServiceNotString), 1);
+        assert_eq!(parsed.reject_counts.total(), 5);
         assert_eq!(total_accepted(&parsed), 1);
     }
 }

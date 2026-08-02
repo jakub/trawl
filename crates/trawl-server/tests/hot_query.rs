@@ -21,9 +21,11 @@ use trawl_server::pool::ExecutorPool;
 /// Build a JSON event map with the given fields.
 fn make_event(service: &str, message: &str) -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert("timestamp".into(), json!("2026-02-15T12:00:00Z"));
+    m.insert("_time".into(), json!("2026-02-15T12:00:00Z"));
+    m.insert("_ingested".into(), json!("2026-02-15T12:00:01Z"));
     m.insert("service".into(), json!(service));
-    m.insert("level".into(), json!("info"));
+    m.insert("severity".into(), json!(9));
+    m.insert("severity_text".into(), json!("info"));
     m.insert("message".into(), json!(message));
     m
 }

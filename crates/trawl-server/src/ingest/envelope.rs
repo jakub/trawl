@@ -1,0 +1,1101 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! The event canonicalizer: one place where an arriving JSON object either
+//! becomes a declared-envelope event (ADR-0009) or is rejected with a typed
+//! reason.
+//!
+//! Principle: **repair when the server has an honest answer; reject when it
+//! would guess.** Every repair is recorded as a [`RepairCode`] in the
+//! event's `_repairs` column and counted per `(code, service)`.
+//!
+//! Three producers feed events through here: the HTTP ingest handler, the
+//! syslog listener, and internal telemetry (`service:trawld`).
+
+use std::fmt;
+
+use serde_json::{Map, Value, json};
+
+use crate::ingest::compaction;
+use crate::ingest::pipeline;
+
+/// What the server changed about an accepted event — a closed enum, same
+/// principle as ADR-0006's "roles are data, permissions are code": codes
+/// are code, so `_repairs` cannot become a junk drawer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairCode {
+    /// `host` was missing; filled from the sender IP.
+    HostFromPeer,
+    /// `env` was missing; filled from `default_env`.
+    EnvDefaulted,
+    /// `_time` was missing or unparseable; used arrival time.
+    TimeFromIngest,
+    /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
+    TimeOutOfRange,
+    /// severity text did not match the ladder.
+    SeverityUnmapped,
+    /// a value exceeded the length cap (`_raw`).
+    FieldTruncated,
+    /// client sent a server-owned field (`_ingested`, `_repairs`, or a
+    /// non-string `_raw`); value dropped and replaced.
+    MetaStripped,
+}
+
+impl RepairCode {
+    /// The wire/metric label spelling of the code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostFromPeer => "host.from_peer",
+            Self::EnvDefaulted => "env.defaulted",
+            Self::TimeFromIngest => "time.from_ingest",
+            Self::TimeOutOfRange => "time.out_of_range",
+            Self::SeverityUnmapped => "severity.unmapped",
+            Self::FieldTruncated => "field.truncated",
+            Self::MetaStripped => "meta.stripped",
+        }
+    }
+}
+
+impl fmt::Display for RepairCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why an event was rejected — used as a prometheus label value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RejectReason {
+    MissingService,
+    /// `service` present but not a JSON string — type-specific, never
+    /// conflated with [`Self::MissingService`].
+    ServiceNotString,
+    EmptyService,
+    ServiceTooLong,
+    InvalidChars,
+    /// `env` present but not a string, or failing the env charset.
+    InvalidEnv,
+    /// `env` valid in shape but not in the configured allowlist —
+    /// repairing it into `default_env` would misfile data in the wrong
+    /// path root permanently.
+    EnvNotAllowed,
+    /// `host` missing and the peer is a configured trusted relay: filling
+    /// from the peer would stamp the relay's address as the origin.
+    HostMissingFromRelay,
+    NotObject,
+    InvalidJson,
+    WalFailure,
+}
+
+impl RejectReason {
+    /// The prometheus label spelling of the reason.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingService => "missing_service",
+            Self::ServiceNotString => "service_not_string",
+            Self::EmptyService => "empty_service",
+            Self::ServiceTooLong => "service_too_long",
+            Self::InvalidChars => "invalid_chars",
+            Self::InvalidEnv => "invalid_env",
+            Self::EnvNotAllowed => "env_not_allowed",
+            Self::HostMissingFromRelay => "host_missing_from_relay",
+            Self::NotObject => "not_object",
+            Self::InvalidJson => "invalid_json",
+            Self::WalFailure => "wal_failure",
+        }
+    }
+
+    /// Every reason, for exhaustive metric/summary iteration.
+    pub const ALL: &'static [Self] = &[
+        Self::MissingService,
+        Self::ServiceNotString,
+        Self::EmptyService,
+        Self::ServiceTooLong,
+        Self::InvalidChars,
+        Self::InvalidEnv,
+        Self::EnvNotAllowed,
+        Self::HostMissingFromRelay,
+        Self::NotObject,
+        Self::InvalidJson,
+        Self::WalFailure,
+    ];
+}
+
+impl fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Per-request context the canonicalizer needs: arrival instant, peer
+/// identity, and the env allowlist. Threaded in deliberately — this is
+/// `validate`'s first config-dependent check, and globals would hide it.
+#[derive(Debug)]
+pub struct EnvelopeContext<'a> {
+    /// RFC 3339 UTC arrival time at microsecond precision — stamped as
+    /// `_ingested` and substituted for a missing/unparseable `_time`.
+    pub arrival: &'a str,
+    /// The same arrival instant, for plausibility windows.
+    pub arrival_instant: chrono::DateTime<chrono::Utc>,
+    /// Peer IP as a string (from the TCP connection).
+    pub peer_host: &'a str,
+    /// Whether the peer is inside a configured `trusted_relays` CIDR:
+    /// a missing `host` is then rejected instead of repaired.
+    pub peer_is_trusted_relay: bool,
+    /// The effective env allowlist (never empty).
+    pub envs: &'a [String],
+    /// Fills a missing `env` (recorded as `env.defaulted`).
+    pub default_env: &'a str,
+}
+
+/// A canonicalized event: the declared envelope plus the client's own
+/// fields, ready for WAL serialization.
+#[derive(Debug)]
+pub struct Canonical {
+    /// Path segment 1 (validated against the allowlist).
+    pub env: String,
+    /// Path segment 2 (validated against the service charset).
+    pub service: String,
+    /// The full event object, envelope fields canonicalized. Optional
+    /// envelope fields are OMITTED when absent, never written as JSON
+    /// null — `DuckDB` infers JSON for an all-null column (ADR-0009).
+    pub obj: Map<String, Value>,
+    /// Repair codes applied, in application order (also joined into the
+    /// object's `_repairs`).
+    pub repairs: Vec<RepairCode>,
+}
+
+/// Maximum preserved length of `_raw` (chars). Generous — `_raw` is the
+/// re-extraction lifeline — but bounded, so one pathological event cannot
+/// dominate a parquet row group. Truncation is recorded as
+/// `field.truncated`.
+pub const MAX_RAW_CHARS: usize = 65_536;
+
+/// How far in the past a parsed `_time` may sit before it is flagged
+/// `time.out_of_range` (kept, never substituted).
+const OUT_OF_RANGE_PAST_DAYS: i64 = 3653; // ~10 years
+/// How far in the future a parsed `_time` may sit before it is flagged.
+const OUT_OF_RANGE_FUTURE_DAYS: i64 = 1;
+
+/// Date-time formats carrying an explicit UTC offset, tried after RFC 3339.
+///
+/// `chrono::DateTime::parse_from_rfc3339` only accepts the extended offset
+/// spelling (`+05:30`), but the ISO 8601 *basic* spelling (`+0530`, `+05`) is
+/// what Java's default logging encoders and Go's `-0700` layouts emit, and the
+/// hard `CAST` this path replaced accepted it. `%#z` is chrono's parse-only
+/// offset that takes `+HH`, `+HHMM` and `+HH:MM` alike.
+const OFFSET_TIMESTAMP_FORMATS: [&str; 6] = [
+    "%Y-%m-%dT%H:%M:%S%.f%#z",
+    "%Y-%m-%d %H:%M:%S%.f%#z",
+    "%Y/%m/%d %H:%M:%S%.f%#z",
+    "%Y-%m-%dT%H:%M%#z",
+    "%Y-%m-%d %H:%M%#z",
+    "%Y/%m/%d %H:%M%#z",
+];
+
+/// Offset-less date-time formats accepted alongside RFC 3339, read as UTC.
+///
+/// `%.f` matches an optional fractional-second suffix, so each second-precision
+/// entry covers both the with- and without-fraction spelling; the `%H:%M`
+/// entries cover minute precision. The slash-dated spellings are what Go's
+/// standard `log` package emits.
+const NAIVE_TIMESTAMP_FORMATS: [&str; 6] = [
+    "%Y-%m-%dT%H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y/%m/%d %H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M",
+];
+
+/// Date-only formats, read as midnight UTC.
+const DATE_ONLY_TIMESTAMP_FORMATS: [&str; 2] = ["%Y-%m-%d", "%Y/%m/%d"];
+
+/// Parse a time value per the ADR-0008 grammar (moved verbatim from the
+/// pre-cutover handler, never narrowed).
+///
+/// A value is valid iff it is a JSON string that — after trimming
+/// surrounding whitespace — chrono parses as RFC 3339, as one of
+/// [`OFFSET_TIMESTAMP_FORMATS`], [`NAIVE_TIMESTAMP_FORMATS`] or
+/// [`DATE_ONLY_TIMESTAMP_FORMATS`]. Returns `None` for anything malformed.
+fn parse_event_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = v.as_str()?.trim();
+    let utc: chrono::DateTime<chrono::Utc> = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+    {
+        dt.with_timezone(&chrono::Utc)
+    } else if let Some(dt) = OFFSET_TIMESTAMP_FORMATS
+        .iter()
+        .find_map(|fmt| chrono::DateTime::parse_from_str(s, fmt).ok())
+    {
+        dt.with_timezone(&chrono::Utc)
+    } else if let Some(naive) = NAIVE_TIMESTAMP_FORMATS
+        .iter()
+        .find_map(|fmt| chrono::NaiveDateTime::parse_from_str(s, fmt).ok())
+    {
+        naive.and_utc()
+    } else {
+        DATE_ONLY_TIMESTAMP_FORMATS
+            .iter()
+            .find_map(|fmt| chrono::NaiveDate::parse_from_str(s, fmt).ok())?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc()
+    };
+    Some(utc)
+}
+
+/// Truncate a string to `max_chars` on a char boundary. Returns the
+/// original when it fits.
+fn truncate_chars(s: String, max_chars: usize) -> (String, bool) {
+    if s.chars().count() > max_chars {
+        (s.chars().take(max_chars).collect(), true)
+    } else {
+        (s, false)
+    }
+}
+
+/// Validate the `service` value: present, a string, non-empty, within the
+/// length cap, charset-clean, and not a dot-name (`.`, `..`, dot-leading).
+///
+/// Path encoding is injective by validation (ADR-0009): the on-disk name
+/// IS the value, so the constraints here are the whole safety argument.
+fn validate_service(obj: &Map<String, Value>) -> Result<String, (String, RejectReason)> {
+    let v = obj.get("service").ok_or_else(|| {
+        (
+            "missing 'service' field".to_owned(),
+            RejectReason::MissingService,
+        )
+    })?;
+    let Some(svc) = v.as_str() else {
+        let type_name = match v {
+            Value::Null => "null",
+            Value::Bool(_) => "a boolean",
+            Value::Number(_) => "a number",
+            Value::Array(_) => "an array",
+            Value::Object(_) => "an object",
+            Value::String(_) => unreachable!("string handled above"),
+        };
+        return Err((
+            format!("'service' must be a string, got {type_name}"),
+            RejectReason::ServiceNotString,
+        ));
+    };
+
+    if svc.is_empty() {
+        return Err((
+            "service name cannot be empty".into(),
+            RejectReason::EmptyService,
+        ));
+    }
+    if svc.len() > pipeline::MAX_SERVICE_NAME_LEN {
+        return Err((
+            format!(
+                "service name too long ({} chars, max {})",
+                svc.len(),
+                pipeline::MAX_SERVICE_NAME_LEN,
+            ),
+            RejectReason::ServiceTooLong,
+        ));
+    }
+    if !svc.bytes().all(pipeline::is_valid_service_char) {
+        return Err((
+            format!(
+                "service '{svc}' contains invalid characters \
+                 (only alphanumeric, dash, underscore, dot allowed)"
+            ),
+            RejectReason::InvalidChars,
+        ));
+    }
+    if svc.starts_with('.') {
+        return Err((
+            format!("service '{svc}' cannot be '.', '..', or start with a dot"),
+            RejectReason::InvalidChars,
+        ));
+    }
+
+    Ok(svc.to_owned())
+}
+
+/// Validate/derive the `env` value against the allowlist. Returns the env
+/// and whether it was defaulted.
+fn resolve_env(
+    obj: &Map<String, Value>,
+    ctx: &EnvelopeContext<'_>,
+) -> Result<(String, bool), (String, RejectReason)> {
+    match obj.get("env") {
+        None | Some(Value::Null) => Ok((ctx.default_env.to_owned(), true)),
+        Some(Value::String(env)) => {
+            if !trawl_config::is_valid_env_name(env) {
+                return Err((
+                    format!("env '{env}' is not a valid env name (must match [a-z0-9_-]{{1,32}})"),
+                    RejectReason::InvalidEnv,
+                ));
+            }
+            if !ctx.envs.iter().any(|e| e == env) {
+                return Err((
+                    format!(
+                        "env '{env}' is not in the configured allowlist ({:?})",
+                        ctx.envs
+                    ),
+                    RejectReason::EnvNotAllowed,
+                ));
+            }
+            Ok((env.clone(), false))
+        }
+        Some(other) => Err((
+            format!("'env' must be a string, got {other}"),
+            RejectReason::InvalidEnv,
+        )),
+    }
+}
+
+/// Map a client severity-ish value (`severity_text` / level) to an exact
+/// `SeverityNumber`: name tokens case-insensitively, syslog numerals 0-7
+/// (string or number) inverted onto the `OTel` ladder.
+fn severity_from_value(v: &Value) -> Option<u8> {
+    match v {
+        Value::String(s) => {
+            let s = s.trim();
+            if let Ok(n) = s.parse::<u8>() {
+                trawl_core::severity::from_syslog(n)
+            } else {
+                trawl_core::severity::number_for_token(s)
+            }
+        }
+        Value::Number(n) => n
+            .as_u64()
+            .and_then(|n| u8::try_from(n).ok())
+            .and_then(trawl_core::severity::from_syslog),
+        _ => None,
+    }
+}
+
+/// Resolve the severity chain onto `out`, consuming the `severity`,
+/// `severity_text`, and `level` inputs: a client `severity` integer 1-24
+/// wins → else derive from `severity_text` → else from `level` → else
+/// NULL. `level` is consumed at ingest — the DSL alias would shadow it
+/// anyway; the original is always in `_raw`. Stored `severity_text` is
+/// the client's verbatim when it is a string, else the `level` value used
+/// for derivation, else absent.
+///
+/// Omit-when-null: an all-null column in a batch must be absent, not JSON
+/// null, or `DuckDB` infers JSON for the column type (ADR-0009). Returns
+/// whether the event carried severity-ish input that failed to map
+/// (`severity.unmapped`).
+fn resolve_severity(out: &mut Map<String, Value>) -> bool {
+    let client_severity = out.remove("severity");
+    let client_text = out.remove("severity_text");
+    let level = out.remove("level");
+
+    let valid_client_number = client_severity
+        .as_ref()
+        .and_then(Value::as_i64)
+        .filter(|n| trawl_core::severity::is_valid_number(*n));
+
+    let severity_number = valid_client_number.or_else(|| {
+        client_text
+            .as_ref()
+            .and_then(severity_from_value)
+            .or_else(|| level.as_ref().and_then(severity_from_value))
+            .map(i64::from)
+    });
+
+    let stored_text: Option<String> = match &client_text {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => match &level {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        },
+    };
+
+    let unmapped = severity_number.is_none()
+        && (client_severity.is_some() || client_text.is_some() || level.is_some());
+
+    if let Some(n) = severity_number {
+        out.insert("severity".into(), json!(n));
+    }
+    if let Some(t) = stored_text {
+        out.insert("severity_text".into(), json!(t));
+    }
+    unmapped
+}
+
+/// Canonicalize one parsed event object into the declared envelope.
+///
+/// Field order of operations is load-bearing:
+/// 1. `service` validation (reject path — nothing else runs).
+/// 2. `_raw` capture — FIRST, before reserved-key stripping and every
+///    repair, so the server's own fills never appear inside "what arrived".
+/// 3. Reserved-key strip (`meta.stripped`), `_trawl_wal_file` silent drop.
+/// 4. `_time` from the wire aliases (`_time`/`timestamp`/`@timestamp`,
+///    consumed), ADR-0008 grammar, `time.from_ingest`/`time.out_of_range`.
+/// 5. `_ingested` stamp.
+/// 6. `env` default-or-reject, `host` peer-fill-or-relay-reject.
+/// 7. Severity chain (`severity` 1-24 → `severity_text` → `level` → NULL);
+///    `level` is consumed.
+/// 8. `_repairs` assembly (omitted when clean).
+pub fn canonicalize(
+    obj: &Map<String, Value>,
+    ctx: &EnvelopeContext<'_>,
+) -> Result<Canonical, (String, RejectReason)> {
+    let service = validate_service(obj)?;
+    // Env and host decide rejection before any mutation happens.
+    let (env, env_defaulted) = resolve_env(obj, ctx)?;
+    let host_missing = matches!(obj.get("host"), None | Some(Value::Null));
+    if host_missing && ctx.peer_is_trusted_relay {
+        return Err((
+            format!(
+                "event has no 'host' and peer {} is a configured trusted relay \
+                 — filling from the peer would stamp the relay's address as \
+                 the origin",
+                ctx.peer_host
+            ),
+            RejectReason::HostMissingFromRelay,
+        ));
+    }
+
+    let mut repairs: Vec<RepairCode> = Vec::new();
+    let push_repair = |repairs: &mut Vec<RepairCode>, code: RepairCode| {
+        if !repairs.contains(&code) {
+            repairs.push(code);
+        }
+    };
+
+    // 2. Capture `_raw` before anything is stripped or repaired: a
+    // client-supplied string `_raw` (a collector preserving its pre-parse
+    // line) is kept verbatim; otherwise the canonical pre-repair
+    // serialization of the parsed object is the most original form
+    // available (wire-exact bytes do not exist — events arrive inside JSON
+    // arrays and the WAL re-serializes anyway).
+    let raw_string = match obj.get("_raw") {
+        Some(Value::String(s)) => s.clone(),
+        _ => serde_json::to_string(obj).unwrap_or_default(),
+    };
+    let (raw_string, truncated) = truncate_chars(raw_string, MAX_RAW_CHARS);
+
+    let mut out = obj.clone();
+
+    // 3. Server-owned metadata is never client-settable: honouring it would
+    // let a sender forge its own handling history.
+    let mut stripped_meta = false;
+    for key in trawl_core::schema::RESERVED_CLIENT_FIELDS {
+        if out.remove(*key).is_some() {
+            stripped_meta = true;
+        }
+    }
+    if matches!(out.get("_raw"), Some(v) if !v.is_string()) {
+        out.remove("_raw");
+        stripped_meta = true;
+    }
+    if stripped_meta {
+        push_repair(&mut repairs, RepairCode::MetaStripped);
+    }
+    // Compaction's synthetic provenance column: trawl's key, not the
+    // client's — silently dropped (a row carrying it wedges read_json).
+    out.remove(compaction::WAL_FILE_COL);
+
+    // 4. `_time` from the first present wire alias; all aliases consumed.
+    let time_input = trawl_core::schema::TIME_ALIASES
+        .iter()
+        .find_map(|k| out.get(*k).cloned());
+    for k in trawl_core::schema::TIME_ALIASES {
+        out.remove(*k);
+    }
+    let canonical_time = match &time_input {
+        None => {
+            push_repair(&mut repairs, RepairCode::TimeFromIngest);
+            ctx.arrival.to_owned()
+        }
+        Some(v) => {
+            if let Some(dt) = parse_event_time(v) {
+                let past = ctx.arrival_instant - chrono::Duration::days(OUT_OF_RANGE_PAST_DAYS);
+                let future = ctx.arrival_instant + chrono::Duration::days(OUT_OF_RANGE_FUTURE_DAYS);
+                if dt < past || dt > future {
+                    // Implausible, but parseable: kept — flagged, never
+                    // substituted (the client said what it said).
+                    push_repair(&mut repairs, RepairCode::TimeOutOfRange);
+                }
+                dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+            } else {
+                push_repair(&mut repairs, RepairCode::TimeFromIngest);
+                ctx.arrival.to_owned()
+            }
+        }
+    };
+    out.insert(trawl_core::schema::TIME.into(), json!(canonical_time));
+
+    // 5. Server-stamped arrival time.
+    out.insert(trawl_core::schema::INGESTED.into(), json!(ctx.arrival));
+
+    // 6. env / host.
+    out.insert("env".into(), json!(env));
+    if env_defaulted {
+        push_repair(&mut repairs, RepairCode::EnvDefaulted);
+    }
+    if host_missing {
+        out.insert("host".into(), json!(ctx.peer_host));
+        push_repair(&mut repairs, RepairCode::HostFromPeer);
+    }
+
+    // 7. Severity chain (`level` consumed).
+    if resolve_severity(&mut out) {
+        push_repair(&mut repairs, RepairCode::SeverityUnmapped);
+    }
+
+    // 8. `_raw` and `_repairs`.
+    if truncated {
+        push_repair(&mut repairs, RepairCode::FieldTruncated);
+    }
+    out.insert(trawl_core::schema::RAW.into(), json!(raw_string));
+    if repairs.is_empty() {
+        out.remove(trawl_core::schema::REPAIRS);
+    } else {
+        let joined = repairs
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        out.insert(trawl_core::schema::REPAIRS.into(), json!(joined));
+    }
+
+    Ok(Canonical {
+        env,
+        service,
+        obj: out,
+        repairs,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arrival_instant() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    const ARRIVAL: &str = "2026-01-01T00:00:00.000000Z";
+
+    fn ctx_with(envs: &[String], relay: bool) -> EnvelopeContext<'_> {
+        EnvelopeContext {
+            arrival: ARRIVAL,
+            arrival_instant: arrival_instant(),
+            peer_host: "10.0.4.55",
+            peer_is_trusted_relay: relay,
+            envs,
+            default_env: &envs[0],
+        }
+    }
+
+    fn envs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn event(json: &str) -> Map<String, Value> {
+        serde_json::from_str::<Value>(json)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    fn canon(json: &str) -> Canonical {
+        let e = envs(&["prod", "lab"]);
+        canonicalize(&event(json), &ctx_with(&e, false)).expect("event must canonicalize")
+    }
+
+    fn reject(json: &str) -> (String, RejectReason) {
+        let e = envs(&["prod", "lab"]);
+        canonicalize(&event(json), &ctx_with(&e, false)).expect_err("event must reject")
+    }
+
+    fn codes(c: &Canonical) -> Vec<&'static str> {
+        c.repairs.iter().map(|r| r.as_str()).collect()
+    }
+
+    // --- the declared schema, enforced (acceptance criterion 1) ---
+
+    #[test]
+    fn fully_specified_event_is_clean() {
+        let c = canon(
+            r#"{"service":"nginx","env":"prod","host":"web01",
+                "_time":"2025-12-31T23:00:00Z","severity":17,
+                "severity_text":"error","message":"boom","_raw":"raw line"}"#,
+        );
+        assert!(c.repairs.is_empty(), "clean event: {:?}", c.repairs);
+        assert!(
+            !c.obj.contains_key("_repairs"),
+            "_repairs must be OMITTED (not null) for clean events"
+        );
+        assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
+        assert_eq!(c.obj["_ingested"], ARRIVAL);
+        assert_eq!(c.obj["_raw"], "raw line");
+        assert_eq!(c.obj["env"], "prod");
+        assert_eq!(c.obj["severity"], 17);
+        assert_eq!(c.obj["severity_text"], "error");
+    }
+
+    #[test]
+    fn missing_time_repairs_from_ingest() {
+        let c = canon(r#"{"service":"s","env":"prod","host":"h"}"#);
+        assert_eq!(c.obj["_time"], ARRIVAL);
+        assert!(codes(&c).contains(&"time.from_ingest"));
+        assert_eq!(c.obj["_repairs"], "time.from_ingest");
+    }
+
+    #[test]
+    fn missing_env_repairs_from_default() {
+        let c = canon(r#"{"service":"s","host":"h","_time":"2025-12-31T23:00:00Z"}"#);
+        assert_eq!(c.obj["env"], "prod");
+        assert_eq!(c.env, "prod");
+        assert!(codes(&c).contains(&"env.defaulted"));
+    }
+
+    #[test]
+    fn missing_host_repairs_from_peer() {
+        let c = canon(r#"{"service":"s","env":"prod","_time":"2025-12-31T23:00:00Z"}"#);
+        assert_eq!(c.obj["host"], "10.0.4.55");
+        assert!(codes(&c).contains(&"host.from_peer"));
+    }
+
+    #[test]
+    fn missing_service_rejects() {
+        let (msg, reason) = reject(r#"{"message":"no service"}"#);
+        assert_eq!(reason, RejectReason::MissingService);
+        assert!(msg.contains("service"));
+    }
+
+    // --- service type-specific rejection (acceptance criterion 2) ---
+
+    #[test]
+    fn service_object_rejects_with_type_reason() {
+        let (msg, reason) = reject(r#"{"service":{"name":"x"}}"#);
+        assert_eq!(reason, RejectReason::ServiceNotString);
+        assert!(msg.contains("object"), "got: {msg}");
+    }
+
+    #[test]
+    fn service_number_rejects_with_type_reason() {
+        let (msg, reason) = reject(r#"{"service":42}"#);
+        assert_eq!(reason, RejectReason::ServiceNotString);
+        assert!(msg.contains("number"), "got: {msg}");
+    }
+
+    #[test]
+    fn service_null_rejects_with_type_reason() {
+        let (_, reason) = reject(r#"{"service":null}"#);
+        assert_eq!(reason, RejectReason::ServiceNotString);
+    }
+
+    // --- service charset (injective paths) ---
+
+    #[test]
+    fn service_dot_names_reject() {
+        for svc in [".", "..", ".hidden"] {
+            let (msg, reason) = reject(&format!(r#"{{"service":"{svc}"}}"#));
+            assert_eq!(reason, RejectReason::InvalidChars, "service {svc:?}");
+            assert!(msg.contains("dot"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn service_space_now_rejects() {
+        let (_, reason) = reject(r#"{"service":"Activity Monitor"}"#);
+        assert_eq!(reason, RejectReason::InvalidChars);
+    }
+
+    #[test]
+    fn service_traversal_rejects() {
+        for svc in ["../../etc/passwd", "a/b", "a\\b"] {
+            let (_, reason) = reject(&format!(r#"{{"service":"{}"}}"#, svc.replace('\\', "\\\\")));
+            assert_eq!(reason, RejectReason::InvalidChars, "service {svc:?}");
+        }
+    }
+
+    #[test]
+    fn service_dotted_names_accepted_verbatim() {
+        let c =
+            canon(r#"{"service":"api.v2","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z"}"#);
+        assert_eq!(c.service, "api.v2");
+    }
+
+    // --- host behind a trusted relay (acceptance criterion 3) ---
+
+    #[test]
+    fn missing_host_behind_trusted_relay_rejects() {
+        let e = envs(&["prod"]);
+        let ctx = ctx_with(&e, true);
+        let (msg, reason) = canonicalize(
+            &event(r#"{"service":"s","env":"prod","_time":"2025-12-31T23:00:00Z"}"#),
+            &ctx,
+        )
+        .expect_err("must reject");
+        assert_eq!(reason, RejectReason::HostMissingFromRelay);
+        assert!(msg.contains("10.0.4.55"), "got: {msg}");
+    }
+
+    #[test]
+    fn present_host_behind_trusted_relay_accepted() {
+        let e = envs(&["prod"]);
+        let ctx = ctx_with(&e, true);
+        let c = canonicalize(
+            &event(
+                r#"{"service":"s","env":"prod","host":"origin-1","_time":"2025-12-31T23:00:00Z"}"#,
+            ),
+            &ctx,
+        )
+        .expect("must accept");
+        assert_eq!(c.obj["host"], "origin-1");
+        assert!(c.repairs.is_empty());
+    }
+
+    // --- env allowlist (acceptance criterion: unknown env hard-rejects) ---
+
+    #[test]
+    fn unlisted_env_rejects() {
+        let (msg, reason) = reject(r#"{"service":"s","env":"prdo"}"#);
+        assert_eq!(reason, RejectReason::EnvNotAllowed);
+        assert!(msg.contains("prdo"), "got: {msg}");
+    }
+
+    #[test]
+    fn invalid_env_shape_rejects() {
+        for (env_json, label) in [
+            (r#""Prod""#, "uppercase"),
+            (r#""pro.d""#, "dot"),
+            (r#""pro/d""#, "slash"),
+            (r#""..""#, "dotdot"),
+            (r#""""#, "empty"),
+            ("42", "number"),
+            (r#"{"x":1}"#, "object"),
+        ] {
+            let (_, reason) = reject(&format!(r#"{{"service":"s","env":{env_json}}}"#));
+            assert_eq!(reason, RejectReason::InvalidEnv, "env case {label}");
+        }
+    }
+
+    #[test]
+    fn null_env_defaults_like_absent() {
+        let c = canon(r#"{"service":"s","host":"h","env":null,"_time":"2025-12-31T23:00:00Z"}"#);
+        assert_eq!(c.env, "prod");
+        assert!(codes(&c).contains(&"env.defaulted"));
+    }
+
+    // --- severity (acceptance criteria: normalization, precedence, unmapped) ---
+
+    #[test]
+    fn severity_spellings_normalize_to_thirteen() {
+        for spelling in [
+            r#""WARN""#,
+            r#""warning""#,
+            r#""Warn""#,
+            r#""W""#,
+            r#""4""#,
+            "4",
+        ] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","level":{spelling}}}"#
+            ));
+            assert_eq!(c.obj["severity"], 13, "spelling {spelling} must map to 13");
+            assert!(c.repairs.is_empty(), "mapping is not a repair");
+        }
+    }
+
+    #[test]
+    fn severity_text_preserved_verbatim() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity_text":"WARN"}"#,
+        );
+        assert_eq!(c.obj["severity"], 13);
+        assert_eq!(c.obj["severity_text"], "WARN", "verbatim, not lowercased");
+    }
+
+    #[test]
+    fn severity_integer_wins_over_text() {
+        // severity: 17 + severity_text: "info" keeps 17.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":17,"severity_text":"info"}"#,
+        );
+        assert_eq!(c.obj["severity"], 17);
+        assert_eq!(c.obj["severity_text"], "info");
+        assert!(c.repairs.is_empty());
+    }
+
+    #[test]
+    fn severity_text_wins_over_level() {
+        // severity_text: "error" + level: "info" derives 17 from severity_text.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity_text":"error","level":"info"}"#,
+        );
+        assert_eq!(c.obj["severity"], 17);
+        assert_eq!(c.obj["severity_text"], "error");
+    }
+
+    #[test]
+    fn level_is_consumed_never_stored() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","level":"error"}"#,
+        );
+        assert!(!c.obj.contains_key("level"), "level must be consumed");
+        assert_eq!(c.obj["severity"], 17);
+        assert_eq!(
+            c.obj["severity_text"], "error",
+            "the level value used for derivation lands in severity_text"
+        );
+    }
+
+    #[test]
+    fn unmappable_severity_is_null_plus_code_never_reject() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","level":"SPICY"}"#,
+        );
+        assert!(
+            !c.obj.contains_key("severity"),
+            "unmappable severity must be OMITTED (NULL), got {:?}",
+            c.obj.get("severity")
+        );
+        assert_eq!(c.obj["severity_text"], "SPICY", "severity_text intact");
+        assert!(codes(&c).contains(&"severity.unmapped"));
+    }
+
+    #[test]
+    fn out_of_ladder_client_severity_falls_through() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":42}"#,
+        );
+        assert!(!c.obj.contains_key("severity"));
+        assert!(codes(&c).contains(&"severity.unmapped"));
+    }
+
+    #[test]
+    fn absent_severity_is_not_a_repair() {
+        let c = canon(r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z"}"#);
+        assert!(!c.obj.contains_key("severity"));
+        assert!(!c.obj.contains_key("severity_text"));
+        assert!(!codes(&c).contains(&"severity.unmapped"));
+    }
+
+    // --- _raw (acceptance criteria: pre-defaults capture, client honour) ---
+
+    #[test]
+    fn raw_captured_before_host_fill() {
+        // No host: the server fills 10.0.4.55, but _raw must not contain it.
+        let c = canon(r#"{"service":"s","env":"prod","_time":"2025-12-31T23:00:00Z"}"#);
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(
+            !raw.contains("10.0.4.55"),
+            "_raw must not contain the server-filled host: {raw}"
+        );
+        assert_eq!(c.obj["host"], "10.0.4.55");
+    }
+
+    #[test]
+    fn client_string_raw_survives_verbatim() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_raw":"<134>1 the wire line"}"#,
+        );
+        assert_eq!(c.obj["_raw"], "<134>1 the wire line");
+        assert!(c.repairs.is_empty());
+    }
+
+    #[test]
+    fn non_string_raw_replaced_with_meta_stripped() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_raw":{"nested":1}}"#,
+        );
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(raw.starts_with('{'), "server-filled canonical form: {raw}");
+        assert!(codes(&c).contains(&"meta.stripped"));
+    }
+
+    #[test]
+    fn client_ingested_and_repairs_stripped() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_ingested":"1999-01-01T00:00:00Z","_repairs":"forged"}"#,
+        );
+        assert_eq!(c.obj["_ingested"], ARRIVAL, "server stamp wins");
+        assert_eq!(
+            c.obj["_repairs"], "meta.stripped",
+            "forged _repairs replaced by the strip record"
+        );
+        assert!(codes(&c).contains(&"meta.stripped"));
+    }
+
+    #[test]
+    fn raw_contains_stripped_client_meta() {
+        // _raw is "what arrived" — including the forged fields.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_repairs":"forged"}"#,
+        );
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(raw.contains("forged"), "got: {raw}");
+    }
+
+    #[test]
+    fn oversized_raw_truncated_on_char_boundary() {
+        let big: String = "é".repeat(MAX_RAW_CHARS + 50);
+        let c = canon(&format!(
+            r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_raw":"{big}"}}"#
+        ));
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert_eq!(raw.chars().count(), MAX_RAW_CHARS);
+        assert_eq!(raw, "é".repeat(MAX_RAW_CHARS));
+        assert!(codes(&c).contains(&"field.truncated"));
+    }
+
+    // --- _time grammar (the ADR-0008 corpus, moved verbatim) ---
+
+    #[test]
+    fn time_valid_values_canonicalized() {
+        let cases = [
+            ("2025-06-01T12:00:00Z", "2025-06-01T12:00:00.000000Z"),
+            (
+                "2025-06-01T17:30:00.123456+05:30",
+                "2025-06-01T12:00:00.123456Z",
+            ),
+            (
+                "2025-06-01T12:00:00.123456789Z",
+                "2025-06-01T12:00:00.123456Z",
+            ),
+            ("2025-06-01 12:00:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01 12:00:00.5", "2025-06-01T12:00:00.500000Z"),
+            ("2025-06-01T12:00:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01T12:00:00.123", "2025-06-01T12:00:00.123000Z"),
+            ("2025-06-01", "2025-06-01T00:00:00.000000Z"),
+            (
+                "2025-06-01T12:00:00.000+0000",
+                "2025-06-01T12:00:00.000000Z",
+            ),
+            ("2025-06-01T17:30:00+0530", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01 14:00:00+02", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01T12:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01 12:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01T14:00+02:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025/06/01 12:00:00", "2025-06-01T12:00:00.000000Z"),
+            (
+                "2025/06/01 12:00:00.25+00:00",
+                "2025-06-01T12:00:00.250000Z",
+            ),
+            ("2025/06/01", "2025-06-01T00:00:00.000000Z"),
+            ("  2025-06-01T12:00:00Z  ", "2025-06-01T12:00:00.000000Z"),
+            (" 2025-06-01 12:00:00 ", "2025-06-01T12:00:00.000000Z"),
+        ];
+        for (input, expected) in cases {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","timestamp":"{input}"}}"#
+            ));
+            assert_eq!(
+                c.obj["_time"], expected,
+                "input {input:?} should canonicalize"
+            );
+            assert!(
+                !codes(&c).contains(&"time.from_ingest"),
+                "valid input {input:?} is not a repair"
+            );
+        }
+    }
+
+    #[test]
+    fn time_malformed_substituted_and_flagged() {
+        for input in [
+            r#""not-a-date""#,
+            r#""2026-13-45T99:99:99Z""#,
+            r#""2025-06-31""#,
+            r#""1748779200""#,
+            r#"{"nested":1}"#,
+            "12345",
+            "true",
+            "null",
+            r#""""#,
+        ] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","timestamp":{input}}}"#
+            ));
+            assert_eq!(
+                c.obj["_time"], ARRIVAL,
+                "malformed input {input} must be substituted with arrival"
+            );
+            assert!(
+                codes(&c).contains(&"time.from_ingest"),
+                "malformed input {input} must be flagged"
+            );
+            // The original is findable in _raw.
+        }
+    }
+
+    #[test]
+    fn time_out_of_range_kept_but_flagged() {
+        // >10y past and >1d future parse fine but are implausible.
+        for input in ["1999-01-01T00:00:00Z", "2026-01-03T00:00:00Z"] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"{input}"}}"#
+            ));
+            assert_ne!(c.obj["_time"], ARRIVAL, "out-of-range is KEPT: {input}");
+            assert!(codes(&c).contains(&"time.out_of_range"), "input {input}");
+            assert!(!codes(&c).contains(&"time.from_ingest"), "input {input}");
+        }
+    }
+
+    #[test]
+    fn wire_aliases_consumed_in_precedence_order() {
+        // _time wins over timestamp wins over @timestamp; all consumed.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-06-01T10:00:00Z",
+                "timestamp":"2025-06-01T11:00:00Z",
+                "@timestamp":"2025-06-01T12:00:00Z"}"#,
+        );
+        assert_eq!(c.obj["_time"], "2025-06-01T10:00:00.000000Z");
+        assert!(!c.obj.contains_key("timestamp"));
+        assert!(!c.obj.contains_key("@timestamp"));
+
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "timestamp":"2025-06-01T11:00:00Z",
+                "@timestamp":"2025-06-01T12:00:00Z"}"#,
+        );
+        assert_eq!(c.obj["_time"], "2025-06-01T11:00:00.000000Z");
+
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "@timestamp":"2025-06-01T12:00:00Z"}"#,
+        );
+        assert_eq!(c.obj["_time"], "2025-06-01T12:00:00.000000Z");
+    }
+
+    // --- reserved provenance key ---
+
+    #[test]
+    fn wal_file_key_silently_dropped() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_trawl_wal_file":"x","keep":"me"}"#,
+        );
+        assert!(!c.obj.contains_key(compaction::WAL_FILE_COL));
+        assert_eq!(c.obj["keep"], "me");
+        assert!(
+            c.repairs.is_empty(),
+            "the provenance key drop is silent, not meta.stripped"
+        );
+    }
+
+    // --- multiple repairs aggregate ---
+
+    #[test]
+    fn multiple_repairs_join_comma_separated() {
+        let e = envs(&["prod"]);
+        let ctx = ctx_with(&e, false);
+        let c = canonicalize(&event(r#"{"service":"s","level":"SPICY"}"#), &ctx).unwrap();
+        let repairs = c.obj["_repairs"].as_str().unwrap();
+        for code in [
+            "time.from_ingest",
+            "env.defaulted",
+            "host.from_peer",
+            "severity.unmapped",
+        ] {
+            assert!(repairs.contains(code), "missing {code} in {repairs}");
+        }
+        assert!(repairs.contains(','));
+    }
+}

@@ -137,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn full_timestamp_invalid_fallback() {
+    fn full_timestamp_malformed_fallback() {
         assert_eq!(format_full_timestamp("garbage"), "garbage");
     }
 }

@@ -116,13 +116,20 @@ use trawl_server::transport::http;
 
 /// Create a `PrometheusHandle` for test contexts.
 ///
-/// Uses `PrometheusBuilder` with a noop recorder since tests don't scrape
-/// the endpoint. Each call creates an independent recorder which is NOT
-/// installed globally (the handle is self-contained).
+/// Installs the recorder globally (nextest is process-per-test, so this
+/// cannot collide across tests) so `/metrics` reflects the counters the
+/// handlers emit via `metrics::counter!`. Falls back to a detached
+/// recorder when a global one is already installed (a test that builds
+/// two servers) — that second handle renders empty, which no test relies
+/// on.
 pub fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics_exporter_prometheus::PrometheusBuilder::new()
-        .build_recorder()
-        .handle()
+        .install_recorder()
+        .unwrap_or_else(|_| {
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .build_recorder()
+                .handle()
+        })
 }
 
 /// Find an available port by binding to :0 and reading back the assigned port.
@@ -376,10 +383,15 @@ pub fn ensure_fixtures() -> String {
 
         conn.execute_batch(
             "CREATE TABLE logs (
-                timestamp TIMESTAMP,
-                host VARCHAR,
+                _time TIMESTAMP,
+                _ingested TIMESTAMP,
+                _raw VARCHAR,
+                _repairs VARCHAR,
+                env VARCHAR,
                 service VARCHAR,
-                level VARCHAR,
+                host VARCHAR,
+                severity INTEGER,
+                severity_text VARCHAR,
                 message VARCHAR
             )",
         )
@@ -387,9 +399,9 @@ pub fn ensure_fixtures() -> String {
 
         conn.execute_batch(
             "INSERT INTO logs VALUES
-            ('2024-01-15 10:00:00', 'web01', 'nginx', 'info', 'request ok'),
-            ('2024-01-15 10:00:01', 'web01', 'nginx', 'error', 'upstream timeout'),
-            ('2024-01-15 10:00:02', 'db01', 'postgres', 'info', 'checkpoint complete')",
+            ('2024-01-15 10:00:00', '2024-01-15 10:00:10', 'raw0', NULL, 'prod', 'nginx', 'web01', 9, 'info', 'request ok'),
+            ('2024-01-15 10:00:01', '2024-01-15 10:00:11', 'raw1', NULL, 'prod', 'nginx', 'web01', 17, 'error', 'upstream timeout'),
+            ('2024-01-15 10:00:02', '2024-01-15 10:00:12', 'raw2', NULL, 'prod', 'postgres', 'db01', 9, 'info', 'checkpoint complete')",
         )
         .unwrap();
 

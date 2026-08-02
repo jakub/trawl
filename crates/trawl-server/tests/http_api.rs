@@ -117,10 +117,13 @@ async fn schema_returns_columns(pool: sqlx::PgPool) {
 
     // Our test fixture has these exact columns.
     let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
-    assert!(names.contains(&"timestamp"), "missing timestamp column");
+    assert!(names.contains(&"_time"), "missing _time column");
+    assert!(names.contains(&"_ingested"), "missing _ingested column");
+    assert!(names.contains(&"_raw"), "missing _raw column");
+    assert!(names.contains(&"env"), "missing env column");
     assert!(names.contains(&"host"), "missing host column");
     assert!(names.contains(&"service"), "missing service column");
-    assert!(names.contains(&"level"), "missing level column");
+    assert!(names.contains(&"severity"), "missing severity column");
     assert!(names.contains(&"message"), "missing message column");
     assert_eq!(schema.file_count, 2);
 }
@@ -206,6 +209,119 @@ async fn ingest_accepts_ndjson(pool: sqlx::PgPool) {
 
     let resp = client.ingest(&records).await.unwrap();
     assert_eq!(resp.accepted, 2);
+}
+
+/// A vector-shaped payload (wire aliases `timestamp` + `level`) lands as
+/// the declared envelope and is immediately queryable through the `level`
+/// DSL band alias, with `_time`, `severity`, and `_raw` populated.
+#[sqlx::test(migrations = false)]
+async fn vector_shaped_ingest_queryable_via_level_alias(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    let query = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let records = vec![
+        serde_json::json!({"service": "vec-svc", "host": "web01", "level": "error",
+            "timestamp": now, "message": "boom"}),
+        serde_json::json!({"service": "vec-svc", "host": "web01", "level": "info",
+            "timestamp": now, "message": "fine"}),
+    ];
+    let resp = ingest.ingest(&records).await.unwrap();
+    assert_eq!(resp.accepted, 2);
+
+    let result = query
+        .query_paginated("service=vec-svc level=error last=1h", None, None)
+        .await
+        .unwrap();
+    assert_eq!(result.result.row_count(), 1, "only the ERROR-band row");
+    let col = |name: &str| {
+        result
+            .result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("column {name} present"))
+    };
+    let row = &result.result.rows[0];
+    assert_eq!(
+        row[col("severity")],
+        trawl_api::value::Value::Integer(17),
+        "level:error derives severity 17"
+    );
+    assert!(
+        matches!(&row[col("_time")], trawl_api::value::Value::String(_)),
+        "_time populated"
+    );
+    match &row[col("_raw")] {
+        trawl_api::value::Value::String(raw) => {
+            assert!(raw.contains("boom"), "_raw carries the original: {raw}");
+        }
+        other => panic!("_raw must be a string, got {other:?}"),
+    }
+}
+
+/// An event with an unlisted env is rejected per-event with a typed
+/// message; the sibling with no env lands under `default_env`.
+#[sqlx::test(migrations = false)]
+async fn ingest_unlisted_env_rejected_per_event(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let client = raw_client();
+
+    let body = "{\"service\":\"env-svc\",\"env\":\"nope\",\"message\":\"bad\"}\n\
+                {\"service\":\"env-svc\",\"message\":\"good\"}";
+    let resp = client
+        .post(format!("{}/api/v1/ingest", server.url))
+        .header("authorization", format!("Bearer {}", server.ingest_token))
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: trawl_api::IngestResponse = resp.json().await.unwrap();
+    assert_eq!(body.accepted, 1);
+    assert_eq!(body.rejected, 1);
+    assert!(
+        body.errors[0].message.contains("nope"),
+        "the typed reason names the env: {}",
+        body.errors[0].message
+    );
+}
+
+/// Repairs surface as `trawl_ingest_repairs_total{code, service}` on the
+/// unauthenticated /metrics endpoint.
+#[sqlx::test(migrations = false)]
+async fn ingest_repairs_exposed_on_metrics(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+
+    let records = vec![serde_json::json!({
+        "service": "repair-svc", "host": "web01", "env": "prod",
+        "timestamp": "not-a-date", "message": "clock trouble"
+    })];
+    let resp = ingest.ingest(&records).await.unwrap();
+    assert_eq!(resp.accepted, 1, "a repair is not a rejection");
+
+    let metrics_body = raw_client()
+        .get(format!("{}/metrics", server.url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = metrics_body
+        .lines()
+        .find(|l| {
+            l.starts_with("trawl_ingest_repairs_total")
+                && l.contains("code=\"time.from_ingest\"")
+                && l.contains("service=\"repair-svc\"")
+        })
+        .unwrap_or_else(|| {
+            panic!("expected a labelled trawl_ingest_repairs_total line in:\n{metrics_body}")
+        });
+    assert!(line.trim_end().ends_with('1'), "counter at 1: {line}");
 }
 
 #[sqlx::test(migrations = false)]

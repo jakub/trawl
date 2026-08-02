@@ -798,7 +798,7 @@ fn rollup_day_inner(
     let fast = conn.execute_batch(&format!(
         "COPY (\
              SELECT * FROM read_parquet([{file_list_sql}], union_by_name=true) \
-             ORDER BY \"timestamp\"\
+             ORDER BY \"_time\"\
          ) TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY, \
              BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
         tmp_path.to_string_lossy(),
@@ -936,7 +936,7 @@ fn rollup_with_casts(
         .join(" UNION ALL BY NAME ");
 
     conn.execute_batch(&format!(
-        "COPY (SELECT * FROM ({union_sql}) ORDER BY \"timestamp\") TO '{}' \
+        "COPY (SELECT * FROM ({union_sql}) ORDER BY \"_time\") TO '{}' \
          (FORMAT PARQUET, COMPRESSION SNAPPY, BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
         tmp_path.to_string_lossy(),
     ))
@@ -1086,7 +1086,7 @@ fn read_wal_to_table(
 /// (see [`build_wal_batch`]) instead of wedging forever.
 pub(super) const WAL_FILE_COL: &str = "_trawl_wal_file";
 
-/// SQL expression producing a never-NULL `timestamp` for a WAL row
+/// SQL expression producing a never-NULL `_time` for a WAL row
 /// (ADR-0008: the partition key is never hard-CAST).
 ///
 /// Three arms: `TRY_CAST` the raw value (always succeeds on post-fix data,
@@ -1099,11 +1099,28 @@ fn timestamp_repair_expr(prov_col: &str) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
     format!(
         "COALESCE(\
-             TRY_CAST(\"timestamp\" AS TIMESTAMP), \
+             TRY_CAST(\"_time\" AS TIMESTAMP), \
              epoch_ms(TRY_CAST(regexp_extract({prov_col}, \
                  '_([0-9]+)_[0-9a-f]{{4}}\\.ndjson$', 1) AS BIGINT)), \
              TIMESTAMP '{now}'\
-         ) AS \"timestamp\""
+         ) AS \"_time\""
+    )
+}
+
+/// SQL expression producing a never-NULL TIMESTAMP `_ingested` for a WAL
+/// row — the same repair ladder as [`timestamp_repair_expr`], so the
+/// second envelope TIMESTAMP column can never wedge a batch or land as
+/// VARCHAR in parquet either. Ingest always stamps `_ingested`, so the
+/// fallback arms fire only on hand-written or damaged WAL.
+fn ingested_repair_expr(prov_col: &str) -> String {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
+    format!(
+        "COALESCE(\
+             TRY_CAST(\"_ingested\" AS TIMESTAMP), \
+             epoch_ms(TRY_CAST(regexp_extract({prov_col}, \
+                 '_([0-9]+)_[0-9a-f]{{4}}\\.ndjson$', 1) AS BIGINT)), \
+             TIMESTAMP '{now}'\
+         ) AS \"_ingested\""
     )
 }
 
@@ -1143,7 +1160,7 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 ///    data — it never feeds [`timestamp_repair_expr`].
 /// 3. On a flatten collision (`Duplicate name`), an explicit column list with
 ///    `json` typed as opaque JSON. This keeps only the stable vector envelope
-///    (plus `timestamp_invalid`): user fields outside it are dropped for the
+///    (plus `_repairs`): user fields outside it are dropped for the
 ///    whole batch — the disclosed price of draining a batch whose flattened
 ///    keys collide, and the pre-existing behavior for that shape.
 ///
@@ -1152,7 +1169,7 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 /// [`timestamp_repair_expr`].
 ///
 /// `sample_size=-1` (schema detection over every row, not `DuckDB`'s default
-/// ~20480-row prefix) is what keeps `timestamp_invalid` alive: it is sparse
+/// ~20480-row prefix) is what keeps `_repairs` alive: it is sparse
 /// by construction — only repaired events carry it — so on any WAL file
 /// bigger than the sample it fell outside the inferred schema and
 /// `union_by_name` dropped it with no error at all, losing the evidence
@@ -1170,9 +1187,10 @@ fn build_wal_batch(
         .join(", ");
     let auto_read = |prov_col: &str| {
         let repair = timestamp_repair_expr(prov_col);
+        let ingested = ingested_repair_expr(prov_col);
         conn.execute_batch(&format!(
             "CREATE TABLE wal_batch AS \
-             SELECT * EXCLUDE ({prov_col}) REPLACE ({repair}) \
+             SELECT * EXCLUDE ({prov_col}) REPLACE ({repair}, {ingested}) \
              FROM read_json([{file_list_sql}], format='newline_delimited', \
              records=true, auto_detect=true, union_by_name=true, \
              field_appearance_threshold=0, maximum_depth=2, sample_size=-1, \
@@ -1212,18 +1230,20 @@ fn build_wal_batch(
     // Explicit columns: the stable vector envelope, with `json` as
     // opaque JSON to prevent struct flattening that causes collisions.
     let repair = timestamp_repair_expr(WAL_FILE_COL);
+    let ingested = ingested_repair_expr(WAL_FILE_COL);
     conn.execute_batch(&format!(
         "CREATE TABLE wal_batch AS \
-         SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
+         SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}, {ingested}) \
          FROM read_json([{file_list_sql}], format='newline_delimited', \
          records=true, union_by_name=true, filename='{WAL_FILE_COL}', \
          columns={{\
-         host: 'VARCHAR', json: 'JSON', \
+         \"_time\": 'VARCHAR', \"_ingested\": 'VARCHAR', \
+         \"_raw\": 'VARCHAR', \"_repairs\": 'VARCHAR', \
+         env: 'VARCHAR', service: 'VARCHAR', host: 'VARCHAR', \
+         severity: 'BIGINT', severity_text: 'VARCHAR', \
+         message: 'VARCHAR', json: 'JSON', \
          k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
-         k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR', \
-         level: 'VARCHAR', message: 'VARCHAR', \
-         service: 'VARCHAR', timestamp: 'VARCHAR', \
-         timestamp_invalid: 'VARCHAR'}})"
+         k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR'}})"
     ))
     .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
 }
@@ -1548,7 +1568,7 @@ fn compact_service_inner(
         // target (DuckDB auto-writes bloom filters on any column it
         // dictionary-encodes; this locks in a known FP rate).
         conn.execute_batch(&format!(
-            "COPY (SELECT * FROM merged ORDER BY \"timestamp\") TO '{}' \
+            "COPY (SELECT * FROM merged ORDER BY \"_time\") TO '{}' \
              (FORMAT PARQUET, COMPRESSION SNAPPY, \
               BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
             tmp_path.display(),
@@ -1562,7 +1582,7 @@ fn compact_service_inner(
     } else {
         // Fresh write: no existing file to merge with.
         conn.execute_batch(&format!(
-            "COPY (SELECT * FROM wal_batch ORDER BY \"timestamp\") TO '{}' \
+            "COPY (SELECT * FROM wal_batch ORDER BY \"_time\") TO '{}' \
              (FORMAT PARQUET, COMPRESSION SNAPPY, \
               BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
             tmp_path.display(),
@@ -1793,7 +1813,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let record = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"hello"}"#;
+        let record = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"hello"}"#;
         let wal_files = vec![write_wal_file(&wal_dir, "nginx", &[record])];
 
         compact_service_blocking(&wal_files, &data_dir, "nginx", "2GB").unwrap();
@@ -1820,12 +1840,12 @@ mod tests {
         std::fs::create_dir_all(&wal_dir).unwrap();
 
         // First compaction: write initial data.
-        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"first"}"#;
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"first"}"#;
         let files1 = vec![write_wal_file(&wal_dir, "nginx", &[r1])];
         compact_service_blocking(&files1, &data_dir, "nginx", "2GB").unwrap();
 
         // Second compaction: merge new data into existing file.
-        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"nginx","message":"second"}"#;
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","message":"second"}"#;
         let files2 = vec![write_wal_file(&wal_dir, "nginx", &[r2])];
         compact_service_blocking(&files2, &data_dir, "nginx", "2GB").unwrap();
 
@@ -1857,8 +1877,8 @@ mod tests {
 
         // Ingest out-of-order timestamps in both the fresh-write and
         // merge paths to verify both sort.
-        let late = r#"{"timestamp":"2026-01-01T00:00:10Z","service":"nginx","msg":"late"}"#;
-        let early = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"nginx","msg":"early"}"#;
+        let late = r#"{"_time":"2026-01-01T00:00:10Z","_ingested":"2026-01-01T00:00:10Z","service":"nginx","msg":"late"}"#;
+        let early = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","msg":"early"}"#;
         compact_service_blocking(
             &[write_wal_file(&wal_dir, "nginx", &[late, early])],
             &data_dir,
@@ -1869,7 +1889,7 @@ mod tests {
 
         // Second batch merges into the existing file; include a timestamp
         // that should sort between the two above.
-        let middle = r#"{"timestamp":"2026-01-01T00:00:05Z","service":"nginx","msg":"middle"}"#;
+        let middle = r#"{"_time":"2026-01-01T00:00:05Z","_ingested":"2026-01-01T00:00:05Z","service":"nginx","msg":"middle"}"#;
         compact_service_blocking(
             &[write_wal_file(&wal_dir, "nginx", &[middle])],
             &data_dir,
@@ -1911,8 +1931,8 @@ mod tests {
 
         // Two records with different key sets — simulates the real scenario
         // where services emit log lines with varying JSON shapes.
-        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"test","message":"base record"}"#;
-        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"test","message":"extra","extra_field":"surprise","error":"oh no"}"#;
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"test","message":"base record"}"#;
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"test","message":"extra","extra_field":"surprise","error":"oh no"}"#;
 
         let f1 = write_wal_file(&wal_dir, "test", &[r1]);
         let f2 = write_wal_file(&wal_dir, "test", &[r2]);
@@ -1951,8 +1971,8 @@ mod tests {
         // with varying subkeys. The `json` object has different keys across
         // records, and `k8s_namespace` at the top level coexists with
         // `namespace` inside the nested object.
-        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"test","message":"startup","k8s_namespace":"default","json":{"level":"info","msg":"starting","namespace":"kube-system","build":{"version":"1.0","commit":"abc123"}}}"#;
-        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"test","message":"runtime","k8s_namespace":"default","json":{"level":"warn","msg":"something happened"}}"#;
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"test","message":"startup","k8s_namespace":"default","json":{"level":"info","msg":"starting","namespace":"kube-system","build":{"version":"1.0","commit":"abc123"}}}"#;
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"test","message":"runtime","k8s_namespace":"default","json":{"level":"warn","msg":"something happened"}}"#;
 
         let f1 = write_wal_file(&wal_dir, "test", &[r1]);
         let f2 = write_wal_file(&wal_dir, "test", &[r2]);
@@ -1989,8 +2009,8 @@ mod tests {
         // Simulates flux-operator: `k8s_namespace` at top level, `namespace`
         // inside the `json` sub-object. With unlimited depth, DuckDB would
         // flatten `json.namespace` and collide with the top-level key.
-        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"flux-op","message":"reconcile","k8s_namespace":"flux-system","json":{"controller":"fluxinstance","level":"info","msg":"Reconciliation finished","name":"flux","namespace":"flux-system"}}"#;
-        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"flux-op","message":"sync","k8s_namespace":"flux-system","json":{"controller":"kustomization","level":"info","msg":"Applied revision","namespace":"default"}}"#;
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"flux-op","message":"reconcile","k8s_namespace":"flux-system","json":{"controller":"fluxinstance","level":"info","msg":"Reconciliation finished","name":"flux","namespace":"flux-system"}}"#;
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"flux-op","message":"sync","k8s_namespace":"flux-system","json":{"controller":"kustomization","level":"info","msg":"Applied revision","namespace":"default"}}"#;
 
         let f1 = write_wal_file(&wal_dir, "flux-op", &[r1]);
         let f2 = write_wal_file(&wal_dir, "flux-op", &[r2]);
@@ -2027,9 +2047,9 @@ mod tests {
         // Create 3 WAL files. Compact them in two calls to simulate chunking:
         // first call processes 2 files, second call processes 1 file and
         // merges with the existing parquet from the first call.
-        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"test","message":"one"}"#;
-        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"test","message":"two"}"#;
-        let r3 = r#"{"timestamp":"2026-01-01T00:00:02Z","service":"test","message":"three"}"#;
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"test","message":"one"}"#;
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"test","message":"two"}"#;
+        let r3 = r#"{"_time":"2026-01-01T00:00:02Z","_ingested":"2026-01-01T00:00:02Z","service":"test","message":"three"}"#;
 
         let f1 = write_wal_file(&wal_dir, "test", &[r1]);
         let f2 = write_wal_file(&wal_dir, "test", &[r2]);
@@ -2073,12 +2093,12 @@ mod tests {
         std::fs::create_dir_all(&wal_dir).unwrap();
 
         // First batch: container_id is a JSON object.
-        let r1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"kubelet","message":"start","container_id":{"id":"abc123","runtime":"containerd"}}"#;
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"kubelet","message":"start","container_id":{"id":"abc123","runtime":"containerd"}}"#;
         let f1 = write_wal_file(&wal_dir, "kubelet", &[r1]);
         compact_service_blocking(&[f1], &data_dir, "kubelet", "2GB").unwrap();
 
         // Second batch: container_id is a plain string.
-        let r2 = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"kubelet","message":"running","container_id":"def456"}"#;
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"kubelet","message":"running","container_id":"def456"}"#;
         let f2 = write_wal_file(&wal_dir, "kubelet", &[r2]);
 
         // This would previously fail with a type mismatch error.
@@ -2130,7 +2150,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let r = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"k","containerID":{"id":"abc"},"count":5}"#;
+        let r = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"k","containerID":{"id":"abc"},"count":5}"#;
         let f = write_wal_file(&wal_dir, "k", &[r]);
         compact_service_blocking(std::slice::from_ref(&f), &data_dir, "k", "2GB").unwrap();
 
@@ -2269,9 +2289,9 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
-        let r2 = r#"{"timestamp":"2026-01-15T02:30:00Z","service":"nginx","msg":"b"}"#;
-        let r3 = r#"{"timestamp":"2026-01-15T02:45:00Z","service":"nginx","msg":"c"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r2 = r#"{"_time":"2026-01-15T02:30:00Z","_ingested":"2026-01-15T02:30:00Z","service":"nginx","msg":"b"}"#;
+        let r3 = r#"{"_time":"2026-01-15T02:45:00Z","_ingested":"2026-01-15T02:45:00Z","service":"nginx","msg":"c"}"#;
 
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
         let f2 = write_hourly_parquet(&data_dir, date, "02", "nginx", &[r2, r3]);
@@ -2311,7 +2331,7 @@ mod tests {
         let date = "2026-01-15";
 
         // First rollup: create initial daily file.
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
         let day_dir = data_dir.join(date);
         rollup_day_blocking(&day_dir, "nginx", &[f1], "2GB")
@@ -2319,7 +2339,7 @@ mod tests {
             .unwrap();
 
         // Late-arriving data creates a new hourly file.
-        let r2 = r#"{"timestamp":"2026-01-15T03:00:00Z","service":"nginx","msg":"late"}"#;
+        let r2 = r#"{"_time":"2026-01-15T03:00:00Z","_ingested":"2026-01-15T03:00:00Z","service":"nginx","msg":"late"}"#;
         let f2 = write_hourly_parquet(&data_dir, date, "03", "nginx", &[r2]);
 
         // Second rollup: should merge existing daily + new hourly.
@@ -2349,8 +2369,8 @@ mod tests {
         let date = "2026-01-15";
 
         // Write records in reverse order across hours.
-        let r1 = r#"{"timestamp":"2026-01-15T23:00:00Z","service":"nginx","msg":"late"}"#;
-        let r2 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"early"}"#;
+        let r1 = r#"{"_time":"2026-01-15T23:00:00Z","_ingested":"2026-01-15T23:00:00Z","service":"nginx","msg":"late"}"#;
+        let r2 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"early"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "23", "nginx", &[r1]);
         let f2 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r2]);
 
@@ -2365,7 +2385,7 @@ mod tests {
         let first_msg: String = conn
             .query_row(
                 &format!(
-                    "SELECT msg FROM read_parquet('{}') ORDER BY \"timestamp\" LIMIT 1",
+                    "SELECT msg FROM read_parquet('{}') ORDER BY \"_time\" LIMIT 1",
                     daily.display()
                 ),
                 [],
@@ -2385,9 +2405,8 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        let r1 =
-            r#"{"timestamp":"2026-01-15T01:00:00Z","service":"ctrl","offset":{"v":1,"u":"x"}}"#;
-        let r2 = r#"{"timestamp":"2026-01-15T02:00:00Z","service":"ctrl","offset":"540.203µs"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"ctrl","offset":{"v":1,"u":"x"}}"#;
+        let r2 = r#"{"_time":"2026-01-15T02:00:00Z","_ingested":"2026-01-15T02:00:00Z","service":"ctrl","offset":"540.203µs"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "ctrl", &[r1]);
         let f2 = write_hourly_parquet(&data_dir, date, "02", "ctrl", &[r2]);
 
@@ -2470,7 +2489,9 @@ mod tests {
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
-        let r1 = format!(r#"{{"timestamp":"{yesterday}T01:00:00Z","service":"nginx","msg":"a"}}"#);
+        let r1 = format!(
+            r#"{{"_time":"{yesterday}T01:00:00Z","_ingested":"{yesterday}T01:00:00Z","service":"nginx","msg":"a"}}"#
+        );
         write_hourly_parquet(&data_dir, &yesterday, "01", "nginx", &[&r1]);
 
         // WAL dir is empty — compact_once should still run rollup.
@@ -2500,7 +2521,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
 
         let day_dir = data_dir.join(date);
@@ -2524,7 +2545,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
 
         let day_dir = data_dir.join(date);
@@ -2553,7 +2574,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
 
         let day_dir = data_dir.join(date);
@@ -2600,7 +2621,7 @@ mod tests {
 
         // A real parquet file is valid.
         let data_dir = dir.join("data");
-        let r = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"x","m":"y"}"#;
+        let r = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"x","m":"y"}"#;
         let good = write_hourly_parquet(&data_dir, "2026-01-15", "01", "x", &[r]);
         assert!(is_valid_parquet(&good), "real parquet should be valid");
 
@@ -2666,7 +2687,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let good = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"hello"}"#;
+        let good = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"hello"}"#;
         let good_file = write_wal_file(&wal_dir, "nginx", &[good]);
 
         // A pure-NUL WAL file (the torn-write crash signature: unflushed
@@ -2753,7 +2774,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let good = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"web","message":"ok"}"#;
+        let good = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"web","message":"ok"}"#;
         let good_file = write_wal_file(&wal_dir, "web", &[good]);
 
         let millis = std::time::SystemTime::now()
@@ -2766,7 +2787,7 @@ mod tests {
         let malformed = wal_dir.join(format!("web_{millis}_trunc.ndjson"));
         std::fs::write(
             &malformed,
-            b"{\"timestamp\":\"2026-01-01T00:00:01Z\",\"service\":\"web\",\"message\":",
+            b"{\"_time\":\"2026-01-01T00:00:01Z\",\"_ingested\":\"2026-01-01T00:00:01Z\",\"service\":\"web\",\"message\":",
         )
         .unwrap();
 
@@ -2828,7 +2849,7 @@ mod tests {
         let data_file = tmp.path().join("data_is_a_file");
         std::fs::write(&data_file, b"not a directory").unwrap();
 
-        let good = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"svc","message":"ok"}"#;
+        let good = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"svc","message":"ok"}"#;
         let good_file = write_wal_file(&wal_dir, "svc", &[good]);
 
         let millis = std::time::SystemTime::now()
@@ -2861,7 +2882,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"ok"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"ok"}"#;
         let good = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
 
         // A truncated parquet in another hour (crash mid-COPY).
@@ -2984,7 +3005,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
 
         let day_dir = data_dir.join(date);
@@ -3116,7 +3137,7 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
         let day_dir = data_dir.join(date);
 
@@ -3234,8 +3255,8 @@ mod tests {
         let date = "2026-01-15";
 
         // Two hourlies were originally merged; the canonical already exists.
-        let r1 = r#"{"timestamp":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
-        let r2 = r#"{"timestamp":"2026-01-15T02:00:00Z","service":"nginx","msg":"b"}"#;
+        let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let r2 = r#"{"_time":"2026-01-15T02:00:00Z","_ingested":"2026-01-15T02:00:00Z","service":"nginx","msg":"b"}"#;
         let already_deleted = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
         let still_present = write_hourly_parquet(&data_dir, date, "02", "nginx", &[r2]);
 
@@ -3309,7 +3330,7 @@ mod tests {
         let wal = wal_dir.join(format!("svc_{known_millis}_abcd.ndjson"));
         std::fs::write(
             &wal,
-            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"wedged\"}\n",
+            b"{\"_time\":\"not-a-date\",\"_ingested\":\"not-a-date\",\"service\":\"svc\",\"message\":\"wedged\"}\n",
         )
         .unwrap();
 
@@ -3319,7 +3340,7 @@ mod tests {
 
         let parquet = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet.len(), 1);
-        let ts = read_strings(&parquet[0], "CAST(\"timestamp\" AS VARCHAR)");
+        let ts = read_strings(&parquet[0], "CAST(\"_time\" AS VARCHAR)");
         assert_eq!(
             ts,
             vec!["2024-10-27 03:33:20".to_owned()],
@@ -3341,12 +3362,12 @@ mod tests {
         let b = wal_dir.join("svc_1730000060000_bbbb.ndjson");
         std::fs::write(
             &a,
-            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"a\"}\n",
+            b"{\"_time\":\"not-a-date\",\"_ingested\":\"not-a-date\",\"service\":\"svc\",\"message\":\"a\"}\n",
         )
         .unwrap();
         std::fs::write(
             &b,
-            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"b\"}\n",
+            b"{\"_time\":\"not-a-date\",\"_ingested\":\"not-a-date\",\"service\":\"svc\",\"message\":\"b\"}\n",
         )
         .unwrap();
 
@@ -3354,10 +3375,7 @@ mod tests {
 
         let parquet = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet.len(), 1);
-        let rows = read_strings(
-            &parquet[0],
-            "message || '@' || CAST(\"timestamp\" AS VARCHAR)",
-        );
+        let rows = read_strings(&parquet[0], "message || '@' || CAST(\"_time\" AS VARCHAR)");
         assert_eq!(
             rows,
             vec![
@@ -3387,7 +3405,7 @@ mod tests {
             let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
             std::fs::write(
                 &wal,
-                format!(r#"{{"timestamp":{variant},"service":"svc","message":"v{i}"}}"#),
+                format!(r#"{{"_time":{variant},"_ingested":"2026-01-01T00:00:00Z","service":"svc","message":"v{i}"}}"#),
             )
             .unwrap();
 
@@ -3400,7 +3418,7 @@ mod tests {
             let nulls: i64 = conn
                 .query_row(
                     &format!(
-                        "SELECT count(*)::BIGINT FROM read_parquet('{}') WHERE \"timestamp\" IS NULL",
+                        "SELECT count(*)::BIGINT FROM read_parquet('{}') WHERE \"_time\" IS NULL",
                         parquet[0].display()
                     ),
                     [],
@@ -3415,9 +3433,9 @@ mod tests {
     }
 
     /// A repaired event past `DuckDB`'s default JSON sample window still
-    /// reaches parquet with its `timestamp_invalid` intact.
+    /// reaches parquet with its `_repairs` intact.
     ///
-    /// `timestamp_invalid` is sparse by construction — only repaired events
+    /// `_repairs` is sparse by construction — only repaired events
     /// carry it. Auto-detection over a bounded sample never saw it on a WAL
     /// file bigger than the sample, so the preserved original was dropped
     /// with no error at all, defeating ADR-0008's promise that the evidence
@@ -3437,13 +3455,13 @@ mod tests {
         for i in 0..30_000 {
             writeln!(
                 lines,
-                "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
+                "{{\"_time\":\"2026-01-01T00:00:00Z\",\"_ingested\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
             )
             .unwrap();
         }
         lines.push_str(
-            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\
-             \"message\":\"repaired\",\"timestamp_invalid\":\"not-a-date\"}\n",
+            "{\"_time\":\"2026-01-01T00:00:00Z\",\"_ingested\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\
+             \"message\":\"repaired\",\"_repairs\":\"time.from_ingest\"}\n",
         );
         let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
         std::fs::write(&wal, lines).unwrap();
@@ -3452,15 +3470,12 @@ mod tests {
 
         let parquet = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet.len(), 1);
-        let preserved = read_strings(
-            &parquet[0],
-            "COALESCE(string_agg(timestamp_invalid), 'MISSING')",
-        );
+        let preserved = read_strings(&parquet[0], "COALESCE(string_agg(_repairs), 'MISSING')");
         assert_eq!(
             preserved,
-            vec!["not-a-date".to_owned()],
-            "the preserved original must survive a WAL file larger than the \
-             JSON sample window"
+            vec!["time.from_ingest".to_owned()],
+            "the sparse repair column must survive a WAL file larger than \
+             the JSON sample window"
         );
     }
 
@@ -3475,9 +3490,10 @@ mod tests {
         std::fs::create_dir_all(&wal_dir).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let good1 = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"good1"}"#;
-        let bad = r#"{"timestamp":"not-a-date","service":"nginx","message":"bad"}"#;
-        let good2 = r#"{"timestamp":"2026-01-01T00:00:02Z","service":"nginx","message":"good2"}"#;
+        let good1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"good1"}"#;
+        let bad =
+            r#"{"_time":"not-a-date","_ingested":"not-a-date","service":"nginx","message":"bad"}"#;
+        let good2 = r#"{"_time":"2026-01-01T00:00:02Z","_ingested":"2026-01-01T00:00:02Z","service":"nginx","message":"good2"}"#;
         let wal = wal_dir.join("nginx_1730000000000_abcd.ndjson");
         std::fs::write(&wal, [good1, bad, good2].join("\n")).unwrap();
 
@@ -3519,7 +3535,7 @@ mod tests {
         let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
         std::fs::write(
             &wal,
-            b"{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\"filename\":\"user.txt\",\"message\":\"m\"}\n",
+            b"{\"_time\":\"2026-01-01T00:00:00Z\",\"_ingested\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\"filename\":\"user.txt\",\"message\":\"m\"}\n",
         )
         .unwrap();
 
@@ -3554,8 +3570,8 @@ mod tests {
 
         // Malformed timestamp on the poison row: the repair must fall back to
         // the file's OWN name — never to the client-controlled value.
-        let poison = r#"{"timestamp":"not-a-date","service":"nginx","message":"poison","_trawl_wal_file":"/etc/passwd","request_id":"deadbeef"}"#;
-        let innocent = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"nginx","message":"innocent","trace_id":"t1"}"#;
+        let poison = r#"{"_time":"not-a-date","_ingested":"not-a-date","service":"nginx","message":"poison","_trawl_wal_file":"/etc/passwd","request_id":"deadbeef"}"#;
+        let innocent = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","message":"innocent","trace_id":"t1"}"#;
         let wal = wal_dir.join("nginx_1730000000000_abcd.ndjson");
         std::fs::write(&wal, [poison, innocent].join("\n")).unwrap();
 
@@ -3607,7 +3623,7 @@ mod tests {
                 &format!(
                     "SELECT count(*)::BIGINT FROM read_parquet('{}') \
                      WHERE message = 'poison' \
-                       AND \"timestamp\" = epoch_ms(1730000000000)",
+                       AND \"_time\" = epoch_ms(1730000000000)",
                     parquet[0].display()
                 ),
                 [],
@@ -3632,7 +3648,7 @@ mod tests {
         let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
         std::fs::write(
             &wal,
-            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"m\"}\n",
+            b"{\"_time\":\"not-a-date\",\"_ingested\":\"not-a-date\",\"service\":\"svc\",\"message\":\"m\"}\n",
         )
         .unwrap();
 
@@ -3670,7 +3686,7 @@ mod tests {
         let wal = wal_dir.join("svc_oddname.ndjson");
         std::fs::write(
             &wal,
-            b"{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"m\"}\n",
+            b"{\"_time\":\"not-a-date\",\"_ingested\":\"not-a-date\",\"service\":\"svc\",\"message\":\"m\"}\n",
         )
         .unwrap();
 
@@ -3680,10 +3696,7 @@ mod tests {
 
         let parquet = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet.len(), 1);
-        let ts = read_strings(
-            &parquet[0],
-            "strftime(\"timestamp\", '%Y-%m-%dT%H:%M:%S.%fZ')",
-        );
+        let ts = read_strings(&parquet[0], "strftime(\"_time\", '%Y-%m-%dT%H:%M:%S.%fZ')");
         assert_eq!(ts.len(), 1);
         let got = chrono::DateTime::parse_from_rfc3339(&ts[0])
             .unwrap_or_else(|e| panic!("parquet timestamp {} must parse: {e}", ts[0]))

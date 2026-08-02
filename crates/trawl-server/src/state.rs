@@ -169,6 +169,37 @@ pub struct IngestState {
     pub syslog_stats: Option<Arc<SyslogStats>>,
     /// Compaction cycle counters (None if ingest is disabled).
     pub compaction_stats: Option<Arc<CompactionStats>>,
+    /// Effective env allowlist (never empty; ADR-0009). Events with an
+    /// unlisted `env` hard-reject.
+    pub envs: Arc<[String]>,
+    /// Fills a missing `env` on ingested events.
+    pub default_env: Arc<str>,
+    /// Parsed `trusted_relays` CIDRs: a host-less event from one of these
+    /// peers is rejected instead of peer-repaired. Parsed boot-fatally —
+    /// a warn-skipped entry would fail open into host repair.
+    pub trusted_relays: Arc<[crate::syslog::CidrEntry]>,
+}
+
+/// Parse `[ingest] trusted_relays` CIDRs, boot-fatally.
+///
+/// Deliberately NOT the syslog `parse_cidrs` warn-skip: a skipped relay
+/// CIDR would fail open — host-less events from that relay would be
+/// peer-repaired where the operator configured a reject.
+fn parse_trusted_relays(
+    cidrs: &[String],
+) -> Result<Arc<[crate::syslog::CidrEntry]>, crate::error::ServerError> {
+    let mut entries = Vec::with_capacity(cidrs.len());
+    for cidr in cidrs {
+        let entry = crate::syslog::parse_cidr(cidr).ok_or_else(|| {
+            crate::error::ServerError::Internal(format!(
+                "invalid CIDR {cidr:?} in ingest.trusted_relays — refusing to \
+                 start (a skipped entry would repair hosts where a reject was \
+                 configured)"
+            ))
+        })?;
+        entries.push(entry);
+    }
+    Ok(entries.into())
 }
 
 /// Shared counters for syslog ingest stats (dashboard + monitoring).
@@ -441,6 +472,9 @@ impl AppState {
                 } else {
                     None
                 },
+                envs: config.ingest.effective_envs().into(),
+                default_env: config.ingest.default_env.as_str().into(),
+                trusted_relays: parse_trusted_relays(&config.ingest.trusted_relays)?,
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),

@@ -270,7 +270,7 @@ impl HotBuffer {
 ///
 /// `DuckDB`'s `read_json` auto-detection infers the schema from a bounded
 /// prefix of the file (~20480 records) and then hard-errors — `unknown key`
-/// — on any later record carrying a key outside it. `timestamp_invalid` is
+/// — on any later record carrying a key outside it. `_repairs` is
 /// sparse by construction (only repaired events carry it, ADR-0008) and the
 /// buffer holds up to `max_events` (100k by default), so one repaired event
 /// past the prefix used to break every query touching the hot buffer.
@@ -282,7 +282,7 @@ impl HotBuffer {
 /// buffer size. Writing the pioneers first instead puts the complete key set inside the
 /// detection prefix for the price of one pass over the buffer, and does it
 /// with the events' real values: an always-emitted null placeholder column
-/// would be inferred as JSON, so `timestamp_invalid` would come back quoted
+/// would be inferred as JSON, so `_repairs` would come back quoted
 /// and numeric fields would stop being numbers.
 ///
 /// A homogeneous buffer has exactly one pioneer (the first event), so the
@@ -434,14 +434,14 @@ mod tests {
         assert!(parsed["service"].is_string());
     }
 
-    /// Build `n` plain events plus one carrying the sparse `timestamp_invalid`
+    /// Build `n` plain events plus one carrying the sparse `_repairs`
     /// key, with the sparse one last — the shape that used to break queries.
     fn events_with_trailing_sparse_key(n: usize) -> Vec<Event> {
         let mut events: Vec<Event> = (0..n)
             .map(|i| {
                 let mut m = serde_json::Map::new();
                 m.insert(
-                    "timestamp".into(),
+                    "_time".into(),
                     serde_json::Value::String("2024-01-15T10:00:00Z".into()),
                 );
                 m.insert("service".into(), serde_json::Value::String("svc".into()));
@@ -451,7 +451,7 @@ mod tests {
             .collect();
         let mut repaired = serde_json::Map::new();
         repaired.insert(
-            "timestamp".into(),
+            "_time".into(),
             serde_json::Value::String("2024-01-15T10:00:00Z".into()),
         );
         repaired.insert("service".into(), serde_json::Value::String("svc".into()));
@@ -460,8 +460,8 @@ mod tests {
             serde_json::Value::String("repaired".into()),
         );
         repaired.insert(
-            "timestamp_invalid".into(),
-            serde_json::Value::String("not-a-date".into()),
+            "_repairs".into(),
+            serde_json::Value::String("time.from_ingest".into()),
         );
         events.push(repaired);
         events
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn snapshot_hoists_schema_pioneers_to_the_front() {
         // DuckDB infers the snapshot's schema from a bounded prefix and then
-        // hard-errors on a later record with a key outside it. `timestamp_invalid`
+        // hard-errors on a later record with a key outside it. `_repairs`
         // is sparse by construction (ADR-0008), so the writer moves the events
         // that introduce a new key to the front — cheaper than making every
         // query re-detect over the whole file.
@@ -497,7 +497,7 @@ mod tests {
         );
         let sparse_at = lines
             .iter()
-            .position(|l| l.contains("timestamp_invalid"))
+            .position(|l| l.contains("_repairs"))
             .expect("the repaired event must still be in the snapshot");
         assert!(
             sparse_at < 2,
@@ -558,7 +558,7 @@ mod tests {
 
             let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
             assert!(
-                col_names.contains(&"timestamp_invalid"),
+                col_names.contains(&"_repairs"),
                 "the preserved original must survive (with_cold={with_cold}); \
                  got columns {col_names:?}"
             );

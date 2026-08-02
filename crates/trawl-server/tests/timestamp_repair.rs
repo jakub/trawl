@@ -2,12 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end tests for ADR-0008 malformed-timestamp handling: every
-//! trigger variant ingests via the real handler, is queryable from the hot
-//! buffer, compacts to parquet without wedging, and stays queryable — with
-//! the original value preserved in `timestamp_invalid` and `timestamp` set
-//! to the arrival time. Plus the canonicalization acceptance criterion at
-//! the API level.
+//! End-to-end tests for ADR-0008 malformed-time handling under the
+//! ADR-0009 envelope: every trigger variant ingests via the real handler,
+//! is queryable from the hot buffer, compacts to parquet without wedging,
+//! and stays queryable — with `_time` set to the arrival time, the
+//! `time.from_ingest` code in `_repairs`, and the original value findable
+//! in `_raw`. Plus the canonicalization acceptance criterion at the API
+//! level.
 
 mod common;
 
@@ -48,7 +49,7 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
     let ingest_client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query_client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // (payload, expected timestamp_invalid preservation)
+    // (payload, substring of the original that must be findable in _raw)
     let variants: Vec<(serde_json::Value, &str)> = vec![
         (json!("not-a-date"), "not-a-date"),
         (json!("2026-13-45T99:99:99Z"), "2026-13-45T99:99:99Z"),
@@ -60,6 +61,8 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
     for (i, (bad, _)) in variants.iter().enumerate() {
         let record = json!({
             "service": format!("svc{i}"),
+            "env": "prod",
+            "host": "web01",
             "timestamp": bad,
             "message": format!("variant {i}"),
         });
@@ -81,9 +84,15 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
             "variant {bad} must be hot-queryable within last=1h"
         );
         assert_eq!(
-            first_row_string(&result.result, "timestamp_invalid").as_deref(),
-            Some(*preserved),
-            "variant {bad}: original must be preserved verbatim (hot)"
+            first_row_string(&result.result, "_repairs").as_deref(),
+            Some("time.from_ingest"),
+            "variant {bad}: the repair must be recorded (hot)"
+        );
+        let raw = first_row_string(&result.result, "_raw")
+            .unwrap_or_else(|| panic!("variant {bad}: _raw present (hot)"));
+        assert!(
+            raw.contains(preserved),
+            "variant {bad}: original must be findable in _raw (hot): {raw}"
         );
     }
 
@@ -128,19 +137,25 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
             "variant {bad} must remain queryable from parquet within last=1h"
         );
         assert_eq!(
-            first_row_string(&result.result, "timestamp_invalid").as_deref(),
-            Some(*preserved),
-            "variant {bad}: original must be preserved verbatim (parquet)"
+            first_row_string(&result.result, "_repairs").as_deref(),
+            Some("time.from_ingest"),
+            "variant {bad}: the repair must be recorded (parquet)"
         );
-        let ts = first_row_string(&result.result, "timestamp")
-            .unwrap_or_else(|| panic!("variant {bad}: timestamp column present"));
+        let raw = first_row_string(&result.result, "_raw")
+            .unwrap_or_else(|| panic!("variant {bad}: _raw present (parquet)"));
+        assert!(
+            raw.contains(preserved),
+            "variant {bad}: original must be findable in _raw (parquet): {raw}"
+        );
+        let ts = first_row_string(&result.result, "_time")
+            .unwrap_or_else(|| panic!("variant {bad}: _time column present"));
         // Engine formats timestamps as "YYYY-MM-DD HH:MM:SS[.frac]" (UTC).
         let parsed = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f")
             .unwrap_or_else(|e| panic!("variant {bad}: timestamp {ts} must parse: {e}"))
             .and_utc();
         assert!(
             parsed > before_ingest && parsed < after_ingest,
-            "variant {bad}: timestamp must be the arrival time, got {ts}"
+            "variant {bad}: _time must be the arrival time, got {ts}"
         );
     }
 }
@@ -157,6 +172,8 @@ async fn offset_timestamp_canonicalized_to_utc_instant(pool: sqlx::PgPool) {
 
     let record = json!({
         "service": "canon",
+        "env": "prod",
+        "host": "web01",
         "timestamp": "2026-01-01T10:00:00.123456+05:30",
         "message": "offset input",
     });
@@ -169,12 +186,12 @@ async fn offset_timestamp_canonicalized_to_utc_instant(pool: sqlx::PgPool) {
         .expect("query ok");
     assert_eq!(result.result.row_count(), 1);
     assert_eq!(
-        first_row_string(&result.result, "timestamp").as_deref(),
+        first_row_string(&result.result, "_time").as_deref(),
         Some("2026-01-01 04:30:00.123456"),
         "the +05:30 instant must land as UTC with microsecond precision"
     );
     assert_eq!(
-        first_row_string(&result.result, "timestamp_invalid"),
+        first_row_string(&result.result, "_repairs"),
         None,
         "a valid offset timestamp is canonicalized, not repaired"
     );
@@ -183,6 +200,8 @@ async fn offset_timestamp_canonicalized_to_utc_instant(pool: sqlx::PgPool) {
     // `LocalDateTime`) is read as UTC, not demoted to arrival time.
     let record = json!({
         "service": "canon-naive",
+        "env": "prod",
+        "host": "web01",
         "timestamp": "2026-01-01T04:30:00.123456",
         "message": "offset-less input",
     });
@@ -195,12 +214,12 @@ async fn offset_timestamp_canonicalized_to_utc_instant(pool: sqlx::PgPool) {
         .expect("query ok");
     assert_eq!(result.result.row_count(), 1);
     assert_eq!(
-        first_row_string(&result.result, "timestamp").as_deref(),
+        first_row_string(&result.result, "_time").as_deref(),
         Some("2026-01-01 04:30:00.123456"),
         "an offset-less ISO 8601 value must keep its event time, read as UTC"
     );
     assert_eq!(
-        first_row_string(&result.result, "timestamp_invalid"),
+        first_row_string(&result.result, "_repairs"),
         None,
         "an offset-less ISO 8601 value is canonicalized, not repaired"
     );

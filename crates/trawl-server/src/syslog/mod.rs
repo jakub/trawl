@@ -138,7 +138,7 @@ fn parse_cidrs(cidrs: &[String]) -> Arc<[CidrEntry]> {
     entries.into()
 }
 
-fn parse_cidr(cidr: &str) -> Option<CidrEntry> {
+pub(crate) fn parse_cidr(cidr: &str) -> Option<CidrEntry> {
     if let Some((addr_str, prefix_str)) = cidr.split_once('/') {
         let addr: IpAddr = addr_str.parse().ok()?;
         let prefix_len: u8 = prefix_str.parse().ok()?;

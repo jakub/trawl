@@ -163,7 +163,7 @@ fn build_reader(source: &str) -> Result<String, super::EmitError> {
 /// heterogeneous-schema events into a single MAP column.
 ///
 /// Schema detection deliberately keeps `DuckDB`'s bounded default sample.
-/// A sparse column — `timestamp_invalid`, which only repaired events carry
+/// A sparse column — `_repairs`, which only repaired events carry
 /// (ADR-0008) — first appearing past that prefix throws an `unknown key`
 /// error for the whole query, but `sample_size=-1` is the wrong cure: it
 /// re-parses the entire snapshot on *every* query and SSE poll (~2.7x the

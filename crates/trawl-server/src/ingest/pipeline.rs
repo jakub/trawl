@@ -23,11 +23,12 @@ pub const MAX_SERVICE_NAME_LEN: usize = 128;
 
 /// Check if a byte is valid in a service name.
 ///
-/// Allows alphanumeric, dash, underscore, dot, and space.
-/// Shared between HTTP ingest (which rejects invalid chars) and
-/// syslog ingest (which strips them).
+/// Allows alphanumeric, dash, underscore, and dot — no spaces (ADR-0009:
+/// service is a path segment carried verbatim into filenames, so the
+/// charset is the injectivity argument). Shared between HTTP ingest
+/// (which rejects invalid chars) and syslog ingest (which strips them).
 pub fn is_valid_service_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b' '
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
 }
 
 /// Events for a single service within a batch, ready for WAL writing.

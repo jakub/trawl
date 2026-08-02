@@ -1148,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_timestamp_invalid() {
+    fn parse_timestamp_rejects_malformed() {
         assert!(parse_timestamp("not-a-date").is_none());
         assert!(parse_timestamp("").is_none());
     }
