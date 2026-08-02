@@ -1081,9 +1081,9 @@ fn read_wal_to_table(
 /// `wal_batch` so it never reaches parquet.
 ///
 /// The name is reserved, not unreachable: ingest strips it from incoming
-/// events (`fill_defaults`) so no client can plant it, and
-/// [`is_column_collision`] keeps pre-fix WAL that already carries it draining
-/// through the explicit-columns fallback instead of wedging forever.
+/// events (`fill_defaults`) so no client can plant it, and pre-fix WAL that
+/// already carries it drains losslessly through a renamed provenance column
+/// (see [`build_wal_batch`]) instead of wedging forever.
 pub(super) const WAL_FILE_COL: &str = "_trawl_wal_file";
 
 /// SQL expression producing a never-NULL `timestamp` for a WAL row
@@ -1095,12 +1095,12 @@ pub(super) const WAL_FILE_COL: &str = "_trawl_wal_file";
 /// pre-fix wedged WAL with no operator step; else the compaction instant —
 /// a NULL partition key would sort first and fall outside every `last=Xh`
 /// filter, a silent failure of its own.
-fn timestamp_repair_expr() -> String {
+fn timestamp_repair_expr(prov_col: &str) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
     format!(
         "COALESCE(\
              TRY_CAST(\"timestamp\" AS TIMESTAMP), \
-             epoch_ms(TRY_CAST(regexp_extract({WAL_FILE_COL}, \
+             epoch_ms(TRY_CAST(regexp_extract({prov_col}, \
                  '_([0-9]+)_[0-9a-f]{{4}}\\.ndjson$', 1) AS BIGINT)), \
              TIMESTAMP '{now}'\
          ) AS \"timestamp\""
@@ -1108,30 +1108,48 @@ fn timestamp_repair_expr() -> String {
 }
 
 /// Does this `read_json` error mean a projected column collided, rather than
-/// that the data is unreadable?
+/// that the data is unreadable? Neither shape is a reason to quarantine:
 ///
-/// Two shapes, both resolved by the explicit-columns fallback and neither a
-/// reason to quarantine:
 /// - `Duplicate name` — nested JSON keys that collide when flattened.
+///   Resolved by the explicit-columns fallback.
 /// - `Option filename adds column "…", but a column with this name is also in
 ///   the file` — a WAL row literally carrying [`WAL_FILE_COL`]. Ingest strips
 ///   that key now, but WAL written before it did would otherwise fail this
 ///   read on every tick forever: never drained, never quarantined (the
 ///   isolation path's `probe_ndjson` omits `filename=`, so the file parses
 ///   cleanly and survives), taking every batch-mate for the service with it.
+///   Resolved losslessly by retrying under a renamed provenance column
+///   ([`is_filename_collision`]).
 fn is_column_collision(e: &duckdb::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("Duplicate name") || msg.contains("adds column")
+    is_filename_collision(e) || e.to_string().contains("Duplicate name")
+}
+
+/// The [`is_column_collision`] shape specific to the `filename=` option: the
+/// data itself carries a column named like the synthetic provenance column.
+fn is_filename_collision(e: &duckdb::Error) -> bool {
+    e.to_string().contains("adds column")
 }
 
 /// Build the `wal_batch` table from a multi-file `read_json`.
 ///
-/// Tries auto-detection first (`maximum_depth=2`). On a column collision
-/// ([`is_column_collision`]) it falls back to an explicit column list with
-/// `json` typed as opaque JSON. Any other read error is returned so the
-/// caller can isolate the offending file.
+/// A three-step ladder, lossless until the last resort:
 ///
-/// A malformed `timestamp` is never fatal here: see [`timestamp_repair_expr`].
+/// 1. Auto-detection (`maximum_depth=2`) with [`WAL_FILE_COL`] as the
+///    provenance column.
+/// 2. On a `filename=` collision ([`is_filename_collision`] — legacy WAL
+///    written before ingest reserved the key), the same auto-detect read under
+///    a randomized provenance name. Lossless: every user field survives, and
+///    the row's literal `_trawl_wal_file` value lands in parquet as ordinary
+///    data — it never feeds [`timestamp_repair_expr`].
+/// 3. On a flatten collision (`Duplicate name`), an explicit column list with
+///    `json` typed as opaque JSON. This keeps only the stable vector envelope
+///    (plus `timestamp_invalid`): user fields outside it are dropped for the
+///    whole batch — the disclosed price of draining a batch whose flattened
+///    keys collide, and the pre-existing behavior for that shape.
+///
+/// Any other read error is returned so the caller can isolate the offending
+/// file. A malformed `timestamp` is never fatal here: see
+/// [`timestamp_repair_expr`].
 ///
 /// `sample_size=-1` (schema detection over every row, not `DuckDB`'s default
 /// ~20480-row prefix) is what keeps `timestamp_invalid` alive: it is sparse
@@ -1150,46 +1168,64 @@ fn build_wal_batch(
         .map(|p| format!("'{}'", p.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(", ");
-    let repair = timestamp_repair_expr();
+    let auto_read = |prov_col: &str| {
+        let repair = timestamp_repair_expr(prov_col);
+        conn.execute_batch(&format!(
+            "CREATE TABLE wal_batch AS \
+             SELECT * EXCLUDE ({prov_col}) REPLACE ({repair}) \
+             FROM read_json([{file_list_sql}], format='newline_delimited', \
+             records=true, auto_detect=true, union_by_name=true, \
+             field_appearance_threshold=0, maximum_depth=2, sample_size=-1, \
+             filename='{prov_col}')"
+        ))
+    };
 
-    // Primary path: auto-detect with union_by_name to handle heterogeneous schemas.
-    let result = conn.execute_batch(&format!(
+    let collision = match auto_read(WAL_FILE_COL) {
+        Ok(()) => return Ok(()),
+        Err(e) if is_filename_collision(&e) => {
+            // Randomized so legacy data cannot collide with it too; if it
+            // somehow does, the explicit-columns rung below still drains.
+            let alt = format!("{WAL_FILE_COL}_{:08x}", rand::random::<u32>());
+            tracing::warn!(
+                event_type = "compaction_provenance_rename",
+                compact_service = %service,
+                error = %e,
+                "WAL data carries the provenance column name; retrying under a renamed column"
+            );
+            match auto_read(&alt) {
+                Ok(()) => return Ok(()),
+                Err(e2) if is_column_collision(&e2) => e2,
+                Err(e2) => return Err(format!("read_json (renamed provenance) failed: {e2}")),
+            }
+        }
+        Err(e) if is_column_collision(&e) => e,
+        Err(e) => return Err(format!("read_json failed: {e}")),
+    };
+
+    tracing::warn!(
+        event_type = "compaction_fallback",
+        compact_service = %service,
+        error = %collision,
+        "falling back to explicit columns to avoid a column-name collision; \
+         user fields outside the envelope are dropped for this batch"
+    );
+    // Explicit columns: the stable vector envelope, with `json` as
+    // opaque JSON to prevent struct flattening that causes collisions.
+    let repair = timestamp_repair_expr(WAL_FILE_COL);
+    conn.execute_batch(&format!(
         "CREATE TABLE wal_batch AS \
          SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
          FROM read_json([{file_list_sql}], format='newline_delimited', \
-         records=true, auto_detect=true, union_by_name=true, \
-         field_appearance_threshold=0, maximum_depth=2, sample_size=-1, \
-         filename='{WAL_FILE_COL}')"
-    ));
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if is_column_collision(&e) => {
-            tracing::warn!(
-                event_type = "compaction_fallback",
-                compact_service = %service,
-                error = %e,
-                "falling back to explicit columns to avoid a column-name collision"
-            );
-            // Explicit columns: the stable vector envelope, with `json` as
-            // opaque JSON to prevent struct flattening that causes collisions.
-            conn.execute_batch(&format!(
-                "CREATE TABLE wal_batch AS \
-                 SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
-                 FROM read_json([{file_list_sql}], format='newline_delimited', \
-                 records=true, union_by_name=true, filename='{WAL_FILE_COL}', \
-                 columns={{\
-                 host: 'VARCHAR', json: 'JSON', \
-                 k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
-                 k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR', \
-                 level: 'VARCHAR', message: 'VARCHAR', \
-                 service: 'VARCHAR', timestamp: 'VARCHAR', \
-                 timestamp_invalid: 'VARCHAR'}})"
-            ))
-            .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
-        }
-        Err(e) => Err(format!("read_json failed: {e}")),
-    }
+         records=true, union_by_name=true, filename='{WAL_FILE_COL}', \
+         columns={{\
+         host: 'VARCHAR', json: 'JSON', \
+         k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
+         k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR', \
+         level: 'VARCHAR', message: 'VARCHAR', \
+         service: 'VARCHAR', timestamp: 'VARCHAR', \
+         timestamp_invalid: 'VARCHAR'}})"
+    ))
+    .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
 }
 
 /// Probe a single WAL file by fully scanning it through `read_json`.
@@ -3499,12 +3535,15 @@ mod tests {
         );
     }
 
-    /// WAL written before ingest stripped the reserved key still drains: a
-    /// row literally carrying `_trawl_wal_file` collides with the synthetic
-    /// provenance column, which must route to the explicit-columns fallback
-    /// rather than failing the read forever (the isolation path cannot save
-    /// it — `probe_ndjson` omits `filename=`, so the file parses cleanly and
-    /// is kept as a survivor). Its innocent batch-mate must land too.
+    /// WAL written before ingest stripped the reserved key still drains, and
+    /// drains LOSSLESSLY: a row literally carrying `_trawl_wal_file` collides
+    /// with the synthetic provenance column, which must route to the renamed
+    /// provenance retry rather than failing the read forever (the isolation
+    /// path cannot save it — `probe_ndjson` omits `filename=`, so the file
+    /// parses cleanly and is kept as a survivor). Its innocent batch-mate
+    /// must land too, and every user field outside the vector envelope must
+    /// survive — the whole point of the rename over the explicit-columns
+    /// fallback, which would drop them for the entire batch.
     #[tokio::test]
     async fn compact_once_drains_wal_carrying_reserved_provenance_key() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3513,9 +3552,10 @@ mod tests {
         std::fs::create_dir_all(&wal_dir).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let poison = r#"{"timestamp":"2026-01-01T00:00:00Z","service":"nginx","message":"poison","_trawl_wal_file":"/etc/passwd"}"#;
-        let innocent =
-            r#"{"timestamp":"2026-01-01T00:00:01Z","service":"nginx","message":"innocent"}"#;
+        // Malformed timestamp on the poison row: the repair must fall back to
+        // the file's OWN name — never to the client-controlled value.
+        let poison = r#"{"timestamp":"not-a-date","service":"nginx","message":"poison","_trawl_wal_file":"/etc/passwd","request_id":"deadbeef"}"#;
+        let innocent = r#"{"timestamp":"2026-01-01T00:00:01Z","service":"nginx","message":"innocent","trace_id":"t1"}"#;
         let wal = wal_dir.join("nginx_1730000000000_abcd.ndjson");
         std::fs::write(&wal, [poison, innocent].join("\n")).unwrap();
 
@@ -3540,21 +3580,43 @@ mod tests {
             "both events land, including the batch-mate"
         );
 
+        // Non-envelope user fields survive on both rows.
         let conn = duckdb::Connection::open_in_memory().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "DESCRIBE SELECT * FROM read_parquet('{}')",
-                parquet[0].display()
-            ))
+        let (request_id, wal_file_val, trace_id): (String, String, String) = conn
+            .query_row(
+                &format!(
+                    "SELECT max(request_id), max({WAL_FILE_COL}), max(trace_id) \
+                     FROM read_parquet('{}')",
+                    parquet[0].display()
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("non-envelope user fields must survive the drain");
+        assert_eq!(request_id, "deadbeef");
+        assert_eq!(trace_id, "t1");
+        assert_eq!(
+            wal_file_val, "/etc/passwd",
+            "the client's literal column is preserved as ordinary data"
+        );
+
+        // The malformed timestamp was repaired from the file's own name, not
+        // from the client-controlled `_trawl_wal_file` value.
+        let repaired: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}') \
+                     WHERE message = 'poison' \
+                       AND \"timestamp\" = epoch_ms(1730000000000)",
+                    parquet[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        let cols: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert!(
-            !cols.iter().any(|c| c == WAL_FILE_COL),
-            "the client's value must not land as the provenance column, got {cols:?}"
+        assert_eq!(
+            repaired, 1,
+            "the poison row's timestamp must come from its WAL filename"
         );
     }
 
