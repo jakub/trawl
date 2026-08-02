@@ -654,16 +654,19 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 }
 
 #[test]
-fn hot_sparse_repair_column_survives_past_the_sample_window() {
+fn hot_sparse_repair_column_survives_inside_the_sample_window() {
     // `timestamp_invalid` is by construction sparse — it appears only on
-    // repaired events. DuckDB's JSON auto-detection samples a bounded prefix
-    // by default (~20480 rows), so on a hot snapshot larger than that a
-    // repaired event near the end left the column out of the inferred schema
-    // and the preserved original vanished from every query with no error
-    // (ADR-0008 promises it survives). sample_size=-1 on the hot readers
-    // inspects every row. Checked with and without cold parquet present:
-    // those are two different reader call sites (hot+cold union vs the
-    // hot-only reader used before any file has been compacted).
+    // repaired events (ADR-0008). DuckDB's JSON auto-detection samples a
+    // bounded prefix by default (~20480 rows) and then errors on any later
+    // record carrying a key outside the inferred schema, so the hot-buffer
+    // snapshot writer hoists one event per novel key to the front of the
+    // file (`HotBuffer::build_snapshot`) rather than making these readers
+    // pay whole-file detection on every query. This asserts the reader half
+    // of that contract: a snapshot far larger than the sample window keeps
+    // the sparse column as long as it appears in the prefix. Checked with
+    // and without cold parquet present: those are two different reader call
+    // sites (hot+cold union vs the hot-only reader used before any file has
+    // been compacted).
     use duckdb::Connection;
     use std::fmt::Write as _;
 
@@ -671,7 +674,10 @@ fn hot_sparse_repair_column_survives_past_the_sample_window() {
         let dir = tempfile::tempdir().unwrap();
         let hot = dir.path().join("hot.ndjson");
 
-        let mut lines = String::new();
+        let mut lines = String::from(
+            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\
+             \"message\":\"repaired\",\"timestamp_invalid\":\"not-a-date\"}\n",
+        );
         for i in 0..30_000 {
             writeln!(
                 lines,
@@ -679,10 +685,6 @@ fn hot_sparse_repair_column_survives_past_the_sample_window() {
             )
             .unwrap();
         }
-        lines.push_str(
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\
-             \"message\":\"repaired\",\"timestamp_invalid\":\"not-a-date\"}\n",
-        );
         std::fs::write(&hot, lines).unwrap();
 
         if with_cold {

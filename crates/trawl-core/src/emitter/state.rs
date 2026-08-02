@@ -144,12 +144,12 @@ fn build_reader(source: &str) -> Result<String, super::EmitError> {
             // when events have heterogeneous schemas where most fields appear in
             // less than 10% of records (e.g. internal telemetry with 64 keys
             // mixed with external events that only have 5 keys).
-            // sample_size=-1 for the same reason as `hot_reader` below: this
-            // is also the reader for a hot-only query (no cold files yet),
-            // where a sparse column past the default sample would be lost.
+            // Schema detection stays on DuckDB's bounded default sample — see
+            // `hot_reader` below for why whole-file detection is not the way to
+            // keep sparse columns alive.
             Ok(format!(
                 "read_json('{source}', format='newline_delimited', records=true, \
-                 auto_detect=true, field_appearance_threshold=0, sample_size=-1)"
+                 auto_detect=true, field_appearance_threshold=0)"
             ))
         } else {
             Ok(format!("read_parquet('{source}', union_by_name=true)"))
@@ -162,17 +162,19 @@ fn build_reader(source: &str) -> Result<String, super::EmitError> {
 /// `field_appearance_threshold=0` prevents `DuckDB` from collapsing
 /// heterogeneous-schema events into a single MAP column.
 ///
-/// `sample_size=-1` detects the schema from every row instead of `DuckDB`'s
-/// default ~20480-row prefix. The snapshot concatenates every live batch and
-/// routinely exceeds that, and a sparse column — `timestamp_invalid`, which
-/// only repaired events carry (ADR-0008) — first appearing past the prefix
-/// otherwise either vanishes from results or throws an `unknown key` error
-/// for the whole query.
+/// Schema detection deliberately keeps `DuckDB`'s bounded default sample.
+/// A sparse column — `timestamp_invalid`, which only repaired events carry
+/// (ADR-0008) — first appearing past that prefix throws an `unknown key`
+/// error for the whole query, but `sample_size=-1` is the wrong cure: it
+/// re-parses the entire snapshot on *every* query and SSE poll (~2.7x the
+/// read cost, and it grows with the buffer). The snapshot writer instead
+/// hoists one event per novel key to the front of the file, so the whole key
+/// set is inside the prefix (see `HotBuffer::build_snapshot`).
 fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
     validate_source_path(hot)?;
     Ok(format!(
         "read_json('{hot}', format='newline_delimited', records=true, \
-         auto_detect=true, field_appearance_threshold=0, sample_size=-1)"
+         auto_detect=true, field_appearance_threshold=0)"
     ))
 }
 

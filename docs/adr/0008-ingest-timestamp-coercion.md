@@ -73,11 +73,20 @@ outlier.
 - `timestamp_invalid` is a sparse column; it is absent from the vast majority
   of files. `union_by_name=true` reconciles it across files, but only if
   `DuckDB` detected it at all: JSON schema detection samples a bounded prefix
-  (~20480 rows) by default, so every `read_json` over WAL or a hot-buffer
-  snapshot sets `sample_size=-1`. Without it a repaired event past the prefix
-  is dropped from the inferred schema with no error — the preservation this
-  ADR promises would silently not happen on exactly the high-volume services
-  where it matters most.
+  (~20480 rows) by default, and a repaired event past that prefix is dropped
+  from the inferred schema (WAL, where the read unions by name) or fails the
+  query outright with `unknown key` (a hot-buffer snapshot). Two different
+  cures, because the two reads have different cost profiles. Compaction's WAL
+  read runs once per batch on a background task and sets `sample_size=-1`.
+  The hot-buffer snapshot is read by *every* query and SSE poll, where
+  whole-file detection costs ~2.7x the read (+135ms on a full default-size
+  buffer, and it grows with `hot_buffer_max_bytes`), so the writer
+  instead hoists one event per novel key to the front of the snapshot: the
+  full key set lands inside the default prefix, with real values, and the
+  reader stays on the cheap default sample. An always-emitted null
+  placeholder would be simpler but wrong — a column that is null throughout
+  the sample is inferred as JSON, which returns `timestamp_invalid` quoted
+  and turns sparse numeric fields into non-numbers.
 - A malformed timestamp is now visible three ways: the preserved field, an
   ingest counter, and normal queryability at roughly the right time — rather
   than as a `compaction_error` line repeating every 10s with no indication of
