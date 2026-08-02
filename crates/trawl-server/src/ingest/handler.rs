@@ -20,6 +20,7 @@ use indexmap::IndexMap;
 use serde_json::json;
 
 use crate::error::ServerError;
+use crate::ingest::compaction;
 use crate::ingest::pipeline::{self, ServiceBatch};
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
@@ -247,8 +248,8 @@ fn preserve_invalid_timestamp(v: &serde_json::Value) -> String {
     }
 }
 
-/// Fill mandatory fields on an event map if they are missing, and
-/// canonicalize or repair the `timestamp` (ADR-0008).
+/// Fill mandatory fields on an event map if they are missing, canonicalize
+/// or repair the `timestamp` (ADR-0008), and drop reserved keys.
 ///
 /// Events without these fields are effectively invisible to most queries
 /// (time filters, bare text search, host grouping), so we fill sensible
@@ -257,11 +258,17 @@ fn preserve_invalid_timestamp(v: &serde_json::Value) -> String {
 /// with the arrival default (the original preserved in `timestamp_invalid`)
 /// rather than poisoning compaction's batch CAST downstream.
 ///
+/// [`compaction::WAL_FILE_COL`] is stripped for the same reason: compaction
+/// projects it as a synthetic provenance column, and a row carrying it makes
+/// `read_json` fail to bind — a request-controlled wedge that would stall
+/// the service's whole WAL. The key is trawl's, not the client's.
+///
 /// Returns the preserved original when a malformed timestamp was repaired.
 fn fill_defaults(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     defaults: &IngestDefaults,
 ) -> Option<String> {
+    obj.remove(compaction::WAL_FILE_COL);
     let repaired = match obj.get("timestamp") {
         None => {
             obj.insert("timestamp".into(), json!(&defaults.timestamp));
@@ -1238,6 +1245,35 @@ mod tests {
         let wal_event: serde_json::Value = serde_json::from_str(wal_text.trim()).unwrap();
         assert_eq!(wal_event["timestamp"], "2026-01-01T00:00:00.000Z");
         assert_eq!(wal_event["timestamp_invalid"], "not-a-date");
+    }
+
+    /// A client-supplied `_trawl_wal_file` never reaches the WAL: compaction
+    /// projects that name as its synthetic provenance column, so a row
+    /// carrying it makes `read_json` fail to bind and wedges the service's
+    /// whole WAL. The event itself is still accepted.
+    #[test]
+    fn reserved_wal_file_key_stripped_from_events() {
+        let data = br#"{"service":"test","timestamp":"2025-06-01T12:00:00Z","_trawl_wal_file":"x","keep":"me"}"#;
+        let parsed = parse_events(data, &test_defaults()).unwrap();
+        assert!(parsed.errors.is_empty(), "stripping is not a rejection");
+        assert_eq!(total_accepted(&parsed), 1);
+
+        let event = &service_maps(&parsed, "test")[0];
+        assert!(
+            !event.contains_key(compaction::WAL_FILE_COL),
+            "reserved key must be stripped, got {event:?}"
+        );
+        assert_eq!(
+            event.get("keep").and_then(serde_json::Value::as_str),
+            Some("me"),
+            "other user fields are untouched"
+        );
+
+        let wal_text = std::str::from_utf8(&parsed.batches["test"].ndjson).unwrap();
+        assert!(
+            !wal_text.contains(compaction::WAL_FILE_COL),
+            "reserved key must not reach the WAL bytes: {wal_text}"
+        );
     }
 
     #[test]
