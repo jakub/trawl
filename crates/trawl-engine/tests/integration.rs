@@ -602,3 +602,61 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
         "the cold parquet row must survive alongside the malformed-timestamp hot row"
     );
 }
+
+#[test]
+fn hot_sparse_repair_column_survives_past_the_sample_window() {
+    // `timestamp_invalid` is by construction sparse — it appears only on
+    // repaired events. DuckDB's JSON auto-detection samples a bounded prefix
+    // by default (~20480 rows), so on a hot snapshot larger than that a
+    // repaired event near the end left the column out of the inferred schema
+    // and the preserved original vanished from every query with no error
+    // (ADR-0008 promises it survives). sample_size=-1 on the hot readers
+    // inspects every row. Checked with and without cold parquet present:
+    // those are two different reader call sites (hot+cold union vs the
+    // hot-only reader used before any file has been compacted).
+    use duckdb::Connection;
+    use std::fmt::Write as _;
+
+    for with_cold in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().join("hot.ndjson");
+
+        let mut lines = String::new();
+        for i in 0..30_000 {
+            writeln!(
+                lines,
+                "{{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
+            )
+            .unwrap();
+        }
+        lines.push_str(
+            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\
+             \"message\":\"repaired\",\"timestamp_invalid\":\"not-a-date\"}\n",
+        );
+        std::fs::write(&hot, lines).unwrap();
+
+        if with_cold {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                              'svc' AS service, 'cold row' AS message) \
+                 TO '{}' (FORMAT PARQUET)",
+                dir.path().join("cold.parquet").display()
+            ))
+            .unwrap();
+        }
+
+        let exec = Executor::new().expect("executor should initialize");
+        let source = format!("{}/*.parquet", dir.path().display());
+        let result = exec
+            .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+            .expect("hot query must succeed");
+
+        let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            col_names.contains(&"timestamp_invalid"),
+            "the preserved original must survive a hot snapshot larger than the \
+             JSON sample window (with_cold={with_cold}); got columns {col_names:?}"
+        );
+    }
+}

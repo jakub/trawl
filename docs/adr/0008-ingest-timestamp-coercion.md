@@ -61,8 +61,14 @@ outlier.
 
 ## Consequences
 
-- `timestamp_invalid` is a sparse column, which `union_by_name=true` already
-  handles; it is absent from the vast majority of files.
+- `timestamp_invalid` is a sparse column; it is absent from the vast majority
+  of files. `union_by_name=true` reconciles it across files, but only if
+  `DuckDB` detected it at all: JSON schema detection samples a bounded prefix
+  (~20480 rows) by default, so every `read_json` over WAL or a hot-buffer
+  snapshot sets `sample_size=-1`. Without it a repaired event past the prefix
+  is dropped from the inferred schema with no error — the preservation this
+  ADR promises would silently not happen on exactly the high-volume services
+  where it matters most.
 - A malformed timestamp is now visible three ways: the preserved field, an
   ingest counter, and normal queryability at roughly the right time — rather
   than as a `compaction_error` line repeating every 10s with no indication of

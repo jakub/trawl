@@ -1128,6 +1128,14 @@ fn is_column_collision(e: &duckdb::Error) -> bool {
 /// caller can isolate the offending file.
 ///
 /// A malformed `timestamp` is never fatal here: see [`timestamp_repair_expr`].
+///
+/// `sample_size=-1` (schema detection over every row, not `DuckDB`'s default
+/// ~20480-row prefix) is what keeps `timestamp_invalid` alive: it is sparse
+/// by construction — only repaired events carry it — so on any WAL file
+/// bigger than the sample it fell outside the inferred schema and
+/// `union_by_name` dropped it with no error at all, losing the evidence
+/// ADR-0008 promises to preserve. Any other sparse user field was equally
+/// exposed. The explicit-columns fallback lists it for the same reason.
 fn build_wal_batch(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -1146,7 +1154,7 @@ fn build_wal_batch(
          SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
          FROM read_json([{file_list_sql}], format='newline_delimited', \
          records=true, auto_detect=true, union_by_name=true, \
-         field_appearance_threshold=0, maximum_depth=2, \
+         field_appearance_threshold=0, maximum_depth=2, sample_size=-1, \
          filename='{WAL_FILE_COL}')"
     ));
 
@@ -1171,7 +1179,8 @@ fn build_wal_batch(
                  k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
                  k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR', \
                  level: 'VARCHAR', message: 'VARCHAR', \
-                 service: 'VARCHAR', timestamp: 'VARCHAR'}})"
+                 service: 'VARCHAR', timestamp: 'VARCHAR', \
+                 timestamp_invalid: 'VARCHAR'}})"
             ))
             .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
         }
@@ -3359,6 +3368,56 @@ mod tests {
                 "variant {variant}: no parquet row may have a NULL timestamp"
             );
         }
+    }
+
+    /// A repaired event past `DuckDB`'s default JSON sample window still
+    /// reaches parquet with its `timestamp_invalid` intact.
+    ///
+    /// `timestamp_invalid` is sparse by construction — only repaired events
+    /// carry it. Auto-detection over a bounded sample never saw it on a WAL
+    /// file bigger than the sample, so the preserved original was dropped
+    /// with no error at all, defeating ADR-0008's promise that the evidence
+    /// survives to the operator.
+    #[test]
+    fn compact_preserves_repair_column_past_the_sample_window() {
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Larger than DuckDB's default JSON sample (~20480 rows), with the
+        // only repaired event as the very last line.
+        let mut lines = String::new();
+        for i in 0..30_000 {
+            writeln!(
+                lines,
+                "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
+            )
+            .unwrap();
+        }
+        lines.push_str(
+            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"service\":\"svc\",\
+             \"message\":\"repaired\",\"timestamp_invalid\":\"not-a-date\"}\n",
+        );
+        let wal = wal_dir.join("svc_1730000000000_abcd.ndjson");
+        std::fs::write(&wal, lines).unwrap();
+
+        compact_service_blocking(&[wal], &data_dir, "svc", "2GB").expect("must compact");
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let preserved = read_strings(
+            &parquet[0],
+            "COALESCE(string_agg(timestamp_invalid), 'MISSING')",
+        );
+        assert_eq!(
+            preserved,
+            vec!["not-a-date".to_owned()],
+            "the preserved original must survive a WAL file larger than the \
+             JSON sample window"
+        );
     }
 
     /// One bad event does not affect its batch-mates: 1 bad + 2 good in one
