@@ -90,9 +90,12 @@ impl Executor {
     /// The emitted SQL unions the primary parquet source with a hot buffer
     /// ndjson file via `UNION ALL BY NAME`.
     ///
-    /// Handles cold-start gracefully: when no parquet files exist yet
-    /// (empty columns = no data source), falls back to querying just the
-    /// hot buffer so events ingested before the first compaction are visible.
+    /// Handles cold-start gracefully: when the cold source matches no file at
+    /// all, falls back to querying just the hot buffer so events ingested
+    /// before the first compaction are visible. A columnless union result is
+    /// not taken as proof of that — it is re-checked against the files on
+    /// disk, because a list source reports "no files" for a single empty
+    /// element too (ADR-0008).
     pub fn run_query_with_hot(
         &self,
         dsl: &str,
@@ -122,14 +125,31 @@ impl Executor {
             outcome = self.execute_emitted(&coerced, max_rows, utc_offset_secs);
         }
 
+        // `execute_emitted` maps DuckDB's "no files match the pattern" error
+        // to an empty result. For a LIST source that error also fires when a
+        // SINGLE element matches nothing — even when its siblings hold data —
+        // so an empty result never proves a cold start. The server emits one
+        // glob per hour in range and prunes only on parent-directory
+        // existence, so a sparse-traffic service routinely gets elements
+        // pointing at hour dirs holding no file of its own. Retry over just
+        // the elements that match a file, so the cold rows that do exist are
+        // never silently dropped (ADR-0008).
+        if matches!(&outcome, Ok(r) if r.columns.is_empty())
+            && let Some(pruned) = self.pruned_cold_source(source)
+        {
+            let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source)?;
+            outcome = self.execute_emitted(&pruned_emitted, max_rows, utc_offset_secs);
+        }
+
         // Classify the (possibly retried) outcome, then route on the pure
         // `cold_action` decision so the outcome policy stays unit-testable.
         let class = match &outcome {
             // Columns present → real result (possibly empty rows).
             Ok(r) if !r.columns.is_empty() => HotColdOutcome::Columns,
-            // No columns: execute_emitted mapped a "no files match the glob"
-            // error to an empty result — the genuine cold-start case.
-            Ok(_) => HotColdOutcome::NoColdFiles,
+            // No columns: the source matched no file at all, or the prune
+            // above could not narrow it. Hot-only is safe only if a presence
+            // check confirms there is no cold data to hide.
+            Ok(_) => HotColdOutcome::NoColumns,
             // A binder error remapped to Emit (querying a nonexistent field)
             // — a user error, safe to keep the empty-result UX.
             Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
@@ -142,8 +162,8 @@ impl Executor {
         let hot_only = match cold_action(class) {
             ColdAction::ReturnOutcome => false,
             ColdAction::HotOnly => true,
-            // Evaluated only on this error path: hot-only is permitted
-            // exactly when there is no cold data it could hide.
+            // Evaluated only on this path: hot-only is permitted exactly
+            // when there is no cold data it could hide.
             ColdAction::HotOnlyIfNoColdFiles => !self.cold_files_present(source),
         };
         let mut result = if hot_only {
@@ -227,9 +247,10 @@ impl Executor {
 
     /// Whether the cold source has any concrete files behind it.
     ///
-    /// Consulted only on the error path of the hot+cold outcome policy: a
-    /// hot-only fallback after an unexpected failure is permitted exactly
-    /// when there is no cold data it could hide. A plain glob is counted via
+    /// Consulted only on the fallback path of the hot+cold outcome policy: a
+    /// hot-only read after an unexpected failure — or after a columnless
+    /// result — is permitted exactly when there is no cold data it could
+    /// hide. A plain glob is counted via
     /// `glob(?)`; a list source (`['a', 'b']`) is counted by globbing each
     /// element — its members are globs over hours that may hold no file yet,
     /// so membership alone proves nothing. Errs on the side of "present" so
@@ -242,6 +263,32 @@ impl Executor {
             Some(items) => items.iter().any(|item| self.glob_has_match(item)),
             None => self.glob_has_match(source),
         }
+    }
+
+    /// Narrow a list source (`['a', 'b']`) to the elements that match at
+    /// least one file on disk.
+    ///
+    /// `read_parquet` rejects the whole list when ANY element matches nothing,
+    /// so a list carrying both populated and empty hour globs — the normal
+    /// shape for a sparse-traffic service — reads as "no files" and would drop
+    /// the cold rows that do exist. Pruning the empty elements makes the read
+    /// succeed over exactly the same data.
+    ///
+    /// Returns `None` when there is nothing to prune: a plain glob, a list
+    /// this parser doesn't understand, a list where no element matches (the
+    /// genuine cold start), or one where every element already matches.
+    fn pruned_cold_source(&self, source: &str) -> Option<String> {
+        let items = glob_list_items(source)?;
+        let matching: Vec<&str> = items
+            .iter()
+            .copied()
+            .filter(|item| self.glob_has_match(item))
+            .collect();
+        if matching.is_empty() || matching.len() == items.len() {
+            return None;
+        }
+        let quoted: Vec<String> = matching.iter().map(|item| format!("'{item}'")).collect();
+        Some(format!("[{}]", quoted.join(", ")))
     }
 
     /// Whether `pattern` matches at least one file on disk. Errs on the side
@@ -861,9 +908,12 @@ enum HotColdOutcome {
     /// The union produced columns (rows may be empty) — an authoritative
     /// result; return it as-is.
     Columns,
-    /// The cold glob matched no files (the cold-start case, mapped to an
-    /// empty result by `execute_emitted`) — hot-only cannot hide anything.
-    NoColdFiles,
+    /// The union produced no columns at all — `execute_emitted` mapped a "no
+    /// files match the pattern" error to an empty result. Usually the cold
+    /// start, but a list source raises the same error for one non-matching
+    /// element, so this is an observation, not proof: hot-only still needs a
+    /// cold-file presence check.
+    NoColumns,
     /// A binder error remapped to `Emit` (querying a nonexistent field) — a
     /// user error; hot-only keeps the established empty-result UX.
     BenignBinder,
@@ -895,8 +945,8 @@ enum ColdAction {
 fn cold_action(outcome: HotColdOutcome) -> ColdAction {
     match outcome {
         HotColdOutcome::Columns | HotColdOutcome::Fatal => ColdAction::ReturnOutcome,
-        HotColdOutcome::NoColdFiles | HotColdOutcome::BenignBinder => ColdAction::HotOnly,
-        HotColdOutcome::Recoverable => ColdAction::HotOnlyIfNoColdFiles,
+        HotColdOutcome::BenignBinder => ColdAction::HotOnly,
+        HotColdOutcome::NoColumns | HotColdOutcome::Recoverable => ColdAction::HotOnlyIfNoColdFiles,
     }
 }
 
@@ -1472,12 +1522,12 @@ mod tests {
     #[test]
     fn cold_action_routes_by_outcome_class() {
         // The outcome policy: hot-only fallback is permitted only when it
-        // cannot hide cold data. Columns and Fatal return the outcome;
-        // cold-start and benign missing-column errors go hot-only; any other
-        // failure may go hot-only ONLY if a cold-file presence check proves
-        // there is nothing to hide (ADR-0008: a cold-data drop is never
-        // silent, and an arbitrary database failure never masquerades as
-        // success).
+        // cannot hide cold data. Columns and Fatal return the outcome; a
+        // benign missing-column error goes hot-only; a columnless result and
+        // any other failure may go hot-only ONLY if a cold-file presence
+        // check proves there is nothing to hide (ADR-0008: a cold-data drop
+        // is never silent, and an arbitrary database failure never
+        // masquerades as success).
         assert_eq!(
             cold_action(HotColdOutcome::Columns),
             ColdAction::ReturnOutcome,
@@ -1489,9 +1539,10 @@ mod tests {
             "a non-recoverable error is propagated, not masked by a hot-only read"
         );
         assert_eq!(
-            cold_action(HotColdOutcome::NoColdFiles),
-            ColdAction::HotOnly,
-            "a genuine cold start (glob matched nothing) stays hot-only"
+            cold_action(HotColdOutcome::NoColumns),
+            ColdAction::HotOnlyIfNoColdFiles,
+            "a columnless result is only a cold start if no cold files exist — \
+             a list source reports the same error for one empty element"
         );
         assert_eq!(
             cold_action(HotColdOutcome::BenignBinder),
@@ -1605,6 +1656,47 @@ mod tests {
         assert!(
             exec.cold_files_present(&absent),
             "a list whose globs match a file must report cold files present"
+        );
+    }
+
+    #[test]
+    fn partial_list_source_miss_keeps_cold_rows() {
+        // The server emits one glob per hour in the query range and prunes
+        // only on parent-directory existence, so a sparse-traffic service
+        // routinely gets a list whose elements point at hour directories
+        // (created by other services) holding no file of its own. DuckDB
+        // raises "No files found that match the pattern" for such an element
+        // even when a sibling element has data, and `execute_emitted` maps
+        // that to an empty result — so an empty result must NOT be read as
+        // "cold start". The cold rows that do exist must still come back.
+        let dir = tempfile::tempdir().unwrap();
+        let full_hour = dir.path().join("10");
+        let empty_hour = dir.path().join("11");
+        std::fs::create_dir_all(&full_hour).unwrap();
+        std::fs::create_dir_all(&empty_hour).unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &full_hour.join("svc.parquet"), "'plain'");
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+
+        let exec = Executor::new().unwrap();
+        let source = format!(
+            "['{}/*.parquet', '{}/*.parquet']",
+            full_hour.display(),
+            empty_hour.display()
+        );
+        let result = exec
+            .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+            .expect("a partial list-source miss must not fail the query");
+        assert_eq!(
+            result.row_count(),
+            2,
+            "the cold row behind the matching glob element must survive an \
+             empty sibling element, alongside the hot row"
         );
     }
 
