@@ -668,7 +668,27 @@ impl Executor {
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
-        match self.export_parquet_from_emitted(&emitted, output_path, max_rows) {
+        let mut outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
+
+        // Same prune retry as `run_query_with_hot`: `read_parquet` rejects a
+        // LIST source wholesale when a SINGLE element matches nothing, even
+        // when its siblings hold data. The server emits one glob per hour in
+        // range and prunes only on parent-directory existence, so a
+        // sparse-traffic service routinely gets elements pointing at hour dirs
+        // holding no file of its own. Unlike the query path — where
+        // `execute_emitted` maps the error to an empty result — the export
+        // surfaces it raw, and the hot-only arm below cannot rescue it (a
+        // matching sibling makes `cold_files_present` true). Retry over just
+        // the elements that match a file so the cold rows that do exist are
+        // exported (ADR-0008).
+        if matches!(&outcome, Err(EngineError::Database(e)) if is_no_files_error(e))
+            && let Some(pruned) = self.pruned_cold_source(source)
+        {
+            let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source)?;
+            outcome = self.export_parquet_from_emitted(&pruned_emitted, output_path, max_rows);
+        }
+
+        match outcome {
             // No parquet files / binder-shaped failure → hot-only is only
             // permitted when there is no cold data it could hide.
             Err(EngineError::Database(_) | EngineError::Emit(_))
@@ -1925,6 +1945,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1, "the exported parquet must carry the hot row");
+    }
+
+    #[test]
+    fn export_with_hot_keeps_cold_rows_on_partial_list_miss() {
+        // The everyday `service=X last=24h` export shape: one glob per hour in
+        // range, one hour directory holding the service's parquet and a
+        // sibling hour directory that exists (other services compacted there)
+        // without a file of its own. DuckDB rejects the whole list, and the
+        // hot-only arm cannot rescue it because the matching sibling makes
+        // cold files "present" — so without the prune retry this 500s. Both
+        // the cold row and the hot row must land in the exported parquet.
+        let dir = tempfile::tempdir().unwrap();
+        let full_hour = dir.path().join("10");
+        let empty_hour = dir.path().join("11");
+        std::fs::create_dir_all(&full_hour).unwrap();
+        std::fs::create_dir_all(&empty_hour).unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &full_hour.join("svc.parquet"), "'plain'");
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+        let out = dir.path().join("export.parquet");
+
+        let exec = Executor::new().unwrap();
+        let source = format!(
+            "['{}/*.parquet', '{}/*.parquet']",
+            full_hour.display(),
+            empty_hour.display()
+        );
+        exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
+            .expect("a partial list-source miss must not fail the export");
+
+        let rows: i64 = exec
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    out.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "the cold row behind the matching glob element must survive an \
+             empty sibling element, alongside the hot row"
+        );
     }
 
     #[test]
