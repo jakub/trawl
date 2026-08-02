@@ -213,28 +213,67 @@ const MAX_TIMESTAMP_INVALID_CHARS: usize = 256;
 /// Maximum number of preserved originals sampled for the `ingest_repairs` warn.
 const MAX_REPAIR_SAMPLES: usize = 5;
 
+/// Date-time formats carrying an explicit UTC offset, tried after RFC 3339.
+///
+/// `chrono::DateTime::parse_from_rfc3339` only accepts the extended offset
+/// spelling (`+05:30`), but the ISO 8601 *basic* spelling (`+0530`, `+05`) is
+/// what Java's default logging encoders and Go's `-0700` layouts emit, and the
+/// hard `CAST` this path replaces accepted it. `%#z` is chrono's parse-only
+/// offset that takes `+HH`, `+HHMM` and `+HH:MM` alike.
+const OFFSET_TIMESTAMP_FORMATS: [&str; 6] = [
+    "%Y-%m-%dT%H:%M:%S%.f%#z",
+    "%Y-%m-%d %H:%M:%S%.f%#z",
+    "%Y/%m/%d %H:%M:%S%.f%#z",
+    "%Y-%m-%dT%H:%M%#z",
+    "%Y-%m-%d %H:%M%#z",
+    "%Y/%m/%d %H:%M%#z",
+];
+
 /// Offset-less date-time formats accepted alongside RFC 3339, read as UTC.
 ///
-/// `%.f` matches an optional fractional-second suffix, so each entry covers
-/// both the with- and without-fraction spelling. Together with RFC 3339 and
-/// the date-only form these are shapes the hard `CAST` this replaces accepted,
-/// and shapes the in-memory matcher (`trawl_core::filter::parse_timestamp`)
-/// accepts on the live path — ingest must not be the narrower of the two, or a
-/// producer emitting `LocalDateTime` / `datetime.isoformat()` silently loses
-/// its event time to the arrival substitution.
-const NAIVE_TIMESTAMP_FORMATS: [&str; 2] = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"];
+/// `%.f` matches an optional fractional-second suffix, so each second-precision
+/// entry covers both the with- and without-fraction spelling; the `%H:%M`
+/// entries cover minute precision. The slash-dated spellings are what Go's
+/// standard `log` package emits.
+const NAIVE_TIMESTAMP_FORMATS: [&str; 6] = [
+    "%Y-%m-%dT%H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y/%m/%d %H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M",
+];
+
+/// Date-only formats, read as midnight UTC.
+const DATE_ONLY_TIMESTAMP_FORMATS: [&str; 2] = ["%Y-%m-%d", "%Y/%m/%d"];
 
 /// Canonicalize a present `timestamp` value per the ADR-0008 grammar.
 ///
-/// A value is valid iff it is a JSON string chrono parses as RFC 3339, as one
-/// of [`NAIVE_TIMESTAMP_FORMATS`], or as a bare `%Y-%m-%d` date (midnight
-/// UTC). Valid values are rewritten to RFC 3339 UTC at microsecond precision
-/// (`DuckDB`'s native TIMESTAMP resolution) so compaction's `TRY_CAST`
-/// succeeds on post-fix data by construction. Returns `None` for anything
-/// malformed.
+/// A value is valid iff it is a JSON string that — after trimming surrounding
+/// whitespace — chrono parses as RFC 3339, as one of
+/// [`OFFSET_TIMESTAMP_FORMATS`], [`NAIVE_TIMESTAMP_FORMATS`] or
+/// [`DATE_ONLY_TIMESTAMP_FORMATS`]. Valid values are rewritten to RFC 3339 UTC
+/// at microsecond precision (`DuckDB`'s native TIMESTAMP resolution) so
+/// compaction's `TRY_CAST` succeeds on post-fix data by construction. Returns
+/// `None` for anything malformed.
+///
+/// The grammar covers the shapes real log producers emit, and is a superset of
+/// what the in-memory matcher (`trawl_core::filter::parse_timestamp`) accepts
+/// on the live path apart from bare epoch numbers — ingest must not be the
+/// narrower of the two, or a producer emitting `LocalDateTime` /
+/// `datetime.isoformat()` silently loses its event time to the arrival
+/// substitution. It is deliberately *not* literal parity with the hard `CAST`
+/// it replaces: `DuckDB`'s timestamp parser is looser still (e.g. `infinity`,
+/// named month forms), and anything outside this grammar is preserved in
+/// `timestamp_invalid` rather than guessed at.
 fn canonical_timestamp(v: &serde_json::Value) -> Option<String> {
-    let s = v.as_str()?;
+    let s = v.as_str()?.trim();
     let utc: chrono::DateTime<chrono::Utc> = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+    {
+        dt.with_timezone(&chrono::Utc)
+    } else if let Some(dt) = OFFSET_TIMESTAMP_FORMATS
+        .iter()
+        .find_map(|fmt| chrono::DateTime::parse_from_str(s, fmt).ok())
     {
         dt.with_timezone(&chrono::Utc)
     } else if let Some(naive) = NAIVE_TIMESTAMP_FORMATS
@@ -243,8 +282,9 @@ fn canonical_timestamp(v: &serde_json::Value) -> Option<String> {
     {
         naive.and_utc()
     } else {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .ok()?
+        DATE_ONLY_TIMESTAMP_FORMATS
+            .iter()
+            .find_map(|fmt| chrono::NaiveDate::parse_from_str(s, fmt).ok())?
             .and_hms_opt(0, 0, 0)?
             .and_utc()
     };
@@ -1139,6 +1179,28 @@ mod tests {
             ("2025-06-01T12:00:00.123", "2025-06-01T12:00:00.123000Z"),
             // Date-only, read as midnight UTC.
             ("2025-06-01", "2025-06-01T00:00:00.000000Z"),
+            // ISO 8601 *basic* offsets (no colon) — logback's default encoder,
+            // Go's `-0700` layouts. RFC 3339 parsing alone rejects these.
+            (
+                "2025-06-01T12:00:00.000+0000",
+                "2025-06-01T12:00:00.000000Z",
+            ),
+            ("2025-06-01T17:30:00+0530", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01 14:00:00+02", "2025-06-01T12:00:00.000000Z"),
+            // Minute precision, offset-less and with an offset.
+            ("2025-06-01T12:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01 12:00", "2025-06-01T12:00:00.000000Z"),
+            ("2025-06-01T14:00+02:00", "2025-06-01T12:00:00.000000Z"),
+            // Slash-dated (Go's standard `log` package).
+            ("2025/06/01 12:00:00", "2025-06-01T12:00:00.000000Z"),
+            (
+                "2025/06/01 12:00:00.25+00:00",
+                "2025-06-01T12:00:00.250000Z",
+            ),
+            ("2025/06/01", "2025-06-01T00:00:00.000000Z"),
+            // Surrounding whitespace is trimmed before parsing.
+            ("  2025-06-01T12:00:00Z  ", "2025-06-01T12:00:00.000000Z"),
+            (" 2025-06-01 12:00:00 ", "2025-06-01T12:00:00.000000Z"),
         ];
         let defaults = test_defaults();
         for (input, expected) in cases {
