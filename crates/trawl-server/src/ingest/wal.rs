@@ -16,24 +16,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Sanitize a service name for use in filenames.
-///
-/// Only alphanumeric, dash, and underscore survive; everything else
-/// (including dots) becomes underscore. Shared between WAL writer
-/// and query planner so file patterns match at query time.
-pub fn sanitize_service_for_filename(service: &str) -> String {
-    service
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 /// Atomic WAL file writer for ingest events.
 #[derive(Debug)]
 pub struct WalWriter {
@@ -67,10 +49,18 @@ impl WalWriter {
     /// the rename entry durable so a crash can't lose the just-acked batch.
     ///
     /// Returns the final path of the WAL file on success.
-    pub fn write(&self, service: &str, events: &[u8]) -> std::io::Result<PathBuf> {
+    ///
+    /// Files land in `wal_dir/{env}/` (lazily created), named
+    /// `{service}_{unix_millis}_{4_hex}.ndjson` with the service name
+    /// VERBATIM — path encoding is injective by validation (ADR-0009):
+    /// both `env` and `service` were validated at ingest, so `api.v2`
+    /// and `api_v2` are distinct files and pruning stays exact.
+    pub fn write(&self, env: &str, service: &str, events: &[u8]) -> std::io::Result<PathBuf> {
         let filename = Self::generate_filename(service)?;
-        let tmp_path = self.wal_dir.join(format!("{filename}.tmp"));
-        let final_path = self.wal_dir.join(format!("{filename}.ndjson"));
+        let env_dir = self.wal_dir.join(env);
+        std::fs::create_dir_all(&env_dir)?;
+        let tmp_path = env_dir.join(format!("{filename}.tmp"));
+        let final_path = env_dir.join(format!("{filename}.ndjson"));
 
         let mut file = File::create(&tmp_path)?;
         file.write_all(events)?;
@@ -87,10 +77,10 @@ impl WalWriter {
         // a dir-fsync failure here only weakens crash-survival of the rename
         // entry. It must NOT fail an otherwise-successful, already-visible write
         // — that would falsely reject the batch and risk a duplicate on retry.
-        if let Err(e) = File::open(&self.wal_dir).and_then(|d| d.sync_all()) {
+        if let Err(e) = File::open(&env_dir).and_then(|d| d.sync_all()) {
             tracing::warn!(
                 event_type = "wal_dir_fsync_failed",
-                dir = %self.wal_dir.display(),
+                dir = %env_dir.display(),
                 error = %e,
                 "WAL parent-dir fsync failed; write is durable but the rename \
                  entry may not survive a crash"
@@ -101,6 +91,8 @@ impl WalWriter {
     }
 
     /// Generate a unique filename: `{service}_{unix_millis}_{4_hex_random}`.
+    ///
+    /// The service name is carried verbatim — it was validated at ingest.
     fn generate_filename(service: &str) -> std::io::Result<String> {
         let millis = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -111,8 +103,7 @@ impl WalWriter {
         let random: u16 = rand::random();
         let hex = format!("{random:04x}");
 
-        let safe_service = sanitize_service_for_filename(service);
-        Ok(format!("{safe_service}_{millis}_{hex}"))
+        Ok(format!("{service}_{millis}_{hex}"))
     }
 }
 
@@ -121,24 +112,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn write_creates_ndjson_file() {
+    fn write_creates_ndjson_file_under_env_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let writer = WalWriter::new(tmp.path().to_path_buf());
         writer.ensure_dir().unwrap();
 
         let events = b"{\"service\":\"test\",\"message\":\"hello\"}\n";
-        let path = writer.write("test", events).unwrap();
+        let path = writer.write("prod", "test", events).unwrap();
 
         assert!(path.exists());
         assert!(path.extension().is_some_and(|ext| ext == "ndjson"));
         assert_eq!(std::fs::read(&path).unwrap(), events);
+        assert_eq!(
+            path.parent().unwrap(),
+            tmp.path().join("prod"),
+            "WAL files land under wal_dir/{{env}}/"
+        );
     }
 
     #[test]
-    fn filename_sanitizes_service_name() {
-        let name = WalWriter::generate_filename("my/bad service").unwrap();
-        assert!(!name.contains('/'));
-        assert!(name.starts_with("my_bad_service_"));
+    fn filename_carries_service_verbatim() {
+        // api.v2 and api_v2 must be DISTINCT files (injective paths,
+        // ADR-0009) — the old sanitizer collapsed them.
+        let dotted = WalWriter::generate_filename("api.v2").unwrap();
+        let underscored = WalWriter::generate_filename("api_v2").unwrap();
+        assert!(dotted.starts_with("api.v2_"), "got {dotted}");
+        assert!(underscored.starts_with("api_v2_"), "got {underscored}");
+    }
+
+    #[test]
+    fn two_envs_same_service_are_separate_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = WalWriter::new(tmp.path().to_path_buf());
+        writer.ensure_dir().unwrap();
+
+        let prod = writer.write("prod", "svc", b"{}\n").unwrap();
+        let lab = writer.write("lab", "svc", b"{}\n").unwrap();
+        assert_ne!(prod, lab);
+        assert!(prod.starts_with(tmp.path().join("prod")));
+        assert!(lab.starts_with(tmp.path().join("lab")));
     }
 
     #[test]
@@ -147,35 +159,13 @@ mod tests {
         let writer = WalWriter::new(tmp.path().to_path_buf());
         writer.ensure_dir().unwrap();
 
-        writer.write("test", b"{}\n").unwrap();
+        writer.write("prod", "test", b"{}\n").unwrap();
 
-        let tmp_files: Vec<_> = std::fs::read_dir(tmp.path())
+        let tmp_files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
             .collect();
         assert!(tmp_files.is_empty(), "no .tmp files should remain");
-    }
-
-    #[test]
-    fn sanitize_preserves_valid_chars() {
-        assert_eq!(
-            sanitize_service_for_filename("nginx-proxy_v2"),
-            "nginx-proxy_v2"
-        );
-    }
-
-    #[test]
-    fn sanitize_replaces_dots() {
-        assert_eq!(sanitize_service_for_filename("api.v2"), "api_v2");
-        assert_eq!(
-            sanitize_service_for_filename("host.name.prod"),
-            "host_name_prod"
-        );
-    }
-
-    #[test]
-    fn sanitize_replaces_special_chars() {
-        assert_eq!(sanitize_service_for_filename("a/b:c d"), "a_b_c_d");
     }
 }

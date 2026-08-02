@@ -428,6 +428,7 @@ impl AppState {
                 Arc::clone(&writer),
                 Some(Arc::clone(&buffer)),
                 Some(Arc::clone(&bus)),
+                config.ingest.default_env.as_str().into(),
             ));
             (Some(writer), Some(bus), Some(buffer), Some(pipeline))
         } else {

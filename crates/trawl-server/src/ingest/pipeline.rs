@@ -63,6 +63,9 @@ pub struct PipelineWriter {
     wal_writer: Arc<WalWriter>,
     hot_buffer: Option<Arc<HotBuffer>>,
     event_bus: Option<Arc<LocalEventBus>>,
+    /// Env for service-keyed batch writers (syslog) that predate the env
+    /// dimension — their events are stamped with `default_env` upstream.
+    default_env: Arc<str>,
 }
 
 impl PipelineWriter {
@@ -70,11 +73,13 @@ impl PipelineWriter {
         wal_writer: Arc<WalWriter>,
         hot_buffer: Option<Arc<HotBuffer>>,
         event_bus: Option<Arc<LocalEventBus>>,
+        default_env: Arc<str>,
     ) -> Self {
         Self {
             wal_writer,
             hot_buffer,
             event_bus,
+            default_env,
         }
     }
 
@@ -89,14 +94,15 @@ impl PipelineWriter {
     /// services that fail WAL writing are dropped (logged, not published).
     pub fn write(&self, batches: IndexMap<String, ServiceBatch>) -> usize {
         let mut total_written = 0;
+        let env = Arc::clone(&self.default_env);
 
         for (svc, batch) in batches {
             let event_count = batch.maps.len();
 
-            match self.wal_writer.write(&svc, &batch.ndjson) {
+            match self.wal_writer.write(&env, &svc, &batch.ndjson) {
                 Ok(wal_path) => {
                     total_written += event_count;
-                    self.publish(&svc, batch, &wal_path);
+                    self.publish(&env, &svc, batch, &wal_path);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -117,12 +123,17 @@ impl PipelineWriter {
     ///
     /// Called after WAL writing succeeds to make events immediately
     /// visible to queries (via hot buffer) and SSE streams (via event bus).
-    pub(crate) fn publish(&self, svc: &str, batch: ServiceBatch, wal_path: &Path) {
-        let batch_id: Arc<str> = wal_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .into();
+    pub(crate) fn publish(&self, env: &str, svc: &str, batch: ServiceBatch, wal_path: &Path) {
+        // `{env}/{stem}`: two envs must never collide on a hot-buffer
+        // drain key (compaction derives the same shape from the env dir).
+        let batch_id: Arc<str> = format!(
+            "{env}/{}",
+            wal_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+        )
+        .into();
 
         let ingest_batch = Arc::new(IngestBatch {
             batch_id,

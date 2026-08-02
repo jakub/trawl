@@ -201,15 +201,36 @@ fn retention_tick(
     Ok(())
 }
 
-/// Enumerate date-formatted directories in `data_dir`, excluding today
-/// and non-date directories (like "wal"). Returns sorted oldest-first.
+/// Enumerate date-formatted directories across every env directory in
+/// `data_dir` (ADR-0009 layout: `data/{env}/{date}/`), excluding today
+/// and non-date directories. Env directories are recognised by the env
+/// charset with `wal`/`scheduled` reserved — anything else at the top
+/// level (a stray file, the EPOCH marker, a set-aside dir) is skipped.
+/// Candidates are merged across envs, sorted oldest-first, so
+/// disk-pressure deletion stays globally oldest-first while deleting one
+/// env's date dir stays O(1) and never touches other envs.
 fn enumerate_date_dirs(data_dir: &Path, today: &str) -> Result<Vec<(NaiveDate, PathBuf)>, String> {
     let entries = std::fs::read_dir(data_dir)
         .map_err(|e| format!("failed to read data directory {}: {e}", data_dir.display()))?;
 
-    let mut dirs: Vec<(NaiveDate, PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
+    let mut dirs: Vec<(NaiveDate, PathBuf)> = Vec::new();
+    for env_entry in entries.flatten() {
+        let env_path = env_entry.path();
+        if !env_path.is_dir() {
+            continue;
+        }
+        let Some(env_name) = env_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !trawl_config::is_valid_env_name(env_name)
+            || trawl_config::RESERVED_ENV_NAMES.contains(&env_name)
+        {
+            continue;
+        }
+        let Ok(date_entries) = std::fs::read_dir(&env_path) else {
+            continue;
+        };
+        dirs.extend(date_entries.flatten().filter_map(|entry| {
             let path = entry.path();
             if !path.is_dir() {
                 return None;
@@ -223,8 +244,8 @@ fn enumerate_date_dirs(data_dir: &Path, today: &str) -> Result<Vec<(NaiveDate, P
             }
             let date = NaiveDate::parse_from_str(name, "%Y-%m-%d").ok()?;
             Some((date, path))
-        })
-        .collect();
+        }));
+    }
 
     dirs.sort_by_key(|(date, _)| *date);
     Ok(dirs)
@@ -293,22 +314,66 @@ mod tests {
     #[test]
     fn enumerate_excludes_wal_and_non_dates() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("2026-01-01")).unwrap();
-        std::fs::create_dir(tmp.path().join("wal")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-01-01")).unwrap();
+        // Reserved dirs and non-env top-level entries are skipped entirely.
+        std::fs::create_dir_all(tmp.path().join("wal/2026-01-01")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("scheduled/2026-01-01")).unwrap();
         std::fs::create_dir(tmp.path().join("not-a-date")).unwrap();
+        // A legacy top-level date dir is not an env dir — skipped.
+        std::fs::create_dir(tmp.path().join("2026-01-02")).unwrap();
         // Also create a regular file — should be skipped.
         std::fs::write(tmp.path().join("stray.txt"), b"hi").unwrap();
 
         let dirs = enumerate_date_dirs(tmp.path(), "2099-01-01").unwrap();
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].0, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        assert!(dirs[0].1.starts_with(tmp.path().join("prod")));
+    }
+
+    #[test]
+    fn enumerate_merges_candidates_across_envs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-01-20")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("lab/2026-01-10")).unwrap();
+
+        let dirs = enumerate_date_dirs(tmp.path(), "2099-01-01").unwrap();
+        assert_eq!(dirs.len(), 2);
+        // Oldest first regardless of env.
+        assert!(dirs[0].1.starts_with(tmp.path().join("lab")));
+        assert!(dirs[1].1.starts_with(tmp.path().join("prod")));
+    }
+
+    #[test]
+    fn age_based_removes_one_envs_date_without_touching_others() {
+        let today = chrono::Utc::now().date_naive();
+        let old_date = (today - chrono::Duration::days(200))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lab_old = tmp.path().join("lab").join(&old_date);
+        let prod_old = tmp.path().join("prod").join(&old_date);
+        std::fs::create_dir_all(&lab_old).unwrap();
+        std::fs::write(lab_old.join("svc.parquet"), b"lab data").unwrap();
+        std::fs::create_dir_all(&prod_old).unwrap();
+        std::fs::write(prod_old.join("svc.parquet"), b"prod data").unwrap();
+
+        // Both envs' old dates age out independently; deleting one is an
+        // O(1) directory remove that never touches the sibling env root.
+        let config = make_config(90, 0);
+        retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
+
+        assert!(!lab_old.exists());
+        assert!(!prod_old.exists());
+        assert!(tmp.path().join("lab").exists(), "env root survives");
+        assert!(tmp.path().join("prod").exists(), "env root survives");
     }
 
     #[test]
     fn enumerate_excludes_today() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("2026-02-13")).unwrap();
-        std::fs::create_dir(tmp.path().join("2026-02-12")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-02-13")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-02-12")).unwrap();
 
         let dirs = enumerate_date_dirs(tmp.path(), "2026-02-13").unwrap();
         assert_eq!(dirs.len(), 1);
@@ -318,9 +383,9 @@ mod tests {
     #[test]
     fn enumerate_sorts_oldest_first() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("2026-03-01")).unwrap();
-        std::fs::create_dir(tmp.path().join("2026-01-15")).unwrap();
-        std::fs::create_dir(tmp.path().join("2026-02-20")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-03-01")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-01-15")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-02-20")).unwrap();
 
         let dirs = enumerate_date_dirs(tmp.path(), "2099-01-01").unwrap();
         let dates: Vec<_> = dirs.iter().map(|(d, _)| *d).collect();
@@ -341,11 +406,17 @@ mod tests {
         let recent_date = today - chrono::Duration::days(30);
 
         let tmp = tempfile::tempdir().unwrap();
-        let old_dir = tmp.path().join(old_date.format("%Y-%m-%d").to_string());
-        let recent_dir = tmp.path().join(recent_date.format("%Y-%m-%d").to_string());
-        std::fs::create_dir(&old_dir).unwrap();
+        let old_dir = tmp
+            .path()
+            .join("prod")
+            .join(old_date.format("%Y-%m-%d").to_string());
+        let recent_dir = tmp
+            .path()
+            .join("prod")
+            .join(recent_date.format("%Y-%m-%d").to_string());
+        std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::write(old_dir.join("test.parquet"), b"old data").unwrap();
-        std::fs::create_dir(&recent_dir).unwrap();
+        std::fs::create_dir_all(&recent_dir).unwrap();
         std::fs::write(recent_dir.join("test.parquet"), b"recent data").unwrap();
 
         let config = make_config(90, 0);
@@ -358,8 +429,8 @@ mod tests {
     #[test]
     fn age_based_preserves_when_disabled() {
         let tmp = tempfile::tempdir().unwrap();
-        let old_dir = tmp.path().join("2020-01-01");
-        std::fs::create_dir(&old_dir).unwrap();
+        let old_dir = tmp.path().join("prod/2020-01-01");
+        std::fs::create_dir_all(&old_dir).unwrap();
 
         let config = make_config(0, 0);
         retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
@@ -370,11 +441,11 @@ mod tests {
     #[test]
     fn disk_pressure_deletes_oldest_first() {
         let tmp = tempfile::tempdir().unwrap();
-        let oldest = tmp.path().join("2026-01-01");
-        let middle = tmp.path().join("2026-01-15");
-        let newest = tmp.path().join("2026-02-01");
+        let oldest = tmp.path().join("prod/2026-01-01");
+        let middle = tmp.path().join("prod/2026-01-15");
+        let newest = tmp.path().join("prod/2026-02-01");
         for dir in [&oldest, &middle, &newest] {
-            std::fs::create_dir(dir).unwrap();
+            std::fs::create_dir_all(dir).unwrap();
             std::fs::write(dir.join("data.parquet"), b"some data").unwrap();
         }
 
@@ -400,8 +471,8 @@ mod tests {
     #[test]
     fn both_disabled_deletes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("2020-01-01");
-        std::fs::create_dir(&dir).unwrap();
+        let dir = tmp.path().join("prod/2020-01-01");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("data.parquet"), b"old").unwrap();
 
         let config = make_config(0, 0);
@@ -414,8 +485,8 @@ mod tests {
     fn today_never_deleted_by_disk_pressure() {
         let tmp = tempfile::tempdir().unwrap();
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let today_dir = tmp.path().join(&today);
-        std::fs::create_dir(&today_dir).unwrap();
+        let today_dir = tmp.path().join("prod").join(&today);
+        std::fs::create_dir_all(&today_dir).unwrap();
         std::fs::write(today_dir.join("data.parquet"), b"today").unwrap();
 
         // Disk pressure with only today's dir — should warn but not delete.
@@ -428,10 +499,10 @@ mod tests {
     #[test]
     fn partial_failure_continues() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir_a = tmp.path().join("2020-01-01");
-        let dir_b = tmp.path().join("2020-06-01");
-        std::fs::create_dir(&dir_a).unwrap();
-        std::fs::create_dir(&dir_b).unwrap();
+        let dir_a = tmp.path().join("prod/2020-01-01");
+        let dir_b = tmp.path().join("prod/2020-06-01");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
         std::fs::write(dir_b.join("data.parquet"), b"data").unwrap();
 
         // Make dir_a undeletable by removing it before the tick (simulates

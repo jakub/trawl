@@ -235,8 +235,6 @@ pub async fn ingest(
 /// reported as per-event errors — successful groups are durable. Failed
 /// groups are removed from `parsed.batches` so they are never published.
 ///
-/// The per-env WAL directory layout lands with the storage cutover; until
-/// then the env travels in the event rows.
 fn write_wal_batches(
     wal_writer: &crate::ingest::wal::WalWriter,
     parsed: &mut ParsedEvents,
@@ -246,7 +244,7 @@ fn write_wal_batches(
 
     for (key, batch) in &parsed.batches {
         let (env, svc) = key;
-        match wal_writer.write(svc, &batch.ndjson) {
+        match wal_writer.write(env, svc, &batch.ndjson) {
             Ok(path) => wal_paths.push((key.clone(), path)),
             Err(e) => {
                 tracing::warn!(
@@ -358,7 +356,7 @@ fn finalize_ingest(
     if let Some(pipeline) = &state.ingest.pipeline {
         for (key, wal_path) in wal_paths {
             if let Some(batch) = parsed.batches.swap_remove(key) {
-                pipeline.publish(&key.1, batch, wal_path);
+                pipeline.publish(&key.0, &key.1, batch, wal_path);
             }
         }
     }

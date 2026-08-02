@@ -120,7 +120,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Activate internal telemetry by injecting the WAL writer.
     if let Some((handle, layer)) = &telemetry {
         if let Some(writer) = &state.ingest.wal_writer {
-            handle.set(Arc::clone(writer));
+            handle.set(Arc::clone(writer), &config.ingest.default_env);
         }
         // Activate event bus for real-time telemetry fanout (SSE streaming).
         if let Some(bus) = &state.ingest.event_bus {

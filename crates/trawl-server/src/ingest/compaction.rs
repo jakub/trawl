@@ -112,16 +112,26 @@ pub async fn compact_once(
     memory_limit: &str,
 ) -> Result<u64, String> {
     // Remove orphaned .parquet.tmp files from interrupted compaction runs.
-    cleanup_stale_tmp_files(data_dir, min_age * 2);
-
-    let files = scan_wal_files(wal_dir, min_age).map_err(|e| format!("scan failed: {e}"))?;
+    for (_env, env_data_dir) in list_env_dirs(data_dir) {
+        cleanup_stale_tmp_files(&env_data_dir, min_age * 2);
+    }
 
     // Tally of corrupt WAL files quarantined this cycle. Folded into the
     // return value so it lands on `CompactionStats.total_errors` as a
     // data-loss signal, mirroring the rollup quarantine count.
     let mut wal_quarantined: u64 = 0;
 
-    if !files.is_empty() {
+    // Env is the outermost storage dimension (ADR-0009): WAL lives in
+    // `wal_dir/{env}/` and parquet in `data_dir/{env}/{date}/{HH}/`.
+    // The per-env inner algorithm is unchanged.
+    for (env, env_wal_dir) in list_env_dirs(wal_dir) {
+        let env_data_dir = data_dir.join(&env);
+        let files =
+            scan_wal_files(&env_wal_dir, min_age).map_err(|e| format!("scan failed: {e}"))?;
+
+        if files.is_empty() {
+            continue;
+        }
         // Group WAL files by service prefix.
         let groups = group_by_service(files);
 
@@ -156,13 +166,17 @@ pub async fn compact_once(
 
                 // Events remain visible in the hot buffer until drain. Brief
                 // duplicates (events in both parquet and hot snapshot) are
-                // acceptable — invisible events are not.
-                let batch_ids: Vec<&str> = chunk
+                // acceptable — invisible events are not. Batch ids are
+                // `{env}/{stem}` so two envs can never collide on a drain
+                // key (the publisher uses the same shape).
+                let batch_ids: Vec<String> = chunk
                     .iter()
-                    .filter_map(|f| f.file_stem()?.to_str())
+                    .filter_map(|f| Some(format!("{env}/{}", f.file_stem()?.to_str()?)))
                     .collect();
+                let batch_ids: Vec<&str> = batch_ids.iter().map(String::as_str).collect();
 
-                let outcome = compact_service_batch(chunk, data_dir, service, memory_limit).await;
+                let outcome =
+                    compact_service_batch(chunk, &env_data_dir, service, memory_limit).await;
 
                 // Fold the quarantine count UNCONDITIONALLY — quarantining
                 // renames the corrupt file to `.corrupt`, so a retry can't
@@ -239,6 +253,16 @@ pub async fn compact_once(
 /// `{hour}/{service}.parquet` files, merges them (sorted by timestamp)
 /// into `{date}/{service}.parquet`, then removes the hourly sources.
 async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String> {
+    let mut total: u64 = 0;
+    for (_env, env_data_dir) in list_env_dirs(data_dir) {
+        total += rollup_env_once(&env_data_dir, memory_limit).await?;
+    }
+    Ok(total)
+}
+
+/// Roll up one env root (`data_dir/{env}`): consolidate each historical
+/// date's hourly files into per-service daily files. Never crosses envs.
+async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut failures: u64 = 0;
     let mut quarantined_total: u64 = 0;
@@ -779,7 +803,7 @@ fn rollup_day_inner(
     }
 
     // Path provenance: service is sanitized to [A-Za-z0-9_-] at ingest
-    // (wal.rs sanitize_service_for_filename) and data_dir is operator-trusted,
+    // (ingest service charset validation) and data_dir is operator-trusted,
     // so direct interpolation cannot inject. No quote-escaping needed.
     let file_list_sql = all_files
         .iter()
@@ -920,7 +944,7 @@ fn rollup_with_casts(
 
     // Build one casting SELECT per file and union them by name.
     // Path provenance: service is sanitized to [A-Za-z0-9_-] at ingest
-    // (wal.rs sanitize_service_for_filename) and data_dir is operator-trusted,
+    // (ingest service charset validation) and data_dir is operator-trusted,
     // so direct interpolation cannot inject. No quote-escaping needed.
     let union_sql = files
         .iter()
@@ -1632,6 +1656,34 @@ fn compact_service_blocking(
     let mut quarantined: u64 = 0;
     compact_service_inner(wal_files, data_dir, service, memory_limit, &mut quarantined)
         .map(|()| quarantined)
+}
+
+/// Enumerate env directories under a root: immediate subdirectories whose
+/// name passes the env charset and is not reserved. Anything else
+/// (`scheduled/`, a stray file, a legacy date dir) is skipped — env names
+/// were validated at ingest, so the directory name IS the env value.
+fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?.to_owned();
+            if !trawl_config::is_valid_env_name(&name)
+                || trawl_config::RESERVED_ENV_NAMES.contains(&name.as_str())
+            {
+                return None;
+            }
+            Some((name, path))
+        })
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 /// Remove stale `.parquet.tmp` files left by interrupted compaction or
@@ -2492,7 +2544,7 @@ mod tests {
         let r1 = format!(
             r#"{{"_time":"{yesterday}T01:00:00Z","_ingested":"{yesterday}T01:00:00Z","service":"nginx","msg":"a"}}"#
         );
-        write_hourly_parquet(&data_dir, &yesterday, "01", "nginx", &[&r1]);
+        write_hourly_parquet(&data_dir.join("prod"), &yesterday, "01", "nginx", &[&r1]);
 
         // WAL dir is empty — compact_once should still run rollup.
         compact_once(
@@ -2507,8 +2559,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Day-level file should exist from rollup.
-        let daily = data_dir.join(&yesterday).join("nginx.parquet");
+        // Day-level file should exist from rollup (under the env root).
+        let daily = data_dir.join("prod").join(&yesterday).join("nginx.parquet");
         assert!(
             daily.exists(),
             "rollup should run even when WAL dir is empty"
@@ -3043,7 +3095,7 @@ mod tests {
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
-        let bad_dir = data_dir.join(&yesterday).join("00");
+        let bad_dir = data_dir.join("prod").join(&yesterday).join("00");
         std::fs::create_dir_all(&bad_dir).unwrap();
         std::fs::write(bad_dir.join("svc.parquet"), b"").unwrap(); // zero-byte
 
@@ -3065,7 +3117,13 @@ mod tests {
             "quarantine data-loss should flow out as a rollup failure/data-loss tally, got {errors}"
         );
         // No daily file from the all-corrupt input.
-        assert!(!data_dir.join(&yesterday).join("svc.parquet").exists());
+        assert!(
+            !data_dir
+                .join("prod")
+                .join(&yesterday)
+                .join("svc.parquet")
+                .exists()
+        );
     }
 
     #[test]
@@ -3479,6 +3537,88 @@ mod tests {
         );
     }
 
+    /// The two path dimensions (ADR-0009): compaction writes
+    /// `data/{env}/{date}/{HH}/{service}.parquet`, never merges across
+    /// envs, and carries service names verbatim so `api.v2` and `api_v2`
+    /// land in distinct files.
+    #[tokio::test]
+    async fn compact_once_partitions_by_env_and_verbatim_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+
+        let row = |env: &str, msg: &str| {
+            format!(
+                r#"{{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","env":"{env}","service":"svc","message":"{msg}"}}"#
+            )
+        };
+        std::fs::create_dir_all(wal_dir.join("prod")).unwrap();
+        std::fs::create_dir_all(wal_dir.join("lab")).unwrap();
+        std::fs::write(
+            wal_dir.join("prod").join("svc_1730000000000_aaaa.ndjson"),
+            row("prod", "prod-row"),
+        )
+        .unwrap();
+        std::fs::write(
+            wal_dir.join("lab").join("svc_1730000000000_bbbb.ndjson"),
+            row("lab", "lab-row"),
+        )
+        .unwrap();
+        // Dotted vs underscored service in the same env: distinct files.
+        std::fs::write(
+            wal_dir.join("prod").join("api.v2_1730000000000_cccc.ndjson"),
+            r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","env":"prod","service":"api.v2","message":"dotted"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            wal_dir.join("prod").join("api_v2_1730000000000_dddd.ndjson"),
+            r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","env":"prod","service":"api_v2","message":"underscored"}"#,
+        )
+        .unwrap();
+
+        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")
+            .await
+            .expect("compaction tick must succeed");
+        assert_eq!(errors, 0);
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let hour = chrono::Utc::now().format("%H").to_string();
+        let prod_svc = data_dir
+            .join("prod")
+            .join(&today)
+            .join(&hour)
+            .join("svc.parquet");
+        let lab_svc = data_dir
+            .join("lab")
+            .join(&today)
+            .join(&hour)
+            .join("svc.parquet");
+        assert!(prod_svc.exists(), "expected {}", prod_svc.display());
+        assert!(lab_svc.exists(), "expected {}", lab_svc.display());
+        assert_eq!(
+            read_strings(&prod_svc, "message"),
+            vec!["prod-row".to_owned()],
+            "prod parquet must not absorb the lab env's rows"
+        );
+        assert_eq!(
+            read_strings(&lab_svc, "message"),
+            vec!["lab-row".to_owned()],
+            "lab parquet must not absorb the prod env's rows"
+        );
+
+        let hour_dir = data_dir.join("prod").join(&today).join(&hour);
+        assert!(hour_dir.join("api.v2.parquet").exists(), "dotted file");
+        assert!(hour_dir.join("api_v2.parquet").exists(), "underscored file");
+        assert_eq!(
+            read_strings(&hour_dir.join("api.v2.parquet"), "message"),
+            vec!["dotted".to_owned()]
+        );
+        assert_eq!(
+            read_strings(&hour_dir.join("api_v2.parquet"), "message"),
+            vec!["underscored".to_owned()]
+        );
+    }
+
     /// One bad event does not affect its batch-mates: 1 bad + 2 good in one
     /// WAL file all land, the WAL directory drains, and `compact_once`
     /// reports zero errors — no poison pill.
@@ -3494,7 +3634,8 @@ mod tests {
         let bad =
             r#"{"_time":"not-a-date","_ingested":"not-a-date","service":"nginx","message":"bad"}"#;
         let good2 = r#"{"_time":"2026-01-01T00:00:02Z","_ingested":"2026-01-01T00:00:02Z","service":"nginx","message":"good2"}"#;
-        let wal = wal_dir.join("nginx_1730000000000_abcd.ndjson");
+        std::fs::create_dir_all(wal_dir.join("prod")).unwrap();
+        let wal = wal_dir.join("prod").join("nginx_1730000000000_abcd.ndjson");
         std::fs::write(&wal, [good1, bad, good2].join("\n")).unwrap();
 
         let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")
@@ -3572,7 +3713,8 @@ mod tests {
         // the file's OWN name — never to the client-controlled value.
         let poison = r#"{"_time":"not-a-date","_ingested":"not-a-date","service":"nginx","message":"poison","_trawl_wal_file":"/etc/passwd","request_id":"deadbeef"}"#;
         let innocent = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","message":"innocent","trace_id":"t1"}"#;
-        let wal = wal_dir.join("nginx_1730000000000_abcd.ndjson");
+        std::fs::create_dir_all(wal_dir.join("prod")).unwrap();
+        let wal = wal_dir.join("prod").join("nginx_1730000000000_abcd.ndjson");
         std::fs::write(&wal, [poison, innocent].join("\n")).unwrap();
 
         let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")

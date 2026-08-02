@@ -117,7 +117,7 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
     assert_eq!(errors, 0, "no compaction errors for repaired timestamps");
     assert_eq!(hot_buffer.event_count(), 0, "hot buffer drained");
 
-    let leftover: Vec<_> = std::fs::read_dir(&wal_dir)
+    let leftover: Vec<_> = std::fs::read_dir(wal_dir.join("prod"))
         .unwrap()
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "ndjson"))

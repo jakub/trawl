@@ -214,7 +214,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wal = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
         wal.ensure_dir().unwrap();
-        let pipeline = Arc::new(PipelineWriter::new(wal, None, None));
+        let pipeline = Arc::new(PipelineWriter::new(wal, None, None, "prod".into()));
 
         let config = SyslogConfig {
             batch_interval_ms,
@@ -258,7 +258,7 @@ mod tests {
         handle.await.unwrap();
 
         // Verify WAL file was created
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -287,7 +287,7 @@ mod tests {
         let _ = shutdown_tx.send(true);
         handle.await.unwrap();
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -319,7 +319,7 @@ mod tests {
         let _ = shutdown_tx.send(true);
         handle.await.unwrap();
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -352,7 +352,7 @@ mod tests {
         handle.await.unwrap();
 
         // Should have separate WAL files for each service
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))

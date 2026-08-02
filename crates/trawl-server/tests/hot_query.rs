@@ -75,10 +75,12 @@ async fn hot_buffer_makes_events_immediately_queryable() {
     let wal_writer = WalWriter::new(wal_dir.clone());
     wal_writer.ensure_dir().unwrap();
     let ndjson = events_to_ndjson(&events);
-    let wal_path = wal_writer.write("nginx", &ndjson).unwrap();
+    let wal_path = wal_writer.write("prod", "nginx", &ndjson).unwrap();
 
     // Insert directly into hot buffer (simulating what the ingest handler does).
-    let batch_id: Arc<str> = wal_path.file_stem().unwrap().to_str().unwrap().into();
+    // `{env}/{stem}` — must match what compaction derives from the env dir.
+    let batch_id: Arc<str> =
+        format!("prod/{}", wal_path.file_stem().unwrap().to_str().unwrap()).into();
     let ndjson_bytes = ndjson.len();
     let batch = Arc::new(IngestBatch {
         batch_id,
@@ -188,10 +190,10 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     let wal_writer = WalWriter::new(wal_dir.clone());
     wal_writer.ensure_dir().unwrap();
     let ndjson1 = events_to_ndjson(&batch1_events);
-    let wal1 = wal_writer.write("nginx", &ndjson1).unwrap();
+    let wal1 = wal_writer.write("prod", "nginx", &ndjson1).unwrap();
 
     let batch1 = Arc::new(IngestBatch {
-        batch_id: wal1.file_stem().unwrap().to_str().unwrap().into(),
+        batch_id: format!("prod/{}", wal1.file_stem().unwrap().to_str().unwrap()).into(),
         service: "nginx".into(),
         byte_size: ndjson1.len(),
         events: batch1_events,
@@ -215,7 +217,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
 
     let batch2_events = vec![make_event("nginx", "batch two gamma")];
     let ndjson2 = events_to_ndjson(&batch2_events);
-    let _wal2 = wal_writer.write("nginx", &ndjson2).unwrap();
+    let _wal2 = wal_writer.write("prod", "nginx", &ndjson2).unwrap();
 
     let batch2 = Arc::new(IngestBatch {
         batch_id: "batch2_manual".into(),
@@ -263,7 +265,7 @@ async fn query_works_without_hot_buffer() {
     let wal_writer = WalWriter::new(wal_dir.clone());
     wal_writer.ensure_dir().unwrap();
     let ndjson = events_to_ndjson(&events);
-    let _wal = wal_writer.write("nginx", &ndjson).unwrap();
+    let _wal = wal_writer.write("prod", "nginx", &ndjson).unwrap();
 
     trawl_server::ingest::compaction::compact_once(
         &wal_dir,

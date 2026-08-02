@@ -55,7 +55,7 @@ use crate::ingest::wal::WalWriter;
 /// Cloned into the [`WalLayer`] and retained by `main()`. Once the WAL
 /// writer is ready, [`set`](Self::set) activates event capture.
 #[derive(Debug, Clone)]
-pub struct WalHandle(Arc<OnceLock<Arc<WalWriter>>>);
+pub struct WalHandle(Arc<OnceLock<(Arc<WalWriter>, Arc<str>)>>);
 
 impl Default for WalHandle {
     fn default() -> Self {
@@ -69,14 +69,15 @@ impl WalHandle {
         Self(Arc::new(OnceLock::new()))
     }
 
-    /// Inject the WAL writer. Called once after config is loaded.
-    /// Subsequent calls are silently ignored (first write wins).
-    pub fn set(&self, writer: Arc<WalWriter>) {
-        let _ = self.0.set(writer);
+    /// Inject the WAL writer and the env telemetry events land under
+    /// (`default_env`). Called once after config is loaded. Subsequent
+    /// calls are silently ignored (first write wins).
+    pub fn set(&self, writer: Arc<WalWriter>, env: &str) {
+        let _ = self.0.set((writer, env.into()));
     }
 
-    /// Get the writer, if available.
-    fn get(&self) -> Option<&Arc<WalWriter>> {
+    /// Get the writer and env, if available.
+    fn get(&self) -> Option<&(Arc<WalWriter>, Arc<str>)> {
         self.0.get()
     }
 }
@@ -160,7 +161,7 @@ impl WalLayer {
 impl WalLayerInner {
     /// Swap out the buffer and write its contents to the WAL.
     fn flush(&self) {
-        let Some(writer) = self.handle.get() else {
+        let Some((writer, env)) = self.handle.get() else {
             return;
         };
 
@@ -176,7 +177,7 @@ impl WalLayerInner {
         // the byte buffer and must stay in sync.
         let maps = std::mem::take(&mut *self.event_maps.lock());
 
-        match writer.write("trawld", &data) {
+        match writer.write(env, "trawld", &data) {
             Err(e) => {
                 // MUST NOT use tracing here — infinite recursion.
                 eprintln!("[trawl-telemetry] WAL write failed: {e}");
@@ -189,11 +190,14 @@ impl WalLayerInner {
                 // batch_id MUST match the WAL filename stem so compaction
                 // can drain the hot buffer after writing parquet.
                 use crate::bus::{EventBus, IngestBatch};
-                let batch_id: Arc<str> = wal_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("trawld_unknown")
-                    .into();
+                let batch_id: Arc<str> = format!(
+                    "{env}/{}",
+                    wal_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("trawld_unknown")
+                )
+                .into();
                 let batch = Arc::new(IngestBatch {
                     batch_id,
                     service: "trawld".into(),
@@ -497,7 +501,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         assert!(handle.get().is_some());
     }
@@ -525,13 +529,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
         writer.ensure_dir().unwrap();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         layer_ref.flush();
         assert!(layer_ref.inner.buffer.lock().is_empty());
 
         // Verify the bootstrap event reached the WAL.
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -551,7 +555,7 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         let layer = WalLayer::new(handle);
         let layer_ref = layer.clone();
@@ -570,7 +574,7 @@ mod tests {
 
         layer_ref.flush();
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -593,7 +597,7 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         let layer = WalLayer::new(handle);
         let layer_ref = layer.clone();
@@ -616,7 +620,7 @@ mod tests {
         assert!(layer_ref.inner.buffer.lock().is_empty());
 
         // Verify WAL file was written.
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -645,7 +649,7 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         let layer = WalLayer::new(handle);
         let layer_ref = layer.clone();
@@ -668,7 +672,7 @@ mod tests {
 
         layer_ref.flush();
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -694,7 +698,7 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         let layer = WalLayer::new(handle);
         let layer_ref = layer.clone();
@@ -707,7 +711,7 @@ mod tests {
 
         layer_ref.flush();
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -730,7 +734,7 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         let bus = Arc::new(LocalEventBus::new(16));
         let mut sub = bus.subscribe();
@@ -758,8 +762,8 @@ mod tests {
         assert_eq!(batch.events[0]["user"], "alice");
         assert!(batch.byte_size > 0);
         assert!(
-            batch.batch_id.starts_with("trawld_"),
-            "batch_id should use WAL filename stem: {}",
+            batch.batch_id.starts_with("prod/trawld_"),
+            "batch_id is {{env}}/{{stem}}: {}",
             batch.batch_id
         );
     }
