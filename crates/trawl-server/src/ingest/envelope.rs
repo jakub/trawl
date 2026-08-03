@@ -484,6 +484,25 @@ fn resolve_severity(out: &mut Map<String, Value>) -> bool {
     unmapped
 }
 
+/// Stringify top-level object/array values to their JSON text (ADR-0009
+/// slice 2): with nothing left to flatten, a `read_json` "Duplicate name"
+/// collision is structurally impossible, so compaction never has to choose
+/// between draining a batch and keeping its columns.
+///
+/// Runs AFTER the `_raw` capture (the nesting stays findable there) and
+/// AFTER the reserved-key strip (a forged object `_raw` must strip as
+/// meta, not be laundered into a string). This is a canonicalization like
+/// RFC 3339 time reformatting, NOT a repair — a code firing on every k8s
+/// event would destroy `_repairs`'s NULL-dominance. Reach nested values
+/// with `json_extract_string(k8s, '$.pod')`.
+fn stringify_nested_values(out: &mut Map<String, Value>) {
+    for value in out.values_mut() {
+        if value.is_object() || value.is_array() {
+            *value = Value::String(value.to_string());
+        }
+    }
+}
+
 /// Canonicalize one parsed event object into the declared envelope.
 ///
 /// Field order of operations is load-bearing:
@@ -558,6 +577,9 @@ pub fn canonicalize(
     // Compaction's synthetic provenance column: trawl's key, not the
     // client's — silently dropped (a row carrying it wedges read_json).
     out.remove(compaction::WAL_FILE_COL);
+
+    // 3.5. Nested values become JSON text (see [`stringify_nested_values`]).
+    stringify_nested_values(&mut out);
 
     // 4. `_time` from the first present wire alias; all aliases consumed.
     let time_input = trawl_core::schema::TIME_ALIASES
@@ -723,6 +745,102 @@ mod tests {
         let c = canon(r#"{"service":"s","env":"prod","_time":"2025-12-31T23:00:00Z"}"#);
         assert_eq!(c.obj["host"], "10.0.4.55");
         assert!(codes(&c).contains(&"host.from_peer"));
+    }
+
+    // --- nested-value stringification (ADR-0009 slice 2) ---
+
+    #[test]
+    fn object_values_are_stringified_to_json_text() {
+        // Killing the duplicate-name class structurally: with nothing to
+        // flatten, `read_json` can never raise a "Duplicate name" collision
+        // and the explicit-columns fallback is deleted rather than fixed.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z",
+                "k8s":{"pod":"x","ns":"default"}}"#,
+        );
+        let k8s = c.obj["k8s"]
+            .as_str()
+            .expect("object value becomes a string");
+        let parsed: Value = serde_json::from_str(k8s).expect("the string is JSON text");
+        assert_eq!(parsed["pod"], "x");
+        assert_eq!(parsed["ns"], "default");
+    }
+
+    #[test]
+    fn array_values_are_stringified_to_json_text() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","tags":["a","b"]}"#,
+        );
+        let tags = c.obj["tags"]
+            .as_str()
+            .expect("array value becomes a string");
+        assert_eq!(
+            serde_json::from_str::<Value>(tags).unwrap(),
+            serde_json::json!(["a", "b"])
+        );
+    }
+
+    #[test]
+    fn stringification_is_canonicalization_not_a_repair() {
+        // NO RepairCode: this is a canonicalization like RFC 3339
+        // reformatting — a code firing on every k8s event would destroy the
+        // NULL-dominance of `_repairs`.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","k8s":{"pod":"x"}}"#,
+        );
+        assert!(
+            c.repairs.is_empty(),
+            "no repair for stringification: {:?}",
+            c.repairs
+        );
+        assert!(!c.obj.contains_key("_repairs"));
+    }
+
+    #[test]
+    fn stringification_leaves_scalars_untouched() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z",
+                "count":42,"ratio":1.5,"ok":true,"note":"plain"}"#,
+        );
+        assert_eq!(c.obj["count"], 42);
+        assert_eq!(c.obj["ratio"], 1.5);
+        assert_eq!(c.obj["ok"], true);
+        assert_eq!(c.obj["note"], "plain");
+    }
+
+    #[test]
+    fn raw_preserves_the_original_nesting() {
+        // `_raw` is captured BEFORE stringification, so the original
+        // structure stays findable there.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","k8s":{"pod":"x"}}"#,
+        );
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(
+            raw.contains(r#""k8s":{"pod":"x"}"#),
+            "_raw must hold the pre-stringification nesting: {raw}"
+        );
+    }
+
+    #[test]
+    fn non_string_raw_is_still_stripped_before_stringification() {
+        // A client object `_raw` must strip with meta.stripped — the
+        // stringify pass must not first turn it into an honourable string.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","_raw":{"forged":true}}"#,
+        );
+        assert!(codes(&c).contains(&"meta.stripped"));
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(
+            raw.contains("forged"),
+            "server-filled _raw is the pre-repair serialization: {raw}"
+        );
     }
 
     #[test]
