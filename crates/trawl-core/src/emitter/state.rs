@@ -212,6 +212,59 @@ fn conform_untyped(quoted: &str, pin: crate::schema::CanonicalType) -> String {
     }
 }
 
+/// Fold catalog pins onto the quoted identifiers they actually name,
+/// yielding at most one `REPLACE` entry per hot column.
+///
+/// Catalog field names are case-SENSITIVE (a postgres TEXT primary key, fed
+/// straight from client JSON keys, never case-normalised at ingest) while
+/// `DuckDB` identifiers are case-INSENSITIVE. So `Status` from one service
+/// and `status` from another are two pins naming ONE hot column, and a
+/// `REPLACE` list carrying both is `Parser Error: Duplicate entry "status"`
+/// — which, with any cold parquet present, fails EVERY query and SSE poll
+/// for as long as such events sit in the buffer. The same collision reaches
+/// here through [`super::fields::quote_field`]'s alias mapping, so the fold
+/// keys on the mapped, quoted name rather than the catalog's.
+///
+/// `DuckDB`'s identifier comparison is ASCII-only (`café` and `CAFÉ` stay
+/// distinct columns — probed in `trawl-engine/tests/duckdb_probe.rs`), so
+/// the fold uses ASCII case only and collapses exactly what `DuckDB` would.
+///
+/// Colliding pins that agree on a type keep it; pins that disagree degrade
+/// to `VARCHAR`, the lossless conform ([`conform_untyped`] stringifies every
+/// inference class) — picking either typed pin instead would `TRY_CAST` the
+/// other variant's values to NULL. Pins colliding with a `TIMESTAMP_COLUMNS`
+/// entry drop out entirely: those already carry an unconditional `TRY_CAST`.
+///
+/// Returned in identifier order, so the emitted SQL stays deterministic.
+fn fold_case_variants(
+    pins: &crate::schema::FieldTypes,
+) -> Vec<(String, crate::schema::CanonicalType)> {
+    use std::collections::BTreeMap;
+
+    let timestamps: Vec<String> = crate::schema::TIMESTAMP_COLUMNS
+        .iter()
+        .map(|col| super::fields::quote_field(col).to_ascii_uppercase())
+        .collect();
+
+    let mut folded: BTreeMap<String, (String, crate::schema::CanonicalType)> = BTreeMap::new();
+    for (field, ty) in pins.iter() {
+        let quoted = super::fields::quote_field(field);
+        let key = quoted.to_ascii_uppercase();
+        if timestamps.contains(&key) {
+            continue;
+        }
+        folded
+            .entry(key)
+            .and_modify(|slot| {
+                if slot.1 != ty {
+                    slot.1 = crate::schema::CanonicalType::Varchar;
+                }
+            })
+            .or_insert((quoted, ty));
+    }
+    folded.into_values().collect()
+}
+
 /// Public accessor for the parquet/list source reader expression, so the
 /// engine can `DESCRIBE` the same cold source the emitter reads from.
 pub fn source_reader(source: &str) -> Result<String, super::EmitError> {
@@ -244,6 +297,10 @@ impl EmitterState {
     ///   that disagrees with the write-time pin degrades to NULL instead of
     ///   throwing the union.
     ///
+    /// Pins are folded onto the identifiers they actually name first — see
+    /// [`fold_case_variants`], without which two case-variant pins are a
+    /// hard parse error on every query.
+    ///
     /// The cold branch is deliberately plain: parquet is write-time
     /// conformant (ADR-0009 slice 2), and a defensive cold cast would mask
     /// a real invariant breach.
@@ -259,12 +316,8 @@ impl EmitterState {
         for col in crate::schema::TIMESTAMP_COLUMNS {
             parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
         }
-        for (field, ty) in pins.iter() {
-            if crate::schema::TIMESTAMP_COLUMNS.contains(&field) {
-                continue;
-            }
-            let q = super::fields::quote_field(field);
-            parts.push(format!("{} AS {q}", conform_untyped(&q, ty)));
+        for (quoted, ty) in fold_case_variants(pins) {
+            parts.push(format!("{} AS {quoted}", conform_untyped(&quoted, ty)));
         }
         let hot_replace = parts.join(", ");
 

@@ -70,3 +70,49 @@ fn untyped_varchar_conform_expression_is_unquoted_across_inference_classes() {
         "strings must land UNQUOTED (n/a, not \"n/a\") in every class"
     );
 }
+
+/// `DuckDB` identifiers are case-INSENSITIVE, but only over ASCII. Catalog
+/// pins are case-SENSITIVE names taken from client JSON keys, so two pins
+/// can name one hot column — and a `REPLACE` list carrying both is a hard
+/// parse error, not a degraded read. This pins both halves of the fold in
+/// `trawl-core`'s `fold_case_variants`: what must collapse, and what must
+/// NOT (folding `CAFÉ` onto `café` would silently drop a real pin).
+#[test]
+fn replace_list_identifier_folding_is_ascii_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("hot.ndjson");
+    let mut f = std::fs::File::create(&file).unwrap();
+    writeln!(f, r#"{{"status":"ok","café":"a","Ωx":"b"}}"#).unwrap();
+    f.sync_all().unwrap();
+
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let replace = |entries: &str| {
+        conn.prepare(&format!(
+            "SELECT * REPLACE ({entries}) FROM {}",
+            hot_reader(&file)
+        ))
+        .err()
+        .map(|e| e.to_string())
+    };
+
+    // ASCII case-variants are ONE column: naming both is a parse error.
+    let err = replace(r#"to_json("Status") AS "Status", to_json("status") AS "status""#)
+        .expect("two ASCII case-variants must be rejected");
+    assert!(
+        err.contains("Duplicate entry"),
+        "expected a duplicate-entry parse error, got: {err}"
+    );
+    // ...and either spelling alone binds the column.
+    assert_eq!(replace(r#"to_json("STATUS") AS "STATUS""#), None);
+
+    // Non-ASCII case is NOT folded — these stay distinct identifiers, so
+    // the emitter must not fold them either.
+    for (name, variant) in [("café", "CAFÉ"), ("Ωx", "ωx")] {
+        let err = replace(&format!(r#"to_json("{variant}") AS "{variant}""#))
+            .unwrap_or_else(|| panic!("{variant} unexpectedly bound {name}"));
+        assert!(
+            err.contains("not found"),
+            "expected {variant} to be a distinct identifier from {name}, got: {err}"
+        );
+    }
+}
