@@ -50,9 +50,12 @@ fn extract_eq_filter<'a>(
 /// `env=X` pins the outer directory; otherwise every env directory on
 /// disk is searched. `service=X` narrows the file pattern — VERBATIM
 /// (path encoding is injective by validation, so `api.v2` and `api_v2`
-/// are distinct files and pruning is exact). A time filter scopes to the
-/// relevant date/hour directories; without one, date-formatted dirs are
-/// enumerated per env.
+/// are distinct files and pruning is exact), but only when the literal
+/// satisfies the same `is_valid_service_name` predicate ingest enforces:
+/// a value no on-disk file can carry is also a value that must never be
+/// spliced into the glob list, so it falls back to the wildcard pattern.
+/// A time filter scopes to the relevant date/hour directories; without
+/// one, date-formatted dirs are enumerated per env.
 ///
 /// Returns a `DuckDB` list literal like
 /// `['data/prod/2026-08-02/14/*.parquet', ...]` when scoping is
@@ -64,7 +67,12 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
         return fallback_glob.to_owned();
     };
 
-    let service = extract_eq_filter(&ast.search, "service");
+    // The literal is interpolated verbatim into single-quoted glob
+    // entries, so anything outside the ingest-side charset (quotes,
+    // separators, slashes, dots at the front) is rejected here rather
+    // than allowed to close one path and open another.
+    let service = extract_eq_filter(&ast.search, "service")
+        .filter(|s| trawl_config::is_valid_service_name(s));
     let file_pattern = service.map_or_else(|| "*.parquet".to_owned(), |s| format!("{s}.parquet"));
 
     let base = base_dir.trim_end_matches('/');
@@ -692,6 +700,38 @@ mod tests {
             source.contains(&hourly_glob),
             "expected hourly glob, got: {source}"
         );
+    }
+
+    #[test]
+    fn invalid_service_value_cannot_inject_paths() {
+        // A quoted DSL literal can carry `', '` — the list-item separator.
+        // It must never reach the glob list: the pattern falls back to the
+        // wildcard, so no attacker-chosen path is ever emitted.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod").join("2026-01-15")).unwrap();
+        let fallback = format!("{base}/**/*.parquet");
+
+        for dsl in [
+            r#"service="nginx', '/**/*""#,
+            r#"service="nginx', '/etc/shadow""#,
+            "service=../../escaped",
+            "service=.hidden",
+        ] {
+            let source = compute_source(base, dsl, &fallback);
+            assert!(
+                source.contains("*.parquet"),
+                "invalid service must fall back to the wildcard, got: {source}"
+            );
+            assert!(
+                !source.contains("nginx") && !source.contains("hidden"),
+                "invalid service must not reach the glob list, got: {source}"
+            );
+            assert!(
+                !source.contains("/etc/") && !source.contains(".."),
+                "invalid service must not escape the data root, got: {source}"
+            );
+        }
     }
 
     #[test]
