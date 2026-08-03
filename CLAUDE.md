@@ -15,11 +15,11 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 
 ```
 crates/
-  trawl-core/            # DSL parser, AST, SQL emitter (pure, no I/O)
-  trawl-engine/          # DuckDB integration, query execution; owns the hot+cold union fallback ladder (VARCHAR coercion on schema conflict, list-source pruning on partial glob miss) and the no-silent-cold-drop outcome policy shared by the query and parquet-export paths (src/executor.rs, ADR-0008)
-  trawl-api/             # shared wire types (request/response structs)
-  trawl-config/          # shared config.toml types (no I/O)
-  trawl-server/          # daemon (axum, HTTPS via tokio-rustls); owns the postgres app-state store (history/saved/schedule + report runs) in its own `trawl` database — sole-writer via session advisory lock, auto-migrated at boot (src/store/, ADR-0004 slice 3; trawl-auth crate deleted). authz is permission-only (src/policy.rs — no `Role` enum, ADR-0006 slice 1). ingest canonicalizes/substitutes timestamps (src/ingest/handler.rs) and compaction repairs them per-row from WAL-filename provenance (src/ingest/compaction.rs, ADR-0008)
+  trawl-core/            # DSL parser, AST, SQL emitter (pure, no I/O); also owns the envelope column catalog (src/schema.rs) and the OTel severity ladder + syslog inversion (src/severity.rs) shared by the emitter and the in-memory SSE filter (ADR-0009)
+  trawl-engine/          # DuckDB integration, query execution; owns the hot+cold union fallback ladder (VARCHAR coercion on schema conflict, list-source pruning on partial glob miss), the `_raw`-free retry for sources that lack `_raw` (embedded mode over foreign parquet — decided by re-binding, not by error text, ADR-0009) and the no-silent-cold-drop outcome policy shared by the query and parquet-export paths (src/executor.rs, ADR-0008)
+  trawl-api/             # shared wire types (request/response structs); envelope-aware result column ordering (`WELL_KNOWN_LOG_FIELDS` leading, `TRAILING_LOG_FIELDS` demoted — mirrored, not imported, by trawl-core/trawl-cli with parity tests)
+  trawl-config/          # shared config.toml types (no I/O); also the injective path-encoding predicates (`is_valid_env_name`, `is_valid_service_name`, `RESERVED_ENV_NAMES`) every ingest path funnels names through (ADR-0009)
+  trawl-server/          # daemon (axum, HTTPS via tokio-rustls); owns the postgres app-state store (history/saved/schedule + report runs) in its own `trawl` database — sole-writer via session advisory lock, auto-migrated at boot (src/store/, ADR-0004 slice 3; trawl-auth crate deleted). authz is permission-only (src/policy.rs — no `Role` enum, ADR-0006 slice 1). ingest canonicalizes every event into the declared envelope (src/ingest/envelope.rs, ADR-0009), compaction repairs `_time`/`_ingested` per-row from WAL-filename provenance (src/ingest/compaction.rs, ADR-0008) and the boot-time storage-epoch cutover gates the data root (src/epoch.rs, ADR-0009)
   trawl-client/          # typed async HTTP client library
   trawl-cli/             # unified CLI + TUI binary
   trawl-admin/           # admin CLI (TLS cert generation only — key mgmt lives in fleet-admin)
@@ -170,7 +170,7 @@ trawl query -f table "* | head 5 | fields timestamp, host, service, severity, me
 trawl query "last=1h | stats count() by service" | jq '.service'
 
 # export to CSV file
-trawl query -f csv "last=24h | stats count() by service, level" > report.csv
+trawl query -f csv "last=24h | stats count() by service, severity_text" > report.csv
 
 # validate a query without executing
 trawl validate "level=error | stats count() by host"
@@ -245,17 +245,23 @@ status=200,301,404              # IN list (comma-separated)
 status>=400                     # comparison (>, >=, <, <=, !=)
 path=/api/*                     # glob pattern
 message=/error.*/               # regex pattern (slashes required)
-service="Activity Monitor"      # quoted values (for spaces/special chars)
+host="db host"                  # quoted values (for spaces/special chars)
+env=prod                        # environment (prunes the path glob)
 ```
 
 **operators**: `=`, `!=`, `>`, `>=`, `<`, `<=`
 
+**severity (`level` is an alias, not a column)** — `level` compiles to band predicates over the numeric `severity`: `level=error` → `severity BETWEEN 17 AND 20`, `level>=warn` → `severity >= 13`, `level=warn,error` → either band. tokens: `trace`/`t`, `debug`/`d`, `info`/`i`, `notice`, `warn`/`warning`/`w`, `error`/`err`/`e`, `fatal`/`critical`/`crit`/`f`, `alert`, `emerg`/`panic`. anything else — an unknown token, a glob or regex on `level`, or naming `level` anywhere outside a comparison (`table`/`fields`, `stats by`, `sort`, `dedup`, `rename`, `let`) — is a query error; project `severity` (number) or `severity_text` (original text) instead. `where level == "error"` works and matches live tail (SSE) exactly.
+
+**time aliases** — `timestamp` and `@timestamp` both resolve to the physical `_time` column.
+
 **text search**
 ```
-error                           # bare word (substring match)
--debug                          # negated (exclude)
+error                           # bare word (substring match over message OR _raw)
+-debug                          # negated (excluded when either column matches)
 "connection refused"            # exact phrase
 ```
+searching `_raw` is whole-event search: for server-filled `_raw` (the canonical pre-repair JSON) a bare term can match another field's value or a field *name*. confine a match to one column with a field filter (`message=/debug/`).
 
 **time filters**
 ```

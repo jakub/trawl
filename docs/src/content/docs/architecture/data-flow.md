@@ -10,8 +10,9 @@ Vector (gzip JSON batch, 1MB / 5s)
   → POST /api/v1/ingest (rate limit: ingest_rpm per key, body: 16MB max)
     → auth middleware (argon2id, 5-min DashMap cache)
     → spawn_blocking:
-        decompress → parse JSON/ndjson → validate service name
-        → WalWriter::write() (atomic tmp→rename, ndjson)
+        decompress → parse JSON/ndjson → canonicalize into the envelope
+          (capture _raw, resolve env/service/host/_time/severity — ADR-0009)
+        → WalWriter::write() (atomic tmp→rename, ndjson, under wal/{env}/)
     → hot_buffer.insert(Arc<IngestBatch>)
     → bus.publish(Arc<IngestBatch>)
         └→ SSE subscribers (CompiledFilter, aho-corasick SIMD)
@@ -19,13 +20,17 @@ Vector (gzip JSON batch, 1MB / 5s)
 
 ### WAL writer
 
-Each ingest batch produces one WAL file per service. Writes are atomic via tmp-file-then-rename. Filename format: `{service}_{unix_millis}_{4_hex_random}.ndjson`. Service names are validated against `[a-zA-Z0-9\-_.]` to prevent path traversal.
+Each ingest batch produces one WAL file per service, under the batch's env directory: `wal/{env}/{service}_{unix_millis}_{4_hex_random}.ndjson`. Writes are atomic via tmp-file-then-rename. The service name is carried **verbatim** — there is no filename sanitizer. It does not need one: `env` and `service` were validated at ingest (`[a-z0-9_-]{1,32}` and `[A-Za-z0-9._-]`, no dot-leading, ≤128 bytes), so path encoding is injective by validation and `api.v2` and `api_v2` stay distinct files (ADR-0009).
 
-### Timestamp canonicalization
+### Envelope canonicalization
 
-A present `timestamp` is valid iff it is a JSON string that, after trimming surrounding whitespace, parses as RFC 3339, as a date-time carrying an ISO 8601 *basic* offset (`+0530`, `+02` — what Java and Go encoders emit, and what RFC 3339 parsing alone rejects), as an offset-less date-time (read as UTC), or as a bare date (midnight UTC). Date and time may be separated by `T` or a space, the date may be `YYYY-MM-DD` or `YYYY/MM/DD`, and seconds and their fraction are optional (`HH:MM` is accepted). The grammar is deliberately not literal parity with DuckDB's `CAST` — anything outside it is preserved rather than guessed at. Valid values are canonicalized at ingest to RFC 3339 UTC at microsecond precision (DuckDB's native `TIMESTAMP` resolution), so the WAL and hot buffer only ever contain well-formed timestamps.
+Every accepted event is rewritten into the declared envelope — `_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message` (ADR-0009). The canonicalizer captures `_raw` first (the client's string `_raw` verbatim when supplied, else the canonical pre-repair serialization), strips server-owned fields, consumes the `_time`/`timestamp`/`@timestamp` wire aliases, stamps `_ingested`, resolves `env` against the allowlist, fills `host` from the peer where that is honest, and derives the OTel `severity` number. The governing rule: **repair when the server has an honest answer, reject when it would guess.** Repairs are a closed code set recorded per-event in `_repairs` and counted by `trawl_ingest_repairs_total{code, service}`; rejections are per-event and carry a typed reason, so valid siblings in the same batch still land.
 
-Anything else — an unparseable string, a nested object, a bare number — is **substituted, never fatal and never dropped**: `timestamp` is overwritten with the request-arrival time (the same default an absent timestamp gets) and the original value is preserved verbatim in `timestamp_invalid` (truncated to 256 chars). The event still counts as accepted; repairs are visible via the `trawl_ingest_events_repaired_total` counter and an `ingest_repairs` warn with sampled originals. `timestamp_invalid` is a sparse column, absent from the vast majority of parquet files.
+#### Timestamps
+
+A present `_time` is valid iff it is a JSON string that, after trimming surrounding whitespace, parses as RFC 3339, as a date-time carrying an ISO 8601 *basic* offset (`+0530`, `+02` — what Java and Go encoders emit, and what RFC 3339 parsing alone rejects), as an offset-less date-time (read as UTC), or as a bare date (midnight UTC). Date and time may be separated by `T` or a space, the date may be `YYYY-MM-DD` or `YYYY/MM/DD`, and seconds and their fraction are optional (`HH:MM` is accepted). The grammar is deliberately not literal parity with DuckDB's `CAST` — anything outside it is repaired rather than guessed at. Valid values are canonicalized at ingest to RFC 3339 UTC at microsecond precision (DuckDB's native `TIMESTAMP` resolution), so the WAL and hot buffer only ever contain well-formed timestamps.
+
+Anything else — an unparseable string, a nested object, a bare number — is **substituted, never fatal and never dropped**: `_time` is overwritten with the request-arrival time (the same default an absent `_time` gets) and the event is flagged `time.from_ingest`; the value as it arrived remains findable in `_raw`. A value that parses but is implausible (more than 10 years past, more than a day future) is kept as sent and flagged `time.out_of_range` — clock skew is a fact about the sender, not a reason to rewrite its data. The event still counts as accepted in both cases.
 
 ### Hot buffer
 
@@ -62,7 +67,7 @@ The partition key is never hard-CAST in emitted SQL (ADR-0008) — one malformed
 
 ### Daily rollup
 
-Once per day, hourly parquets are merged into a single daily parquet per service, sorted by timestamp. Crash-safe via `.rollup-{service}` marker files.
+Once per day, hourly parquets are merged into a single daily parquet per service, sorted by `_time`. Crash-safe via `.rollup-{service}` marker files.
 
 ### Retention
 
@@ -135,7 +140,7 @@ A pool of N connections (default: `num_cpus`) sharing one in-memory DuckDB datab
 
 ### Hot buffer integration
 
-All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is written to a temp ndjson file and read by DuckDB alongside the parquet files. This ensures freshly ingested events (not yet compacted) are always visible. The union applies `TRY_CAST` to the hot side's `timestamp` — a malformed hot value degrades that one row, never the whole union.
+All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is written to a temp ndjson file and read by DuckDB alongside the parquet files. This ensures freshly ingested events (not yet compacted) are always visible. The union applies `TRY_CAST` to both of the hot side's TIMESTAMP columns (`_time`, `_ingested`) — a malformed hot value degrades that one row, never the whole union.
 
 When the two sides disagree on a column's type, the union is retried with the conflicting columns cast to `VARCHAR` on both sides, preserving hot **and** cold rows. What counts as such a conflict is decided from evidence, not from the error text: DuckDB reports both an irreconcilable schema and an unconvertible value as `Conversion`-class errors, so the retry only fires when describing the two sources actually turns up a column they type differently. A genuine data-conversion error turns up none, is not misread as a schema conflict, and falls through to the policy below.
 
