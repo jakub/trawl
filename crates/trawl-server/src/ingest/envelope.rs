@@ -253,6 +253,39 @@ fn truncate_chars(s: String, max_chars: usize) -> (String, bool) {
     }
 }
 
+/// Maximum length (chars) of a client-supplied value quoted back inside a
+/// reject message. The handler returns one message per rejected event,
+/// uncapped in count, so a message that echoes its input verbatim makes the
+/// response an amplifier of whatever the client sent: every other reject
+/// message on this path is bounded, and this keeps the echoing ones so.
+const MAX_REJECT_ECHO_CHARS: usize = 64;
+
+/// A client value as it may appear in a reject message: bounded, cut on a
+/// char boundary, and marked when cut. Enough to recognize the offending
+/// value without repeating it back wholesale.
+fn echo(value: &str) -> String {
+    let (shown, truncated) = truncate_chars(value.to_owned(), MAX_REJECT_ECHO_CHARS);
+    if truncated {
+        format!("{shown}...")
+    } else {
+        shown
+    }
+}
+
+/// The JSON type of a value, for a "wrong type" reject message. The type
+/// only — `Display` on a `Value` serializes the whole thing, and an object
+/// or array the client chose is unbounded by construction.
+const fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// Validate the `service` value: present, a string, non-empty, within the
 /// length cap, charset-clean, and not a dot-name (`.`, `..`, dot-leading).
 ///
@@ -266,16 +299,8 @@ fn validate_service(obj: &Map<String, Value>) -> Result<String, (String, RejectR
         )
     })?;
     let Some(svc) = v.as_str() else {
-        let type_name = match v {
-            Value::Null => "null",
-            Value::Bool(_) => "a boolean",
-            Value::Number(_) => "a number",
-            Value::Array(_) => "an array",
-            Value::Object(_) => "an object",
-            Value::String(_) => unreachable!("string handled above"),
-        };
         return Err((
-            format!("'service' must be a string, got {type_name}"),
+            format!("'service' must be a string, got {}", json_type_name(v)),
             RejectReason::ServiceNotString,
         ));
     };
@@ -325,8 +350,14 @@ fn resolve_env(
         None | Some(Value::Null) => Ok((ctx.default_env.to_owned(), true)),
         Some(Value::String(env)) => {
             if !trawl_config::is_valid_env_name(env) {
+                // The value failed the charset/length rule, so it is exactly
+                // the case where the original may be arbitrarily long —
+                // echo a bounded prefix, never the whole thing.
                 return Err((
-                    format!("env '{env}' is not a valid env name (must match [a-z0-9_-]{{1,32}})"),
+                    format!(
+                        "env '{}' is not a valid env name (must match [a-z0-9_-]{{1,32}})",
+                        echo(env)
+                    ),
                     RejectReason::InvalidEnv,
                 ));
             }
@@ -342,7 +373,7 @@ fn resolve_env(
             Ok((env.clone(), false))
         }
         Some(other) => Err((
-            format!("'env' must be a string, got {other}"),
+            format!("'env' must be a string, got {}", json_type_name(other)),
             RejectReason::InvalidEnv,
         )),
     }
@@ -808,6 +839,60 @@ mod tests {
             let (_, reason) = reject(&format!(r#"{{"service":"s","env":{env_json}}}"#));
             assert_eq!(reason, RejectReason::InvalidEnv, "env case {label}");
         }
+    }
+
+    /// Reject messages go back to the client one per rejected event, with no
+    /// cap on how many. Every message on this path is bounded, so no single
+    /// event can amplify a request into an arbitrarily large response (or an
+    /// arbitrarily large allocation on the way there).
+    const MAX_REJECT_MSG_CHARS: usize = 256;
+
+    fn reject_obj(obj: &Map<String, Value>) -> (String, RejectReason) {
+        let e = envs(&["prod", "lab"]);
+        canonicalize(obj, &ctx_with(&e, false)).expect_err("event must reject")
+    }
+
+    #[test]
+    fn multi_megabyte_env_string_reject_message_is_bounded() {
+        let mut obj = Map::new();
+        obj.insert("service".into(), json!("nginx"));
+        obj.insert("env".into(), json!("e".repeat(4 * 1024 * 1024)));
+
+        let (msg, reason) = reject_obj(&obj);
+        assert_eq!(reason, RejectReason::InvalidEnv);
+        assert!(
+            msg.chars().count() <= MAX_REJECT_MSG_CHARS,
+            "reject message must not echo the whole value ({} chars)",
+            msg.chars().count()
+        );
+        assert!(
+            msg.contains("eeee"),
+            "a bounded prefix still identifies the value: {msg}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_env_object_reject_message_is_bounded() {
+        let mut nested = json!("leaf");
+        for _ in 0..512 {
+            nested = json!({ "deeper": nested });
+        }
+        let mut obj = Map::new();
+        obj.insert("service".into(), json!("nginx"));
+        obj.insert("env".into(), nested);
+
+        let (msg, reason) = reject_obj(&obj);
+        assert_eq!(reason, RejectReason::InvalidEnv);
+        assert!(
+            msg.chars().count() <= MAX_REJECT_MSG_CHARS,
+            "reject message must not serialize the value ({} chars)",
+            msg.chars().count()
+        );
+        assert!(
+            !msg.contains("deeper") && !msg.contains("leaf"),
+            "a wrong-typed value is reported by type only: {msg}"
+        );
+        assert!(msg.contains("an object"), "got: {msg}");
     }
 
     #[test]
