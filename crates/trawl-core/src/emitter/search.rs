@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
+use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken, Spanned};
 
 use super::SqlValue;
 use super::fields::{coerce_filter_value, quote_field};
@@ -61,34 +61,41 @@ pub(crate) fn emit_search(
                 emit_search_token(&token.node, state)?;
             }
         }
-        _ => {
-            // multi-group (OR) — collect each group's WHERE clauses separately
-            let mut group_conditions = Vec::new();
-            for group in &search.groups {
-                let mut result = Ok(());
-                let clauses = state.collect_where_clauses(|s| {
-                    for token in group {
-                        result = emit_search_token(&token.node, s);
-                        if result.is_err() {
-                            break;
-                        }
-                    }
-                });
-                result?;
-                if !clauses.is_empty() {
-                    let joined = clauses.join(" AND ");
-                    group_conditions.push(format!("({joined})"));
-                }
-            }
-            if !group_conditions.is_empty() {
-                let or_expr = group_conditions.join(" OR ");
-                // Wrap in parens so the OR doesn't interact with other
-                // top-level WHERE clauses (e.g. the hoisted time filter).
-                state.push_where(format!("({or_expr})"));
-            }
-        }
+        // multi-group (OR) — collect each group's WHERE clauses separately
+        _ => emit_or_groups(&search.groups, state)?,
     }
 
+    Ok(())
+}
+
+/// Emit OR-separated groups as a single parenthesised WHERE clause.
+///
+/// Each group's clauses are collected separately and AND-joined, then the
+/// groups are OR-joined: `(a AND b) OR (c AND d)`. The whole expression is
+/// wrapped in parens so the OR doesn't interact with other top-level WHERE
+/// clauses (e.g. the hoisted time filter). Groups that emit no clauses (a
+/// lone `*`, say) drop out.
+fn emit_or_groups(
+    groups: &[Vec<Spanned<SearchToken>>],
+    state: &mut EmitterState,
+) -> Result<(), super::EmitError> {
+    let mut group_conditions = Vec::new();
+    for group in groups {
+        let clauses = state.collect_where_clauses(|s| {
+            for token in group {
+                emit_search_token(&token.node, s)?;
+            }
+            Ok(())
+        })?;
+        if !clauses.is_empty() {
+            let joined = clauses.join(" AND ");
+            group_conditions.push(format!("({joined})"));
+        }
+    }
+    if !group_conditions.is_empty() {
+        let or_expr = group_conditions.join(" OR ");
+        state.push_where(format!("({or_expr})"));
+    }
     Ok(())
 }
 
@@ -185,38 +192,12 @@ fn emit_search_token(
             push_text_search(format!("%{}%", qs.phrase), false, state);
         }
         SearchToken::Not(inner) => {
-            let mut result = Ok(());
-            let clauses = state.collect_where_clauses(|s| {
-                result = emit_search_token(&inner.node, s);
-            });
-            result?;
+            let clauses = state.collect_where_clauses(|s| emit_search_token(&inner.node, s))?;
             if !clauses.is_empty() {
                 state.push_where(format!("NOT ({})", clauses.join(" AND ")));
             }
         }
-        SearchToken::Group(groups) => {
-            let mut group_conditions = Vec::new();
-            for group in groups {
-                let mut result = Ok(());
-                let clauses = state.collect_where_clauses(|s| {
-                    for token in group {
-                        result = emit_search_token(&token.node, s);
-                        if result.is_err() {
-                            break;
-                        }
-                    }
-                });
-                result?;
-                if !clauses.is_empty() {
-                    let joined = clauses.join(" AND ");
-                    group_conditions.push(format!("({joined})"));
-                }
-            }
-            if !group_conditions.is_empty() {
-                let or_expr = group_conditions.join(" OR ");
-                state.push_where(format!("({or_expr})"));
-            }
-        }
+        SearchToken::Group(groups) => emit_or_groups(groups, state)?,
     }
     Ok(())
 }
