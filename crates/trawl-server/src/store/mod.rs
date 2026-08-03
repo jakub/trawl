@@ -19,6 +19,7 @@
 //! `main` to terminate the daemon before a second instance can acquire the
 //! freed lock and become a concurrent writer.
 
+pub mod catalog;
 pub mod error;
 pub mod history;
 pub mod saved;
@@ -33,6 +34,7 @@ use sqlx::{Connection as _, PgPool};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+pub use catalog::{CatalogStore, FieldConflict, FieldConflictRow, FieldServiceRow, PinProposal};
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
@@ -96,6 +98,9 @@ pub struct StorageState {
     pub saved: SavedQueryStore,
     /// Schedules + report runs store.
     pub schedule: ScheduleStore,
+    /// Field catalog: type pins, per-service observations, conflicts
+    /// (ADR-0009 slice 2).
+    pub catalog: CatalogStore,
     /// Guard task owning the dedicated session connection that holds
     /// `pg_advisory_lock`. Lives exactly as long as the state; its `Drop`
     /// aborts the task, dropping the connection and releasing the lock.
@@ -185,6 +190,7 @@ impl StorageState {
             history: HistoryStore::new(pool.clone()),
             saved: SavedQueryStore::new(pool.clone()),
             schedule: ScheduleStore::new(pool.clone()),
+            catalog: CatalogStore::new(pool.clone()),
             pool,
             _lock_guard: Arc::new(LockGuard(guard)),
             lock_lost_rx,

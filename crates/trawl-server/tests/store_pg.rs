@@ -1370,3 +1370,160 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool
     }
     panic!("replacement never acquired the freed lock: {last_err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// field catalog (ADR-0009 slice 2)
+// ---------------------------------------------------------------------------
+
+mod catalog {
+    use super::*;
+    use trawl_core::schema::{CanonicalType, ENVELOPE_TYPES};
+    use trawl_server::store::{CatalogStore, FieldConflict, PinProposal};
+
+    fn catalog(pool: &PgPool) -> CatalogStore {
+        CatalogStore::new(pool.clone())
+    }
+
+    fn proposal(field: &str, ty: CanonicalType) -> PinProposal {
+        PinProposal {
+            field: field.to_owned(),
+            ty,
+            pinned_from: "svc-a".to_owned(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn migration_seed_matches_envelope_types(pool: PgPool) {
+        // The declared schema is the catalog's first citizen: the migration
+        // seed must mirror trawl-core's ENVELOPE_TYPES exactly.
+        let pins = catalog(&pool).load_pins().await.unwrap();
+        for (field, ty) in ENVELOPE_TYPES {
+            let pinned = pins.iter().find(|(f, _)| f == field);
+            assert_eq!(
+                pinned.map(|(_, t)| *t),
+                Some(*ty),
+                "envelope field {field} must be pre-seeded with its declared type"
+            );
+        }
+        assert_eq!(
+            pins.len(),
+            ENVELOPE_TYPES.len(),
+            "a fresh catalog holds exactly the declared envelope"
+        );
+    }
+
+    #[sqlx::test]
+    async fn pin_missing_is_first_writer_wins(pool: PgPool) {
+        let store = catalog(&pool);
+
+        let pins = store
+            .pin_missing(&[proposal("duration", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        assert_eq!(pins.get("duration"), Some(&CanonicalType::BigInt));
+
+        // A later batch proposing a different type does NOT repin — the
+        // authoritative pin comes back instead.
+        let pins = store
+            .pin_missing(&[proposal("duration", CanonicalType::Varchar)])
+            .await
+            .unwrap();
+        assert_eq!(
+            pins.get("duration"),
+            Some(&CanonicalType::BigInt),
+            "an existing pin is never overwritten by pin_missing"
+        );
+    }
+
+    #[sqlx::test]
+    async fn pin_missing_race_converges_on_one_pin(pool: PgPool) {
+        // Two concurrent proposals for the same unpinned field with
+        // different types: both callers must come back with the SAME
+        // authoritative pin (INSERT ... ON CONFLICT DO NOTHING + re-read).
+        let a = catalog(&pool);
+        let b = catalog(&pool);
+        let pa_prop = [proposal("racy", CanonicalType::BigInt)];
+        let pb_prop = [proposal("racy", CanonicalType::Varchar)];
+        let (ra, rb) = tokio::join!(a.pin_missing(&pa_prop), b.pin_missing(&pb_prop));
+        let pa = ra.unwrap();
+        let pb = rb.unwrap();
+        assert_eq!(
+            pa.get("racy"),
+            pb.get("racy"),
+            "both racers must observe the same authoritative pin"
+        );
+        assert!(pa.contains_key("racy"));
+    }
+
+    #[sqlx::test]
+    async fn touch_services_advances_only_last_seen(pool: PgPool) {
+        let store = catalog(&pool);
+        let fields = vec!["duration".to_owned()];
+
+        store.touch_services("svc-a", &fields, 10).await.unwrap();
+        let first = store.field_services("duration").await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].service, "svc-a");
+        assert_eq!(first[0].row_count, 10);
+        assert_eq!(first[0].first_seen, first[0].last_seen);
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        store.touch_services("svc-a", &fields, 5).await.unwrap();
+        let second = store.field_services("duration").await.unwrap();
+        assert_eq!(second.len(), 1, "upsert, not append");
+        assert_eq!(second[0].row_count, 15, "row_count accumulates");
+        assert_eq!(
+            second[0].first_seen, first[0].first_seen,
+            "first_seen never moves"
+        );
+        assert!(
+            second[0].last_seen > first[0].last_seen,
+            "last_seen advances"
+        );
+    }
+
+    #[sqlx::test]
+    async fn conflicts_append_and_never_aggregate(pool: PgPool) {
+        let store = catalog(&pool);
+        let row = FieldConflict {
+            field: "duration".to_owned(),
+            service: "svc-b".to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 3,
+        };
+        store
+            .record_conflicts(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+        store.record_conflicts(&[row]).await.unwrap();
+
+        let rows = store.conflicts_for_field("duration").await.unwrap();
+        assert_eq!(rows.len(), 2, "field_conflicts is append-only");
+        assert_eq!(rows[0].service, "svc-b");
+        assert_eq!(rows[0].observed_type, "VARCHAR");
+        assert_eq!(rows[0].expected_type, "BIGINT");
+        assert_eq!(rows[0].rows_nulled, 3);
+    }
+
+    #[sqlx::test]
+    async fn catalog_id_is_stable_and_conformance_flips_once(pool: PgPool) {
+        let store = catalog(&pool);
+        let id1 = store.catalog_id().await.unwrap();
+        let id2 = store.catalog_id().await.unwrap();
+        assert_eq!(id1, id2, "catalog_id is a stable identity");
+        assert!(!id1.is_empty());
+
+        assert!(
+            !store.is_conformed().await.unwrap(),
+            "a fresh catalog has not run the boot conformance pass"
+        );
+        store.mark_conformed().await.unwrap();
+        assert!(store.is_conformed().await.unwrap());
+        assert_eq!(
+            store.catalog_id().await.unwrap(),
+            id1,
+            "conformance marking must not rotate the identity"
+        );
+    }
+}
