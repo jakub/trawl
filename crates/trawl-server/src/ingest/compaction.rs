@@ -7,7 +7,7 @@
 //! Periodically scans the WAL directory for `.ndjson` files, groups
 //! them by service, and uses `DuckDB` to convert each batch to parquet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
 use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb_type};
-use trawl_engine::is_conversion_error;
 
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
@@ -843,13 +842,12 @@ fn rollup_day_inner(
         .join(", ");
     let tmp_path = day_dir.join(format!("{service}.parquet.tmp"));
 
-    // Read, merge, sort by timestamp, and write to tmp file. The fast path
-    // leans on `union_by_name` to reconcile heterogeneous schemas, but that
-    // only unifies by column NAME — it cannot bridge a column that is JSON
-    // or STRUCT in one hourly file and VARCHAR in another (independent
-    // per-batch type inference at write time produces exactly this drift).
-    // On that bind-time type/remap error, fall back to describing each file
-    // and casting the conflicting columns to VARCHAR before unioning.
+    // Read, merge, sort by timestamp, and write to tmp file. Every hourly
+    // file is write-time conformant to the field catalog (ADR-0009 slice 2),
+    // so `union_by_name` cannot hit a type conflict on trawl-written files —
+    // a conversion-class failure here means foreign parquet in the tree and
+    // errors loudly (inputs retained, retried next tick) rather than being
+    // silently rewritten by the deleted VARCHAR-cast fallback.
     let fast = conn.execute_batch(&format!(
         "COPY (\
              SELECT * FROM read_parquet([{file_list_sql}], union_by_name=true) \
@@ -858,36 +856,20 @@ fn rollup_day_inner(
              BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
         tmp_path.to_string_lossy(),
     ));
-    match fast {
-        Ok(()) => {}
-        // A conversion-class failure is the trigger, not the verdict: the
-        // fallback per-file-describes the inputs and only casts columns that
-        // genuinely carry more than one type, so a failure that is not a
-        // schema conflict simply re-raises from there (ADR-0008).
-        Err(e) if is_conversion_error(&e) => {
-            tracing::warn!(
-                event_type = "rollup_fallback",
-                compact_service = %service,
-                error = %e,
-                "rollup type conflict across hourly files, falling back to VARCHAR casts"
-            );
-            rollup_with_casts(&conn, &all_files, &tmp_path, service)?;
-        }
-        Err(e) => {
-            // S2: this file passed `is_valid_parquet`'s magic-byte sniff but
-            // is unreadable by `read_parquet` for a non-type, non-corruption
-            // reason (e.g. a valid header/trailer but a corrupt MIDDLE). The
-            // sniff can't catch that, and no amount of retrying repairs it —
-            // surface it distinctly at error level so the rare forever-retry
-            // is visible on the dashboard rather than buried in the count.
-            tracing::error!(
-                event_type = "rollup_unreadable",
-                compact_service = %service,
-                error = %e,
-                "rollup input passed magic-byte validation but is unreadable; will retry indefinitely"
-            );
-            return Err(format!("rollup COPY failed: {e}"));
-        }
+    if let Err(e) = fast {
+        // S2: a file that passed `is_valid_parquet`'s magic-byte sniff but
+        // fails `read_parquet` — corrupt middle, or a schema the catalog
+        // invariant says trawl cannot have written. No amount of retrying
+        // repairs either — surface it distinctly at error level so the rare
+        // forever-retry is visible on the dashboard rather than buried in
+        // the count.
+        tracing::error!(
+            event_type = "rollup_unreadable",
+            compact_service = %service,
+            error = %e,
+            "rollup inputs unreadable or nonconformant (foreign parquet?); will retry indefinitely"
+        );
+        return Err(format!("rollup COPY failed: {e}"));
     }
 
     // Write marker BEFORE rename so recovery knows which hourlies to clean up.
@@ -923,79 +905,6 @@ fn rollup_day_inner(
     );
 
     Ok(())
-}
-
-/// Rollup fallback: union hourly parquet files when their schemas conflict.
-///
-/// The fast-path `read_parquet([...], union_by_name=true)` fails at bind
-/// time when the same column name has incompatible physical types across
-/// files (e.g. JSON/STRUCT in one hour, VARCHAR in another). This rebuilds
-/// the merge explicitly: `DESCRIBE` every file, find columns whose type
-/// differs across files, cast those to `VARCHAR` in each branch, and
-/// `UNION ALL BY NAME` so heterogeneous column sets still line up (missing
-/// columns become NULL). Mirrors [`merge_with_existing`] but generalised
-/// to N files for the daily rollup.
-fn rollup_with_casts(
-    conn: &duckdb::Connection,
-    files: &[PathBuf],
-    tmp_path: &Path,
-    service: &str,
-) -> Result<(), String> {
-    // Describe every input file and accumulate the set of types seen per
-    // column name across all files.
-    let mut col_types: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut schemas: Vec<Vec<ColInfo>> = Vec::with_capacity(files.len());
-    for f in files {
-        let schema = describe_source(
-            conn,
-            &format!("SELECT * FROM read_parquet('{}')", f.display()),
-        )?;
-        for col in &schema {
-            col_types
-                .entry(col.name.clone())
-                .or_default()
-                .insert(col.dtype.clone());
-        }
-        schemas.push(schema);
-    }
-
-    // A column conflicts when it appears with more than one distinct type.
-    let conflicts: Vec<String> = col_types
-        .into_iter()
-        .filter(|(_, types)| types.len() > 1)
-        .map(|(name, _)| name)
-        .collect();
-
-    tracing::info!(
-        event_type = "rollup_fallback",
-        compact_service = %service,
-        conflicting_columns = ?conflicts,
-        "casting conflicting columns to VARCHAR for rollup"
-    );
-
-    // Build one casting SELECT per file and union them by name.
-    // Path provenance: service is sanitized to [A-Za-z0-9_-] at ingest
-    // (ingest service charset validation) and data_dir is operator-trusted,
-    // so direct interpolation cannot inject. No quote-escaping needed.
-    let union_sql = files
-        .iter()
-        .zip(&schemas)
-        .map(|(f, schema)| {
-            format!(
-                "SELECT {} FROM read_parquet('{}')",
-                build_cast_select(schema, &conflicts),
-                f.display()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" UNION ALL BY NAME ");
-
-    conn.execute_batch(&format!(
-        "COPY (SELECT * FROM ({union_sql}) ORDER BY \"_time\") TO '{}' \
-         (FORMAT PARQUET, COMPRESSION SNAPPY, BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
-        tmp_path.to_string_lossy(),
-    ))
-    .map_err(|e| format!("rollup (type fallback) failed: {e}"))
 }
 
 /// Outcome of one per-service WAL compaction batch.
@@ -1238,9 +1147,10 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
 /// set aside. Returns `Ok(0)` when every file turned out corrupt (the caller
 /// treats that as data-loss, not error).
 ///
-/// After the table is built, any column `DuckDB` inferred as a complex type
-/// (STRUCT/MAP/JSON/LIST) is coerced to VARCHAR — see
-/// [`coerce_complex_columns_to_varchar`] for why.
+/// Complex-typed columns cannot arise here: ingest canonicalization
+/// stringifies top-level object/array values before the WAL is written, and
+/// the conform phase pins every column to a canonical scalar type before
+/// the parquet write (ADR-0009 slice 2).
 fn read_wal_to_table(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -1508,31 +1418,17 @@ pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Build a SELECT list that casts conflicting columns to `VARCHAR`.
-///
-/// Non-conflicting columns pass through quoted (`"col"`); conflicting
-/// ones become `CAST("col" AS VARCHAR) AS "col"`.
-fn build_cast_select(schema: &[ColInfo], conflicts: &[String]) -> String {
-    schema
-        .iter()
-        .map(|col| {
-            let quoted = quote_ident(&col.name);
-            if conflicts.contains(&col.name) {
-                format!("CAST({quoted} AS VARCHAR) AS {quoted}")
-            } else {
-                quoted
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Merge `wal_batch` with an existing parquet file via `UNION ALL BY NAME`.
 ///
-/// Fast path: direct union. If that fails with a type mismatch (e.g.
-/// JSON vs VARCHAR for the same column), falls back to `DESCRIBE`-ing
-/// both sides, finding the conflicting columns, and casting them to
-/// `VARCHAR` before retrying.
+/// The batch is conformed to the catalog pins before this runs, and every
+/// trawl-written parquet file is write-time conformant too (ADR-0009 slice
+/// 2), so the direct union cannot conflict on trawl's own files. A failure
+/// here therefore means the existing file violates the invariant — foreign
+/// parquet dropped into the tree, or a restore against a stale catalog —
+/// and is surfaced as `catalog_invariant_violation`: the batch errors, the
+/// WAL files are retained, and the tick retries. The cast-and-retry
+/// fallback that used to rewrite both sides silently is deliberately gone
+/// and must not be rebuilt.
 fn merge_with_existing(
     conn: &duckdb::Connection,
     canonical_path: &Path,
@@ -1540,75 +1436,24 @@ fn merge_with_existing(
 ) -> Result<(), String> {
     let pq_path = canonical_path.display();
 
-    // Fast path: direct union.
-    let result = conn.execute_batch(&format!(
+    conn.execute_batch(&format!(
         "CREATE TABLE merged AS \
          SELECT * FROM read_parquet('{pq_path}') \
          UNION ALL BY NAME \
          SELECT * FROM wal_batch",
-    ));
-
-    match result {
-        Ok(()) => Ok(()),
-        // Trigger, not verdict: the fallback below describes both sides and
-        // re-raises the original error when they hold no conflicting column
-        // — so a genuine data-conversion error is not treated as a schema
-        // conflict here either (ADR-0008).
-        Err(e) if is_conversion_error(&e) => {
-            tracing::warn!(
-                event_type = "compaction_fallback",
-                compact_service = %service,
-                error = %e,
-                "type mismatch during merge, falling back to explicit casts"
-            );
-
-            // Get schemas for both sides.
-            let pq_schema =
-                describe_source(conn, &format!("SELECT * FROM read_parquet('{pq_path}')"))?;
-            let wb_schema = describe_source(conn, "SELECT * FROM wal_batch")?;
-
-            // Build a lookup of wal_batch column types.
-            let wb_types: HashMap<&str, &str> = wb_schema
-                .iter()
-                .map(|c| (c.name.as_str(), c.dtype.as_str()))
-                .collect();
-
-            // Find columns present in both with different types.
-            let conflicts: Vec<String> = pq_schema
-                .iter()
-                .filter(|col| {
-                    wb_types
-                        .get(col.name.as_str())
-                        .is_some_and(|wb_type| *wb_type != col.dtype)
-                })
-                .map(|col| col.name.clone())
-                .collect();
-
-            if conflicts.is_empty() {
-                // Not actually a type conflict — re-raise original error.
-                return Err(format!("merge read_parquet failed: {e}"));
-            }
-
-            tracing::info!(
-                event_type = "compaction_fallback",
-                compact_service = %service,
-                conflicting_columns = ?conflicts,
-                "casting conflicting columns to VARCHAR"
-            );
-
-            let pq_select = build_cast_select(&pq_schema, &conflicts);
-            let wb_select = build_cast_select(&wb_schema, &conflicts);
-
-            conn.execute_batch(&format!(
-                "CREATE TABLE merged AS \
-                 SELECT {pq_select} FROM read_parquet('{pq_path}') \
-                 UNION ALL BY NAME \
-                 SELECT {wb_select} FROM wal_batch",
-            ))
-            .map_err(|e| format!("merge (type fallback) failed: {e}"))
-        }
-        Err(e) => Err(format!("merge read_parquet failed: {e}")),
-    }
+    ))
+    .map_err(|e| {
+        tracing::error!(
+            event_type = "catalog_invariant_violation",
+            compact_service = %service,
+            path = %canonical_path.display(),
+            error = %e,
+            "merge with existing parquet failed — write-time conformance makes this \
+             impossible for trawl-written files (foreign parquet at this path?); \
+             WAL retained, batch retried next tick"
+        );
+        format!("merge read_parquet failed: {e}")
+    })
 }
 
 /// A batch staged in `DuckDB` between the read/infer phase and the
@@ -1894,7 +1739,8 @@ fn conform_and_write(
         // Merge: union existing parquet rows with new WAL batch.
         // BY NAME handles heterogeneous schemas (different events have
         // different fields) — missing columns become NULL in parquet.
-        // Falls back to explicit casts if column types conflict.
+        // Both sides are catalog-conformant, so a type conflict here means
+        // a foreign file and errors loudly (WAL retained, retried).
         merge_with_existing(&conn, &canonical_path, service)?;
 
         // ORDER BY timestamp so row-group min/max stats enable range
@@ -2584,10 +2430,11 @@ mod tests {
 
     #[test]
     fn compact_merges_despite_type_conflict() {
-        // Simulates the k8s containerID scenario: first compaction writes
-        // a parquet file where `container_id` is a JSON object, second
-        // compaction has WAL data where `container_id` is a plain string.
-        // The merge should succeed by falling back to VARCHAR casts.
+        // Simulates the k8s containerID scenario: first batch carries
+        // `container_id` as a JSON object, second as a plain string. The
+        // cast-fallback that used to rescue this is deleted (ADR-0009 slice
+        // 2) — instead the conform pipeline pins the column VARCHAR at the
+        // FIRST write, so the second batch merges with no conflict at all.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
@@ -3151,11 +2998,14 @@ mod tests {
     }
 
     #[test]
-    fn rollup_merges_despite_type_conflict_across_hours() {
-        // The prod failure: hour 01 wrote `offset` as a JSON/STRUCT object,
-        // hour 02 wrote it as a plain string ("540.203µs"). The bare
-        // read_parquet(union_by_name=true) raises a bind-time type/remap
-        // error; the rollup must fall back to VARCHAR casts and still merge.
+    fn rollup_of_nonconformant_hourlies_errors_loudly_and_retains_inputs() {
+        // Hour 01 carries `offset` as a STRUCT, hour 02 as a plain string —
+        // a mix write-time conformance can no longer produce, so it can only
+        // mean foreign parquet dropped into the tree. The VARCHAR-cast
+        // fallback that used to rewrite both sides silently is deleted
+        // (ADR-0009 slice 2): the rollup must fail loudly and RETAIN the
+        // hourly inputs for the operator (retried next tick), never
+        // half-produce a daily file.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -3166,40 +3016,64 @@ mod tests {
         let f2 = write_hourly_parquet(&data_dir, date, "02", "ctrl", &[r2]);
 
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "ctrl", &[f1.clone(), f2.clone()], "2GB")
-            .result
-            .unwrap();
+        let outcome = rollup_day_blocking(&day_dir, "ctrl", &[f1.clone(), f2.clone()], "2GB");
+        assert!(
+            outcome.result.is_err(),
+            "a nonconformant hourly set must fail the rollup loudly"
+        );
+        assert!(
+            f1.exists() && f2.exists(),
+            "the hourly inputs must be retained for repair/retry"
+        );
+        assert!(
+            !day_dir.join("ctrl.parquet").exists(),
+            "no daily file may be produced from a nonconformant set"
+        );
+    }
 
-        let daily = day_dir.join("ctrl.parquet");
-        assert!(daily.exists(), "daily parquet should exist after fallback");
-        assert!(!f1.exists(), "hourly file 1 should be deleted");
-        assert!(!f2.exists(), "hourly file 2 should be deleted");
+    #[test]
+    fn merge_into_foreign_nonconformant_parquet_errors_and_retains_wal() {
+        // The canonical hourly file already holds `container_id` as a STRUCT
+        // (foreign parquet — the conform pipeline always writes VARCHAR for
+        // it). Merging a conformant WAL batch into it hits a union type
+        // conflict; the deleted cast-and-retry must NOT be rebuilt: the
+        // batch errors (logged as catalog_invariant_violation), the WAL file
+        // survives for the next tick, and the existing file is untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        let count: i64 = conn
-            .query_row(
-                &format!(
-                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
-                    daily.display()
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2, "both rows present despite offset type conflict");
+        // Foreign file at the canonical path the batch will target — the
+        // output dir is derived from the compaction instant, so place it at
+        // today's date/hour with a genuinely STRUCT-typed column.
+        let now = chrono::Utc::now();
+        let existing = write_hourly_parquet(
+            &data_dir,
+            &now.format("%Y-%m-%d").to_string(),
+            &now.format("%H").to_string(),
+            "kubelet",
+            &[
+                r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"kubelet","message":"start","container_id":{"id":"abc123","runtime":"containerd"}}"#,
+            ],
+        );
+        let before = std::fs::metadata(&existing).unwrap().len();
 
-        // The conflicting column must be unified to VARCHAR.
-        let col_type: String = conn
-            .query_row(
-                &format!(
-                    "SELECT typeof(\"offset\") FROM read_parquet('{}') LIMIT 1",
-                    daily.display()
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(col_type, "VARCHAR", "offset should be cast to VARCHAR");
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"kubelet","message":"running","container_id":"def456"}"#;
+        let f2 = write_wal_file(&wal_dir, "kubelet", &[r2]);
+
+        let err = compact_service_blocking(std::slice::from_ref(&f2), &data_dir, "kubelet", "2GB")
+            .expect_err("merging into a foreign nonconformant file must error");
+        assert!(
+            err.contains("merge"),
+            "the error must surface from the merge step: {err}"
+        );
+        assert!(f2.exists(), "the WAL file must survive for the next tick");
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().len(),
+            before,
+            "the existing parquet must be untouched"
+        );
     }
 
     #[test]
