@@ -656,6 +656,57 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
+    /// The vote weighs rows that CARRY the field, not the file's row count:
+    /// a mostly-NULL `duration` in a big file holds no values to describe, so
+    /// it must not win the pin and `TRY_CAST` the small file's real values away.
+    #[sqlx::test]
+    async fn all_null_column_in_a_bigger_file_does_not_win_the_pin(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // 6 rows, `duration` typed BIGINT but empty in every one of them.
+        plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             NULL::BIGINT AS duration FROM range(6)",
+        );
+        // 2 rows, `duration` VARCHAR and populated.
+        let populated = plant(
+            &data_dir,
+            "prod/2026-08-01/11/svc-b.parquet",
+            "SELECT TIMESTAMP '2026-08-01 11:00:00' AS \"_time\", 'svc-b' AS service, \
+             x AS duration FROM (VALUES ('1.5s'), ('2.5s')) t(x)",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+
+        assert_eq!(
+            cache.get("duration"),
+            Some(trawl_core::schema::CanonicalType::Varchar),
+            "the only column carrying values wins the pin"
+        );
+        assert_eq!(column_type(&populated, "duration"), "VARCHAR");
+
+        // Nothing was nulled: both real values survive.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let kept: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(duration)::BIGINT FROM \
+                     read_parquet('{}/**/*.parquet', union_by_name=true)",
+                    data_dir.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 2, "no populated value was TRY_CAST away");
+    }
+
     #[sqlx::test]
     async fn second_boot_is_a_noop(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();

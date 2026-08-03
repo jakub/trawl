@@ -65,8 +65,12 @@ pub struct ConformSummary {
 struct FileScan {
     path: PathBuf,
     service: String,
-    rows: u64,
     schema: Vec<ColInfo>,
+    /// Non-null row count per column, positionally parallel to `schema`.
+    /// This — not the file's total row count — is a column's voting weight:
+    /// a column that is 99.9% NULL in a huge file describes almost nothing
+    /// and must not outvote the same field fully populated elsewhere.
+    non_null: Vec<u64>,
 }
 
 /// Run the boot conformance pass unless the dual-sided identity says it
@@ -117,7 +121,8 @@ pub async fn ensure_conformance(
     };
 
     // Seed pins: declared fields came with the migration; custom fields by
-    // most-rows-wins across files, ties by ladder order.
+    // most-rows-wins across files — rows CARRYING the field, not the files'
+    // row counts — ties by ladder order.
     let existing: HashMap<String, CanonicalType> = store
         .load_pins()
         .await
@@ -317,20 +322,19 @@ fn scan_corpus(data_dir: &Path, memory_limit: &str) -> Result<(Vec<FileScan>, us
 }
 
 /// Describe one parquet file: magic-byte sniff first (the cheap catch for a
-/// truncated or non-parquet file), then schema + row count.
+/// truncated or non-parquet file), then schema + per-column non-null counts.
+///
+/// One `count(<col>)` per column rather than a single `count(*)`: the counts
+/// weight the pin vote, and a column's weight must be the rows that actually
+/// carry a value for it (parquet keeps per-column null counts in the footer,
+/// so this stays a metadata read).
 fn scan_file(conn: &duckdb::Connection, path: PathBuf) -> Result<FileScan, String> {
     if !is_valid_parquet(&path) {
         return Err("not a parquet file (magic-byte sniff failed)".to_owned());
     }
     let safe = path.to_string_lossy().replace('\'', "''");
     let schema = describe_source(conn, &format!("SELECT * FROM read_parquet('{safe}')"))?;
-    let rows: i64 = conn
-        .query_row(
-            &format!("SELECT count(*)::BIGINT FROM read_parquet('{safe}')"),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("row count failed: {e}"))?;
+    let non_null = count_non_null(conn, &safe, &schema)?;
     let service = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -339,9 +343,36 @@ fn scan_file(conn: &duckdb::Connection, path: PathBuf) -> Result<FileScan, Strin
     Ok(FileScan {
         path,
         service,
-        rows: u64::try_from(rows).unwrap_or(0),
         schema,
+        non_null,
     })
+}
+
+/// Non-null row count per column, positionally parallel to `schema`.
+fn count_non_null(
+    conn: &duckdb::Connection,
+    safe_path: &str,
+    schema: &[ColInfo],
+) -> Result<Vec<u64>, String> {
+    if schema.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {} FROM read_parquet('{safe_path}')",
+        schema
+            .iter()
+            .map(|c| format!("count({})::BIGINT", quote_ident(&c.name)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    conn.query_row(&sql, [], |row| {
+        let mut out = Vec::with_capacity(schema.len());
+        for i in 0..schema.len() {
+            out.push(u64::try_from(row.get::<_, i64>(i)?).unwrap_or(0));
+        }
+        Ok(out)
+    })
+    .map_err(|e| format!("non-null counts failed: {e}"))
 }
 
 /// The canonical type a standing parquet column proposes at boot.
@@ -366,13 +397,19 @@ fn ladder_rank(ty: CanonicalType) -> usize {
 
 /// Seed proposals for unpinned fields: per field, the candidate backed by
 /// the most rows across files wins; ties resolve by ladder order.
+///
+/// A candidate's weight is the number of rows that actually carry a value
+/// for that column (`count(<col>)`), never the file's total row count — an
+/// all-but-empty column in a large file describes no values and so gets no
+/// say over a fully populated column in a smaller one. Since the losers get
+/// `TRY_CAST` to the winner's pin, a misweighted vote is a data loss.
 fn most_rows_wins(
     scan: &[FileScan],
     existing: &HashMap<String, CanonicalType>,
 ) -> Vec<PinProposal> {
     let mut votes: HashMap<&str, HashMap<CanonicalType, u64>> = HashMap::new();
     for file in scan {
-        for col in &file.schema {
+        for (col, rows) in file.schema.iter().zip(&file.non_null) {
             if existing.contains_key(&col.name) {
                 continue;
             }
@@ -380,7 +417,7 @@ fn most_rows_wins(
                 .entry(col.name.as_str())
                 .or_default()
                 .entry(boot_candidate(&col.dtype))
-                .or_default() += file.rows;
+                .or_default() += *rows;
         }
     }
     let mut proposals: Vec<PinProposal> = votes
@@ -535,4 +572,68 @@ fn rewrite_file(
         }
     }
     Ok(Some(conflicts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileScan, most_rows_wins};
+    use crate::ingest::compaction::ColInfo;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use trawl_core::schema::CanonicalType;
+
+    fn scan(name: &str, cols: &[(&str, &str, u64)]) -> FileScan {
+        FileScan {
+            path: PathBuf::from(format!("/data/prod/2026-08-01/10/{name}.parquet")),
+            service: name.to_owned(),
+            schema: cols
+                .iter()
+                .map(|(n, t, _)| ColInfo {
+                    name: (*n).to_owned(),
+                    dtype: (*t).to_owned(),
+                })
+                .collect(),
+            non_null: cols.iter().map(|(_, _, rows)| *rows).collect(),
+        }
+    }
+
+    /// A near-empty column in a huge file must not outvote a fully populated
+    /// one in a small file — the loser's values are `TRY_CAST` away.
+    #[test]
+    fn vote_weight_is_rows_carrying_the_field_not_file_rows() {
+        // 1M-row file, `duration` non-null in 1000 of them; 100k-row file with
+        // `duration` populated throughout.
+        let corpus = vec![
+            scan("svc-a", &[("duration", "BIGINT", 1_000)]),
+            scan("svc-b", &[("duration", "VARCHAR", 100_000)]),
+        ];
+        let proposals = most_rows_wins(&corpus, &HashMap::new());
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].field, "duration");
+        assert_eq!(
+            proposals[0].ty,
+            CanonicalType::Varchar,
+            "the populated column wins the vote"
+        );
+    }
+
+    /// An all-NULL column carries no evidence at all: it must not decide the
+    /// pin against the only column that holds values.
+    #[test]
+    fn all_null_column_does_not_vote() {
+        let corpus = vec![
+            scan("svc-a", &[("duration", "VARCHAR", 0)]),
+            scan("svc-b", &[("duration", "BIGINT", 5)]),
+        ];
+        let proposals = most_rows_wins(&corpus, &HashMap::new());
+        assert_eq!(proposals[0].ty, CanonicalType::BigInt);
+    }
+
+    /// Already-pinned fields never re-vote.
+    #[test]
+    fn existing_pins_are_left_alone() {
+        let corpus = vec![scan("svc-a", &[("duration", "VARCHAR", 10)])];
+        let existing = HashMap::from([("duration".to_owned(), CanonicalType::BigInt)]);
+        assert!(most_rows_wins(&corpus, &existing).is_empty());
+    }
 }
