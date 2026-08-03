@@ -369,13 +369,37 @@ fn severity_from_value(v: &Value) -> Option<u8> {
     }
 }
 
+/// Render a severity-ish value as a stored `severity_text` label: strings
+/// verbatim, numbers as their numeral. Anything else has no honest label
+/// (it still survives inside `_raw`).
+fn severity_label(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// Resolve the severity chain onto `out`, consuming the `severity`,
 /// `severity_text`, and `level` inputs: a client `severity` integer 1-24
-/// wins → else derive from `severity_text` → else from `level` → else
-/// NULL. `level` is consumed at ingest — the DSL alias would shadow it
-/// anyway; the original is always in `_raw`. Stored `severity_text` is
-/// the client's verbatim when it is a string, else the `level` value used
-/// for derivation, else absent.
+/// wins → else derive from a *string* `severity` → else from
+/// `severity_text` → else from `level` → else NULL. `level` is consumed at
+/// ingest — the DSL alias would shadow it anyway; the original is always
+/// in `_raw`.
+///
+/// A numeric `severity` is only ever read on the `OTel` ladder, never
+/// syslog-inverted: `severity: 0` is `OTel`'s UNSPECIFIED as readily as it
+/// is syslog's Emergency, and guessing would stamp FATAL on an OTel-native
+/// client. A string `severity` carries no such ambiguity, so
+/// `{"severity":"ERROR"}` — the shape GCP/Stackdriver structured logging
+/// emits — maps through the same token/syslog table as the other
+/// candidates instead of being dropped.
+///
+/// Stored `severity_text` is the client's verbatim when it is a string,
+/// else the `level` value, else the client `severity` whenever that was
+/// not a ladder integer. No severity-ish input is ever deleted from the
+/// event: an unmappable value leaves `severity` NULL but stays queryable
+/// as `severity_text`.
 ///
 /// Omit-when-null: an all-null column in a batch must be absent, not JSON
 /// null, or `DuckDB` infers JSON for the column type (ADR-0009). Returns
@@ -391,21 +415,30 @@ fn resolve_severity(out: &mut Map<String, Value>) -> bool {
         .and_then(Value::as_i64)
         .filter(|n| trawl_core::severity::is_valid_number(*n));
 
+    // Only a string `severity` joins the derivation chain (see above); an
+    // out-of-ladder integer falls through to the text candidates.
+    let mapped_client_severity = match &client_severity {
+        Some(v @ Value::String(_)) => severity_from_value(v),
+        _ => None,
+    };
+
     let severity_number = valid_client_number.or_else(|| {
-        client_text
-            .as_ref()
-            .and_then(severity_from_value)
+        mapped_client_severity
+            .or_else(|| client_text.as_ref().and_then(severity_from_value))
             .or_else(|| level.as_ref().and_then(severity_from_value))
             .map(i64::from)
     });
 
+    // A ladder-valid integer is a number, not a label — it already lives
+    // in `severity` and must not also become `severity_text`.
+    let unclaimed_severity = if valid_client_number.is_some() {
+        None
+    } else {
+        client_severity.as_ref()
+    };
     let stored_text: Option<String> = match &client_text {
         Some(Value::String(s)) => Some(s.clone()),
-        _ => match &level {
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(Value::Number(n)) => Some(n.to_string()),
-            _ => None,
-        },
+        _ => severity_label(level.as_ref()).or_else(|| severity_label(unclaimed_severity)),
     };
 
     let unmapped = severity_number.is_none()
@@ -431,8 +464,9 @@ fn resolve_severity(out: &mut Map<String, Value>) -> bool {
 ///    consumed), ADR-0008 grammar, `time.from_ingest`/`time.out_of_range`.
 /// 5. `_ingested` stamp.
 /// 6. `env` default-or-reject, `host` peer-fill-or-relay-reject.
-/// 7. Severity chain (`severity` 1-24 → `severity_text` → `level` → NULL);
-///    `level` is consumed.
+/// 7. Severity chain (`severity` 1-24 → string `severity` → `severity_text`
+///    → `level` → NULL); `level` is consumed, and no severity-ish input is
+///    ever deleted (an unmappable one lands in `severity_text`).
 /// 8. `_repairs` assembly (omitted when clean).
 pub fn canonicalize(
     obj: &Map<String, Value>,
@@ -861,12 +895,76 @@ mod tests {
     }
 
     #[test]
+    fn string_client_severity_maps_like_a_token() {
+        // GCP/Stackdriver structured logging emits `severity: "ERROR"`.
+        for spelling in [r#""ERROR""#, r#""error""#, r#""err""#, r#""3""#] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":{spelling}}}"#
+            ));
+            assert_eq!(c.obj["severity"], 17, "spelling {spelling} must map to 17");
+            assert!(c.repairs.is_empty(), "mapping is not a repair");
+        }
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":"ERROR"}"#,
+        );
+        assert_eq!(
+            c.obj["severity_text"], "ERROR",
+            "the client spelling is preserved verbatim"
+        );
+    }
+
+    #[test]
     fn out_of_ladder_client_severity_falls_through() {
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":42}"#,
         );
         assert!(!c.obj.contains_key("severity"));
         assert!(codes(&c).contains(&"severity.unmapped"));
+    }
+
+    #[test]
+    fn unmappable_client_severity_is_never_deleted() {
+        // Neither an out-of-ladder integer nor an unknown token may vanish
+        // from the stored event: the value stays queryable as severity_text.
+        for (input, expected) in [("42", "42"), ("0", "0"), (r#""SPICY""#, "SPICY")] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":{input}}}"#
+            ));
+            assert!(
+                !c.obj.contains_key("severity"),
+                "unmappable severity must be OMITTED (NULL): {input}"
+            );
+            assert_eq!(
+                c.obj["severity_text"], expected,
+                "severity {input} must survive as severity_text"
+            );
+            assert!(codes(&c).contains(&"severity.unmapped"), "input {input}");
+        }
+    }
+
+    #[test]
+    fn ladder_client_severity_is_not_echoed_as_text() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":17}"#,
+        );
+        assert_eq!(c.obj["severity"], 17);
+        assert!(
+            !c.obj.contains_key("severity_text"),
+            "a ladder numeral is not a label, got {:?}",
+            c.obj.get("severity_text")
+        );
+    }
+
+    #[test]
+    fn severity_text_wins_over_string_severity_for_the_label() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":"ERROR","severity_text":"warn"}"#,
+        );
+        assert_eq!(c.obj["severity"], 17, "severity leads the derivation");
+        assert_eq!(
+            c.obj["severity_text"], "warn",
+            "the dedicated text field still owns the label"
+        );
     }
 
     #[test]

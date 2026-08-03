@@ -46,9 +46,10 @@ natively, which is preferred.
 
 ### Severity tokens
 
-`severity_text` (or `level`) values are matched case-insensitively against
-this table; anything else leaves `severity` NULL with the
-`severity.unmapped` repair code (never a rejection):
+`severity`, `severity_text` and `level` values are matched
+case-insensitively against this table; anything else leaves `severity`
+NULL with the `severity.unmapped` repair code (never a rejection) and is
+preserved as `severity_text`:
 
 | tokens | number |
 |---|---|
@@ -65,7 +66,12 @@ this table; anything else leaves `severity` NULL with the
 Syslog numerics 0-7 are accepted and **inverted** onto the OTel ladder
 (syslog counts down from Emergency 0): 7→5, 6→9, 5→10, 4→13, 3→17, 2→21,
 1→23, 0→24. A client-supplied integer `severity` in 1-24 always wins;
-then `severity_text`; then `level`.
+then a string `severity` (`{"severity":"ERROR"}`, the GCP/Stackdriver
+shape); then `severity_text`; then `level`. An **integer** `severity` is
+only ever read on the OTel ladder — never syslog-inverted, because `0` is
+OTel's UNSPECIFIED as readily as it is syslog's Emergency — so an
+out-of-ladder integer maps to nothing and is kept as `severity_text`
+rather than guessed at.
 
 ### env
 
