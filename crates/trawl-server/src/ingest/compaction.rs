@@ -1698,6 +1698,170 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
     })
 }
 
+/// Which corpus a [`ConformPlan`] is being built over. The two conform
+/// sites agree on every rule except these, so the difference is named
+/// rather than duplicated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConformPolicy {
+    /// A freshly-read WAL batch (compaction). `_time`/`_ingested` pass
+    /// through untouched — the ADR-0008 repair ladder already made them
+    /// TIMESTAMP and they must never be re-cast — and a column with NO pin
+    /// (an all-null unpinned column whose pin deferred) is DROPPED:
+    /// `union_by_name` reads an absent column as NULL, and writing typed
+    /// NULLs would let a silent field pre-empt its own real type.
+    WalBatch,
+    /// A standing parquet file (boot conformance pass). Every column is
+    /// conformed, `_time` included — a legacy file whose timestamp column
+    /// is mistyped is exactly what that pass exists to fix — and a column
+    /// with no pin is kept verbatim (pins cover every scanned field, so
+    /// this is unreachable in practice).
+    StandingFile,
+}
+
+/// One column the plan will `TRY_CAST`.
+struct CastEntry {
+    name: String,
+    dtype: String,
+    pin: CanonicalType,
+    expr: String,
+}
+
+/// The per-column select list that conforms a source to the pins, plus the
+/// bookkeeping needed to tally what the casts nulled.
+///
+/// Shared by compaction (conforming `wal_batch` in place) and the boot pass
+/// (rewriting a standing parquet file): both build the same select list from
+/// [`conform_expr`] and record the same [`FieldConflict`] evidence, and only
+/// differ in where the rows come from ([`ConformPlan::tally_conflicts`]'s
+/// `source`) and how the result is applied.
+pub(crate) struct ConformPlan {
+    /// Per-column SELECT expressions, in schema order.
+    pub(crate) select_list: Vec<String>,
+    /// The RETAINED column names — the post-conform column set, so
+    /// bookkeeping can never claim a service carried a field no parquet
+    /// file holds.
+    pub(crate) retained: Vec<String>,
+    /// Columns omitted from the output because their pin deferred.
+    pub(crate) dropped: Vec<String>,
+    casts: Vec<CastEntry>,
+}
+
+impl ConformPlan {
+    /// Plan the conform of `schema` against `pins` under `policy`.
+    pub(crate) fn build(
+        schema: &[ColInfo],
+        pins: &HashMap<String, CanonicalType>,
+        policy: ConformPolicy,
+    ) -> Self {
+        let mut plan = Self {
+            select_list: Vec::with_capacity(schema.len()),
+            retained: Vec::with_capacity(schema.len()),
+            dropped: Vec::new(),
+            casts: Vec::new(),
+        };
+        for col in schema {
+            let quoted = quote_ident(&col.name);
+            if policy == ConformPolicy::WalBatch
+                && trawl_core::schema::TIMESTAMP_COLUMNS.contains(&col.name.as_str())
+            {
+                plan.keep(col, quoted);
+                continue;
+            }
+            match pins.get(&col.name).copied() {
+                None if policy == ConformPolicy::WalBatch => plan.dropped.push(col.name.clone()),
+                None => plan.keep(col, quoted),
+                Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
+                    None => plan.keep(col, quoted),
+                    Some(expr) => {
+                        plan.select_list.push(format!("{expr} AS {quoted}"));
+                        plan.retained.push(col.name.clone());
+                        plan.casts.push(CastEntry {
+                            name: col.name.clone(),
+                            dtype: col.dtype.clone(),
+                            pin,
+                            expr,
+                        });
+                    }
+                },
+            }
+        }
+        plan
+    }
+
+    /// Pass one column through untouched.
+    fn keep(&mut self, col: &ColInfo, quoted: String) {
+        self.select_list.push(quoted);
+        self.retained.push(col.name.clone());
+    }
+
+    /// Whether the plan rewrites anything at all.
+    pub(crate) fn is_noop(&self) -> bool {
+        self.casts.is_empty() && self.dropped.is_empty()
+    }
+
+    /// How many columns the plan casts (a no-cast plan can still drop
+    /// columns, so this is not the inverse of [`Self::is_noop`]).
+    pub(crate) fn cast_count(&self) -> usize {
+        self.casts.len()
+    }
+
+    /// Tally, in ONE aggregate pass over `source` (a FROM-clause source
+    /// expression), what each cast would null — necessarily BEFORE the plan
+    /// is applied, since applying it destroys the pre-cast values.
+    ///
+    /// A conflict is one row per cast column that had at least one non-null
+    /// value and either nulled rows or carried a concrete (non-JSON)
+    /// disagreeing type. An all-null pinned column (e.g. a batch with no
+    /// `_repairs`) casts silently — that is representation, not
+    /// disagreement — and a JSON source that converts fully is honest
+    /// convergence. Both are noise, not conflicts.
+    pub(crate) fn tally_conflicts(
+        &self,
+        conn: &duckdb::Connection,
+        source: &str,
+        service: &str,
+    ) -> Result<Vec<FieldConflict>, String> {
+        if self.casts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stats_sql = format!(
+            "SELECT {} FROM {source}",
+            self.casts
+                .iter()
+                .map(|c| {
+                    let q = quote_ident(&c.name);
+                    format!("count({q})::BIGINT, count({})::BIGINT", c.expr)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let stats: Vec<(i64, i64)> = conn
+            .query_row(&stats_sql, [], |row| {
+                let mut out = Vec::with_capacity(self.casts.len());
+                for i in 0..self.casts.len() {
+                    out.push((row.get::<_, i64>(2 * i)?, row.get::<_, i64>(2 * i + 1)?));
+                }
+                Ok(out)
+            })
+            .map_err(|e| format!("conform stats query failed: {e}"))?;
+
+        let mut conflicts = Vec::new();
+        for (cast, (non_null, ok)) in self.casts.iter().zip(&stats) {
+            let rows_nulled = u64::try_from(non_null - ok).unwrap_or(0);
+            if *non_null > 0 && (cast.dtype != "JSON" || rows_nulled > 0) {
+                conflicts.push(FieldConflict {
+                    field: cast.name.clone(),
+                    service: service.to_owned(),
+                    observed_type: cast.dtype.clone(),
+                    expected_type: cast.pin,
+                    rows_nulled,
+                });
+            }
+        }
+        Ok(conflicts)
+    }
+}
+
 /// Blocking phase 3: conform `wal_batch` to the authoritative pins, then
 /// write parquet exactly as before (canonical `{service}.parquet` per
 /// hour-directory, merge with the existing file when present, `.tmp` +
@@ -1812,139 +1976,44 @@ fn conform_and_write(
     })
 }
 
-/// Conform `wal_batch` to the pins in place.
+/// Conform `wal_batch` to the pins in place, per [`ConformPolicy::WalBatch`].
 ///
-/// Per column: `_time`/`_ingested` pass through (the ADR-0008 repair
-/// ladder made them TIMESTAMP already, and they must never be re-cast);
-/// a column whose observed type matches its pin passes through; a
-/// mismatch is `TRY_CAST` to the pin (see [`conform_expr`]); a column with
-/// NO pin — an all-null unpinned column whose pin deferred — is dropped
-/// from this batch's output (`union_by_name` reads an absent column as
-/// NULL, and writing typed NULLs would let a silent field pre-empt its own
-/// real type).
-///
-/// Returns the recordable conflicts and the RETAINED column names.
-///
-/// Conflicts are one row per cast column that had at least one non-null
-/// value and either nulled rows or carried a concrete (non-JSON)
-/// disagreeing type. An all-null pinned column (e.g. a batch with no
-/// `_repairs`) casts silently — that is representation, not disagreement.
-///
-/// The retained names are the post-conform column set — the dropped
-/// deferred-pin columns are absent, so bookkeeping can never claim a
-/// service carried a field no parquet file holds.
+/// Returns the recordable conflicts (see [`ConformPlan::tally_conflicts`])
+/// and the RETAINED column names.
 fn conform_wal_batch(
     conn: &duckdb::Connection,
     schema: &[ColInfo],
     pins: &HashMap<String, CanonicalType>,
     service: &str,
 ) -> Result<(Vec<FieldConflict>, Vec<String>), String> {
-    struct CastEntry {
-        name: String,
-        dtype: String,
-        pin: CanonicalType,
-        expr: String,
-    }
-
-    let mut select_list: Vec<String> = Vec::with_capacity(schema.len());
-    let mut retained: Vec<String> = Vec::with_capacity(schema.len());
-    let mut casts: Vec<CastEntry> = Vec::new();
-    let mut dropped: Vec<&str> = Vec::new();
-
-    for col in schema {
-        let quoted = quote_ident(&col.name);
-        if trawl_core::schema::TIMESTAMP_COLUMNS.contains(&col.name.as_str()) {
-            select_list.push(quoted);
-            retained.push(col.name.clone());
-            continue;
-        }
-        match pins.get(&col.name) {
-            None => dropped.push(&col.name),
-            Some(pin) => match conform_expr(&quoted, &col.dtype, *pin) {
-                None => {
-                    select_list.push(quoted);
-                    retained.push(col.name.clone());
-                }
-                Some(expr) => {
-                    select_list.push(format!("{expr} AS {quoted}"));
-                    retained.push(col.name.clone());
-                    casts.push(CastEntry {
-                        name: col.name.clone(),
-                        dtype: col.dtype.clone(),
-                        pin: *pin,
-                        expr,
-                    });
-                }
-            },
-        }
-    }
-
-    if select_list.is_empty() {
+    let plan = ConformPlan::build(schema, pins, ConformPolicy::WalBatch);
+    if plan.select_list.is_empty() {
         return Err("conform produced an empty column list".to_owned());
     }
 
-    // One aggregate pass tallies the nulled rows per cast column BEFORE the
-    // table is replaced.
-    let mut conflicts = Vec::new();
-    if !casts.is_empty() {
-        let stats_sql = format!(
-            "SELECT {} FROM wal_batch",
-            casts
-                .iter()
-                .map(|c| {
-                    let q = quote_ident(&c.name);
-                    format!("count({q})::BIGINT, count({})::BIGINT", c.expr)
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let stats: Vec<(i64, i64)> = conn
-            .query_row(&stats_sql, [], |row| {
-                let mut out = Vec::with_capacity(casts.len());
-                for i in 0..casts.len() {
-                    out.push((row.get::<_, i64>(2 * i)?, row.get::<_, i64>(2 * i + 1)?));
-                }
-                Ok(out)
-            })
-            .map_err(|e| format!("conform stats query failed: {e}"))?;
+    // Tallied BEFORE the table is replaced.
+    let conflicts = plan.tally_conflicts(conn, "wal_batch", service)?;
 
-        for (cast, (non_null, ok)) in casts.iter().zip(&stats) {
-            let rows_nulled = u64::try_from(non_null - ok).unwrap_or(0);
-            // A cast over zero values is representation of absence; a JSON
-            // source that converts fully is honest convergence. Both are
-            // noise, not conflicts.
-            if *non_null > 0 && (cast.dtype != "JSON" || rows_nulled > 0) {
-                conflicts.push(FieldConflict {
-                    field: cast.name.clone(),
-                    service: service.to_owned(),
-                    observed_type: cast.dtype.clone(),
-                    expected_type: cast.pin,
-                    rows_nulled,
-                });
-            }
-        }
-    }
-
-    if !dropped.is_empty() {
+    if !plan.dropped.is_empty() {
         tracing::info!(
             event_type = "catalog_pin_deferred",
             compact_service = %service,
-            columns = ?dropped,
+            columns = ?plan.dropped,
             "all-null unpinned columns deferred (absent from this file)"
         );
     }
 
-    if !casts.is_empty() || !dropped.is_empty() {
+    if !plan.is_noop() {
         conn.execute_batch(&format!(
             "CREATE TABLE wal_conformed AS SELECT {} FROM wal_batch; \
              DROP TABLE wal_batch; \
              ALTER TABLE wal_conformed RENAME TO wal_batch",
-            select_list.join(", ")
+            plan.select_list.join(", ")
         ))
         .map_err(|e| format!("catalog conform failed: {e}"))?;
     }
 
-    Ok((conflicts, retained))
+    Ok((conflicts, plan.retained))
 }
 
 /// Test-only convenience wrapper: prepare + local pins + conform/write,

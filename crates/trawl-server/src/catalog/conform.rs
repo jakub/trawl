@@ -52,7 +52,7 @@ use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb
 
 use super::FieldCatalog;
 use crate::ingest::compaction::{
-    ColInfo, conform_expr, describe_source, is_valid_parquet, quote_ident,
+    ColInfo, ConformPlan, ConformPolicy, describe_source, is_valid_parquet, quote_ident,
 };
 use crate::store::{CatalogStore, FieldConflict, PinProposal};
 
@@ -608,70 +608,28 @@ fn rewrite_file(
     file: &FileScan,
     pins: &HashMap<String, CanonicalType>,
 ) -> Result<Option<Vec<FieldConflict>>, String> {
-    struct CastEntry {
-        name: String,
-        dtype: String,
-        pin: CanonicalType,
-        expr: String,
-    }
-    let mut select_list: Vec<String> = Vec::with_capacity(file.schema.len());
-    let mut casts: Vec<CastEntry> = Vec::new();
-    let mut has_time = false;
-    for col in &file.schema {
-        if col.name == trawl_core::schema::TIME {
-            has_time = true;
-        }
-        let quoted = quote_ident(&col.name);
-        match pins.get(&col.name).copied() {
-            None => select_list.push(quoted), // unpinnable? pins cover all scanned fields
-            Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
-                None => select_list.push(quoted),
-                Some(expr) => {
-                    select_list.push(format!("{expr} AS {quoted}"));
-                    casts.push(CastEntry {
-                        name: col.name.clone(),
-                        dtype: col.dtype.clone(),
-                        pin,
-                        expr,
-                    });
-                }
-            },
-        }
-    }
-    if casts.is_empty() {
+    let plan = ConformPlan::build(&file.schema, pins, ConformPolicy::StandingFile);
+    if plan.cast_count() == 0 {
         return Ok(None);
     }
 
     let safe = file.path.to_string_lossy().replace('\'', "''");
-    // Tally the nulled rows before rewriting.
-    let stats_sql = format!(
-        "SELECT {} FROM read_parquet('{safe}')",
-        casts
-            .iter()
-            .map(|c| {
-                let q = quote_ident(&c.name);
-                format!("count({q})::BIGINT, count({})::BIGINT", c.expr)
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let stats: Vec<(i64, i64)> = conn
-        .query_row(&stats_sql, [], |row| {
-            let mut out = Vec::with_capacity(casts.len());
-            for i in 0..casts.len() {
-                out.push((row.get::<_, i64>(2 * i)?, row.get::<_, i64>(2 * i + 1)?));
-            }
-            Ok(out)
-        })
-        .map_err(|e| format!("conform stats failed: {e}"))?;
+    let source = format!("read_parquet('{safe}')");
+    // Tally the nulled rows before rewriting: the rewrite destroys the
+    // pre-cast values this evidence is drawn from.
+    let conflicts = plan.tally_conflicts(conn, &source, &file.service)?;
 
+    let has_time = file
+        .schema
+        .iter()
+        .any(|c| c.name == trawl_core::schema::TIME);
     let order = if has_time { " ORDER BY \"_time\"" } else { "" };
     let tmp = file.path.with_extension("parquet.tmp");
     conn.execute_batch(&format!(
-        "COPY (SELECT {} FROM read_parquet('{safe}'){order}) TO '{}' \
+        "COPY (SELECT {} FROM {source}{order}) TO '{}' \
          (FORMAT PARQUET, COMPRESSION SNAPPY, \
           BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
-        select_list.join(", "),
+        plan.select_list.join(", "),
         tmp.to_string_lossy().replace('\'', "''"),
     ))
     .map_err(|e| format!("conform rewrite failed: {e}"))?;
@@ -679,23 +637,10 @@ fn rewrite_file(
     tracing::info!(
         event_type = "catalog_conform_rewrite",
         file = %file.path.display(),
-        columns = casts.len(),
+        columns = plan.cast_count(),
         "rewrote nonconforming parquet file to match the catalog"
     );
 
-    let mut conflicts = Vec::new();
-    for (cast, (non_null, ok)) in casts.iter().zip(&stats) {
-        let rows_nulled = u64::try_from(non_null - ok).unwrap_or(0);
-        if *non_null > 0 && (cast.dtype != "JSON" || rows_nulled > 0) {
-            conflicts.push(FieldConflict {
-                field: cast.name.clone(),
-                service: file.service.clone(),
-                observed_type: cast.dtype.clone(),
-                expected_type: cast.pin,
-                rows_nulled,
-            });
-        }
-    }
     Ok(Some(conflicts))
 }
 
