@@ -181,23 +181,6 @@ pub fn emit_with_hot_source(
     })
 }
 
-/// Emit a hot+cold union query with `varchar_cols` coerced to VARCHAR on
-/// both sides.
-///
-/// The executor calls this to retry a query whose hot+cold union failed on
-/// a column type conflict, coercing the conflicting columns so both the hot
-/// and cold rows survive instead of dropping the cold side.
-pub fn emit_with_hot_source_coerced(
-    query: &Query,
-    source: &str,
-    hot_source: &str,
-    varchar_cols: &[String],
-) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || {
-        EmitterState::with_hot_source_coerced(source, hot_source, varchar_cols)
-    })
-}
-
 /// Emit the query, and — when text search bound `_raw` — a second time with
 /// the column replaced by a typed NULL, stored as
 /// [`EmittedQuery::raw_free_sql`] for the executor's fallback.
@@ -1406,61 +1389,29 @@ mod tests {
         // the shape the coerced path emits for zero coercions: plain cold
         // select, hot side with only the two timestamp TRY_CASTs.
         let query = parser::parse("service=nginx").unwrap();
-        let plain = emit_with_hot_source(
+        let sql = emit_with_hot_source(
             &query,
             SRC,
             "/tmp/hot_abc123.ndjson",
             &crate::schema::FieldTypes::new(),
         )
-        .unwrap();
-        let coerced =
-            emit_with_hot_source_coerced(&query, SRC, "/tmp/hot_abc123.ndjson", &[]).unwrap();
-        assert_eq!(plain.sql, coerced.sql);
-    }
-
-    #[test]
-    fn hot_source_coerced_empty_matches_plain() {
-        // The empty-coercion path must be byte-identical to the plain hot
-        // source so the common case is unchanged.
-        let query = parser::parse("service=nginx").unwrap();
-        let plain = emit_with_hot_source(
-            &query,
-            SRC,
-            "/tmp/hot_abc123.ndjson",
-            &crate::schema::FieldTypes::new(),
-        )
-        .unwrap();
-        let coerced =
-            emit_with_hot_source_coerced(&query, SRC, "/tmp/hot_abc123.ndjson", &[]).unwrap();
-        assert_eq!(plain.sql, coerced.sql);
-    }
-
-    #[test]
-    fn hot_source_coerced_casts_columns_both_sides() {
-        let query = parser::parse("*").unwrap();
-        let cols = vec!["status".to_string(), "containerID".to_string()];
-        let sql = emit_with_hot_source_coerced(&query, SRC, "/tmp/hot_abc123.ndjson", &cols)
-            .unwrap()
-            .sql;
-        // Cold (parquet) side casts the conflicting columns to VARCHAR.
+        .unwrap()
+        .sql;
         assert!(
-            sql.contains(r#"REPLACE (CAST("status" AS VARCHAR) AS "status""#),
-            "cold side should cast status: {sql}"
+            sql.contains("(SELECT * FROM read_parquet("),
+            "cold branch must be plain: {sql}"
         );
         assert!(
-            sql.contains(r#"CAST("containerID" AS VARCHAR) AS "containerID""#),
-            "should cast containerID: {sql}"
+            sql.contains(
+                r#"REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested") FROM read_json("#
+            ),
+            "hot branch must carry exactly the two timestamp TRY_CASTs \
+             (TRY_CAST — the partition key is never hard-CAST, ADR-0008): {sql}"
         );
-        // Hot side keeps the casts for BOTH envelope timestamp columns
-        // (TRY_CAST — the partition key is never hard-CAST, ADR-0008)
-        // and adds the VARCHAR casts.
-        assert!(
-            sql.contains(r#"TRY_CAST("_time" AS TIMESTAMP) AS "_time""#),
-            "hot side keeps _time TRY_CAST: {sql}"
-        );
-        assert!(
-            sql.contains(r#"TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested""#),
-            "hot side keeps _ingested TRY_CAST: {sql}"
+        assert_eq!(
+            sql.matches("REPLACE").count(),
+            1,
+            "empty pins must add no further REPLACE entries: {sql}"
         );
     }
 

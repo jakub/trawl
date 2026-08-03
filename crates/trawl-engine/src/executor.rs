@@ -111,16 +111,14 @@ impl Executor {
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, pins)?;
         let mut outcome = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
 
-        // A column type conflict between the hot and cold sources (e.g. a
-        // field that is BIGINT in parquet but VARCHAR in the hot snapshot)
-        // would otherwise fail the union. Retry with the conflicting columns
-        // coerced to VARCHAR on both sides, preserving hot AND cold data. A
-        // failure that survives to the outcome policy below returns the error
-        // whenever cold files exist — a cold-data drop is never silent.
-        if let Some(cols) = self.hot_cold_conflict_columns(&outcome, source, hot_source) {
-            let coerced = emitter::emit_with_hot_source_coerced(&ast, source, hot_source, &cols)?;
-            outcome = self.execute_emitted(&coerced, max_rows, utc_offset_secs);
-        }
+        // A hot value disagreeing with a catalog pin is already conformed on
+        // the union's hot branch by the emitter (TRY_CAST to NULL), and
+        // parquet is write-time conformant — so a type conflict surviving to
+        // here means a nonconformant corpus (foreign parquet dropped in
+        // post-boot, restore against a stale catalog) and falls through to
+        // the outcome policy below as a loud error whenever cold files
+        // exist. The read-time coerced retry that used to paper over it is
+        // deleted (ADR-0009 slice 2).
 
         // `execute_emitted` maps DuckDB's "no files match the pattern" error
         // to an empty result. For a LIST source that error also fires when a
@@ -131,21 +129,11 @@ impl Executor {
         // pointing at hour dirs holding no file of its own. Retry over just
         // the elements that match a file, so the cold rows that do exist are
         // never silently dropped (ADR-0008).
-        //
-        // The pruned read is the FIRST one that actually touches the cold
-        // files, so it is also the first that can hit a hot/cold schema
-        // conflict — it gets the same coerced retry, or a repairable conflict
-        // would fall through to the outcome policy and hard-error.
         if matches!(&outcome, Ok(r) if r.columns.is_empty())
             && let Some(pruned) = self.pruned_cold_source(source)
         {
             let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins)?;
             outcome = self.execute_emitted(&pruned_emitted, max_rows, utc_offset_secs);
-            if let Some(cols) = self.hot_cold_conflict_columns(&outcome, &pruned, hot_source) {
-                let coerced =
-                    emitter::emit_with_hot_source_coerced(&ast, &pruned, hot_source, &cols)?;
-                outcome = self.execute_emitted(&coerced, max_rows, utc_offset_secs);
-            }
         }
 
         // Classify the (possibly retried) outcome, then route on the pure
@@ -335,77 +323,6 @@ impl Executor {
             out.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
         }
         Ok(out)
-    }
-
-    /// The columns to coerce when `outcome` failed on a repairable hot/cold
-    /// schema conflict, or `None` when it is not one.
-    ///
-    /// The `Conversion` class is only the cheap pre-filter: a genuine
-    /// data-conversion error carries it too. What makes this a *schema*
-    /// conflict is the evidence — at least one column the two sources describe
-    /// differently — so the conflicting columns are gathered first and
-    /// `is_union_type_conflict` is asked with them in hand. A data error yields
-    /// none, is not misread as a conflict, and skips the retry that could not
-    /// have helped it (ADR-0008).
-    ///
-    /// Asked of every cold source the union is executed over — the original one
-    /// and, when the list prune narrows it, the pruned one too: the pruned read
-    /// is the first that actually touches the cold files, so it is the first
-    /// that can raise the conflict at all.
-    ///
-    /// Generic over the success type so the query path (`QueryResult`) and the
-    /// parquet export path (`()`) share one classifier: only the error arm is
-    /// inspected, and both paths must repair the same conflict.
-    fn hot_cold_conflict_columns<T>(
-        &self,
-        outcome: &Result<T, EngineError>,
-        source: &str,
-        hot_source: &str,
-    ) -> Option<Vec<String>> {
-        match outcome {
-            Err(EngineError::Database(e)) if is_conversion_error(e) => self
-                .hot_cold_conflicts(source, hot_source)
-                .ok()
-                .filter(|cols| is_union_type_conflict(e, cols)),
-            _ => None,
-        }
-    }
-
-    /// Find columns shared by the cold (parquet) and hot (ndjson) sources
-    /// whose inferred types differ — the columns that must be coerced to
-    /// VARCHAR for the hot+cold `UNION ALL BY NAME` to bind.
-    ///
-    /// Returns an error (caught by the caller, which then falls back to
-    /// hot-only) if either source cannot be described — e.g. on cold start
-    /// with no parquet files.
-    fn hot_cold_conflicts(
-        &self,
-        source: &str,
-        hot_source: &str,
-    ) -> Result<Vec<String>, EngineError> {
-        let cold_reader = emitter::source_reader(source)?;
-        let hot_reader = emitter::hot_source_reader(hot_source)?;
-
-        let cold = self.describe_types(&format!("SELECT * FROM {cold_reader}"))?;
-        // Describe the hot side with the same timestamp casts the union
-        // applies — BOTH envelope TIMESTAMP columns (`_time`, `_ingested`,
-        // trawl_core::schema::TIMESTAMP_COLUMNS) — so the always-TIMESTAMP
-        // keys aren't flagged as conflicts.
-        let replace_list = trawl_core::schema::TIMESTAMP_COLUMNS
-            .iter()
-            .map(|col| format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let hot = self.describe_types(&format!(
-            "SELECT * REPLACE ({replace_list}) FROM {hot_reader}"
-        ))?;
-
-        let hot_types: std::collections::HashMap<String, String> = hot.into_iter().collect();
-        Ok(cold
-            .into_iter()
-            .filter(|(name, ty)| hot_types.get(name).is_some_and(|h| h != ty))
-            .map(|(name, _)| name)
-            .collect())
     }
 
     /// Describe the schema without reading row data.
@@ -711,12 +628,13 @@ impl Executor {
 
     /// Export with hot buffer union, falling back to hot-only on cold start.
     ///
-    /// Routes through the same retries and the same outcome gate as
-    /// [`Self::run_query_with_hot`]: a repairable hot/cold type conflict is
-    /// retried with the conflicting columns coerced to VARCHAR, a partial
-    /// list-source miss is retried over the pruned list, and a database failure
-    /// over an existing cold corpus returns the error instead of silently
-    /// exporting hot-only data (ADR-0008).
+    /// Routes through the same retry and the same outcome gate as
+    /// [`Self::run_query_with_hot`]: the hot branch is pin-conformed by the
+    /// emitter (a nonconformant corpus errors loudly — see the note in
+    /// `run_query_with_hot`), a partial list-source miss is retried over the
+    /// pruned list, and a database failure over an existing cold corpus
+    /// returns the error instead of silently exporting hot-only data
+    /// (ADR-0008).
     #[allow(clippy::too_many_arguments)]
     pub fn export_parquet_with_hot(
         &self,
@@ -731,18 +649,6 @@ impl Executor {
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, pins)?;
         let mut outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
-        // Same coerced retry as `run_query_with_hot`: a column typed
-        // differently in parquet and in the hot snapshot fails the union with a
-        // `Conversion` error. Retry with the conflicting columns cast to
-        // VARCHAR on both sides so the export keeps hot AND cold data. Without
-        // it the outcome gate below returns the error whenever cold files exist
-        // — the same query would succeed as CSV/JSON (which route through the
-        // query path) and fail as parquet.
-        if let Some(cols) = self.hot_cold_conflict_columns(&outcome, source, hot_source) {
-            let coerced = emitter::emit_with_hot_source_coerced(&ast, source, hot_source, &cols)?;
-            outcome = self.export_parquet_from_emitted(&coerced, output_path, max_rows);
-        }
-
         // Same prune retry as `run_query_with_hot`: `read_parquet` rejects a
         // LIST source wholesale when a SINGLE element matches nothing, even
         // when its siblings hold data. The server emits one glob per hour in
@@ -754,21 +660,11 @@ impl Executor {
         // matching sibling makes `cold_files_present` true). Retry over just
         // the elements that match a file so the cold rows that do exist are
         // exported (ADR-0008).
-        //
-        // The pruned read is the FIRST one that actually touches the cold
-        // files, so it is also the first that can hit a hot/cold schema
-        // conflict — it gets the same coerced retry, or a repairable conflict
-        // would fall through to the outcome gate and hard-error.
         if matches!(&outcome, Err(EngineError::Database(e)) if is_no_files_error(e))
             && let Some(pruned) = self.pruned_cold_source(source)
         {
             let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins)?;
             outcome = self.export_parquet_from_emitted(&pruned_emitted, output_path, max_rows);
-            if let Some(cols) = self.hot_cold_conflict_columns(&outcome, &pruned, hot_source) {
-                let coerced =
-                    emitter::emit_with_hot_source_coerced(&ast, &pruned, hot_source, &cols)?;
-                outcome = self.export_parquet_from_emitted(&coerced, output_path, max_rows);
-            }
         }
 
         match outcome {
@@ -1071,31 +967,13 @@ fn error_class(msg: &str) -> Option<&str> {
 /// conflict: a genuine data-conversion error (`CAST('abc' AS INTEGER)`)
 /// carries the very same class, and no substring of the body separates the
 /// two either — both shapes say a value "can't be cast to the destination
-/// type" and both name a "source column". Callers that must not confuse the
-/// two ask [`is_union_type_conflict`], which additionally requires schema
-/// evidence.
+/// type" and both name a "source column".
 ///
 /// Deliberately does NOT match corruption ("too small to be a Parquet
 /// file") or missing-column binder errors: those are handled by quarantine
 /// and the benign-binder carve-out respectively.
 pub fn is_conversion_error(e: &duckdb::Error) -> bool {
     error_class(&e.to_string()) == Some("Conversion")
-}
-
-/// Check if a `DuckDB` failure is a union *type conflict*: two sources
-/// disagreeing on a column's type, which a cast-to-`VARCHAR` retry can fix.
-///
-/// The error class alone cannot decide this — a genuine data-conversion
-/// error (a VALUE that cannot be converted, e.g. `CAST('abc' AS INTEGER)`)
-/// is `Conversion`-class too, and the message body does not separate them
-/// (ADR-0008). So the classifier requires *evidence*: `conflicting_columns`
-/// is the set of columns whose described type actually differs between the
-/// two sources being unioned. A schema conflict always produces at least
-/// one; a data error produces none, so it is never misread as a schema
-/// conflict — it falls through to the caller's outcome policy, which returns
-/// the error rather than silently dropping cold data.
-fn is_union_type_conflict(e: &duckdb::Error, conflicting_columns: &[String]) -> bool {
-    is_conversion_error(e) && !conflicting_columns.is_empty()
 }
 
 /// Classification of the hot+cold union outcome that `run_query_with_hot`
@@ -1429,7 +1307,7 @@ mod tests {
 
     use super::{
         ColdAction, Executor, FieldTypes, HotColdOutcome, cold_action, error_class,
-        glob_list_items, is_complex_type, is_conversion_error, is_union_type_conflict,
+        glob_list_items, is_complex_type, is_conversion_error,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -1548,16 +1426,16 @@ mod tests {
     }
 
     #[test]
-    fn genuine_data_conversion_error_is_not_misread_as_a_union_type_conflict() {
-        let dir = tempfile::tempdir().unwrap();
+    fn genuine_data_conversion_error_carries_the_conversion_class() {
+        // The premise ADR-0008 rests on: neither the class token nor the
+        // message body can tell a value that cannot be converted from a
+        // schema that cannot be reconciled. Both are `Conversion`-class, and
+        // on the bundled 1.5.5 both bodies name a "source column" and talk
+        // about casting to a "destination type". This is exactly why the
+        // read path no longer classifies conflicts at all (ADR-0009 slice 2
+        // deleted the coerced retry): the catalog enforces conformance at
+        // write time and any surviving Conversion error is loud.
         let data = data_conversion_error();
-
-        // The premise: neither the class token nor the message body can tell
-        // a value that cannot be converted from a schema that cannot be
-        // reconciled. Both are `Conversion`-class, and on the bundled 1.5.5
-        // both bodies name a "source column" and talk about casting to a
-        // "destination type". Anything keying off the error ALONE misreads
-        // this data error as a union type conflict.
         assert_eq!(
             error_class(&data.to_string()),
             Some("Conversion"),
@@ -1565,78 +1443,6 @@ mod tests {
         );
         assert!(is_conversion_error(&data));
         assert!(is_conversion_error(&union_conversion_error()));
-
-        // So the classifier requires EVIDENCE — the columns the two sources
-        // actually describe differently. A data error has none, and is
-        // therefore never misread as a union type conflict (ADR-0008).
-        assert!(
-            !is_union_type_conflict(&data, &[]),
-            "a data-conversion error with no conflicting column must NOT \
-             classify as a union type conflict: {data}"
-        );
-
-        // The same evidence classifies a real schema conflict as one...
-        let conflict = union_conversion_error();
-        assert!(
-            is_union_type_conflict(&conflict, &["meta".to_string()]),
-            "a conversion error over a genuinely drifted column IS a union \
-             type conflict: {conflict}"
-        );
-
-        // ...and evidence alone is not enough either: an unrelated failure
-        // does not become a type conflict just because the schemas drift.
-        let corrupt = corruption_error(dir.path());
-        assert!(
-            !is_union_type_conflict(&corrupt, &["meta".to_string()]),
-            "corruption is not a type conflict even with drifted columns: {corrupt}"
-        );
-    }
-
-    #[test]
-    fn hot_cold_conflicts_separate_a_data_error_from_a_schema_conflict() {
-        // The evidence `is_union_type_conflict` consumes is not hand-made:
-        // prove it is empty for hot/cold sources that agree on every column
-        // (the situation a genuine data-conversion error arises in) and
-        // non-empty for sources that genuinely drift.
-        let dir = tempfile::tempdir().unwrap();
-        let setup = Connection::open_in_memory().unwrap();
-        setup
-            .execute_batch(&format!(
-                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
-                 'svc' AS service, 'abc' AS duration) TO '{}' (FORMAT PARQUET)",
-                dir.path().join("cold.parquet").display()
-            ))
-            .unwrap();
-        let exec = Executor::new().unwrap();
-        let source = format!("{}/*.parquet", dir.path().display());
-
-        // `duration` is VARCHAR on both sides — schemas agree.
-        let agreed = dir.path().join("agreed.ndjson");
-        std::fs::write(
-            &agreed,
-            "{\"_time\":\"2024-01-15T11:00:00Z\",\"_ingested\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":\"7\"}\n",
-        )
-        .unwrap();
-        assert!(
-            exec.hot_cold_conflicts(&source, agreed.to_str().unwrap())
-                .expect("describing matched sources must succeed")
-                .is_empty(),
-            "sources that agree on every column yield no conflict evidence"
-        );
-
-        // `duration` is VARCHAR cold but BIGINT hot — a real schema conflict.
-        let drifted = dir.path().join("drifted.ndjson");
-        std::fs::write(
-            &drifted,
-            "{\"_time\":\"2024-01-15T11:00:00Z\",\"_ingested\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":7}\n",
-        )
-        .unwrap();
-        assert_eq!(
-            exec.hot_cold_conflicts(&source, drifted.to_str().unwrap())
-                .expect("describing drifted sources must succeed"),
-            vec!["duration".to_string()],
-            "a column typed differently on each side is the conflict evidence"
-        );
     }
 
     #[test]

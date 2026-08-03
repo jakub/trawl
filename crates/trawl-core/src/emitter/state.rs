@@ -192,33 +192,6 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
     ))
 }
 
-/// Build the body of a `REPLACE (...)` clause casting `varchar_cols` to
-/// VARCHAR. When `with_timestamp` is set, the canonical casts for BOTH
-/// envelope TIMESTAMP columns (`_time`, `_ingested`) are prepended — the
-/// hot side always needs them to match parquet's TIMESTAMP, and a second
-/// TIMESTAMP column left VARCHAR would trip the union-conflict path on
-/// every query with a non-empty hot buffer. The timestamp columns are
-/// never coerced to VARCHAR — `_time` is the sort/partition key — and
-/// never hard-CAST either (ADR-0008): `TRY_CAST` degrades one malformed
-/// hot row to NULL instead of throwing the whole hot+cold union (which
-/// previously fell back to hot-only, silently dropping every cold row).
-fn varchar_replace_list(varchar_cols: &[String], with_timestamp: bool) -> String {
-    let mut parts = Vec::with_capacity(varchar_cols.len() + crate::schema::TIMESTAMP_COLUMNS.len());
-    if with_timestamp {
-        for col in crate::schema::TIMESTAMP_COLUMNS {
-            parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
-        }
-    }
-    for col in varchar_cols {
-        if crate::schema::TIMESTAMP_COLUMNS.contains(&col.as_str()) {
-            continue;
-        }
-        let q = super::fields::quote_field(col);
-        parts.push(format!("CAST({q} AS VARCHAR) AS {q}"));
-    }
-    parts.join(", ")
-}
-
 /// Conform expression for one pinned field on the hot branch, applied
 /// UNTYPED — the emitter has no `DESCRIBE`, so the expression must be valid
 /// whatever type `read_json` inferred for the column.
@@ -297,40 +270,6 @@ impl EmitterState {
 
         let composite = format!(
             "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
-             SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
-        );
-        Ok(Self::with_source(composite))
-    }
-
-    /// Like [`with_hot_source`], but additionally coerces `varchar_cols` to
-    /// VARCHAR on BOTH branches of the union.
-    ///
-    /// Used by the executor to retry a query whose hot+cold union failed on
-    /// a column type conflict (e.g. the same field is BIGINT in parquet but
-    /// VARCHAR in the hot snapshot). Coercing the conflicting columns on both
-    /// sides keeps the union valid, preserving hot AND cold rows instead of
-    /// the executor falling back to hot-only and dropping the cold side.
-    ///
-    /// With an empty `varchar_cols` this is byte-identical to the original
-    /// composite source.
-    pub(crate) fn with_hot_source_coerced(
-        primary: &str,
-        hot: &str,
-        varchar_cols: &[String],
-    ) -> Result<Self, super::EmitError> {
-        let primary_reader = build_reader(primary)?;
-        let hot_reader = hot_reader(hot)?;
-
-        let cold_replace = varchar_replace_list(varchar_cols, false);
-        let cold_select = if cold_replace.is_empty() {
-            format!("SELECT * FROM {primary_reader}")
-        } else {
-            format!("SELECT * REPLACE ({cold_replace}) FROM {primary_reader}")
-        };
-
-        let hot_replace = varchar_replace_list(varchar_cols, true);
-        let composite = format!(
-            "({cold_select} UNION ALL BY NAME \
              SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
         );
         Ok(Self::with_source(composite))
