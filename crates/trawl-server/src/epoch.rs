@@ -86,9 +86,13 @@ pub enum Outcome {
 /// touches the data root. Returns an error (refusing to start) for the
 /// ambiguous state or an unrecognized epoch.
 ///
-/// `wal_dir` is the *effective* WAL directory: when it lies outside the
-/// data root, the legacy-rename branch sets it aside too
-/// (`{wal_dir}.pre-schema-v2`) — parquet and WAL move together.
+/// `wal_dir` is the *effective* WAL directory. When it lies outside the
+/// data root it is not covered by any rename of that root, so every branch
+/// that ends with this node owning `data_root` handles it explicitly: the
+/// legacy-rename branch always sets it aside (`{wal_dir}.pre-schema-v2`) so
+/// parquet and WAL move together, and the branches that rename nothing set
+/// it aside only if it still holds pre-cutover flat `*.ndjson` files, which
+/// the env-directory-walking compactor could otherwise never see again.
 ///
 /// `ingest_enabled` gates the destructive branch: a node that writes no
 /// data does not own the directory `[data] path` points at, so it never
@@ -117,7 +121,12 @@ fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outc
 
     if !data_root.exists() {
         // Fresh install — or the crash-resume window between the
-        // set-aside rename and the fresh-root rename.
+        // set-aside rename and the fresh-root rename. An external WAL dir
+        // is not covered by either rename, so it is handled here; only a
+        // node that ingests owns it (same rule as the root itself).
+        if ingest_enabled {
+            set_aside_stranded_external_wal(data_root, wal_dir)?;
+        }
         create_fresh_root(data_root)?;
         return Ok(Outcome::FreshRoot);
     }
@@ -165,14 +174,19 @@ fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outc
             if !looks_like_trawl_root(data_root) {
                 // Nothing here says trawl wrote this directory: a
                 // pre-created empty root, a fresh mount (`lost+found`), or
-                // a mistyped path. Take the marker, move nothing.
+                // a mistyped path. Take the marker, move the root nowhere
+                // — but an external WAL dir is not part of this root, and
+                // pre-cutover files there would be stranded.
+                let external_wal_set_aside = set_aside_stranded_external_wal(data_root, wal_dir)?;
                 adopt_in_place(data_root)?;
                 tracing::info!(
                     event_type = "epoch_adopted_in_place",
                     path = %data_root.display(),
+                    external_wal_set_aside,
                     "data root holds no pre-cutover trawl data (no wal/, \
                      partition dir or parquet) — marked as epoch \
-                     {CURRENT_EPOCH} in place; nothing was set aside"
+                     {CURRENT_EPOCH} in place; the data root itself was \
+                     not renamed"
                 );
                 return Ok(Outcome::AdoptedInPlace);
             }
@@ -395,27 +409,7 @@ fn set_aside_legacy_root(
     // FIRST, so a crash after this rename still resumes correctly (the
     // data root is untouched, the branch re-runs, and the WAL set-aside
     // is a no-op because the source is gone).
-    let wal_is_external = !wal_dir.starts_with(data_root);
-    let mut external_wal_set_aside = false;
-    if wal_is_external && wal_dir.exists() {
-        let wal_aside = sibling_with_suffix(wal_dir, SET_ASIDE_SUFFIX);
-        if wal_aside.exists() {
-            return Err(format!(
-                "ambiguous WAL state: both {} and {} exist — refusing to \
-                 start rather than guess; move one aside manually",
-                wal_dir.display(),
-                wal_aside.display()
-            ));
-        }
-        std::fs::rename(wal_dir, &wal_aside).map_err(|e| {
-            format!(
-                "failed to set aside external WAL dir {} → {}: {e}",
-                wal_dir.display(),
-                wal_aside.display()
-            )
-        })?;
-        external_wal_set_aside = true;
-    }
+    let external_wal_set_aside = set_aside_external_wal(data_root, wal_dir)?;
 
     std::fs::rename(data_root, aside).map_err(|e| {
         format!(
@@ -445,6 +439,73 @@ fn set_aside_legacy_root(
         parquet_files,
         wal_files,
         external_wal_set_aside,
+    })
+}
+
+/// Rename an *external* WAL dir to `{wal_dir}.pre-schema-v2`. Returns
+/// whether anything moved; a WAL dir inside the data root rides the root
+/// rename instead and is left to it.
+fn set_aside_external_wal(data_root: &Path, wal_dir: &Path) -> Result<bool, String> {
+    if wal_dir.starts_with(data_root) || !wal_dir.exists() {
+        return Ok(false);
+    }
+    let wal_aside = sibling_with_suffix(wal_dir, SET_ASIDE_SUFFIX);
+    if wal_aside.exists() {
+        return Err(format!(
+            "ambiguous WAL state: both {} and {} exist — refusing to \
+             start rather than guess; move one aside manually",
+            wal_dir.display(),
+            wal_aside.display()
+        ));
+    }
+    std::fs::rename(wal_dir, &wal_aside).map_err(|e| {
+        format!(
+            "failed to set aside external WAL dir {} → {}: {e}",
+            wal_dir.display(),
+            wal_aside.display()
+        )
+    })?;
+    Ok(true)
+}
+
+/// The branches that rename nothing — fresh root and adopt-in-place — still
+/// owe an answer for an *external* WAL dir: it lives outside the root they
+/// left alone, so no other step of the cutover ever looks at it.
+///
+/// Pre-cutover WAL files sit flat at `{wal_dir}/*.ndjson`; epoch 2 puts
+/// every one under `{wal_dir}/{env}/`, and the compactor now iterates env
+/// directories only. A flat file left in place is therefore invisible
+/// forever: never compacted, never counted, never deleted — silent data
+/// loss plus an unbounded disk leak. Set such a dir aside with the same
+/// rename the legacy branch uses; a WAL dir that is empty or already in
+/// the epoch-2 env layout is left exactly as it is.
+fn set_aside_stranded_external_wal(data_root: &Path, wal_dir: &Path) -> Result<bool, String> {
+    if wal_dir.starts_with(data_root) || !has_flat_legacy_wal(wal_dir) {
+        return Ok(false);
+    }
+    let wal_aside = sibling_with_suffix(wal_dir, SET_ASIDE_SUFFIX);
+    let wal_files = count_files_with_ext(wal_dir, "ndjson");
+    set_aside_external_wal(data_root, wal_dir)?;
+    tracing::warn!(
+        event_type = "epoch_external_wal_set_aside",
+        set_aside = %wal_aside.display(),
+        wal_files,
+        "pre-schema-v2 WAL files found in the external WAL directory while \
+         the data root needed no rename — set aside (ADR-0009: legacy data \
+         is dropped from queries, not deleted); delete it manually to \
+         reclaim disk"
+    );
+    Ok(true)
+}
+
+/// Any `*.ndjson` directly under `wal_dir` — the pre-cutover flat layout.
+fn has_flat_legacy_wal(wal_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(wal_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.extension().is_some_and(|e| e == "ndjson") && path.is_file()
     })
 }
 
@@ -868,6 +929,103 @@ mod tests {
             std::fs::read(tmp.path().join("fast-wal.pre-schema-v2/svc_1_aa.ndjson")).unwrap(),
             b"wal bytes"
         );
+    }
+
+    #[test]
+    fn flat_external_wal_is_set_aside_even_when_the_root_is_fresh() {
+        // The compactor walks `{wal_dir}/{env}/` only, so a pre-cutover
+        // flat `*.ndjson` left in place would never be compacted, counted
+        // or deleted. A missing data root must not excuse leaving it.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = tmp.path().join("fast-wal");
+        std::fs::create_dir_all(&wal).unwrap();
+        std::fs::write(wal.join("svc_1_aa.ndjson"), b"wal bytes").unwrap();
+
+        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
+        assert_eq!(outcome, Outcome::FreshRoot);
+        assert_eq!(read_marker(&data), CURRENT_EPOCH);
+        assert!(!wal.exists(), "the stranded WAL dir moved aside");
+        assert_eq!(
+            std::fs::read(tmp.path().join("fast-wal.pre-schema-v2/svc_1_aa.ndjson")).unwrap(),
+            b"wal bytes"
+        );
+    }
+
+    #[test]
+    fn flat_external_wal_is_set_aside_when_the_root_is_adopted_in_place() {
+        // The narrow but real trigger: external wal_dir plus a data root
+        // whose first compaction never ran, so it carries no evidence.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("lost+found")).unwrap();
+        let wal = tmp.path().join("fast-wal");
+        std::fs::create_dir_all(&wal).unwrap();
+        std::fs::write(wal.join("svc_1_aa.ndjson"), b"wal bytes").unwrap();
+
+        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
+        assert_eq!(outcome, Outcome::AdoptedInPlace);
+        assert_eq!(read_marker(&data), CURRENT_EPOCH);
+        assert!(
+            !tmp.path().join("data.pre-schema-v2").exists(),
+            "the data root itself is still not renamed"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("fast-wal.pre-schema-v2/svc_1_aa.ndjson")).unwrap(),
+            b"wal bytes"
+        );
+
+        // Idempotent: the next boot is an ordinary epoch-2 boot.
+        std::fs::create_dir_all(&wal).unwrap();
+        let second = ensure_current_epoch(&data, &wal, true).unwrap();
+        assert_eq!(
+            second,
+            Outcome::Current {
+                aside_present: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_epoch_2_external_wal_dir_is_left_alone() {
+        // Files under `{wal_dir}/{env}/` are live epoch-2 WAL the compactor
+        // can see: a root that needs no rename must not touch them.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = tmp.path().join("fast-wal");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        std::fs::write(env_wal.join("svc_1_aa.ndjson"), b"live bytes").unwrap();
+
+        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
+        assert_eq!(outcome, Outcome::FreshRoot);
+        assert!(
+            !tmp.path().join("fast-wal.pre-schema-v2").exists(),
+            "live epoch-2 WAL is never set aside"
+        );
+        assert_eq!(
+            std::fs::read(env_wal.join("svc_1_aa.ndjson")).unwrap(),
+            b"live bytes"
+        );
+    }
+
+    #[test]
+    fn a_query_only_node_never_moves_the_wal_dir() {
+        // Ingest disabled: this node writes no WAL, so the dir is not its
+        // to move — same rule that defers the data-root cutover.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = tmp.path().join("fast-wal");
+        std::fs::create_dir_all(&wal).unwrap();
+        std::fs::write(wal.join("svc_1_aa.ndjson"), b"not ours").unwrap();
+
+        let outcome = ensure_current_epoch(&data, &wal, false).unwrap();
+        assert_eq!(outcome, Outcome::FreshRoot);
+        assert_eq!(
+            std::fs::read(wal.join("svc_1_aa.ndjson")).unwrap(),
+            b"not ours"
+        );
+        assert!(!tmp.path().join("fast-wal.pre-schema-v2").exists());
     }
 
     #[test]
