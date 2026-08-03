@@ -1110,7 +1110,7 @@ fn read_wal_to_table(
 /// (see [`build_wal_batch`]) instead of wedging forever.
 pub(super) const WAL_FILE_COL: &str = "_trawl_wal_file";
 
-/// SQL expression producing a never-NULL `_time` for a WAL row
+/// SQL expression producing a never-NULL TIMESTAMP `column` for a WAL row
 /// (ADR-0008: the partition key is never hard-CAST).
 ///
 /// Three arms: `TRY_CAST` the raw value (always succeeds on post-fix data,
@@ -1119,33 +1119,29 @@ pub(super) const WAL_FILE_COL: &str = "_trawl_wal_file";
 /// pre-fix wedged WAL with no operator step; else the compaction instant —
 /// a NULL partition key would sort first and fall outside every `last=Xh`
 /// filter, a silent failure of its own.
-fn timestamp_repair_expr(prov_col: &str) -> String {
+fn repair_expr(prov_col: &str, column: &str) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
     format!(
         "COALESCE(\
-             TRY_CAST(\"_time\" AS TIMESTAMP), \
+             TRY_CAST(\"{column}\" AS TIMESTAMP), \
              epoch_ms(TRY_CAST(regexp_extract({prov_col}, \
                  '_([0-9]+)_[0-9a-f]{{4}}\\.ndjson$', 1) AS BIGINT)), \
              TIMESTAMP '{now}'\
-         ) AS \"_time\""
+         ) AS \"{column}\""
     )
 }
 
-/// SQL expression producing a never-NULL TIMESTAMP `_ingested` for a WAL
-/// row — the same repair ladder as [`timestamp_repair_expr`], so the
-/// second envelope TIMESTAMP column can never wedge a batch or land as
-/// VARCHAR in parquet either. Ingest always stamps `_ingested`, so the
-/// fallback arms fire only on hand-written or damaged WAL.
-fn ingested_repair_expr(prov_col: &str) -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
-    format!(
-        "COALESCE(\
-             TRY_CAST(\"_ingested\" AS TIMESTAMP), \
-             epoch_ms(TRY_CAST(regexp_extract({prov_col}, \
-                 '_([0-9]+)_[0-9a-f]{{4}}\\.ndjson$', 1) AS BIGINT)), \
-             TIMESTAMP '{now}'\
-         ) AS \"_ingested\""
-    )
+/// Body of the `REPLACE (...)` clause repairing every envelope TIMESTAMP
+/// column (`trawl_core::schema::TIMESTAMP_COLUMNS`) with the same ladder,
+/// so neither can wedge a batch or land as VARCHAR in parquet. Ingest always
+/// stamps `_ingested`, so its fallback arms fire only on hand-written or
+/// damaged WAL.
+fn timestamp_repair_list(prov_col: &str) -> String {
+    trawl_core::schema::TIMESTAMP_COLUMNS
+        .iter()
+        .map(|column| repair_expr(prov_col, column))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Does this `read_json` error mean a projected column collided, rather than
@@ -1181,7 +1177,7 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 ///    written before ingest reserved the key), the same auto-detect read under
 ///    a randomized provenance name. Lossless: every user field survives, and
 ///    the row's literal `_trawl_wal_file` value lands in parquet as ordinary
-///    data — it never feeds [`timestamp_repair_expr`].
+///    data — it never feeds [`repair_expr`].
 /// 3. On a flatten collision (`Duplicate name`), an explicit column list with
 ///    `json` typed as opaque JSON. This keeps only the stable vector envelope
 ///    (plus `_repairs`): user fields outside it are dropped for the
@@ -1190,7 +1186,7 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 ///
 /// Any other read error is returned so the caller can isolate the offending
 /// file. A malformed `timestamp` is never fatal here: see
-/// [`timestamp_repair_expr`].
+/// [`repair_expr`].
 ///
 /// `sample_size=-1` (schema detection over every row, not `DuckDB`'s default
 /// ~20480-row prefix) is what keeps `_repairs` alive: it is sparse
@@ -1210,11 +1206,10 @@ fn build_wal_batch(
         .collect::<Vec<_>>()
         .join(", ");
     let auto_read = |prov_col: &str| {
-        let repair = timestamp_repair_expr(prov_col);
-        let ingested = ingested_repair_expr(prov_col);
+        let repair = timestamp_repair_list(prov_col);
         conn.execute_batch(&format!(
             "CREATE TABLE wal_batch AS \
-             SELECT * EXCLUDE ({prov_col}) REPLACE ({repair}, {ingested}) \
+             SELECT * EXCLUDE ({prov_col}) REPLACE ({repair}) \
              FROM read_json([{file_list_sql}], format='newline_delimited', \
              records=true, auto_detect=true, union_by_name=true, \
              field_appearance_threshold=0, maximum_depth=2, sample_size=-1, \
@@ -1253,11 +1248,10 @@ fn build_wal_batch(
     );
     // Explicit columns: the stable vector envelope, with `json` as
     // opaque JSON to prevent struct flattening that causes collisions.
-    let repair = timestamp_repair_expr(WAL_FILE_COL);
-    let ingested = ingested_repair_expr(WAL_FILE_COL);
+    let repair = timestamp_repair_list(WAL_FILE_COL);
     conn.execute_batch(&format!(
         "CREATE TABLE wal_batch AS \
-         SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}, {ingested}) \
+         SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
          FROM read_json([{file_list_sql}], format='newline_delimited', \
          records=true, union_by_name=true, filename='{WAL_FILE_COL}', \
          columns={{\
