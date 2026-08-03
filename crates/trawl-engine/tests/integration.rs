@@ -112,6 +112,38 @@ fn stats_count_by_service() {
 }
 
 #[test]
+fn stats_group_by_repairs_separates_clean_from_repaired() {
+    // ADR-0009: `_repairs` is NULL on clean events and carries the repair
+    // codes on repaired ones, so it must behave as an ordinary groupable
+    // dimension — one group per distinct code plus a NULL group for the
+    // untouched majority. The fixture seeds exactly one repaired row
+    // (`host.from_peer`) among 13.
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("* | stats count() by _repairs", &glob)
+        .unwrap();
+
+    assert_eq!(result.columns[0].name, "_repairs");
+    let groups: Vec<(&Value, &Value)> = result.rows.iter().map(|r| (&r[0], &r[1])).collect();
+    assert_eq!(
+        groups.len(),
+        2,
+        "expected a clean group and one repaired group, got {groups:?}"
+    );
+    assert!(
+        groups.contains(&(&Value::Null, &Value::Integer(12))),
+        "the 12 clean events must aggregate under a NULL `_repairs`: {groups:?}"
+    );
+    assert!(
+        groups.contains(&(
+            &Value::String("host.from_peer".to_string()),
+            &Value::Integer(1)
+        )),
+        "the repaired event must aggregate under its repair code: {groups:?}"
+    );
+}
+
+#[test]
 fn stats_with_where_cte() {
     let (exec, glob) = setup();
     let result = exec
