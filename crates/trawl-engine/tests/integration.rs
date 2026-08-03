@@ -356,6 +356,80 @@ fn bare_word_matches_content_only_in_raw() {
     assert_eq!(result.row_count(), 1, "message-only terms keep matching");
 }
 
+/// Write a parquet file shaped like the ingest canonicalizer's output: no
+/// collector sent a pre-parse line, so `_raw` is the server's JSON
+/// serialization of the event as it arrived.
+fn canonicalized_parquet(dir: &std::path::Path) -> String {
+    let path = dir.join("canonical.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (TIMESTAMP '2024-01-15 10:00:00', 'nginx', 'started',
+              '{{\"service\":\"nginx\",\"debug_mode\":false,\"message\":\"started\"}}'),
+             (TIMESTAMP '2024-01-15 10:00:01', 'sshd', 'accepted key',
+              '{{\"service\":\"sshd\",\"message\":\"accepted key\"}}')
+         ) t(_time, service, message, _raw)) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("canonicalized fixture should be written");
+    path.display().to_string()
+}
+
+/// Bare-word search over a server-filled `_raw` is whole-event search
+/// (ADR-0009): the term reaches another field's *value* and a field *name*,
+/// and negation excludes on exactly the same basis. Pinned because it is a
+/// decision the DSL reference documents, not an accident of the fill.
+#[test]
+fn bare_word_search_reaches_the_whole_event_through_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = canonicalized_parquet(dir.path());
+    let exec = Executor::new().expect("executor should initialize");
+
+    // Another field's value: "nginx" is in `service`, never in `message`.
+    let by_value = exec.run_query_max("nginx", &source).expect("field value");
+    assert_eq!(
+        by_value.row_count(),
+        1,
+        "a bare term must find the event through another field's value"
+    );
+
+    // A field name: "debug" exists only as the key `debug_mode`.
+    let by_name = exec.run_query_max("debug", &source).expect("field name");
+    assert_eq!(
+        by_name.row_count(),
+        1,
+        "serialized field names are part of the searched text"
+    );
+
+    // Negation is the exact mirror — the same row drops out.
+    let negated = exec.run_query_max("-debug", &source).expect("negated");
+    assert_eq!(
+        negated.row_count(),
+        1,
+        "negation mirrors the positive match"
+    );
+    let svc = negated
+        .columns
+        .iter()
+        .position(|c| c.name == "service")
+        .expect("service column");
+    assert_eq!(
+        negated.rows[0][svc],
+        Value::String("sshd".into()),
+        "the row whose serialization contains 'debug' is the one excluded"
+    );
+
+    // A field filter never consults `_raw` — that is the narrow form.
+    let confined = exec
+        .run_query_max("message=/debug/", &source)
+        .expect("field filter");
+    assert_eq!(
+        confined.row_count(),
+        0,
+        "message=/debug/ must not see the field name in _raw"
+    );
+}
+
 #[test]
 fn well_known_fields_match_core_schema() {
     // trawl-api duplicates the envelope ordering constants because it does

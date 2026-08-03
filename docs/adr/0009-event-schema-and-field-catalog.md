@@ -312,6 +312,20 @@ itself is untouched.
   cardinality cap never would. The service charset drops space and keeps dots;
   filenames carry the name verbatim. The allowlist gates writes only; existing
   directories stay readable.
+- **Bare search over `_raw` is whole-event search, and is documented as such.**
+  "Bare search additionally covers `_raw`" was written while `_raw` meant a
+  collector's pre-parse line. The canonical-pre-repair fallback makes the
+  server-filled `_raw` a JSON object, so a bare term matches anywhere in the
+  event — another field's value (`nginx` finds `service=nginx`) *and* a field
+  name (`debug` finds `debug_mode`), with negation excluding on the same
+  basis. The behaviour stands: finding an event without knowing which field
+  holds the term is the whole reason bare words exist, and confining the
+  search to `message` would make `_raw` coverage a no-op for every event our
+  own collectors produce (none of them send a pre-parse line). What was wrong
+  was the telling — the DSL reference now states the consequence and points at
+  field filters (`message=/debug/`) for a match confined to one column, and
+  execution tests pin both directions so the semantics are a decision rather
+  than a surprise.
 - Smaller corrections, folded into the slices: `_raw` is the client's string
   `_raw` verbatim when supplied, else the **canonical pre-repair
   serialization** — "exactly as it arrived on the wire" was false (the WAL

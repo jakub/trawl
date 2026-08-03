@@ -73,9 +73,31 @@ error                           # bare word — substring match
 "connection refused"            # exact phrase
 ```
 
-Bare-word and phrase search match the `message` column **and** `_raw`
-(the preserved original), so content that was parsed away is still
-findable. Negation excludes an event only when neither matches.
+Bare-word and phrase search match the `message` column **and** `_raw`,
+so content that was parsed away is still findable. Negation excludes an
+event when either column matches.
+
+Because `_raw` holds the most original form of the event, searching it is
+**whole-event search**, and what "whole event" means depends on who filled
+it:
+
+- a collector that sent its own string `_raw` — the pre-parse line, matched
+  as text;
+- everything else — the server's JSON serialization of the event as it
+  arrived, so a term matches anywhere in that object: another field's
+  **value** (`nginx` finds an event with `service=nginx`, even when
+  `message` never says it) and a field **name** (`debug` finds an event
+  carrying `debug_mode`, and `-debug` therefore excludes it).
+
+That is the point of a bare word — find the event without knowing which
+field holds the term. When you do know, filter the field and `_raw` is
+never consulted:
+
+```
+message=/debug/                 # regex, message only
+message=*debug*                 # glob, message only (case-sensitive)
+service=nginx                   # exact field match
+```
 
 ### Time filters
 

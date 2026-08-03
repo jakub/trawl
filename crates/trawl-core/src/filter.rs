@@ -447,6 +447,12 @@ impl TextMatcher {
     /// - negated: `("message" NOT ILIKE p AND COALESCE("_raw" NOT ILIKE p,
     ///   TRUE))` — `message` must be present and term-free, and `_raw`
     ///   (when present) term-free too.
+    ///
+    /// Searching `_raw` is whole-event search: unless a collector supplied a
+    /// pre-parse line, `_raw` is the server's JSON serialization of the event,
+    /// so a term matches another field's value *and* a field name — and the
+    /// negated form excludes on the same basis (see
+    /// [`crate::emitter`]'s `push_text_search` and the DSL reference).
     fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
         let msg = match event.get("message") {
             Some(Value::String(s)) => Some(self.searcher.is_match(s)),
@@ -959,6 +965,24 @@ mod tests {
             "-debug",
             r#"{"message": "debug: starting up"}"#
         ));
+    }
+
+    /// Whole-event search (ADR-0009): with a server-filled `_raw` — the JSON
+    /// serialization of the event — a bare term reaches another field's value
+    /// and a field name, and the negated form excludes on the same basis.
+    /// Mirrors `bare_word_search_reaches_the_whole_event_through_raw` in the
+    /// engine's execution tests.
+    #[test]
+    fn text_search_covers_the_whole_event_through_raw() {
+        let event = r#"{"message": "started", "service": "nginx", "debug_mode": false,
+             "_raw": "{\"service\":\"nginx\",\"debug_mode\":false,\"message\":\"started\"}"}"#;
+        // Another field's value, absent from `message`.
+        assert!(matches_event("nginx", event));
+        // A field name, present nowhere else.
+        assert!(matches_event("debug", event));
+        // Negation is the exact mirror.
+        assert!(!matches_event("-debug", event));
+        assert!(matches_event("-absent", event));
     }
 
     #[test]

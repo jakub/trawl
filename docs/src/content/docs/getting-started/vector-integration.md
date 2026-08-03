@@ -18,7 +18,7 @@ about the event.
 |---|---|---|---|
 | `_time` | TIMESTAMP | you (or trawl repairs) | event time; missing/unparseable values are replaced with the arrival time and flagged `time.from_ingest` |
 | `_ingested` | TIMESTAMP | trawl | arrival time; client values are stripped (`meta.stripped`) |
-| `_raw` | VARCHAR | you or trawl | most original form available: send a string `_raw` to preserve your pre-parse line, else trawl stores the pre-repair serialization of what arrived |
+| `_raw` | VARCHAR | you or trawl | most original form available: send a string `_raw` to preserve your pre-parse line, else trawl stores the pre-repair serialization of what arrived. Bare-word search reads this column, so under the serialization a bare term matches any field's value **and** any field name — see [Text search](/reference/dsl/#text-search) |
 | `_repairs` | VARCHAR | trawl | comma-separated repair codes; NULL for untouched events |
 | `env` | VARCHAR | you (or `default_env`) | path dimension; must be in the server's `ingest.envs` allowlist or the event **rejects** |
 | `service` | VARCHAR | you — **required** | shard key and filename; missing or non-string values **reject**. Charset `[A-Za-z0-9._-]`, no spaces, no leading dot, ≤128 bytes |

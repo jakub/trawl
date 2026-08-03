@@ -107,6 +107,16 @@ fn emit_or_groups(
 /// vetoing the row under SQL three-valued logic. The in-memory filter
 /// ([`crate::filter`]) mirrors these semantics exactly.
 ///
+/// Searching `_raw` is **whole-event search**, deliberately: except when a
+/// collector supplied its own pre-parse line, `_raw` is the server's JSON
+/// serialization of the event as it arrived, so an ILIKE over it matches
+/// another field's value (`nginx` finds `service=nginx`) *and* a field name
+/// (`debug` finds `debug_mode`) — and the negated form excludes on exactly
+/// the same basis. That reach is why bare words are worth having; a match
+/// confined to one column is what field filters (`message=/debug/`) are for.
+/// Documented in the DSL reference under "Text search"; changing it means
+/// changing both.
+///
 /// The `_raw` side comes from [`EmitterState::raw_column`], so the raw-free
 /// pass (for sources without the column) substitutes a typed NULL while
 /// pushing the same two parameters in the same order — both passes share
