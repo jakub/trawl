@@ -893,6 +893,55 @@ mod boot {
         );
     }
 
+    /// A READABLE parquet in a foreign layout is still not trawl's file.
+    /// The rewrite is in place, lossy and irreversible (no backup, no
+    /// dry-run, no opt-in), so the boot pass must decide "mine" from the
+    /// PATH, before it opens anything: an operator's own parquet dropped
+    /// under the data root is left byte-identical, never votes on a pin, and
+    /// — like every other skip — withholds completion so the next boot
+    /// re-runs rather than declaring the corpus proven.
+    #[sqlx::test]
+    async fn foreign_layout_files_are_never_rewritten(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (majority, minority) = plant_disagreeing_corpus(&data_dir);
+
+        // Perfectly readable, disagrees with the corpus pin, carries a field
+        // of its own — and sits nowhere ingest could have written it.
+        let foreign = plant(
+            &data_dir,
+            "operator-scratch/export.parquet",
+            "SELECT 'x' AS operator_only_field, '1.5s' AS duration",
+        );
+        let bytes_before = std::fs::read(&foreign).unwrap();
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+
+        assert_eq!(summary.skipped, 1, "the foreign file is one skip");
+        assert_eq!(summary.scanned, 2, "only trawl's own files are scanned");
+        assert_eq!(summary.rewritten, 1, "the minority file still conforms");
+        assert_eq!(column_type(&minority, "duration"), "BIGINT");
+        assert_eq!(column_type(&majority, "duration"), "BIGINT");
+
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            bytes_before,
+            "a foreign file must come out of the boot pass byte-identical"
+        );
+        assert!(
+            cache.get("operator_only_field").is_none(),
+            "a foreign file's columns must not vote on the catalog"
+        );
+        assert!(
+            !data_dir.join("CATALOG").exists(),
+            "an unproven corpus must not publish the conformance identity"
+        );
+    }
+
     /// One unreadable or foreign `.parquet` under the data root must never
     /// take trawld's boot down with it: the pass isolates it per file
     /// (skip + warn + count), conforms everything else, and — because the

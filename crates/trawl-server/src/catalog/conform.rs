@@ -44,6 +44,18 @@
 //! published — the next boot re-runs the pass, so a transient read failure
 //! self-heals and a permanent one keeps warning.
 //!
+//! "Foreign" is decided by the PATH, before the file is ever read
+//! ([`layout_path`]): the pass rewrites a standing file IN PLACE, lossily
+//! (every value the `TRY_CAST` cannot read becomes NULL) and irreversibly
+//! (the source is the destination — there is no backup, no dry-run, and no
+//! operator opt-in), so it may only ever touch files trawl itself wrote.
+//! That means a path that reads back as `{env}/{date}[/{HH}]/{service}.parquet`
+//! with every component passing the injective ingest predicates. A parquet an
+//! operator dropped anywhere else under the data root is skipped exactly like
+//! an unreadable one — same warning, same counter, same withheld completion —
+//! because "readable" is not "mine", and silently rewriting someone else's
+//! file would be the destructive surprise [`skip_file`] exists to refuse.
+//!
 //! This machinery is deliberately the embryo of the repin rewriter (#53).
 
 use std::collections::HashMap;
@@ -78,10 +90,15 @@ pub struct ConformSummary {
     pub skipped: usize,
 }
 
-/// One scanned parquet file.
+/// One scanned parquet file. Only ever built for a path that read back as
+/// trawl's own layout ([`layout_path`]) — a `FileScan` is a licence to
+/// rewrite the file in place, so a foreign path never becomes one.
 struct FileScan {
     path: PathBuf,
     service: String,
+    /// The instant this file's partition directory claims — the rewrite's
+    /// never-NULL `_time`/`_ingested` fallback (see [`layout_path`]).
+    time_fallback: chrono::DateTime<chrono::Utc>,
     schema: Vec<ColInfo>,
     /// Non-null row count per column, positionally parallel to `schema`.
     /// This — not the file's total row count — is a column's voting weight:
@@ -416,7 +433,21 @@ fn scan_corpus(
 
     let mut out = Vec::with_capacity(files.len());
     for (path, _) in files {
-        match scan_file(&conn, path.clone(), pinned) {
+        // The layout gate comes FIRST, before the file is opened: everything
+        // downstream of the scan may rewrite the file in place, so a path
+        // trawl did not write is set aside here, unread and untouched.
+        let Some(layout) = layout_path(data_dir, &path) else {
+            skipped += 1;
+            skip_file(
+                &path,
+                "layout",
+                "not in trawl's {env}/{date}[/{HH}]/{service}.parquet layout — \
+                 the boot pass only rewrites files it wrote itself",
+            );
+            progress.tick();
+            continue;
+        };
+        match scan_file(&conn, path.clone(), &layout, pinned) {
             Ok(scan) => out.push(scan),
             Err(e) => {
                 skipped += 1;
@@ -426,6 +457,73 @@ fn scan_corpus(
         progress.tick();
     }
     Ok((out, skipped))
+}
+
+/// Where one standing file sits in trawl's own storage layout.
+struct LayoutPath {
+    /// The service the path names — read off the layout, not guessed from a
+    /// file stem, so it is the same string ingest wrote verbatim.
+    service: String,
+    /// The instant this file's partition directory claims (see
+    /// [`ConformPolicy::StandingFile`]).
+    instant: chrono::DateTime<chrono::Utc>,
+}
+
+/// Read `path` back as trawl's own storage layout — `{env}/{date}/{HH}/
+/// {service}.parquet`, or `{env}/{date}/{service}.parquet` for a daily
+/// rollup — relative to the data root. `None` = foreign, i.e. NOT ours.
+///
+/// This is the whole safety gate on an in-place, lossy, irreversible rewrite,
+/// so it is deliberately the strict inverse of the write path rather than a
+/// loose shape match: every component is checked against the same injective
+/// predicates ingest funnels names through (`is_valid_env_name` minus the
+/// reserved names, `is_valid_service_name`), and the date/hour must be a real
+/// instant. A file that ingest could not have produced this path for is not
+/// trawl's file, whatever it contains.
+///
+/// The boundary it can draw is "a path the writer could have produced", not
+/// provenance: a file planted at an exactly-valid layout path is ours as far
+/// as anything here can tell. Deliberately NOT tightened with the configured
+/// `[ingest] envs` allowlist — an env retired from the config still has a
+/// standing corpus that queries read and the invariant must therefore cover.
+///
+/// It doubles as the rewrite's never-NULL `_time` fallback: a standing file
+/// has no WAL filename to recover an ingest instant from, but it does sit in
+/// a directory that already claims an hour — the closest honest answer
+/// available, and by construction inside the window the row was pruned to.
+fn layout_path(data_dir: &Path, path: &Path) -> Option<LayoutPath> {
+    let rel = path.strip_prefix(data_dir).ok()?;
+    let mut parts: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_str()?),
+            // `..`, a root, a prefix: not a path the writer can produce.
+            _ => return None,
+        }
+    }
+    let (env, day, hour, file) = match parts.as_slice() {
+        [env, day, file] => (*env, *day, None, *file),
+        [env, day, hour, file] => (*env, *day, Some(*hour), *file),
+        _ => return None,
+    };
+    if !trawl_config::is_valid_env_name(env) || trawl_config::RESERVED_ENV_NAMES.contains(&env) {
+        return None;
+    }
+    let service = file.strip_suffix(".parquet")?;
+    if !trawl_config::is_valid_service_name(service) {
+        return None;
+    }
+    let day = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
+    let instant = match hour {
+        // Two digits, and an hour that exists: `and_hms_opt` rejects 24+.
+        Some(hh) if hh.len() == 2 => day.and_hms_opt(hh.parse::<u32>().ok()?, 0, 0)?.and_utc(),
+        Some(_) => return None,
+        None => day.and_hms_opt(0, 0, 0)?.and_utc(),
+    };
+    Some(LayoutPath {
+        service: service.to_owned(),
+        instant,
+    })
 }
 
 /// Describe one parquet file: magic-byte sniff first (the cheap catch for a
@@ -438,6 +536,7 @@ fn scan_corpus(
 fn scan_file(
     conn: &duckdb::Connection,
     path: PathBuf,
+    layout: &LayoutPath,
     pinned: &HashMap<String, CanonicalType>,
 ) -> Result<FileScan, String> {
     if !is_valid_parquet(&path) {
@@ -446,14 +545,10 @@ fn scan_file(
     let safe = path.to_string_lossy().replace('\'', "''");
     let schema = describe_source(conn, &format!("SELECT * FROM read_parquet('{safe}')"))?;
     let non_null = count_non_null(conn, &safe, &schema, &voting_columns(&schema, pinned))?;
-    let service = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_owned();
     Ok(FileScan {
         path,
-        service,
+        service: layout.service.clone(),
+        time_fallback: layout.instant,
         schema,
         non_null,
     })
@@ -624,43 +719,6 @@ fn rewrite_nonconforming(
     Ok((rewritten, skipped, conflicts))
 }
 
-/// The instant a file's own partition path names: `{date}/{HH}` for an
-/// hour file, `{date}` at midnight UTC for a daily rollup, and the conform
-/// instant for anything else (a foreign layout the walk still adopted).
-///
-/// This is the never-NULL last arm the rewrite conforms `_time`/`_ingested`
-/// with (see [`ConformPolicy::StandingFile`]): a standing file has no WAL
-/// filename to recover an ingest instant from, but it does sit in a
-/// directory that already claims an hour — the closest honest answer
-/// available, and by construction inside the window the row was already
-/// pruned to.
-fn partition_instant(path: &Path) -> chrono::DateTime<chrono::Utc> {
-    partition_path_instant(path).unwrap_or_else(chrono::Utc::now)
-}
-
-/// [`partition_instant`]'s path parse, `None` when the layout is foreign.
-fn partition_path_instant(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
-    let dir = path.parent()?;
-    let name = dir.file_name()?.to_str()?;
-    // `data/{env}/{date}/{HH}/{service}.parquet`
-    if name.len() == 2
-        && let Ok(hour) = name.parse::<u32>()
-    {
-        let day = dir.parent()?.file_name()?.to_str()?;
-        return chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
-            .ok()?
-            .and_hms_opt(hour, 0, 0)
-            .map(|dt| dt.and_utc());
-    }
-    // `data/{env}/{date}/{service}.parquet` (daily rollup)
-    Some(
-        chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d")
-            .ok()?
-            .and_hms_opt(0, 0, 0)?
-            .and_utc(),
-    )
-}
-
 /// Conform one file. `Ok(None)` = it already agreed with every pin.
 fn rewrite_file(
     conn: &duckdb::Connection,
@@ -671,7 +729,7 @@ fn rewrite_file(
         &file.schema,
         pins,
         ConformPolicy::StandingFile {
-            time_fallback: partition_instant(&file.path),
+            time_fallback: file.time_fallback,
         },
     );
     if plan.cast_count() == 0 {
@@ -775,6 +833,7 @@ mod tests {
         FileScan {
             path: PathBuf::from(format!("/data/prod/2026-08-01/10/{name}.parquet")),
             service: name.to_owned(),
+            time_fallback: chrono::Utc::now(),
             schema: cols
                 .iter()
                 .map(|(n, t, _)| ColInfo {
@@ -856,33 +915,60 @@ mod tests {
         );
     }
 
-    /// The rewrite's never-NULL last arm comes from the file's own partition
-    /// directory, for both layouts.
+    /// Both of trawl's own layouts read back, service and instant intact —
+    /// the service off the path (verbatim, as ingest wrote it) and the
+    /// rewrite's never-NULL `_time` fallback off the partition directory.
     #[test]
-    fn partition_instant_reads_the_hour_and_the_daily_rollup() {
-        assert_eq!(
-            super::partition_path_instant(&PathBuf::from("/data/prod/2026-08-01/10/svc-a.parquet"))
-                .map(|t| t.to_rfc3339()),
-            Some("2026-08-01T10:00:00+00:00".to_owned())
-        );
-        assert_eq!(
-            super::partition_path_instant(&PathBuf::from("/data/prod/2026-08-01/svc-a.parquet"))
-                .map(|t| t.to_rfc3339()),
-            Some("2026-08-01T00:00:00+00:00".to_owned())
-        );
+    fn layout_path_reads_the_hour_and_the_daily_rollup() {
+        let root = PathBuf::from("/var/lib/trawl/data");
+        let hourly =
+            super::layout_path(&root, &root.join("prod/2026-08-01/10/api.v2.parquet")).unwrap();
+        assert_eq!(hourly.service, "api.v2");
+        assert_eq!(hourly.instant.to_rfc3339(), "2026-08-01T10:00:00+00:00");
+
+        let daily = super::layout_path(&root, &root.join("prod/2026-08-01/svc-a.parquet")).unwrap();
+        assert_eq!(daily.service, "svc-a");
+        assert_eq!(daily.instant.to_rfc3339(), "2026-08-01T00:00:00+00:00");
     }
 
-    /// A file the walk adopted from a foreign layout names no instant; the
-    /// caller falls back to the conform instant rather than writing NULL.
+    /// The gate on an in-place, lossy, irreversible rewrite: anything the
+    /// write path could not have produced is foreign, and a foreign file is
+    /// never scanned, never votes, and above all is never rewritten.
     #[test]
-    fn partition_instant_declines_a_foreign_path() {
+    fn layout_path_declines_everything_trawl_did_not_write() {
+        let root = PathBuf::from("/var/lib/trawl/data");
+        let foreign = [
+            // Depth: loose at the root, or nested past the layout.
+            "svc-a.parquet",
+            "prod/svc-a.parquet",
+            "prod/2026-08-01/10/extra/svc-a.parquet",
+            // An operator's own tree that happens to sit under the data root.
+            "backups/exports/10/svc-a.parquet",
+            "prod/backup-2026-08-01/svc-a.parquet",
+            // Reserved env names are trawl's, but not the corpus.
+            "wal/2026-08-01/10/svc-a.parquet",
+            "scheduled/2026-08-01/10/svc-a.parquet",
+            // Names ingest's injective encoding cannot emit.
+            "PROD/2026-08-01/10/svc-a.parquet",
+            "prod/2026-08-01/10/Living Room AP.parquet",
+            // Not an instant.
+            "prod/2026-08-01/99/svc-a.parquet",
+            "prod/2026-08-01/1/svc-a.parquet",
+            "prod/2026-13-01/10/svc-a.parquet",
+        ];
+        for rel in foreign {
+            assert!(
+                super::layout_path(&root, &root.join(rel)).is_none(),
+                "{rel} is not a path trawl wrote and must not be adopted"
+            );
+        }
+        // Outside the data root entirely.
         assert!(
-            super::partition_path_instant(&PathBuf::from("/data/loose/svc-a.parquet")).is_none()
-        );
-        assert!(
-            super::partition_path_instant(&PathBuf::from("/data/prod/2026-08-01/99/svc.parquet"))
-                .is_none(),
-            "an out-of-range hour is not an instant"
+            super::layout_path(
+                &root,
+                &PathBuf::from("/srv/other/prod/2026-08-01/10/s.parquet")
+            )
+            .is_none()
         );
     }
 }
