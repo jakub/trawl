@@ -139,6 +139,7 @@ The repo ships ready-made configs under `config/vector/`:
 Every server-side substitution is visible: the event's `_repairs` column
 carries codes (`host.from_peer`, `env.defaulted`, `time.from_ingest`,
 `time.out_of_range`, `severity.unmapped`, `field.truncated`,
-`meta.stripped`) and `trawl_ingest_repairs_total{code, service}` counts
+`meta.stripped`, `field.name_too_long`) and
+`trawl_ingest_repairs_total{code, service}` counts
 them on `/metrics`. `stats count() by _repairs, service` shows which
 senders the server is having to patch.

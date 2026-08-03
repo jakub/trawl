@@ -44,6 +44,24 @@ pub const TIMESTAMP_COLUMNS: &[&str] = &[TIME, INGESTED];
 /// (`_raw` is also server-owned when the client value is not a string.)
 pub const RESERVED_CLIENT_FIELDS: &[&str] = &[INGESTED, REPAIRS];
 
+/// Maximum length (bytes) of a field name trawl will store.
+///
+/// The field catalog keys on the name (`field_types.field` is a `TEXT`
+/// PRIMARY KEY, `field_services` a `(field, service)` one), so a name that
+/// cannot fit a postgres btree key cannot be pinned — and an unpinnable
+/// column is a wedge, not a nuisance: pinning is a hard gate in front of
+/// every parquet write. Postgres' limit is ~2704 bytes for the whole index
+/// tuple; 255 keeps a full order of magnitude of headroom while being far
+/// above any field name a log producer legitimately emits.
+pub const MAX_FIELD_NAME_BYTES: usize = 255;
+
+/// Whether a field name can be carried through the catalog (and therefore
+/// stored at all). Bounded in BYTES because the constraint being respected
+/// is postgres' byte-sized btree key limit, not a character count.
+pub fn is_storable_field_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_FIELD_NAME_BYTES
+}
+
 /// Leading well-known columns for result reordering, in display order.
 pub const LEADING_LOG_FIELDS: &[&str] =
     &[TIME, ENV, SERVICE, HOST, SEVERITY, SEVERITY_TEXT, MESSAGE];
@@ -257,6 +275,22 @@ mod tests {
         assert_eq!(resolve_field_alias("@timestamp"), "_time");
         assert_eq!(resolve_field_alias("_time"), "_time");
         assert_eq!(resolve_field_alias("host"), "host");
+    }
+
+    #[test]
+    fn storable_field_names_are_bounded_in_bytes() {
+        assert!(is_storable_field_name("duration"));
+        assert!(is_storable_field_name(&"k".repeat(MAX_FIELD_NAME_BYTES)));
+        assert!(!is_storable_field_name(
+            &"k".repeat(MAX_FIELD_NAME_BYTES + 1)
+        ));
+        // Bytes, not chars: the limit being respected is postgres' btree
+        // key size, and every declared envelope field clears it easily.
+        assert!(!is_storable_field_name(&"é".repeat(MAX_FIELD_NAME_BYTES)));
+        assert!(!is_storable_field_name(""));
+        for (field, _) in ENVELOPE_TYPES {
+            assert!(is_storable_field_name(field));
+        }
     }
 
     #[test]

@@ -1455,6 +1455,70 @@ mod catalog {
         assert!(pa.contains_key("racy"));
     }
 
+    /// A name no btree key can hold: 3000 pseudo-random printable bytes.
+    ///
+    /// The wide alphabet is load-bearing. Postgres pglz-compresses an
+    /// oversized index value before giving up, so a repeated-character
+    /// name of the same length slips under the limit and would not
+    /// exercise the failure at all; this one reproduces
+    /// `index row size 3016 exceeds btree version 4 maximum 2704`
+    /// verbatim against `field_types_pkey`.
+    fn unstorable_field_name() -> String {
+        let mut x: u32 = 0x1234_5678;
+        std::iter::repeat_with(|| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            char::from(33 + u8::try_from((x >> 16) % 93).unwrap())
+        })
+        .take(3000)
+        .collect()
+    }
+
+    #[sqlx::test]
+    async fn pin_missing_skips_unstorable_names_instead_of_failing(pool: PgPool) {
+        // An over-long field name must never error the pin statement:
+        // pinning gates every parquet write, so an Err here retains the
+        // batch and re-fails on every compaction tick, forever.
+        let store = catalog(&pool);
+        let huge = unstorable_field_name();
+
+        let pins = store
+            .pin_missing(&[
+                proposal(&huge, CanonicalType::Varchar),
+                proposal("duration", CanonicalType::BigInt),
+            ])
+            .await
+            .expect("an unstorable name must not fail the batch's pins");
+
+        assert!(
+            !pins.contains_key(&huge),
+            "the unstorable name is not pinned — leaving it unpinned is what \
+             makes the conform step drop the column"
+        );
+        assert_eq!(
+            pins.get("duration"),
+            Some(&CanonicalType::BigInt),
+            "every other field in the batch still pins"
+        );
+
+        // And it really is absent from the catalog, not silently stored.
+        let all = store.load_pins().await.unwrap();
+        assert!(all.iter().all(|(f, _)| f != &huge));
+    }
+
+    #[sqlx::test]
+    async fn touch_services_skips_unstorable_names_instead_of_failing(pool: PgPool) {
+        let store = catalog(&pool);
+        let huge = unstorable_field_name();
+
+        store
+            .touch_services("svc-a", &[huge.clone(), "duration".to_owned()], 7)
+            .await
+            .expect("an unstorable name must not fail the observation upsert");
+
+        assert!(store.field_services(&huge).await.unwrap().is_empty());
+        assert_eq!(store.field_services("duration").await.unwrap().len(), 1);
+    }
+
     #[sqlx::test]
     async fn touch_services_advances_only_last_seen(pool: PgPool) {
         let store = catalog(&pool);

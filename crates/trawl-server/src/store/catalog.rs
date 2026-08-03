@@ -76,6 +76,37 @@ pub struct FieldConflictRow {
     pub at: DateTime<Utc>,
 }
 
+/// The names in `names` that cannot be a catalog key, de-duplicated and
+/// each shortened for logging (a name that overflows a btree key would
+/// otherwise make the log line an amplifier of whatever a client sent).
+fn unstorable_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = names
+        .filter(|n| !trawl_core::schema::is_storable_field_name(n))
+        .map(|n| {
+            let head: String = n.chars().take(48).collect();
+            format!("{head}... ({} bytes)", n.len())
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// One warning per call site for skipped names. Deliberately a warning and
+/// not an error: the alternative — failing the statement — wedges the
+/// caller (compaction retains the batch and re-fails forever), which is the
+/// failure this skipping exists to prevent.
+fn warn_unstorable(op: &str, rejected: &[String]) {
+    tracing::warn!(
+        event_type = "catalog_field_name_unstorable",
+        op,
+        max_bytes = trawl_core::schema::MAX_FIELD_NAME_BYTES,
+        fields = ?rejected,
+        "field name(s) too long to be a catalog key — skipped; the column is \
+         not pinned (and so not stored), values remain in _raw"
+    );
+}
+
 /// Postgres-backed field catalog. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
 pub struct CatalogStore {
@@ -118,10 +149,25 @@ impl CatalogStore {
     /// First-writer-wins: `INSERT ... ON CONFLICT (field) DO NOTHING`, then
     /// a re-read — so two racing batches (or a proposal against an existing
     /// pin) both come back with the same pin, never their own proposal.
+    ///
+    /// A field whose name cannot be a catalog key (see
+    /// [`unstorable_names`]) is DROPPED from the proposal set rather than
+    /// allowed to error the insert: pinning gates every parquet write, so
+    /// one such name would otherwise retain the batch for retry on every
+    /// tick, forever. Absent from the returned map, the column is simply
+    /// unpinned — which the conform step already treats as "drop it".
     pub async fn pin_missing(
         &self,
         proposals: &[PinProposal],
     ) -> Result<HashMap<String, CanonicalType>, StoreError> {
+        let rejected = unstorable_names(proposals.iter().map(|p| p.field.as_str()));
+        if !rejected.is_empty() {
+            warn_unstorable("pin", &rejected);
+        }
+        let proposals: Vec<&PinProposal> = proposals
+            .iter()
+            .filter(|p| trawl_core::schema::is_storable_field_name(&p.field))
+            .collect();
         if proposals.is_empty() {
             return Ok(HashMap::new());
         }
@@ -161,12 +207,25 @@ impl CatalogStore {
 
     /// Upsert per-service observations for a compacted batch: `first_seen`
     /// is set once, `last_seen` advances, `row_count` accumulates.
+    ///
+    /// Names that cannot be a catalog key are skipped for the same reason
+    /// as in [`Self::pin_missing`] — `field_services` keys on
+    /// `(field, service)`, so an over-long name overflows this btree too.
     pub async fn touch_services(
         &self,
         service: &str,
         fields: &[String],
         row_count: u64,
     ) -> Result<(), StoreError> {
+        let rejected = unstorable_names(fields.iter().map(String::as_str));
+        if !rejected.is_empty() {
+            warn_unstorable("observe", &rejected);
+        }
+        let fields: Vec<&str> = fields
+            .iter()
+            .map(String::as_str)
+            .filter(|f| trawl_core::schema::is_storable_field_name(f))
+            .collect();
         if fields.is_empty() {
             return Ok(());
         }
@@ -177,7 +236,7 @@ impl CatalogStore {
              SET last_seen = now(),
                  row_count = field_services.row_count + EXCLUDED.row_count",
         )
-        .bind(fields)
+        .bind(&fields)
         .bind(service)
         .bind(i64::try_from(row_count).unwrap_or(i64::MAX))
         .execute(&self.pool)

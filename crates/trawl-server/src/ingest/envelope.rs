@@ -40,6 +40,9 @@ pub enum RepairCode {
     /// client sent a server-owned field (`_ingested`, `_repairs`, or a
     /// non-string `_raw`); value dropped and replaced.
     MetaStripped,
+    /// a field's NAME exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
+    /// the field was dropped (its value stays findable in `_raw`).
+    FieldNameTooLong,
 }
 
 impl RepairCode {
@@ -53,6 +56,7 @@ impl RepairCode {
             Self::SeverityUnmapped => "severity.unmapped",
             Self::FieldTruncated => "field.truncated",
             Self::MetaStripped => "meta.stripped",
+            Self::FieldNameTooLong => "field.name_too_long",
         }
     }
 }
@@ -503,13 +507,60 @@ fn stringify_nested_values(out: &mut Map<String, Value>) {
     }
 }
 
+/// Remove the fields a client may never set, returning whether any were
+/// present (the `meta.stripped` repair): honouring them would let a sender
+/// forge its own handling history. `_trawl_wal_file` — compaction's
+/// synthetic provenance column, trawl's key rather than the client's — goes
+/// silently, since a row carrying it wedges `read_json`.
+fn strip_server_owned(out: &mut Map<String, Value>) -> bool {
+    let mut stripped = false;
+    for key in trawl_core::schema::RESERVED_CLIENT_FIELDS {
+        if out.remove(*key).is_some() {
+            stripped = true;
+        }
+    }
+    if matches!(out.get("_raw"), Some(v) if !v.is_string()) {
+        out.remove("_raw");
+        stripped = true;
+    }
+    out.remove(compaction::WAL_FILE_COL);
+    stripped
+}
+
+/// Drop every field whose NAME cannot be a field-catalog key, returning
+/// whether any were dropped (the `field.name_too_long` repair).
+///
+/// This is the only seam that sees a client-chosen key before it becomes a
+/// column. Compaction pins every dynamic column in postgres BEFORE writing
+/// the parquet that carries it, and an over-long name overflows the btree
+/// key behind `field_types.field`: the insert errors, the batch is retained
+/// for retry, and the same WAL re-fails on every tick — permanently, for
+/// that service. Bounding the name here is what keeps that unreachable.
+///
+/// Dropping the field is a repair with an honest answer rather than a
+/// guess: `_raw` is captured before this runs, so the name and its value
+/// both stay recoverable, and no other field in the event is punished for
+/// one bad key (rejecting the event would throw away good data).
+fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
+    let unstorable: Vec<String> = out
+        .keys()
+        .filter(|k| !trawl_core::schema::is_storable_field_name(k))
+        .cloned()
+        .collect();
+    for k in &unstorable {
+        out.remove(k);
+    }
+    !unstorable.is_empty()
+}
+
 /// Canonicalize one parsed event object into the declared envelope.
 ///
 /// Field order of operations is load-bearing:
 /// 1. `service` validation (reject path — nothing else runs).
 /// 2. `_raw` capture — FIRST, before reserved-key stripping and every
 ///    repair, so the server's own fills never appear inside "what arrived".
-/// 3. Reserved-key strip (`meta.stripped`), `_trawl_wal_file` silent drop.
+/// 3. Reserved-key strip (`meta.stripped`), `_trawl_wal_file` silent drop,
+///    over-long field-name drop (`field.name_too_long`).
 /// 4. `_time` from the wire aliases (`_time`/`timestamp`/`@timestamp`,
 ///    consumed), ADR-0008 grammar, `time.from_ingest`/`time.out_of_range`.
 /// 5. `_ingested` stamp.
@@ -559,24 +610,15 @@ pub fn canonicalize(
 
     let mut out = obj.clone();
 
-    // 3. Server-owned metadata is never client-settable: honouring it would
-    // let a sender forge its own handling history.
-    let mut stripped_meta = false;
-    for key in trawl_core::schema::RESERVED_CLIENT_FIELDS {
-        if out.remove(*key).is_some() {
-            stripped_meta = true;
-        }
-    }
-    if matches!(out.get("_raw"), Some(v) if !v.is_string()) {
-        out.remove("_raw");
-        stripped_meta = true;
-    }
-    if stripped_meta {
+    // 3. Server-owned metadata is never client-settable.
+    if strip_server_owned(&mut out) {
         push_repair(&mut repairs, RepairCode::MetaStripped);
     }
-    // Compaction's synthetic provenance column: trawl's key, not the
-    // client's — silently dropped (a row carrying it wedges read_json).
-    out.remove(compaction::WAL_FILE_COL);
+
+    // 3.2. Names too long to be a catalog key never become columns.
+    if drop_unstorable_names(&mut out) {
+        push_repair(&mut repairs, RepairCode::FieldNameTooLong);
+    }
 
     // 3.5. Nested values become JSON text (see [`stringify_nested_values`]).
     stringify_nested_values(&mut out);
@@ -1244,6 +1286,46 @@ mod tests {
         assert_eq!(raw.chars().count(), MAX_RAW_CHARS);
         assert_eq!(raw, "é".repeat(MAX_RAW_CHARS));
         assert!(codes(&c).contains(&"field.truncated"));
+    }
+
+    // --- field-name bound (catalog key safety) ---
+
+    #[test]
+    fn overlong_field_name_is_dropped_not_fatal() {
+        // An unbounded key would be proposed as a catalog pin and overflow
+        // the `field_types.field` btree, retaining the batch for retry on
+        // every compaction tick forever.
+        let long = "k".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
+        let c = canon(&format!(
+            r#"{{"service":"s","env":"prod","host":"h",
+                 "_time":"2025-12-31T23:00:00Z","{long}":"v","ok":"kept"}}"#
+        ));
+        assert!(!c.obj.contains_key(&long), "over-long key must not survive");
+        assert_eq!(c.obj["ok"], "kept", "other fields are untouched");
+        assert!(codes(&c).contains(&"field.name_too_long"));
+        // The value stays recoverable: `_raw` is captured before the drop.
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(raw.contains(&long), "dropped key must remain in _raw");
+    }
+
+    #[test]
+    fn field_name_at_the_cap_is_kept() {
+        let at_cap = "k".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES);
+        let c = canon(&format!(
+            r#"{{"service":"s","env":"prod","host":"h",
+                 "_time":"2025-12-31T23:00:00Z","{at_cap}":"v"}}"#
+        ));
+        assert_eq!(c.obj[&at_cap], "v");
+        assert!(c.repairs.is_empty(), "clean event: {:?}", c.repairs);
+    }
+
+    #[test]
+    fn field_name_bound_counts_bytes_not_chars() {
+        // The constraint respected is postgres' byte-sized btree key limit,
+        // so a multi-byte name under the char count still has to fit.
+        let multibyte = "é".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES / 2 + 1);
+        assert!(multibyte.chars().count() <= trawl_core::schema::MAX_FIELD_NAME_BYTES);
+        assert!(!trawl_core::schema::is_storable_field_name(&multibyte));
     }
 
     // --- _time grammar (the ADR-0008 corpus, moved verbatim) ---

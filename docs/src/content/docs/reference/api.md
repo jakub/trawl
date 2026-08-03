@@ -220,6 +220,7 @@ Every accepted event is canonicalized into the declared envelope (ADR-0009) — 
 - `service` missing, non-string, empty, over 128 bytes, containing invalid characters, or dot-leading → **rejected** with a typed reason
 - unmappable severity → `severity` NULL, `severity.unmapped`, never a rejection
 - client-sent `_ingested`/`_repairs` or a non-string `_raw` → stripped and replaced (`meta.stripped`)
+- a field whose **name** exceeds 255 bytes → that field is dropped (`field.name_too_long`), the rest of the event is accepted. The field catalog keys on the name, and a name too long to be a postgres btree key could never be pinned — which would stall compaction for that service rather than lose one field. The name and its value stay findable in `_raw`.
 
 Repairs are recorded per-event in `_repairs` (comma-separated codes, NULL when untouched) and counted in `trawl_ingest_repairs_total{code, service}`; they do not affect the `accepted`/`rejected` counts in the response. The `service` label is client-supplied, so it is capped at the first 256 distinct services seen since boot — repairs for services past the cap count under `service="<other>"` instead of growing the metric registry without bound. Rejections are per-event: valid siblings in the same batch still land.
 
