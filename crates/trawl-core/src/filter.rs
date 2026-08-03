@@ -16,6 +16,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
+use crate::emitter::EmitError;
 
 /// A compiled filter that can match JSON events in memory.
 ///
@@ -67,10 +68,6 @@ enum SeverityMatcher {
     NotBand { lo: u8, hi: u8 },
     /// Ordered comparison against the token's exact number.
     Ordered { op: CompareOp, number: u8 },
-    /// Glob/regex/unknown token — the SQL emitter rejects the query, so
-    /// this matcher never fires (the stream endpoint validates via emit
-    /// before compiling a filter).
-    Never,
 }
 
 impl SeverityMatcher {
@@ -91,41 +88,44 @@ impl SeverityMatcher {
             Self::Ordered { op, number } => {
                 sev.is_some_and(|n| apply_ord(n.cmp(&i64::from(*number)), *op))
             }
-            Self::Never => false,
         }
     }
 }
 
+/// Resolve a severity token the SQL emitter has already accepted.
+fn resolve_token(token: &str) -> (u8, (u8, u8)) {
+    let number = crate::severity::number_for_token(token)
+        .expect("emitter accepted the token, so it is in the table");
+    let band = crate::severity::band_of(number).expect("table numbers are in-ladder");
+    (number, band)
+}
+
 /// Compile a `level` field filter into a severity matcher.
-fn compile_level(op: FilterOp, value: &FilterValue) -> SeverityMatcher {
-    let band =
-        |token: &str| crate::severity::number_for_token(token).and_then(crate::severity::band_of);
-    match (op, value) {
-        (FilterOp::Eq, FilterValue::Literal(v)) => {
-            band(v).map_or(SeverityMatcher::Never, |(lo, hi)| SeverityMatcher::Band {
-                lo,
-                hi,
-            })
-        }
-        (FilterOp::Ne, FilterValue::Literal(v)) => band(v)
-            .map_or(SeverityMatcher::Never, |(lo, hi)| {
-                SeverityMatcher::NotBand { lo, hi }
-            }),
-        (FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte, FilterValue::Literal(v)) => {
-            crate::severity::number_for_token(v).map_or(SeverityMatcher::Never, |number| {
-                SeverityMatcher::Ordered {
+///
+/// Rejection is delegated to the SQL emitter's `level` predicates so the
+/// stream refuses exactly the queries `/api/v1/query` refuses, with the
+/// same message: an unknown token, a glob or a regex on `level` is an
+/// error here too, never a filter that silently matches nothing.
+fn compile_level(op: FilterOp, value: &FilterValue) -> Result<SeverityMatcher, EmitError> {
+    match value {
+        FilterValue::Literal(v) => {
+            crate::emitter::severity::level_predicate(op, v)?;
+            let (number, (lo, hi)) = resolve_token(v);
+            Ok(match op {
+                FilterOp::Eq => SeverityMatcher::Band { lo, hi },
+                FilterOp::Ne => SeverityMatcher::NotBand { lo, hi },
+                _ => SeverityMatcher::Ordered {
                     op: compile_op(op),
                     number,
-                }
+                },
             })
         }
-        (_, FilterValue::List(vs)) => {
-            let bands: Option<Vec<(u8, u8)>> = vs.iter().map(|v| band(v)).collect();
-            bands.map_or(SeverityMatcher::Never, |bands| SeverityMatcher::Bands {
-                bands,
+        FilterValue::List(vs) => {
+            crate::emitter::severity::level_in_list(vs)?;
+            Ok(SeverityMatcher::Bands {
+                bands: vs.iter().map(|v| resolve_token(v).1).collect(),
             })
         }
-        _ => SeverityMatcher::Never,
     }
 }
 
@@ -178,7 +178,15 @@ impl CompiledFilter {
     ///
     /// Regex and glob patterns are compiled eagerly. Invalid patterns
     /// are silently skipped (they would also fail at SQL execution time).
-    pub fn compile(search: &SearchStage) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL emitter's error when the search stage contains a
+    /// `level` filter the emitter rejects (unknown severity token, glob
+    /// or regex). Such a filter has no in-memory meaning: compiling it to
+    /// a match-nothing predicate would turn a typo into a silently empty
+    /// live stream while the same query errors on `/api/v1/query`.
+    pub fn compile(search: &SearchStage) -> Result<Self, EmitError> {
         let time_filter = search.time_filter.as_ref().map(|tf| TimeMatcher {
             duration_secs: tf.node.duration.to_seconds(),
         });
@@ -195,23 +203,14 @@ impl CompiledFilter {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
 
-        let groups = search
-            .groups
-            .iter()
-            .map(|group| {
-                group
-                    .iter()
-                    .filter_map(|token| compile_token(&token.node))
-                    .collect()
-            })
-            .collect();
+        let groups = compile_groups(&search.groups)?;
 
-        Self {
+        Ok(Self {
             groups,
             time_filter,
             earliest,
             latest,
-        }
+        })
     }
 
     /// Test whether a JSON event matches this filter.
@@ -271,20 +270,41 @@ impl CompiledFilter {
     }
 }
 
-fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
-    match token {
+/// Compile OR-of-AND groups, dropping tokens with no in-memory matcher.
+fn compile_groups(
+    groups: &[Vec<crate::ast::Spanned<SearchToken>>],
+) -> Result<Vec<Vec<TokenMatcher>>, EmitError> {
+    groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .filter_map(|token| compile_token(&token.node).transpose())
+                .collect()
+        })
+        .collect()
+}
+
+fn compile_token(token: &SearchToken) -> Result<Option<TokenMatcher>, EmitError> {
+    Ok(match token {
         SearchToken::FieldFilter(ff) => {
             // `level` is the severity band alias — mirror the SQL emitter.
             if ff.field == "level" {
-                return Some(TokenMatcher::Severity(compile_level(ff.op, &ff.value)));
+                return Ok(Some(TokenMatcher::Severity(compile_level(
+                    ff.op, &ff.value,
+                )?)));
             }
             let predicate = match (&ff.op, &ff.value) {
                 (FilterOp::Glob, FilterValue::Literal(pattern)) => {
-                    let regex = Regex::new(&glob_to_regex(pattern)).ok()?;
+                    let Ok(regex) = Regex::new(&glob_to_regex(pattern)) else {
+                        return Ok(None);
+                    };
                     FieldPredicate::Glob { regex }
                 }
                 (FilterOp::Regex, FilterValue::Literal(pattern)) => {
-                    let regex = Regex::new(pattern).ok()?;
+                    let Ok(regex) = Regex::new(pattern) else {
+                        return Ok(None);
+                    };
                     FieldPredicate::Regex { regex }
                 }
                 (_, FilterValue::List(values)) => FieldPredicate::InList {
@@ -305,12 +325,14 @@ fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
         SearchToken::TextSearch(ts) => {
             // Wildcard `*` matches everything — skip.
             if ts.term == "*" {
-                return None;
+                return Ok(None);
             }
-            let searcher = AhoCorasick::builder()
+            let Ok(searcher) = AhoCorasick::builder()
                 .ascii_case_insensitive(true)
                 .build([&ts.term])
-                .ok()?;
+            else {
+                return Ok(None);
+            };
             Some(TokenMatcher::Text(TextMatcher {
                 searcher,
                 negated: ts.negated,
@@ -323,32 +345,28 @@ fn compile_token(token: &SearchToken) -> Option<TokenMatcher> {
             None
         }
         SearchToken::QuotedSearch(qs) => {
-            let searcher = AhoCorasick::builder()
+            let Ok(searcher) = AhoCorasick::builder()
                 .ascii_case_insensitive(true)
                 .build([&qs.phrase])
-                .ok()?;
+            else {
+                return Ok(None);
+            };
             Some(TokenMatcher::Text(TextMatcher {
                 searcher,
                 negated: false,
             }))
         }
         SearchToken::Not(inner) => {
-            let inner_matcher = compile_token(&inner.node)?;
+            let Some(inner_matcher) = compile_token(&inner.node)? else {
+                return Ok(None);
+            };
             Some(TokenMatcher::Not(Box::new(inner_matcher)))
         }
         SearchToken::Group(groups) => {
-            let compiled_groups: Vec<Vec<TokenMatcher>> = groups
-                .iter()
-                .map(|group| {
-                    group
-                        .iter()
-                        .filter_map(|t| compile_token(&t.node))
-                        .collect()
-                })
-                .collect();
+            let compiled_groups = compile_groups(groups)?;
             Some(TokenMatcher::OrGroup(compiled_groups))
         }
-    }
+    })
 }
 
 fn compile_op(op: FilterOp) -> CompareOp {
@@ -738,7 +756,7 @@ mod tests {
     /// Helper: parse DSL, compile filter, test against event.
     fn matches_event(dsl: &str, event_json: &str) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search);
+        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
         filter.matches(&event)
@@ -749,7 +767,7 @@ mod tests {
     /// between event construction and evaluation, which flakes under load.
     fn matches_event_at(dsl: &str, event_json: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search);
+        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
         filter.matches_at(&event, now)
@@ -1030,6 +1048,43 @@ mod tests {
         assert!(matches_event("", r#"{"service": "nginx"}"#));
     }
 
+    // ── level rejection parity with the SQL emitter ───────────────────
+
+    #[test]
+    fn level_rejections_match_the_sql_emitter() {
+        // A `level` filter the emitter refuses must fail filter compilation
+        // with the same message: the SSE stream rejects the query instead of
+        // going live on a predicate that can never match an event.
+        for dsl in [
+            "level=eror",
+            "level!=eror",
+            "level>=eror",
+            "level=error,eror",
+            "level=err*",
+            "level=/err.*/",
+        ] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let emit_error = crate::emitter::emit(&query, "/data/**/*.parquet")
+                .err()
+                .map_or_else(
+                    || panic!("{dsl:?} should be an emit error"),
+                    |e| e.to_string(),
+                );
+            let compile_error = CompiledFilter::compile(&query.search).err().map_or_else(
+                || panic!("{dsl:?} should not compile to a filter"),
+                |e| e.to_string(),
+            );
+            assert_eq!(compile_error, emit_error, "{dsl:?}");
+        }
+    }
+
+    #[test]
+    fn level_known_token_still_compiles() {
+        assert!(matches_event("level=error", r#"{"severity": 17}"#));
+        assert!(matches_event("level=error,fatal", r#"{"severity": 21}"#));
+        assert!(!matches_event("level=error", r#"{"severity": 9}"#));
+    }
+
     // ── null/missing field ────────────────────────────────────────────
 
     #[test]
@@ -1257,7 +1312,7 @@ mod tests {
     #[test]
     fn matches_at_uses_provided_now() {
         let query = parser::parse("last=1h").expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search);
+        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
 
         // Event 30 min ago from "now".
         let now = chrono::Utc::now();

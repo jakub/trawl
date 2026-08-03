@@ -12,7 +12,7 @@ mod fields;
 mod functions;
 mod pipeline;
 mod search;
-mod severity;
+pub(crate) mod severity;
 mod state;
 mod validate;
 

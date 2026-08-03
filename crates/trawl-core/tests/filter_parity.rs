@@ -14,7 +14,9 @@ use std::io::Write;
 use duckdb::Connection;
 use serde_json::{Map, Value};
 
+use trawl_core::ast::PipeStage;
 use trawl_core::emitter::{self, EmittedQuery, SqlValue};
+use trawl_core::eval::eval_expr;
 use trawl_core::filter::CompiledFilter;
 use trawl_core::parser;
 
@@ -326,8 +328,11 @@ fn filter_matches_sql_parity() {
             continue;
         };
 
-        // In-memory filter result.
-        let filter = CompiledFilter::compile(&query.search);
+        // In-memory filter result — a compile error mirrors an emit error.
+        let Ok(filter) = CompiledFilter::compile(&query.search) else {
+            skipped += 1;
+            continue;
+        };
         let filter_result = filter.matches(&event);
 
         // Write event as ndjson (suffix required for emitter dispatch).
@@ -376,7 +381,7 @@ fn filter_matches_sql_parity() {
 /// Assert filter and SQL agree for one (dsl, event) pair.
 fn assert_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>) {
     let query = parser::parse(dsl).expect("dsl parses");
-    let filter = CompiledFilter::compile(&query.search);
+    let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
     let filter_result = filter.matches(event);
 
     let mut tmp = tempfile::Builder::new()
@@ -470,6 +475,66 @@ fn bare_search_raw_parity() {
     for &(dsl, sev, message, raw) in cases {
         let event = envelope_event(sev, message, raw);
         assert_parity(&conn, dsl, &event);
+    }
+}
+
+/// Assert the streaming `where` evaluator and SQL agree for one
+/// (dsl, event) pair. The DSL must carry exactly one `where` stage.
+fn assert_where_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>) {
+    let query = parser::parse(dsl).expect("dsl parses");
+    let where_stage = query
+        .pipeline
+        .iter()
+        .find_map(|s| match &s.node {
+            PipeStage::Where(w) => Some(w),
+            _ => None,
+        })
+        .expect("dsl has a where stage");
+    let eval_result = eval_expr(&where_stage.condition, event).is_truthy();
+
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+    tmp.flush().unwrap();
+    let emitted = emitter::emit(&query, tmp.path().to_str().unwrap()).expect("emit succeeds");
+    let sql_result = sql_matches(conn, &emitted);
+
+    assert_eq!(
+        eval_result, sql_result,
+        "where-stage parity mismatch
+dsl: {dsl:?}
+event: {event:?}
+sql: {}",
+        emitted.sql
+    );
+}
+
+/// The pipeline `where level …` stage means the same thing to the SQL
+/// emitter and to the streaming evaluator, for every severity number and
+/// NULL. `level` is an alias, not a column: the evaluator has to mirror
+/// the band predicate or SSE filters out everything batch returns.
+#[test]
+fn where_level_band_parity_exhaustive() {
+    let conn = Connection::open_in_memory().unwrap();
+    let dsls = [
+        "* | where level == \"error\"",
+        "* | where level != \"info\"",
+        "* | where level >= \"warn\"",
+        "* | where level > \"warn\"",
+        "* | where level < \"info\"",
+        "* | where level <= \"info\"",
+        "* | where level == \"notice\"",
+        "* | where level == \"error\" and status == 500",
+        "* | where not (level == \"error\")",
+    ];
+    for dsl in dsls {
+        for sev in (1..=24).map(Some).chain([None]) {
+            let mut event = envelope_event(sev, "hello", None);
+            event.insert("status".into(), Value::Number(500.into()));
+            assert_where_parity(&conn, dsl, &event);
+        }
     }
 }
 
