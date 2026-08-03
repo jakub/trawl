@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+# Launch the fast development build of trawld with the downloaded DuckDB
+# shared library. Cargo injects this loader path for `cargo run`, but
+# fleet-dev deliberately launches the already-built binary so application
+# credentials are never exposed to build scripts or proc macros.
+
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+trawl_root="$(CDPATH= cd -- "$script_dir/.." && pwd -P)"
+
+target_dir="${CARGO_TARGET_DIR:-$trawl_root/target}"
+case "$target_dir" in
+    /*) ;;
+    *) target_dir="$trawl_root/$target_dir" ;;
+esac
+
+profile_dir="$target_dir/debug"
+deps_dir="$profile_dir/deps"
+trawld="$profile_dir/trawld"
+
+case "$(uname -s)" in
+    Linux)
+        duckdb_library="$deps_dir/libduckdb.so"
+        if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+            export LD_LIBRARY_PATH="$deps_dir:$LD_LIBRARY_PATH"
+        else
+            export LD_LIBRARY_PATH="$deps_dir"
+        fi
+        ;;
+    Darwin)
+        duckdb_library="$deps_dir/libduckdb.dylib"
+        if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
+            export DYLD_LIBRARY_PATH="$deps_dir:$DYLD_LIBRARY_PATH"
+        else
+            export DYLD_LIBRARY_PATH="$deps_dir"
+        fi
+        ;;
+    *)
+        printf 'trawld-dev: unsupported development host: %s\n' "$(uname -s)" >&2
+        exit 2
+        ;;
+esac
+
+if [[ ! -x "$trawld" ]]; then
+    printf 'trawld-dev: missing development binary: %s\n' "$trawld" >&2
+    printf 'trawld-dev: run cargo build --no-default-features -p trawl-server\n' >&2
+    exit 1
+fi
+
+if [[ ! -r "$duckdb_library" ]]; then
+    printf 'trawld-dev: missing DuckDB development library: %s\n' "$duckdb_library" >&2
+    printf 'trawld-dev: run cargo build --no-default-features -p trawl-server\n' >&2
+    exit 1
+fi
+
+exec "$trawld" "$@"

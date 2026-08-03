@@ -243,6 +243,9 @@ jobs:
         with:
           tool: cargo-zigbuild
 
+      # Follow-up: this path downloads libduckdb.dylib while the tarball below
+      # currently stages only `trawl`. Audit with `otool -L`, then either ship
+      # and locate the dylib or produce a correctly linked static artifact.
       - name: Build CLI for macOS
         run: cargo zigbuild --release --target aarch64-apple-darwin -p trawl-cli --no-default-features
         env:

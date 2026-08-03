@@ -73,13 +73,15 @@ postgres), [cargo-nextest](https://nexte.st) (tests),
 [trunk](https://trunkrs.dev) (web UI — it fetches the lockfile-matching
 `wasm-bindgen` itself), and [lefthook](https://lefthook.dev) (git hooks).
 The attached development stack also uses [mprocs](https://github.com/pvolok/mprocs).
-The bundled DuckDB build needs a C/C++ toolchain (`gcc`/`clang` + `cmake`).
+Production-style builds bundle DuckDB and need a C/C++ toolchain
+(`gcc`/`clang` + `cmake`). The canonical `bin/dev` flow uses the matching
+prebuilt DuckDB shared library instead.
 
 ```bash
 rustup target add wasm32-unknown-unknown   # web UI only
 lefthook install                           # fmt/clippy pre-commit, tests pre-push
 
-cargo build                                # first build compiles DuckDB — go get coffee
+cargo build                                # production-style build with bundled DuckDB
 cargo xtask build-web --release            # optimized + precompressed SPA embedded in trawl-web
 ```
 
@@ -100,6 +102,24 @@ bin/fleet-dev doctor trawl
 bin/dev
 # browse http://localhost:8081/login and paste the key shown in mprocs
 ```
+
+`bin/dev` is the canonical fast development path. Its first server build may
+download the version-matched DuckDB shared library; Cargo caches the archive
+and extracted libraries below `target/duckdb-download`. The launcher supplies
+the loader path only to `trawld`, so the browser flow and the `mprocs` pane
+layout are unchanged. An ordinary `cargo build -p trawl-server` still compiles
+and statically bundles DuckDB.
+
+If old bundled DuckDB fingerprints consume excessive disk, inspect and then
+remove only that package's generated artifacts:
+
+```bash
+cargo clean -p libduckdb-sys --dry-run
+cargo clean -p libduckdb-sys
+```
+
+The downloaded cache is preserved, but the next bundled build recompiles
+DuckDB. Cleanup is deliberately not part of `bin/dev`.
 
 `bin/dev --release-spa` keeps the same stack with an optimized SPA.
 `bin/dev --tailscale` verifies the persistent Tailscale Serve mapping before

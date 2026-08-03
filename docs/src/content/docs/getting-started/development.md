@@ -22,6 +22,14 @@ The first launch starts `pgvector/pgvector:pg18` on
 role and API key. It then starts `trawld`, `trawl-web`, and Trunk. Open
 `http://localhost:8081/login` and paste the key displayed in the login pane.
 
+`bin/dev` is also the canonical fast server build. It downloads the
+version-matched DuckDB shared library on first use and caches the archive and
+extracted libraries below `target/duckdb-download`; later builds reuse it.
+The development launcher supplies the library path only to `trawld`. The
+browser flow and the three `mprocs` panes do not change. A direct
+`cargo build -p trawl-server` remains the production-style path and compiles
+bundled DuckDB.
+
 The interactive database lives in the named
 `fleet-dev-postgres-data` volume. It is intentionally separate from
 `docker-compose.dev.yml`, which is disposable test infrastructure. If
@@ -37,6 +45,18 @@ bin/fleet-dev doctor trawl
 bin/fleet-dev setup trawl
 bin/dev --release-spa
 ```
+
+If historical bundled DuckDB fingerprints grow too large, preview and remove
+only `libduckdb-sys` build artifacts with:
+
+```bash
+cargo clean -p libduckdb-sys --dry-run
+cargo clean -p libduckdb-sys
+```
+
+The versioned download cache remains available, while the next bundled build
+must compile DuckDB again. `fleet-dev` never performs this cleanup
+automatically.
 
 `plan` is pure: it does not read token files, resolve credentials, connect to a
 database, or change Tailscale configuration. Under Tailscale exposure it does

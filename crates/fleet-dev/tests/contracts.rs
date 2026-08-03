@@ -73,8 +73,22 @@ fn committed_trawl_manifest_pins_the_frozen_contract() {
     );
     assert_eq!(
         manifest.preparation.as_ref().unwrap().command,
-        ["cargo", "build", "-p", "trawl-server", "-p", "trawl-web"]
+        [
+            "cargo",
+            "build",
+            "--no-default-features",
+            "-p",
+            "trawl-server",
+            "-p",
+            "trawl-web"
+        ]
     );
+    let trawld = manifest
+        .processes
+        .iter()
+        .find(|process| process.name == "trawld")
+        .unwrap();
+    assert_eq!(trawld.command, ["bin/trawld-dev"]);
     assert!(
         manifest
             .processes
@@ -230,9 +244,15 @@ fn rendered_runtime_is_private_isolated_and_ephemeral() {
         serde_json::from_slice(&std::fs::read(&runtime.mprocs_config).unwrap()).unwrap();
     let procs = document["procs"].as_object().unwrap();
     let trawld = procs["trawl-trawld"]["env"].as_object().unwrap();
+    assert_eq!(
+        procs["trawl-trawld"]["cmd"],
+        serde_json::json!(["bin/trawld-dev"])
+    );
     assert_eq!(trawld["FLEET_DATABASE_URL"], "postgres://fleet-secret");
     assert_eq!(trawld["TRAWL_DATABASE_URL"], "postgres://trawl-secret");
     assert!(!trawld.contains_key("FLEET_SESSION_AEAD_KEY"));
+    assert!(!trawld.contains_key("LD_LIBRARY_PATH"));
+    assert!(!trawld.contains_key("DYLD_LIBRARY_PATH"));
 
     let web = procs["trawl-trawl-web"]["env"].as_object().unwrap();
     assert_eq!(web["FLEET_SESSION_AEAD_KEY"], "session-secret");

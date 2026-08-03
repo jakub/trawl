@@ -24,11 +24,11 @@ permissions = [
 ]
 
 [preparation]
-command = ["cargo", "build", "-p", "trawl-server", "-p", "trawl-web"]
+command = ["cargo", "build", "--no-default-features", "-p", "trawl-server", "-p", "trawl-web"]
 
 [[processes]]
 name = "trawld"
-command = ["target/debug/trawld"]
+command = ["bin/trawld-dev"]
 
 [processes.resolved_env]
 FLEET_DATABASE_URL = "fleet.database_url"

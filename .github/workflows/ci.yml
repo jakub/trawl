@@ -115,6 +115,12 @@ jobs:
           # shared service container. The #[sqlx::test] harness hardwires
           # DATABASE_URL.
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - name: Smoke-test downloaded DuckDB development launcher
+        run: |
+          cargo build -p trawl-server --no-default-features
+          bin/trawld-dev --version
+        env:
+          DUCKDB_DOWNLOAD_LIB: "1"
 
   msrv:
     name: msrv check

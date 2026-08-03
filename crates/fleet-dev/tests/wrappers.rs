@@ -10,10 +10,34 @@ use std::process::Command;
 
 const DEV_WRAPPER: &str = include_str!("../../../bin/dev");
 const FLEET_WRAPPER: &str = include_str!("../../../bin/fleet-dev");
+const TRAWLD_DEV_WRAPPER: &str = include_str!("../../../bin/trawld-dev");
+
+fn trawl_root() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("fleet-dev lives at crates/fleet-dev")
+        .to_owned()
+}
 
 fn executable(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn fake_trawld_target(root: &Path, target: &Path) {
+    let profile = target.join("debug");
+    let deps = profile.join("deps");
+    std::fs::create_dir_all(&deps).unwrap();
+    std::fs::write(deps.join("libduckdb.so"), b"").unwrap();
+    executable(
+        &profile.join("trawld"),
+        "#!/bin/sh\nprintf 'loader=%s\\n' \"$LD_LIBRARY_PATH\"\nprintf 'arg=%s\\n' \"$@\"\nif test \"${1:-}\" = exit; then exit \"${2:-0}\"; fi\n",
+    );
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    executable(&bin.join("trawld-dev"), TRAWLD_DEV_WRAPPER);
 }
 
 #[test]
@@ -113,4 +137,99 @@ fn cargo_binstub_preserves_argument_boundaries_and_root() {
             .any(|pair| pair == ["--trawl-root", root.path().to_str().unwrap()])
     );
     assert!(args.ends_with(&["plan", "trawl", "--format", "json"]));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trawld_dev_supports_absolute_target_and_preserves_loader_path_and_arguments() {
+    let root = tempfile::Builder::new()
+        .prefix("trawld dev absolute ")
+        .tempdir()
+        .unwrap();
+    let target = root.path().join("absolute target");
+    fake_trawld_target(root.path(), &target);
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let output = Command::new(root.path().join("bin/trawld-dev"))
+        .current_dir(elsewhere.path())
+        .env("CARGO_TARGET_DIR", &target)
+        .env("LD_LIBRARY_PATH", "/existing/libs")
+        .args(["alpha beta", "gamma"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            format!(
+                "loader={}:/existing/libs",
+                target.join("debug/deps").display()
+            ),
+            "arg=alpha beta".to_owned(),
+            "arg=gamma".to_owned(),
+        ]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trawld_dev_resolves_relative_target_against_checkout_and_propagates_exit() {
+    let root = tempfile::Builder::new()
+        .prefix("trawld dev relative ")
+        .tempdir()
+        .unwrap();
+    let target = root.path().join("relative-target");
+    fake_trawld_target(root.path(), &target);
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let output = Command::new(root.path().join("bin/trawld-dev"))
+        .current_dir(elsewhere.path())
+        .env("CARGO_TARGET_DIR", "relative-target")
+        .env_remove("LD_LIBRARY_PATH")
+        .args(["exit", "37"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(37));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.lines().next().is_some_and(|line| {
+            line == format!("loader={}", target.join("debug/deps").display())
+        })
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trawld_dev_reports_a_missing_downloaded_library_without_running_binary() {
+    let root = tempfile::Builder::new()
+        .prefix("trawld dev missing ")
+        .tempdir()
+        .unwrap();
+    let target = root.path().join("target");
+    fake_trawld_target(root.path(), &target);
+    std::fs::remove_file(target.join("debug/deps/libduckdb.so")).unwrap();
+
+    let output = Command::new(root.path().join("bin/trawld-dev"))
+        .env("CARGO_TARGET_DIR", &target)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("missing DuckDB development library"));
+    assert!(stderr.contains("cargo build --no-default-features -p trawl-server"));
+}
+
+#[test]
+fn trawld_dev_has_valid_bash_syntax() {
+    let output = Command::new("bash")
+        .args(["-n", trawl_root().join("bin/trawld-dev").to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
