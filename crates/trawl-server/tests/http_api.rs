@@ -259,6 +259,30 @@ async fn vector_shaped_ingest_queryable_via_level_alias(pool: sqlx::PgPool) {
         }
         other => panic!("_raw must be a string, got {other:?}"),
     }
+
+    // …and the pre-cutover shape of the same query — grouping on `level`
+    // as if it were a column — is a 4xx, not a 200 with zero rows. The
+    // matching data is right there; an empty success would tell a
+    // migrated saved query nothing about why its results vanished.
+    let resp = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({
+            "query": "service=vec-svc last=1h | stats count() by level"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "`stats by level` must be a client error, not an empty success"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("filter-only alias"),
+        "the error must name the severity alias: {body}"
+    );
 }
 
 /// An event with an unlisted env is rejected per-event with a typed

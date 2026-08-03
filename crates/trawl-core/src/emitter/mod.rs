@@ -467,6 +467,77 @@ mod tests {
         assert_snapshot!(emit_dsl(r#"* | where level >= "warn""#));
     }
 
+    /// `level` is consumed at ingest, so a non-comparison use names a
+    /// column that does not exist. Emitting it verbatim gets a binder
+    /// error that the hot/cold ladder downgrades to an empty 200 — every
+    /// pre-cutover saved query grouping on `level` would silently return
+    /// nothing. Reject it instead, everywhere a field name can appear.
+    #[test]
+    fn error_level_in_stats_by() {
+        assert_snapshot!(emit_dsl_err("* | stats count() by level"));
+    }
+
+    #[test]
+    fn error_level_in_table() {
+        assert_snapshot!(emit_dsl_err("* | table host, level"));
+    }
+
+    #[test]
+    fn error_level_in_sort() {
+        assert_snapshot!(emit_dsl_err("* | sort -level"));
+    }
+
+    #[test]
+    fn error_level_in_expression() {
+        assert_snapshot!(emit_dsl_err(r#"* | where lower(level) == "error""#));
+    }
+
+    /// A `level` column defined mid-pipeline would shadow the severity
+    /// alias for every later stage, so the write side is rejected too.
+    #[test]
+    fn error_level_as_assignment_target() {
+        assert_snapshot!(emit_dsl_err(r#"* | let level = "error""#));
+    }
+
+    /// Every other field-name position routes through the same check.
+    #[test]
+    fn error_level_in_remaining_positions() {
+        for dsl in [
+            "* | top 5 level",
+            "* | rare 5 level",
+            "* | dedup level",
+            "* | drop level",
+            "* | rename level as lvl",
+            "* | rename service as level",
+            "* | timechart span=5m count() by level",
+            "* | pivot count() on level",
+            "* | stats count() as level",
+            "* | extract kv from level",
+            r#"* | where level in ("error")"#,
+        ] {
+            let err = emit_dsl_err(dsl);
+            assert!(
+                err.contains("filter-only alias"),
+                "{dsl} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    /// The rejection must not swallow the legal comparison forms, in
+    /// either stage.
+    #[test]
+    fn level_comparisons_still_emit() {
+        for dsl in [
+            "level=error",
+            "level>=warn",
+            r#"* | where level == "error""#,
+            r#"* | where level != "info" and service == "nginx""#,
+        ] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            emit(&query, SRC).expect("level comparison should still emit");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // _time alias inversion (ADR-0009)
     // -----------------------------------------------------------------------
@@ -842,7 +913,7 @@ mod tests {
 
     #[test]
     fn pipe_let_override_existing() {
-        assert_snapshot!(emit_dsl("* | let level = lower(level)"));
+        assert_snapshot!(emit_dsl("* | let message = lower(message)"));
     }
 
     // -----------------------------------------------------------------------
@@ -983,7 +1054,7 @@ mod tests {
     #[test]
     fn pipe_timechart_by_then_where() {
         assert_snapshot!(emit_dsl(
-            "last=1h | timechart span=5m count() by level | where count > 10"
+            "last=1h | timechart span=5m count() by severity | where count > 10"
         ));
     }
 

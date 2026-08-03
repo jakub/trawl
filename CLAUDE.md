@@ -164,7 +164,7 @@ trawl query "level=error last=1h | stats count() by service | sort -count | head
 trawl query -p dev "level=error last=1h | stats count() by service | sort -count | head 10"
 
 # browse all data (table output)
-trawl query -f table "* | head 5 | fields timestamp, host, service, level, message"
+trawl query -f table "* | head 5 | fields timestamp, host, service, severity, message"
 
 # pipe JSON to jq for ad-hoc processing
 trawl query "last=1h | stats count() by service" | jq '.service'
@@ -477,5 +477,5 @@ last=1h | pivot count() on status by host
 * | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10
 
 # distinct values per group
-* | stats values(level), first(message) by service | head 10
+* | stats values(severity_text), first(message) by service | head 10
 ```

@@ -375,6 +375,33 @@ fn level_eq_error_matches_the_error_band() {
     assert_eq!(result.row_count(), 3, "exactly the three ERROR-band rows");
 }
 
+/// Grouping or projecting on `level` must fail loudly through the whole
+/// executor, not just inside the emitter.
+///
+/// `level` is consumed at ingest, so these used to reach `DuckDB` as a
+/// missing column: the hot/cold ladder classified that binder error as
+/// benign, fell back to hot-only, and the re-emit's second binder error
+/// became an empty result — a pre-cutover saved query returned zero rows
+/// and a 200 instead of saying its column was gone.
+#[test]
+fn level_outside_a_comparison_errors_instead_of_returning_no_rows() {
+    let (exec, glob) = setup();
+    for dsl in [
+        "* | stats count() by level",
+        "* | table level",
+        "* | sort level",
+    ] {
+        let err = exec
+            .run_query_max(dsl, &glob)
+            .expect_err("a `level` column reference must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("filter-only alias"),
+            "{dsl} must explain the severity alias, got: {msg}"
+        );
+    }
+}
+
 #[test]
 fn bare_word_matches_content_only_in_raw() {
     // "gateway-detail" appears only in one row's `_raw`, never in `message`

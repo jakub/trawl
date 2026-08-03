@@ -1,12 +1,12 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"last=1h | timechart span=5m count() by level | where count > 10\")"
+expression: "emit_dsl(\"last=1h | timechart span=5m count() by severity | where count > 10\")"
 ---
 WITH _s0 AS (
-  SELECT time_bucket(INTERVAL '5 minutes', TRY_CAST("_time" AS TIMESTAMP)) AS "_time", "level", COUNT(*) AS "count"
+  SELECT time_bucket(INTERVAL '5 minutes', TRY_CAST("_time" AS TIMESTAMP)) AS "_time", "severity", COUNT(*) AS "count"
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
   WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '1 hours'
-  GROUP BY time_bucket(INTERVAL '5 minutes', TRY_CAST("_time" AS TIMESTAMP)), "level"
+  GROUP BY time_bucket(INTERVAL '5 minutes', TRY_CAST("_time" AS TIMESTAMP)), "severity"
   ORDER BY time_bucket(INTERVAL '5 minutes', TRY_CAST("_time" AS TIMESTAMP)) ASC
 )
 SELECT *

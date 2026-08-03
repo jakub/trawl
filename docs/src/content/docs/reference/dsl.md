@@ -57,8 +57,13 @@ level>=warn                     # severity >= 13 (the token's exact number)
 - `level` works in search-stage filters and in `where` comparisons
   against a token literal — both compile to the same band predicate, and
   live tail (SSE) evaluates them identically to a batch query.
-- Everywhere else — projections, `stats by`, `sort`, `let` arithmetic —
-  use `severity`/`severity_text`; there is no stored `level` column.
+- Everywhere else — projections, `stats by`, `sort`, `dedup`, `rename`,
+  `let` arithmetic — naming `level` is a query error, because there is no
+  stored `level` column to read or write. Use `severity` (the number) or
+  `severity_text` (the original text) instead. The error is deliberate:
+  emitting `level` verbatim would ask the database for a column that does
+  not exist, and a pre-cutover saved query would come back empty rather
+  than say so.
 
 ### Time aliases
 
@@ -428,5 +433,5 @@ last=1h | pivot count() on status by host
 * | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10
 
 # Distinct values per group
-* | stats values(level), first(message) by service | head 10
+* | stats values(severity_text), first(message) by service | head 10
 ```

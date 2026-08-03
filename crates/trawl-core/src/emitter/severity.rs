@@ -62,6 +62,31 @@ fn unknown_token_error(token: &str) -> EmitError {
     }
 }
 
+/// Reject `level` in any position other than a comparison against a
+/// severity token.
+///
+/// `level` is a filter-only alias for the numeric `severity` column
+/// (ADR-0009) — ingest consumes it, so there is no `level` column to read.
+/// Grouping, projecting, sorting or otherwise naming it emits `"level"`
+/// verbatim; `DuckDB` answers with a binder error, which the hot/cold
+/// ladder reads as a benign missing column and downgrades to an empty
+/// result. A pre-cutover saved query, schedule or dashboard panel would
+/// then return an empty 200 instead of saying its column is gone, so fail
+/// loudly and name the two columns that do exist.
+pub(crate) fn reject_level_field(name: &str) -> Result<(), EmitError> {
+    if name != LEVEL_FIELD {
+        return Ok(());
+    }
+    Err(EmitError::UnsupportedOperation {
+        message: format!(
+            "'{LEVEL_FIELD}' is a filter-only alias for the numeric severity column, \
+             not a stored column — it works in comparisons only (level=error, \
+             where level >= \"warn\"); to group, project or sort use severity (the \
+             number) or severity_text (the original text)"
+        ),
+    })
+}
+
 fn pattern_error() -> EmitError {
     EmitError::UnsupportedOperation {
         message: format!(
