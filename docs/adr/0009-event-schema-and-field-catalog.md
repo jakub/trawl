@@ -191,7 +191,11 @@ late-arriving data. Nothing records what the server changed about an event.
   `host.from_peer`, `env.defaulted`, `time.from_ingest`, `time.out_of_range`,
   `severity.unmapped`, `field.truncated`. Accompanied by
   `trawl_ingest_repairs_total{code, service}`, because alerting on a counter is far
-  cheaper than querying logs.
+  cheaper than querying logs. `service` is the only client-controlled label in the
+  tree and the prometheus recorder never evicts a counter series, so the label is
+  admitted for the first 256 distinct services seen per process and collapses to
+  `service="<other>"` thereafter — otherwise any key holding `ingest` grows the
+  registry without bound by posting fresh service names.
 
   It is not named `_tags`: in observability that word means user-supplied labels
   (Datadog tags, Prometheus labels), and reusing it for server annotations is a

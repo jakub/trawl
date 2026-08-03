@@ -4,6 +4,7 @@
 
 //! Prometheus metrics: metric name constants, descriptions, and gauge collection.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -46,7 +47,8 @@ pub fn describe_metrics() {
     describe_counter!(
         INGEST_REPAIRS_TOTAL,
         "Repairs applied to accepted ingest events, labelled by repair code \
-         and service (codes also recorded per-event in _repairs)"
+         and service (codes also recorded per-event in _repairs); services \
+         beyond the first 256 seen collapse into service=\"<other>\""
     );
     describe_gauge!(
         HOT_BUFFER_EVENTS,
@@ -78,6 +80,57 @@ pub fn describe_metrics() {
     );
     describe_gauge!(WAL_FILES, "Number of pending WAL (ndjson) files");
     describe_gauge!(WAL_BYTES, "Total byte size of pending WAL files");
+}
+
+// -- bounded label values ----------------------------------------------------
+
+/// Maximum distinct `service` label values admitted to `trawl_ingest_repairs_total`.
+///
+/// Every other label in this crate (`reason`, `status`, `transport`, `subsystem`)
+/// comes from a closed, code-defined set. `service` is client-supplied and its
+/// charset admits effectively unbounded values, while the prometheus recorder
+/// retains counter series for the process lifetime — so without a cap any key
+/// holding `ingest` could grow the registry and the `/metrics` payload without
+/// bound by posting events with fresh service names.
+pub const REPAIR_SERVICE_LABEL_CAP: usize = 256;
+
+/// Label value that novel services collapse into once the cap is reached.
+///
+/// The angle brackets are outside the ingest service charset (alphanumeric,
+/// dash, underscore, dot), so this can never collide with a real service name.
+pub const OVERFLOW_SERVICE_LABEL: &str = "<other>";
+
+/// Process-wide set of service names already admitted as a repair label value.
+fn repair_service_labels() -> &'static Mutex<HashSet<String>> {
+    static LABELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LABELS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Map a client-supplied service name onto a bounded `trawl_ingest_repairs_total`
+/// label value.
+///
+/// Already-admitted services pass through verbatim; once
+/// [`REPAIR_SERVICE_LABEL_CAP`] distinct services have been admitted, further
+/// novel names return [`OVERFLOW_SERVICE_LABEL`] so the series count stays
+/// bounded at `cap + 1` per repair code.
+pub fn repair_service_label(service: &str) -> String {
+    let mut admitted = repair_service_labels()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    bounded_label(&mut admitted, service, REPAIR_SERVICE_LABEL_CAP)
+}
+
+/// Cap-enforcing core of [`repair_service_label`], split out so it is testable
+/// without the process-wide static.
+fn bounded_label(admitted: &mut HashSet<String>, service: &str, cap: usize) -> String {
+    if admitted.contains(service) {
+        return service.to_string();
+    }
+    if admitted.len() >= cap {
+        return OVERFLOW_SERVICE_LABEL.to_string();
+    }
+    admitted.insert(service.to_string());
+    service.to_string()
 }
 
 // -- gauge collection --------------------------------------------------------
@@ -312,6 +365,39 @@ mod tests {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let _handle = builder.install_recorder().expect("install test recorder");
         describe_metrics();
+    }
+
+    #[test]
+    fn bounded_label_admits_up_to_the_cap_then_collapses() {
+        let mut admitted = HashSet::new();
+        for i in 0..3 {
+            let svc = format!("svc-{i}");
+            assert_eq!(bounded_label(&mut admitted, &svc, 3), svc);
+        }
+
+        // Novel services past the cap collapse into the overflow bucket...
+        assert_eq!(
+            bounded_label(&mut admitted, "svc-3", 3),
+            OVERFLOW_SERVICE_LABEL
+        );
+        assert_eq!(
+            bounded_label(&mut admitted, "svc-4", 3),
+            OVERFLOW_SERVICE_LABEL
+        );
+        // ...and do not consume admission slots, so the series count is capped.
+        assert_eq!(admitted.len(), 3);
+
+        // Already-admitted services keep reporting under their own name.
+        assert_eq!(bounded_label(&mut admitted, "svc-1", 3), "svc-1");
+    }
+
+    #[test]
+    fn overflow_label_cannot_collide_with_a_service_name() {
+        assert!(
+            !OVERFLOW_SERVICE_LABEL
+                .bytes()
+                .all(crate::ingest::pipeline::is_valid_service_char)
+        );
     }
 
     #[test]

@@ -329,10 +329,16 @@ fn finalize_ingest(
 
     if !parsed.repairs.is_empty() {
         for ((code, service), count) in &parsed.repairs {
+            // SECURITY: `service` is client-supplied and `/metrics` is
+            // unauthenticated. It is a data dimension ADR-0009 publishes
+            // deliberately (alerting per repair code and sender), unlike the
+            // principal-derived labels `handlers.rs` forbids — but the
+            // recorder never evicts a series, so the distinct label values are
+            // capped and per-key attribution stays in the authenticated log.
             metrics::counter!(
                 crate::metrics::INGEST_REPAIRS_TOTAL,
                 "code" => *code,
-                "service" => service.clone()
+                "service" => crate::metrics::repair_service_label(service)
             )
             .increment(*count);
         }

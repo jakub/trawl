@@ -221,7 +221,7 @@ Every accepted event is canonicalized into the declared envelope (ADR-0009) — 
 - unmappable severity → `severity` NULL, `severity.unmapped`, never a rejection
 - client-sent `_ingested`/`_repairs` or a non-string `_raw` → stripped and replaced (`meta.stripped`)
 
-Repairs are recorded per-event in `_repairs` (comma-separated codes, NULL when untouched) and counted in `trawl_ingest_repairs_total{code, service}`; they do not affect the `accepted`/`rejected` counts in the response. Rejections are per-event: valid siblings in the same batch still land.
+Repairs are recorded per-event in `_repairs` (comma-separated codes, NULL when untouched) and counted in `trawl_ingest_repairs_total{code, service}`; they do not affect the `accepted`/`rejected` counts in the response. The `service` label is client-supplied, so it is capped at the first 256 distinct services seen since boot — repairs for services past the cap count under `service="<other>"` instead of growing the metric registry without bound. Rejections are per-event: valid siblings in the same batch still land.
 
 Reserved field: `_trawl_wal_file` is trawl's own, used internally to carry each row's source WAL file through compaction. If an event supplies it, the key is silently dropped before the event is written — the rest of the event is accepted unchanged.
 
