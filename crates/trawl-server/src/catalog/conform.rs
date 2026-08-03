@@ -200,7 +200,10 @@ fn read_marker(data_dir: &Path) -> Option<String> {
 fn publish_marker(data_dir: &Path, catalog_id: &str) -> Result<(), String> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| format!("failed to create data root for marker: {e}"))?;
-    let staged = data_dir.join(format!("{CATALOG_MARKER}.next"));
+    // PID-unique staged name: concurrent publishers (test harnesses share
+    // a fixture corpus) must not clobber each other's staged file between
+    // write and rename.
+    let staged = data_dir.join(format!("{CATALOG_MARKER}.next.{}", std::process::id()));
     std::fs::write(&staged, format!("{catalog_id}\n"))
         .map_err(|e| format!("failed to write {}: {e}", staged.display()))?;
     std::fs::File::open(&staged)

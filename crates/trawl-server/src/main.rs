@@ -167,6 +167,28 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // ADR-0009 boot conformance pass: make the write-time invariant true
+    // over the standing corpus before anything reads or writes it. Only on
+    // ingest-enabled nodes (a query-only node does not own the data root).
+    // Fatal on failure, like the epoch gate — a data root not proven
+    // conformant must not serve queries.
+    if config.ingest.enabled {
+        let summary = trawl_server::catalog::conform::ensure_conformance(
+            &state.storage.catalog,
+            &state.query.field_catalog,
+            &config.data.base_dir(),
+            &config.ingest.compaction_memory_limit,
+        )
+        .await?;
+        tracing::info!(
+            event_type = "catalog_conform",
+            ran = summary.ran,
+            scanned = summary.scanned,
+            rewritten = summary.rewritten,
+            "boot conformance pass finished"
+        );
+    }
+
     let compaction_handle = spawn_ingest_pipeline(&config, &state)?;
 
     // Spawn syslog listeners if enabled (requires ingest to be enabled).

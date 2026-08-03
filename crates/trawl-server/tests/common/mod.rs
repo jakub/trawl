@@ -399,7 +399,7 @@ pub fn ensure_fixtures() -> String {
                 env VARCHAR,
                 service VARCHAR,
                 host VARCHAR,
-                severity INTEGER,
+                severity BIGINT,
                 severity_text VARCHAR,
                 message VARCHAR
             )",
@@ -683,8 +683,10 @@ pub async fn setup_in_dir_with_data(
         .await
         .expect("failed to create app state");
 
+    boot_conformance_pass(&state, &config).await;
+
     // Snapshot collector: makes GET /api/v1/dashboard live in tests, same
-    // as trawld's main() does in production.
+    // as trawld's `main()` does in production.
     let _collector = trawl_server::monitor::spawn_snapshot_collector(
         state.clone(),
         addr.clone(),
@@ -693,6 +695,29 @@ pub async fn setup_in_dir_with_data(
         false,
     );
 
+    serve_and_wait(&state, &config, http_config, &addr).await;
+
+    TestServer {
+        url: format!("https://{addr}"),
+        analyst_token,
+        admin_token,
+        reader_token,
+        ingest_token,
+        coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
+        fleet_pool: pool,
+        fleet_db_url,
+        app_db_url,
+        state,
+    }
+}
+
+/// Spawn the HTTPS server task and wait for it to answer on `addr`.
+async fn serve_and_wait(
+    state: &AppState,
+    config: &Config,
+    http_config: trawl_server::state::HttpConfig,
+    addr: &str,
+) {
     let server_config = config.server.clone();
     let state_dir = config.state_dir();
     let spawned_state = state.clone();
@@ -707,19 +732,21 @@ pub async fn setup_in_dir_with_data(
         .await
         .unwrap();
     });
-    wait_for_ready(&addr).await;
+    wait_for_ready(addr).await;
+}
 
-    TestServer {
-        url: format!("https://{addr}"),
-        analyst_token,
-        admin_token,
-        reader_token,
-        ingest_token,
-        coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
-        fleet_pool: pool,
-        fleet_db_url,
-        app_db_url,
-        state,
+/// Boot conformance pass, same as trawld's `main()` does in production
+/// (ingest is enabled in the test config default).
+async fn boot_conformance_pass(state: &trawl_server::state::AppState, config: &Config) {
+    if config.ingest.enabled {
+        trawl_server::catalog::conform::ensure_conformance(
+            &state.storage.catalog,
+            &state.query.field_catalog,
+            &config.data.base_dir(),
+            &config.ingest.compaction_memory_limit,
+        )
+        .await
+        .expect("boot conformance pass must succeed");
     }
 }
 

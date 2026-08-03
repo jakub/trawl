@@ -622,4 +622,45 @@ mod boot {
         let marker = std::fs::read_to_string(data_dir.join("CATALOG")).unwrap();
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
+
+    /// Wiring: server boot itself runs the conformance pass — pins land in
+    /// the process cache and one query returns the full corrected corpus,
+    /// without this test ever calling `ensure_conformance`.
+    #[sqlx::test(migrations = false)]
+    async fn server_boot_runs_the_conformance_pass(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let data_dir = root.join("data");
+        let (majority, minority) = plant_disagreeing_corpus(&data_dir);
+        let data_glob = format!("{}/**/*.parquet", data_dir.display());
+
+        let server = crate::common::setup_in_dir_with_data(
+            pool,
+            &root,
+            data_glob,
+            trawl_server::config::RateLimitConfig::default(),
+        )
+        .await;
+        std::mem::forget(tmp);
+
+        // Pins were hydrated by boot, not by this test.
+        assert_eq!(
+            server.state.query.field_catalog.get("duration"),
+            Some(trawl_core::schema::CanonicalType::BigInt),
+            "boot must seed and hydrate the pin cache"
+        );
+
+        // The corpus was corrected on disk.
+        assert_eq!(column_type(&minority, "duration"), "BIGINT");
+        assert_eq!(column_type(&majority, "duration"), "BIGINT");
+
+        // One union returns the full corrected corpus.
+        let query =
+            trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+        let result = query
+            .query_paginated("service=svc-a OR service=svc-b", None, None)
+            .await
+            .expect("query across the corrected corpus must succeed");
+        assert_eq!(result.result.row_count(), 4, "full corpus visible");
+    }
 }
