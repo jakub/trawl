@@ -43,33 +43,6 @@ fn extract_eq_filter<'a>(
     })
 }
 
-/// Enumerate env directories under the data root: immediate subdirectories
-/// whose name passes the env charset and is not reserved (`wal/`,
-/// `scheduled/`). Sorted for deterministic glob ordering.
-fn enumerate_env_dirs(base: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return Vec::new();
-    };
-    let mut envs: Vec<String> = entries
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let name = path.file_name()?.to_str()?.to_owned();
-            if !trawl_config::is_valid_env_name(&name)
-                || trawl_config::RESERVED_ENV_NAMES.contains(&name.as_str())
-            {
-                return None;
-            }
-            Some(name)
-        })
-        .collect();
-    envs.sort();
-    envs
-}
-
 /// Compute the `read_parquet()` source argument over the two path
 /// dimensions (ADR-0009): `data/{env}/{date}/{HH}/{service}.parquet`,
 /// day-level `data/{env}/{date}/{service}.parquet` after rollup.
@@ -109,7 +82,7 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
             // an empty result and the SQL filter keeps hot rows correct.
             return format!("{base}/.no-such-env/{file_pattern}");
         }
-        None => enumerate_env_dirs(base),
+        None => crate::env_dirs::list_env_names(std::path::Path::new(base)),
     };
 
     if envs.is_empty() {

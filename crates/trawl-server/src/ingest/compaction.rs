@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 use trawl_engine::{is_complex_type, is_conversion_error};
 
+use crate::env_dirs::list_env_dirs;
 use crate::hot_buffer::HotBuffer;
 use crate::state::CompactionStats;
 
@@ -1650,34 +1651,6 @@ fn compact_service_blocking(
     let mut quarantined: u64 = 0;
     compact_service_inner(wal_files, data_dir, service, memory_limit, &mut quarantined)
         .map(|()| quarantined)
-}
-
-/// Enumerate env directories under a root: immediate subdirectories whose
-/// name passes the env charset and is not reserved. Anything else
-/// (`scheduled/`, a stray file, a legacy date dir) is skipped — env names
-/// were validated at ingest, so the directory name IS the env value.
-fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut dirs: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let name = path.file_name()?.to_str()?.to_owned();
-            if !trawl_config::is_valid_env_name(&name)
-                || trawl_config::RESERVED_ENV_NAMES.contains(&name.as_str())
-            {
-                return None;
-            }
-            Some((name, path))
-        })
-        .collect();
-    dirs.sort();
-    dirs
 }
 
 /// Remove stale `.parquet.tmp` files left by interrupted compaction or
