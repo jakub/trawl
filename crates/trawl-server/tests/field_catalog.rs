@@ -656,6 +656,67 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
+    /// A standing file whose `_time` is VARCHAR text no parser can read must
+    /// NOT be rewritten to a NULL partition key: a NULL sorts first and falls
+    /// outside every `last=Xh` filter, so the row would survive the conform
+    /// and become permanently unqueryable by time (ADR-0008). The rewrite
+    /// substitutes the file's own partition instant, exactly as compaction
+    /// substitutes the WAL filename's.
+    #[sqlx::test]
+    async fn unparseable_standing_time_conforms_to_the_partition_instant(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // Majority (3 rows) pins `_time` TIMESTAMP.
+        plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' + INTERVAL (x) MINUTE AS \"_time\", \
+             'svc-a' AS service FROM (VALUES (1), (2), (3)) t(x)",
+        );
+        // Minority: VARCHAR `_time` carrying text no TRY_CAST can read.
+        let minority = plant(
+            &data_dir,
+            "prod/2026-08-01/11/svc-b.parquet",
+            "SELECT 'yesterday-ish' AS \"_time\", 'svc-b' AS service",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+        assert_eq!(summary.rewritten, 1, "only the minority file disagrees");
+        assert_eq!(column_type(&minority, "_time"), "TIMESTAMP");
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let (nulls, substituted): (i64, String) = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FILTER (WHERE \"_time\" IS NULL)::BIGINT, \
+                     max(\"_time\")::VARCHAR FROM read_parquet('{}/**/*.parquet', \
+                     union_by_name=true)",
+                    data_dir.display()
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(nulls, 0, "the conform must never manufacture a NULL _time");
+        assert_eq!(
+            substituted, "2026-08-01 11:00:00",
+            "the unreadable row takes its own hour directory's instant"
+        );
+
+        // Substituting a value is still losing one: the evidence is recorded.
+        let conflicts = store.conflicts_for_field("_time").await.unwrap();
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.service == "svc-b" && c.rows_nulled == 1),
+            "the unreadable timestamp is conflict evidence: {conflicts:?}"
+        );
+    }
+
     /// The vote weighs rows that CARRY the field, not the file's row count:
     /// a mostly-NULL `duration` in a big file holds no values to describe, so
     /// it must not win the pin and `TRY_CAST` the small file's real values away.

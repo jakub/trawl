@@ -617,13 +617,56 @@ fn rewrite_nonconforming(
     Ok((rewritten, skipped, conflicts))
 }
 
+/// The instant a file's own partition path names: `{date}/{HH}` for an
+/// hour file, `{date}` at midnight UTC for a daily rollup, and the conform
+/// instant for anything else (a foreign layout the walk still adopted).
+///
+/// This is the never-NULL last arm the rewrite conforms `_time`/`_ingested`
+/// with (see [`ConformPolicy::StandingFile`]): a standing file has no WAL
+/// filename to recover an ingest instant from, but it does sit in a
+/// directory that already claims an hour — the closest honest answer
+/// available, and by construction inside the window the row was already
+/// pruned to.
+fn partition_instant(path: &Path) -> chrono::DateTime<chrono::Utc> {
+    partition_path_instant(path).unwrap_or_else(chrono::Utc::now)
+}
+
+/// [`partition_instant`]'s path parse, `None` when the layout is foreign.
+fn partition_path_instant(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let dir = path.parent()?;
+    let name = dir.file_name()?.to_str()?;
+    // `data/{env}/{date}/{HH}/{service}.parquet`
+    if name.len() == 2
+        && let Ok(hour) = name.parse::<u32>()
+    {
+        let day = dir.parent()?.file_name()?.to_str()?;
+        return chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(hour, 0, 0)
+            .map(|dt| dt.and_utc());
+    }
+    // `data/{env}/{date}/{service}.parquet` (daily rollup)
+    Some(
+        chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc(),
+    )
+}
+
 /// Conform one file. `Ok(None)` = it already agreed with every pin.
 fn rewrite_file(
     conn: &duckdb::Connection,
     file: &FileScan,
     pins: &HashMap<String, CanonicalType>,
 ) -> Result<Option<Vec<FieldConflict>>, String> {
-    let plan = ConformPlan::build(&file.schema, pins, ConformPolicy::StandingFile);
+    let plan = ConformPlan::build(
+        &file.schema,
+        pins,
+        ConformPolicy::StandingFile {
+            time_fallback: partition_instant(&file.path),
+        },
+    );
     if plan.cast_count() == 0 {
         return Ok(None);
     }
@@ -749,6 +792,36 @@ mod tests {
         assert!(
             voting_columns(&file.schema, &pinned).is_empty(),
             "an all-pinned schema must skip the count query entirely"
+        );
+    }
+
+    /// The rewrite's never-NULL last arm comes from the file's own partition
+    /// directory, for both layouts.
+    #[test]
+    fn partition_instant_reads_the_hour_and_the_daily_rollup() {
+        assert_eq!(
+            super::partition_path_instant(&PathBuf::from("/data/prod/2026-08-01/10/svc-a.parquet"))
+                .map(|t| t.to_rfc3339()),
+            Some("2026-08-01T10:00:00+00:00".to_owned())
+        );
+        assert_eq!(
+            super::partition_path_instant(&PathBuf::from("/data/prod/2026-08-01/svc-a.parquet"))
+                .map(|t| t.to_rfc3339()),
+            Some("2026-08-01T00:00:00+00:00".to_owned())
+        );
+    }
+
+    /// A file the walk adopted from a foreign layout names no instant; the
+    /// caller falls back to the conform instant rather than writing NULL.
+    #[test]
+    fn partition_instant_declines_a_foreign_path() {
+        assert!(
+            super::partition_path_instant(&PathBuf::from("/data/loose/svc-a.parquet")).is_none()
+        );
+        assert!(
+            super::partition_path_instant(&PathBuf::from("/data/prod/2026-08-01/99/svc.parquet"))
+                .is_none(),
+            "an out-of-range hour is not an instant"
         );
     }
 }

@@ -1771,6 +1771,33 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
     })
 }
 
+/// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
+/// arm, so conforming a standing file can never manufacture a NULL partition
+/// key (the boot-pass counterpart of [`repair_expr`]'s third arm, ADR-0008).
+///
+/// Only fires for [`ConformPolicy::StandingFile`] on a
+/// [`trawl_core::schema::TIMESTAMP_COLUMNS`] member actually pinned
+/// TIMESTAMP: a `_time` pinned VARCHAR is plain text and needs no partition
+/// guard (and could not take a TIMESTAMP literal anyway).
+fn guard_partition_key(
+    policy: ConformPolicy,
+    is_time_col: bool,
+    pin: CanonicalType,
+    expr: &str,
+) -> String {
+    match policy {
+        ConformPolicy::StandingFile { time_fallback }
+            if is_time_col && pin == CanonicalType::Timestamp =>
+        {
+            format!(
+                "COALESCE({expr}, TIMESTAMP '{}')",
+                time_fallback.format("%Y-%m-%d %H:%M:%S%.6f")
+            )
+        }
+        _ => expr.to_owned(),
+    }
+}
+
 /// Which corpus a [`ConformPlan`] is being built over. The two conform
 /// sites agree on every rule except these, so the difference is named
 /// rather than duplicated.
@@ -1791,7 +1818,19 @@ pub(crate) enum ConformPolicy {
     /// is mistyped is exactly what that pass exists to fix — and a column
     /// with no pin is kept verbatim (pins cover every scanned field, so
     /// this is unreachable in practice).
-    StandingFile,
+    ///
+    /// `time_fallback` is the last arm of the TIMESTAMP-pinned envelope
+    /// columns' conform, exactly as [`repair_expr`] is for WAL: a value the
+    /// `TRY_CAST` cannot read must NOT be written as NULL, because a NULL
+    /// partition key sorts first and falls outside every `last=Xh` filter
+    /// — the row would survive the rewrite yet become permanently
+    /// unqueryable by time (ADR-0008). The boot pass has no WAL filename to
+    /// recover an instant from, so the caller supplies the file's own
+    /// partition instant (its `{date}/{HH}` directory), or the conform
+    /// instant when the path carries none.
+    StandingFile {
+        time_fallback: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// One column the plan will `TRY_CAST`.
@@ -1837,9 +1876,8 @@ impl ConformPlan {
         };
         for col in schema {
             let quoted = quote_ident(&col.name);
-            if policy == ConformPolicy::WalBatch
-                && trawl_core::schema::TIMESTAMP_COLUMNS.contains(&col.name.as_str())
-            {
+            let is_time_col = trawl_core::schema::TIMESTAMP_COLUMNS.contains(&col.name.as_str());
+            if policy == ConformPolicy::WalBatch && is_time_col {
                 plan.keep(col, quoted);
                 continue;
             }
@@ -1849,7 +1887,13 @@ impl ConformPlan {
                 Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
                     None => plan.keep(col, quoted),
                     Some(expr) => {
-                        plan.select_list.push(format!("{expr} AS {quoted}"));
+                        // The written expression may carry a never-NULL last
+                        // arm; the tallied one never does. `tally_conflicts`
+                        // counts what the CAST could not read, and a fallback
+                        // that substitutes an instant has still destroyed the
+                        // original value — evidence worth recording.
+                        let written = guard_partition_key(policy, is_time_col, pin, &expr);
+                        plan.select_list.push(format!("{written} AS {quoted}"));
                         plan.retained.push(col.name.clone());
                         plan.casts.push(CastEntry {
                             name: col.name.clone(),
