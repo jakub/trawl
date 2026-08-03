@@ -10,8 +10,9 @@ Vector (gzip JSON batch, 1MB / 5s)
   → POST /api/v1/ingest (rate limit: ingest_rpm per key, body: 16MB max)
     → auth middleware (argon2id, 5-min DashMap cache)
     → spawn_blocking:
-        decompress → parse JSON/ndjson → validate service name
-        → WalWriter::write() (atomic tmp→rename, ndjson)
+        decompress → parse JSON/ndjson → canonicalize into the envelope
+          (capture _raw, resolve env/service/host/_time/severity — ADR-0009)
+        → WalWriter::write() (atomic tmp→rename, ndjson, under wal/{env}/)
     → hot_buffer.insert(Arc<IngestBatch>)
     → bus.publish(Arc<IngestBatch>)
         └→ SSE subscribers (CompiledFilter, aho-corasick SIMD)
@@ -19,13 +20,17 @@ Vector (gzip JSON batch, 1MB / 5s)
 
 ### WAL writer
 
-Each ingest batch produces one WAL file per service. Writes are atomic via tmp-file-then-rename. Filename format: `{service}_{unix_millis}_{4_hex_random}.ndjson`. Service names are validated against `[a-zA-Z0-9\-_.]` to prevent path traversal.
+Each ingest batch produces one WAL file per service, under the batch's env directory: `wal/{env}/{service}_{unix_millis}_{4_hex_random}.ndjson`. Writes are atomic via tmp-file-then-rename. The service name is carried **verbatim** — there is no filename sanitizer. It does not need one: `env` and `service` were validated at ingest (`[a-z0-9_-]{1,32}` and `[A-Za-z0-9._-]`, no dot-leading, ≤128 bytes), so path encoding is injective by validation and `api.v2` and `api_v2` stay distinct files (ADR-0009).
 
-### Timestamp canonicalization
+### Envelope canonicalization
 
-A present `timestamp` is valid iff it is a JSON string that, after trimming surrounding whitespace, parses as RFC 3339, as a date-time carrying an ISO 8601 *basic* offset (`+0530`, `+02` — what Java and Go encoders emit, and what RFC 3339 parsing alone rejects), as an offset-less date-time (read as UTC), or as a bare date (midnight UTC). Date and time may be separated by `T` or a space, the date may be `YYYY-MM-DD` or `YYYY/MM/DD`, and seconds and their fraction are optional (`HH:MM` is accepted). The grammar is deliberately not literal parity with DuckDB's `CAST` — anything outside it is preserved rather than guessed at. Valid values are canonicalized at ingest to RFC 3339 UTC at microsecond precision (DuckDB's native `TIMESTAMP` resolution), so the WAL and hot buffer only ever contain well-formed timestamps.
+Every accepted event is rewritten into the declared envelope — `_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message` (ADR-0009). The canonicalizer captures `_raw` first (the client's string `_raw` verbatim when supplied, else the canonical pre-repair serialization), strips server-owned fields, consumes the `_time`/`timestamp`/`@timestamp` wire aliases, stamps `_ingested`, resolves `env` against the allowlist, fills `host` from the peer where that is honest, and derives the OTel `severity` number. The governing rule: **repair when the server has an honest answer, reject when it would guess.** Repairs are a closed code set recorded per-event in `_repairs` and counted by `trawl_ingest_repairs_total{code, service}`; rejections are per-event and carry a typed reason, so valid siblings in the same batch still land.
 
-Anything else — an unparseable string, a nested object, a bare number — is **substituted, never fatal and never dropped**: `timestamp` is overwritten with the request-arrival time (the same default an absent timestamp gets) and the original value is preserved verbatim in `timestamp_invalid` (truncated to 256 chars). The event still counts as accepted; repairs are visible via the `trawl_ingest_events_repaired_total` counter and an `ingest_repairs` warn with sampled originals. `timestamp_invalid` is a sparse column, absent from the vast majority of parquet files.
+#### Timestamps
+
+A present `_time` is valid iff it is a JSON string that, after trimming surrounding whitespace, parses as RFC 3339, as a date-time carrying an ISO 8601 *basic* offset (`+0530`, `+02` — what Java and Go encoders emit, and what RFC 3339 parsing alone rejects), as an offset-less date-time (read as UTC), or as a bare date (midnight UTC). Date and time may be separated by `T` or a space, the date may be `YYYY-MM-DD` or `YYYY/MM/DD`, and seconds and their fraction are optional (`HH:MM` is accepted). The grammar is deliberately not literal parity with DuckDB's `CAST` — anything outside it is repaired rather than guessed at. Valid values are canonicalized at ingest to RFC 3339 UTC at microsecond precision (DuckDB's native `TIMESTAMP` resolution), so the WAL and hot buffer only ever contain well-formed timestamps.
+
+Anything else — an unparseable string, a nested object, a bare number — is **substituted, never fatal and never dropped**: `_time` is overwritten with the request-arrival time (the same default an absent `_time` gets) and the event is flagged `time.from_ingest`; the value as it arrived remains findable in `_raw`. A value that parses but is implausible (more than 10 years past, more than a day future) is kept as sent and flagged `time.out_of_range` — clock skew is a fact about the sender, not a reason to rewrite its data. The event still counts as accepted in both cases.
 
 ### Hot buffer
 
@@ -43,51 +48,64 @@ A `tokio::sync::broadcast` channel (capacity 4096) publishing `Arc<IngestBatch>`
 
 Every 10 seconds, the compaction task:
 
-1. Scans the WAL directory for `.ndjson` files older than 10 seconds
+1. Scans each env directory (`wal/{env}/`) for `.ndjson` files older than 10 seconds
 2. Groups them by service
 3. For each service, spawns a blocking task with an ephemeral DuckDB connection:
-   - `read_json_auto([wal files])` → repair timestamps (below)
+   - `read_json_auto([wal files])` → repair `_time`/`_ingested` (below)
    - `UNION ALL BY NAME` with existing parquet (if any)
-   - `COPY TO data/YYYY-MM-DD/HH/service.parquet` (atomic rename)
-4. Drains the hot buffer entries for compacted batches
+   - `COPY TO data/{env}/YYYY-MM-DD/HH/{service}.parquet` (atomic rename)
+4. Drains the hot buffer entries for compacted batches (drain keys are `{env}/{wal-stem}`)
 5. Deletes processed WAL files
 
 ### Timestamp repair
 
-The partition key is never hard-CAST in emitted SQL (ADR-0008) — one malformed value must never wedge a batch. Compaction resolves each row's `timestamp` through a three-arm `COALESCE`:
+The partition key is never hard-CAST in emitted SQL (ADR-0008) — one malformed value must never wedge a batch. Compaction resolves each row's `_time` (and `_ingested`, same ladder) through a three-arm `COALESCE`:
 
 1. `TRY_CAST` of the raw value — always succeeds for post-canonicalization data;
 2. the ingest instant recovered from the row's **own** WAL filename (`{service}_{unix_millis}_...`), read per-row via `read_json(..., filename=...)` — this drains WAL written before the ingest fix with no operator step;
-3. the compaction instant — so no parquet row ever carries a NULL timestamp (a NULL partition key would sort first and fall outside every `last=` filter).
+3. the compaction instant — so no parquet row ever carries a NULL `_time` (a NULL partition key would sort first and fall outside every `last=` filter).
 
 ### Daily rollup
 
-Once per day, hourly parquets are merged into a single daily parquet per service, sorted by timestamp. Crash-safe via `.rollup-{service}` marker files.
+Once per day, hourly parquets are merged into a single daily parquet per service, sorted by `_time`. Crash-safe via `.rollup-{service}` marker files.
 
 ### Retention
 
-Age-based (default 90 days) + disk pressure (minimum 1 GiB free). The unit of deletion is a full date directory.
+Age-based (default 90 days) + disk pressure (minimum 1 GiB free). The unit of deletion is a full date directory inside one env (`data/{env}/{date}/`) — per-env deletion is O(1) and never touches sibling envs. Disk-pressure candidates are merged oldest-first across envs.
 
 ## Storage layout
 
-Three-tier storage hierarchy:
+Two path dimensions besides time (ADR-0009): `env` outermost, `service` as the filename. Path encoding is injective by validation — both values are constrained at ingest and written verbatim, so `api.v2` and `api_v2` are distinct files and pruning is exact.
 
 ```
 data/
-  2026-03-14/
-    00/
-      nginx.parquet          # hourly partition
+  EPOCH                      # storage epoch marker, content "2"
+  prod/
+    2026-03-14/
+      00/
+        nginx.parquet        # hourly partition
+        sshd.parquet
+      01/
+        nginx.parquet
+      ...
+      nginx.parquet          # daily rollup (merged hourly files)
       sshd.parquet
-    01/
-      nginx.parquet
-    ...
-    nginx.parquet            # daily rollup (merged hourly files)
-    sshd.parquet
-  2026-03-13/
-    ...
+    2026-03-13/
+      ...
+  lab/
+    2026-03-14/
+      ...
 ```
 
-Schema is fully dynamic — no predefined columns. `union_by_name=true` handles heterogeneous schemas across services. Timestamps are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
+The envelope columns (`_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message`) are declared and enforced at ingest; user fields beyond them stay fully dynamic — `union_by_name=true` handles heterogeneous schemas across services. `_time`/`_ingested` are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
+
+### The epoch cutover
+
+`data/EPOCH` (content `2`) marks the post-ADR-0009 layout; the legacy layout has none. At boot trawld runs a restartable, filesystem-only decision table: a fresh install creates the marked root; an epoch-2 root boots normally; a legacy root is renamed to `data.pre-schema-v2/` (an external `wal_dir` moves to `{wal_dir}.pre-schema-v2` with it) and a fresh marked root is created; a root with no marker AND an existing set-aside refuses to start with instructions. trawl never deletes the set-aside directory — remove it manually to reclaim disk. While it exists, disk-pressure retention is suppressed and logs `retention_disk_pressure_suppressed`: the set-aside sits outside `data/`, so deleting fresh partitions would destroy live data without reclaiming a byte of it. Age-based retention keeps running.
+
+The rename only ever fires on evidence that trawl wrote the directory — a `wal/` subdir, a `YYYY-MM-DD` partition dir, or a parquet file — and only when `ingest.enabled` is true. A marker-less directory with none of those (a pre-created empty root, a fresh mount holding `lost+found`, a mistyped `[data] path`) is adopted in place: the marker is written, the root itself does not move. An *external* `wal_dir` is judged separately in that case, since no rename of the data root covers it: if it still holds pre-cutover flat `{wal_dir}/*.ndjson` files it is set aside as `{wal_dir}.pre-schema-v2` (`epoch_external_wal_set_aside`) — the compactor walks `{wal_dir}/{env}/` only, so leaving them would strand them forever, never compacted and never deleted. A WAL dir that is empty or already in the epoch-2 env layout is left alone. And an ingest-disabled node — a query-only trawld pointed at a shared or read-only parquet archive — is left completely untouched, marker included, since it owns nothing under that path.
+
+One subtree survives the cutover: `scheduled/`, the report-run results. Those are materialized query results, not epoch-1 events, and each is named by a *relative* path in a live postgres `report_runs` row that the cutover deliberately does not touch — so the directory is carried back out of the set-aside into the fresh root (`epoch_report_runs_carried_over`) and every stored path keeps resolving. It is one rename, attempted on every boot that sees a set-aside, so a crash mid-cutover simply finishes the job on the next start; if both roots somehow hold report runs, trawld logs `epoch_report_runs_conflict` and leaves both alone rather than merging them for you.
 
 ### App-state store
 
@@ -122,7 +140,7 @@ A pool of N connections (default: `num_cpus`) sharing one in-memory DuckDB datab
 
 ### Hot buffer integration
 
-All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is written to a temp ndjson file and read by DuckDB alongside the parquet files. This ensures freshly ingested events (not yet compacted) are always visible. The union applies `TRY_CAST` to the hot side's `timestamp` — a malformed hot value degrades that one row, never the whole union.
+All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is written to a temp ndjson file and read by DuckDB alongside the parquet files. This ensures freshly ingested events (not yet compacted) are always visible. The union applies `TRY_CAST` to both of the hot side's TIMESTAMP columns (`_time`, `_ingested`) — a malformed hot value degrades that one row, never the whole union.
 
 When the two sides disagree on a column's type, the union is retried with the conflicting columns cast to `VARCHAR` on both sides, preserving hot **and** cold rows. What counts as such a conflict is decided from evidence, not from the error text: DuckDB reports both an irreconcilable schema and an unconvertible value as `Conversion`-class errors, so the retry only fires when describing the two sources actually turns up a column they type differently. A genuine data-conversion error turns up none, is not misread as a schema conflict, and falls through to the policy below.
 

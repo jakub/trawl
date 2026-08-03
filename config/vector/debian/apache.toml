@@ -33,7 +33,7 @@ inputs = ["route_apache.access", "route_apache._unmatched"]
 source = '''
 parsed, err = parse_apache_log(.message, "combined")
 if err == null {
-  .timestamp = parsed.timestamp
+  ._time = parsed.timestamp
   .src_ip = parsed.host
   .method = parsed.method
   .uri = parsed.path
@@ -47,17 +47,18 @@ if err == null {
 
   status = to_int(parsed.status) ?? 0
   if status >= 500 {
-    .level = "error"
+    .severity_text = "error"
   } else if status >= 400 {
-    .level = "warn"
+    .severity_text = "warn"
   } else {
-    .level = "info"
+    .severity_text = "info"
   }
 } else {
-  .level = "info"
+  .severity_text = "info"
 }
 
 .service = "apache"
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.file)
 '''
@@ -84,19 +85,20 @@ if err == null {
 
   lvl = downcase(to_string(parsed.level))
   if lvl == "emerg" || lvl == "alert" || lvl == "crit" || lvl == "error" {
-    .level = "error"
+    .severity_text = "error"
   } else if lvl == "warn" {
-    .level = "warn"
+    .severity_text = "warn"
   } else if lvl == "notice" || lvl == "info" {
-    .level = "info"
+    .severity_text = "info"
   } else {
-    .level = "debug"
+    .severity_text = "debug"
   }
 } else {
-  .level = "error"
+  .severity_text = "error"
 }
 
 .service = "apache"
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.file)
 '''

@@ -45,20 +45,21 @@ if err == null {
   # map level prefix characters
   lvl = parsed.level_char
   if lvl == "#" {
-    .level = "warn"
+    .severity_text = "warn"
   } else if lvl == "*" {
-    .level = "info"
+    .severity_text = "info"
   } else if lvl == "-" {
-    .level = "info"
+    .severity_text = "info"
   } else {
     # "." = debug
-    .level = "debug"
+    .severity_text = "debug"
   }
 } else {
-  .level = "info"
+  .severity_text = "info"
 }
 
 .service = "redis"
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.file)
 '''

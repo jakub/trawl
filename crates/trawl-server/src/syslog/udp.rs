@@ -27,6 +27,7 @@ const UDP_RECV_BUFFER_SIZE: usize = 65_536;
 /// Run the UDP syslog listener until shutdown.
 pub async fn run_udp_listener(
     config: &SyslogConfig,
+    default_env: &str,
     sender: SyslogSender,
     cidrs: Arc<[CidrEntry]>,
     stats: Option<Arc<SyslogStats>>,
@@ -83,10 +84,12 @@ pub async fn run_udp_listener(
 
                 let parsed = parse::parse_syslog(raw);
                 let (service, map) = convert::syslog_to_event(
+                    raw,
                     &parsed,
                     source_ip,
                     &config.source_service_map,
                     &config.default_service,
+                    default_env,
                 );
 
                 let event = SyslogEvent {

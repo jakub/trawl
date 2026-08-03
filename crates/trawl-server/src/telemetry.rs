@@ -55,7 +55,7 @@ use crate::ingest::wal::WalWriter;
 /// Cloned into the [`WalLayer`] and retained by `main()`. Once the WAL
 /// writer is ready, [`set`](Self::set) activates event capture.
 #[derive(Debug, Clone)]
-pub struct WalHandle(Arc<OnceLock<Arc<WalWriter>>>);
+pub struct WalHandle(Arc<OnceLock<(Arc<WalWriter>, Arc<str>)>>);
 
 impl Default for WalHandle {
     fn default() -> Self {
@@ -69,14 +69,15 @@ impl WalHandle {
         Self(Arc::new(OnceLock::new()))
     }
 
-    /// Inject the WAL writer. Called once after config is loaded.
-    /// Subsequent calls are silently ignored (first write wins).
-    pub fn set(&self, writer: Arc<WalWriter>) {
-        let _ = self.0.set(writer);
+    /// Inject the WAL writer and the env telemetry events land under
+    /// (`default_env`). Called once after config is loaded. Subsequent
+    /// calls are silently ignored (first write wins).
+    pub fn set(&self, writer: Arc<WalWriter>, env: &str) {
+        let _ = self.0.set((writer, env.into()));
     }
 
-    /// Get the writer, if available.
-    fn get(&self) -> Option<&Arc<WalWriter>> {
+    /// Get the writer and env, if available.
+    fn get(&self) -> Option<&(Arc<WalWriter>, Arc<str>)> {
         self.0.get()
     }
 }
@@ -93,6 +94,8 @@ pub struct WalLayer {
 }
 
 struct WalLayerInner {
+    /// Env stamped onto telemetry events (`default_env`).
+    env: String,
     handle: WalHandle,
     buffer: Mutex<Vec<u8>>,
     /// Cached hostname, resolved once at layer creation.
@@ -117,8 +120,10 @@ impl std::fmt::Debug for WalLayer {
 }
 
 impl WalLayer {
-    /// Create a new layer backed by the given handle.
-    pub fn new(handle: WalHandle) -> Self {
+    /// Create a new layer backed by the given handle. `env` is the env
+    /// telemetry events are stamped with (`default_env`) — the records
+    /// carry it as a column, matching where the WAL handle files them.
+    pub fn new(handle: WalHandle, env: &str) -> Self {
         let host = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -128,6 +133,7 @@ impl WalLayer {
                 handle,
                 buffer: Mutex::new(Vec::with_capacity(8192)),
                 host,
+                env: env.to_owned(),
                 dropped_bytes: AtomicU64::new(0),
                 bus: OnceLock::new(),
                 hot_buffer: OnceLock::new(),
@@ -160,7 +166,7 @@ impl WalLayer {
 impl WalLayerInner {
     /// Swap out the buffer and write its contents to the WAL.
     fn flush(&self) {
-        let Some(writer) = self.handle.get() else {
+        let Some((writer, env)) = self.handle.get() else {
             return;
         };
 
@@ -176,7 +182,7 @@ impl WalLayerInner {
         // the byte buffer and must stay in sync.
         let maps = std::mem::take(&mut *self.event_maps.lock());
 
-        match writer.write("trawld", &data) {
+        match writer.write(env, "trawld", &data) {
             Err(e) => {
                 // MUST NOT use tracing here — infinite recursion.
                 eprintln!("[trawl-telemetry] WAL write failed: {e}");
@@ -189,11 +195,14 @@ impl WalLayerInner {
                 // batch_id MUST match the WAL filename stem so compaction
                 // can drain the hot buffer after writing parquet.
                 use crate::bus::{EventBus, IngestBatch};
-                let batch_id: Arc<str> = wal_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("trawld_unknown")
-                    .into();
+                let batch_id: Arc<str> = format!(
+                    "{env}/{}",
+                    wal_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("trawld_unknown")
+                )
+                .into();
                 let batch = Arc::new(IngestBatch {
                     batch_id,
                     service: "trawld".into(),
@@ -354,17 +363,20 @@ where
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| message_to_event_type(&message));
 
-        let mut record = serde_json::Map::with_capacity(8 + span_fields.len());
-        record.insert(
-            "timestamp".into(),
-            json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
-        );
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let level = metadata.level().as_str().to_ascii_lowercase();
+        let mut record = serde_json::Map::with_capacity(12 + span_fields.len());
+        record.insert("_time".into(), json!(&now));
+        record.insert("_ingested".into(), json!(&now));
+        record.insert("env".into(), json!(&self.inner.env));
         record.insert("service".into(), json!("trawld"));
         record.insert("host".into(), json!(&self.inner.host));
-        record.insert(
-            "level".into(),
-            json!(metadata.level().as_str().to_ascii_lowercase()),
-        );
+        // The server is the producer, so severity maps directly from the
+        // tracing level onto the OTel ladder (ADR-0009).
+        if let Some(n) = trawl_core::severity::number_for_token(&level) {
+            record.insert("severity".into(), json!(n));
+        }
+        record.insert("severity_text".into(), json!(&level));
         record.insert("target".into(), json!(metadata.target()));
         record.insert("event_type".into(), json!(event_type));
         record.insert("message".into(), json!(message));
@@ -373,6 +385,12 @@ where
         for (k, v) in span_fields {
             record.entry(k).or_insert(v);
         }
+
+        // `_raw` is required by the envelope: for server-generated events
+        // the canonical serialization of the record IS the most original
+        // form available.
+        let raw = serde_json::Value::Object(record.clone()).to_string();
+        record.insert("_raw".into(), json!(raw));
 
         // Clone the map for event bus publishing (before moving into Value).
         self.inner.event_maps.lock().push(record.clone());
@@ -497,7 +515,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         assert!(handle.get().is_some());
     }
@@ -507,7 +525,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
 
         let handle = WalHandle::new();
-        let layer = WalLayer::new(handle.clone());
+        let layer = WalLayer::new(handle.clone(), "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -525,13 +543,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
         writer.ensure_dir().unwrap();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         layer_ref.flush();
         assert!(layer_ref.inner.buffer.lock().is_empty());
 
         // Verify the bootstrap event reached the WAL.
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -551,9 +569,9 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -570,7 +588,7 @@ mod tests {
 
         layer_ref.flush();
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -593,9 +611,9 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -616,7 +634,7 @@ mod tests {
         assert!(layer_ref.inner.buffer.lock().is_empty());
 
         // Verify WAL file was written.
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -631,8 +649,12 @@ mod tests {
         assert_eq!(parsed["user"], "alice");
         assert_eq!(parsed["rows"], 42);
         assert_eq!(parsed["message"], "test complete");
-        assert!(parsed["timestamp"].is_string());
-        assert!(parsed["level"].is_string());
+        assert!(parsed["_time"].is_string());
+        assert!(parsed["_ingested"].is_string());
+        assert!(parsed["_raw"].is_string());
+        assert_eq!(parsed["env"], "prod");
+        assert_eq!(parsed["severity"], 9, "tracing info maps to OTel 9");
+        assert_eq!(parsed["severity_text"], "info");
         assert!(parsed["target"].is_string());
     }
 
@@ -645,9 +667,9 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -668,7 +690,7 @@ mod tests {
 
         layer_ref.flush();
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -694,9 +716,9 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         let layer_ref = layer.clone();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -707,7 +729,7 @@ mod tests {
 
         layer_ref.flush();
 
-        let files: Vec<_> = std::fs::read_dir(tmp.path())
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
@@ -730,12 +752,12 @@ mod tests {
         writer.ensure_dir().unwrap();
 
         let handle = WalHandle::new();
-        handle.set(Arc::clone(&writer));
+        handle.set(Arc::clone(&writer), "prod");
 
         let bus = Arc::new(LocalEventBus::new(16));
         let mut sub = bus.subscribe();
 
-        let layer = WalLayer::new(handle);
+        let layer = WalLayer::new(handle, "prod");
         layer.set_bus(Arc::clone(&bus));
         let layer_ref = layer.clone();
 
@@ -758,8 +780,8 @@ mod tests {
         assert_eq!(batch.events[0]["user"], "alice");
         assert!(batch.byte_size > 0);
         assert!(
-            batch.batch_id.starts_with("trawld_"),
-            "batch_id should use WAL filename stem: {}",
+            batch.batch_id.starts_with("prod/trawld_"),
+            "batch_id is {{env}}/{{stem}}: {}",
             batch.batch_id
         );
     }

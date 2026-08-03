@@ -80,7 +80,7 @@ impl Executor {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
         }
         if emitted.needs_column_reorder {
-            result.reorder_columns(trawl_api::value::WELL_KNOWN_LOG_FIELDS);
+            result.reorder_log_columns();
         }
         Ok(result)
     }
@@ -192,7 +192,7 @@ impl Executor {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
         }
         if emitted.needs_column_reorder {
-            result.reorder_columns(trawl_api::value::WELL_KNOWN_LOG_FIELDS);
+            result.reorder_log_columns();
         }
         Ok(result)
     }
@@ -204,6 +204,17 @@ impl Executor {
     ///
     /// `utc_offset_secs` is applied to all timestamp values at format time.
     pub fn execute_emitted(
+        &self,
+        query: &EmittedQuery,
+        max_rows: usize,
+        utc_offset_secs: i32,
+    ) -> Result<QueryResult, EngineError> {
+        with_raw_fallback(query, |q| {
+            self.execute_emitted_once(q, max_rows, utc_offset_secs)
+        })
+    }
+
+    fn execute_emitted_once(
         &self,
         query: &EmittedQuery,
         max_rows: usize,
@@ -373,10 +384,17 @@ impl Executor {
         let hot_reader = emitter::hot_source_reader(hot_source)?;
 
         let cold = self.describe_types(&format!("SELECT * FROM {cold_reader}"))?;
-        // Describe the hot side with the same timestamp cast the union
-        // applies, so the always-TIMESTAMP key isn't flagged as a conflict.
+        // Describe the hot side with the same timestamp casts the union
+        // applies — BOTH envelope TIMESTAMP columns (`_time`, `_ingested`,
+        // trawl_core::schema::TIMESTAMP_COLUMNS) — so the always-TIMESTAMP
+        // keys aren't flagged as conflicts.
+        let replace_list = trawl_core::schema::TIMESTAMP_COLUMNS
+            .iter()
+            .map(|col| format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         let hot = self.describe_types(&format!(
-            "SELECT * REPLACE (TRY_CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\") FROM {hot_reader}"
+            "SELECT * REPLACE ({replace_list}) FROM {hot_reader}"
         ))?;
 
         let hot_types: std::collections::HashMap<String, String> = hot.into_iter().collect();
@@ -768,6 +786,17 @@ impl Executor {
         output_path: &Path,
         max_rows: usize,
     ) -> Result<(), EngineError> {
+        with_raw_fallback(emitted, |q| {
+            self.export_parquet_from_emitted_once(q, output_path, max_rows)
+        })
+    }
+
+    fn export_parquet_from_emitted_once(
+        &self,
+        emitted: &EmittedQuery,
+        output_path: &Path,
+        max_rows: usize,
+    ) -> Result<(), EngineError> {
         if !emitted.rust_stages.is_empty() {
             return Err(EngineError::Emit(
                 trawl_core::emitter::EmitError::UnsupportedOperation {
@@ -960,6 +989,54 @@ fn is_no_files_error(e: &duckdb::Error) -> bool {
 fn is_binder_column_error(e: &duckdb::Error) -> bool {
     let msg = e.to_string();
     msg.contains(DUCKDB_BINDER_ERROR_MSG) && (msg.contains("column") || msg.contains("not found"))
+}
+
+/// Retry `attempt` with the query's `_raw`-free SQL when the first try failed
+/// to bind a column.
+///
+/// Text search binds `_raw`, which every trawl-written corpus has but an
+/// arbitrary source does not — user-owned parquet read in embedded mode, say.
+/// Rather than trust the error message (a missing `_raw` and a genuinely
+/// unknown field read the same), this asks for evidence: re-run with the
+/// `_raw` side bound to a typed NULL, and take that result only if it binds.
+/// If it fails too, the missing column was the user's, so the original error
+/// is what they see. The parameter list is identical between the two SQL
+/// strings (ADR-0009).
+///
+/// Costs nothing on the success path, and nothing for queries without a text
+/// search — `raw_free_sql` is `None` there.
+fn with_raw_fallback<T>(
+    query: &EmittedQuery,
+    attempt: impl Fn(&EmittedQuery) -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    let err = match attempt(query) {
+        Err(e) if is_missing_column_failure(&e) => e,
+        outcome => return outcome,
+    };
+    let Some(raw_free) = &query.raw_free_sql else {
+        return Err(err);
+    };
+    let fallback = EmittedQuery {
+        sql: raw_free.clone(),
+        raw_free_sql: None,
+        ..query.clone()
+    };
+    attempt(&fallback).map_err(|_| err)
+}
+
+/// Whether an engine failure is "a column in the query does not exist in the
+/// source" — in either shape it can take: the query path remaps it to
+/// [`EngineError::Emit`], the export path surfaces it raw.
+///
+/// The trigger for the `_raw`-free retry (see [`with_raw_fallback`]), which
+/// then decides from evidence — does the raw-free SQL bind? — rather than
+/// from which column the message names.
+fn is_missing_column_failure(e: &EngineError) -> bool {
+    match e {
+        EngineError::Emit(_) => true,
+        EngineError::Database(db) => is_binder_column_error(db),
+        _ => false,
+    }
 }
 
 /// Leading `"<Class> Error"` token of a `DuckDB` message — `"Conversion"`
@@ -1355,7 +1432,7 @@ mod tests {
     /// `VARCHAR`). Mirrors the cold-fixture shape used in `integration.rs`.
     fn write_meta_parquet(conn: &Connection, path: &Path, meta_expr: &str) {
         conn.execute_batch(&format!(
-            "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+            "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                           'svc' AS service, {meta_expr} AS meta) \
              TO '{}' (FORMAT PARQUET)",
             path.display()
@@ -1520,7 +1597,7 @@ mod tests {
         let setup = Connection::open_in_memory().unwrap();
         setup
             .execute_batch(&format!(
-                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                  'svc' AS service, 'abc' AS duration) TO '{}' (FORMAT PARQUET)",
                 dir.path().join("cold.parquet").display()
             ))
@@ -1532,7 +1609,7 @@ mod tests {
         let agreed = dir.path().join("agreed.ndjson");
         std::fs::write(
             &agreed,
-            "{\"timestamp\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":\"7\"}\n",
+            "{\"_time\":\"2024-01-15T11:00:00Z\",\"_ingested\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":\"7\"}\n",
         )
         .unwrap();
         assert!(
@@ -1546,7 +1623,7 @@ mod tests {
         let drifted = dir.path().join("drifted.ndjson");
         std::fs::write(
             &drifted,
-            "{\"timestamp\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":7}\n",
+            "{\"_time\":\"2024-01-15T11:00:00Z\",\"_ingested\":\"2024-01-15T11:00:00Z\",\"service\":\"svc\",\"duration\":7}\n",
         )
         .unwrap();
         assert_eq!(
@@ -1694,7 +1771,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
 
@@ -1842,7 +1919,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
 
@@ -1866,7 +1943,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
 
@@ -1953,7 +2030,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
 
@@ -2012,7 +2089,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
         let out = dir.path().join("export.parquet");
@@ -2055,7 +2132,7 @@ mod tests {
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
-            "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hi\"}\n",
         )
         .unwrap();
         let out = dir.path().join("export.parquet");

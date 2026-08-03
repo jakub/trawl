@@ -34,7 +34,7 @@ if starts_with(msg, "# Time:") {
   # # User@Host: user[user] @ localhost []  Id: 12345
   # # Query_time: 1.234  Lock_time: 0.001 Rows_sent: 10  Rows_examined: 50000
   # SELECT ...
-  .level = "warn"
+  .severity_text = "warn"
 
   qt_match, err = parse_regex(msg, r'Query_time:\s*(?P<qt>[\d.]+)')
   if err == null { .query_time = to_float(qt_match.qt) ?? null }
@@ -58,19 +58,20 @@ if starts_with(msg, "# Time:") {
 
     sev = downcase(to_string(parsed.severity))
     if sev == "error" {
-      .level = "error"
+      .severity_text = "error"
     } else if sev == "warning" {
-      .level = "warn"
+      .severity_text = "warn"
     } else {
       # Note, System, etc.
-      .level = "info"
+      .severity_text = "info"
     }
   } else {
-    .level = "info"
+    .severity_text = "info"
   }
 }
 
 .service = "mysql"
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.file)
 '''

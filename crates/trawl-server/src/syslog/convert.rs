@@ -4,9 +4,13 @@
 
 //! Convert parsed syslog messages to trawl event maps.
 //!
-//! Produces the same core fields as Vector-ingested events (`service`,
-//! `host`, `timestamp`, `level`, `message`) so that queries work
-//! identically regardless of ingestion path.
+//! Produces the declared ADR-0009 envelope (`_time`, `_ingested`,
+//! `_raw`, `env`, `service`, `host`, `severity`, `severity_text`,
+//! `message`) so that queries work identically regardless of ingestion
+//! path. The syslog listener is an input-mapping ingestor: appnames are
+//! mapped *into* the service charset before validation, syslog numeric
+//! severities are inverted onto the `OTel` ladder, and `_raw` carries the
+//! pre-parse wire line verbatim.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -26,89 +30,126 @@ const MAX_SD_PARAMS_TOTAL: usize = 128;
 /// Maximum length of a structured data field key (`sd_{id}_{param}`).
 const MAX_SD_KEY_LEN: usize = 256;
 
-/// Sanitize a service name: strip invalid characters, truncate, fallback.
-fn sanitize_service(raw: &str) -> Option<String> {
-    if raw.is_empty() {
-        return None;
-    }
+/// Last-resort service name when every candidate sanitizes away.
+const FALLBACK_SERVICE: &str = "syslog";
 
-    let sanitized: String = raw
+/// Map a candidate into the service charset: drop invalid characters,
+/// drop leading dots, truncate to the length cap. Returns `None` when
+/// nothing usable survives.
+///
+/// The result always satisfies [`pipeline::is_valid_service_name`] — the
+/// syslog listener is an input-mapping ingestor, so it maps rather than
+/// rejects, but it may never emit a name HTTP ingest would refuse
+/// (ADR-0009: the name reaches WAL filenames verbatim).
+fn sanitize_service(raw: &str) -> Option<String> {
+    let filtered: String = raw
         .bytes()
         .filter(|b| pipeline::is_valid_service_char(*b))
-        .map(|b| b as char)
+        .map(char::from)
         .collect();
 
-    if sanitized.is_empty() {
-        return None;
-    }
+    // Dot-leading names are `.`, `..` (path escape) or dotfiles; strip the
+    // leading run rather than rejecting the whole candidate.
+    let trimmed = filtered.trim_start_matches('.');
+    let capped = &trimmed[..trimmed.len().min(pipeline::MAX_SERVICE_NAME_LEN)];
 
-    if sanitized.len() > pipeline::MAX_SERVICE_NAME_LEN {
-        Some(sanitized[..pipeline::MAX_SERVICE_NAME_LEN].to_owned())
+    if capped.is_empty() {
+        None
     } else {
-        Some(sanitized)
+        Some(capped.to_owned())
     }
 }
 
 /// Derive the service name for a syslog event.
 ///
-/// Priority:
+/// Priority (each candidate sanitized, falling through when it maps to
+/// nothing):
 /// 1. `source_service_map` lookup by source IP (explicit user config)
-/// 2. APP-NAME / tag from the syslog message (sanitized)
+/// 2. APP-NAME / tag from the syslog message
 /// 3. `default_service` from config
+/// 4. [`FALLBACK_SERVICE`]
+///
+/// The return value always satisfies [`pipeline::is_valid_service_name`].
 pub fn derive_service<S: BuildHasher>(
     source_ip: IpAddr,
     appname: Option<&str>,
     source_service_map: &HashMap<String, String, S>,
     default_service: &str,
 ) -> String {
-    // 1. Check source IP mapping
     let ip_str = source_ip.to_string();
-    if let Some(mapped) = source_service_map.get(&ip_str) {
-        return mapped.clone();
-    }
-
-    // 2. Use APP-NAME/tag if valid
-    if let Some(sanitized) = appname.and_then(sanitize_service) {
-        return sanitized;
-    }
-
-    // 3. Fallback to default
-    default_service.to_owned()
+    source_service_map
+        .get(&ip_str)
+        .map(String::as_str)
+        .and_then(sanitize_service)
+        .or_else(|| appname.and_then(sanitize_service))
+        .or_else(|| sanitize_service(default_service))
+        .unwrap_or_else(|| FALLBACK_SERVICE.to_owned())
 }
 
-/// Format a syslog timestamp to RFC 3339 with millisecond precision.
+/// Format a syslog timestamp to RFC 3339 UTC at microsecond precision
+/// (the envelope's canonical `_time` spelling).
 fn format_timestamp(ts: Option<DateTime<FixedOffset>>) -> String {
     match ts {
         Some(dt) => dt
             .with_timezone(&Utc)
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        None => Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        None => Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
     }
 }
 
-/// Convert a parsed syslog message into a trawl event map.
+/// The syslog severity keyword and its `OTel` `SeverityNumber` (via the
+/// ADR-0009 inversion table — syslog counts down from Emergency 0, `OTel`
+/// counts up).
+fn severity_mapping(sev: syslog_loose::SyslogSeverity) -> (&'static str, Option<u8>) {
+    use syslog_loose::SyslogSeverity as S;
+    let (keyword, numeral) = match sev {
+        S::SEV_EMERG => ("emerg", 0),
+        S::SEV_ALERT => ("alert", 1),
+        S::SEV_CRIT => ("crit", 2),
+        S::SEV_ERR => ("err", 3),
+        S::SEV_WARNING => ("warning", 4),
+        S::SEV_NOTICE => ("notice", 5),
+        S::SEV_INFO => ("info", 6),
+        S::SEV_DEBUG => ("debug", 7),
+    };
+    (keyword, trawl_core::severity::from_syslog(numeral))
+}
+
+/// Convert a parsed syslog message into a declared-envelope event map.
 ///
-/// The resulting map contains the same core fields as Vector-ingested events.
+/// `raw` is the pre-parse wire line — the most original form available —
+/// and lands in `_raw` verbatim. `default_env` stamps `env`.
 pub fn syslog_to_event<S: BuildHasher>(
+    raw: &str,
     msg: &Message<&str>,
     source_ip: IpAddr,
     source_service_map: &HashMap<String, String, S>,
     default_service: &str,
+    default_env: &str,
 ) -> (String, Map<String, Value>) {
     let mut map = Map::new();
 
-    // Core fields (matching Vector schema)
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let service = derive_service(source_ip, msg.appname, source_service_map, default_service);
     map.insert("service".into(), json!(service));
-    map.insert("timestamp".into(), json!(format_timestamp(msg.timestamp)));
+    map.insert("env".into(), json!(default_env));
+    map.insert("_time".into(), json!(format_timestamp(msg.timestamp)));
+    map.insert("_ingested".into(), json!(now));
+    map.insert("_raw".into(), json!(raw));
     map.insert(
         "host".into(),
         json!(msg.hostname.unwrap_or(&source_ip.to_string())),
     );
-    map.insert(
-        "level".into(),
-        json!(parse::severity_to_level(msg.severity)),
-    );
+    // Severity: syslog numerics inverted onto the OTel ladder; the
+    // keyword is preserved as severity_text. Absent severity is omitted,
+    // never guessed (omit-when-null, ADR-0009).
+    if let Some(sev) = msg.severity {
+        let (keyword, number) = severity_mapping(sev);
+        if let Some(n) = number {
+            map.insert("severity".into(), json!(n));
+        }
+        map.insert("severity_text".into(), json!(keyword));
+    }
     map.insert("message".into(), json!(msg.msg));
 
     // Syslog-specific metadata (prefixed to avoid collisions)
@@ -160,12 +201,18 @@ mod tests {
         let mut service_map = HashMap::new();
         service_map.insert("192.168.1.1".to_string(), "unifi-gateway".to_string());
 
-        let (service, map) = syslog_to_event(&parsed, source_ip, &service_map, "syslog");
+        let (service, map) =
+            syslog_to_event(raw, &parsed, source_ip, &service_map, "syslog", "prod");
 
         assert_eq!(service, "unifi-gateway");
         assert_eq!(map["service"], "unifi-gateway");
+        assert_eq!(map["env"], "prod");
         assert_eq!(map["host"], "UGW");
-        assert_eq!(map["level"], "info"); // severity 6
+        assert_eq!(map["severity"], 9, "syslog 6 (info) inverts to OTel 9");
+        assert_eq!(map["severity_text"], "info");
+        assert!(map["_time"].is_string());
+        assert!(map["_ingested"].is_string());
+        assert_eq!(map["_raw"], raw, "the pre-parse wire line lands in _raw");
         assert!(map["message"].as_str().unwrap().contains("[UFW BLOCK]"));
         assert_eq!(map["syslog_facility"], "local0");
         assert_eq!(map["syslog_source_ip"], "192.168.1.1");
@@ -177,7 +224,8 @@ mod tests {
         let parsed = parse_syslog(raw);
         let source_ip: IpAddr = "10.0.0.50".parse().unwrap();
 
-        let (service, map) = syslog_to_event(&parsed, source_ip, &HashMap::new(), "syslog");
+        let (service, map) =
+            syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
 
         assert_eq!(service, "sshd");
         assert_eq!(map["service"], "sshd");
@@ -190,7 +238,8 @@ mod tests {
         let parsed = parse_syslog(raw);
         let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        let (service, _map) = syslog_to_event(&parsed, source_ip, &HashMap::new(), "syslog");
+        let (service, _map) =
+            syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
 
         assert_eq!(service, "syslog");
     }
@@ -202,12 +251,76 @@ mod tests {
         let parsed = parse_syslog(raw);
         let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        let (_service, map) = syslog_to_event(&parsed, source_ip, &HashMap::new(), "syslog");
+        let (_service, map) =
+            syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
 
         // If hostname is None, should use source IP
         let host = map["host"].as_str().unwrap();
         // hostname might be parsed from the message; if not, should be source IP
         assert!(!host.is_empty());
+    }
+
+    /// Acceptance criterion (ADR-0009): syslog numerics are INVERTED —
+    /// 0 (emerg) maps into the FATAL band, 7 (debug) into DEBUG. A naive
+    /// passthrough would invert every severity in the corpus.
+    #[test]
+    fn syslog_numerics_invert_onto_the_otel_ladder() {
+        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        // PRI 0*8+0 = <0> emerg; PRI 0*8+7 = <7> debug (facility kern).
+        let emerg_raw = "<0>Mar 12 10:00:00 h app: the world is on fire";
+        let parsed = parse_syslog(emerg_raw);
+        let (_s, map) = syslog_to_event(
+            emerg_raw,
+            &parsed,
+            source_ip,
+            &HashMap::new(),
+            "syslog",
+            "prod",
+        );
+        assert_eq!(
+            map["severity"], 24,
+            "syslog 0 (emerg) is OTel 24 (FATAL band)"
+        );
+        assert_eq!(map["severity_text"], "emerg");
+
+        let debug_raw = "<7>Mar 12 10:00:00 h app: noisy detail";
+        let parsed = parse_syslog(debug_raw);
+        let (_s, map) = syslog_to_event(
+            debug_raw,
+            &parsed,
+            source_ip,
+            &HashMap::new(),
+            "syslog",
+            "prod",
+        );
+        assert_eq!(
+            map["severity"], 5,
+            "syslog 7 (debug) is OTel 5 (DEBUG band)"
+        );
+        assert_eq!(map["severity_text"], "debug");
+    }
+
+    /// The full envelope is present on every converted event.
+    #[test]
+    fn converted_event_carries_the_envelope() {
+        let raw = "<134>Mar 12 10:00:00 web01 nginx: GET /";
+        let parsed = parse_syslog(raw);
+        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let (_s, map) = syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "lab");
+        for key in [
+            "_time",
+            "_ingested",
+            "_raw",
+            "env",
+            "service",
+            "host",
+            "message",
+        ] {
+            assert!(map.contains_key(key), "envelope key {key} missing");
+        }
+        assert_eq!(map["env"], "lab");
+        assert!(!map.contains_key("level"), "level is never stored");
+        assert!(!map.contains_key("timestamp"), "timestamp is never stored");
     }
 
     #[test]
@@ -222,6 +335,67 @@ mod tests {
         );
         assert_eq!(sanitize_service(""), None);
         assert_eq!(sanitize_service("///"), None);
+        // Dot-leading names would become dotfile parquets; `..` is a path
+        // escape. Both lose their leading dot run.
+        assert_eq!(sanitize_service(".foo"), Some("foo".to_string()));
+        assert_eq!(sanitize_service(".."), None);
+        assert_eq!(
+            sanitize_service("../../escaped"),
+            Some("escaped".to_string())
+        );
+    }
+
+    /// ADR-0009 injectivity: the on-disk name IS the service value, so
+    /// every `derive_service` path — including the two unvalidated config
+    /// fields — must yield a name HTTP ingest would also accept. Before
+    /// this was enforced, a mapped service of `../../escaped` wrote WAL
+    /// files outside the WAL root (silent data loss) and `Living Room AP`
+    /// produced a parquet glob the emitter refuses.
+    #[test]
+    fn derive_service_output_is_always_a_valid_service_name() {
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        let other: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let mut map = HashMap::new();
+        map.insert("192.168.1.1".to_string(), "../../escaped".to_string());
+        assert_eq!(derive_service(ip, None, &map, "syslog"), "escaped");
+
+        let mut map = HashMap::new();
+        map.insert("192.168.1.1".to_string(), "Living Room AP".to_string());
+        assert_eq!(derive_service(ip, None, &map, "syslog"), "LivingRoomAP");
+
+        // A map value that sanitizes to nothing falls through to appname.
+        let mut map = HashMap::new();
+        map.insert("192.168.1.1".to_string(), "..".to_string());
+        assert_eq!(derive_service(ip, Some("sshd"), &map, "syslog"), "sshd");
+
+        // Dot-leading appnames never become dotfiles.
+        assert_eq!(
+            derive_service(other, Some(".hidden"), &HashMap::new(), "syslog"),
+            "hidden"
+        );
+
+        // An unusable default_service still yields a valid name.
+        assert_eq!(
+            derive_service(other, None, &HashMap::new(), "/../"),
+            "syslog"
+        );
+
+        for candidate in [
+            "../../escaped",
+            "Living Room AP",
+            ".hidden",
+            "..",
+            "/../",
+            "",
+            &"x".repeat(200),
+        ] {
+            let derived = derive_service(other, Some(candidate), &HashMap::new(), candidate);
+            assert!(
+                pipeline::is_valid_service_name(&derived),
+                "derive_service({candidate:?}) yielded invalid name {derived:?}"
+            );
+        }
     }
 
     #[test]

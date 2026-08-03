@@ -102,6 +102,21 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // ADR-0009 storage-epoch gate: runs before any component touches the
+    // data root. Refuses to start on the ambiguous branch.
+    let epoch_outcome = trawl_server::epoch::ensure_current_epoch(
+        &config.data.base_dir(),
+        &config.wal_dir(),
+        config.ingest.enabled,
+    )?;
+    tracing::info!(
+        event_type = "epoch_gate",
+        outcome = ?epoch_outcome,
+        epoch = trawl_server::epoch::CURRENT_EPOCH,
+        "storage epoch verified"
+    );
+    warn_unlisted_env_dirs(&config);
+
     let (mut state, http_config) = AppState::from_config(&config, metrics_handle).await?;
 
     // Open query debug log if configured (CLI flag overrides config).
@@ -120,7 +135,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Activate internal telemetry by injecting the WAL writer.
     if let Some((handle, layer)) = &telemetry {
         if let Some(writer) = &state.ingest.wal_writer {
-            handle.set(Arc::clone(writer));
+            handle.set(Arc::clone(writer), &config.ingest.default_env);
         }
         // Activate event bus for real-time telemetry fanout (SSE streaming).
         if let Some(bus) = &state.ingest.event_bus {
@@ -159,6 +174,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handles = trawl_server::syslog::spawn_syslog(
             &config.syslog,
+            config.ingest.default_env.as_str().into(),
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
             state.ingest.syslog_stats.clone(),
             shutdown_rx,
@@ -371,6 +387,38 @@ fn spawn_ingest_pipeline(
 
 /// Initialize the tracing subscriber.
 ///
+/// Warn for on-disk env directories not in the current allowlist: the
+/// allowlist gates writes, not reads — removing an env stops new ingest
+/// but its directories stay queryable and age out under retention
+/// normally (ADR-0009).
+fn warn_unlisted_env_dirs(config: &Config) {
+    let allowed = config.ingest.effective_envs();
+    let Ok(entries) = std::fs::read_dir(config.data.base_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if trawl_server::config::is_valid_env_name(name)
+            && !trawl_server::config::RESERVED_ENV_NAMES.contains(&name)
+            && !allowed.iter().any(|e| e == name)
+        {
+            tracing::warn!(
+                event_type = "env_not_in_allowlist",
+                env = %name,
+                "on-disk env directory is not in ingest.envs — new ingest \
+                 for it rejects, existing data stays queryable and ages out \
+                 under retention"
+            );
+        }
+    }
+}
+
 /// When internal telemetry is enabled, registers a [`WalLayer`] that
 /// replaces the JSON file logger. Returns both the [`WalHandle`] (for
 /// deferred writer injection) and a [`WalLayer`] clone (sharing the same
@@ -393,7 +441,7 @@ fn init_tracing(
     if use_telemetry {
         // WAL layer replaces the JSON file logger.
         let handle = WalHandle::new();
-        let wal_layer = WalLayer::new(handle.clone());
+        let wal_layer = WalLayer::new(handle.clone(), &config.ingest.default_env);
         let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>
 
         if monitor_active {

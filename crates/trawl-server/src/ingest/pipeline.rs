@@ -18,17 +18,11 @@ use crate::bus::{EventBus as _, IngestBatch, LocalEventBus};
 use crate::hot_buffer::HotBuffer;
 use crate::ingest::wal::WalWriter;
 
-/// Maximum service name length (shared between HTTP and syslog ingest).
-pub const MAX_SERVICE_NAME_LEN: usize = 128;
-
-/// Check if a byte is valid in a service name.
-///
-/// Allows alphanumeric, dash, underscore, dot, and space.
-/// Shared between HTTP ingest (which rejects invalid chars) and
-/// syslog ingest (which strips them).
-pub fn is_valid_service_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b' '
-}
+/// The service-name rule (ADR-0009), re-exported from `trawl-config` so
+/// that every ingestion path — HTTP ingest (which rejects violations),
+/// syslog ingest (which maps into the charset) and config load (which
+/// refuses to start) — decides from one definition.
+pub use trawl_config::{MAX_SERVICE_NAME_LEN, is_valid_service_char, is_valid_service_name};
 
 /// Events for a single service within a batch, ready for WAL writing.
 #[derive(Debug, Default)]
@@ -62,6 +56,9 @@ pub struct PipelineWriter {
     wal_writer: Arc<WalWriter>,
     hot_buffer: Option<Arc<HotBuffer>>,
     event_bus: Option<Arc<LocalEventBus>>,
+    /// Env for service-keyed batch writers (syslog) that predate the env
+    /// dimension — their events are stamped with `default_env` upstream.
+    default_env: Arc<str>,
 }
 
 impl PipelineWriter {
@@ -69,11 +66,13 @@ impl PipelineWriter {
         wal_writer: Arc<WalWriter>,
         hot_buffer: Option<Arc<HotBuffer>>,
         event_bus: Option<Arc<LocalEventBus>>,
+        default_env: Arc<str>,
     ) -> Self {
         Self {
             wal_writer,
             hot_buffer,
             event_bus,
+            default_env,
         }
     }
 
@@ -88,14 +87,15 @@ impl PipelineWriter {
     /// services that fail WAL writing are dropped (logged, not published).
     pub fn write(&self, batches: IndexMap<String, ServiceBatch>) -> usize {
         let mut total_written = 0;
+        let env = Arc::clone(&self.default_env);
 
         for (svc, batch) in batches {
             let event_count = batch.maps.len();
 
-            match self.wal_writer.write(&svc, &batch.ndjson) {
+            match self.wal_writer.write(&env, &svc, &batch.ndjson) {
                 Ok(wal_path) => {
                     total_written += event_count;
-                    self.publish(&svc, batch, &wal_path);
+                    self.publish(&env, &svc, batch, &wal_path);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -116,12 +116,17 @@ impl PipelineWriter {
     ///
     /// Called after WAL writing succeeds to make events immediately
     /// visible to queries (via hot buffer) and SSE streams (via event bus).
-    pub(crate) fn publish(&self, svc: &str, batch: ServiceBatch, wal_path: &Path) {
-        let batch_id: Arc<str> = wal_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .into();
+    pub(crate) fn publish(&self, env: &str, svc: &str, batch: ServiceBatch, wal_path: &Path) {
+        // `{env}/{stem}`: two envs must never collide on a hot-buffer
+        // drain key (compaction derives the same shape from the env dir).
+        let batch_id: Arc<str> = format!(
+            "{env}/{}",
+            wal_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+        )
+        .into();
 
         let ingest_batch = Arc::new(IngestBatch {
             batch_id,

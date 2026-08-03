@@ -110,13 +110,13 @@ if unit != "" {
 # 0=emerg, 1=alert, 2=crit, 3=error, 4=warn, 5=notice, 6=info, 7=debug
 priority = to_int(.PRIORITY) ?? 6
 if priority <= 3 {
-  .level = "error"
+  .severity_text = "error"
 } else if priority == 4 {
-  .level = "warn"
+  .severity_text = "warn"
 } else if priority <= 6 {
-  .level = "info"
+  .severity_text = "info"
 } else {
-  .level = "debug"
+  .severity_text = "debug"
 }
 
 # --- UFW firewall log enhancement ---
@@ -131,9 +131,9 @@ if contains(msg, "[UFW ") {
     ufw_action = action_match.action
   }
   if ufw_action == "BLOCK" {
-    .level = "warn"
+    .severity_text = "warn"
   } else if ufw_action == "ALLOW" {
-    .level = "info"
+    .severity_text = "info"
   }
 
   # extract network fields
@@ -180,6 +180,7 @@ del(._TRANSPORT)
 del(._UID)
 del(.PRIORITY)
 del(.SYSLOG_IDENTIFIER)
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 '''
 
@@ -237,15 +238,16 @@ if filepath != "" {
 # scan message for log level keywords
 msg = downcase(to_string(.message) ?? "")
 if match(msg, r'\b(?:error|fatal|panic|crit)\b') {
-  .level = "error"
+  .severity_text = "error"
 } else if match(msg, r'\b(?:warn|warning)\b') {
-  .level = "warn"
+  .severity_text = "warn"
 } else if match(msg, r'\b(?:debug|trace)\b') {
-  .level = "debug"
+  .severity_text = "debug"
 } else {
-  .level = "info"
+  .severity_text = "info"
 }
 
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 '''
 

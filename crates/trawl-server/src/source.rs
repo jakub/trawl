@@ -16,13 +16,16 @@ use trawl_core::ast::{FieldFilter, FilterOp, FilterValue, SearchToken};
 /// so we widen the file selection window by one hour.
 const TIME_FILTER_PADDING_SECS: u64 = 3600;
 
-/// Extract an exact service name from the search stage, if present.
+/// Extract an exact value for `field` from the search stage, if present.
 ///
 /// Only returns `Some` for single-group queries with a simple equality
-/// filter (`service=nginx`). Multi-group (OR) queries can't be narrowed
-/// to one service safely, and glob/regex operators are also ignored.
-fn extract_service_filter(search: &trawl_core::ast::SearchStage) -> Option<&str> {
-    // Can't narrow when OR is involved — different groups may target different services.
+/// filter (`service=nginx`, `env=prod`). Multi-group (OR) queries can't
+/// be narrowed safely, and glob/regex operators are also ignored.
+fn extract_eq_filter<'a>(
+    search: &'a trawl_core::ast::SearchStage,
+    field_name: &str,
+) -> Option<&'a str> {
+    // Can't narrow when OR is involved — different groups may target different values.
     if search.groups.len() != 1 {
         return None;
     }
@@ -32,7 +35,7 @@ fn extract_service_filter(search: &trawl_core::ast::SearchStage) -> Option<&str>
             op: FilterOp::Eq,
             value: FilterValue::Literal(s),
         }) = &t.node
-            && field == "service"
+            && field == field_name
         {
             return Some(s.as_str());
         }
@@ -40,44 +43,109 @@ fn extract_service_filter(search: &trawl_core::ast::SearchStage) -> Option<&str>
     })
 }
 
-/// Compute the `read_parquet()` source argument, scoped to relevant
-/// hour-directories when the query contains a time filter and/or
-/// narrowed to a single service file when `service=X` is present.
+/// Compute the `read_parquet()` source argument over the two path
+/// dimensions (ADR-0009): `data/{env}/{date}/{HH}/{service}.parquet`,
+/// day-level `data/{env}/{date}/{service}.parquet` after rollup.
 ///
-/// Supports two-tier parquet layout: day-level files for consolidated
-/// dates and hour-level files for unconsolidated dates. Both layouts
-/// are checked for all dates, including today.
-/// Checks for day-level files with a cheap `stat()` before falling back
-/// to hourly expansion.
+/// `env=X` pins the outer directory; otherwise every env directory on
+/// disk is searched. `service=X` narrows the file pattern — VERBATIM
+/// (path encoding is injective by validation, so `api.v2` and `api_v2`
+/// are distinct files and pruning is exact), but only when the literal
+/// satisfies the same `is_valid_service_name` predicate ingest enforces:
+/// a value no on-disk file can carry is also a value that must never be
+/// spliced into the glob list, so it falls back to the wildcard pattern.
+/// A time filter scopes to the relevant date/hour directories; without
+/// one, date-formatted dirs are enumerated per env.
 ///
-/// Returns a `DuckDB` list literal like `['path/14/*.parquet', 'path/15/*.parquet']`
-/// when time-scoping is possible, or falls back to the recursive glob.
+/// Returns a `DuckDB` list literal like
+/// `['data/prod/2026-08-02/14/*.parquet', ...]` when scoping is
+/// possible, or falls back to a recursive glob. Pruning is an
+/// optimization only: the SQL WHERE clause always re-filters, so a
+/// broader source is never incorrect.
 pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> String {
     let Ok(ast) = trawl_core::parser::parse(dsl) else {
         return fallback_glob.to_owned();
     };
 
-    let service = extract_service_filter(&ast.search);
-    let file_pattern = service.map_or_else(
-        || "*.parquet".to_owned(),
-        |s| {
-            format!(
-                "{}.parquet",
-                crate::ingest::wal::sanitize_service_for_filename(s)
-            )
-        },
-    );
-
-    let time_filter = ast.search.time_filter.as_ref().map(|tf| tf.node.duration);
+    // The literal is interpolated verbatim into single-quoted glob
+    // entries, so anything outside the ingest-side charset (quotes,
+    // separators, slashes, dots at the front) is rejected here rather
+    // than allowed to close one path and open another.
+    let service = extract_eq_filter(&ast.search, "service")
+        .filter(|s| trawl_config::is_valid_service_name(s));
+    let file_pattern = service.map_or_else(|| "*.parquet".to_owned(), |s| format!("{s}.parquet"));
 
     let base = base_dir.trim_end_matches('/');
 
-    let Some(duration) = time_filter else {
-        // No time filter — enumerate date-formatted directories to avoid
-        // scanning `scheduled/` (or other non-date subdirs) accidentally.
-        return date_scoped_fallback(base, &file_pattern);
+    let envs: Vec<String> = match extract_eq_filter(&ast.search, "env") {
+        Some(env)
+            if trawl_config::is_valid_env_name(env)
+                && !trawl_config::RESERVED_ENV_NAMES.contains(&env) =>
+        {
+            vec![env.to_owned()]
+        }
+        Some(_) => {
+            // A value no on-disk env can carry (they were validated at
+            // ingest) — match nothing; the executor treats "no files" as
+            // an empty result and the SQL filter keeps hot rows correct.
+            return no_match_source(base, &file_pattern);
+        }
+        None => crate::env_dirs::list_env_names(std::path::Path::new(base)),
     };
 
+    if envs.is_empty() {
+        // Cold start (no env directories yet). There is no log parquet to
+        // reach for, and `{base}/**/` would reach past the env dimension
+        // into `scheduled/` — materialized saved-query output the planner
+        // deliberately excludes (its schema is the query's, not an event's,
+        // so a union turns into a hard query error under ADR-0008). Match
+        // nothing, exactly as the invalid-env branch above does.
+        return no_match_source(base, &file_pattern);
+    }
+
+    let time_filter = ast.search.time_filter.as_ref().map(|tf| tf.node.duration);
+
+    let mut globs: Vec<String> = Vec::new();
+    for env in &envs {
+        let env_base = format!("{base}/{env}");
+        match time_filter {
+            Some(duration) => {
+                let scoped = time_scoped_globs(&env_base, duration, &file_pattern);
+                if scoped.is_empty() {
+                    globs.extend(date_scoped_globs(&env_base, &file_pattern));
+                } else {
+                    globs.extend(scoped);
+                }
+            }
+            None => globs.extend(date_scoped_globs(&env_base, &file_pattern)),
+        }
+    }
+
+    if globs.is_empty() {
+        // Every env exists but none holds a matching date directory — the
+        // same "nothing to read" state as a cold start, and the same reason
+        // not to fall back to `{base}/**/` over `scheduled/`.
+        return no_match_source(base, &file_pattern);
+    }
+    format!("[{}]", globs.join(", "))
+}
+
+/// The source for "no on-disk file can match": a path segment that is not a
+/// legal env name, so no data directory can ever carry it. The executor
+/// reads "no files" as an empty cold side and the SQL filter keeps hot rows
+/// correct.
+fn no_match_source(base: &str, file_pattern: &str) -> String {
+    format!("{base}/.no-such-env/{file_pattern}")
+}
+
+/// Time-scoped globs for one env root: hour-level for today, day-level
+/// and/or hour-level for historical dates, existence-filtered. Returns
+/// an empty vec when nothing on disk matches the window.
+fn time_scoped_globs(
+    base: &str,
+    duration: trawl_core::ast::TrawlDuration,
+    file_pattern: &str,
+) -> Vec<String> {
     let total_secs = duration
         .to_seconds()
         .saturating_add(TIME_FILTER_PADDING_SECS);
@@ -100,7 +168,7 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
             // Today may have day-level consolidated files from a
             // previous server session or an earlier daily rollup.
             // Check once, then emit hourly globs for the time range.
-            if has_day_level_files(base, &day, &file_pattern) {
+            if has_day_level_files(base, &day, file_pattern) {
                 globs.push(format!("'{base}/{day}/{file_pattern}'"));
             }
             while cursor <= end {
@@ -112,7 +180,7 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
             // Historical date — check for consolidated day-level file
             // and/or remaining hourly directories. Both can coexist
             // during partial rollup (one service consolidated, another not).
-            let has_day = has_day_level_files(base, &day, &file_pattern);
+            let has_day = has_day_level_files(base, &day, file_pattern);
             let has_hours = has_hour_dirs(base, &day);
 
             if has_day {
@@ -131,15 +199,11 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
         }
     }
 
-    if globs.is_empty() {
-        return date_scoped_fallback(base, &file_pattern);
-    }
-
     // Filter out globs whose parent directory doesn't exist on disk.
     // This avoids sending DuckDB a list of entirely nonexistent paths,
     // which would trigger a "No files found" error before the executor
     // safety net catches it.
-    let globs: Vec<String> = globs
+    globs
         .into_iter()
         .filter(|g| {
             // globs are formatted as 'path/to/file_pattern' — strip quotes
@@ -149,28 +213,17 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
                 .parent()
                 .is_some_and(std::path::Path::exists)
         })
-        .collect();
-
-    if globs.is_empty() {
-        // All glob dirs were nonexistent — fall back to date-scoped glob.
-        // The SQL time filter still provides correctness.
-        return date_scoped_fallback(base, &file_pattern);
-    }
-
-    format!("[{}]", globs.join(", "))
+        .collect()
 }
 
-/// Build a date-scoped glob for queries without a time filter.
+/// Date-scoped globs for one env root, for queries without a time filter.
 ///
-/// Enumerates directories matching `YYYY-MM-DD` in the base dir and builds
-/// a `DuckDB` list of globs for each. This naturally excludes non-date subdirs
-/// like `scheduled/` from being scanned.
-///
-/// Falls back to `{base}/**/{file_pattern}` only if the base dir is empty
-/// or can't be read (cold start / new install).
-fn date_scoped_fallback(base: &str, file_pattern: &str) -> String {
+/// Enumerates directories matching `YYYY-MM-DD` in the env base and
+/// builds one recursive glob per date dir. Returns an empty vec when the
+/// env base holds no date dirs.
+fn date_scoped_globs(base: &str, file_pattern: &str) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(base) else {
-        return format!("{base}/**/{file_pattern}");
+        return Vec::new();
     };
 
     let mut globs = Vec::new();
@@ -185,13 +238,9 @@ fn date_scoped_fallback(base: &str, file_pattern: &str) -> String {
         }
     }
 
-    if globs.is_empty() {
-        return format!("{base}/**/{file_pattern}");
-    }
-
     // Sort for deterministic ordering.
     globs.sort();
-    format!("[{}]", globs.join(", "))
+    globs
 }
 
 /// Check if a directory name looks like `YYYY-MM-DD`.
@@ -253,30 +302,46 @@ fn has_hour_dirs(base: &str, day: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Resolve a bare (non-list) source pattern with the same matcher
+    /// `read_parquet` uses, so a test can assert what a source really
+    /// reaches on disk rather than what its text looks like.
+    fn glob_matches(pattern: &str) -> Vec<String> {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("SELECT file FROM glob('{pattern}')"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
-    fn no_time_filter_returns_recursive_glob() {
-        // No time filter, no service → broad glob.
+    fn no_time_filter_over_empty_root_matches_nothing() {
+        // No env directory on disk → nothing to read.
         let source = compute_source("/data", "level=error", "/data/**/*.parquet");
-        assert_eq!(source, "/data/**/*.parquet");
+        assert_eq!(source, "/data/.no-such-env/*.parquet");
     }
 
     #[test]
     fn service_filter_narrows_glob() {
         // Exact service filter → narrow to service-specific file.
         let source = compute_source("/data", "service=nginx", "/data/**/*.parquet");
-        assert_eq!(source, "/data/**/nginx.parquet");
+        assert_eq!(source, "/data/.no-such-env/nginx.parquet");
     }
 
     #[test]
     fn service_glob_keeps_wildcard() {
         // Glob operator on service → can't narrow, keep *.parquet.
         let source = compute_source("/data", "service=ng*", "/data/**/*.parquet");
-        assert_eq!(source, "/data/**/*.parquet");
+        assert_eq!(source, "/data/.no-such-env/*.parquet");
     }
 
     #[test]
     fn bad_dsl_returns_fallback() {
-        let source = compute_source("/data", "broken {{{ query", "/data/**/*.parquet");
+        // Unparseable DSL: nothing to prune from, so the caller's fallback
+        // stands (the query itself fails to parse downstream anyway).
+        let source = compute_source("/data", "| | invalid", "/data/**/*.parquet");
         assert_eq!(source, "/data/**/*.parquet");
     }
 
@@ -292,7 +357,7 @@ mod tests {
             let dt = now - chrono::Duration::hours(h_offset);
             let date = dt.format("%Y-%m-%d").to_string();
             let hour = dt.format("%H").to_string();
-            std::fs::create_dir_all(tmp.path().join(&date).join(&hour)).unwrap();
+            std::fs::create_dir_all(tmp.path().join("prod").join(&date).join(&hour)).unwrap();
         }
         let fallback = format!("{base}/**/*.parquet");
         let source = compute_source(base, "last=1h", &fallback);
@@ -325,7 +390,7 @@ mod tests {
             let dt = now - chrono::Duration::hours(h_offset);
             let date = dt.format("%Y-%m-%d").to_string();
             let hour = dt.format("%H").to_string();
-            std::fs::create_dir_all(tmp.path().join(&date).join(&hour)).unwrap();
+            std::fs::create_dir_all(tmp.path().join("prod").join(&date).join(&hour)).unwrap();
         }
         let fallback = format!("{base}/**/*.parquet");
         let source = compute_source(base, "service=nginx last=1h", &fallback);
@@ -358,7 +423,7 @@ mod tests {
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
-        let day_dir = tmp.path().join(&yesterday);
+        let day_dir = tmp.path().join("prod").join(&yesterday);
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
 
@@ -366,7 +431,7 @@ mod tests {
         let source = compute_source(base, "service=nginx last=48h", &fallback);
 
         // Should include day-level path for yesterday (no /HH/ component).
-        let expected_day_glob = format!("'{base}/{yesterday}/nginx.parquet'");
+        let expected_day_glob = format!("'{base}/prod/{yesterday}/nginx.parquet'");
         assert!(
             source.contains(&expected_day_glob),
             "expected day-level glob for {yesterday}, got: {source}"
@@ -382,7 +447,7 @@ mod tests {
             .format("%Y-%m-%d")
             .to_string();
         // Create hour dirs but no day-level file.
-        let hour_dir = tmp.path().join(&yesterday).join("14");
+        let hour_dir = tmp.path().join("prod").join(&yesterday).join("14");
         std::fs::create_dir_all(&hour_dir).unwrap();
         std::fs::write(hour_dir.join("nginx.parquet"), b"data").unwrap();
 
@@ -390,7 +455,7 @@ mod tests {
         let source = compute_source(base, "service=nginx last=48h", &fallback);
 
         // Only hour 14 exists on disk, so only that glob survives filtering.
-        let hourly_pattern = format!("{base}/{yesterday}/14/nginx.parquet");
+        let hourly_pattern = format!("{base}/prod/{yesterday}/14/nginx.parquet");
         assert!(
             source.contains(&hourly_pattern),
             "expected hourly glob for existing dir, got: {source}"
@@ -405,7 +470,7 @@ mod tests {
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
-        let day_dir = tmp.path().join(&yesterday);
+        let day_dir = tmp.path().join("prod").join(&yesterday);
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
         std::fs::write(day_dir.join("postgres.parquet"), b"data").unwrap();
@@ -414,7 +479,7 @@ mod tests {
         let source = compute_source(base, "last=48h", &fallback);
 
         // Should use day-level glob (*.parquet at date level).
-        let expected_day_glob = format!("'{base}/{yesterday}/*.parquet'");
+        let expected_day_glob = format!("'{base}/prod/{yesterday}/*.parquet'");
         assert!(
             source.contains(&expected_day_glob),
             "expected day-level wildcard glob for {yesterday}, got: {source}"
@@ -503,7 +568,7 @@ mod tests {
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
-        let day_dir = tmp.path().join(&yesterday);
+        let day_dir = tmp.path().join("prod").join(&yesterday);
         std::fs::create_dir_all(&day_dir).unwrap();
 
         // nginx consolidated at day level.
@@ -518,8 +583,8 @@ mod tests {
         let source = compute_source(base, "last=48h", &fallback);
 
         // Should include BOTH day-level glob and the existing hourly dir.
-        let day_glob = format!("'{base}/{yesterday}/*.parquet'");
-        let hourly_glob = format!("'{base}/{yesterday}/14/*.parquet'");
+        let day_glob = format!("'{base}/prod/{yesterday}/*.parquet'");
+        let hourly_glob = format!("'{base}/prod/{yesterday}/14/*.parquet'");
         assert!(
             source.contains(&day_glob),
             "expected day-level glob in mixed state, got: {source}"
@@ -532,11 +597,143 @@ mod tests {
 
     #[test]
     fn sanitizes_dotted_service() {
-        // Dotted service name should be sanitized to match WAL/compaction filenames.
+        // INVERTED (ADR-0009): filenames carry the service verbatim, so a
+        // dotted service prunes to its own file — `api.v2` and `api_v2`
+        // are distinct.
         let source = compute_source("/data", "service=api.v2", "/data/**/*.parquet");
         assert_eq!(
-            source, "/data/**/api_v2.parquet",
-            "dots should be replaced with underscores in file pattern"
+            source, "/data/.no-such-env/api.v2.parquet",
+            "the file pattern carries the service name verbatim"
+        );
+    }
+
+    #[test]
+    fn env_and_service_pruning_matrix() {
+        // Two envs on disk, one date dir each. env=X pins the env
+        // directory; service=Y pins the file pattern; both compose;
+        // neither searches every env.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        for env in ["prod", "lab"] {
+            std::fs::create_dir_all(tmp.path().join(env).join("2026-01-15")).unwrap();
+        }
+        let fallback = format!("{base}/**/*.parquet");
+
+        // env only.
+        let source = compute_source(base, "env=prod", &fallback);
+        assert!(source.contains("/prod/"), "got: {source}");
+        assert!(
+            !source.contains("/lab/"),
+            "env=prod must prune lab: {source}"
+        );
+
+        // service only — both envs searched, file pattern pinned.
+        let source = compute_source(base, "service=nginx", &fallback);
+        assert!(source.contains("/prod/"), "got: {source}");
+        assert!(source.contains("/lab/"), "got: {source}");
+        assert!(source.contains("nginx.parquet"), "got: {source}");
+        assert!(!source.contains("*.parquet"), "got: {source}");
+
+        // both.
+        let source = compute_source(base, "env=lab service=nginx", &fallback);
+        assert!(source.contains("/lab/"), "got: {source}");
+        assert!(!source.contains("/prod/"), "got: {source}");
+        assert!(source.contains("nginx.parquet"), "got: {source}");
+
+        // neither — every env, wildcard pattern.
+        let source = compute_source(base, "level=error", &fallback);
+        assert!(source.contains("/prod/"), "got: {source}");
+        assert!(source.contains("/lab/"), "got: {source}");
+    }
+
+    #[test]
+    fn dotted_and_underscored_services_prune_distinctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let date_dir = tmp.path().join("prod").join("2026-01-15");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        std::fs::write(date_dir.join("api.v2.parquet"), b"a").unwrap();
+        std::fs::write(date_dir.join("api_v2.parquet"), b"b").unwrap();
+        let fallback = format!("{base}/**/*.parquet");
+
+        let dotted = compute_source(base, "service=api.v2", &fallback);
+        let underscored = compute_source(base, "service=api_v2", &fallback);
+        assert!(dotted.contains("api.v2.parquet"), "got: {dotted}");
+        assert!(underscored.contains("api_v2.parquet"), "got: {underscored}");
+        assert_ne!(dotted, underscored, "the two services must prune apart");
+    }
+
+    #[test]
+    fn invalid_env_value_matches_nothing() {
+        // `env=../evil` can never match on-disk data (env names were
+        // validated at ingest) — the source must not glob anything real.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod").join("2026-01-15")).unwrap();
+        let fallback = format!("{base}/**/*.parquet");
+
+        let source = compute_source(base, "env=../evil", &fallback);
+        assert!(
+            source.contains(".no-such-env"),
+            "invalid env must yield a no-match source, got: {source}"
+        );
+        assert!(!source.contains("/prod/"), "got: {source}");
+    }
+
+    /// A post-cutover install before its first compaction: `data/` holds the
+    /// EPOCH marker and `scheduled/` report runs, and no env directory yet.
+    /// The source must not reach into `scheduled/` — those parquet files are
+    /// materialized saved-query output, not events, and unioning them into
+    /// the log side turns into a hard query error under ADR-0008.
+    #[test]
+    fn cold_start_source_never_reaches_scheduled_report_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        std::fs::write(tmp.path().join("EPOCH"), b"2").unwrap();
+        let runs = tmp.path().join("scheduled").join("errors-by-host");
+        std::fs::create_dir_all(&runs).unwrap();
+        let run = runs.join("run_1.parquet");
+        std::fs::write(&run, b"report run").unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "level=error", &fallback);
+
+        assert_eq!(source, format!("{base}/.no-such-env/*.parquet"));
+        assert!(
+            glob_matches(&source).is_empty(),
+            "cold-start source must match nothing, got: {source}"
+        );
+        // The fallback it replaced really did sweep the report run in.
+        assert!(
+            glob_matches(&fallback).contains(&run.to_string_lossy().into_owned()),
+            "sanity: the `**` fallback is what reached the scheduled run"
+        );
+    }
+
+    /// Same, one dimension in: env directories exist, but none holds a date
+    /// directory the query could read. Still nothing to read, still no
+    /// excuse to glob the whole data root.
+    #[test]
+    fn no_matching_date_dir_never_reaches_scheduled_report_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        std::fs::write(tmp.path().join("EPOCH"), b"2").unwrap();
+        let runs = tmp.path().join("scheduled").join("errors-by-host");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("run_1.parquet"), b"report run").unwrap();
+        // Env dirs exist (so the cold-start branch is not the one under
+        // test) but neither carries a `YYYY-MM-DD` directory.
+        for env in ["prod", "lab"] {
+            std::fs::create_dir_all(tmp.path().join(env)).unwrap();
+        }
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "level=error", &fallback);
+
+        assert_eq!(source, format!("{base}/.no-such-env/*.parquet"));
+        assert!(
+            glob_matches(&source).is_empty(),
+            "date-less source must match nothing, got: {source}"
         );
     }
 
@@ -550,7 +747,7 @@ mod tests {
         let today = now.format("%Y-%m-%d").to_string();
 
         // Create day-level file only (no hourly subdirs).
-        let day_dir = tmp.path().join(&today);
+        let day_dir = tmp.path().join("prod").join(&today);
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("trawld.parquet"), b"data").unwrap();
 
@@ -558,7 +755,7 @@ mod tests {
         let source = compute_source(base, "service=trawld last=1h", &fallback);
 
         // Day-level glob must be present so the consolidated file is found.
-        let day_glob = format!("'{base}/{today}/trawld.parquet'");
+        let day_glob = format!("'{base}/prod/{today}/trawld.parquet'");
         assert!(
             source.contains(&day_glob),
             "expected day-level glob for today, got: {source}"
@@ -574,7 +771,7 @@ mod tests {
         let today = now.format("%Y-%m-%d").to_string();
         let hour = now.format("%H").to_string();
 
-        let day_dir = tmp.path().join(&today);
+        let day_dir = tmp.path().join("prod").join(&today);
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
         std::fs::create_dir_all(day_dir.join(&hour)).unwrap();
@@ -582,8 +779,8 @@ mod tests {
         let fallback = format!("{base}/**/*.parquet");
         let source = compute_source(base, "last=1h", &fallback);
 
-        let day_glob = format!("'{base}/{today}/*.parquet'");
-        let hourly_glob = format!("{base}/{today}/{hour}/");
+        let day_glob = format!("'{base}/prod/{today}/*.parquet'");
+        let hourly_glob = format!("{base}/prod/{today}/{hour}/");
         assert!(
             source.contains(&day_glob),
             "expected day-level glob, got: {source}"
@@ -595,20 +792,52 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_service_with_time_filter() {
+    fn invalid_service_value_cannot_inject_paths() {
+        // A quoted DSL literal can carry `', '` — the list-item separator.
+        // It must never reach the glob list: the pattern falls back to the
+        // wildcard, so no attacker-chosen path is ever emitted.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod").join("2026-01-15")).unwrap();
+        let fallback = format!("{base}/**/*.parquet");
+
+        for dsl in [
+            r#"service="nginx', '/**/*""#,
+            r#"service="nginx', '/etc/shadow""#,
+            "service=../../escaped",
+            "service=.hidden",
+        ] {
+            let source = compute_source(base, dsl, &fallback);
+            assert!(
+                source.contains("*.parquet"),
+                "invalid service must fall back to the wildcard, got: {source}"
+            );
+            assert!(
+                !source.contains("nginx") && !source.contains("hidden"),
+                "invalid service must not reach the glob list, got: {source}"
+            );
+            assert!(
+                !source.contains("/etc/") && !source.contains(".."),
+                "invalid service must not escape the data root, got: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn verbatim_service_with_time_filter() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         let fallback = format!("{base}/**/*.parquet");
         let source = compute_source(base, "service=host.name last=1h", &fallback);
 
-        // Should use sanitized filename pattern.
+        // Filenames carry the service verbatim (ADR-0009).
         assert!(
-            source.contains("host_name.parquet"),
-            "expected sanitized service in time-scoped glob, got: {source}"
+            source.contains("host.name.parquet"),
+            "expected the verbatim service in the glob, got: {source}"
         );
         assert!(
-            !source.contains("host.name.parquet"),
-            "should not contain unsanitized service name, got: {source}"
+            !source.contains("host_name.parquet"),
+            "must not sanitize the service name, got: {source}"
         );
     }
 }

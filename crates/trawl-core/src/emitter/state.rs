@@ -62,6 +62,20 @@ pub(crate) struct EmitterState {
     pivot: Option<PivotSpec>,
     ctes: Vec<Cte>,
     params: Vec<SqlValue>,
+    /// How text search binds `_raw` in this pass (see [`RawBinding`]).
+    raw_binding: RawBinding,
+}
+
+/// How the `_raw` column is bound by text search in one emission pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawBinding {
+    /// `_raw` may be bound; no text search has done so yet.
+    Available,
+    /// A text-search predicate bound `_raw`, so this query needs a raw-free
+    /// variant for sources that lack the column.
+    Bound,
+    /// The raw-free pass: text search substitutes a typed NULL for `_raw`.
+    Suppressed,
 }
 
 /// Validate a source path for use in `DuckDB` table-valued functions.
@@ -163,7 +177,7 @@ fn build_reader(source: &str) -> Result<String, super::EmitError> {
 /// heterogeneous-schema events into a single MAP column.
 ///
 /// Schema detection deliberately keeps `DuckDB`'s bounded default sample.
-/// A sparse column — `timestamp_invalid`, which only repaired events carry
+/// A sparse column — `_repairs`, which only repaired events carry
 /// (ADR-0008) — first appearing past that prefix throws an `unknown key`
 /// error for the whole query, but `sample_size=-1` is the wrong cure: it
 /// re-parses the entire snapshot on *every* query and SSE poll (~2.7x the
@@ -179,19 +193,24 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
 }
 
 /// Build the body of a `REPLACE (...)` clause casting `varchar_cols` to
-/// VARCHAR. When `with_timestamp` is set, the canonical timestamp cast is
-/// prepended (the hot side always needs it to match parquet's TIMESTAMP).
-/// `timestamp` is never coerced to VARCHAR — it is the sort/partition key —
-/// and never hard-CAST either (ADR-0008): `TRY_CAST` degrades one malformed
+/// VARCHAR. When `with_timestamp` is set, the canonical casts for BOTH
+/// envelope TIMESTAMP columns (`_time`, `_ingested`) are prepended — the
+/// hot side always needs them to match parquet's TIMESTAMP, and a second
+/// TIMESTAMP column left VARCHAR would trip the union-conflict path on
+/// every query with a non-empty hot buffer. The timestamp columns are
+/// never coerced to VARCHAR — `_time` is the sort/partition key — and
+/// never hard-CAST either (ADR-0008): `TRY_CAST` degrades one malformed
 /// hot row to NULL instead of throwing the whole hot+cold union (which
 /// previously fell back to hot-only, silently dropping every cold row).
 fn varchar_replace_list(varchar_cols: &[String], with_timestamp: bool) -> String {
-    let mut parts = Vec::with_capacity(varchar_cols.len() + 1);
+    let mut parts = Vec::with_capacity(varchar_cols.len() + crate::schema::TIMESTAMP_COLUMNS.len());
     if with_timestamp {
-        parts.push("TRY_CAST(\"timestamp\" AS TIMESTAMP) AS \"timestamp\"".to_string());
+        for col in crate::schema::TIMESTAMP_COLUMNS {
+            parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
+        }
     }
     for col in varchar_cols {
-        if col == "timestamp" {
+        if crate::schema::TIMESTAMP_COLUMNS.contains(&col.as_str()) {
             continue;
         }
         let q = super::fields::quote_field(col);
@@ -278,6 +297,38 @@ impl EmitterState {
             pivot: None,
             ctes: Vec::new(),
             params: Vec::new(),
+            raw_binding: RawBinding::Available,
+        }
+    }
+
+    /// Emit the raw-free variant of this query: text search binds a typed
+    /// NULL instead of the `_raw` column.
+    pub(crate) fn without_raw_column(mut self) -> Self {
+        self.raw_binding = RawBinding::Suppressed;
+        self
+    }
+
+    /// Whether text search bound the `_raw` column during this pass.
+    pub(crate) fn bound_raw_column(&self) -> bool {
+        self.raw_binding == RawBinding::Bound
+    }
+
+    /// The expression text search uses for the `_raw` side of its predicate.
+    ///
+    /// `_raw` is a server guarantee, not a guarantee of every source a query
+    /// can be pointed at: user-owned parquet read in embedded mode has no
+    /// such column, and binding it there fails the whole query. The raw-free
+    /// pass substitutes a typed NULL, which under the predicate's
+    /// three-valued logic degrades bare-word search to `message` alone —
+    /// exactly what the in-memory filter does for an event without `_raw`
+    /// (ADR-0009: bare search covers `_raw` *where present*).
+    pub(crate) fn raw_column(&mut self) -> &'static str {
+        match self.raw_binding {
+            RawBinding::Suppressed => "NULL::VARCHAR",
+            RawBinding::Available | RawBinding::Bound => {
+                self.raw_binding = RawBinding::Bound;
+                "\"_raw\""
+            }
         }
     }
 
@@ -294,13 +345,19 @@ impl EmitterState {
 
     /// Run a closure that may push WHERE clauses, capturing them separately.
     ///
-    /// Swaps the WHERE buffer, runs the closure, then restores the original.
-    /// Parameters pushed during the closure are kept (ordering is preserved).
-    /// Used by multi-group (OR) search emission to collect per-group clauses.
-    pub(crate) fn collect_where_clauses(&mut self, f: impl FnOnce(&mut Self)) -> Vec<String> {
+    /// Swaps the WHERE buffer, runs the closure, then restores the original —
+    /// the restore happens even when the closure fails, so a failed emission
+    /// never leaks half-built clauses into the caller's buffer. Parameters
+    /// pushed during the closure are kept (ordering is preserved). Used by
+    /// multi-group (OR) search emission to collect per-group clauses.
+    pub(crate) fn collect_where_clauses(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<(), super::EmitError>,
+    ) -> Result<Vec<String>, super::EmitError> {
         let original = std::mem::take(&mut self.where_clauses);
-        f(self);
-        std::mem::replace(&mut self.where_clauses, original)
+        let outcome = f(self);
+        let collected = std::mem::replace(&mut self.where_clauses, original);
+        outcome.map(|()| collected)
     }
 
     /// Conditionally flush the current state to a CTE based on the given condition.

@@ -8,7 +8,7 @@
 //! appliances that often emit slightly non-conformant syslog.
 
 use chrono::{Datelike, Utc};
-use syslog_loose::{Message, ProcId, SyslogFacility, SyslogSeverity, Variant};
+use syslog_loose::{Message, ProcId, SyslogFacility, Variant};
 
 /// Parse a raw syslog message string.
 ///
@@ -29,23 +29,6 @@ fn resolve_year(_: syslog_loose::IncompleteDate) -> i32 {
 
 /// Map syslog severity to trawl's level vocabulary.
 ///
-/// Matches the level mapping used by Vector's journald transform so
-/// that queries like `level=error` work identically regardless of
-/// ingestion source.
-pub fn severity_to_level(severity: Option<SyslogSeverity>) -> &'static str {
-    match severity {
-        Some(
-            SyslogSeverity::SEV_EMERG
-            | SyslogSeverity::SEV_ALERT
-            | SyslogSeverity::SEV_CRIT
-            | SyslogSeverity::SEV_ERR,
-        ) => "error",
-        Some(SyslogSeverity::SEV_WARNING) => "warn",
-        Some(SyslogSeverity::SEV_NOTICE | SyslogSeverity::SEV_INFO) | None => "info",
-        Some(SyslogSeverity::SEV_DEBUG) => "debug",
-    }
-}
-
 /// Map syslog facility to a human-readable string.
 pub fn facility_to_str(facility: Option<SyslogFacility>) -> Option<&'static str> {
     Some(match facility? {
@@ -88,6 +71,7 @@ pub fn procid_to_string(procid: &Option<ProcId<&str>>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use syslog_loose::SyslogSeverity;
 
     #[test]
     fn parse_rfc3164_unifi_style() {
@@ -113,19 +97,6 @@ mod tests {
         assert_eq!(parsed.appname, Some("nginx"));
         assert!(parsed.msg.contains("GET /api/v1/health"));
         assert_eq!(parsed.severity, Some(SyslogSeverity::SEV_NOTICE));
-    }
-
-    #[test]
-    fn severity_mapping() {
-        assert_eq!(severity_to_level(Some(SyslogSeverity::SEV_EMERG)), "error");
-        assert_eq!(severity_to_level(Some(SyslogSeverity::SEV_ALERT)), "error");
-        assert_eq!(severity_to_level(Some(SyslogSeverity::SEV_CRIT)), "error");
-        assert_eq!(severity_to_level(Some(SyslogSeverity::SEV_ERR)), "error");
-        assert_eq!(severity_to_level(Some(SyslogSeverity::SEV_WARNING)), "warn");
-        assert_eq!(severity_to_level(Some(SyslogSeverity::SEV_NOTICE)), "info");
-        assert_eq!(severity_to_level(Some(SyslogSeverity::SEV_INFO)), "info");
-        assert_eq!(severity_to_level(Some(SyslogSeverity::SEV_DEBUG)), "debug");
-        assert_eq!(severity_to_level(None), "info");
     }
 
     #[test]

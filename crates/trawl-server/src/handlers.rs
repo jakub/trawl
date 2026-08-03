@@ -2097,7 +2097,10 @@ pub async fn stream_query(
     // Parse and compile the filter once upfront.
     let ast = trawl_core::parser::parse(&query_dsl)
         .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
-    let filter = trawl_core::filter::CompiledFilter::compile(&ast.search);
+    // Rejects whatever the SQL emitter rejects (e.g. `level=eror`) instead
+    // of opening a live-looking stream that can never match an event.
+    let filter = trawl_core::filter::CompiledFilter::compile(&ast.search)
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     // Compile the pipeline stages for streaming evaluation.
     let stream_plan = trawl_core::stream::compile_stream_plan(&ast.pipeline)

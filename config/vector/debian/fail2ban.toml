@@ -36,27 +36,28 @@ if err == null {
 
   lvl = upcase(to_string(parsed.level))
   if lvl == "ERROR" || lvl == "CRITICAL" {
-    .level = "error"
+    .severity_text = "error"
   } else if lvl == "WARNING" || lvl == "NOTICE" {
-    .level = "warn"
+    .severity_text = "warn"
   } else if lvl == "DEBUG" {
-    .level = "debug"
+    .severity_text = "debug"
   } else {
-    .level = "info"
+    .severity_text = "info"
   }
 } else {
   # fallback: still capture lines that don't match the structured format
   msg = downcase(to_string(.message) ?? "")
   if match(msg, r'\b(?:error|critical)\b') {
-    .level = "error"
+    .severity_text = "error"
   } else if match(msg, r'\b(?:warn|warning|notice)\b') {
-    .level = "warn"
+    .severity_text = "warn"
   } else {
-    .level = "info"
+    .severity_text = "info"
   }
 }
 
 .service = "fail2ban"
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.file)
 '''

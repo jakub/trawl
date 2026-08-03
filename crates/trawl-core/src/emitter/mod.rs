@@ -12,6 +12,7 @@ mod fields;
 mod functions;
 mod pipeline;
 mod search;
+pub(crate) mod severity;
 mod state;
 mod validate;
 
@@ -25,6 +26,7 @@ pub(crate) use functions::{
     format_literal_position, unit_literal_positions, validate_format_literal, validate_unit_literal,
 };
 pub use state::{hot_source_reader, source_reader, validate_source_path};
+pub(crate) use validate::validate_level_references;
 pub use validate::validate_pipeline;
 
 use std::fmt;
@@ -47,6 +49,18 @@ pub struct EmittedQuery {
     /// fields first. `true` when the pipeline has no explicit column selection
     /// or aggregation — i.e. the column set comes from `SELECT *`.
     pub needs_column_reorder: bool,
+    /// The same query with text search's `_raw` side bound to a typed NULL
+    /// instead of the column — `Some` only when a text search referenced
+    /// `_raw`.
+    ///
+    /// `_raw` is a server guarantee, not a guarantee of every source a query
+    /// can be pointed at: user-owned parquet read in embedded mode has no
+    /// such column, and binding it there would fail the whole query instead
+    /// of searching `message` alone (ADR-0009: bare search covers `_raw`
+    /// *where present*). [`params`](Self::params) applies unchanged — the
+    /// raw-free pass pushes the same parameters in the same order — so the
+    /// executor can retry with this SQL against a source that has no `_raw`.
+    pub raw_free_sql: Option<String>,
 }
 
 /// A parameter value for a SQL query placeholder.
@@ -142,8 +156,7 @@ impl EmitError {
 ///
 /// `source` is the parquet glob path, e.g. `"/data/**/*.parquet"`.
 pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
-    let state = EmitterState::new(source)?;
-    emit_from_state(query, state)
+    emit_with_raw_fallback(query, || EmitterState::new(source))
 }
 
 /// Emit SQL that unions the primary parquet source with a hot buffer ndjson file.
@@ -155,8 +168,7 @@ pub fn emit_with_hot_source(
     source: &str,
     hot_source: &str,
 ) -> Result<EmittedQuery, EmitError> {
-    let state = EmitterState::with_hot_source(source, hot_source)?;
-    emit_from_state(query, state)
+    emit_with_raw_fallback(query, || EmitterState::with_hot_source(source, hot_source))
 }
 
 /// Emit a hot+cold union query with `varchar_cols` coerced to VARCHAR on
@@ -171,11 +183,40 @@ pub fn emit_with_hot_source_coerced(
     hot_source: &str,
     varchar_cols: &[String],
 ) -> Result<EmittedQuery, EmitError> {
-    let state = EmitterState::with_hot_source_coerced(source, hot_source, varchar_cols)?;
-    emit_from_state(query, state)
+    emit_with_raw_fallback(query, || {
+        EmitterState::with_hot_source_coerced(source, hot_source, varchar_cols)
+    })
 }
 
-fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuery, EmitError> {
+/// Emit the query, and — when text search bound `_raw` — a second time with
+/// the column replaced by a typed NULL, stored as
+/// [`EmittedQuery::raw_free_sql`] for the executor's fallback.
+///
+/// `make_state` is called once per pass so both start from an identical
+/// state; the raw-free pass pushes the same parameters in the same order, so
+/// the two SQL strings share one parameter list.
+fn emit_with_raw_fallback(
+    query: &Query,
+    make_state: impl Fn() -> Result<EmitterState, EmitError>,
+) -> Result<EmittedQuery, EmitError> {
+    let (mut emitted, referenced_raw) = emit_from_state(query, make_state()?)?;
+    if referenced_raw {
+        let (raw_free, _) = emit_from_state(query, make_state()?.without_raw_column())?;
+        debug_assert_eq!(
+            raw_free.params, emitted.params,
+            "raw-free pass must keep the parameter list identical"
+        );
+        emitted.raw_free_sql = Some(raw_free.sql);
+    }
+    Ok(emitted)
+}
+
+/// Emit one pass. Returns the query and whether text search referenced the
+/// `_raw` column.
+fn emit_from_state(
+    query: &Query,
+    mut state: EmitterState,
+) -> Result<(EmittedQuery, bool), EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
 
     // `from saved` cannot be combined with search-stage filters.
@@ -213,15 +254,20 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
     }
 
     let needs_column_reorder = state.needs_column_reorder();
+    let referenced_raw = state.bound_raw_column();
     let sql = state.finalize();
     let params = state.into_params();
 
-    Ok(EmittedQuery {
-        sql,
-        params,
-        rust_stages,
-        needs_column_reorder,
-    })
+    Ok((
+        EmittedQuery {
+            sql,
+            params,
+            rust_stages,
+            needs_column_reorder,
+            raw_free_sql: None,
+        },
+        referenced_raw,
+    ))
 }
 
 #[cfg(test)]
@@ -371,6 +417,205 @@ mod tests {
     fn search_or_with_time_filter() {
         // Time filter should be emitted as top-level WHERE, outside OR parens.
         assert_snapshot!(emit_dsl("service=nginx last=2h OR service=postgres"));
+    }
+
+    // -----------------------------------------------------------------------
+    // level → severity band alias (ADR-0009)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_level_eq_band() {
+        assert_snapshot!(emit_dsl("level=error"));
+    }
+
+    #[test]
+    fn search_level_gte_number() {
+        assert_snapshot!(emit_dsl("level>=warn"));
+    }
+
+    #[test]
+    fn search_level_ne_band() {
+        assert_snapshot!(emit_dsl("level!=info"));
+    }
+
+    #[test]
+    fn search_level_in_list() {
+        assert_snapshot!(emit_dsl("level=error,fatal"));
+    }
+
+    #[test]
+    fn search_level_case_insensitive_token() {
+        assert_snapshot!(emit_dsl("level=WARN"));
+    }
+
+    #[test]
+    fn error_level_unknown_token() {
+        assert_snapshot!(emit_dsl_err("level=spicy"));
+    }
+
+    #[test]
+    fn error_level_glob() {
+        assert_snapshot!(emit_dsl_err("level=glob:err*"));
+    }
+
+    #[test]
+    fn where_level_eq_band() {
+        assert_snapshot!(emit_dsl(r#"* | where level == "error""#));
+    }
+
+    #[test]
+    fn where_level_gte_number() {
+        assert_snapshot!(emit_dsl(r#"* | where level >= "warn""#));
+    }
+
+    /// `level` is consumed at ingest, so a non-comparison use names a
+    /// column that does not exist. Emitting it verbatim gets a binder
+    /// error that the hot/cold ladder downgrades to an empty 200 — every
+    /// pre-cutover saved query grouping on `level` would silently return
+    /// nothing. Reject it instead, everywhere a field name can appear.
+    #[test]
+    fn error_level_in_stats_by() {
+        assert_snapshot!(emit_dsl_err("* | stats count() by level"));
+    }
+
+    #[test]
+    fn error_level_in_table() {
+        assert_snapshot!(emit_dsl_err("* | table host, level"));
+    }
+
+    #[test]
+    fn error_level_in_sort() {
+        assert_snapshot!(emit_dsl_err("* | sort -level"));
+    }
+
+    #[test]
+    fn error_level_in_expression() {
+        assert_snapshot!(emit_dsl_err(r#"* | where lower(level) == "error""#));
+    }
+
+    /// A `level` column defined mid-pipeline would shadow the severity
+    /// alias for every later stage, so the write side is rejected too.
+    #[test]
+    fn error_level_as_assignment_target() {
+        assert_snapshot!(emit_dsl_err(r#"* | let level = "error""#));
+    }
+
+    /// Every other field-name position routes through the same check.
+    #[test]
+    fn error_level_in_remaining_positions() {
+        for dsl in [
+            "* | top 5 level",
+            "* | rare 5 level",
+            "* | dedup level",
+            "* | drop level",
+            "* | rename level as lvl",
+            "* | rename service as level",
+            "* | timechart span=5m count() by level",
+            "* | pivot count() on level",
+            "* | stats count() as level",
+            "* | extract kv from level",
+            r#"* | where level in ("error")"#,
+        ] {
+            let err = emit_dsl_err(dsl);
+            assert!(
+                err.contains("filter-only alias"),
+                "{dsl} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    /// The rejection must not swallow the legal comparison forms, in
+    /// either stage.
+    #[test]
+    fn level_comparisons_still_emit() {
+        for dsl in [
+            "level=error",
+            "level>=warn",
+            r#"* | where level == "error""#,
+            r#"* | where level != "info" and service == "nginx""#,
+        ] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            emit(&query, SRC).expect("level comparison should still emit");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // _time alias inversion (ADR-0009)
+    // -----------------------------------------------------------------------
+
+    /// `timestamp`, `@timestamp` and `_time` all resolve to the physical
+    /// `_time` column.
+    #[test]
+    fn time_aliases_resolve_identically() {
+        let canonical = emit_dsl("* | sort _time");
+        assert_eq!(emit_dsl("* | sort timestamp"), canonical);
+        assert_eq!(emit_dsl("* | sort @timestamp"), canonical);
+        assert!(canonical.contains("\"_time\""));
+        assert!(!canonical.contains("\"timestamp\""));
+    }
+
+    #[test]
+    fn time_filter_uses_time_column() {
+        let sql = emit_dsl("last=1h");
+        assert!(
+            sql.contains(r#"TRY_CAST("_time" AS TIMESTAMP)"#),
+            "time filter must target _time: {sql}"
+        );
+    }
+
+    /// Bare search covers `message` OR `_raw`.
+    #[test]
+    fn bare_search_covers_raw() {
+        let sql = emit_dsl("error");
+        assert!(sql.contains(r#""message""#), "message side: {sql}");
+        assert!(sql.contains(r#""_raw""#), "_raw side: {sql}");
+    }
+
+    /// Text search carries a raw-free variant for sources with no `_raw`
+    /// column — same parameters, `_raw` bound to a typed NULL so the
+    /// predicate degrades to `message` alone.
+    #[test]
+    fn text_search_carries_a_raw_free_variant() {
+        for dsl in ["boom", r#""boom error""#, "-boom service=nginx"] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let emitted = emit(&query, SRC).expect("emit should succeed");
+            let raw_free = emitted
+                .raw_free_sql
+                .as_ref()
+                .unwrap_or_else(|| panic!("{dsl} must carry a raw-free variant"));
+
+            assert!(
+                !raw_free.contains(r#""_raw""#),
+                "{dsl} raw-free variant still binds _raw: {raw_free}"
+            );
+            assert!(
+                raw_free.contains("NULL::VARCHAR"),
+                "{dsl} raw-free variant must bind a typed NULL: {raw_free}"
+            );
+            assert_eq!(
+                raw_free.matches('?').count(),
+                emitted.params.len(),
+                "{dsl} raw-free variant must reuse the same parameter list"
+            );
+            assert_eq!(
+                raw_free.replace("NULL::VARCHAR", r#""_raw""#),
+                emitted.sql,
+                "{dsl} raw-free variant must differ only in the _raw side"
+            );
+        }
+    }
+
+    /// A query that never binds `_raw` needs no fallback.
+    #[test]
+    fn queries_without_text_search_have_no_raw_free_variant() {
+        for dsl in ["service=nginx", "* | stats count() by host", "last=1h"] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let emitted = emit(&query, SRC).expect("emit should succeed");
+            assert!(
+                emitted.raw_free_sql.is_none(),
+                "{dsl} must not carry a raw-free variant"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -669,7 +914,7 @@ mod tests {
 
     #[test]
     fn pipe_let_override_existing() {
-        assert_snapshot!(emit_dsl("* | let level = lower(level)"));
+        assert_snapshot!(emit_dsl("* | let message = lower(message)"));
     }
 
     // -----------------------------------------------------------------------
@@ -810,7 +1055,7 @@ mod tests {
     #[test]
     fn pipe_timechart_by_then_where() {
         assert_snapshot!(emit_dsl(
-            "last=1h | timechart span=5m count() by level | where count > 10"
+            "last=1h | timechart span=5m count() by severity | where count > 10"
         ));
     }
 
@@ -1114,11 +1359,16 @@ mod tests {
             sql.contains(r#"CAST("containerID" AS VARCHAR) AS "containerID""#),
             "should cast containerID: {sql}"
         );
-        // Hot side keeps the timestamp cast (TRY_CAST — the partition key
-        // is never hard-CAST, ADR-0008) and adds the VARCHAR casts.
+        // Hot side keeps the casts for BOTH envelope timestamp columns
+        // (TRY_CAST — the partition key is never hard-CAST, ADR-0008)
+        // and adds the VARCHAR casts.
         assert!(
-            sql.contains(r#"TRY_CAST("timestamp" AS TIMESTAMP) AS "timestamp""#),
-            "hot side keeps timestamp TRY_CAST: {sql}"
+            sql.contains(r#"TRY_CAST("_time" AS TIMESTAMP) AS "_time""#),
+            "hot side keeps _time TRY_CAST: {sql}"
+        );
+        assert!(
+            sql.contains(r#"TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested""#),
+            "hot side keeps _ingested TRY_CAST: {sql}"
         );
     }
 

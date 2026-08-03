@@ -41,20 +41,21 @@ if err == null {
 
   lvl = upcase(to_string(parsed.level))
   if lvl == "ERROR" || lvl == "FATAL" || lvl == "PANIC" {
-    .level = "error"
+    .severity_text = "error"
   } else if lvl == "WARNING" {
-    .level = "warn"
+    .severity_text = "warn"
   } else if lvl == "DEBUG" || starts_with(lvl, "DEBUG") {
-    .level = "debug"
+    .severity_text = "debug"
   } else {
     # LOG, NOTICE, STATEMENT, DETAIL, HINT, CONTEXT
-    .level = "info"
+    .severity_text = "info"
   }
 } else {
-  .level = "info"
+  .severity_text = "info"
 }
 
 .service = "postgresql"
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.file)
 '''

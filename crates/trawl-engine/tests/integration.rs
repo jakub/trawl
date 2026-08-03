@@ -112,6 +112,38 @@ fn stats_count_by_service() {
 }
 
 #[test]
+fn stats_group_by_repairs_separates_clean_from_repaired() {
+    // ADR-0009: `_repairs` is NULL on clean events and carries the repair
+    // codes on repaired ones, so it must behave as an ordinary groupable
+    // dimension — one group per distinct code plus a NULL group for the
+    // untouched majority. The fixture seeds exactly one repaired row
+    // (`host.from_peer`) among 13.
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("* | stats count() by _repairs", &glob)
+        .unwrap();
+
+    assert_eq!(result.columns[0].name, "_repairs");
+    let groups: Vec<(&Value, &Value)> = result.rows.iter().map(|r| (&r[0], &r[1])).collect();
+    assert_eq!(
+        groups.len(),
+        2,
+        "expected a clean group and one repaired group, got {groups:?}"
+    );
+    assert!(
+        groups.contains(&(&Value::Null, &Value::Integer(12))),
+        "the 12 clean events must aggregate under a NULL `_repairs`: {groups:?}"
+    );
+    assert!(
+        groups.contains(&(
+            &Value::String("host.from_peer".to_string()),
+            &Value::Integer(1)
+        )),
+        "the repaired event must aggregate under its repair code: {groups:?}"
+    );
+}
+
+#[test]
 fn stats_with_where_cte() {
     let (exec, glob) = setup();
     let result = exec
@@ -280,6 +312,200 @@ fn timechart_minute_buckets() {
 }
 
 #[test]
+fn timechart_bucket_values_group_by_full_expression() {
+    // The bucket is aliased AS "_time" — the same name as the source column
+    // it is derived from. Grouping must reference the full time_bucket
+    // expression, not the ambiguous alias, or DuckDB groups by the raw
+    // source column and the aggregation is silently wrong (one output row
+    // per input row). Pin actual bucket values and counts, not SQL text.
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max("* | timechart span=1m count()", &glob)
+        .unwrap();
+    assert_eq!(result.row_count(), 3, "three distinct minute buckets");
+    let buckets: Vec<(String, i64)> = result
+        .rows
+        .iter()
+        .map(|r| {
+            let Value::String(t) = &r[0] else {
+                panic!("bucket must format as a timestamp string, got {:?}", r[0])
+            };
+            let Value::Integer(c) = r[1] else {
+                panic!("count must be an integer, got {:?}", r[1])
+            };
+            (t.clone(), c)
+        })
+        .collect();
+    assert_eq!(
+        buckets,
+        vec![
+            ("2024-01-15 10:00:00".to_string(), 6),
+            ("2024-01-15 10:01:00".to_string(), 4),
+            ("2024-01-15 10:02:00".to_string(), 3),
+        ],
+        "rows must aggregate into whole-minute buckets"
+    );
+}
+
+#[test]
+fn level_gte_warn_returns_only_warn_and_above() {
+    // `level>=warn` compiles to `severity >= 13`; only WARN-and-above rows
+    // (severity 13 and 17 in the fixture) come back.
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("level>=warn", &glob).unwrap();
+    assert_eq!(result.row_count(), 7, "4 warn + 3 error rows");
+    let sev_idx = result
+        .columns
+        .iter()
+        .position(|c| c.name == "severity")
+        .expect("severity column present");
+    for row in &result.rows {
+        let Value::Integer(sev) = row[sev_idx] else {
+            panic!("severity must be an integer, got {:?}", row[sev_idx])
+        };
+        assert!(sev >= 13, "row below the WARN band leaked through: {sev}");
+    }
+}
+
+#[test]
+fn level_eq_error_matches_the_error_band() {
+    // `level=error` compiles to `severity BETWEEN 17 AND 20`.
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("level=error", &glob).unwrap();
+    assert_eq!(result.row_count(), 3, "exactly the three ERROR-band rows");
+}
+
+/// Grouping or projecting on `level` must fail loudly through the whole
+/// executor, not just inside the emitter.
+///
+/// `level` is consumed at ingest, so these used to reach `DuckDB` as a
+/// missing column: the hot/cold ladder classified that binder error as
+/// benign, fell back to hot-only, and the re-emit's second binder error
+/// became an empty result — a pre-cutover saved query returned zero rows
+/// and a 200 instead of saying its column was gone.
+#[test]
+fn level_outside_a_comparison_errors_instead_of_returning_no_rows() {
+    let (exec, glob) = setup();
+    for dsl in [
+        "* | stats count() by level",
+        "* | table level",
+        "* | sort level",
+    ] {
+        let err = exec
+            .run_query_max(dsl, &glob)
+            .expect_err("a `level` column reference must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("filter-only alias"),
+            "{dsl} must explain the severity alias, got: {msg}"
+        );
+    }
+}
+
+#[test]
+fn bare_word_matches_content_only_in_raw() {
+    // "gateway-detail" appears only in one row's `_raw`, never in `message`
+    // — bare-word search must cover both columns.
+    let (exec, glob) = setup();
+    let result = exec.run_query_max("gateway-detail", &glob).unwrap();
+    assert_eq!(result.row_count(), 1, "the _raw-only term must match");
+
+    // And a message-only term still matches (that row's _raw is "raw4").
+    let result = exec.run_query_max("redirect", &glob).unwrap();
+    assert_eq!(result.row_count(), 1, "message-only terms keep matching");
+}
+
+/// Write a parquet file shaped like the ingest canonicalizer's output: no
+/// collector sent a pre-parse line, so `_raw` is the server's JSON
+/// serialization of the event as it arrived.
+fn canonicalized_parquet(dir: &std::path::Path) -> String {
+    let path = dir.join("canonical.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (TIMESTAMP '2024-01-15 10:00:00', 'nginx', 'started',
+              '{{\"service\":\"nginx\",\"debug_mode\":false,\"message\":\"started\"}}'),
+             (TIMESTAMP '2024-01-15 10:00:01', 'sshd', 'accepted key',
+              '{{\"service\":\"sshd\",\"message\":\"accepted key\"}}')
+         ) t(_time, service, message, _raw)) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("canonicalized fixture should be written");
+    path.display().to_string()
+}
+
+/// Bare-word search over a server-filled `_raw` is whole-event search
+/// (ADR-0009): the term reaches another field's *value* and a field *name*,
+/// and negation excludes on exactly the same basis. Pinned because it is a
+/// decision the DSL reference documents, not an accident of the fill.
+#[test]
+fn bare_word_search_reaches_the_whole_event_through_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = canonicalized_parquet(dir.path());
+    let exec = Executor::new().expect("executor should initialize");
+
+    // Another field's value: "nginx" is in `service`, never in `message`.
+    let by_value = exec.run_query_max("nginx", &source).expect("field value");
+    assert_eq!(
+        by_value.row_count(),
+        1,
+        "a bare term must find the event through another field's value"
+    );
+
+    // A field name: "debug" exists only as the key `debug_mode`.
+    let by_name = exec.run_query_max("debug", &source).expect("field name");
+    assert_eq!(
+        by_name.row_count(),
+        1,
+        "serialized field names are part of the searched text"
+    );
+
+    // Negation is the exact mirror — the same row drops out.
+    let negated = exec.run_query_max("-debug", &source).expect("negated");
+    assert_eq!(
+        negated.row_count(),
+        1,
+        "negation mirrors the positive match"
+    );
+    let svc = negated
+        .columns
+        .iter()
+        .position(|c| c.name == "service")
+        .expect("service column");
+    assert_eq!(
+        negated.rows[0][svc],
+        Value::String("sshd".into()),
+        "the row whose serialization contains 'debug' is the one excluded"
+    );
+
+    // A field filter never consults `_raw` — that is the narrow form.
+    let confined = exec
+        .run_query_max("message=/debug/", &source)
+        .expect("field filter");
+    assert_eq!(
+        confined.row_count(),
+        0,
+        "message=/debug/ must not see the field name in _raw"
+    );
+}
+
+#[test]
+fn well_known_fields_match_core_schema() {
+    // trawl-api duplicates the envelope ordering constants because it does
+    // not depend on trawl-core; this pins the two in sync.
+    assert_eq!(
+        trawl_api::value::WELL_KNOWN_LOG_FIELDS,
+        trawl_core::schema::LEADING_LOG_FIELDS,
+        "WELL_KNOWN_LOG_FIELDS must mirror trawl_core::schema::LEADING_LOG_FIELDS"
+    );
+    assert_eq!(
+        trawl_api::value::TRAILING_LOG_FIELDS,
+        trawl_core::schema::TRAILING_LOG_FIELDS,
+        "TRAILING_LOG_FIELDS must mirror trawl_core::schema::TRAILING_LOG_FIELDS"
+    );
+}
+
+#[test]
 fn pivot_on_service() {
     let (exec, glob) = setup();
     let result = exec
@@ -322,6 +548,69 @@ fn json_stats_pipeline() {
     assert_eq!(result.columns[0].name, "service");
 }
 
+// -- sources outside the ADR-0009 envelope -----------------------------------
+
+/// Write a parquet file with a `message` but no `_raw` column — user-owned
+/// data read in embedded mode (`trawl query --data ...`), or any corpus trawl
+/// did not write itself.
+fn foreign_parquet(dir: &std::path::Path) -> String {
+    let path = dir.join("foreign.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (TIMESTAMP '2024-01-15 10:00:00', 'nginx', 'boom error'),
+             (TIMESTAMP '2024-01-15 10:00:01', 'nginx', 'all quiet')
+         ) t(_time, service, message)) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("foreign fixture should be written");
+    path.display().to_string()
+}
+
+/// Bare-word and quoted-phrase search degrade to `message` alone rather than
+/// failing the whole query when the source has no `_raw` column.
+#[test]
+fn text_search_without_a_raw_column_searches_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = foreign_parquet(dir.path());
+    let exec = Executor::new().expect("executor should initialize");
+
+    let bare = exec.run_query_max("boom", &source).expect("bare word");
+    assert_eq!(bare.row_count(), 1, "bare word must match on message");
+
+    let quoted = exec
+        .run_query_max(r#""boom error""#, &source)
+        .expect("quoted phrase");
+    assert_eq!(quoted.row_count(), 1, "quoted phrase must match on message");
+
+    let negated = exec.run_query_max("-boom", &source).expect("negated");
+    assert_eq!(
+        negated.row_count(),
+        1,
+        "negation must not veto on a missing _raw"
+    );
+    assert!(
+        !negated.columns.iter().any(|c| c.name == "_raw"),
+        "the fallback must not invent a _raw column: {:?}",
+        negated.columns
+    );
+}
+
+/// The fallback is evidence-based: it rescues a query whose only unbindable
+/// column was `_raw`. A genuinely unknown field still errors.
+#[test]
+fn text_search_without_a_raw_column_keeps_unknown_field_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = foreign_parquet(dir.path());
+    let exec = Executor::new().expect("executor should initialize");
+
+    let result = exec.run_query_max("boom nosuchfield=1", &source);
+    assert!(
+        matches!(result, Err(EngineError::Emit(_))),
+        "unknown field must still error: {result:?}"
+    );
+}
+
 // -- error path tests --------------------------------------------------------
 
 #[test]
@@ -350,10 +639,13 @@ fn describe_schema_returns_columns() {
     let schema = exec.describe_schema(&glob).unwrap();
 
     let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
-    assert!(names.contains(&"timestamp"), "missing timestamp column");
+    assert!(names.contains(&"_time"), "missing _time column");
+    assert!(names.contains(&"_ingested"), "missing _ingested column");
+    assert!(names.contains(&"_raw"), "missing _raw column");
+    assert!(names.contains(&"env"), "missing env column");
     assert!(names.contains(&"host"), "missing host column");
     assert!(names.contains(&"service"), "missing service column");
-    assert!(names.contains(&"level"), "missing level column");
+    assert!(names.contains(&"severity"), "missing severity column");
     assert!(names.contains(&"message"), "missing message column");
     assert!(schema.file_count > 0, "should find fixture files");
 }
@@ -381,7 +673,7 @@ fn setup_kv() -> (Executor, String) {
         std::fs::create_dir_all(&dir).unwrap();
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE kv_logs (timestamp TIMESTAMP, host VARCHAR, message VARCHAR);
+            "CREATE TABLE kv_logs (_time TIMESTAMP, host VARCHAR, message VARCHAR);
              INSERT INTO kv_logs VALUES
              ('2024-01-15 10:00:00', 'web01', 'method=GET status=200 path=/api duration=0.045'),
              ('2024-01-15 10:00:01', 'web01', 'method=POST status=500 path=/api/create duration=1.234'),
@@ -536,7 +828,7 @@ fn hot_cold_type_conflict_keeps_both_rows() {
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
         cold.display()
@@ -545,7 +837,7 @@ fn hot_cold_type_conflict_keeps_both_rows() {
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
 
@@ -582,7 +874,7 @@ fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
         full.join("cold.parquet").display()
@@ -591,7 +883,7 @@ fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
 
@@ -628,7 +920,7 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows() {
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
         cold.display()
@@ -637,7 +929,7 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows() {
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
 
@@ -680,7 +972,7 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_sourc
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
         full.join("cold.parquet").display()
@@ -689,7 +981,7 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_sourc
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
 
@@ -733,7 +1025,7 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, 'cold row' AS message) \
          TO '{}' (FORMAT PARQUET)",
         cold.display()
@@ -742,7 +1034,7 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 
     std::fs::write(
         &hot,
-        "{\"timestamp\":\"not-a-date\",\"service\":\"svc\",\"message\":\"hot row\"}\n",
+        "{\"_time\":\"not-a-date\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"message\":\"hot row\"}\n",
     )
     .unwrap();
 
@@ -761,8 +1053,8 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 
 #[test]
 fn hot_sparse_repair_column_survives_inside_the_sample_window() {
-    // `timestamp_invalid` is by construction sparse — it appears only on
-    // repaired events (ADR-0008). DuckDB's JSON auto-detection samples a
+    // `_repairs` is by construction sparse — it appears only on repaired
+    // events (ADR-0009). DuckDB's JSON auto-detection samples a
     // bounded prefix by default (~20480 rows) and then errors on any later
     // record carrying a key outside the inferred schema, so the hot-buffer
     // snapshot writer hoists one event per novel key to the front of the
@@ -781,13 +1073,13 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
         let hot = dir.path().join("hot.ndjson");
 
         let mut lines = String::from(
-            "{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\
-             \"message\":\"repaired\",\"timestamp_invalid\":\"not-a-date\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\
+             \"message\":\"repaired\",\"_repairs\":\"time.from_ingest\"}\n",
         );
         for i in 0..30_000 {
             writeln!(
                 lines,
-                "{{\"timestamp\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
+                "{{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\"service\":\"svc\",\"message\":\"m{i}\"}}"
             )
             .unwrap();
         }
@@ -796,7 +1088,7 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
         if with_cold {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(&format!(
-                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"timestamp\", \
+                "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                               'svc' AS service, 'cold row' AS message) \
                  TO '{}' (FORMAT PARQUET)",
                 dir.path().join("cold.parquet").display()
@@ -812,9 +1104,18 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
 
         let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
         assert!(
-            col_names.contains(&"timestamp_invalid"),
-            "the preserved original must survive a hot snapshot larger than the \
-             JSON sample window (with_cold={with_cold}); got columns {col_names:?}"
+            col_names.contains(&"_repairs"),
+            "the sparse repair column must survive a hot snapshot larger than \
+             the JSON sample window (with_cold={with_cold}); got columns {col_names:?}"
+        );
+        // Row counts pin that this rode the real union (with cold present)
+        // rather than a silent hot-only fallback.
+        let expected = 30_001 + usize::from(with_cold);
+        assert_eq!(
+            result.row_count(),
+            expected,
+            "every hot row (and the cold row when present) must survive \
+             (with_cold={with_cold})"
         );
     }
 }

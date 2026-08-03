@@ -2,7 +2,7 @@
 source: crates/trawl-core/src/emitter/mod.rs
 expression: "emit_dsl(\"* | timechart span=1h count() by service\")"
 ---
-SELECT time_bucket(INTERVAL '1 hours', CAST("timestamp" AS TIMESTAMP)) AS "_time", "service", COUNT(*) AS "count"
+SELECT time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP)) AS "_time", "service", COUNT(*) AS "count"
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-GROUP BY "_time", "service"
-ORDER BY "_time" ASC
+GROUP BY time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP)), "service"
+ORDER BY time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP)) ASC

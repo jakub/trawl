@@ -25,10 +25,50 @@ status=200,301,404              # IN list (comma-separated)
 status>=400                     # comparison
 path=/api/*                     # glob pattern
 message=/error.*/               # regex pattern (slash-delimited)
-service="Activity Monitor"      # quoted values for spaces/special chars
+host="db host"                  # quoted values for spaces/special chars
+env=prod                        # environment (path-pruned)
 ```
 
 **Operators:** `=`, `!=`, `>`, `>=`, `<`, `<=`
+
+### Severity: the `level` alias
+
+`level` is a **query alias for the numeric `severity` column** (OTel
+SeverityNumber 1-24). Name tokens are matched case-insensitively and
+compile to band predicates:
+
+```
+level=error                     # severity BETWEEN 17 AND 20 (the ERROR band)
+level!=info                     # NOT BETWEEN 9 AND 12, or severity IS NULL
+level=warn,error                # either band
+level>=warn                     # severity >= 13 (the token's exact number)
+| where level == "error"        # same band predicate, in a pipe stage
+```
+
+- Equality/IN match the whole band containing the token (`notice` falls
+  inside the INFO band).
+- Ordered comparisons use the token's exact number (`warn` = 13,
+  `error` = 17, ...).
+- Valid tokens: `trace`/`t`, `debug`/`d`, `info`/`i`, `notice`,
+  `warn`/`warning`/`w`, `error`/`err`/`e`, `fatal`/`critical`/`crit`/`f`,
+  `alert`, `emerg`/`panic`. Anything else (or a glob/regex on `level`) is
+  a query error — match the original spelling with
+  `severity_text="..."` instead.
+- `level` works in search-stage filters and in `where` comparisons
+  against a token literal — both compile to the same band predicate, and
+  live tail (SSE) evaluates them identically to a batch query.
+- Everywhere else — projections, `stats by`, `sort`, `dedup`, `rename`,
+  `let` arithmetic — naming `level` is a query error, because there is no
+  stored `level` column to read or write. Use `severity` (the number) or
+  `severity_text` (the original text) instead. The error is deliberate:
+  emitting `level` verbatim would ask the database for a column that does
+  not exist, and a pre-cutover saved query would come back empty rather
+  than say so.
+
+### Time aliases
+
+`timestamp` and `@timestamp` are query aliases for the physical `_time`
+column — all three resolve identically.
 
 ### Text search
 
@@ -36,6 +76,32 @@ service="Activity Monitor"      # quoted values for spaces/special chars
 error                           # bare word — substring match
 -debug                          # negated — exclude matches
 "connection refused"            # exact phrase
+```
+
+Bare-word and phrase search match the `message` column **and** `_raw`,
+so content that was parsed away is still findable. Negation excludes an
+event when either column matches.
+
+Because `_raw` holds the most original form of the event, searching it is
+**whole-event search**, and what "whole event" means depends on who filled
+it:
+
+- a collector that sent its own string `_raw` — the pre-parse line, matched
+  as text;
+- everything else — the server's JSON serialization of the event as it
+  arrived, so a term matches anywhere in that object: another field's
+  **value** (`nginx` finds an event with `service=nginx`, even when
+  `message` never says it) and a field **name** (`debug` finds an event
+  carrying `debug_mode`, and `-debug` therefore excludes it).
+
+That is the point of a bare word — find the event without knowing which
+field holds the term. When you do know, filter the field and `_raw` is
+never consulted:
+
+```
+message=/debug/                 # regex, message only
+message=*debug*                 # glob, message only (case-sensitive)
+service=nginx                   # exact field match
 ```
 
 ### Time filters
@@ -367,5 +433,5 @@ last=1h | pivot count() on status by host
 * | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10
 
 # Distinct values per group
-* | stats values(level), first(message) by service | head 10
+* | stats values(severity_text), first(message) by service | head 10
 ```

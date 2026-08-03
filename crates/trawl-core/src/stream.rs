@@ -22,6 +22,7 @@ use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, WhereStage,
 };
+use crate::emitter::severity::{as_level_comparison, level_predicate};
 use crate::emitter::{
     format_literal_position, map_field_name, unit_literal_positions, validate_format_literal,
     validate_unit_literal,
@@ -62,6 +63,9 @@ pub enum StreamPlanError {
     InvalidUnit(String),
     /// A `strftime`/`strptime` format string literal contains an invalid code.
     InvalidFormat(String),
+    /// A `level` reference the SQL emitter rejects: an unknown severity
+    /// token, or `level` named anywhere other than a comparison.
+    InvalidLevel(String),
 }
 
 impl fmt::Display for StreamPlanError {
@@ -73,6 +77,7 @@ impl fmt::Display for StreamPlanError {
             Self::InvalidRegex(msg) => write!(f, "invalid regex: {msg}"),
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
+            Self::InvalidLevel(msg) => write!(f, "invalid level comparison: {msg}"),
         }
     }
 }
@@ -84,6 +89,17 @@ impl std::error::Error for StreamPlanError {}
 /// Rejects unsupported stages (sort, pivot, multiple aggregations)
 /// with an error before the stream starts.
 pub fn compile_stream_plan(pipeline: &[Spanned<PipeStage>]) -> Result<StreamPlan, StreamPlanError> {
+    // `level` is a filter-only alias for the numeric `severity` column
+    // (ADR-0009), so every other use of the name — `stats … by level`,
+    // `table level`, `where level in (…)`, `where "error" == level`,
+    // `where isnull(level)` — is a batch-path error. Eval has no error
+    // channel: it would read an absent key, evaluate NULL and open a
+    // live-looking stream that can never match. Reject the same shapes the
+    // emitter does, from the same arbiter, so live tail and batch agree.
+    for spanned in pipeline {
+        reject_level_references(&spanned.node)?;
+    }
+
     // Find the first aggregation stage index (if any).
     let agg_idx = pipeline.iter().position(|s| is_agg_stage(&s.node));
 
@@ -120,6 +136,11 @@ pub fn compile_stream_plan(pipeline: &[Spanned<PipeStage>]) -> Result<StreamPlan
         }
         Ok(StreamPlan::PassThrough(stages))
     }
+}
+
+fn reject_level_references(stage: &PipeStage) -> Result<(), StreamPlanError> {
+    crate::emitter::validate_level_references(stage)
+        .map_err(|e| StreamPlanError::InvalidLevel(e.to_string()))
 }
 
 fn is_agg_stage(stage: &PipeStage) -> bool {
@@ -327,7 +348,7 @@ fn compile_limit(s: &LimitStage) -> CompiledStage {
 }
 
 fn compile_where(s: &WhereStage) -> Result<CompiledStage, StreamPlanError> {
-    validate_expr_units(&s.condition)?;
+    validate_expr(&s.condition)?;
     Ok(CompiledStage::Where {
         condition: s.condition.clone(),
     })
@@ -335,20 +356,22 @@ fn compile_where(s: &WhereStage) -> Result<CompiledStage, StreamPlanError> {
 
 fn compile_let(s: &LetStage) -> Result<CompiledStage, StreamPlanError> {
     for (_, expr) in &s.assignments {
-        validate_expr_units(expr)?;
+        validate_expr(expr)?;
     }
     Ok(CompiledStage::Let {
         assignments: s.assignments.clone(),
     })
 }
 
-/// Walk an expression tree and validate date/time unit and format literals.
+/// Walk an expression tree and validate date/time unit and format literals
+/// plus `level` comparison tokens.
 ///
 /// This replicates the checks `emit_expr` performs on the batch path so that an
-/// unsupported unit, or an invalid `strftime`/`strptime` format literal, is
-/// rejected at `compile_stream_plan` time rather than silently evaluating to
-/// `Null` (or, in batch, erroring) in live tail.
-fn validate_expr_units(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPlanError> {
+/// unsupported unit, an invalid `strftime`/`strptime` format literal, or an
+/// unknown severity token in `where level == "..."` is rejected at
+/// `compile_stream_plan` time rather than silently evaluating to `Null` (or, in
+/// batch, erroring) in live tail.
+fn validate_expr(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPlanError> {
     match &expr.node {
         Expr::FunctionCall { name, args } => {
             let unit_positions = unit_literal_positions(name);
@@ -375,18 +398,25 @@ fn validate_expr_units(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPla
             }
             // Recurse into all args.
             for arg in args {
-                validate_expr_units(arg)?;
+                validate_expr(arg)?;
             }
         }
-        Expr::Binary { lhs, rhs, .. } => {
-            validate_expr_units(lhs)?;
-            validate_expr_units(rhs)?;
+        Expr::Binary { lhs, op, rhs } => {
+            // `level` aliases the numeric severity column (ADR-0009); the
+            // emitter rejects unknown tokens, so the stream must too — eval
+            // has no error channel and would just match nothing.
+            if let Some((filter_op, token)) = as_level_comparison(lhs, *op, rhs) {
+                level_predicate(filter_op, token)
+                    .map_err(|e| StreamPlanError::InvalidLevel(e.to_string()))?;
+            }
+            validate_expr(lhs)?;
+            validate_expr(rhs)?;
         }
-        Expr::Unary { operand, .. } => validate_expr_units(operand)?,
+        Expr::Unary { operand, .. } => validate_expr(operand)?,
         Expr::InList { expr: target, list } => {
-            validate_expr_units(target)?;
+            validate_expr(target)?;
             for item in list {
-                validate_expr_units(item)?;
+                validate_expr(item)?;
             }
         }
         Expr::Literal(_) | Expr::FieldRef(_) => {}
@@ -1106,8 +1136,8 @@ fn make_group_key(group_by: &[String], event: &Map<String, Value>) -> GroupKey {
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
 fn event_time_bucket(event: &Map<String, Value>, span_secs: u64) -> i64 {
-    // Try to parse timestamp field as RFC3339
-    if let Some(Value::String(ts)) = event.get("timestamp")
+    // Try to parse the _time field as RFC3339
+    if let Some(Value::String(ts)) = event.get("_time")
         && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
     {
         return dt.timestamp() / span_secs as i64;
@@ -1368,8 +1398,8 @@ mod tests {
         };
         assert_eq!(
             fields,
-            &["timestamp", "event_type", "target", "message"],
-            "Table stage must store fields in user-specified order"
+            &["_time", "event_type", "target", "message"],
+            "Table stage must store fields in user-specified order (aliases mapped)"
         );
     }
 
@@ -1379,9 +1409,9 @@ mod tests {
             fields: vec!["_time".into(), "host".into()],
             keyword: "table",
         });
-        let mut ev = event(&json!({"timestamp": "2026-01-01", "host": "web-1", "message": "hi"}));
+        let mut ev = event(&json!({"_time": "2026-01-01", "host": "web-1", "message": "hi"}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert!(ev.contains_key("timestamp"));
+        assert!(ev.contains_key("_time"));
         assert!(ev.contains_key("host"));
         assert!(!ev.contains_key("message"));
     }
@@ -1511,6 +1541,103 @@ mod tests {
         let mut stage = compile_where(&WhereStage { condition }).unwrap();
         let mut ev = event(&json!({"host": "web-1"}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Filtered);
+    }
+
+    /// `where level == "..."` reads the numeric `severity` column, exactly
+    /// like the SQL band predicate — `level` itself is never stored.
+    fn level_where(op: BinaryOp, token: &str) -> Result<CompiledStage, StreamPlanError> {
+        compile_where(&WhereStage {
+            condition: span(Expr::Binary {
+                lhs: Box::new(span(Expr::FieldRef("level".into()))),
+                op,
+                rhs: Box::new(span(Expr::Literal(LiteralValue::String(token.into())))),
+            }),
+        })
+    }
+
+    #[test]
+    fn where_level_eq_matches_severity_band() {
+        let mut stage = level_where(BinaryOp::Eq, "error").unwrap();
+        let mut in_band = event(&json!({"severity": 17, "severity_text": "error"}));
+        assert_eq!(apply_stage(&mut stage, &mut in_band), StageResult::Pass);
+        let mut out_of_band = event(&json!({"severity": 9, "severity_text": "info"}));
+        assert_eq!(
+            apply_stage(&mut stage, &mut out_of_band),
+            StageResult::Filtered
+        );
+        // absent severity → NULL → no match (SQL: NULL BETWEEN … is NULL)
+        let mut missing = event(&json!({"host": "web-1"}));
+        assert_eq!(apply_stage(&mut stage, &mut missing), StageResult::Filtered);
+    }
+
+    #[test]
+    fn where_level_ne_includes_null_severity() {
+        let mut stage = level_where(BinaryOp::Ne, "info").unwrap();
+        let mut out_of_band = event(&json!({"severity": 17}));
+        assert_eq!(apply_stage(&mut stage, &mut out_of_band), StageResult::Pass);
+        let mut in_band = event(&json!({"severity": 9}));
+        assert_eq!(apply_stage(&mut stage, &mut in_band), StageResult::Filtered);
+        // mirrors `… OR "severity" IS NULL`
+        let mut missing = event(&json!({"host": "web-1"}));
+        assert_eq!(apply_stage(&mut stage, &mut missing), StageResult::Pass);
+    }
+
+    #[test]
+    fn where_level_ordered_uses_exact_number() {
+        let mut stage = level_where(BinaryOp::Gte, "warn").unwrap();
+        let mut warn = event(&json!({"severity": 13}));
+        assert_eq!(apply_stage(&mut stage, &mut warn), StageResult::Pass);
+        let mut info = event(&json!({"severity": 12}));
+        assert_eq!(apply_stage(&mut stage, &mut info), StageResult::Filtered);
+    }
+
+    #[test]
+    fn where_level_unknown_token_rejected_at_compile() {
+        let err = level_where(BinaryOp::Eq, "erro").unwrap_err();
+        assert!(
+            matches!(err, StreamPlanError::InvalidLevel(_)),
+            "expected InvalidLevel, got {err:?}"
+        );
+        assert!(err.to_string().contains("unknown severity token"));
+    }
+
+    /// Every `level` shape the SQL emitter rejects is refused here too.
+    ///
+    /// `level` aliases the numeric `severity` column only inside a
+    /// comparison; anywhere else there is no such key to read, and eval —
+    /// having no error channel — would evaluate NULL and hold open a
+    /// healthy-looking stream that matches nothing, while the very same
+    /// query is a 400 on the batch path.
+    #[test]
+    fn rejects_level_outside_a_comparison() {
+        for dsl in [
+            r#"* | where level in ("error", "fatal")"#,
+            r#"* | where "error" == level"#,
+            "* | where isnull(level)",
+            "* | where level matches /err.*/",
+            "* | stats count() by level",
+            "* | table level",
+            "* | dedup level",
+            "* | rename level as lvl",
+            "* | let lvl = level",
+        ] {
+            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
+            let err = compile_stream_plan(&pipeline).unwrap_err();
+            assert!(
+                matches!(err, StreamPlanError::InvalidLevel(_)),
+                "{dsl}: expected InvalidLevel, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("filter-only alias"),
+                "{dsl}: {err}"
+            );
+        }
+
+        // the comparison itself is untouched
+        let ok = crate::parser::parse(r#"* | where level >= "warn""#)
+            .expect("parses")
+            .pipeline;
+        assert!(compile_stream_plan(&ok).is_ok());
     }
 
     // ── tier 2: let ────────────────────────────────────────────────
@@ -2415,7 +2542,7 @@ mod tests {
 
     #[test]
     fn stream_where_date_part_rejects_unknown_unit() {
-        // validate_expr_units should also fire inside where conditions
+        // validate_expr should also fire inside where conditions
         let condition = span(Expr::Binary {
             lhs: Box::new(span(Expr::FunctionCall {
                 name: "date_part".into(),
@@ -2491,7 +2618,7 @@ mod tests {
 
     #[test]
     fn stream_where_strftime_rejects_invalid_format() {
-        // validate_expr_units should also fire inside where conditions
+        // validate_expr should also fire inside where conditions
         let condition = span(Expr::Binary {
             lhs: Box::new(span(Expr::FunctionCall {
                 name: "strftime".into(),

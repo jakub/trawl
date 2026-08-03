@@ -4,5 +4,5 @@ expression: "emit_dsl(\"* | tail 5\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-ORDER BY "timestamp" DESC
+ORDER BY "_time" DESC
 LIMIT 5

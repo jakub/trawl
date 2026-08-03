@@ -320,6 +320,83 @@ pub struct IngestConfig {
     /// Accepts `DuckDB` memory strings like `"2GB"`, `"512MB"`. Default: `"2GB"`.
     #[serde(default = "default_compaction_memory_limit")]
     pub compaction_memory_limit: String,
+
+    /// Fills a missing `env` on ingested events (recorded as the
+    /// `env.defaulted` repair). Must be a member of the effective env
+    /// allowlist and pass the env charset. Default: `"prod"` (ADR-0009).
+    #[serde(default = "default_env_name")]
+    pub default_env: String,
+
+    /// Environment allowlist: an event whose `env` is not listed here
+    /// hard-rejects with a typed reason — repairing it into `default_env`
+    /// would misfile data in the wrong path root permanently. Omitted or
+    /// empty means implicitly `[default_env]` (see
+    /// [`IngestConfig::effective_envs`]). Every entry must match
+    /// `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved (ADR-0009).
+    #[serde(default)]
+    pub envs: Vec<String>,
+
+    /// CIDR blocks of trusted relays/collectors. An event with no `host`
+    /// from a peer inside any of these blocks is rejected instead of
+    /// repaired — behind a relay the peer address is confidently wrong.
+    /// Parsed (boot-fatal on a bad entry) by the server at startup.
+    #[serde(default)]
+    pub trusted_relays: Vec<String>,
+}
+
+impl IngestConfig {
+    /// The effective env allowlist: `envs` when non-empty, else
+    /// `[default_env]` — zero-config ingestion works out of the box and
+    /// envs are declared at the moment they start being used.
+    pub fn effective_envs(&self) -> Vec<String> {
+        if self.envs.is_empty() {
+            vec![self.default_env.clone()]
+        } else {
+            self.envs.clone()
+        }
+    }
+}
+
+/// Env names reserved for sibling directories under the data root.
+pub const RESERVED_ENV_NAMES: &[&str] = &["wal", "scheduled"];
+
+/// Whether `name` is a valid environment name: `[a-z0-9_-]{1,32}`.
+///
+/// Path encoding is injective by validation (ADR-0009): env is a path
+/// segment and is never rewritten on the way to disk, so the charset is
+/// the whole safety argument — no dots (dot-leading names), no slashes,
+/// no uppercase (case-colliding filesystems).
+pub fn is_valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Maximum service name length (ADR-0009 path segment cap).
+pub const MAX_SERVICE_NAME_LEN: usize = 128;
+
+/// Whether `b` is a byte allowed in a service name: alphanumeric, dash,
+/// underscore, dot — no spaces, no slashes.
+pub fn is_valid_service_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+}
+
+/// Whether `name` is a valid service name: non-empty, at most
+/// [`MAX_SERVICE_NAME_LEN`] bytes, [`is_valid_service_char`] throughout,
+/// and not dot-leading.
+///
+/// Path encoding is injective by validation (ADR-0009): service is a path
+/// segment carried verbatim into WAL filenames and parquet names, so this
+/// predicate is the whole safety argument — no slashes (path escape), no
+/// spaces (unquotable globs), no dot-leading names (`.`, `..`, dotfiles).
+/// Every ingestion path must funnel service names through it.
+pub fn is_valid_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SERVICE_NAME_LEN
+        && name.bytes().all(is_valid_service_char)
+        && !name.starts_with('.')
 }
 
 impl Default for IngestConfig {
@@ -338,8 +415,16 @@ impl Default for IngestConfig {
             telemetry_flush_interval_secs: DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS,
             compaction_chunk_size: DEFAULT_COMPACTION_CHUNK_SIZE,
             compaction_memory_limit: DEFAULT_COMPACTION_MEMORY_LIMIT.to_string(),
+            default_env: default_env_name(),
+            envs: Vec::new(),
+            trusted_relays: Vec::new(),
         }
     }
+}
+
+/// Default environment name for zero-config deployments.
+fn default_env_name() -> String {
+    "prod".to_string()
 }
 
 /// Data retention policy settings.
@@ -1276,6 +1361,47 @@ impl Config {
             ));
         }
 
+        // Env allowlist (ADR-0009): validated at load, refuse to start
+        // otherwise — env is a path segment and the charset is the whole
+        // injectivity argument.
+        for env in &self.ingest.envs {
+            if !is_valid_env_name(env) {
+                return Err(ConfigError::Validation(format!(
+                    "ingest.envs entry {env:?} is not a valid env name \
+                     (must match [a-z0-9_-]{{1,32}})"
+                )));
+            }
+            if RESERVED_ENV_NAMES.contains(&env.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "ingest.envs entry {env:?} is reserved — `wal/` and \
+                     `scheduled/` live alongside env directories under the \
+                     data root"
+                )));
+            }
+        }
+        if !is_valid_env_name(&self.ingest.default_env) {
+            return Err(ConfigError::Validation(format!(
+                "ingest.default_env {:?} is not a valid env name \
+                 (must match [a-z0-9_-]{{1,32}})",
+                self.ingest.default_env
+            )));
+        }
+        if RESERVED_ENV_NAMES.contains(&self.ingest.default_env.as_str()) {
+            return Err(ConfigError::Validation(format!(
+                "ingest.default_env {:?} is reserved — `wal/` and \
+                 `scheduled/` live alongside env directories under the data \
+                 root",
+                self.ingest.default_env
+            )));
+        }
+        if !self.ingest.envs.is_empty() && !self.ingest.envs.contains(&self.ingest.default_env) {
+            return Err(ConfigError::Validation(format!(
+                "ingest.default_env {:?} must be a member of ingest.envs \
+                 ({:?})",
+                self.ingest.default_env, self.ingest.envs
+            )));
+        }
+
         if self.syslog.enabled {
             if self.syslog.batch_interval_ms == 0 {
                 return Err(ConfigError::Validation(
@@ -1295,6 +1421,38 @@ impl Config {
             if self.syslog.tcp_enabled && self.syslog.tcp_idle_timeout_secs == 0 {
                 return Err(ConfigError::Validation(
                     "syslog.tcp_idle_timeout_secs must be > 0 when TCP is enabled".into(),
+                ));
+            }
+            self.validate_syslog_service_names()?;
+        }
+
+        Ok(())
+    }
+
+    /// Service names from syslog config reach WAL filenames verbatim
+    /// (ADR-0009), so they carry the same charset/dot obligations as
+    /// ingested ones — refuse to start rather than write outside the data
+    /// tree or produce a name no query can name.
+    fn validate_syslog_service_names(&self) -> Result<(), ConfigError> {
+        let invalid = |field: String, value: &String| {
+            ConfigError::Validation(format!(
+                "{field} {value:?} is not a valid service name \
+                 (1-{MAX_SERVICE_NAME_LEN} chars of [A-Za-z0-9._-], not \
+                 dot-leading)"
+            ))
+        };
+
+        if !is_valid_service_name(&self.syslog.default_service) {
+            return Err(invalid(
+                "syslog.default_service".to_owned(),
+                &self.syslog.default_service,
+            ));
+        }
+        for (ip, service) in &self.syslog.source_service_map {
+            if !is_valid_service_name(service) {
+                return Err(invalid(
+                    format!("syslog.source_service_map entry {ip:?} ="),
+                    service,
                 ));
             }
         }
@@ -2224,5 +2382,196 @@ path = "/data/*.parquet"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.web.shared_domain.is_none());
+    }
+
+    // -- [ingest] env allowlist (ADR-0009) --------------------------------
+
+    fn config_with_ingest(ingest: &str) -> Config {
+        let toml = format!(
+            r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[ingest]
+{ingest}
+"#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn ingest_env_zero_config_defaults() {
+        // Zero-config ingestion works out of the box: default_env fills a
+        // missing env, and an omitted `envs` behaves as `[default_env]`.
+        let config = config_with_ingest("");
+        assert_eq!(config.ingest.default_env, "prod");
+        assert!(config.ingest.envs.is_empty());
+        assert_eq!(config.ingest.effective_envs(), vec!["prod".to_string()]);
+        assert!(config.ingest.trusted_relays.is_empty());
+        config.validate().expect("zero-config ingest must validate");
+    }
+
+    #[test]
+    fn ingest_envs_omitted_behaves_as_default_env() {
+        let config = config_with_ingest(r#"default_env = "lab""#);
+        assert_eq!(config.ingest.effective_envs(), vec!["lab".to_string()]);
+        config.validate().expect("default_env alone must validate");
+    }
+
+    #[test]
+    fn ingest_explicit_envs_parse_and_validate() {
+        let config = config_with_ingest(
+            r#"
+default_env = "prod"
+envs = ["prod", "lab"]
+trusted_relays = ["10.0.4.0/24"]
+"#,
+        );
+        assert_eq!(
+            config.ingest.effective_envs(),
+            vec!["prod".to_string(), "lab".to_string()]
+        );
+        assert_eq!(config.ingest.trusted_relays, vec!["10.0.4.0/24"]);
+        config.validate().expect("explicit envs must validate");
+    }
+
+    #[test]
+    fn validation_rejects_default_env_not_in_envs() {
+        let config = config_with_ingest(
+            r#"
+default_env = "dev"
+envs = ["prod", "lab"]
+"#,
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("default_env"), "got: {err}");
+        assert!(err.contains("dev"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_env_charset_violations() {
+        // `[a-z0-9_-]{1,32}` — uppercase, dots, slashes, spaces, empty, and
+        // over-length names are all path-placement hazards.
+        for bad in [
+            "Prod",
+            "pro.d",
+            "pro/d",
+            "pro d",
+            "",
+            "..",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 33 chars
+        ] {
+            let config = config_with_ingest(&format!(r#"envs = ["prod", "{bad}"]"#));
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("env"),
+                "env name {bad:?} must fail validation; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_bad_default_env_charset() {
+        let config = config_with_ingest(r#"default_env = "Prod""#);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("default_env"), "got: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_reserved_env_names() {
+        // `wal/` (default wal_dir) and `scheduled/` (report runs) live under
+        // the data root — an env with either name would collide with them.
+        for reserved in ["wal", "scheduled"] {
+            let config = config_with_ingest(&format!(r#"envs = ["prod", "{reserved}"]"#));
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("reserved"),
+                "env name {reserved:?} must be rejected as reserved; got: {err}"
+            );
+
+            let config = config_with_ingest(&format!(r#"default_env = "{reserved}""#));
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("reserved"),
+                "default_env {reserved:?} must be rejected as reserved; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_name_charset_helper() {
+        assert!(is_valid_env_name("prod"));
+        assert!(is_valid_env_name("lab-2"));
+        assert!(is_valid_env_name("a_b_c"));
+        assert!(is_valid_env_name("x"));
+        assert!(!is_valid_env_name(""));
+        assert!(!is_valid_env_name("Prod"));
+        assert!(!is_valid_env_name("pro.d"));
+        assert!(!is_valid_env_name("pro/d"));
+        assert!(!is_valid_env_name("pro\\d"));
+        assert!(!is_valid_env_name(&"a".repeat(33)));
+        assert!(is_valid_env_name(&"a".repeat(32)));
+    }
+
+    #[test]
+    fn service_name_charset_helper() {
+        assert!(is_valid_service_name("nginx"));
+        assert!(is_valid_service_name("my-app_v2.0"));
+        assert!(is_valid_service_name("UniFi"));
+        assert!(!is_valid_service_name(""));
+        assert!(!is_valid_service_name("Living Room AP"));
+        assert!(!is_valid_service_name("../../escaped"));
+        assert!(!is_valid_service_name(".hidden"));
+        assert!(!is_valid_service_name(".."));
+        assert!(!is_valid_service_name(
+            &"a".repeat(MAX_SERVICE_NAME_LEN + 1)
+        ));
+        assert!(is_valid_service_name(&"a".repeat(MAX_SERVICE_NAME_LEN)));
+    }
+
+    /// Syslog service names reach WAL filenames verbatim (ADR-0009), so a
+    /// path-escaping or unqueryable config value must refuse to start
+    /// rather than silently write outside the data tree.
+    #[test]
+    fn syslog_service_config_is_validated_at_load() {
+        let with_syslog = |syslog: &str| {
+            Config::from_toml(&format!(
+                r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[syslog]
+enabled = true
+{syslog}
+"#
+            ))
+        };
+
+        let err = with_syslog(r#"default_service = "../../escaped""#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("syslog.default_service"), "got: {err}");
+
+        let err = with_syslog(
+            r#"
+[syslog.source_service_map]
+"192.168.1.1" = "Living Room AP"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("syslog.source_service_map"), "got: {err}");
+
+        with_syslog(
+            r#"
+default_service = "syslog"
+
+[syslog.source_service_map]
+"192.168.1.1" = "unifi-gateway"
+"#,
+        )
+        .expect("valid syslog service names must load");
     }
 }

@@ -29,6 +29,7 @@ const MAX_MESSAGE_SIZE: usize = 65_536;
 /// Run the TCP syslog listener until shutdown.
 pub async fn run_tcp_listener(
     config: &SyslogConfig,
+    default_env: &str,
     sender: SyslogSender,
     cidrs: Arc<[CidrEntry]>,
     stats: Option<Arc<SyslogStats>>,
@@ -88,6 +89,7 @@ pub async fn run_tcp_listener(
                 let conn_stats = stats.clone();
                 let conn_config_service_map = config.source_service_map.clone();
                 let conn_default_service = config.default_service.clone();
+                let conn_default_env = default_env.to_owned();
                 let idle_timeout = Duration::from_secs(config.tcp_idle_timeout_secs);
                 let max_events = config.max_events_per_connection;
                 let send_failure_limit = config.consecutive_send_failures_limit;
@@ -99,6 +101,7 @@ pub async fn run_tcp_listener(
                         conn_sender,
                         &conn_config_service_map,
                         &conn_default_service,
+                        &conn_default_env,
                         idle_timeout,
                         max_events,
                         send_failure_limit,
@@ -134,6 +137,7 @@ async fn handle_tcp_connection(
     sender: SyslogSender,
     source_service_map: &std::collections::HashMap<String, String>,
     default_service: &str,
+    default_env: &str,
     idle_timeout: Duration,
     max_events: usize,
     send_failure_limit: usize,
@@ -176,8 +180,14 @@ async fn handle_tcp_connection(
         }
 
         let parsed = parse::parse_syslog(&line);
-        let (service, map) =
-            convert::syslog_to_event(&parsed, source_ip, source_service_map, default_service);
+        let (service, map) = convert::syslog_to_event(
+            &line,
+            &parsed,
+            source_ip,
+            source_service_map,
+            default_service,
+            default_env,
+        );
 
         let event = SyslogEvent {
             service,
@@ -519,6 +529,7 @@ mod tests {
             tx,
             &std::collections::HashMap::new(),
             "syslog",
+            "prod",
             Duration::from_millis(50), // very short timeout for test
             100_000,
             100,
@@ -546,6 +557,7 @@ mod tests {
                 tx,
                 &std::collections::HashMap::new(),
                 "syslog",
+                "prod",
                 Duration::from_secs(5),
                 3, // max 3 events
                 100,

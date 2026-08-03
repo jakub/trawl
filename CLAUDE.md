@@ -15,11 +15,11 @@ self-hosted log collection, storage, and search platform for homelabs and small-
 
 ```
 crates/
-  trawl-core/            # DSL parser, AST, SQL emitter (pure, no I/O)
-  trawl-engine/          # DuckDB integration, query execution; owns the hot+cold union fallback ladder (VARCHAR coercion on schema conflict, list-source pruning on partial glob miss) and the no-silent-cold-drop outcome policy shared by the query and parquet-export paths (src/executor.rs, ADR-0008)
-  trawl-api/             # shared wire types (request/response structs)
-  trawl-config/          # shared config.toml types (no I/O)
-  trawl-server/          # daemon (axum, HTTPS via tokio-rustls); owns the postgres app-state store (history/saved/schedule + report runs) in its own `trawl` database — sole-writer via session advisory lock, auto-migrated at boot (src/store/, ADR-0004 slice 3; trawl-auth crate deleted). authz is permission-only (src/policy.rs — no `Role` enum, ADR-0006 slice 1). ingest canonicalizes/substitutes timestamps (src/ingest/handler.rs) and compaction repairs them per-row from WAL-filename provenance (src/ingest/compaction.rs, ADR-0008)
+  trawl-core/            # DSL parser, AST, SQL emitter (pure, no I/O); also owns the envelope column catalog (src/schema.rs) and the OTel severity ladder + syslog inversion (src/severity.rs) shared by the emitter and the in-memory SSE filter (ADR-0009)
+  trawl-engine/          # DuckDB integration, query execution; owns the hot+cold union fallback ladder (VARCHAR coercion on schema conflict, list-source pruning on partial glob miss), the `_raw`-free retry for sources that lack `_raw` (embedded mode over foreign parquet — decided by re-binding, not by error text, ADR-0009) and the no-silent-cold-drop outcome policy shared by the query and parquet-export paths (src/executor.rs, ADR-0008)
+  trawl-api/             # shared wire types (request/response structs); envelope-aware result column ordering (`WELL_KNOWN_LOG_FIELDS` leading, `TRAILING_LOG_FIELDS` demoted — mirrored, not imported, by trawl-core/trawl-cli with parity tests)
+  trawl-config/          # shared config.toml types (no I/O); also the injective path-encoding predicates (`is_valid_env_name`, `is_valid_service_name`, `RESERVED_ENV_NAMES`) every ingest path funnels names through (ADR-0009)
+  trawl-server/          # daemon (axum, HTTPS via tokio-rustls); owns the postgres app-state store (history/saved/schedule + report runs) in its own `trawl` database — sole-writer via session advisory lock, auto-migrated at boot (src/store/, ADR-0004 slice 3; trawl-auth crate deleted). authz is permission-only (src/policy.rs — no `Role` enum, ADR-0006 slice 1). ingest canonicalizes every event into the declared envelope (src/ingest/envelope.rs, ADR-0009), compaction repairs `_time`/`_ingested` per-row from WAL-filename provenance (src/ingest/compaction.rs, ADR-0008) and the boot-time storage-epoch cutover gates the data root (src/epoch.rs, ADR-0009)
   trawl-client/          # typed async HTTP client library
   trawl-cli/             # unified CLI + TUI binary
   trawl-admin/           # admin CLI (TLS cert generation only — key mgmt lives in fleet-admin)
@@ -43,9 +43,12 @@ crates/
 - **per-key rate limiting**: one token bucket per key id per route class (`default_rpm` for interactive routes, `ingest_rpm` for `/api/v1/ingest`, the latter earned by the `ingest` permission). a role's optional `rate_rpm` overrides — never combines with — the class default; effective ceiling = max `rate_rpm` across the key's roles when any role sets it
 - **real-time event bus**: ingested events are published to a `broadcast::channel`-backed bus and stored in a hot buffer, making them queryable within milliseconds of ingest (before WAL compaction to parquet)
 - **hot buffer**: batch-keyed in-memory store that makes fresh events visible to ALL queries via `UNION ALL BY NAME` with the parquet source; drained automatically after compaction. the snapshot writer hoists one event per novel key to the front of the ndjson so the full key set lands inside DuckDB's default schema-detection prefix — the reader stays on the cheap default sample instead of paying `sample_size=-1` on every query and SSE poll (ADR-0008)
-- **timestamps are canonicalized at ingest, never fatal downstream** (ADR-0008): a valid `timestamp` (RFC 3339, ISO 8601 basic offsets like `+0530`/`+02`, offset-less date-times read as UTC, `T` or space separator, `YYYY-MM-DD` or `YYYY/MM/DD`, optional seconds/fraction, or a bare date at midnight UTC) is rewritten to RFC 3339 UTC microseconds; anything else is **substituted, not rejected** — `timestamp` becomes the arrival time and the original is preserved verbatim in `timestamp_invalid` (counted by `trawl_ingest_events_repaired_total`). the partition key is never hard-CAST: compaction resolves it through `COALESCE(TRY_CAST(raw), ingest instant from the row's own WAL filename, compaction instant)` and the hot/cold union `TRY_CAST`s the hot side, so one bad value can never wedge a batch or throw a union
+- **the declared event envelope (ADR-0009)**: ten fields enforced at ingest — `_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message` (`_` = metadata about the record's handling). the canonicalizer (`trawl-server/src/ingest/envelope.rs`) captures `_raw` FIRST (client string honoured verbatim, else pre-repair serialization), strips server-owned `_ingested`/`_repairs` (`meta.stripped`), consumes the `_time`/`timestamp`/`@timestamp` wire aliases, stamps `_ingested`, defaults-or-rejects `env` against the `[ingest] envs` allowlist, peer-fills `host` (rejects behind a `trusted_relays` peer), and derives OTel `severity` (integer 1-24 > `severity_text` > `level`, all consumed; syslog numerics 0-7 INVERTED). repairs are a closed enum recorded in `_repairs` + `trawl_ingest_repairs_total{code,service}`. principle: repair when the server has an honest answer, reject (typed reason) when it would guess — `service` missing/non-string/bad-charset and unlisted `env` reject
+- **timestamps are canonicalized at ingest, never fatal downstream** (ADR-0008): a valid `_time` input (RFC 3339, ISO 8601 basic offsets like `+0530`/`+02`, offset-less date-times read as UTC, `T` or space separator, `YYYY-MM-DD` or `YYYY/MM/DD`, optional seconds/fraction, or a bare date at midnight UTC) is rewritten to RFC 3339 UTC microseconds; anything else is **substituted, not rejected** — `_time` becomes the arrival time with the `time.from_ingest` repair code (the original is findable in `_raw`). parseable-but-implausible values (>10y past / >1d future) are kept and flagged `time.out_of_range`. the partition key is never hard-CAST: compaction resolves `_time` (and `_ingested`, same ladder) through `COALESCE(TRY_CAST(raw), ingest instant from the row's own WAL filename, compaction instant)` and the hot/cold union `TRY_CAST`s both TIMESTAMP columns on the hot side, so one bad value can never wedge a batch or throw a union
+- **storage layout (ADR-0009)**: `data/{env}/{date}/{HH}/{service}.parquet` (daily rollup: `data/{env}/{date}/{service}.parquet`), WAL under `wal/{env}/`. path encoding is injective by validation — env charset `[a-z0-9_-]{1,32}` (`wal`/`scheduled` reserved), service charset `[A-Za-z0-9._-]` (no spaces, no leading dot, ≤128 bytes), names written VERBATIM (no sanitizer; `api.v2` ≠ `api_v2`). `data/EPOCH` (content `2`) marks the layout; boot runs the restartable cutover table in `trawl-server/src/epoch.rs` (legacy root → `data.pre-schema-v2/`, never deleted by trawl)
+- **DSL severity**: `level` is a query alias for numeric `severity` — `level=error` → `severity BETWEEN 17 AND 20`, `level>=warn` → `severity >= 13`; unknown/glob/regex `level` values are emit errors; `level` in projections/group-by surfaces column-not-found (use `severity`/`severity_text`). `timestamp`/`@timestamp` alias to the physical `_time` column. bare text search covers `message` OR `_raw`. token table + syslog inversion live in `trawl-core/src/severity.rs`; envelope consts in `trawl-core/src/schema.rs`
 - **a cold-data drop is never a silent 200** (ADR-0008): hot-only fallback is permitted only where it cannot hide cold data — a genuine cold start (glob matches no parquet) or a missing-column user error. any other database failure with cold files present returns an error. union-type conflicts are decided from evidence (a column the two sources describe differently), not from error-message substrings — DuckDB reports an irreconcilable schema and an unconvertible value identically as `Conversion`-class
-- **reserved field names**: `timestamp_invalid` (preserved malformed ingest timestamp) and `_trawl_wal_file` (per-row WAL provenance carried through compaction). ingest silently drops `_trawl_wal_file` from incoming events and accepts the rest unchanged
+- **reserved field names**: the envelope's `_ingested`/`_repairs` (client values stripped with `meta.stripped`; non-string `_raw` likewise) and `_trawl_wal_file` (per-row WAL provenance carried through compaction — silently dropped from incoming events, the rest accepted unchanged)
 - **live streaming**: SSE endpoint uses `CompiledFilter` (in-memory DSL matcher) against the event bus for real-time event delivery, with back-pressure notifications via `StreamEvent::Lagged`
 
 ## tooling
@@ -161,13 +164,13 @@ trawl query "level=error last=1h | stats count() by service | sort -count | head
 trawl query -p dev "level=error last=1h | stats count() by service | sort -count | head 10"
 
 # browse all data (table output)
-trawl query -f table "* | head 5 | fields timestamp, host, service, level, message"
+trawl query -f table "* | head 5 | fields timestamp, host, service, severity, message"
 
 # pipe JSON to jq for ad-hoc processing
 trawl query "last=1h | stats count() by service" | jq '.service'
 
 # export to CSV file
-trawl query -f csv "last=24h | stats count() by service, level" > report.csv
+trawl query -f csv "last=24h | stats count() by service, severity_text" > report.csv
 
 # validate a query without executing
 trawl validate "level=error | stats count() by host"
@@ -242,17 +245,23 @@ status=200,301,404              # IN list (comma-separated)
 status>=400                     # comparison (>, >=, <, <=, !=)
 path=/api/*                     # glob pattern
 message=/error.*/               # regex pattern (slashes required)
-service="Activity Monitor"      # quoted values (for spaces/special chars)
+host="db host"                  # quoted values (for spaces/special chars)
+env=prod                        # environment (prunes the path glob)
 ```
 
 **operators**: `=`, `!=`, `>`, `>=`, `<`, `<=`
 
+**severity (`level` is an alias, not a column)** — `level` compiles to band predicates over the numeric `severity`: `level=error` → `severity BETWEEN 17 AND 20`, `level>=warn` → `severity >= 13`, `level=warn,error` → either band. tokens: `trace`/`t`, `debug`/`d`, `info`/`i`, `notice`, `warn`/`warning`/`w`, `error`/`err`/`e`, `fatal`/`critical`/`crit`/`f`, `alert`, `emerg`/`panic`. anything else — an unknown token, a glob or regex on `level`, or naming `level` anywhere outside a comparison (`table`/`fields`, `stats by`, `sort`, `dedup`, `rename`, `let`) — is a query error; project `severity` (number) or `severity_text` (original text) instead. `where level == "error"` works and matches live tail (SSE) exactly.
+
+**time aliases** — `timestamp` and `@timestamp` both resolve to the physical `_time` column.
+
 **text search**
 ```
-error                           # bare word (substring match)
--debug                          # negated (exclude)
+error                           # bare word (substring match over message OR _raw)
+-debug                          # negated (excluded when either column matches)
 "connection refused"            # exact phrase
 ```
+searching `_raw` is whole-event search: for server-filled `_raw` (the canonical pre-repair JSON) a bare term can match another field's value or a field *name*. confine a match to one column with a field filter (`message=/debug/`).
 
 **time filters**
 ```
@@ -474,5 +483,5 @@ last=1h | pivot count() on status by host
 * | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10
 
 # distinct values per group
-* | stats values(level), first(message) by service | head 10
+* | stats values(severity_text), first(message) by service | head 10
 ```

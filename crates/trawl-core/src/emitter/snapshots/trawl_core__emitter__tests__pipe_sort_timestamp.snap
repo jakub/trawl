@@ -4,4 +4,4 @@ expression: "emit_dsl(\"* | sort @timestamp\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-ORDER BY "timestamp" ASC
+ORDER BY "_time" ASC

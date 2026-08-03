@@ -4,8 +4,7 @@ expression: "emit_dsl(r#\"earliest=\"2026-03-14T00:00:00Z\" level=error\"#)"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE CAST("timestamp" AS TIMESTAMP) >= CAST(? AS TIMESTAMP) AND "level" = ?
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= CAST(? AS TIMESTAMP) AND "severity" BETWEEN 17 AND 20
 ---
 params:
   0: '2026-03-14T00:00:00Z'
-  1: 'error'

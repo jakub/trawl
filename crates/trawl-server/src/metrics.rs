@@ -4,6 +4,7 @@
 
 //! Prometheus metrics: metric name constants, descriptions, and gauge collection.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -18,7 +19,7 @@ pub const QUERIES_TOTAL: &str = "trawl_queries_total";
 pub const QUERY_DURATION: &str = "trawl_query_duration_seconds";
 pub const INGEST_EVENTS_TOTAL: &str = "trawl_ingest_events_total";
 pub const INGEST_EVENTS_REJECTED_TOTAL: &str = "trawl_ingest_events_rejected_total";
-pub const INGEST_EVENTS_REPAIRED_TOTAL: &str = "trawl_ingest_events_repaired_total";
+pub const INGEST_REPAIRS_TOTAL: &str = "trawl_ingest_repairs_total";
 pub const HOT_BUFFER_EVENTS: &str = "trawl_hot_buffer_events";
 pub const HOT_BUFFER_BYTES: &str = "trawl_hot_buffer_bytes";
 pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";
@@ -44,9 +45,10 @@ pub fn describe_metrics() {
         "Total number of rejected ingest events"
     );
     describe_counter!(
-        INGEST_EVENTS_REPAIRED_TOTAL,
-        "Total number of accepted events whose malformed timestamp was \
-         substituted with the arrival time (original preserved in timestamp_invalid)"
+        INGEST_REPAIRS_TOTAL,
+        "Repairs applied to accepted ingest events, labelled by repair code \
+         and service (codes also recorded per-event in _repairs); services \
+         beyond the first 256 seen collapse into service=\"<other>\""
     );
     describe_gauge!(
         HOT_BUFFER_EVENTS,
@@ -78,6 +80,57 @@ pub fn describe_metrics() {
     );
     describe_gauge!(WAL_FILES, "Number of pending WAL (ndjson) files");
     describe_gauge!(WAL_BYTES, "Total byte size of pending WAL files");
+}
+
+// -- bounded label values ----------------------------------------------------
+
+/// Maximum distinct `service` label values admitted to `trawl_ingest_repairs_total`.
+///
+/// Every other label in this crate (`reason`, `status`, `transport`, `subsystem`)
+/// comes from a closed, code-defined set. `service` is client-supplied and its
+/// charset admits effectively unbounded values, while the prometheus recorder
+/// retains counter series for the process lifetime — so without a cap any key
+/// holding `ingest` could grow the registry and the `/metrics` payload without
+/// bound by posting events with fresh service names.
+pub const REPAIR_SERVICE_LABEL_CAP: usize = 256;
+
+/// Label value that novel services collapse into once the cap is reached.
+///
+/// The angle brackets are outside the ingest service charset (alphanumeric,
+/// dash, underscore, dot), so this can never collide with a real service name.
+pub const OVERFLOW_SERVICE_LABEL: &str = "<other>";
+
+/// Process-wide set of service names already admitted as a repair label value.
+fn repair_service_labels() -> &'static Mutex<HashSet<String>> {
+    static LABELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LABELS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Map a client-supplied service name onto a bounded `trawl_ingest_repairs_total`
+/// label value.
+///
+/// Already-admitted services pass through verbatim; once
+/// [`REPAIR_SERVICE_LABEL_CAP`] distinct services have been admitted, further
+/// novel names return [`OVERFLOW_SERVICE_LABEL`] so the series count stays
+/// bounded at `cap + 1` per repair code.
+pub fn repair_service_label(service: &str) -> String {
+    let mut admitted = repair_service_labels()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    bounded_label(&mut admitted, service, REPAIR_SERVICE_LABEL_CAP)
+}
+
+/// Cap-enforcing core of [`repair_service_label`], split out so it is testable
+/// without the process-wide static.
+fn bounded_label(admitted: &mut HashSet<String>, service: &str, cap: usize) -> String {
+    if admitted.contains(service) {
+        return service.to_string();
+    }
+    if admitted.len() >= cap {
+        return OVERFLOW_SERVICE_LABEL.to_string();
+    }
+    admitted.insert(service.to_string());
+    service.to_string()
 }
 
 // -- gauge collection --------------------------------------------------------
@@ -237,6 +290,31 @@ fn wal_cache() -> &'static Mutex<CachedWalStats> {
     })
 }
 
+/// Recursively tally `.ndjson` files under `dir` into `file_count`/`total_bytes`.
+///
+/// Recursive by necessity: WAL files live one level down in `wal_dir/{env}/`
+/// (ADR-0009), so a flat scan of `wal_dir` sees only directories and reports
+/// 0/0 forever — blinding the operator's only stalled-compaction signal.
+/// Unreadable directories and entries are skipped rather than aborting the
+/// walk, so one bad env still yields the rest of the fleet's numbers.
+fn walk_wal_files(dir: &Path, file_count: &mut u64, total_bytes: &mut u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_wal_files(&entry.path(), file_count, total_bytes);
+        } else if ft.is_file() && entry.path().extension().is_some_and(|ext| ext == "ndjson") {
+            *file_count += 1;
+            if let Ok(meta) = entry.metadata() {
+                *total_bytes += meta.len();
+            }
+        }
+    }
+}
+
 /// Scan WAL directory for `.ndjson` files and update gauge metrics.
 ///
 /// Uses a 30s TTL cache to avoid repeated directory scans.
@@ -264,17 +342,7 @@ fn collect_wal_gauges(wal_dir: &Path) {
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
 
-    if let Ok(entries) = std::fs::read_dir(wal_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "ndjson") {
-                file_count += 1;
-                if let Ok(meta) = entry.metadata() {
-                    total_bytes += meta.len();
-                }
-            }
-        }
-    }
+    walk_wal_files(wal_dir, &mut file_count, &mut total_bytes);
 
     metrics::gauge!(WAL_FILES).set(file_count as f64);
     metrics::gauge!(WAL_BYTES).set(total_bytes as f64);
@@ -312,6 +380,66 @@ mod tests {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let _handle = builder.install_recorder().expect("install test recorder");
         describe_metrics();
+    }
+
+    #[test]
+    fn wal_walk_counts_files_inside_env_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wal_dir = tmp.path();
+
+        // WAL files land in `wal_dir/{env}/` (ADR-0009) — a flat scan of
+        // `wal_dir` would see only directories and report 0/0.
+        for (env, service, bytes) in [("prod", "nginx", "aaaa"), ("dev", "api", "bb")] {
+            let env_dir = wal_dir.join(env);
+            std::fs::create_dir_all(&env_dir).expect("create env dir");
+            std::fs::write(env_dir.join(format!("{service}_1_abcd.ndjson")), bytes)
+                .expect("write wal file");
+            // Non-ndjson siblings (in-flight tmp, quarantined) must not count.
+            std::fs::write(env_dir.join(format!("{service}_2_abcd.tmp")), "zzzz")
+                .expect("write tmp file");
+            std::fs::write(env_dir.join(format!("{service}_3_abcd.corrupt")), "zzzz")
+                .expect("write corrupt file");
+        }
+
+        let mut file_count = 0;
+        let mut total_bytes = 0;
+        walk_wal_files(wal_dir, &mut file_count, &mut total_bytes);
+
+        assert_eq!(file_count, 2);
+        assert_eq!(total_bytes, 6);
+    }
+
+    #[test]
+    fn bounded_label_admits_up_to_the_cap_then_collapses() {
+        let mut admitted = HashSet::new();
+        for i in 0..3 {
+            let svc = format!("svc-{i}");
+            assert_eq!(bounded_label(&mut admitted, &svc, 3), svc);
+        }
+
+        // Novel services past the cap collapse into the overflow bucket...
+        assert_eq!(
+            bounded_label(&mut admitted, "svc-3", 3),
+            OVERFLOW_SERVICE_LABEL
+        );
+        assert_eq!(
+            bounded_label(&mut admitted, "svc-4", 3),
+            OVERFLOW_SERVICE_LABEL
+        );
+        // ...and do not consume admission slots, so the series count is capped.
+        assert_eq!(admitted.len(), 3);
+
+        // Already-admitted services keep reporting under their own name.
+        assert_eq!(bounded_label(&mut admitted, "svc-1", 3), "svc-1");
+    }
+
+    #[test]
+    fn overflow_label_cannot_collide_with_a_service_name() {
+        assert!(
+            !OVERFLOW_SERVICE_LABEL
+                .bytes()
+                .all(crate::ingest::pipeline::is_valid_service_char)
+        );
     }
 
     #[test]

@@ -81,7 +81,10 @@ fn ResultsTableBody(
         .into_any();
     }
 
-    let level_idx = columns.iter().position(|c| c == "level");
+    // Severity-keyed row coloring (ADR-0009): the numeric `severity`
+    // column and the verbatim `severity_text` both color by OTel band.
+    let severity_idx = columns.iter().position(|c| c == "severity");
+    let severity_text_idx = columns.iter().position(|c| c == "severity_text");
     let expanded = RwSignal::new(None::<usize>);
     let sort = RwSignal::new(None::<SortState>);
 
@@ -141,7 +144,8 @@ fn ResultsTableBody(
                             (move || sorted_indices.render(
                                 rows_data.clone(),
                                 cols_for_view.clone(),
-                                level_idx,
+                                severity_idx,
+                                severity_text_idx,
                                 expanded,
                                 on_add_filter,
                                 on_navigate,
@@ -206,7 +210,8 @@ impl SortedIndices {
         &self,
         rows: Vec<Vec<Value>>,
         columns: Vec<String>,
-        level_idx: Option<usize>,
+        severity_idx: Option<usize>,
+        severity_text_idx: Option<usize>,
         expanded: RwSignal<Option<usize>>,
         on_add_filter: Callback<Filter>,
         on_navigate: Callback<String>,
@@ -223,7 +228,8 @@ impl SortedIndices {
                         idx=i
                         row=row
                         columns=cols
-                        level_idx=level_idx
+                        severity_idx=severity_idx
+                        severity_text_idx=severity_text_idx
                         expanded=expanded
                         on_add_filter=on_add_filter
                         on_navigate=on_navigate
@@ -241,7 +247,8 @@ fn RowFragment(
     idx: usize,
     row: Vec<Value>,
     columns: Vec<String>,
-    level_idx: Option<usize>,
+    severity_idx: Option<usize>,
+    severity_text_idx: Option<usize>,
     expanded: RwSignal<Option<usize>>,
     on_add_filter: Callback<Filter>,
     on_navigate: Callback<String>,
@@ -252,9 +259,9 @@ fn RowFragment(
         .iter()
         .enumerate()
         .map(|(ci, v)| {
-            if Some(ci) == level_idx {
+            if Some(ci) == severity_idx || Some(ci) == severity_text_idx {
                 let s = value_to_string(v);
-                let cls = level_class(&s);
+                let cls = severity_class(v);
                 view! { <td><span class=cls>{s}</span></td> }.into_any()
             } else {
                 view! { <td>{value_to_string(v)}</td> }.into_any()
@@ -449,12 +456,19 @@ fn escape_dq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn level_class(s: &str) -> &'static str {
-    match s.to_ascii_lowercase().as_str() {
-        "error" | "err" | "fatal" | "critical" => "lvl lvl-error",
-        "warn" | "warning" => "lvl lvl-warn",
-        "info" => "lvl lvl-info",
-        "debug" | "trace" => "lvl lvl-debug",
+/// CSS class for a severity value: numeric `severity` (OTel 1-24) or a
+/// `severity_text` token, both resolved to a band via `trawl_core`.
+fn severity_class(v: &Value) -> &'static str {
+    let number = match v {
+        Value::Integer(n) => u8::try_from(*n).ok().filter(|n| (1..=24).contains(n)),
+        Value::String(s) => trawl_core::severity::number_for_token(s),
+        _ => None,
+    };
+    match number.and_then(trawl_core::severity::band_name) {
+        Some("error" | "fatal") => "lvl lvl-error",
+        Some("warn") => "lvl lvl-warn",
+        Some("info") => "lvl lvl-info",
+        Some("debug" | "trace") => "lvl lvl-debug",
         _ => "lvl",
     }
 }

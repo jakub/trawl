@@ -34,7 +34,7 @@ inputs = ["route_nginx.access", "route_nginx._unmatched"]
 source = '''
 parsed, err = parse_nginx_log(.message, "combined")
 if err == null {
-  .timestamp = parsed.timestamp
+  ._time = parsed.timestamp
   .src_ip = parsed.client
   .method = parsed.method
   .uri = parsed.path
@@ -48,17 +48,18 @@ if err == null {
 
   status = to_int(parsed.status) ?? 0
   if status >= 500 {
-    .level = "error"
+    .severity_text = "error"
   } else if status >= 400 {
-    .level = "warn"
+    .severity_text = "warn"
   } else {
-    .level = "info"
+    .severity_text = "info"
   }
 } else {
-  .level = "info"
+  .severity_text = "info"
 }
 
 .service = "nginx"
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.file)
 '''
@@ -79,19 +80,20 @@ if err == null {
 
   sev = parsed.severity
   if sev == "emerg" || sev == "alert" || sev == "crit" || sev == "error" {
-    .level = "error"
+    .severity_text = "error"
   } else if sev == "warn" {
-    .level = "warn"
+    .severity_text = "warn"
   } else if sev == "notice" || sev == "info" {
-    .level = "info"
+    .severity_text = "info"
   } else {
-    .level = "debug"
+    .severity_text = "debug"
   }
 } else {
-  .level = "error"
+  .severity_text = "error"
 }
 
 .service = "nginx"
+.env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 del(.file)
 '''

@@ -116,13 +116,20 @@ use trawl_server::transport::http;
 
 /// Create a `PrometheusHandle` for test contexts.
 ///
-/// Uses `PrometheusBuilder` with a noop recorder since tests don't scrape
-/// the endpoint. Each call creates an independent recorder which is NOT
-/// installed globally (the handle is self-contained).
+/// Installs the recorder globally (nextest is process-per-test, so this
+/// cannot collide across tests) so `/metrics` reflects the counters the
+/// handlers emit via `metrics::counter!`. Falls back to a detached
+/// recorder when a global one is already installed (a test that builds
+/// two servers) — that second handle renders empty, which no test relies
+/// on.
 pub fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics_exporter_prometheus::PrometheusBuilder::new()
-        .build_recorder()
-        .handle()
+        .install_recorder()
+        .unwrap_or_else(|_| {
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .build_recorder()
+                .handle()
+        })
 }
 
 /// Find an available port by binding to :0 and reading back the assigned port.
@@ -359,27 +366,41 @@ pub fn ensure_fixtures() -> String {
         .join("tests")
         .join("fixtures")
         .join("parquet");
-    let nginx_path = dir.join("nginx.parquet");
+    // The ADR-0009 on-disk layout the query planner prunes over:
+    // `{data}/{env}/{date}/{HH}/{service}.parquet`. Fixtures live there
+    // because that is the only shape the server ever writes — a flat data
+    // root is only reachable through a whole-root `**` glob, which the
+    // planner deliberately no longer emits (it would swallow `scheduled/`).
+    let hour_dir = dir.join("prod").join("2024-01-15").join("10");
+    let nginx_path = hour_dir.join("nginx.parquet");
 
-    // Remove stale scheduled-run results from prior test invocations —
-    // the `**/*.parquet` glob would otherwise include them as log data.
+    // Remove stale scheduled-run results from prior test invocations.
     let scheduled_dir = dir.join("scheduled");
     if scheduled_dir.exists() {
         let _ = std::fs::remove_dir_all(&scheduled_dir);
     }
+    // Remove pre-ADR-0009 flat fixtures left by an older checkout.
+    for legacy in ["nginx.parquet", "postgres.parquet"] {
+        let _ = std::fs::remove_file(dir.join(legacy));
+    }
 
     if !nginx_path.exists() {
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&hour_dir).unwrap();
         let suffix = format!("_{}", std::process::id());
 
         let conn = duckdb::Connection::open_in_memory().unwrap();
 
         conn.execute_batch(
             "CREATE TABLE logs (
-                timestamp TIMESTAMP,
-                host VARCHAR,
+                _time TIMESTAMP,
+                _ingested TIMESTAMP,
+                _raw VARCHAR,
+                _repairs VARCHAR,
+                env VARCHAR,
                 service VARCHAR,
-                level VARCHAR,
+                host VARCHAR,
+                severity INTEGER,
+                severity_text VARCHAR,
                 message VARCHAR
             )",
         )
@@ -387,15 +408,15 @@ pub fn ensure_fixtures() -> String {
 
         conn.execute_batch(
             "INSERT INTO logs VALUES
-            ('2024-01-15 10:00:00', 'web01', 'nginx', 'info', 'request ok'),
-            ('2024-01-15 10:00:01', 'web01', 'nginx', 'error', 'upstream timeout'),
-            ('2024-01-15 10:00:02', 'db01', 'postgres', 'info', 'checkpoint complete')",
+            ('2024-01-15 10:00:00', '2024-01-15 10:00:10', 'raw0', NULL, 'prod', 'nginx', 'web01', 9, 'info', 'request ok'),
+            ('2024-01-15 10:00:01', '2024-01-15 10:00:11', 'raw1', NULL, 'prod', 'nginx', 'web01', 17, 'error', 'upstream timeout'),
+            ('2024-01-15 10:00:02', '2024-01-15 10:00:12', 'raw2', NULL, 'prod', 'postgres', 'db01', 9, 'info', 'checkpoint complete')",
         )
         .unwrap();
 
         // Write per-service parquet files to match compaction naming convention.
-        let nginx_tmp = dir.join(format!("nginx{suffix}.parquet"));
-        let postgres_tmp = dir.join(format!("postgres{suffix}.parquet"));
+        let nginx_tmp = hour_dir.join(format!("nginx{suffix}.parquet"));
+        let postgres_tmp = hour_dir.join(format!("postgres{suffix}.parquet"));
 
         conn.execute_batch(&format!(
             "COPY (SELECT * FROM logs WHERE service = 'nginx') TO '{}' (FORMAT PARQUET)",
@@ -410,7 +431,7 @@ pub fn ensure_fixtures() -> String {
 
         // Atomic rename — loser's rename fails harmlessly if winner already placed the file.
         let _ = std::fs::rename(&nginx_tmp, nginx_path);
-        let _ = std::fs::rename(&postgres_tmp, dir.join("postgres.parquet"));
+        let _ = std::fs::rename(&postgres_tmp, hour_dir.join("postgres.parquet"));
         // Clean up if we lost the race.
         let _ = std::fs::remove_file(&nginx_tmp);
         let _ = std::fs::remove_file(&postgres_tmp);

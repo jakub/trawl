@@ -322,7 +322,7 @@ fn process_dedup(dedup: &crate::ast::DedupStage, ctx: &mut EmitterState) {
             "*".to_string(),
             format!(
                 "ROW_NUMBER() OVER (PARTITION BY {partition_clause} ORDER BY \
-                 CAST(\"timestamp\" AS TIMESTAMP) DESC) AS \"_rn\""
+                 TRY_CAST(\"_time\" AS TIMESTAMP) DESC) AS \"_rn\""
             ),
         ];
         ctx.has_projection = true;
@@ -348,12 +348,15 @@ fn process_timechart(
         None => auto_bucket_interval(ctx.time_filter.as_ref()),
     };
 
-    let bucket_expr = format!(
-        "time_bucket(INTERVAL '{interval}', CAST(\"timestamp\" AS TIMESTAMP)) AS \"_time\""
-    );
+    // The bucket is aliased AS "_time", which is ALSO the name of the
+    // physical event-time column it buckets. GROUP BY / ORDER BY must
+    // therefore reference the full expression, not the name — a bare
+    // "_time" would bind to the source column and silently break the
+    // aggregation (one group per input row).
+    let bucket = format!("time_bucket(INTERVAL '{interval}', TRY_CAST(\"_time\" AS TIMESTAMP))");
 
-    let mut select_items = vec![bucket_expr];
-    let mut group_items = vec!["\"_time\"".to_string()];
+    let mut select_items = vec![format!("{bucket} AS \"_time\"")];
+    let mut group_items = vec![bucket.clone()];
 
     for field in &tc.group_by {
         let q = quote_field(field);
@@ -381,7 +384,7 @@ fn process_timechart(
 
     ctx.select = select_items;
     ctx.group_by = group_items;
-    ctx.order_by.push("\"_time\" ASC".to_string());
+    ctx.order_by.push(format!("{bucket} ASC"));
     ctx.has_aggregation = true;
     ctx.had_explicit_columns = true;
 
@@ -411,11 +414,11 @@ fn auto_bucket_interval(time_filter: Option<&crate::ast::TrawlDuration>) -> Stri
 fn process_tail(tail: &crate::ast::TailStage, ctx: &mut EmitterState) {
     ctx.flush_if(FlushCondition::IfModifiedOrLimited);
 
-    // if no explicit sort exists, default to timestamp DESC so "tail"
+    // if no explicit sort exists, default to _time DESC so "tail"
     // means "last N chronologically". otherwise, respect the existing
     // sort order and just limit.
     if ctx.order_by.is_empty() {
-        ctx.order_by.push("\"timestamp\" DESC".to_string());
+        ctx.order_by.push("\"_time\" DESC".to_string());
     }
     ctx.limit = Some(tail.count);
 }

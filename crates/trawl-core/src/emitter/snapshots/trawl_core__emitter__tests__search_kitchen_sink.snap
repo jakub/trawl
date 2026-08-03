@@ -1,13 +1,14 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(r#\"service:nginx level:error last:2h \"connection refused\" -debug\"#)"
+expression: "emit_dsl(r#\"service=nginx level=error last=2h \"connection refused\" -debug\"#)"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE CAST("timestamp" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "service" = ? AND "level" = ? AND "message" ILIKE ? AND "message" NOT ILIKE ?
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "service" = ? AND "severity" BETWEEN 17 AND 20 AND ("message" ILIKE ? OR "_raw" ILIKE ?) AND ("message" NOT ILIKE ? AND COALESCE("_raw" NOT ILIKE ?, TRUE))
 ---
 params:
   0: 'nginx'
-  1: 'error'
+  1: '%connection refused%'
   2: '%connection refused%'
   3: '%debug%'
+  4: '%debug%'

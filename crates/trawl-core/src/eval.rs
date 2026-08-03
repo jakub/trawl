@@ -8,7 +8,7 @@
 //! rather than emitting SQL. This is the runtime analog of
 //! `emitter/expr.rs`.
 
-use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
+use crate::ast::{BinaryOp, Expr, FilterOp, LiteralValue, Spanned, UnaryOp};
 use crate::emitter::map_field_name;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::{Map, Value};
@@ -248,9 +248,8 @@ pub fn eval_expr(expr: &Spanned<Expr>, event: &Map<String, Value>) -> EvalValue 
             let mapped = map_field_name(name);
             event.get(mapped).map_or(EvalValue::Null, EvalValue::from)
         }
-        Expr::Binary { lhs, op, rhs } => {
-            eval_binary(&eval_expr(lhs, event), *op, &eval_expr(rhs, event))
-        }
+        Expr::Binary { lhs, op, rhs } => eval_level_comparison(lhs, *op, rhs, event)
+            .unwrap_or_else(|| eval_binary(&eval_expr(lhs, event), *op, &eval_expr(rhs, event))),
         Expr::Unary { op, operand } => eval_unary(*op, eval_expr(operand, event)),
         Expr::FunctionCall { name, args } => {
             let evaluated: Vec<EvalValue> = args.iter().map(|a| eval_expr(a, event)).collect();
@@ -270,6 +269,65 @@ pub fn eval_expr(expr: &Spanned<Expr>, event: &Map<String, Value>) -> EvalValue 
             EvalValue::Bool(false)
         }
     }
+}
+
+/// Evaluate `level <cmp> "token"` against the numeric `severity` column.
+///
+/// `level` is a DSL alias, not a stored field (ADR-0009): `emit_expr`
+/// rewrites the comparison into a severity band predicate, so streaming
+/// eval must do the same. Reading the (absent) `level` key instead would
+/// evaluate NULL and drop every event the batch path returns.
+///
+/// Returns `None` when this is not a level comparison — the caller then
+/// takes the generic path.
+fn eval_level_comparison(
+    lhs: &Spanned<Expr>,
+    op: BinaryOp,
+    rhs: &Spanned<Expr>,
+    event: &Map<String, Value>,
+) -> Option<EvalValue> {
+    let (filter_op, token) = crate::emitter::severity::as_level_comparison(lhs, op, rhs)?;
+
+    // Unknown tokens are an emit error and a stream-plan error, so nothing
+    // reaches here; NULL (never matches) is the closest an evaluator with
+    // no error channel can get to the batch rejection.
+    let Some(number) = crate::severity::number_for_token(token) else {
+        return Some(EvalValue::Null);
+    };
+    let (lo, hi) = crate::severity::band_of(number).expect("table numbers are in-ladder");
+
+    // A hot event may carry `severity` as a JSON string; DuckDB casts the
+    // column to INTEGER before comparing, so parse rather than fall into a
+    // string comparison.
+    let sev = match event
+        .get(crate::schema::SEVERITY)
+        .map_or(EvalValue::Null, EvalValue::from)
+    {
+        EvalValue::Str(s) => s.parse::<i64>().map_or(EvalValue::Null, EvalValue::Int),
+        other => other,
+    };
+
+    // `severity BETWEEN lo AND hi`, three-valued logic included.
+    let between = |sev: &EvalValue| {
+        eval_and(
+            &eval_binary(sev, BinaryOp::Gte, &EvalValue::Int(i64::from(lo))),
+            &eval_binary(sev, BinaryOp::Lte, &EvalValue::Int(i64::from(hi))),
+        )
+    };
+
+    Some(match filter_op {
+        FilterOp::Eq => between(&sev),
+        // mirrors `severity NOT BETWEEN lo AND hi OR severity IS NULL`
+        FilterOp::Ne => eval_or(
+            &eval_unary(UnaryOp::Not, between(&sev)),
+            &EvalValue::Bool(matches!(sev, EvalValue::Null)),
+        ),
+        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
+            eval_binary(&sev, op, &EvalValue::Int(i64::from(number)))
+        }
+        // `as_level_comparison` only yields comparison operators
+        FilterOp::Glob | FilterOp::Regex => EvalValue::Null,
+    })
 }
 
 fn eval_literal(lit: &LiteralValue) -> EvalValue {
@@ -1390,7 +1448,7 @@ mod tests {
 
     #[test]
     fn field_ref_timestamp_mapping() {
-        let ev = event(&json!({"timestamp": "2026-01-01T00:00:00Z"}));
+        let ev = event(&json!({"_time": "2026-01-01T00:00:00Z"}));
         assert_eq!(
             eval_expr(&field("@timestamp"), &ev),
             EvalValue::Str("2026-01-01T00:00:00Z".to_string())
@@ -1399,7 +1457,7 @@ mod tests {
 
     #[test]
     fn field_ref_time_alias() {
-        let ev = event(&json!({"timestamp": "2026-01-01T00:00:00Z"}));
+        let ev = event(&json!({"_time": "2026-01-01T00:00:00Z"}));
         assert_eq!(
             eval_expr(&field("_time"), &ev),
             EvalValue::Str("2026-01-01T00:00:00Z".to_string())
@@ -1589,7 +1647,7 @@ mod tests {
     #[test]
     fn where_timestamp_gt_now_for_future_event() {
         // Event with far-future timestamp: `timestamp > now()` should be true.
-        let ev = event(&json!({"timestamp": "2999-12-31 23:59:59"}));
+        let ev = event(&json!({"_time": "2999-12-31 23:59:59"}));
         let expr = binary(field("timestamp"), BinaryOp::Gt, call("now", vec![]));
         assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(true));
     }
@@ -1597,7 +1655,7 @@ mod tests {
     #[test]
     fn where_timestamp_gt_now_for_past_event() {
         // Event with past timestamp: `timestamp > now()` should be false.
-        let ev = event(&json!({"timestamp": "2000-01-01 00:00:00"}));
+        let ev = event(&json!({"_time": "2000-01-01 00:00:00"}));
         let expr = binary(field("timestamp"), BinaryOp::Gt, call("now", vec![]));
         assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(false));
     }
