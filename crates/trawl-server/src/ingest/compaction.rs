@@ -1881,12 +1881,14 @@ impl ConformPlan {
     /// expression), what each cast would null — necessarily BEFORE the plan
     /// is applied, since applying it destroys the pre-cast values.
     ///
-    /// A conflict is one row per cast column that had at least one non-null
-    /// value and either nulled rows or carried a concrete (non-JSON)
-    /// disagreeing type. An all-null pinned column (e.g. a batch with no
-    /// `_repairs`) casts silently — that is representation, not
-    /// disagreement — and a JSON source that converts fully is honest
-    /// convergence. Both are noise, not conflicts.
+    /// A conflict is one row per cast column the conform actually NULLED.
+    /// A cast that nulls nothing lost no data, whatever the two type names
+    /// say: an all-null pinned column (a batch with no `_repairs`), a JSON
+    /// source that converts fully, and a VARCHAR-pinned field whose batch
+    /// happened to carry only numbers are all honest convergence. Recording
+    /// those would append a row per (field, service) to the APPEND-ONLY
+    /// `field_conflicts` on every compaction tick, forever, for a sender
+    /// that is losing nothing — noise that outgrows the evidence.
     pub(crate) fn tally_conflicts(
         &self,
         conn: &duckdb::Connection,
@@ -1920,7 +1922,7 @@ impl ConformPlan {
         let mut conflicts = Vec::new();
         for (cast, (non_null, ok)) in self.casts.iter().zip(&stats) {
             let rows_nulled = u64::try_from(non_null - ok).unwrap_or(0);
-            if *non_null > 0 && (cast.dtype != "JSON" || rows_nulled > 0) {
+            if rows_nulled > 0 {
                 conflicts.push(FieldConflict {
                     field: cast.name.clone(),
                     service: service.to_owned(),
@@ -2795,6 +2797,40 @@ mod tests {
             i % 60,
             i % 60,
         )
+    }
+
+    /// Only a cast that NULLED something is conflict evidence.
+    /// `field_conflicts` is append-only and compaction ticks every few
+    /// seconds, so recording a lossless conform (here: a VARCHAR-pinned
+    /// field whose batch happened to carry only numbers) would append a row
+    /// per (field, service) forever for a sender losing nothing.
+    #[test]
+    fn lossless_conform_is_not_recorded_as_a_conflict() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT * FROM (VALUES (7, '8'), (9, 'x')) t(num, txt)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("num".to_owned(), CanonicalType::Varchar),
+            ("txt".to_owned(), CanonicalType::BigInt),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        assert_eq!(plan.cast_count(), 2, "both columns disagree with their pin");
+
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "only the lossy cast is evidence: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].field, "txt");
+        assert_eq!(conflicts[0].rows_nulled, 1, "'x' is the only nulled value");
     }
 
     // --- the pin ladder is deterministic over mixed batches (ADR-0009) ---

@@ -33,8 +33,11 @@ CREATE TABLE field_services (
 );
 
 -- Conflict evidence, powering the schema-health dashboard. APPEND-ONLY:
--- one row per conforming cast per batch, never aggregated (retention for
--- this table rides the #51/#53 follow-ons).
+-- one row per LOSSY conforming cast per batch (rows_nulled > 0), never
+-- aggregated (retention for this table rides the #51/#53 follow-ons). A
+-- cast that nulls nothing is not recorded: it would append a row per
+-- (field, service) on every compaction tick forever for a sender that is
+-- losing nothing.
 CREATE TABLE field_conflicts (
     id            BIGSERIAL
         CONSTRAINT field_conflicts_pkey PRIMARY KEY,

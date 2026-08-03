@@ -30,8 +30,11 @@ pub struct PinProposal {
     pub pinned_from: String,
 }
 
-/// One append-only conflict record: a batch column that had to be
-/// `TRY_CAST` to its pin.
+/// One append-only conflict record: a batch column whose `TRY_CAST` to its
+/// pin NULLED at least one value. A cast that nulls nothing is convergence,
+/// not conflict, and is never recorded (see `ConformPlan::tally_conflicts`)
+/// — an append-only row per lossless cast per compaction tick would grow
+/// without bound.
 #[derive(Debug, Clone)]
 pub struct FieldConflict {
     /// Field name.
