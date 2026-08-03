@@ -380,6 +380,89 @@ async fn pin_write_failure_retains_wal_and_writes_nothing(pool: sqlx::PgPool) {
     assert!(!walkdir_parquet(&h.data_dir).is_empty());
 }
 
+/// Acceptance: a HOT-side conflict — an uncompacted event disagreeing with
+/// an existing pin — is nulled on the hot branch of the union while the
+/// full cold history stays visible. The end-to-end proof of the
+/// `HotSnapshot` pin plumbing: the outcome is never hot-only (the cold rows
+/// ARE present) and never a loud error (the pin conformance resolves the
+/// conflict in one execution).
+#[sqlx::test(migrations = false)]
+async fn hot_conflicting_event_is_nulled_and_cold_history_survives(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // Seed the pin: three integer durations, compacted → duration pins
+    // BIGINT and the parquet history exists.
+    let cold_events: Vec<serde_json::Value> = (0..3)
+        .map(|i| {
+            json!({
+                "service": "svc-hot", "env": "prod", "host": "web01",
+                "timestamp": now_ts(),
+                "message": format!("cold{i}"), "duration": 4200 + i,
+            })
+        })
+        .collect();
+    let resp = h.ingest.ingest(&cold_events).await.expect("ingest cold");
+    assert_eq!(resp.accepted, 3);
+    compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
+    assert_eq!(
+        h.server.state.query.field_catalog.get("duration"),
+        Some(trawl_core::schema::CanonicalType::BigInt),
+        "the cold batch must pin duration BIGINT"
+    );
+
+    // The conflicting event arrives and stays UNCOMPACTED — hot only.
+    let hot_event = json!({
+        "service": "svc-hot", "env": "prod", "host": "web01",
+        "timestamp": now_ts(),
+        "message": "hot-conflict", "duration": "n/a",
+    });
+    let resp = h.ingest.ingest(&[hot_event]).await.expect("ingest hot");
+    assert_eq!(resp.accepted, 1);
+    let hot_buffer = h.server.state.query.hot_buffer.as_ref().unwrap();
+    assert!(
+        hot_buffer.event_count() > 0,
+        "the conflicting event must still be in the hot buffer"
+    );
+
+    // The union succeeds in one execution: all four rows, the hot value
+    // NULL, the cold values still integers. A hot-only fallback would show
+    // 1 row; the deleted coerced retry would show strings.
+    let result = h
+        .query
+        .query_paginated("service=svc-hot last=1h", None, None)
+        .await
+        .expect("hot+cold query with a pinned conflict must succeed");
+    assert_eq!(
+        result.result.row_count(),
+        4,
+        "cold history AND the hot event must both be visible — never hot-only"
+    );
+    let values = column_values(&result.result, "duration");
+    let ints = values
+        .iter()
+        .filter(|v| matches!(v, Value::Integer(_)))
+        .count();
+    let nulls = values.iter().filter(|v| matches!(v, Value::Null)).count();
+    assert_eq!(
+        (ints, nulls),
+        (3, 1),
+        "cold values stay BIGINT, the conflicting hot value degrades to NULL: {values:?}"
+    );
+
+    // The nulled hot original stays recoverable from _raw.
+    let hot_row = h
+        .query
+        .query_paginated("service=svc-hot last=1h message=hot-conflict", None, None)
+        .await
+        .expect("query hot row");
+    let raws = column_values(&hot_row.result, "_raw");
+    assert!(
+        raws.iter()
+            .all(|v| matches!(v, Value::String(s) if s.contains("n/a"))),
+        "the nulled hot value must be findable in _raw: {raws:?}"
+    );
+}
+
 /// Acceptance: `field_services` is ever-observed — compaction advances
 /// `last_seen`, and retention deleting a date directory leaves the rows in
 /// place (documented semantics, not a leak).
@@ -621,6 +704,81 @@ mod boot {
         );
         let marker = std::fs::read_to_string(data_dir.join("CATALOG")).unwrap();
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
+    }
+
+    /// Crash-mid-pass: the marker is published LAST, so a crash after the
+    /// rewrites but before the marker leaves a conformant corpus with no
+    /// marker. The re-run must be restartable — rewrite nothing (everything
+    /// already conforms) and republish the marker.
+    #[sqlx::test]
+    async fn crash_before_marker_rerun_rewrites_nothing_and_republishes(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (majority, minority) = plant_disagreeing_corpus(&data_dir);
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+
+        // Simulate the crash window: marker gone, corpus already conformant.
+        std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
+        let mtimes = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let (m1, m2) = (mtimes(&majority), mtimes(&minority));
+
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(summary.ran, "a missing marker must force the pass to run");
+        assert_eq!(summary.rewritten, 0, "the conformant corpus is untouched");
+        assert_eq!(mtimes(&majority), m1, "no file rewritten on the re-run");
+        assert_eq!(mtimes(&minority), m2, "no file rewritten on the re-run");
+        let marker = std::fs::read_to_string(data_dir.join("CATALOG")).unwrap();
+        assert_eq!(
+            marker.trim(),
+            store.catalog_id().await.unwrap(),
+            "the marker must be republished"
+        );
+    }
+
+    /// `data/scheduled/**` holds report-run outputs, not the log corpus —
+    /// the boot pass must never scan it: no pins from its columns, no
+    /// rewrite of its files.
+    #[sqlx::test]
+    async fn scheduled_dir_is_never_scanned(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant_disagreeing_corpus(&data_dir);
+        // A scheduled-output file whose column set would otherwise pin.
+        let sched = plant(
+            &data_dir,
+            "scheduled/42/report.parquet",
+            "SELECT 'x' AS sched_only_field, '1.5s' AS duration",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let before = std::fs::metadata(&sched).unwrap().modified().unwrap();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+
+        assert!(
+            cache.get("sched_only_field").is_none(),
+            "columns seen only under scheduled/ must not pin"
+        );
+        assert_eq!(
+            std::fs::metadata(&sched).unwrap().modified().unwrap(),
+            before,
+            "scheduled/ files must never be rewritten"
+        );
+        assert_eq!(
+            column_type(&sched, "duration"),
+            "VARCHAR",
+            "the scheduled file keeps its own schema even where it disagrees \
+             with the corpus pin"
+        );
     }
 
     /// Wiring: server boot itself runs the conformance pass — pins land in

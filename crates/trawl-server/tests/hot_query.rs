@@ -250,6 +250,119 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     );
 }
 
+/// Hot/cold agreement through the REAL pin plumbing: a compaction tick
+/// with the catalog wired seeds the pin, a later conflicting event sits in
+/// a `HotBuffer` sharing the same `FieldCatalog`, and the query returns
+/// every cold row with the hot value nulled — proving the pins flow
+/// buffer → snapshot → pool → emitter without any test-side shortcut.
+#[sqlx::test]
+async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) {
+    use trawl_server::catalog::{CatalogContext, FieldCatalog};
+    use trawl_server::store::CatalogStore;
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let wal_dir = tmp.path().join("wal");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let catalog = Arc::new(FieldCatalog::new());
+    let ctx = CatalogContext {
+        store: CatalogStore::new(pool),
+        cache: Arc::clone(&catalog),
+    };
+    let hot_buffer = Arc::new(
+        HotBuffer::new(HotBufferConfig {
+            max_events: 10_000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog)),
+    );
+    let exec_pool = ExecutorPool::new(
+        data_dir.to_str().unwrap().to_owned(),
+        1,
+        1000,
+        Some(Arc::clone(&hot_buffer)),
+    );
+
+    // Cold batch: integer durations, compacted with the catalog wired —
+    // the tick seeds the BIGINT pin.
+    let cold: Vec<Map<String, Value>> = (0..2)
+        .map(|i| {
+            let mut m = make_event("nginx", &format!("cold{i}"));
+            m.insert("duration".into(), json!(4200 + i));
+            m
+        })
+        .collect();
+    let wal_writer = WalWriter::new(wal_dir.clone());
+    wal_writer.ensure_dir().unwrap();
+    let ndjson = events_to_ndjson(&cold);
+    wal_writer.write("prod", "nginx", &ndjson).unwrap();
+    trawl_server::ingest::compaction::compact_once(
+        &wal_dir,
+        &data_dir,
+        Duration::ZERO,
+        false,
+        Some(&hot_buffer),
+        500,
+        "2GB",
+        Some(&ctx),
+    )
+    .await
+    .expect("compaction should succeed");
+    assert_eq!(
+        catalog.get("duration"),
+        Some(trawl_core::schema::CanonicalType::BigInt),
+        "the compaction tick must seed the pin"
+    );
+
+    // Conflicting hot event — never compacted.
+    let mut hot = make_event("nginx", "hot-conflict");
+    hot.insert("duration".into(), json!("n/a"));
+    hot_buffer.insert(Arc::new(IngestBatch {
+        batch_id: "hot_manual".into(),
+        service: "nginx".into(),
+        byte_size: 64,
+        events: vec![hot],
+    }));
+
+    let result = exec_pool
+        .execute(
+            exec_pool.allocate_query_id(),
+            "* | head 100",
+            Duration::from_secs(10),
+            false,
+            0,
+        )
+        .await;
+    let query_result = result.result.expect("pinned hot conflict must not error");
+    assert_eq!(
+        query_result.rows.len(),
+        3,
+        "ALL cold rows plus the hot row must be present — never hot-only"
+    );
+    let dur = query_result
+        .columns
+        .iter()
+        .position(|c| c.name == "duration")
+        .expect("duration column present");
+    let ints = query_result
+        .rows
+        .iter()
+        .filter(|r| matches!(r[dur], trawl_api::value::Value::Integer(_)))
+        .count();
+    let nulls = query_result
+        .rows
+        .iter()
+        .filter(|r| matches!(r[dur], trawl_api::value::Value::Null))
+        .count();
+    assert_eq!(
+        (ints, nulls),
+        (2, 1),
+        "cold values stay integers; the hot conflict degrades to NULL"
+    );
+}
+
 #[tokio::test]
 async fn query_works_without_hot_buffer() {
     // Verify the query path still works when no hot buffer is configured.
