@@ -34,7 +34,9 @@ use sqlx::{Connection as _, PgPool};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-pub use catalog::{CatalogStore, FieldConflict, FieldConflictRow, FieldServiceRow, PinProposal};
+pub use catalog::{
+    CatalogStore, FieldConflict, FieldConflictRow, FieldServiceRow, MAX_PINNED_FIELDS, PinProposal,
+};
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};

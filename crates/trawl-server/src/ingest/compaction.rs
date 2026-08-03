@@ -1062,11 +1062,12 @@ async fn compact_service_batch(
 /// batch's pin, not ours, when it got there first). Pins are add-only until
 /// #53, so a `known` entry cannot have gone stale meanwhile.
 ///
-/// Deliberately NOT a `load_pins` + `replace` per batch. The catalog has no
-/// cardinality bound — a pin row exists for every distinct JSON key ever
-/// ingested — so reloading it per chunk per service per tick is O(catalog)
-/// work that a noisy or hostile sender sets the size of. The common case
-/// (nothing new to pin) now costs no postgres round trip at all.
+/// Deliberately NOT a `load_pins` + `replace` per batch. A pin row exists
+/// for every distinct JSON key ever ingested, so reloading it per chunk per
+/// service per tick is O(catalog) work whose size a noisy or hostile sender
+/// picks — up to [`crate::store::MAX_PINNED_FIELDS`], which is what keeps
+/// that "up to" a number at all. The common case (nothing new to pin) now
+/// costs no postgres round trip at all.
 async fn resolve_pins_durable(
     cat: &CatalogContext,
     mut known: HashMap<String, CanonicalType>,
@@ -1778,9 +1779,12 @@ pub(crate) enum ConformPolicy {
     /// A freshly-read WAL batch (compaction). `_time`/`_ingested` pass
     /// through untouched — the ADR-0008 repair ladder already made them
     /// TIMESTAMP and they must never be re-cast — and a column with NO pin
-    /// (an all-null unpinned column whose pin deferred) is DROPPED:
-    /// `union_by_name` reads an absent column as NULL, and writing typed
-    /// NULLs would let a silent field pre-empt its own real type.
+    /// is DROPPED: `union_by_name` reads an absent column as NULL, and
+    /// writing typed NULLs would let a silent field pre-empt its own real
+    /// type. Unpinned means either a deferred pin (all-null column) or a
+    /// denied one (unstorable name, or the catalog at
+    /// [`crate::store::MAX_PINNED_FIELDS`]); both keep their values in
+    /// `_raw`.
     WalBatch,
     /// A standing parquet file (boot conformance pass). Every column is
     /// conformed, `_time` included — a legacy file whose timestamp column
@@ -2073,7 +2077,9 @@ fn conform_wal_batch(
             event_type = "catalog_pin_deferred",
             compact_service = %service,
             columns = ?plan.dropped,
-            "all-null unpinned columns deferred (absent from this file)"
+            "unpinned columns absent from this file (pin deferred as all-null, \
+             or denied — see catalog_pin_cap_reached / \
+             catalog_field_name_unstorable); values remain in _raw"
         );
     }
 

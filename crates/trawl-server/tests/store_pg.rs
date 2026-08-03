@@ -1506,6 +1506,63 @@ mod catalog {
     }
 
     #[sqlx::test]
+    async fn pin_missing_caps_catalog_cardinality(pool: PgPool) {
+        // Field names are client-chosen JSON keys and a pin is permanent
+        // (add-only until #53, and retention never reconciles the catalog),
+        // so an uncapped catalog is an unbounded postgres table AND an
+        // unbounded in-process cache that a sender embedding identifiers in
+        // its keys grows for free. Only the free slots under the cap are
+        // filled; the surplus stays unpinned, which is what makes the
+        // conform step drop the column with its values still in `_raw`.
+        let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
+        let store = catalog(&pool).with_pin_cap(seeded + 2);
+
+        let pins = store
+            .pin_missing(&[
+                proposal("a_field", CanonicalType::BigInt),
+                proposal("b_field", CanonicalType::BigInt),
+                proposal("c_field", CanonicalType::BigInt),
+                proposal("d_field", CanonicalType::BigInt),
+            ])
+            .await
+            .expect("a full catalog must never error the batch — retrying cannot clear it");
+
+        assert_eq!(pins.len(), 2, "only the two free slots are filled");
+        assert!(
+            pins.contains_key("a_field") && pins.contains_key("b_field"),
+            "an overflowing batch picks deterministically, by name"
+        );
+        let all = store.load_pins().await.unwrap();
+        assert_eq!(
+            i64::try_from(all.len()).unwrap(),
+            seeded + 2,
+            "the catalog never exceeds the cap"
+        );
+
+        // A later batch against a full catalog pins nothing new — but must
+        // still resolve the pins that DO exist, or every known column of
+        // every batch would start being dropped once the cap is reached.
+        let pins = store
+            .pin_missing(&[
+                proposal("e_field", CanonicalType::BigInt),
+                proposal("a_field", CanonicalType::Varchar),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            pins.get("a_field"),
+            Some(&CanonicalType::BigInt),
+            "existing pins still resolve at a full catalog"
+        );
+        assert!(!pins.contains_key("e_field"), "no new pin fits");
+        assert_eq!(
+            store.load_pins().await.unwrap().len(),
+            all.len(),
+            "a full catalog never grows"
+        );
+    }
+
+    #[sqlx::test]
     async fn touch_services_skips_unstorable_names_instead_of_failing(pool: PgPool) {
         let store = catalog(&pool);
         let huge = unstorable_field_name();

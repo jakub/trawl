@@ -9,7 +9,11 @@
 //! dynamic field's canonical type here BEFORE the first parquet file
 //! carrying it is written, and conforms every batch to the pins — so
 //! `union_by_name` across any set of trawl-written files can never
-//! conflict. Pins are add-only until the repin machinery (#53).
+//! conflict. Pins are add-only until the repin machinery (#53) — and
+//! because a pin is therefore permanent while its name is a client-chosen
+//! JSON key, the catalog is bounded on both axes: name length by
+//! [`trawl_core::schema::is_storable_field_name`], count by
+//! [`MAX_PINNED_FIELDS`].
 
 use std::collections::HashMap;
 
@@ -80,16 +84,39 @@ pub struct FieldConflictRow {
     pub at: DateTime<Utc>,
 }
 
+/// Maximum number of fields the catalog will ever pin.
+///
+/// Field names are client-chosen JSON keys, and a pin is PERMANENT (pins
+/// are add-only until the repin machinery, #53, and retention never
+/// reconciles `field_services`). Without a count bound, a sender that
+/// embeds identifiers in its keys — `user_12345_status`, accidental or
+/// hostile — grows postgres, the in-process [`crate::catalog::FieldCatalog`]
+/// cache, and every snapshot taken of it without limit. Name LENGTH is
+/// bounded by [`trawl_core::schema::is_storable_field_name`]; this bounds
+/// the COUNT.
+///
+/// A field denied a pin gets the same treatment as an unstorable name: it
+/// is absent from the pin map, so compaction's conform step drops the
+/// column and the values stay findable in `_raw`. Deliberately generous —
+/// a real corpus that legitimately reaches five figures of distinct field
+/// names has a modelling problem this cap should surface, not a capacity
+/// problem trawl should silently absorb.
+pub const MAX_PINNED_FIELDS: i64 = 10_000;
+
+/// One field name shortened for logging: a name can be as long as a client
+/// made it, so echoing it whole turns the log line into an amplifier of
+/// whatever was sent.
+fn short_name(name: &str) -> String {
+    let head: String = name.chars().take(48).collect();
+    format!("{head}... ({} bytes)", name.len())
+}
+
 /// The names in `names` that cannot be a catalog key, de-duplicated and
-/// each shortened for logging (a name that overflows a btree key would
-/// otherwise make the log line an amplifier of whatever a client sent).
+/// each shortened for logging (see [`short_name`]).
 fn unstorable_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut out: Vec<String> = names
         .filter(|n| !trawl_core::schema::is_storable_field_name(n))
-        .map(|n| {
-            let head: String = n.chars().take(48).collect();
-            format!("{head}... ({} bytes)", n.len())
-        })
+        .map(short_name)
         .collect();
     out.sort_unstable();
     out.dedup();
@@ -109,19 +136,43 @@ fn warn_unstorable(op: &str, rejected: &[String]) {
         "field name(s) too long to be a catalog key — skipped; the column is \
          not pinned (and so not stored), values remain in _raw"
     );
+    bump_rejected("name_too_long", rejected.len());
+}
+
+/// Count fields denied a pin, by reason. No field-name label: the names are
+/// client-chosen and unbounded, which is the very problem being counted.
+fn bump_rejected(reason: &'static str, count: usize) {
+    metrics::counter!(
+        crate::metrics::CATALOG_PINS_REJECTED_TOTAL,
+        "reason" => reason
+    )
+    .increment(count as u64);
 }
 
 /// Postgres-backed field catalog. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
 pub struct CatalogStore {
     pool: PgPool,
+    pin_cap: i64,
 }
 
 impl CatalogStore {
     /// Wrap the shared app-state pool (must already be migrated — see
     /// [`super::HistoryStore::new`] for the contract).
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            pin_cap: MAX_PINNED_FIELDS,
+        }
+    }
+
+    /// Override the pin-count cap. Exists so tests can drive the cap
+    /// boundary without inserting [`MAX_PINNED_FIELDS`] rows; production
+    /// uses the constant.
+    #[must_use]
+    pub fn with_pin_cap(mut self, cap: i64) -> Self {
+        self.pin_cap = cap;
+        self
     }
 
     /// Load every pin in the catalog.
@@ -160,6 +211,12 @@ impl CatalogStore {
     /// one such name would otherwise retain the batch for retry on every
     /// tick, forever. Absent from the returned map, the column is simply
     /// unpinned — which the conform step already treats as "drop it".
+    ///
+    /// The same treatment bounds the catalog's SIZE: the insert only fills
+    /// the slots left under [`MAX_PINNED_FIELDS`], so a batch arriving at a
+    /// full catalog pins nothing new and its novel columns are dropped from
+    /// the parquet with their values still in `_raw` (never an `Err` — that
+    /// would wedge compaction for a condition retrying cannot clear).
     pub async fn pin_missing(
         &self,
         proposals: &[PinProposal],
@@ -179,14 +236,28 @@ impl CatalogStore {
         let types: Vec<&str> = proposals.iter().map(|p| p.ty.as_duckdb()).collect();
         let sources: Vec<&str> = proposals.iter().map(|p| p.pinned_from.as_str()).collect();
 
+        // Only the free slots under the cap are filled. Already-pinned
+        // proposals are excluded from `candidate` so they never consume a
+        // slot, and the surplus is ordered by name so an overflowing batch
+        // picks deterministically rather than by arrival accident.
         sqlx::query(
-            "INSERT INTO field_types (field, duckdb_type, pinned_from)
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[])
+            "WITH candidate AS (
+                 SELECT u.f, u.t, u.s, row_number() OVER (ORDER BY u.f) AS rn
+                 FROM UNNEST($1::text[], $2::text[], $3::text[]) AS u(f, t, s)
+                 WHERE NOT EXISTS (SELECT 1 FROM field_types x WHERE x.field = u.f)
+             ),
+             capacity AS (
+                 SELECT GREATEST($4::bigint - (SELECT count(*) FROM field_types), 0) AS slots
+             )
+             INSERT INTO field_types (field, duckdb_type, pinned_from)
+             SELECT c.f, c.t, c.s FROM candidate c, capacity
+             WHERE c.rn <= capacity.slots
              ON CONFLICT (field) DO NOTHING",
         )
         .bind(&fields)
         .bind(&types)
         .bind(&sources)
+        .bind(self.pin_cap)
         .execute(&self.pool)
         .await?;
 
@@ -194,7 +265,8 @@ impl CatalogStore {
             .bind(&fields)
             .fetch_all(&self.pool)
             .await?;
-        rows.iter()
+        let pins = rows
+            .iter()
             .map(|row| {
                 let field: String = row.try_get("field")?;
                 let spelling: String = row.try_get("duckdb_type")?;
@@ -206,7 +278,33 @@ impl CatalogStore {
                 Ok((field, ty))
             })
             .collect::<Result<HashMap<_, _>, sqlx::Error>>()
-            .map_err(StoreError::from)
+            .map_err(StoreError::from)?;
+
+        // Whatever the insert could not seat comes back missing from the
+        // authoritative re-read — the one place that sees the cap bite,
+        // however the slots were lost (full catalog, or a racing batch that
+        // took the last ones).
+        let denied: Vec<String> = {
+            let mut d: Vec<String> = fields
+                .iter()
+                .filter(|f| !pins.contains_key(**f))
+                .map(|f| short_name(f))
+                .collect();
+            d.sort_unstable();
+            d.dedup();
+            d
+        };
+        if !denied.is_empty() {
+            tracing::warn!(
+                event_type = "catalog_pin_cap_reached",
+                cap = self.pin_cap,
+                fields = ?denied,
+                "field catalog is full — field(s) left unpinned; their columns \
+                 are not stored, values remain in _raw"
+            );
+            bump_rejected("cap", denied.len());
+        }
+        Ok(pins)
     }
 
     /// Upsert per-service observations for a compacted batch: `first_seen`

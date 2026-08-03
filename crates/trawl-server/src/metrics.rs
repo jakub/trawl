@@ -36,6 +36,7 @@ pub const CATALOG_CONFLICTS_TOTAL: &str = "trawl_catalog_conflicts_total";
 pub const CATALOG_ROWS_NULLED_TOTAL: &str = "trawl_catalog_rows_nulled_total";
 pub const CATALOG_CONFORM_REWRITES_TOTAL: &str = "trawl_catalog_conform_rewrites_total";
 pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_total";
+pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
 
 // -- description registration ------------------------------------------------
 
@@ -105,6 +106,11 @@ pub fn describe_metrics() {
         "Parquet files the boot conformance pass could not read (truncated, \
          bit-rotted, or foreign) and skipped; they stay outside the catalog \
          invariant and the pass re-runs on the next boot"
+    );
+    describe_counter!(
+        CATALOG_PINS_REJECTED_TOTAL,
+        "Fields denied a catalog pin, labelled by reason (name_too_long, \
+         cap); their columns are not stored and the values remain in _raw"
     );
 }
 

@@ -45,11 +45,11 @@ impl FieldCatalog {
     ///
     /// This — not [`Self::replace`] — is the steady-state update. Pins are
     /// add-only until the repin machinery (#53), so a delta merge lands the
-    /// same map a full reload would, without re-reading a catalog whose size
-    /// is bounded only by how many distinct field names clients have ever
-    /// sent. Compaction runs this once per batch that actually pinned
-    /// something; a batch proposing nothing touches neither postgres nor
-    /// this lock.
+    /// same map a full reload would, without re-reading a catalog sized by
+    /// how many distinct field names clients have ever sent (bounded, but
+    /// only by [`crate::store::MAX_PINNED_FIELDS`]). Compaction runs this
+    /// once per batch that actually pinned something; a batch proposing
+    /// nothing touches neither postgres nor this lock.
     pub fn merge(&self, pins: impl IntoIterator<Item = (String, CanonicalType)>) {
         let mut guard = self.pins.write();
         for (field, ty) in pins {
