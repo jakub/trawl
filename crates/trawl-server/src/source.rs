@@ -88,14 +88,19 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
             // A value no on-disk env can carry (they were validated at
             // ingest) — match nothing; the executor treats "no files" as
             // an empty result and the SQL filter keeps hot rows correct.
-            return format!("{base}/.no-such-env/{file_pattern}");
+            return no_match_source(base, &file_pattern);
         }
         None => crate::env_dirs::list_env_names(std::path::Path::new(base)),
     };
 
     if envs.is_empty() {
-        // Cold start (no env directories yet) — nothing to prune.
-        return format!("{base}/**/{file_pattern}");
+        // Cold start (no env directories yet). There is no log parquet to
+        // reach for, and `{base}/**/` would reach past the env dimension
+        // into `scheduled/` — materialized saved-query output the planner
+        // deliberately excludes (its schema is the query's, not an event's,
+        // so a union turns into a hard query error under ADR-0008). Match
+        // nothing, exactly as the invalid-env branch above does.
+        return no_match_source(base, &file_pattern);
     }
 
     let time_filter = ast.search.time_filter.as_ref().map(|tf| tf.node.duration);
@@ -117,9 +122,20 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str, fallback_glob: &str) -> 
     }
 
     if globs.is_empty() {
-        return format!("{base}/**/{file_pattern}");
+        // Every env exists but none holds a matching date directory — the
+        // same "nothing to read" state as a cold start, and the same reason
+        // not to fall back to `{base}/**/` over `scheduled/`.
+        return no_match_source(base, &file_pattern);
     }
     format!("[{}]", globs.join(", "))
+}
+
+/// The source for "no on-disk file can match": a path segment that is not a
+/// legal env name, so no data directory can ever carry it. The executor
+/// reads "no files" as an empty cold side and the SQL filter keeps hot rows
+/// correct.
+fn no_match_source(base: &str, file_pattern: &str) -> String {
+    format!("{base}/.no-such-env/{file_pattern}")
 }
 
 /// Time-scoped globs for one env root: hour-level for today, day-level
@@ -286,30 +302,46 @@ fn has_hour_dirs(base: &str, day: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Resolve a bare (non-list) source pattern with the same matcher
+    /// `read_parquet` uses, so a test can assert what a source really
+    /// reaches on disk rather than what its text looks like.
+    fn glob_matches(pattern: &str) -> Vec<String> {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("SELECT file FROM glob('{pattern}')"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
-    fn no_time_filter_returns_recursive_glob() {
-        // No time filter, no service → broad glob.
+    fn no_time_filter_over_empty_root_matches_nothing() {
+        // No env directory on disk → nothing to read.
         let source = compute_source("/data", "level=error", "/data/**/*.parquet");
-        assert_eq!(source, "/data/**/*.parquet");
+        assert_eq!(source, "/data/.no-such-env/*.parquet");
     }
 
     #[test]
     fn service_filter_narrows_glob() {
         // Exact service filter → narrow to service-specific file.
         let source = compute_source("/data", "service=nginx", "/data/**/*.parquet");
-        assert_eq!(source, "/data/**/nginx.parquet");
+        assert_eq!(source, "/data/.no-such-env/nginx.parquet");
     }
 
     #[test]
     fn service_glob_keeps_wildcard() {
         // Glob operator on service → can't narrow, keep *.parquet.
         let source = compute_source("/data", "service=ng*", "/data/**/*.parquet");
-        assert_eq!(source, "/data/**/*.parquet");
+        assert_eq!(source, "/data/.no-such-env/*.parquet");
     }
 
     #[test]
     fn bad_dsl_returns_fallback() {
-        let source = compute_source("/data", "broken {{{ query", "/data/**/*.parquet");
+        // Unparseable DSL: nothing to prune from, so the caller's fallback
+        // stands (the query itself fails to parse downstream anyway).
+        let source = compute_source("/data", "| | invalid", "/data/**/*.parquet");
         assert_eq!(source, "/data/**/*.parquet");
     }
 
@@ -570,7 +602,7 @@ mod tests {
         // are distinct.
         let source = compute_source("/data", "service=api.v2", "/data/**/*.parquet");
         assert_eq!(
-            source, "/data/**/api.v2.parquet",
+            source, "/data/.no-such-env/api.v2.parquet",
             "the file pattern carries the service name verbatim"
         );
     }
@@ -646,6 +678,63 @@ mod tests {
             "invalid env must yield a no-match source, got: {source}"
         );
         assert!(!source.contains("/prod/"), "got: {source}");
+    }
+
+    /// A post-cutover install before its first compaction: `data/` holds the
+    /// EPOCH marker and `scheduled/` report runs, and no env directory yet.
+    /// The source must not reach into `scheduled/` — those parquet files are
+    /// materialized saved-query output, not events, and unioning them into
+    /// the log side turns into a hard query error under ADR-0008.
+    #[test]
+    fn cold_start_source_never_reaches_scheduled_report_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        std::fs::write(tmp.path().join("EPOCH"), b"2").unwrap();
+        let runs = tmp.path().join("scheduled").join("errors-by-host");
+        std::fs::create_dir_all(&runs).unwrap();
+        let run = runs.join("run_1.parquet");
+        std::fs::write(&run, b"report run").unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "level=error", &fallback);
+
+        assert_eq!(source, format!("{base}/.no-such-env/*.parquet"));
+        assert!(
+            glob_matches(&source).is_empty(),
+            "cold-start source must match nothing, got: {source}"
+        );
+        // The fallback it replaced really did sweep the report run in.
+        assert!(
+            glob_matches(&fallback).contains(&run.to_string_lossy().into_owned()),
+            "sanity: the `**` fallback is what reached the scheduled run"
+        );
+    }
+
+    /// Same, one dimension in: env directories exist, but none holds a date
+    /// directory the query could read. Still nothing to read, still no
+    /// excuse to glob the whole data root.
+    #[test]
+    fn no_matching_date_dir_never_reaches_scheduled_report_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        std::fs::write(tmp.path().join("EPOCH"), b"2").unwrap();
+        let runs = tmp.path().join("scheduled").join("errors-by-host");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("run_1.parquet"), b"report run").unwrap();
+        // Env dirs exist (so the cold-start branch is not the one under
+        // test) but neither carries a `YYYY-MM-DD` directory.
+        for env in ["prod", "lab"] {
+            std::fs::create_dir_all(tmp.path().join(env)).unwrap();
+        }
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "level=error", &fallback);
+
+        assert_eq!(source, format!("{base}/.no-such-env/*.parquet"));
+        assert!(
+            glob_matches(&source).is_empty(),
+            "date-less source must match nothing, got: {source}"
+        );
     }
 
     #[test]

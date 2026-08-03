@@ -366,17 +366,26 @@ pub fn ensure_fixtures() -> String {
         .join("tests")
         .join("fixtures")
         .join("parquet");
-    let nginx_path = dir.join("nginx.parquet");
+    // The ADR-0009 on-disk layout the query planner prunes over:
+    // `{data}/{env}/{date}/{HH}/{service}.parquet`. Fixtures live there
+    // because that is the only shape the server ever writes — a flat data
+    // root is only reachable through a whole-root `**` glob, which the
+    // planner deliberately no longer emits (it would swallow `scheduled/`).
+    let hour_dir = dir.join("prod").join("2024-01-15").join("10");
+    let nginx_path = hour_dir.join("nginx.parquet");
 
-    // Remove stale scheduled-run results from prior test invocations —
-    // the `**/*.parquet` glob would otherwise include them as log data.
+    // Remove stale scheduled-run results from prior test invocations.
     let scheduled_dir = dir.join("scheduled");
     if scheduled_dir.exists() {
         let _ = std::fs::remove_dir_all(&scheduled_dir);
     }
+    // Remove pre-ADR-0009 flat fixtures left by an older checkout.
+    for legacy in ["nginx.parquet", "postgres.parquet"] {
+        let _ = std::fs::remove_file(dir.join(legacy));
+    }
 
     if !nginx_path.exists() {
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&hour_dir).unwrap();
         let suffix = format!("_{}", std::process::id());
 
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -406,8 +415,8 @@ pub fn ensure_fixtures() -> String {
         .unwrap();
 
         // Write per-service parquet files to match compaction naming convention.
-        let nginx_tmp = dir.join(format!("nginx{suffix}.parquet"));
-        let postgres_tmp = dir.join(format!("postgres{suffix}.parquet"));
+        let nginx_tmp = hour_dir.join(format!("nginx{suffix}.parquet"));
+        let postgres_tmp = hour_dir.join(format!("postgres{suffix}.parquet"));
 
         conn.execute_batch(&format!(
             "COPY (SELECT * FROM logs WHERE service = 'nginx') TO '{}' (FORMAT PARQUET)",
@@ -422,7 +431,7 @@ pub fn ensure_fixtures() -> String {
 
         // Atomic rename — loser's rename fails harmlessly if winner already placed the file.
         let _ = std::fs::rename(&nginx_tmp, nginx_path);
-        let _ = std::fs::rename(&postgres_tmp, dir.join("postgres.parquet"));
+        let _ = std::fs::rename(&postgres_tmp, hour_dir.join("postgres.parquet"));
         // Clean up if we lost the race.
         let _ = std::fs::remove_file(&nginx_tmp);
         let _ = std::fs::remove_file(&postgres_tmp);
