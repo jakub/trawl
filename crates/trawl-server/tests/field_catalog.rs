@@ -463,3 +463,163 @@ fn walkdir_parquet(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// boot conformance pass (ADR-0009 slice 2, section 2b)
+// ---------------------------------------------------------------------------
+
+mod boot {
+    use trawl_server::catalog::{FieldCatalog, conform};
+    use trawl_server::store::CatalogStore;
+
+    /// Plant a parquet file at `data_dir/rel` from a SELECT.
+    fn plant(data_dir: &std::path::Path, rel: &str, select: &str) -> std::path::PathBuf {
+        let path = data_dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY ({select}) TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+        path
+    }
+
+    fn column_type(path: &std::path::Path, column: &str) -> String {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "DESCRIBE SELECT \"{column}\" FROM read_parquet('{}')",
+                path.display()
+            ))
+            .unwrap();
+        stmt.query_row([], |row| row.get(1)).unwrap()
+    }
+
+    /// A pre-catalog corpus where two files disagree on `duration`:
+    /// majority (3 rows) BIGINT, minority (1 row) VARCHAR.
+    fn plant_disagreeing_corpus(
+        data_dir: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let majority = plant(
+            data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS duration FROM (VALUES (410), (420), (430)) t(x)",
+        );
+        let minority = plant(
+            data_dir,
+            "prod/2026-08-01/11/svc-b.parquet",
+            "SELECT TIMESTAMP '2026-08-01 11:00:00' AS \"_time\", 'svc-b' AS service, \
+             '1.5s' AS duration",
+        );
+        (majority, minority)
+    }
+
+    #[sqlx::test]
+    async fn boot_pass_pins_by_most_rows_and_rewrites_minority(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (majority, minority) = plant_disagreeing_corpus(&data_dir);
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+        assert!(summary.ran, "first boot must run the pass");
+        assert_eq!(
+            summary.rewritten, 1,
+            "exactly the minority file is rewritten"
+        );
+
+        // Pin: most-rows-wins → BIGINT.
+        assert_eq!(
+            cache.get("duration"),
+            Some(trawl_core::schema::CanonicalType::BigInt),
+            "the cache is hydrated with the most-rows-wins pin"
+        );
+
+        // The minority file now conforms; the majority was left alone.
+        assert_eq!(column_type(&minority, "duration"), "BIGINT");
+        assert_eq!(column_type(&majority, "duration"), "BIGINT");
+
+        // The conflict is recorded against the minority file's service.
+        let conflicts = store.conflicts_for_field("duration").await.unwrap();
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.service == "svc-b" && c.expected_type == "BIGINT"),
+            "boot rewrite must record the conflict: {conflicts:?}"
+        );
+
+        // Full corpus reads through one union, all rows present.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}/**/*.parquet', \
+                     union_by_name=true)",
+                    data_dir.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 4, "no rows lost by the rewrite");
+
+        // The marker mirrors the catalog identity.
+        let marker = std::fs::read_to_string(data_dir.join("CATALOG")).unwrap();
+        assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
+    }
+
+    #[sqlx::test]
+    async fn second_boot_is_a_noop(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (majority, minority) = plant_disagreeing_corpus(&data_dir);
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        let mtimes = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let (m1, m2) = (mtimes(&majority), mtimes(&minority));
+
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(!summary.ran, "second boot skips: marker + catalog agree");
+        assert_eq!(summary.rewritten, 0);
+        assert_eq!(mtimes(&majority), m1, "no file touched");
+        assert_eq!(mtimes(&minority), m2, "no file touched");
+    }
+
+    #[sqlx::test]
+    async fn mismatched_marker_forces_a_rerun(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant_disagreeing_corpus(&data_dir);
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+
+        // A restored-from-backup data root (or repointed DATABASE_URL)
+        // shows up as an identity mismatch — the pass must re-run.
+        std::fs::write(data_dir.join("CATALOG"), "someone-elses-catalog\n").unwrap();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(summary.ran, "identity mismatch must force a re-run");
+        assert_eq!(
+            summary.rewritten, 0,
+            "already-conformant corpus: zero rewrites"
+        );
+        let marker = std::fs::read_to_string(data_dir.join("CATALOG")).unwrap();
+        assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
+    }
+}

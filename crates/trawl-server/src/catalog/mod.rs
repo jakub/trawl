@@ -11,6 +11,8 @@
 //! (#53), so the cache never needs invalidation — boot hydrates it and
 //! every `pin_missing` refresh only ever adds entries.
 
+pub mod conform;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

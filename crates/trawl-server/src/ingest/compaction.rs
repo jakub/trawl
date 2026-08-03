@@ -1166,7 +1166,7 @@ fn local_pins(proposals: &[PinProposal]) -> HashMap<String, CanonicalType> {
 
 /// Bump the conflict counters (bounded by the shared service-label cap;
 /// never a field-name label).
-fn record_conflict_metrics(service: &str, conflicts: &[FieldConflict]) {
+pub(crate) fn record_conflict_metrics(service: &str, conflicts: &[FieldConflict]) {
     if conflicts.is_empty() {
         return;
     }
@@ -1472,14 +1472,18 @@ fn probe_ndjson(conn: &duckdb::Connection, file: &Path) -> Result<(), String> {
     }
 }
 
-/// Column name and type from `DuckDB` `DESCRIBE`.
-struct ColInfo {
-    name: String,
-    dtype: String,
+/// Column name and type from `DuckDB` `DESCRIBE`. Shared with the boot
+/// conformance pass (`crate::catalog::conform`).
+pub(crate) struct ColInfo {
+    pub(crate) name: String,
+    pub(crate) dtype: String,
 }
 
 /// Run `DESCRIBE <query>` and return the column names and types.
-fn describe_source(conn: &duckdb::Connection, query: &str) -> Result<Vec<ColInfo>, String> {
+pub(crate) fn describe_source(
+    conn: &duckdb::Connection,
+    query: &str,
+) -> Result<Vec<ColInfo>, String> {
     let mut stmt = conn
         .prepare(&format!("DESCRIBE {query}"))
         .map_err(|e| format!("DESCRIBE failed: {e}"))?;
@@ -1500,7 +1504,7 @@ fn describe_source(conn: &duckdb::Connection, query: &str) -> Result<Vec<ColInfo
 /// Escape a `DuckDB` identifier: wrap in double-quotes, doubling any
 /// embedded double-quotes. Column names come from ingested JSON keys
 /// (user-controlled), so this prevents SQL injection in the fallback path.
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -1824,7 +1828,7 @@ fn run_pin_ladder(
 /// - legacy complex types (STRUCT/MAP/LIST from pre-stringification WAL)
 ///   go through `to_json()` so the VARCHAR is real JSON text, reachable
 ///   with `json_extract_string`.
-fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Option<String> {
+pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Option<String> {
     if dtype == pin.as_duckdb() {
         return None;
     }
