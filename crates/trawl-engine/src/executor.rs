@@ -14,6 +14,7 @@ use duckdb::Connection;
 use duckdb::types::{TimeUnit, ValueRef};
 use trawl_core::emitter::{self, EmittedQuery, SqlValue};
 use trawl_core::parser;
+use trawl_core::schema::FieldTypes;
 
 use crate::error::EngineError;
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value};
@@ -105,7 +106,7 @@ impl Executor {
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
+        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, &FieldTypes::new())?;
         let mut outcome = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
 
         // A column type conflict between the hot and cold sources (e.g. a
@@ -136,7 +137,8 @@ impl Executor {
         if matches!(&outcome, Ok(r) if r.columns.is_empty())
             && let Some(pruned) = self.pruned_cold_source(source)
         {
-            let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source)?;
+            let pruned_emitted =
+                emitter::emit_with_hot_source(&ast, &pruned, hot_source, &FieldTypes::new())?;
             outcome = self.execute_emitted(&pruned_emitted, max_rows, utc_offset_secs);
             if let Some(cols) = self.hot_cold_conflict_columns(&outcome, &pruned, hot_source) {
                 let coerced =
@@ -723,7 +725,7 @@ impl Executor {
         max_rows: usize,
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source)?;
+        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, &FieldTypes::new())?;
         let mut outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
         // Same coerced retry as `run_query_with_hot`: a column typed
@@ -757,7 +759,8 @@ impl Executor {
         if matches!(&outcome, Err(EngineError::Database(e)) if is_no_files_error(e))
             && let Some(pruned) = self.pruned_cold_source(source)
         {
-            let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source)?;
+            let pruned_emitted =
+                emitter::emit_with_hot_source(&ast, &pruned, hot_source, &FieldTypes::new())?;
             outcome = self.export_parquet_from_emitted(&pruned_emitted, output_path, max_rows);
             if let Some(cols) = self.hot_cold_conflict_columns(&outcome, &pruned, hot_source) {
                 let coerced =

@@ -219,6 +219,26 @@ fn varchar_replace_list(varchar_cols: &[String], with_timestamp: bool) -> String
     parts.join(", ")
 }
 
+/// Conform expression for one pinned field on the hot branch, applied
+/// UNTYPED — the emitter has no `DESCRIBE`, so the expression must be valid
+/// whatever type `read_json` inferred for the column.
+///
+/// Typed pins (`BIGINT`/`DOUBLE`/`TIMESTAMP`/`BOOLEAN`) use `TRY_CAST`:
+/// a nonconforming hot value degrades to NULL instead of throwing the
+/// hot+cold union (ADR-0008). The VARCHAR pin uses
+/// `json_extract_string(to_json(x), '$')`, which yields UNQUOTED strings
+/// over every inference class the snapshot can produce (VARCHAR, JSON from
+/// mixed values, BIGINT) — probed by execution in
+/// `trawl-engine/tests/duckdb_probe.rs`; a plain `CAST(x AS VARCHAR)` on a
+/// JSON-inferred column would keep the quotes.
+fn conform_untyped(quoted: &str, pin: crate::schema::CanonicalType) -> String {
+    use crate::schema::CanonicalType;
+    match pin {
+        CanonicalType::Varchar => format!("json_extract_string(to_json({quoted}), '$')"),
+        typed => format!("TRY_CAST({quoted} AS {})", typed.as_duckdb()),
+    }
+}
+
 /// Public accessor for the parquet/list source reader expression, so the
 /// engine can `DESCRIBE` the same cold source the emitter reads from.
 pub fn source_reader(source: &str) -> Result<String, super::EmitError> {
@@ -239,11 +259,47 @@ impl EmitterState {
     /// Construct with a composite source that unions parquet with hot buffer ndjson.
     ///
     /// The hot source is read via `read_json` with explicit format parameters
-    /// and a CAST on the timestamp column to match parquet's TIMESTAMP type.
-    /// `field_appearance_threshold=0` prevents `DuckDB` from collapsing
-    /// heterogeneous-schema events into a single MAP column.
-    pub(crate) fn with_hot_source(primary: &str, hot: &str) -> Result<Self, super::EmitError> {
-        Self::with_hot_source_coerced(primary, hot, &[])
+    /// (`field_appearance_threshold=0` prevents `DuckDB` from collapsing
+    /// heterogeneous-schema events into a single MAP column) and a
+    /// `REPLACE` list that conforms the hot branch to the catalog:
+    ///
+    /// - both envelope TIMESTAMP columns get their unconditional `TRY_CAST`s
+    ///   (ADR-0008 — survives empty `pins`, so catalog-less callers keep the
+    ///   timestamp guarantee), and
+    /// - every pinned field (excluding the timestamp columns, already
+    ///   handled) gets its [`conform_untyped`] expression, so a hot value
+    ///   that disagrees with the write-time pin degrades to NULL instead of
+    ///   throwing the union.
+    ///
+    /// The cold branch is deliberately plain: parquet is write-time
+    /// conformant (ADR-0009 slice 2), and a defensive cold cast would mask
+    /// a real invariant breach.
+    pub(crate) fn with_hot_source(
+        primary: &str,
+        hot: &str,
+        pins: &crate::schema::FieldTypes,
+    ) -> Result<Self, super::EmitError> {
+        let primary_reader = build_reader(primary)?;
+        let hot_reader = hot_reader(hot)?;
+
+        let mut parts = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + pins.len());
+        for col in crate::schema::TIMESTAMP_COLUMNS {
+            parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
+        }
+        for (field, ty) in pins.iter() {
+            if crate::schema::TIMESTAMP_COLUMNS.contains(&field) {
+                continue;
+            }
+            let q = super::fields::quote_field(field);
+            parts.push(format!("{} AS {q}", conform_untyped(&q, ty)));
+        }
+        let hot_replace = parts.join(", ");
+
+        let composite = format!(
+            "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
+             SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
+        );
+        Ok(Self::with_source(composite))
     }
 
     /// Like [`with_hot_source`], but additionally coerces `varchar_cols` to
