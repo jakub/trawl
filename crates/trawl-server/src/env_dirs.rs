@@ -11,15 +11,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// Enumerate env directories under `root`: immediate subdirectories whose
-/// name passes the env charset and is not reserved (`wal/`, `scheduled/`).
-/// Anything else (a stray file, a reserved directory) is skipped — env
-/// names were validated at ingest, so the directory name IS the env value.
+/// Enumerate env directories under `root`, reporting an unreadable root.
+///
+/// A *missing* root is a legitimate cold start — no data has been written
+/// yet — and yields an empty list. Any other `read_dir` failure (permissions,
+/// I/O, a file where the root should be) is returned: it means the env set is
+/// unknown, not empty, and a caller that cannot tell the two apart reports a
+/// clean run while nothing gets done (ADR-0008: no silent loss).
 ///
 /// Sorted by name for deterministic ordering (glob order, compaction order).
-pub(crate) fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
+pub(crate) fn try_list_env_dirs(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
     let mut dirs: Vec<(String, PathBuf)> = entries
         .flatten()
@@ -38,7 +43,24 @@ pub(crate) fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
         })
         .collect();
     dirs.sort();
-    dirs
+    Ok(dirs)
+}
+
+/// Enumerate env directories under `root`, treating an unreadable root as
+/// empty. For callers where "no envs" and "cannot tell" are the same
+/// outcome — the query planner (a broader source is never incorrect) and
+/// best-effort housekeeping sweeps. The failure is logged rather than
+/// swallowed silently; anything that must not proceed on an unknown env set
+/// calls [`try_list_env_dirs`] instead.
+pub(crate) fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
+    try_list_env_dirs(root).unwrap_or_else(|e| {
+        tracing::warn!(
+            dir = %root.display(),
+            error = %e,
+            "failed to list env directories, treating as empty"
+        );
+        Vec::new()
+    })
 }
 
 /// Env names under `root`, as [`list_env_dirs`] but dropping the paths.
@@ -76,5 +98,39 @@ mod tests {
     fn missing_root_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(list_env_dirs(&tmp.path().join("nope")).is_empty());
+    }
+
+    /// The fallible listing separates "nothing written yet" from "cannot
+    /// tell": only the former is an empty list, so a caller that must not
+    /// proceed on an unknown env set can refuse to.
+    #[test]
+    fn try_list_separates_cold_start_from_unreadable_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            try_list_env_dirs(&tmp.path().join("nope"))
+                .expect("a missing root is a cold start")
+                .is_empty()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let locked = tmp.path().join("locked");
+            std::fs::create_dir_all(locked.join("prod")).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_dir(&locked).is_ok() {
+                // Running as root: mode bits are not enforced.
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+                return;
+            }
+            let err = try_list_env_dirs(&locked);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                err.expect_err("an unreadable root must not read as empty")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
     }
 }

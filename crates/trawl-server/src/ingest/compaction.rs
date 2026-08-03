@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 use trawl_engine::{is_complex_type, is_conversion_error};
 
-use crate::env_dirs::list_env_dirs;
+use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
 use crate::hot_buffer::HotBuffer;
 use crate::state::CompactionStats;
 
@@ -128,7 +128,21 @@ pub async fn compact_once(
     // Env is the outermost storage dimension (ADR-0009): WAL lives in
     // `wal_dir/{env}/` and parquet in `data_dir/{env}/{date}/{HH}/`.
     // The per-env inner algorithm is unchanged.
-    for (env, env_wal_dir) in list_env_dirs(wal_dir) {
+    //
+    // The root listing is fallible on purpose: an unreadable WAL root is not
+    // an empty WAL root. Swallowing it would iterate nothing and report a
+    // clean cycle while the WAL never drains and the hot buffer evicts
+    // un-compacted events. A *missing* root is a cold start and yields an
+    // empty list silently. Unlike a single unreadable env (isolated and
+    // counted), a bad root leaves nothing to carry on with.
+    let env_wal_dirs = try_list_env_dirs(wal_dir).map_err(|e| {
+        format!(
+            "failed to list WAL env directories in {}: {e}",
+            wal_dir.display()
+        )
+    })?;
+
+    for (env, env_wal_dir) in env_wal_dirs {
         let env_data_dir = data_dir.join(&env);
         let Some(files) = scan_env_wal_files(&env, &env_wal_dir, min_age) else {
             scan_failures += 1;
@@ -3668,6 +3682,56 @@ mod tests {
             "a later env must still compact"
         );
         assert!(!prod_wal.exists(), "a later env's WAL must still drain");
+    }
+
+    /// An unreadable WAL *root* is not an empty WAL root: it must surface as
+    /// an error, never as a clean cycle. Swallowing it iterates no envs, so
+    /// the WAL never drains, the hot buffer evicts un-compacted events, and
+    /// the error counter stays at zero — silent loss (ADR-0008).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compact_once_errors_on_unreadable_wal_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(wal_dir.join("prod")).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        std::fs::set_permissions(&wal_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&wal_dir).is_ok() {
+            // Running as root: the mode bits are not enforced, so there is no
+            // unreadable root to report. Nothing to assert.
+            let _ = std::fs::set_permissions(&wal_dir, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        let result =
+            compact_once(&wal_dir, &data_dir, Duration::ZERO, true, None, 500, "2GB").await;
+        // Teardown first: a leaked 0o000 dir would break tempdir cleanup.
+        std::fs::set_permissions(&wal_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("an unreadable WAL root must not read as a clean cycle");
+        assert!(
+            err.contains("WAL env directories"),
+            "error must name the failing listing, got: {err}"
+        );
+    }
+
+    /// The other half of the pair: a WAL root that does not exist yet is a
+    /// legitimate cold start, and must stay a silent, clean, zero-error run.
+    #[tokio::test]
+    async fn compact_once_is_clean_when_wal_root_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, true, None, 500, "2GB")
+            .await
+            .expect("a missing WAL root is a cold start, not a failure");
+        assert_eq!(errors, 0, "a cold start reports no errors");
     }
 
     /// One bad event does not affect its batch-mates: 1 bad + 2 good in one
