@@ -34,9 +34,27 @@ impl FieldCatalog {
         Self::default()
     }
 
-    /// Replace the whole cache with an authoritative pin set.
+    /// Replace the whole cache with an authoritative pin set (boot only —
+    /// hydration is the one place that has read the whole catalog).
     pub fn replace(&self, pins: impl IntoIterator<Item = (String, CanonicalType)>) {
         *self.pins.write() = pins.into_iter().collect();
+    }
+
+    /// Fold newly-durable pins into the cache, leaving every other entry
+    /// alone.
+    ///
+    /// This — not [`Self::replace`] — is the steady-state update. Pins are
+    /// add-only until the repin machinery (#53), so a delta merge lands the
+    /// same map a full reload would, without re-reading a catalog whose size
+    /// is bounded only by how many distinct field names clients have ever
+    /// sent. Compaction runs this once per batch that actually pinned
+    /// something; a batch proposing nothing touches neither postgres nor
+    /// this lock.
+    pub fn merge(&self, pins: impl IntoIterator<Item = (String, CanonicalType)>) {
+        let mut guard = self.pins.write();
+        for (field, ty) in pins {
+            guard.insert(field, ty);
+        }
     }
 
     /// Look up one field's pin.
@@ -127,6 +145,18 @@ mod tests {
         assert_eq!(pins.get("duration"), Some(CanonicalType::BigInt));
         assert_eq!(pins.get("absent"), None);
         assert_eq!(pins.len(), 1);
+    }
+
+    #[test]
+    fn merge_adds_deltas_without_dropping_existing_pins() {
+        // The steady-state compaction update: only the batch's own new pins
+        // are known, and folding them in must not evict the rest of the
+        // catalog the way `replace` would.
+        let cache = catalog(&[("duration", CanonicalType::BigInt)]);
+        cache.merge([("status".to_owned(), CanonicalType::BigInt)]);
+        assert_eq!(cache.get("duration"), Some(CanonicalType::BigInt));
+        assert_eq!(cache.get("status"), Some(CanonicalType::BigInt));
+        assert_eq!(cache.snapshot().len(), 2);
     }
 
     #[test]

@@ -931,7 +931,8 @@ struct CompactOutcome {
 /// 1. blocking — read the WAL into `wal_batch`, `DESCRIBE` it, and derive
 ///    pin proposals for unpinned columns (candidate ladder over values).
 /// 2. async — `pin_missing` the proposals; the AUTHORITATIVE pins come
-///    back and refresh the in-process cache. A store failure is `Err`:
+///    back and are folded into the in-process cache (skipped entirely when
+///    the batch proposes nothing — the common case). A store failure is `Err`:
 ///    the WAL is retained and retried next tick — never an unconformant
 ///    parquet write.
 /// 3. blocking — conform `wal_batch` to the pins (`TRY_CAST` on mismatch,
@@ -957,7 +958,9 @@ async fn compact_service_batch(
     let memory_limit = memory_limit.to_owned();
     let known = catalog.map_or_else(HashMap::new, |c| c.cache.snapshot());
 
-    // Phase 1: read + infer + propose (blocking).
+    // Phase 1: read + infer + propose (blocking). `known` comes back out of
+    // the closure rather than being cloned into it: phase 2 folds this
+    // batch's new pins into it instead of re-reading the whole catalog.
     let phase1 = tokio::task::spawn_blocking(move || {
         let mut quarantined: u64 = 0;
         let result = prepare_service_batch(
@@ -968,10 +971,10 @@ async fn compact_service_batch(
             &mut quarantined,
             &known,
         );
-        (result, quarantined)
+        (result, quarantined, known)
     })
     .await;
-    let (prep_result, quarantined) = match phase1 {
+    let (prep_result, quarantined, known) = match phase1 {
         Ok(v) => v,
         Err(e) => {
             return CompactOutcome {
@@ -999,7 +1002,7 @@ async fn compact_service_batch(
 
     // Phase 2: pins become durable BEFORE any parquet write.
     let pins = match catalog {
-        Some(cat) => match resolve_pins_durable(cat, &prep.proposals).await {
+        Some(cat) => match resolve_pins_durable(cat, known, &prep.proposals).await {
             Ok(pins) => pins,
             Err(e) => {
                 return CompactOutcome {
@@ -1048,16 +1051,36 @@ async fn compact_service_batch(
     }
 }
 
-/// Make the batch's pin proposals durable and return the full authoritative
-/// pin map, refreshing the in-process cache on the way.
+/// Make the batch's pin proposals durable and return the authoritative pins
+/// for this batch's columns, folding the new ones into the in-process cache
+/// on the way.
+///
+/// `known` is the cache snapshot phase 1 proposed against, and the two
+/// together cover every column of the batch by construction: `propose_pins`
+/// emits a proposal for exactly the columns `known` did not already pin, and
+/// `pin_missing` returns the AUTHORITATIVE pin for each proposal (a racing
+/// batch's pin, not ours, when it got there first). Pins are add-only until
+/// #53, so a `known` entry cannot have gone stale meanwhile.
+///
+/// Deliberately NOT a `load_pins` + `replace` per batch. The catalog has no
+/// cardinality bound — a pin row exists for every distinct JSON key ever
+/// ingested — so reloading it per chunk per service per tick is O(catalog)
+/// work that a noisy or hostile sender sets the size of. The common case
+/// (nothing new to pin) now costs no postgres round trip at all.
 async fn resolve_pins_durable(
     cat: &CatalogContext,
+    mut known: HashMap<String, CanonicalType>,
     proposals: &[PinProposal],
 ) -> Result<HashMap<String, CanonicalType>, crate::store::StoreError> {
-    cat.store.pin_missing(proposals).await?;
-    let all = cat.store.load_pins().await?;
-    cat.cache.replace(all.clone());
-    Ok(all.into_iter().collect())
+    if proposals.is_empty() {
+        return Ok(known);
+    }
+    let pinned = cat.store.pin_missing(proposals).await?;
+    if !pinned.is_empty() {
+        cat.cache.merge(pinned.iter().map(|(f, t)| (f.clone(), *t)));
+        known.extend(pinned);
+    }
+    Ok(known)
 }
 
 /// The no-catalog pin map: the declared envelope plus this batch's own
