@@ -52,11 +52,11 @@ pub struct HotBufferConfig {
 /// the atomic rename publishes the conformant parquet, but the hot drain
 /// that bumps the buffer generation happens AFTER the rename; a
 /// generation-cached pin set would be stale in that window and the union
-/// would hard-error. Intersecting with the observed keys also guarantees
-/// the emitter's `REPLACE` never names a column absent from the snapshot —
-/// including the case-collided spellings [`crate::catalog::FieldCatalog::intersect`] drops,
-/// which `read_json` renames out from under their pin (`Duration` becomes
-/// `Duration_1` next to `duration`).
+/// would hard-error. Intersecting with the observed keys also guarantees the
+/// emitter's `REPLACE` never names a column absent from the snapshot — the
+/// key set is the post-[`CaseMerge`] one, so it names no spelling
+/// `read_json` would have renamed out from under its pin (`Duration` next to
+/// `duration`).
 #[derive(Debug, Clone)]
 pub struct HotSnapshot {
     /// The ndjson snapshot file (shared across concurrent queries).
@@ -74,13 +74,15 @@ impl HotSnapshot {
     }
 }
 
-/// One cache slot: the generation it was built at, the snapshot file, and
-/// the key set observed while writing it (the same pass that finds the
-/// schema pioneers — pins are intersected against it on every call).
+/// One cache slot: the generation it was built at, the snapshot file, the
+/// key set the file actually carries (the same pass that finds the schema
+/// pioneers — pins are intersected against it on every call), and the
+/// spellings [`CaseMerge`] merged case-variants into.
 struct CachedSnapshot {
     generation: u64,
     file: Arc<tempfile::NamedTempFile>,
     keys: Vec<String>,
+    merged: Vec<String>,
 }
 
 /// Batch-keyed in-memory event store.
@@ -230,36 +232,54 @@ impl HotBuffer {
             && cached.generation == current_gen
         {
             return Some(HotSnapshot {
-                field_types: Arc::new(
-                    self.field_catalog
-                        .intersect(cached.keys.iter().map(String::as_str)),
-                ),
+                field_types: Arc::new(self.pins_for(&cached.keys, &cached.merged)),
                 file: Arc::clone(&cached.file),
             });
         }
 
         // Cache miss — build under lock so concurrent queries wait.
-        let (file, keys) = self.build_snapshot()?;
+        let (file, keys, merged) = self.build_snapshot()?;
         let file = Arc::new(file);
-        let field_types = Arc::new(
-            self.field_catalog
-                .intersect(keys.iter().map(String::as_str)),
-        );
+        let field_types = Arc::new(self.pins_for(&keys, &merged));
         *cache = Some(CachedSnapshot {
             generation: current_gen,
             file: Arc::clone(&file),
             keys,
+            merged,
         });
 
         Some(HotSnapshot { file, field_types })
     }
 
+    /// The pins that apply to one snapshot: the catalog intersected with the
+    /// keys the file carries, with every merged spelling forced to `VARCHAR`.
+    ///
+    /// The force is not belt-and-braces: a merged column holds BOTH
+    /// spellings' values, so the catalog's type for whichever spelling won
+    /// the name would `TRY_CAST` the other's values to NULL — and the merged
+    /// name may carry no pin at all (only the other spelling was ever
+    /// compacted), which would leave the column at `read_json`'s inferred
+    /// type and put a union-incompatible pair against its cold counterpart
+    /// one ingest away.
+    fn pins_for(&self, keys: &[String], merged: &[String]) -> trawl_core::schema::FieldTypes {
+        let mut pins = self
+            .field_catalog
+            .intersect(keys.iter().map(String::as_str));
+        for field in merged {
+            pins.insert(field, trawl_core::schema::CanonicalType::Varchar);
+        }
+        pins
+    }
+
     /// Build a fresh snapshot file from the current buffer contents,
-    /// returning it with the observed key set.
+    /// returning it with the key set the file carries and the spellings
+    /// case-variant keys were merged into.
     ///
     /// Events are written schema-pioneers-first (see [`survey_schema`]) so
-    /// that the reader can rely on `DuckDB`'s cheap default schema sample.
-    fn build_snapshot(&self) -> Option<(tempfile::NamedTempFile, Vec<String>)> {
+    /// that the reader can rely on `DuckDB`'s cheap default schema sample,
+    /// and through [`CaseMerge`] so no two keys in the file differ only in
+    /// ASCII case.
+    fn build_snapshot(&self) -> Option<(tempfile::NamedTempFile, Vec<String>, Vec<String>)> {
         let map = self.batches.read();
         if map.is_empty() {
             return None;
@@ -271,23 +291,20 @@ impl HotBuffer {
             .collect();
         let (pioneer, keys) = survey_schema(events.iter().map(|(_, e)| *e));
 
-        // Once per generation (this is the cache-miss path), not per query:
-        // colliding spellings are read as `x` + `x_1`, so the field's data is
-        // split across two output columns and its pin is dropped. Silent
-        // otherwise — the queries still succeed, just against half the rows.
-        let collided = crate::catalog::ascii_case_collisions(keys.iter().map(String::as_str));
-        if !collided.is_empty() {
-            let mut names: Vec<&str> = collided.iter().map(String::as_str).collect();
-            names.sort_unstable();
+        // Planned once per generation (this is the cache-miss path), not per
+        // query. Silent to the client otherwise — the events are ingested and
+        // queryable either way, just under one spelling.
+        let merge = CaseMerge::plan(&keys);
+        if !merge.is_empty() {
             tracing::warn!(
                 event_type = "hot_buffer_case_collision",
-                fields = ?names,
+                fields = ?merge.merged,
                 "hot buffer holds field names differing only in ASCII case; DuckDB \
-                 cannot tell them apart, so each splits into two columns and its \
-                 catalog pin is not applied — normalise the field-name casing at \
-                 the source"
+                 cannot tell them apart, so the snapshot merges them into one \
+                 column read as text — normalise the field-name casing at the source"
             );
         }
+        let keys = merge.rewrite_keys(keys);
 
         let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
         let mut wrote_any = false;
@@ -296,13 +313,15 @@ impl HotBuffer {
             .filter(|&i| pioneer[i])
             .chain((0..events.len()).filter(|&i| !pioneer[i]));
         for (batch_id, event) in order.map(|i| events[i]) {
-            // Events are written verbatim: ingest canonicalization already
-            // stringified top-level object/array values (ADR-0009 slice 2),
-            // so every value here is a scalar.
+            // Events are written verbatim (bar a case merge): ingest
+            // canonicalization already stringified top-level object/array
+            // values (ADR-0009 slice 2), so every value here is a scalar.
             //
             // Serialization failure here is very unlikely (we parsed it
             // successfully during ingest), but log and skip rather than
             // poisoning the entire snapshot.
+            let merged = merge.apply(event);
+            let event = merged.as_ref().unwrap_or(event);
             match serde_json::to_writer(&mut tmpfile, event) {
                 Ok(()) => {
                     if let Err(e) = tmpfile.write_all(b"\n") {
@@ -332,7 +351,7 @@ impl HotBuffer {
             return None;
         }
 
-        Some((tmpfile, keys))
+        Some((tmpfile, keys, merge.merged))
     }
 
     /// Total number of events across all batches.
@@ -353,6 +372,106 @@ impl HotBuffer {
     /// Buffer configuration (max events, max bytes).
     pub fn config(&self) -> &HotBufferConfig {
         &self.config
+    }
+}
+
+/// The rewrite that keeps a snapshot's key set free of ASCII case-variants:
+/// which spellings move, and the spelling they move to.
+///
+/// `DuckDB` identifiers are case-INSENSITIVE while client JSON keys are not,
+/// so a snapshot carrying both `duration` and `Duration` is read as TWO
+/// columns — `read_json` renames the second to `Duration_1` — and only the
+/// first is nameable by a `REPLACE`. The twin therefore reaches the union
+/// unconformed, at whatever type `read_json` inferred, and one
+/// union-incompatible pair against a cold column of the same name (compaction
+/// reads the WAL through the same reader, so `Duration_1` becomes a real
+/// parquet column) throws the whole composite source — failing EVERY query,
+/// not just queries naming the field, for as long as those events sit in the
+/// buffer.
+///
+/// Merging the variants into one spelling removes the twin instead of trying
+/// to conform it: `UNION ALL BY NAME` matches column names case-insensitively
+/// (probed in `trawl-engine/tests/duckdb_probe.rs`), so the merged column
+/// lines up with its cold counterpart under either spelling, and the caller
+/// pins it `VARCHAR` — the lossless conform, and one that unions with every
+/// cold scalar type. Queries also stop seeing half the rows.
+///
+/// The surviving spelling is the ASCII-smallest, chosen only for
+/// determinism: `DuckDB` cannot tell the variants apart, and where a cold
+/// counterpart exists the union takes ITS name for the output column.
+#[derive(Debug, Default)]
+struct CaseMerge {
+    /// Spelling → the spelling it merges into (the survivor is not a key).
+    rename: std::collections::HashMap<String, String>,
+    /// The surviving spellings, sorted — pinned `VARCHAR` by the caller.
+    merged: Vec<String>,
+}
+
+impl CaseMerge {
+    /// Plan the merge for one observed key set.
+    fn plan(keys: &[String]) -> Self {
+        let mut by_fold: std::collections::HashMap<String, Vec<&str>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            by_fold
+                .entry(key.to_ascii_uppercase())
+                .or_default()
+                .push(key.as_str());
+        }
+
+        let mut plan = Self::default();
+        for (_, mut variants) in by_fold {
+            if variants.len() < 2 {
+                continue;
+            }
+            variants.sort_unstable();
+            let survivor = variants[0].to_owned();
+            for variant in &variants[1..] {
+                plan.rename.insert((*variant).to_owned(), survivor.clone());
+            }
+            plan.merged.push(survivor);
+        }
+        plan.merged.sort_unstable();
+        plan
+    }
+
+    /// Whether the key set was already collision-free (the overwhelmingly
+    /// common case — no per-event work at all).
+    fn is_empty(&self) -> bool {
+        self.rename.is_empty()
+    }
+
+    /// The observed key set as the snapshot file actually carries it.
+    fn rewrite_keys(&self, keys: Vec<String>) -> Vec<String> {
+        if self.is_empty() {
+            return keys;
+        }
+        let mut out: Vec<String> = keys
+            .into_iter()
+            .filter(|key| !self.rename.contains_key(key))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The event as it must be written, or `None` when it carries no merged
+    /// spelling and can be serialized as-is.
+    ///
+    /// An event carrying BOTH spellings itself keeps one value — the map is
+    /// keyed by name, so the last spelling in the event's own (sorted) key
+    /// order wins. Nothing honest can be done with two values for what
+    /// `DuckDB` reads as one column, and the whole event survives in `_raw`.
+    fn apply(&self, event: &Event) -> Option<Event> {
+        if self.is_empty() || !event.keys().any(|key| self.rename.contains_key(key)) {
+            return None;
+        }
+        let mut out = Event::new();
+        for (key, value) in event {
+            let name = self.rename.get(key).map_or(key.as_str(), String::as_str);
+            out.insert(name.to_owned(), value.clone());
+        }
+        Some(out)
     }
 }
 
@@ -639,13 +758,9 @@ mod tests {
         assert_eq!(snap.field_types.len(), 1);
     }
 
-    #[test]
-    fn snapshot_field_types_drops_case_collided_keys() {
-        // Two services disagreeing on field-name casing put both spellings
-        // in one snapshot. DuckDB reads them as `duration` + `Duration_1`,
-        // so neither pin names its own column and a REPLACE on either would
-        // retype the other service's values (duckdb_probe.rs). The pins must
-        // not reach the emitter at all; unrelated pins are unaffected.
+    /// A buffer holding both spellings of `duration`, plus an uncollided
+    /// `host`, under a catalog that pins all three.
+    fn buffer_with_case_collision() -> HotBuffer {
         use trawl_core::schema::CanonicalType;
 
         let catalog = Arc::new(crate::catalog::FieldCatalog::new());
@@ -658,7 +773,7 @@ mod tests {
             max_events: 1000,
             max_bytes: 10_000_000,
         })
-        .with_field_catalog(Arc::clone(&catalog));
+        .with_field_catalog(catalog);
 
         let event = |field: &str, value: serde_json::Value| {
             let mut ev = serde_json::Map::new();
@@ -676,15 +791,92 @@ mod tests {
                 event("Duration", serde_json::Value::String("slow".into())),
             ],
         }));
+        buf
+    }
+
+    #[test]
+    fn snapshot_merges_case_collided_keys_into_one_spelling() {
+        // Two services disagreeing on field-name casing put both spellings in
+        // one snapshot. Written verbatim, DuckDB reads them as `duration` +
+        // `Duration_1` (duckdb_probe.rs) — the twin is unnameable by the
+        // emitter's REPLACE, so it reaches the union unconformed and can
+        // throw it. The snapshot must carry ONE spelling, with both values.
+        let buf = buffer_with_case_collision();
 
         let snap = buf.snapshot().expect("should have events");
-        assert_eq!(snap.field_types.get("duration"), None);
-        assert_eq!(snap.field_types.get("Duration"), None);
+        let content = std::fs::read_to_string(snap.path()).unwrap();
+        assert!(
+            !content.contains("\"duration\""),
+            "the ASCII-larger spelling must not reach the file: {content}"
+        );
+        assert_eq!(
+            content.matches("\"Duration\"").count(),
+            2,
+            "both events must carry the surviving spelling: {content}"
+        );
+        assert!(content.contains("410") && content.contains("slow"));
+    }
+
+    #[test]
+    fn snapshot_pins_a_merged_spelling_varchar() {
+        // The merged column holds BOTH spellings' values, so its catalog type
+        // (BIGINT for `duration`) would TRY_CAST the other's to NULL — and
+        // the surviving spelling might carry no pin at all, leaving the
+        // column at read_json's inferred type where it can throw the union.
+        // VARCHAR is the only honest pin. Uncollided pins are unaffected.
+        use trawl_core::schema::CanonicalType;
+
+        let buf = buffer_with_case_collision();
+
+        let snap = buf.snapshot().expect("should have events");
+        assert_eq!(
+            snap.field_types.get("Duration"),
+            Some(CanonicalType::Varchar),
+            "the merged column must be conformed, and only VARCHAR is lossless"
+        );
+        assert_eq!(
+            snap.field_types.get("duration"),
+            None,
+            "the merged-away spelling is not a column in the file"
+        );
         assert_eq!(
             snap.field_types.get("host"),
             Some(CanonicalType::Varchar),
             "an uncollided pin must still be conformed"
         );
+    }
+
+    #[test]
+    fn case_merge_keeps_one_value_when_an_event_carries_both_spellings() {
+        // Degenerate shape: one event with both spellings. DuckDB reads one
+        // column either way, so one value survives — deterministically, and
+        // without a stray key that would reappear as a `_1` twin.
+        let merge = CaseMerge::plan(&["Duration".to_string(), "duration".to_string()]);
+        let mut ev = serde_json::Map::new();
+        ev.insert("Duration".into(), serde_json::Value::String("slow".into()));
+        ev.insert("duration".into(), serde_json::Value::from(410));
+
+        let merged = merge.apply(&ev).expect("the event carries a merged key");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("Duration"), Some(&serde_json::Value::from(410)));
+    }
+
+    #[test]
+    fn case_merge_is_a_no_op_for_a_collision_free_key_set() {
+        let merge = CaseMerge::plan(&["duration".to_string(), "host".to_string()]);
+        assert!(merge.is_empty());
+        assert!(merge.merged.is_empty());
+        let mut ev = serde_json::Map::new();
+        ev.insert("duration".into(), serde_json::Value::from(410));
+        assert!(merge.apply(&ev).is_none());
+    }
+
+    #[test]
+    fn case_merge_does_not_fold_non_ascii_case() {
+        // DuckDB folds ASCII only — `café` and `CAFÉ` are two nameable
+        // columns, so merging them would destroy a real field.
+        let merge = CaseMerge::plan(&["café".to_string(), "CAFÉ".to_string()]);
+        assert!(merge.is_empty());
     }
 
     #[test]

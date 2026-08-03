@@ -73,21 +73,28 @@ impl FieldCatalog {
     /// [`FieldTypes`] the emitter conforms the hot side of the union with.
     /// Zero postgres I/O: this is the whole point of the cache.
     ///
-    /// Fields whose spelling collides case-insensitively with another key in
-    /// the SAME snapshot are dropped: they are unconformable, and conforming
-    /// them would rewrite the wrong column. Catalog names are
-    /// case-SENSITIVE (client JSON keys, never case-normalised) while
-    /// `DuckDB` identifiers are case-INSENSITIVE, so a snapshot carrying both
-    /// `duration` and `Duration` is read as columns `duration` and
-    /// `Duration_1` — `read_json` renames the collided key, and a `REPLACE`
-    /// naming EITHER spelling binds the FIRST column (probed by execution in
-    /// `trawl-engine/tests/duckdb_probe.rs`). Emitting the pin there would
-    /// silently retype and rewrite the other service's values while leaving
-    /// the pinned field's own data (now in `Duration_1`) untouched — the
-    /// server guessing where it has no honest answer (ADR-0009). Dropped
-    /// instead, both columns reach the union exactly as ingested: a genuine
-    /// disagreement with the pin then errors loudly rather than being
-    /// papered over on the wrong column.
+    /// A key whose spelling collides case-insensitively with another key in
+    /// the SAME key set is pinned `VARCHAR` whatever the catalog says.
+    /// Catalog names are case-SENSITIVE (client JSON keys, never
+    /// case-normalised) while `DuckDB` identifiers are case-INSENSITIVE, so
+    /// `duration` and `Duration` name ONE column and a `REPLACE` naming
+    /// either spelling binds whichever column `DuckDB` bound first (probed by
+    /// execution in `trawl-engine/tests/duckdb_probe.rs`) — a TYPED pin there
+    /// would `TRY_CAST` the other spelling's values to NULL. `VARCHAR` is the
+    /// lossless conform (the emitter's expression stringifies every inference
+    /// class) and is the one conform that must not be skipped: an unpinned
+    /// hot column keeps `read_json`'s inferred type, and a single
+    /// union-incompatible pair against its cold counterpart (cold `VARCHAR` ×
+    /// hot JSON, cold `TIMESTAMP` × hot `BIGINT`) throws the whole composite
+    /// source — failing EVERY query while those events sit in the buffer, not
+    /// just queries naming the field. A `VARCHAR` hot column, by contrast,
+    /// unions with every cold scalar type (both probed in
+    /// `trawl-engine/tests/duckdb_probe.rs`).
+    ///
+    /// This is the last line of defence, not the policy: the snapshot writer
+    /// merges case-variant keys into one spelling before they reach here
+    /// ([`crate::hot_buffer::HotBuffer::snapshot`]), so a collided key set is
+    /// only what a caller building its own key set can still hand over.
     #[must_use]
     pub fn intersect<'a>(&self, keys: impl IntoIterator<Item = &'a str>) -> FieldTypes {
         let keys: Vec<&str> = keys.into_iter().collect();
@@ -96,9 +103,8 @@ impl FieldCatalog {
         let mut out = FieldTypes::new();
         for key in keys {
             if collided.contains(&key.to_ascii_uppercase()) {
-                continue;
-            }
-            if let Some(ty) = pins.get(key) {
+                out.insert(key, CanonicalType::Varchar);
+            } else if let Some(ty) = pins.get(key) {
                 out.insert(key, *ty);
             }
         }
@@ -160,28 +166,33 @@ mod tests {
     }
 
     #[test]
-    fn intersect_drops_pins_for_case_collided_keys() {
-        // Both spellings in one snapshot: read_json exposes `duration` and
-        // `Duration_1`, so NEITHER pin can name its own column. Conforming
-        // either would rewrite the other service's values.
+    fn intersect_degrades_case_collided_keys_to_varchar() {
+        // Both spellings in one key set: neither typed pin can name its own
+        // column, so both degrade to the lossless VARCHAR conform. Dropping
+        // them instead would leave the column at read_json's inferred type,
+        // where one union-incompatible pair fails EVERY query.
         let cache = catalog(&[
             ("duration", CanonicalType::BigInt),
             ("Duration", CanonicalType::Varchar),
             ("host", CanonicalType::Varchar),
         ]);
         let pins = cache.intersect(["duration", "Duration", "host"]);
-        assert_eq!(pins.get("duration"), None);
-        assert_eq!(pins.get("Duration"), None);
+        assert_eq!(pins.get("duration"), Some(CanonicalType::Varchar));
+        assert_eq!(pins.get("Duration"), Some(CanonicalType::Varchar));
         assert_eq!(pins.get("host"), Some(CanonicalType::Varchar));
     }
 
     #[test]
-    fn intersect_drops_a_pin_collided_by_an_unpinned_spelling() {
+    fn intersect_degrades_an_unpinned_collided_spelling_too() {
         // The collision does not need two pins: one pinned spelling plus a
         // brand-new event carrying the other spelling is enough to make the
-        // pin bind the wrong column.
+        // pin bind the wrong column — and the unpinned spelling is exactly
+        // the one whose inferred type can throw the union, so it must be
+        // conformed even though the catalog says nothing about it.
         let cache = catalog(&[("Duration", CanonicalType::Varchar)]);
-        assert!(cache.intersect(["Duration", "duration"]).is_empty());
+        let pins = cache.intersect(["Duration", "duration"]);
+        assert_eq!(pins.get("Duration"), Some(CanonicalType::Varchar));
+        assert_eq!(pins.get("duration"), Some(CanonicalType::Varchar));
     }
 
     #[test]

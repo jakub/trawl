@@ -122,8 +122,8 @@ fn replace_list_identifier_folding_is_ascii_only() {
 /// and a `REPLACE` naming either spelling binds the FIRST column. So a pin
 /// applied there conforms the WRONG column — retyping one service's values
 /// while the pinned field's own data sits untouched in `Duration_1`. This is
-/// the execution evidence for `FieldCatalog::intersect` dropping pins whose
-/// spelling collides with another key in the same snapshot.
+/// the execution evidence for the hot buffer merging case-variant keys as it
+/// writes the snapshot, rather than trying to pin either spelling.
 #[test]
 fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
     let dir = tempfile::tempdir().unwrap();
@@ -155,7 +155,7 @@ fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
     );
 
     // Naming the pinned spelling rewrites the OTHER service's column, and
-    // leaves the pinned field's real values (Duration_1) alone.
+    // leaves the pinned field's real values (`Duration_1`) alone.
     let replaced = describe(&format!(
         "SELECT * REPLACE (json_extract_string(to_json(\"Duration\"), '$') AS \"Duration\") \
          FROM {}",
@@ -170,5 +170,100 @@ fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
         ],
         "expected the REPLACE to bind (and retype) the first column, not the \
          pinned spelling's own column"
+    );
+}
+
+/// Two engine assumptions the hot buffer's case-variant merge rests on
+/// (`HotBuffer::build_snapshot`'s `CaseMerge`, ADR-0009 slice 2):
+///
+/// 1. an UNCONFORMED hot column can throw the WHOLE composite source — the
+///    union binds types for every column, so a query whose DSL never names
+///    the field fails too; and
+/// 2. `UNION ALL BY NAME` matches column names case-INSENSITIVELY, and a
+///    `VARCHAR` hot column unions with every cold scalar type.
+///
+/// Together: merging the collided spellings into one column and pinning it
+/// `VARCHAR` is safe under EITHER spelling, while leaving the `_1` twin
+/// unconformed is not.
+#[test]
+fn unconformed_hot_column_throws_the_union_and_varchar_conform_saves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    let cold = dir.path().join("cold.parquet");
+    let mut f = std::fs::File::create(&hot).unwrap();
+    // Mixed values -> JSON, under the OTHER spelling of every cold column.
+    writeln!(
+        f,
+        r#"{{"service":"svc","Duration":"1.5s","Started":1700000000}}"#
+    )
+    .unwrap();
+    writeln!(f, r#"{{"service":"svc","Duration":42,"Started":"x"}}"#).unwrap();
+    f.sync_all().unwrap();
+
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'svc' AS service, '1.5s' AS duration, \
+                      CAST('2024-01-15 09:00:00' AS TIMESTAMP) AS started) \
+         TO '{}' (FORMAT PARQUET)",
+        cold.display()
+    ))
+    .unwrap();
+
+    let union = |replace: &str| {
+        format!(
+            "SELECT * FROM read_parquet('{}') UNION ALL BY NAME SELECT * {replace} FROM {}",
+            cold.display(),
+            hot_reader(&hot)
+        )
+    };
+    let count = |sql: &str| -> Result<usize, duckdb::Error> {
+        // The shape every trawl query has: a filter naming one field, `*` for
+        // the projection. Nothing here mentions the collided field — the
+        // union binds it anyway.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM ({sql}) WHERE service = 'svc' LIMIT 5"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut n = 0;
+        while rows.next()?.is_some() {
+            n += 1;
+        }
+        Ok(n)
+    };
+
+    // Unconformed: cold VARCHAR x hot JSON is irreconcilable, and it takes
+    // the unrelated query down with it.
+    let err = count(&union("")).expect_err("an unconformed hot column must throw the union");
+    assert!(
+        err.to_string().contains("Malformed JSON"),
+        "expected the JSON-vs-VARCHAR union conflict, got: {err}"
+    );
+
+    // Conformed to VARCHAR under the hot spelling: BY NAME folds the case,
+    // so both columns line up and every pair promotes instead of throwing.
+    let replace = "REPLACE (json_extract_string(to_json(\"Duration\"), '$') AS \"Duration\", \
+                   json_extract_string(to_json(\"Started\"), '$') AS \"Started\")";
+    assert_eq!(
+        count(&union(replace)).expect("a VARCHAR hot column must union with any cold type"),
+        3,
+        "the cold row and both hot rows must survive one execution"
+    );
+    assert_eq!(
+        {
+            let mut stmt = conn
+                .prepare(&format!("DESCRIBE {}", union(replace)))
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        },
+        vec![
+            ("service".to_owned(), "VARCHAR".to_owned()),
+            ("duration".to_owned(), "VARCHAR".to_owned()),
+            ("started".to_owned(), "VARCHAR".to_owned()),
+        ],
+        "BY NAME must fold ASCII case (no separate `Duration` column) and \
+         promote the cold TIMESTAMP to VARCHAR rather than throwing"
     );
 }
