@@ -53,7 +53,10 @@ pub struct HotBufferConfig {
 /// that bumps the buffer generation happens AFTER the rename; a
 /// generation-cached pin set would be stale in that window and the union
 /// would hard-error. Intersecting with the observed keys also guarantees
-/// the emitter's `REPLACE` never names a column absent from the snapshot.
+/// the emitter's `REPLACE` never names a column absent from the snapshot —
+/// including the case-collided spellings [`crate::catalog::FieldCatalog::intersect`] drops,
+/// which `read_json` renames out from under their pin (`Duration` becomes
+/// `Duration_1` next to `duration`).
 #[derive(Debug, Clone)]
 pub struct HotSnapshot {
     /// The ndjson snapshot file (shared across concurrent queries).
@@ -267,6 +270,24 @@ impl HotBuffer {
             .flat_map(|batch| batch.events.iter().map(move |e| (&batch.batch_id, e)))
             .collect();
         let (pioneer, keys) = survey_schema(events.iter().map(|(_, e)| *e));
+
+        // Once per generation (this is the cache-miss path), not per query:
+        // colliding spellings are read as `x` + `x_1`, so the field's data is
+        // split across two output columns and its pin is dropped. Silent
+        // otherwise — the queries still succeed, just against half the rows.
+        let collided = crate::catalog::ascii_case_collisions(keys.iter().map(String::as_str));
+        if !collided.is_empty() {
+            let mut names: Vec<&str> = collided.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            tracing::warn!(
+                event_type = "hot_buffer_case_collision",
+                fields = ?names,
+                "hot buffer holds field names differing only in ASCII case; DuckDB \
+                 cannot tell them apart, so each splits into two columns and its \
+                 catalog pin is not applied — normalise the field-name casing at \
+                 the source"
+            );
+        }
 
         let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
         let mut wrote_any = false;
@@ -616,6 +637,54 @@ mod tests {
             "a pin on a field no event carries must not reach the emitter"
         );
         assert_eq!(snap.field_types.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_field_types_drops_case_collided_keys() {
+        // Two services disagreeing on field-name casing put both spellings
+        // in one snapshot. DuckDB reads them as `duration` + `Duration_1`,
+        // so neither pin names its own column and a REPLACE on either would
+        // retype the other service's values (duckdb_probe.rs). The pins must
+        // not reach the emitter at all; unrelated pins are unaffected.
+        use trawl_core::schema::CanonicalType;
+
+        let catalog = Arc::new(crate::catalog::FieldCatalog::new());
+        catalog.replace([
+            ("duration".to_string(), CanonicalType::BigInt),
+            ("Duration".to_string(), CanonicalType::Varchar),
+            ("host".to_string(), CanonicalType::Varchar),
+        ]);
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog));
+
+        let event = |field: &str, value: serde_json::Value| {
+            let mut ev = serde_json::Map::new();
+            ev.insert("service".into(), serde_json::Value::String("svc".into()));
+            ev.insert("host".into(), serde_json::Value::String("h1".into()));
+            ev.insert(field.into(), value);
+            ev
+        };
+        buf.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc-a".into(),
+            byte_size: 100,
+            events: vec![
+                event("duration", serde_json::Value::from(410)),
+                event("Duration", serde_json::Value::String("slow".into())),
+            ],
+        }));
+
+        let snap = buf.snapshot().expect("should have events");
+        assert_eq!(snap.field_types.get("duration"), None);
+        assert_eq!(snap.field_types.get("Duration"), None);
+        assert_eq!(
+            snap.field_types.get("host"),
+            Some(CanonicalType::Varchar),
+            "an uncollided pin must still be conformed"
+        );
     }
 
     #[test]

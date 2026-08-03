@@ -116,3 +116,59 @@ fn replace_list_identifier_folding_is_ascii_only() {
         );
     }
 }
+
+/// A snapshot carrying BOTH spellings of one field is not two nameable
+/// columns: `read_json` renames the collided key (`duration` + `Duration_1`),
+/// and a `REPLACE` naming either spelling binds the FIRST column. So a pin
+/// applied there conforms the WRONG column — retyping one service's values
+/// while the pinned field's own data sits untouched in `Duration_1`. This is
+/// the execution evidence for `FieldCatalog::intersect` dropping pins whose
+/// spelling collides with another key in the same snapshot.
+#[test]
+fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("hot.ndjson");
+    let mut f = std::fs::File::create(&file).unwrap();
+    writeln!(f, r#"{{"duration":410,"x":1}}"#).unwrap();
+    writeln!(f, r#"{{"Duration":"slow","x":2}}"#).unwrap();
+    f.sync_all().unwrap();
+
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let describe = |sql: &str| -> Vec<(String, String)> {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {sql}")).unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+
+    // The second spelling is not its own name: it comes back suffixed.
+    let plain = describe(&format!("SELECT * FROM {}", hot_reader(&file)));
+    assert_eq!(
+        plain,
+        vec![
+            ("duration".to_owned(), "BIGINT".to_owned()),
+            ("x".to_owned(), "BIGINT".to_owned()),
+            ("Duration_1".to_owned(), "VARCHAR".to_owned()),
+        ],
+        "expected read_json to rename the case-collided key"
+    );
+
+    // Naming the pinned spelling rewrites the OTHER service's column, and
+    // leaves the pinned field's real values (Duration_1) alone.
+    let replaced = describe(&format!(
+        "SELECT * REPLACE (json_extract_string(to_json(\"Duration\"), '$') AS \"Duration\") \
+         FROM {}",
+        hot_reader(&file)
+    ));
+    assert_eq!(
+        replaced,
+        vec![
+            ("Duration".to_owned(), "VARCHAR".to_owned()),
+            ("x".to_owned(), "BIGINT".to_owned()),
+            ("Duration_1".to_owned(), "VARCHAR".to_owned()),
+        ],
+        "expected the REPLACE to bind (and retype) the first column, not the \
+         pinned spelling's own column"
+    );
+}

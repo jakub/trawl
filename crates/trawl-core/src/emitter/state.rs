@@ -235,6 +235,14 @@ fn conform_untyped(quoted: &str, pin: crate::schema::CanonicalType) -> String {
 /// other variant's values to NULL. Pins colliding with a `TIMESTAMP_COLUMNS`
 /// entry drop out entirely: those already carry an unconditional `TRY_CAST`.
 ///
+/// This is the last line of defence, not the policy: a caller that knows the
+/// hot source's key set drops colliding pins BEFORE emit (the server's
+/// `FieldCatalog::intersect`), because a snapshot carrying both spellings is
+/// read as `x` + `x_1` and any surviving entry would conform whichever
+/// column `DuckDB` binds first — not necessarily the pinned field's own.
+/// The fold keeps catalog-less and key-set-less callers out of the parse
+/// error regardless.
+///
 /// Returned in identifier order, so the emitted SQL stays deterministic.
 fn fold_case_variants(
     pins: &crate::schema::FieldTypes,
