@@ -584,7 +584,7 @@ const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// they reach `read_parquet`, where they otherwise surface as
 /// "File ... too small to be a Parquet file" and wedge the rollup forever
 /// — no amount of retrying repairs a truncated file.
-fn is_valid_parquet(path: &Path) -> bool {
+pub(crate) fn is_valid_parquet(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
 
     let Ok(mut file) = std::fs::File::open(path) else {

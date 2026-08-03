@@ -781,6 +781,75 @@ mod boot {
         );
     }
 
+    /// One unreadable or foreign `.parquet` under the data root must never
+    /// take trawld's boot down with it: the pass isolates it per file
+    /// (skip + warn + count), conforms everything else, and — because the
+    /// corpus was not proven conformant — withholds completion so the next
+    /// boot re-runs. Once the bad file is gone, the pass completes normally.
+    #[sqlx::test]
+    async fn unreadable_files_are_skipped_not_boot_fatal(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (majority, minority) = plant_disagreeing_corpus(&data_dir);
+
+        // Fails the magic-byte sniff outright (a non-trawl file dropped in,
+        // or a zero-fill from a disk-full event).
+        let junk = data_dir.join("prod/2026-08-01/12/junk.parquet");
+        std::fs::create_dir_all(junk.parent().unwrap()).unwrap();
+        std::fs::write(&junk, b"not a parquet file at all").unwrap();
+        // Passes the sniff (PAR1 bookends) but `read_parquet` cannot parse
+        // it: bogus footer length, i.e. bit rot in the footer.
+        let unreadable = data_dir.join("prod/2026-08-01/13/rotted.parquet");
+        std::fs::create_dir_all(unreadable.parent().unwrap()).unwrap();
+        std::fs::write(&unreadable, b"PAR1\xff\xff\xff\xffPAR1").unwrap();
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("a bad file must not fail the boot pass");
+        assert!(summary.ran);
+        assert_eq!(summary.skipped, 2, "both bad files are skipped, not fatal");
+        assert_eq!(summary.scanned, 2, "only the readable corpus is scanned");
+        assert_eq!(
+            summary.rewritten, 1,
+            "the readable minority file still gets conformed"
+        );
+        assert_eq!(column_type(&minority, "duration"), "BIGINT");
+        assert_eq!(column_type(&majority, "duration"), "BIGINT");
+
+        // Skipped means untouched — the boot pass never moves or rewrites a
+        // file it could not read.
+        assert_eq!(std::fs::read(&junk).unwrap(), b"not a parquet file at all");
+        assert_eq!(
+            std::fs::read(&unreadable).unwrap(),
+            b"PAR1\xff\xff\xff\xffPAR1"
+        );
+
+        // Completion is withheld: no marker, and the next boot re-runs.
+        assert!(
+            !data_dir.join("CATALOG").exists(),
+            "an unproven corpus must not publish the conformance identity"
+        );
+        let again = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(again.ran, "skipped files force a re-run on the next boot");
+        assert_eq!(again.skipped, 2);
+        assert_eq!(again.rewritten, 0, "the readable corpus already conforms");
+
+        // Operator removes the bad files → the pass completes and publishes.
+        std::fs::remove_file(&junk).unwrap();
+        std::fs::remove_file(&unreadable).unwrap();
+        let clean = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(clean.ran);
+        assert_eq!(clean.skipped, 0);
+        let marker = std::fs::read_to_string(data_dir.join("CATALOG")).unwrap();
+        assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
+    }
+
     /// Wiring: server boot itself runs the conformance pass — pins land in
     /// the process cache and one query returns the full corrected corpus,
     /// without this test ever calling `ensure_conformance`.

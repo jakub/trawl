@@ -35,6 +35,7 @@ pub const WAL_BYTES: &str = "trawl_wal_bytes";
 pub const CATALOG_CONFLICTS_TOTAL: &str = "trawl_catalog_conflicts_total";
 pub const CATALOG_ROWS_NULLED_TOTAL: &str = "trawl_catalog_rows_nulled_total";
 pub const CATALOG_CONFORM_REWRITES_TOTAL: &str = "trawl_catalog_conform_rewrites_total";
+pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_total";
 
 // -- description registration ------------------------------------------------
 
@@ -98,6 +99,12 @@ pub fn describe_metrics() {
         CATALOG_CONFORM_REWRITES_TOTAL,
         "Parquet files rewritten by the boot conformance pass to match the \
          field catalog"
+    );
+    describe_counter!(
+        CATALOG_CONFORM_SKIPPED_TOTAL,
+        "Parquet files the boot conformance pass could not read (truncated, \
+         bit-rotted, or foreign) and skipped; they stay outside the catalog \
+         invariant and the pass re-runs on the next boot"
     );
 }
 

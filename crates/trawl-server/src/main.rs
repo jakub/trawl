@@ -171,7 +171,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // over the standing corpus before anything reads or writes it. Only on
     // ingest-enabled nodes (a query-only node does not own the data root).
     // Fatal on failure, like the epoch gate — a data root not proven
-    // conformant must not serve queries.
+    // conformant must not serve queries. Per-file failures are NOT that:
+    // an unreadable or foreign parquet file is skipped and counted inside
+    // the pass, so one bad file cannot keep the daemon down.
     if config.ingest.enabled {
         let summary = trawl_server::catalog::conform::ensure_conformance(
             &state.storage.catalog,
@@ -185,6 +187,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             ran = summary.ran,
             scanned = summary.scanned,
             rewritten = summary.rewritten,
+            skipped = summary.skipped,
             "boot conformance pass finished"
         );
     }

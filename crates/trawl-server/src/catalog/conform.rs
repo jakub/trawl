@@ -19,6 +19,15 @@
 //! crash mid-pass leaves unrewritten files to be redetected on the next
 //! boot (every rewrite is staged + atomically renamed).
 //!
+//! Per-file failures are isolated, never boot-fatal: a truncated, bit-rotted
+//! or foreign `.parquet` under the data root is skipped with a warning and a
+//! `trawl_catalog_conform_skipped_total` bump, exactly like the rollup path
+//! sniffs and sets aside unreadable inputs rather than wedging. Nothing is
+//! moved or deleted (an operator's stray file is theirs), and because the
+//! corpus was then NOT proven conformant, completion is deliberately not
+//! published — the next boot re-runs the pass, so a transient read failure
+//! self-heals and a permanent one keeps warning.
+//!
 //! This machinery is deliberately the embryo of the repin rewriter (#53).
 
 use std::collections::HashMap;
@@ -27,7 +36,9 @@ use std::path::{Path, PathBuf};
 use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb_type};
 
 use super::FieldCatalog;
-use crate::ingest::compaction::{ColInfo, conform_expr, describe_source, quote_ident};
+use crate::ingest::compaction::{
+    ColInfo, conform_expr, describe_source, is_valid_parquet, quote_ident,
+};
 use crate::store::{CatalogStore, FieldConflict, PinProposal};
 
 /// Marker file mirroring `catalog_state.catalog_id` into the data root.
@@ -45,6 +56,9 @@ pub struct ConformSummary {
     pub scanned: usize,
     /// Files rewritten to conform.
     pub rewritten: usize,
+    /// Files skipped as unreadable or foreign (nonzero = the corpus was not
+    /// proven conformant, so completion is withheld and the next boot re-runs).
+    pub skipped: usize,
 }
 
 /// One scanned parquet file.
@@ -82,6 +96,7 @@ pub async fn ensure_conformance(
             ran: false,
             scanned: 0,
             rewritten: 0,
+            skipped: 0,
         });
     }
 
@@ -93,7 +108,7 @@ pub async fn ensure_conformance(
     );
 
     // Phase A (blocking): enumerate + describe the corpus.
-    let scan = {
+    let (scan, scan_skipped) = {
         let data_dir = data_dir.to_path_buf();
         let memory_limit = memory_limit.to_owned();
         tokio::task::spawn_blocking(move || scan_corpus(&data_dir, &memory_limit))
@@ -123,7 +138,7 @@ pub async fn ensure_conformance(
 
     // Phase B (blocking): rewrite the nonconforming files.
     let scanned = scan.len();
-    let (rewritten, conflicts) = {
+    let (rewritten, rewrite_skipped, conflicts) = {
         let data_dir = data_dir.to_path_buf();
         let memory_limit = memory_limit.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -132,6 +147,7 @@ pub async fn ensure_conformance(
         .await
         .map_err(|e| format!("conformance rewrite task panicked: {e}"))??
     };
+    let skipped = scan_skipped + rewrite_skipped;
 
     record_boot_conflicts(store, &conflicts).await;
     if rewritten > 0 {
@@ -139,17 +155,33 @@ pub async fn ensure_conformance(
             .increment(rewritten as u64);
     }
 
-    // Publish completion LAST: postgres side, then the marker file.
-    store
-        .mark_conformed()
-        .await
-        .map_err(|e| format!("failed to record conformance completion: {e}"))?;
-    publish_marker(data_dir, &catalog_id)?;
+    // Publish completion LAST: postgres side, then the marker file — and
+    // only when every file was accounted for. Skipped files mean the corpus
+    // is not proven conformant, so the identity stays unpublished and the
+    // next boot re-runs the pass rather than declaring victory forever.
+    if skipped == 0 {
+        store
+            .mark_conformed()
+            .await
+            .map_err(|e| format!("failed to record conformance completion: {e}"))?;
+        publish_marker(data_dir, &catalog_id)?;
+    } else {
+        tracing::warn!(
+            event_type = "catalog_conform_incomplete",
+            scanned,
+            rewritten,
+            skipped,
+            "boot conformance pass skipped unreadable or foreign parquet files; \
+             the corpus is not proven conformant and the pass will re-run on the \
+             next boot — inspect the skipped files (queries touching them error)"
+        );
+    }
 
     tracing::info!(
         event_type = "catalog_conform_complete",
         scanned,
         rewritten,
+        skipped,
         conflicts = conflicts.len(),
         "boot conformance pass complete"
     );
@@ -158,7 +190,27 @@ pub async fn ensure_conformance(
         ran: true,
         scanned,
         rewritten,
+        skipped,
     })
+}
+
+/// Isolate one bad file: warn, count, leave it exactly where it is.
+///
+/// Deliberately not the rollup's quarantine-rename — the rollup MUST move a
+/// corrupt input aside or it re-reads it forever, whereas the boot pass just
+/// declines to touch what it cannot read. Renaming an operator's file at boot
+/// would be a destructive surprise on a path (foreign parquet dropped into
+/// the tree) where the honest answer is "not mine".
+fn skip_file(path: &Path, phase: &str, error: &str) {
+    metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL).increment(1);
+    tracing::warn!(
+        event_type = "catalog_conform_skip",
+        file = %path.display(),
+        phase,
+        error,
+        "unreadable or foreign parquet file skipped by the boot conformance \
+         pass; it is left untouched and remains outside the catalog invariant"
+    );
 }
 
 /// Record boot-pass conflict evidence: `field_conflicts` rows (best
@@ -239,39 +291,57 @@ fn open_bounded_connection(
 }
 
 /// Enumerate every parquet file under the data root (hourly + daily
-/// rollups, skipping `scheduled/`) and describe each.
-fn scan_corpus(data_dir: &Path, memory_limit: &str) -> Result<Vec<FileScan>, String> {
+/// rollups, skipping `scheduled/`) and describe each. Returns the readable
+/// files plus the count of files skipped as unreadable or foreign — one bad
+/// file must never take the daemon's boot down with it.
+fn scan_corpus(data_dir: &Path, memory_limit: &str) -> Result<(Vec<FileScan>, usize), String> {
     let files = crate::metrics::walk_parquet_files(data_dir)
         .map_err(|e| format!("failed to walk data root: {e}"))?;
     if files.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
     let mut out = Vec::with_capacity(files.len());
+    let mut skipped = 0usize;
     for (path, _) in files {
-        let safe = path.to_string_lossy().replace('\'', "''");
-        let schema = describe_source(&conn, &format!("SELECT * FROM read_parquet('{safe}')"))?;
-        let rows: i64 = conn
-            .query_row(
-                &format!("SELECT count(*)::BIGINT FROM read_parquet('{safe}')"),
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("row count failed for {}: {e}", path.display()))?;
-        let service = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_owned();
-        out.push(FileScan {
-            path,
-            service,
-            rows: u64::try_from(rows).unwrap_or(0),
-            schema,
-        });
+        match scan_file(&conn, path.clone()) {
+            Ok(scan) => out.push(scan),
+            Err(e) => {
+                skipped += 1;
+                skip_file(&path, "scan", &e);
+            }
+        }
     }
-    Ok(out)
+    Ok((out, skipped))
+}
+
+/// Describe one parquet file: magic-byte sniff first (the cheap catch for a
+/// truncated or non-parquet file), then schema + row count.
+fn scan_file(conn: &duckdb::Connection, path: PathBuf) -> Result<FileScan, String> {
+    if !is_valid_parquet(&path) {
+        return Err("not a parquet file (magic-byte sniff failed)".to_owned());
+    }
+    let safe = path.to_string_lossy().replace('\'', "''");
+    let schema = describe_source(conn, &format!("SELECT * FROM read_parquet('{safe}')"))?;
+    let rows: i64 = conn
+        .query_row(
+            &format!("SELECT count(*)::BIGINT FROM read_parquet('{safe}')"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("row count failed: {e}"))?;
+    let service = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    Ok(FileScan {
+        path,
+        service,
+        rows: u64::try_from(rows).unwrap_or(0),
+        schema,
+    })
 }
 
 /// The canonical type a standing parquet column proposes at boot.
@@ -334,110 +404,135 @@ fn most_rows_wins(
 }
 
 /// Rewrite every file whose columns disagree with the pins: `TRY_CAST` to
-/// the pin, staged `.tmp` write, atomic rename. Returns the rewrite count
-/// and the conflict evidence.
+/// the pin, staged `.tmp` write, atomic rename. Returns the rewrite count,
+/// the count of files skipped because their rewrite failed, and the conflict
+/// evidence. A file whose footer described cleanly can still be unreadable
+/// further in (corrupt page, bit rot) — that is one skipped file, not a
+/// refusal to boot.
 fn rewrite_nonconforming(
     scan: &[FileScan],
     pins: &HashMap<String, CanonicalType>,
     data_dir: &Path,
     memory_limit: &str,
-) -> Result<(usize, Vec<FieldConflict>), String> {
+) -> Result<(usize, usize, Vec<FieldConflict>), String> {
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
     let mut rewritten = 0usize;
+    let mut skipped = 0usize;
     let mut conflicts: Vec<FieldConflict> = Vec::new();
 
     for file in scan {
-        struct CastEntry {
-            name: String,
-            dtype: String,
-            pin: CanonicalType,
-            expr: String,
-        }
-        let mut select_list: Vec<String> = Vec::with_capacity(file.schema.len());
-        let mut casts: Vec<CastEntry> = Vec::new();
-        let mut has_time = false;
-        for col in &file.schema {
-            if col.name == trawl_core::schema::TIME {
-                has_time = true;
+        match rewrite_file(&conn, file, pins) {
+            Ok(None) => {}
+            Ok(Some(found)) => {
+                rewritten += 1;
+                conflicts.extend(found);
             }
-            let quoted = quote_ident(&col.name);
-            match pins.get(&col.name).copied() {
-                None => select_list.push(quoted), // unpinnable? pins cover all scanned fields
-                Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
-                    None => select_list.push(quoted),
-                    Some(expr) => {
-                        select_list.push(format!("{expr} AS {quoted}"));
-                        casts.push(CastEntry {
-                            name: col.name.clone(),
-                            dtype: col.dtype.clone(),
-                            pin,
-                            expr,
-                        });
-                    }
-                },
-            }
-        }
-        if casts.is_empty() {
-            continue;
-        }
-
-        let safe = file.path.to_string_lossy().replace('\'', "''");
-        // Tally the nulled rows before rewriting.
-        let stats_sql = format!(
-            "SELECT {} FROM read_parquet('{safe}')",
-            casts
-                .iter()
-                .map(|c| {
-                    let q = quote_ident(&c.name);
-                    format!("count({q})::BIGINT, count({})::BIGINT", c.expr)
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let stats: Vec<(i64, i64)> = conn
-            .query_row(&stats_sql, [], |row| {
-                let mut out = Vec::with_capacity(casts.len());
-                for i in 0..casts.len() {
-                    out.push((row.get::<_, i64>(2 * i)?, row.get::<_, i64>(2 * i + 1)?));
-                }
-                Ok(out)
-            })
-            .map_err(|e| format!("conform stats failed for {}: {e}", file.path.display()))?;
-
-        let order = if has_time { " ORDER BY \"_time\"" } else { "" };
-        let tmp = file.path.with_extension("parquet.tmp");
-        conn.execute_batch(&format!(
-            "COPY (SELECT {} FROM read_parquet('{safe}'){order}) TO '{}' \
-             (FORMAT PARQUET, COMPRESSION SNAPPY, \
-              BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
-            select_list.join(", "),
-            tmp.to_string_lossy().replace('\'', "''"),
-        ))
-        .map_err(|e| format!("conform rewrite failed for {}: {e}", file.path.display()))?;
-        std::fs::rename(&tmp, &file.path)
-            .map_err(|e| format!("conform rename failed for {}: {e}", file.path.display()))?;
-        rewritten += 1;
-        tracing::info!(
-            event_type = "catalog_conform_rewrite",
-            file = %file.path.display(),
-            columns = casts.len(),
-            "rewrote nonconforming parquet file to match the catalog"
-        );
-
-        for (cast, (non_null, ok)) in casts.iter().zip(&stats) {
-            let rows_nulled = u64::try_from(non_null - ok).unwrap_or(0);
-            if *non_null > 0 && (cast.dtype != "JSON" || rows_nulled > 0) {
-                conflicts.push(FieldConflict {
-                    field: cast.name.clone(),
-                    service: file.service.clone(),
-                    observed_type: cast.dtype.clone(),
-                    expected_type: cast.pin,
-                    rows_nulled,
-                });
+            Err(e) => {
+                skipped += 1;
+                // Best effort: drop the staged rewrite so a retry starts clean.
+                let _ = std::fs::remove_file(file.path.with_extension("parquet.tmp"));
+                skip_file(&file.path, "rewrite", &e);
             }
         }
     }
 
-    Ok((rewritten, conflicts))
+    Ok((rewritten, skipped, conflicts))
+}
+
+/// Conform one file. `Ok(None)` = it already agreed with every pin.
+fn rewrite_file(
+    conn: &duckdb::Connection,
+    file: &FileScan,
+    pins: &HashMap<String, CanonicalType>,
+) -> Result<Option<Vec<FieldConflict>>, String> {
+    struct CastEntry {
+        name: String,
+        dtype: String,
+        pin: CanonicalType,
+        expr: String,
+    }
+    let mut select_list: Vec<String> = Vec::with_capacity(file.schema.len());
+    let mut casts: Vec<CastEntry> = Vec::new();
+    let mut has_time = false;
+    for col in &file.schema {
+        if col.name == trawl_core::schema::TIME {
+            has_time = true;
+        }
+        let quoted = quote_ident(&col.name);
+        match pins.get(&col.name).copied() {
+            None => select_list.push(quoted), // unpinnable? pins cover all scanned fields
+            Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
+                None => select_list.push(quoted),
+                Some(expr) => {
+                    select_list.push(format!("{expr} AS {quoted}"));
+                    casts.push(CastEntry {
+                        name: col.name.clone(),
+                        dtype: col.dtype.clone(),
+                        pin,
+                        expr,
+                    });
+                }
+            },
+        }
+    }
+    if casts.is_empty() {
+        return Ok(None);
+    }
+
+    let safe = file.path.to_string_lossy().replace('\'', "''");
+    // Tally the nulled rows before rewriting.
+    let stats_sql = format!(
+        "SELECT {} FROM read_parquet('{safe}')",
+        casts
+            .iter()
+            .map(|c| {
+                let q = quote_ident(&c.name);
+                format!("count({q})::BIGINT, count({})::BIGINT", c.expr)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let stats: Vec<(i64, i64)> = conn
+        .query_row(&stats_sql, [], |row| {
+            let mut out = Vec::with_capacity(casts.len());
+            for i in 0..casts.len() {
+                out.push((row.get::<_, i64>(2 * i)?, row.get::<_, i64>(2 * i + 1)?));
+            }
+            Ok(out)
+        })
+        .map_err(|e| format!("conform stats failed: {e}"))?;
+
+    let order = if has_time { " ORDER BY \"_time\"" } else { "" };
+    let tmp = file.path.with_extension("parquet.tmp");
+    conn.execute_batch(&format!(
+        "COPY (SELECT {} FROM read_parquet('{safe}'){order}) TO '{}' \
+         (FORMAT PARQUET, COMPRESSION SNAPPY, \
+          BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
+        select_list.join(", "),
+        tmp.to_string_lossy().replace('\'', "''"),
+    ))
+    .map_err(|e| format!("conform rewrite failed: {e}"))?;
+    std::fs::rename(&tmp, &file.path).map_err(|e| format!("conform rename failed: {e}"))?;
+    tracing::info!(
+        event_type = "catalog_conform_rewrite",
+        file = %file.path.display(),
+        columns = casts.len(),
+        "rewrote nonconforming parquet file to match the catalog"
+    );
+
+    let mut conflicts = Vec::new();
+    for (cast, (non_null, ok)) in casts.iter().zip(&stats) {
+        let rows_nulled = u64::try_from(non_null - ok).unwrap_or(0);
+        if *non_null > 0 && (cast.dtype != "JSON" || rows_nulled > 0) {
+            conflicts.push(FieldConflict {
+                field: cast.name.clone(),
+                service: file.service.clone(),
+                observed_type: cast.dtype.clone(),
+                expected_type: cast.pin,
+                rows_nulled,
+            });
+        }
+    }
+    Ok(Some(conflicts))
 }
