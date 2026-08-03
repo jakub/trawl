@@ -8,9 +8,7 @@
 //!
 //! Runs inline at boot — after the storage epoch gate, before the ingest
 //! pipeline and HTTP serving — and only on ingest-enabled nodes (a
-//! query-only node does not own the data root). Bounded by a post-cutover
-//! corpus days old (#52 moved the legacy root aside), and usually zero
-//! rewrites.
+//! query-only node does not own the data root).
 //!
 //! Identity is dual-sided: `catalog_state.catalog_id` in postgres is
 //! mirrored into a `data/CATALOG` marker file. The pass is skipped only
@@ -18,6 +16,23 @@
 //! restored from backup shows up as a mismatch and forces a re-run. A
 //! crash mid-pass leaves unrewritten files to be redetected on the next
 //! boot (every rewrite is staged + atomically renamed).
+//!
+//! Cost, since the pass sits in front of HTTP serving and a re-arm can hit
+//! a corpus of any age (the first boot after upgrade is small — #52 moved
+//! the legacy root aside — but a lost marker, a restored data root or a
+//! recreated `trawl` database re-arms it over the whole standing corpus):
+//! the scan is deliberately **metadata-only unless a column still needs a
+//! pin vote**. Describing a file reads its footer; counting a column reads
+//! the column. Only UNPINNED fields vote (`most_rows_wins` ignores the
+//! pinned ones), so pins are loaded BEFORE the scan and the count query is
+//! narrowed to the voting columns — and skipped entirely for a file whose
+//! every field is already pinned. A re-arm against a catalog that already
+//! pins the corpus (the common one: the data and the catalog were always a
+//! pair) therefore costs one footer read per file, not one corpus read.
+//! Both phases emit a `catalog_conform_progress` heartbeat so a long pass
+//! is visibly working rather than indistinguishable from a hang, and every
+//! rewrite is durable on its own, so a boot killed by a supervisor's start
+//! timeout leaves the corpus strictly closer to conformant than it found it.
 //!
 //! Per-file failures are isolated, never boot-fatal: a truncated, bit-rotted
 //! or foreign `.parquet` under the data root is skipped with a warning and a
@@ -70,7 +85,72 @@ struct FileScan {
     /// This — not the file's total row count — is a column's voting weight:
     /// a column that is 99.9% NULL in a huge file describes almost nothing
     /// and must not outvote the same field fully populated elsewhere.
+    ///
+    /// Zero for an already-pinned column: it holds no vote (`most_rows_wins`
+    /// skips it), so the count is never read and deliberately never taken —
+    /// counting it would read the column off disk for a number nothing uses.
     non_null: Vec<u64>,
+}
+
+/// Heartbeat interval for the per-phase progress log.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-phase progress heartbeat.
+///
+/// The pass blocks HTTP serving, so a long one must be visibly making
+/// progress: without this, an operator watching a multi-thousand-file
+/// corpus cannot tell a working boot from a wedged one (and a supervisor
+/// start timeout looks identical to both).
+struct Progress {
+    phase: &'static str,
+    total: usize,
+    done: usize,
+    started: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl Progress {
+    fn new(phase: &'static str, total: usize) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            phase,
+            total,
+            done: 0,
+            started: now,
+            last: now,
+        }
+    }
+
+    /// Count one file, logging at most once per [`PROGRESS_INTERVAL`].
+    fn tick(&mut self) {
+        self.done += 1;
+        if self.last.elapsed() < PROGRESS_INTERVAL {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        tracing::info!(
+            event_type = "catalog_conform_progress",
+            phase = self.phase,
+            done = self.done,
+            total = self.total,
+            elapsed_secs = self.started.elapsed().as_secs(),
+            "boot conformance pass in progress (HTTP serving starts when it completes)"
+        );
+    }
+}
+
+/// Load the catalog's pins and mirror them into the in-process cache the
+/// query path reads.
+async fn hydrate(
+    store: &CatalogStore,
+    cache: &FieldCatalog,
+) -> Result<Vec<(String, CanonicalType)>, String> {
+    let pins = store
+        .load_pins()
+        .await
+        .map_err(|e| format!("failed to load pins: {e}"))?;
+    cache.replace(pins.clone());
+    Ok(pins)
 }
 
 /// Run the boot conformance pass unless the dual-sided identity says it
@@ -91,11 +171,7 @@ pub async fn ensure_conformance(
         .map_err(|e| format!("failed to read conformance state: {e}"))?;
     if conformed && read_marker(data_dir).as_deref() == Some(catalog_id.as_str()) {
         // Still hydrate the cache — skipping the pass must not skip pins.
-        let pins = store
-            .load_pins()
-            .await
-            .map_err(|e| format!("failed to load pins: {e}"))?;
-        cache.replace(pins);
+        hydrate(store, cache).await?;
         return Ok(ConformSummary {
             ran: false,
             scanned: 0,
@@ -111,11 +187,22 @@ pub async fn ensure_conformance(
          catalog/data-root identity mismatch)"
     );
 
+    // Pins BEFORE the scan, not after: they are what makes the scan cheap.
+    // An already-pinned field never votes, so its column is never counted —
+    // and a file with no unpinned field is described from its footer alone.
+    let existing: HashMap<String, CanonicalType> = store
+        .load_pins()
+        .await
+        .map_err(|e| format!("failed to load pins: {e}"))?
+        .into_iter()
+        .collect();
+
     // Phase A (blocking): enumerate + describe the corpus.
     let (scan, scan_skipped) = {
         let data_dir = data_dir.to_path_buf();
         let memory_limit = memory_limit.to_owned();
-        tokio::task::spawn_blocking(move || scan_corpus(&data_dir, &memory_limit))
+        let pinned = existing.clone();
+        tokio::task::spawn_blocking(move || scan_corpus(&data_dir, &memory_limit, &pinned))
             .await
             .map_err(|e| format!("conformance scan task panicked: {e}"))??
     };
@@ -123,23 +210,12 @@ pub async fn ensure_conformance(
     // Seed pins: declared fields came with the migration; custom fields by
     // most-rows-wins across files — rows CARRYING the field, not the files'
     // row counts — ties by ladder order.
-    let existing: HashMap<String, CanonicalType> = store
-        .load_pins()
-        .await
-        .map_err(|e| format!("failed to load pins: {e}"))?
-        .into_iter()
-        .collect();
     let proposals = most_rows_wins(&scan, &existing);
     store
         .pin_missing(&proposals)
         .await
         .map_err(|e| format!("failed to seed pins: {e}"))?;
-    let pins: Vec<(String, CanonicalType)> = store
-        .load_pins()
-        .await
-        .map_err(|e| format!("failed to load pins: {e}"))?;
-    cache.replace(pins.clone());
-    let pins: HashMap<String, CanonicalType> = pins.into_iter().collect();
+    let pins: HashMap<String, CanonicalType> = hydrate(store, cache).await?.into_iter().collect();
 
     // Phase B (blocking): rewrite the nonconforming files.
     let scanned = scan.len();
@@ -299,7 +375,11 @@ fn open_bounded_connection(
 /// rollups, skipping `scheduled/`) and describe each. Returns the readable
 /// files plus the count of files skipped as unreadable or foreign — one bad
 /// file must never take the daemon's boot down with it.
-fn scan_corpus(data_dir: &Path, memory_limit: &str) -> Result<(Vec<FileScan>, usize), String> {
+fn scan_corpus(
+    data_dir: &Path,
+    memory_limit: &str,
+    pinned: &HashMap<String, CanonicalType>,
+) -> Result<(Vec<FileScan>, usize), String> {
     let files = crate::metrics::walk_parquet_files(data_dir)
         .map_err(|e| format!("failed to walk data root: {e}"))?;
     if files.is_empty() {
@@ -307,34 +387,49 @@ fn scan_corpus(data_dir: &Path, memory_limit: &str) -> Result<(Vec<FileScan>, us
     }
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
+    // Announce the corpus size up front: the one number that tells an
+    // operator (and a supervisor start-timeout budget) what this boot is in for.
+    tracing::info!(
+        event_type = "catalog_conform_scan_start",
+        files = files.len(),
+        pinned_fields = pinned.len(),
+        "boot conformance pass scanning the corpus"
+    );
+    let mut progress = Progress::new("scan", files.len());
+
     let mut out = Vec::with_capacity(files.len());
     let mut skipped = 0usize;
     for (path, _) in files {
-        match scan_file(&conn, path.clone()) {
+        match scan_file(&conn, path.clone(), pinned) {
             Ok(scan) => out.push(scan),
             Err(e) => {
                 skipped += 1;
                 skip_file(&path, "scan", &e);
             }
         }
+        progress.tick();
     }
     Ok((out, skipped))
 }
 
 /// Describe one parquet file: magic-byte sniff first (the cheap catch for a
-/// truncated or non-parquet file), then schema + per-column non-null counts.
+/// truncated or non-parquet file), then the schema, then — only if some
+/// column still needs a pin vote — that column's non-null count.
 ///
-/// One `count(<col>)` per column rather than a single `count(*)`: the counts
-/// weight the pin vote, and a column's weight must be the rows that actually
-/// carry a value for it (parquet keeps per-column null counts in the footer,
-/// so this stays a metadata read).
-fn scan_file(conn: &duckdb::Connection, path: PathBuf) -> Result<FileScan, String> {
+/// One `count(<col>)` per voting column rather than a single `count(*)`: the
+/// counts weight the pin vote, and a column's weight must be the rows that
+/// actually carry a value for it.
+fn scan_file(
+    conn: &duckdb::Connection,
+    path: PathBuf,
+    pinned: &HashMap<String, CanonicalType>,
+) -> Result<FileScan, String> {
     if !is_valid_parquet(&path) {
         return Err("not a parquet file (magic-byte sniff failed)".to_owned());
     }
     let safe = path.to_string_lossy().replace('\'', "''");
     let schema = describe_source(conn, &format!("SELECT * FROM read_parquet('{safe}')"))?;
-    let non_null = count_non_null(conn, &safe, &schema)?;
+    let non_null = count_non_null(conn, &safe, &schema, &voting_columns(&schema, pinned))?;
     let service = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -348,31 +443,59 @@ fn scan_file(conn: &duckdb::Connection, path: PathBuf) -> Result<FileScan, Strin
     })
 }
 
+/// Schema indices whose non-null count is worth reading: the columns whose
+/// field is not pinned yet, i.e. exactly the ones that get a vote in
+/// [`most_rows_wins`].
+///
+/// A pinned field's count is dead weight — `most_rows_wins` skips it, and
+/// paying for it means reading the column off disk for every file in the
+/// corpus. When this comes back empty (a catalog that already pins every
+/// field the file carries), the file is described from its footer and never
+/// read at all.
+fn voting_columns(schema: &[ColInfo], pinned: &HashMap<String, CanonicalType>) -> Vec<usize> {
+    schema
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !pinned.contains_key(&c.name))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Non-null row count per column, positionally parallel to `schema`.
+///
+/// Only `voting` indices are counted; every other position is 0 and must
+/// not be read as evidence (see [`FileScan::non_null`]).
 fn count_non_null(
     conn: &duckdb::Connection,
     safe_path: &str,
     schema: &[ColInfo],
+    voting: &[usize],
 ) -> Result<Vec<u64>, String> {
-    if schema.is_empty() {
-        return Ok(Vec::new());
+    let mut out = vec![0u64; schema.len()];
+    if voting.is_empty() {
+        return Ok(out);
     }
     let sql = format!(
         "SELECT {} FROM read_parquet('{safe_path}')",
-        schema
+        voting
             .iter()
-            .map(|c| format!("count({})::BIGINT", quote_ident(&c.name)))
+            .map(|i| format!("count({})::BIGINT", quote_ident(&schema[*i].name)))
             .collect::<Vec<_>>()
             .join(", ")
     );
-    conn.query_row(&sql, [], |row| {
-        let mut out = Vec::with_capacity(schema.len());
-        for i in 0..schema.len() {
-            out.push(u64::try_from(row.get::<_, i64>(i)?).unwrap_or(0));
-        }
-        Ok(out)
-    })
-    .map_err(|e| format!("non-null counts failed: {e}"))
+    let counts: Vec<u64> = conn
+        .query_row(&sql, [], |row| {
+            let mut counts = Vec::with_capacity(voting.len());
+            for i in 0..voting.len() {
+                counts.push(u64::try_from(row.get::<_, i64>(i)?).unwrap_or(0));
+            }
+            Ok(counts)
+        })
+        .map_err(|e| format!("non-null counts failed: {e}"))?;
+    for (idx, count) in voting.iter().zip(counts) {
+        out[*idx] = count;
+    }
+    Ok(out)
 }
 
 /// The canonical type a standing parquet column proposes at boot.
@@ -457,6 +580,7 @@ fn rewrite_nonconforming(
     let mut rewritten = 0usize;
     let mut skipped = 0usize;
     let mut conflicts: Vec<FieldConflict> = Vec::new();
+    let mut progress = Progress::new("rewrite", scan.len());
 
     for file in scan {
         match rewrite_file(&conn, file, pins) {
@@ -472,6 +596,7 @@ fn rewrite_nonconforming(
                 skip_file(&file.path, "rewrite", &e);
             }
         }
+        progress.tick();
     }
 
     Ok((rewritten, skipped, conflicts))
@@ -576,7 +701,7 @@ fn rewrite_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{FileScan, most_rows_wins};
+    use super::{FileScan, most_rows_wins, voting_columns};
     use crate::ingest::compaction::ColInfo;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -635,5 +760,35 @@ mod tests {
         let corpus = vec![scan("svc-a", &[("duration", "VARCHAR", 10)])];
         let existing = HashMap::from([("duration".to_owned(), CanonicalType::BigInt)]);
         assert!(most_rows_wins(&corpus, &existing).is_empty());
+    }
+
+    /// A pinned column has no vote, so its count is never taken — counting it
+    /// would read the column off disk for a number `most_rows_wins` discards.
+    #[test]
+    fn only_unpinned_columns_are_counted() {
+        let file = scan(
+            "svc-a",
+            &[("_time", "TIMESTAMP", 0), ("duration", "BIGINT", 0)],
+        );
+        let pinned = HashMap::from([("_time".to_owned(), CanonicalType::Timestamp)]);
+        assert_eq!(voting_columns(&file.schema, &pinned), vec![1]);
+    }
+
+    /// The identity-mismatch re-arm over a fully-pinned catalog: no column
+    /// needs a vote, so the scan is footer-only and never reads the corpus.
+    #[test]
+    fn a_fully_pinned_file_needs_no_counts_at_all() {
+        let file = scan(
+            "svc-a",
+            &[("_time", "TIMESTAMP", 0), ("duration", "BIGINT", 0)],
+        );
+        let pinned = HashMap::from([
+            ("_time".to_owned(), CanonicalType::Timestamp),
+            ("duration".to_owned(), CanonicalType::BigInt),
+        ]);
+        assert!(
+            voting_columns(&file.schema, &pinned).is_empty(),
+            "an all-pinned schema must skip the count query entirely"
+        );
     }
 }
