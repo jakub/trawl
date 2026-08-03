@@ -901,6 +901,58 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
+    /// A directory the walk cannot enumerate is isolated exactly like an
+    /// unreadable file. The walk covers more than the corpus — the WAL tree
+    /// lives under the data root by default — so one `chmod 000` subdirectory
+    /// (permissions, a transient fault, a stale handle) must not be the
+    /// difference between a daemon that boots and one that refuses to.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn unreadable_directories_are_skipped_not_boot_fatal(pool: sqlx::PgPool) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (majority, minority) = plant_disagreeing_corpus(&data_dir);
+
+        let locked = data_dir.join("prod/2026-08-01/14");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: mode bits are not enforced, nothing to test.
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("an unreadable directory must not fail the boot pass");
+        assert!(summary.ran);
+        assert_eq!(summary.skipped, 1, "the unreadable directory is one skip");
+        assert_eq!(summary.scanned, 2, "the readable corpus is still scanned");
+        assert_eq!(
+            summary.rewritten, 1,
+            "the readable minority file still gets conformed"
+        );
+        assert_eq!(column_type(&minority, "duration"), "BIGINT");
+        assert_eq!(column_type(&majority, "duration"), "BIGINT");
+        assert!(
+            !data_dir.join("CATALOG").exists(),
+            "an unproven corpus must not publish the conformance identity"
+        );
+
+        // Operator fixes the permissions → the pass completes and publishes.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let clean = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(clean.ran, "the skipped directory forced a re-run");
+        assert_eq!(clean.skipped, 0);
+        assert!(data_dir.join("CATALOG").exists());
+    }
+
     /// Wiring: server boot itself runs the conformance pass — pins land in
     /// the process cache and one query returns the full corrected corpus,
     /// without this test ever calling `ensure_conformance`.

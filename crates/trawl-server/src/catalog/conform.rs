@@ -34,8 +34,9 @@
 //! rewrite is durable on its own, so a boot killed by a supervisor's start
 //! timeout leaves the corpus strictly closer to conformant than it found it.
 //!
-//! Per-file failures are isolated, never boot-fatal: a truncated, bit-rotted
-//! or foreign `.parquet` under the data root is skipped with a warning and a
+//! Per-path failures are isolated, never boot-fatal: a truncated, bit-rotted
+//! or foreign `.parquet` under the data root — or a whole subdirectory the
+//! walk cannot enumerate — is skipped with a warning and a
 //! `trawl_catalog_conform_skipped_total` bump, exactly like the rollup path
 //! sniffs and sets aside unreadable inputs rather than wedging. Nothing is
 //! moved or deleted (an operator's stray file is theirs), and because the
@@ -252,9 +253,9 @@ pub async fn ensure_conformance(
             scanned,
             rewritten,
             skipped,
-            "boot conformance pass skipped unreadable or foreign parquet files; \
-             the corpus is not proven conformant and the pass will re-run on the \
-             next boot — inspect the skipped files (queries touching them error)"
+            "boot conformance pass skipped unreadable or foreign paths; the \
+             corpus is not proven conformant and the pass will re-run on the \
+             next boot — inspect the skipped paths (queries touching them error)"
         );
     }
 
@@ -275,7 +276,7 @@ pub async fn ensure_conformance(
     })
 }
 
-/// Isolate one bad file: warn, count, leave it exactly where it is.
+/// Isolate one bad path: warn, count, leave it exactly where it is.
 ///
 /// Deliberately not the rollup's quarantine-rename — the rollup MUST move a
 /// corrupt input aside or it re-reads it forever, whereas the boot pass just
@@ -289,8 +290,8 @@ fn skip_file(path: &Path, phase: &str, error: &str) {
         file = %path.display(),
         phase,
         error,
-        "unreadable or foreign parquet file skipped by the boot conformance \
-         pass; it is left untouched and remains outside the catalog invariant"
+        "unreadable or foreign path skipped by the boot conformance pass; it \
+         is left untouched and remains outside the catalog invariant"
     );
 }
 
@@ -373,17 +374,32 @@ fn open_bounded_connection(
 
 /// Enumerate every parquet file under the data root (hourly + daily
 /// rollups, skipping `scheduled/`) and describe each. Returns the readable
-/// files plus the count of files skipped as unreadable or foreign — one bad
-/// file must never take the daemon's boot down with it.
+/// files plus the count of paths skipped as unreadable or foreign — one bad
+/// file, or one unreadable directory, must never take the daemon's boot down
+/// with it.
 fn scan_corpus(
     data_dir: &Path,
     memory_limit: &str,
     pinned: &HashMap<String, CanonicalType>,
 ) -> Result<(Vec<FileScan>, usize), String> {
-    let files = crate::metrics::walk_parquet_files(data_dir)
-        .map_err(|e| format!("failed to walk data root: {e}"))?;
-    if files.is_empty() {
+    // A root that was never created is a cold start, not a failure: there is
+    // no corpus to prove anything about.
+    if !data_dir.is_dir() {
         return Ok((Vec::new(), 0));
+    }
+    // A directory that cannot be enumerated (permissions, a transient fault,
+    // a stale handle) is isolated exactly like an unreadable file rather than
+    // aborting the walk — this tree is wider than the corpus (the WAL lives
+    // under the data root by default), and one unreadable corner of it must
+    // not keep the daemon down. It counts as a skip, so the corpus is not
+    // proven conformant and the next boot re-runs.
+    let (files, walk_errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
+    let mut skipped = walk_errors.len();
+    for (path, error) in walk_errors {
+        skip_file(&path, "walk", &error.to_string());
+    }
+    if files.is_empty() {
+        return Ok((Vec::new(), skipped));
     }
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
@@ -398,7 +414,6 @@ fn scan_corpus(
     let mut progress = Progress::new("scan", files.len());
 
     let mut out = Vec::with_capacity(files.len());
-    let mut skipped = 0usize;
     for (path, _) in files {
         match scan_file(&conn, path.clone(), pinned) {
             Ok(scan) => out.push(scan),
