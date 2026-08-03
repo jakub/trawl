@@ -120,6 +120,7 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         Some(&hot_buffer),
         500,
         "2GB",
+        None,
     )
     .await
     .expect("compaction should succeed");
@@ -209,6 +210,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         Some(&hot_buffer),
         500,
         "2GB",
+        None,
     )
     .await
     .expect("compaction 1 should succeed");
@@ -275,6 +277,7 @@ async fn query_works_without_hot_buffer() {
         None,
         500,
         "2GB",
+        None,
     )
     .await
     .expect("compaction without hot buffer should succeed");

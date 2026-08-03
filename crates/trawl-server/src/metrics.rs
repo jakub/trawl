@@ -32,6 +32,9 @@ pub const SYSLOG_EVENTS_DROPPED_TOTAL: &str = "trawl_syslog_events_dropped_total
 pub const SYSLOG_TCP_CONNECTIONS: &str = "trawl_syslog_tcp_connections";
 pub const WAL_FILES: &str = "trawl_wal_files";
 pub const WAL_BYTES: &str = "trawl_wal_bytes";
+pub const CATALOG_CONFLICTS_TOTAL: &str = "trawl_catalog_conflicts_total";
+pub const CATALOG_ROWS_NULLED_TOTAL: &str = "trawl_catalog_rows_nulled_total";
+pub const CATALOG_CONFORM_REWRITES_TOTAL: &str = "trawl_catalog_conform_rewrites_total";
 
 // -- description registration ------------------------------------------------
 
@@ -80,6 +83,22 @@ pub fn describe_metrics() {
     );
     describe_gauge!(WAL_FILES, "Number of pending WAL (ndjson) files");
     describe_gauge!(WAL_BYTES, "Total byte size of pending WAL files");
+    describe_counter!(
+        CATALOG_CONFLICTS_TOTAL,
+        "Field-catalog type conflicts recorded at compaction (a batch column \
+         TRY_CAST to its pinned type), labelled by service (same 256-service \
+         cap as trawl_ingest_repairs_total; never a field-name label)"
+    );
+    describe_counter!(
+        CATALOG_ROWS_NULLED_TOTAL,
+        "Rows whose value a catalog-conforming cast nulled (original \
+         recoverable from _raw), labelled by service"
+    );
+    describe_counter!(
+        CATALOG_CONFORM_REWRITES_TOTAL,
+        "Parquet files rewritten by the boot conformance pass to match the \
+         field catalog"
+    );
 }
 
 // -- bounded label values ----------------------------------------------------

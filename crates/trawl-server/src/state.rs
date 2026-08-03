@@ -78,6 +78,10 @@ pub struct QueryState {
     /// Pre-computed per-service schema from background refresh job.
     /// Uses `parking_lot::Mutex` (like `dashboard_snapshot`) for fast reads.
     pub service_schema_cache: Arc<Mutex<Option<CachedServiceSchema>>>,
+    /// In-process field-catalog pin cache (ADR-0009 slice 2): hydrated at
+    /// boot from `field_types`, refreshed by compaction after every
+    /// `pin_missing` — the query path never touches postgres for pins.
+    pub field_catalog: Arc<crate::catalog::FieldCatalog>,
     /// Semaphore bounding concurrent SSE streaming connections.
     pub sse_semaphore: Arc<Semaphore>,
     /// Semaphore bounding concurrent admin dashboard-stats streams.
@@ -417,6 +421,16 @@ impl AppState {
         let auth = build_auth_state(config).await?;
         let storage = build_storage_state(config).await?;
 
+        // Hydrate the in-process pin cache from the migrated catalog so the
+        // first query already sees the pins (zero postgres I/O per query).
+        let field_catalog = Arc::new(crate::catalog::FieldCatalog::new());
+        let pins = storage.catalog.load_pins().await.map_err(|e| {
+            crate::error::ServerError::ServiceUnavailable(format!(
+                "failed to load field-catalog pins at startup: {e}"
+            ))
+        })?;
+        field_catalog.replace(pins);
+
         let (wal_writer, event_bus, hot_buffer, pipeline) = if config.ingest.enabled {
             let writer = Arc::new(WalWriter::new(config.wal_dir()));
             let bus = Arc::new(LocalEventBus::new(config.ingest.event_bus_capacity));
@@ -449,6 +463,7 @@ impl AppState {
                 max_export_rows: config.server.max_export_rows,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                field_catalog,
                 hot_buffer,
                 service_schema_cache: Arc::new(Mutex::new(None)),
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),

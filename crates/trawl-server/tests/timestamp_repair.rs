@@ -111,6 +111,7 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
         Some(hot_buffer),
         500,
         "2GB",
+        None,
     )
     .await
     .expect("compaction tick must succeed");

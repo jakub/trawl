@@ -370,6 +370,14 @@ fn spawn_ingest_pipeline(
         "ingest pipeline enabled"
     );
 
+    // Compaction is the only parquet writer: it pins every field's type in
+    // the catalog BEFORE writing, and conforms every batch to the pins
+    // (ADR-0009 slice 2).
+    let catalog = trawl_server::catalog::CatalogContext {
+        store: state.storage.catalog.clone(),
+        cache: state.query.field_catalog.clone(),
+    };
+
     let handle = trawl_server::ingest::compaction::spawn_compaction(
         wal_dir,
         data_dir,
@@ -379,6 +387,7 @@ fn spawn_ingest_pipeline(
         config.ingest.compaction_memory_limit.clone(),
         state.query.hot_buffer.clone(),
         state.ingest.compaction_stats.clone(),
+        Some(catalog),
         shutdown_rx,
     );
 
