@@ -15,7 +15,7 @@
 //! when BOTH sides agree — a repointed `DATABASE_URL` or a data root
 //! restored from backup shows up as a mismatch and forces a re-run. A
 //! crash mid-pass leaves unrewritten files to be redetected on the next
-//! boot (every rewrite is staged + atomically renamed).
+//! boot (every rewrite is staged, fsynced + atomically renamed).
 //!
 //! Cost, since the pass sits in front of HTTP serving and a re-arm can hit
 //! a corpus of any age (the first boot after upgrade is small — #52 moved
@@ -691,7 +691,26 @@ fn rewrite_file(
         tmp.to_string_lossy().replace('\'', "''"),
     ))
     .map_err(|e| format!("conform rewrite failed: {e}"))?;
+    // Unlike every other staged rename in the tree, this one has no backing
+    // copy: the source IS the destination, and once the rename lands the
+    // pre-conform file is gone. Compaction's `.tmp` is covered by the retained
+    // WAL and the rollup keeps its hourlies until after the rename; here a
+    // crash between the rename and writeback would leave a truncated parquet
+    // where an hour (or a day) of logs used to be — and the next boot would
+    // not retry, because a successful pass publishes the marker. So fsync the
+    // staged file BEFORE the rename, and unlike `publish_marker`'s best-effort
+    // directory sync this one is fatal: failing the file is a skip (the
+    // original stays, the pass withholds completion, the next boot re-runs),
+    // which is strictly better than publishing data that may not be there.
+    std::fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("conform fsync failed: {e}"))?;
     std::fs::rename(&tmp, &file.path).map_err(|e| format!("conform rename failed: {e}"))?;
+    // And make the rename entry itself durable, so a crash cannot resurrect
+    // the directory entry for a file the data of which is already replaced.
+    if let Some(parent) = file.path.parent() {
+        crate::epoch::fsync_dir_best_effort(parent);
+    }
     tracing::info!(
         event_type = "catalog_conform_rewrite",
         file = %file.path.display(),
