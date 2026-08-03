@@ -209,6 +209,17 @@ impl Executor {
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
+        with_raw_fallback(query, |q| {
+            self.execute_emitted_once(q, max_rows, utc_offset_secs)
+        })
+    }
+
+    fn execute_emitted_once(
+        &self,
+        query: &EmittedQuery,
+        max_rows: usize,
+        utc_offset_secs: i32,
+    ) -> Result<QueryResult, EngineError> {
         let mut stmt = match self.conn.prepare(&query.sql) {
             Ok(s) => s,
             Err(e) if is_no_files_error(&e) => return Ok(QueryResult::empty()),
@@ -775,6 +786,17 @@ impl Executor {
         output_path: &Path,
         max_rows: usize,
     ) -> Result<(), EngineError> {
+        with_raw_fallback(emitted, |q| {
+            self.export_parquet_from_emitted_once(q, output_path, max_rows)
+        })
+    }
+
+    fn export_parquet_from_emitted_once(
+        &self,
+        emitted: &EmittedQuery,
+        output_path: &Path,
+        max_rows: usize,
+    ) -> Result<(), EngineError> {
         if !emitted.rust_stages.is_empty() {
             return Err(EngineError::Emit(
                 trawl_core::emitter::EmitError::UnsupportedOperation {
@@ -967,6 +989,54 @@ fn is_no_files_error(e: &duckdb::Error) -> bool {
 fn is_binder_column_error(e: &duckdb::Error) -> bool {
     let msg = e.to_string();
     msg.contains(DUCKDB_BINDER_ERROR_MSG) && (msg.contains("column") || msg.contains("not found"))
+}
+
+/// Retry `attempt` with the query's `_raw`-free SQL when the first try failed
+/// to bind a column.
+///
+/// Text search binds `_raw`, which every trawl-written corpus has but an
+/// arbitrary source does not — user-owned parquet read in embedded mode, say.
+/// Rather than trust the error message (a missing `_raw` and a genuinely
+/// unknown field read the same), this asks for evidence: re-run with the
+/// `_raw` side bound to a typed NULL, and take that result only if it binds.
+/// If it fails too, the missing column was the user's, so the original error
+/// is what they see. The parameter list is identical between the two SQL
+/// strings (ADR-0009).
+///
+/// Costs nothing on the success path, and nothing for queries without a text
+/// search — `raw_free_sql` is `None` there.
+fn with_raw_fallback<T>(
+    query: &EmittedQuery,
+    attempt: impl Fn(&EmittedQuery) -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    let err = match attempt(query) {
+        Err(e) if is_missing_column_failure(&e) => e,
+        outcome => return outcome,
+    };
+    let Some(raw_free) = &query.raw_free_sql else {
+        return Err(err);
+    };
+    let fallback = EmittedQuery {
+        sql: raw_free.clone(),
+        raw_free_sql: None,
+        ..query.clone()
+    };
+    attempt(&fallback).map_err(|_| err)
+}
+
+/// Whether an engine failure is "a column in the query does not exist in the
+/// source" — in either shape it can take: the query path remaps it to
+/// [`EngineError::Emit`], the export path surfaces it raw.
+///
+/// The trigger for the `_raw`-free retry (see [`with_raw_fallback`]), which
+/// then decides from evidence — does the raw-free SQL bind? — rather than
+/// from which column the message names.
+fn is_missing_column_failure(e: &EngineError) -> bool {
+    match e {
+        EngineError::Emit(_) => true,
+        EngineError::Database(db) => is_binder_column_error(db),
+        _ => false,
+    }
 }
 
 /// Leading `"<Class> Error"` token of a `DuckDB` message — `"Conversion"`

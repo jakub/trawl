@@ -415,6 +415,69 @@ fn json_stats_pipeline() {
     assert_eq!(result.columns[0].name, "service");
 }
 
+// -- sources outside the ADR-0009 envelope -----------------------------------
+
+/// Write a parquet file with a `message` but no `_raw` column — user-owned
+/// data read in embedded mode (`trawl query --data ...`), or any corpus trawl
+/// did not write itself.
+fn foreign_parquet(dir: &std::path::Path) -> String {
+    let path = dir.join("foreign.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (TIMESTAMP '2024-01-15 10:00:00', 'nginx', 'boom error'),
+             (TIMESTAMP '2024-01-15 10:00:01', 'nginx', 'all quiet')
+         ) t(_time, service, message)) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("foreign fixture should be written");
+    path.display().to_string()
+}
+
+/// Bare-word and quoted-phrase search degrade to `message` alone rather than
+/// failing the whole query when the source has no `_raw` column.
+#[test]
+fn text_search_without_a_raw_column_searches_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = foreign_parquet(dir.path());
+    let exec = Executor::new().expect("executor should initialize");
+
+    let bare = exec.run_query_max("boom", &source).expect("bare word");
+    assert_eq!(bare.row_count(), 1, "bare word must match on message");
+
+    let quoted = exec
+        .run_query_max(r#""boom error""#, &source)
+        .expect("quoted phrase");
+    assert_eq!(quoted.row_count(), 1, "quoted phrase must match on message");
+
+    let negated = exec.run_query_max("-boom", &source).expect("negated");
+    assert_eq!(
+        negated.row_count(),
+        1,
+        "negation must not veto on a missing _raw"
+    );
+    assert!(
+        !negated.columns.iter().any(|c| c.name == "_raw"),
+        "the fallback must not invent a _raw column: {:?}",
+        negated.columns
+    );
+}
+
+/// The fallback is evidence-based: it rescues a query whose only unbindable
+/// column was `_raw`. A genuinely unknown field still errors.
+#[test]
+fn text_search_without_a_raw_column_keeps_unknown_field_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = foreign_parquet(dir.path());
+    let exec = Executor::new().expect("executor should initialize");
+
+    let result = exec.run_query_max("boom nosuchfield=1", &source);
+    assert!(
+        matches!(result, Err(EngineError::Emit(_))),
+        "unknown field must still error: {result:?}"
+    );
+}
+
 // -- error path tests --------------------------------------------------------
 
 #[test]

@@ -48,6 +48,18 @@ pub struct EmittedQuery {
     /// fields first. `true` when the pipeline has no explicit column selection
     /// or aggregation — i.e. the column set comes from `SELECT *`.
     pub needs_column_reorder: bool,
+    /// The same query with text search's `_raw` side bound to a typed NULL
+    /// instead of the column — `Some` only when a text search referenced
+    /// `_raw`.
+    ///
+    /// `_raw` is a server guarantee, not a guarantee of every source a query
+    /// can be pointed at: user-owned parquet read in embedded mode has no
+    /// such column, and binding it there would fail the whole query instead
+    /// of searching `message` alone (ADR-0009: bare search covers `_raw`
+    /// *where present*). [`params`](Self::params) applies unchanged — the
+    /// raw-free pass pushes the same parameters in the same order — so the
+    /// executor can retry with this SQL against a source that has no `_raw`.
+    pub raw_free_sql: Option<String>,
 }
 
 /// A parameter value for a SQL query placeholder.
@@ -143,8 +155,7 @@ impl EmitError {
 ///
 /// `source` is the parquet glob path, e.g. `"/data/**/*.parquet"`.
 pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
-    let state = EmitterState::new(source)?;
-    emit_from_state(query, state)
+    emit_with_raw_fallback(query, || EmitterState::new(source))
 }
 
 /// Emit SQL that unions the primary parquet source with a hot buffer ndjson file.
@@ -156,8 +167,7 @@ pub fn emit_with_hot_source(
     source: &str,
     hot_source: &str,
 ) -> Result<EmittedQuery, EmitError> {
-    let state = EmitterState::with_hot_source(source, hot_source)?;
-    emit_from_state(query, state)
+    emit_with_raw_fallback(query, || EmitterState::with_hot_source(source, hot_source))
 }
 
 /// Emit a hot+cold union query with `varchar_cols` coerced to VARCHAR on
@@ -172,11 +182,40 @@ pub fn emit_with_hot_source_coerced(
     hot_source: &str,
     varchar_cols: &[String],
 ) -> Result<EmittedQuery, EmitError> {
-    let state = EmitterState::with_hot_source_coerced(source, hot_source, varchar_cols)?;
-    emit_from_state(query, state)
+    emit_with_raw_fallback(query, || {
+        EmitterState::with_hot_source_coerced(source, hot_source, varchar_cols)
+    })
 }
 
-fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuery, EmitError> {
+/// Emit the query, and — when text search bound `_raw` — a second time with
+/// the column replaced by a typed NULL, stored as
+/// [`EmittedQuery::raw_free_sql`] for the executor's fallback.
+///
+/// `make_state` is called once per pass so both start from an identical
+/// state; the raw-free pass pushes the same parameters in the same order, so
+/// the two SQL strings share one parameter list.
+fn emit_with_raw_fallback(
+    query: &Query,
+    make_state: impl Fn() -> Result<EmitterState, EmitError>,
+) -> Result<EmittedQuery, EmitError> {
+    let (mut emitted, referenced_raw) = emit_from_state(query, make_state()?)?;
+    if referenced_raw {
+        let (raw_free, _) = emit_from_state(query, make_state()?.without_raw_column())?;
+        debug_assert_eq!(
+            raw_free.params, emitted.params,
+            "raw-free pass must keep the parameter list identical"
+        );
+        emitted.raw_free_sql = Some(raw_free.sql);
+    }
+    Ok(emitted)
+}
+
+/// Emit one pass. Returns the query and whether text search referenced the
+/// `_raw` column.
+fn emit_from_state(
+    query: &Query,
+    mut state: EmitterState,
+) -> Result<(EmittedQuery, bool), EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
 
     // `from saved` cannot be combined with search-stage filters.
@@ -214,15 +253,20 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
     }
 
     let needs_column_reorder = state.needs_column_reorder();
+    let referenced_raw = state.bound_raw_column();
     let sql = state.finalize();
     let params = state.into_params();
 
-    Ok(EmittedQuery {
-        sql,
-        params,
-        rust_stages,
-        needs_column_reorder,
-    })
+    Ok((
+        EmittedQuery {
+            sql,
+            params,
+            rust_stages,
+            needs_column_reorder,
+            raw_free_sql: None,
+        },
+        referenced_raw,
+    ))
 }
 
 #[cfg(test)]
@@ -453,6 +497,53 @@ mod tests {
         let sql = emit_dsl("error");
         assert!(sql.contains(r#""message""#), "message side: {sql}");
         assert!(sql.contains(r#""_raw""#), "_raw side: {sql}");
+    }
+
+    /// Text search carries a raw-free variant for sources with no `_raw`
+    /// column — same parameters, `_raw` bound to a typed NULL so the
+    /// predicate degrades to `message` alone.
+    #[test]
+    fn text_search_carries_a_raw_free_variant() {
+        for dsl in ["boom", r#""boom error""#, "-boom service=nginx"] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let emitted = emit(&query, SRC).expect("emit should succeed");
+            let raw_free = emitted
+                .raw_free_sql
+                .as_ref()
+                .unwrap_or_else(|| panic!("{dsl} must carry a raw-free variant"));
+
+            assert!(
+                !raw_free.contains(r#""_raw""#),
+                "{dsl} raw-free variant still binds _raw: {raw_free}"
+            );
+            assert!(
+                raw_free.contains("NULL::VARCHAR"),
+                "{dsl} raw-free variant must bind a typed NULL: {raw_free}"
+            );
+            assert_eq!(
+                raw_free.matches('?').count(),
+                emitted.params.len(),
+                "{dsl} raw-free variant must reuse the same parameter list"
+            );
+            assert_eq!(
+                raw_free.replace("NULL::VARCHAR", r#""_raw""#),
+                emitted.sql,
+                "{dsl} raw-free variant must differ only in the _raw side"
+            );
+        }
+    }
+
+    /// A query that never binds `_raw` needs no fallback.
+    #[test]
+    fn queries_without_text_search_have_no_raw_free_variant() {
+        for dsl in ["service=nginx", "* | stats count() by host", "last=1h"] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let emitted = emit(&query, SRC).expect("emit should succeed");
+            assert!(
+                emitted.raw_free_sql.is_none(),
+                "{dsl} must not carry a raw-free variant"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

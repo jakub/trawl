@@ -106,15 +106,21 @@ fn emit_or_groups(
 /// from both columns — `COALESCE(..., TRUE)` keeps a NULL `_raw` from
 /// vetoing the row under SQL three-valued logic. The in-memory filter
 /// ([`crate::filter`]) mirrors these semantics exactly.
+///
+/// The `_raw` side comes from [`EmitterState::raw_column`], so the raw-free
+/// pass (for sources without the column) substitutes a typed NULL while
+/// pushing the same two parameters in the same order — both passes share
+/// one parameter list.
 fn push_text_search(pattern: String, negated: bool, state: &mut EmitterState) {
     let p1 = state.push_param(SqlValue::String(pattern.clone()));
     let p2 = state.push_param(SqlValue::String(pattern));
+    let raw = state.raw_column();
     if negated {
         state.push_where(format!(
-            "(\"message\" NOT ILIKE {p1} AND COALESCE(\"_raw\" NOT ILIKE {p2}, TRUE))"
+            "(\"message\" NOT ILIKE {p1} AND COALESCE({raw} NOT ILIKE {p2}, TRUE))"
         ));
     } else {
-        state.push_where(format!("(\"message\" ILIKE {p1} OR \"_raw\" ILIKE {p2})"));
+        state.push_where(format!("(\"message\" ILIKE {p1} OR {raw} ILIKE {p2})"));
     }
 }
 

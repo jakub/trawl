@@ -62,6 +62,20 @@ pub(crate) struct EmitterState {
     pivot: Option<PivotSpec>,
     ctes: Vec<Cte>,
     params: Vec<SqlValue>,
+    /// How text search binds `_raw` in this pass (see [`RawBinding`]).
+    raw_binding: RawBinding,
+}
+
+/// How the `_raw` column is bound by text search in one emission pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawBinding {
+    /// `_raw` may be bound; no text search has done so yet.
+    Available,
+    /// A text-search predicate bound `_raw`, so this query needs a raw-free
+    /// variant for sources that lack the column.
+    Bound,
+    /// The raw-free pass: text search substitutes a typed NULL for `_raw`.
+    Suppressed,
 }
 
 /// Validate a source path for use in `DuckDB` table-valued functions.
@@ -283,6 +297,38 @@ impl EmitterState {
             pivot: None,
             ctes: Vec::new(),
             params: Vec::new(),
+            raw_binding: RawBinding::Available,
+        }
+    }
+
+    /// Emit the raw-free variant of this query: text search binds a typed
+    /// NULL instead of the `_raw` column.
+    pub(crate) fn without_raw_column(mut self) -> Self {
+        self.raw_binding = RawBinding::Suppressed;
+        self
+    }
+
+    /// Whether text search bound the `_raw` column during this pass.
+    pub(crate) fn bound_raw_column(&self) -> bool {
+        self.raw_binding == RawBinding::Bound
+    }
+
+    /// The expression text search uses for the `_raw` side of its predicate.
+    ///
+    /// `_raw` is a server guarantee, not a guarantee of every source a query
+    /// can be pointed at: user-owned parquet read in embedded mode has no
+    /// such column, and binding it there fails the whole query. The raw-free
+    /// pass substitutes a typed NULL, which under the predicate's
+    /// three-valued logic degrades bare-word search to `message` alone —
+    /// exactly what the in-memory filter does for an event without `_raw`
+    /// (ADR-0009: bare search covers `_raw` *where present*).
+    pub(crate) fn raw_column(&mut self) -> &'static str {
+        match self.raw_binding {
+            RawBinding::Suppressed => "NULL::VARCHAR",
+            RawBinding::Available | RawBinding::Bound => {
+                self.raw_binding = RawBinding::Bound;
+                "\"_raw\""
+            }
         }
     }
 
