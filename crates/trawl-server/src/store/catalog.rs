@@ -13,7 +13,8 @@
 //! because a pin is therefore permanent while its name is a client-chosen
 //! JSON key, the catalog is bounded on every axis a sender controls: name
 //! length by [`trawl_core::schema::is_storable_field_name`], pin count by
-//! [`MAX_PINNED_FIELDS`], and per-field conflict evidence by
+//! [`MAX_PINNED_FIELDS`], per-field service observations by
+//! [`MAX_SERVICES_PER_FIELD`], and per-field conflict evidence by
 //! [`MAX_CONFLICTS_PER_FIELD`].
 
 use std::collections::HashMap;
@@ -63,8 +64,9 @@ pub struct FieldServiceRow {
     pub service: String,
     /// First time compaction observed the field for this service.
     pub first_seen: DateTime<Utc>,
-    /// Most recent observation (consumers window on this — rows are
-    /// ever-observed and retention never reconciles them).
+    /// Most recent observation (consumers window on this — retention never
+    /// reconciles these rows, and the only thing that removes one is the
+    /// least-recently-seen eviction at [`MAX_SERVICES_PER_FIELD`]).
     pub last_seen: DateTime<Utc>,
     /// Cumulative rows compacted in batches that wrote the field — the sum
     /// of per-batch row counts, not a per-value non-null tally.
@@ -104,6 +106,30 @@ pub struct FieldConflictRow {
 /// names has a modelling problem this cap should surface, not a capacity
 /// problem trawl should silently absorb.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
+
+/// Maximum `field_services` observation rows kept per field — the
+/// most-recently-seen survive.
+///
+/// [`MAX_PINNED_FIELDS`] bounds the field axis of that table; this bounds
+/// the SERVICE axis, which is the other client-chosen one. A service name
+/// is validated (`[A-Za-z0-9._-]`, ≤128 bytes) but its cardinality is the
+/// sender's to choose, and unlike the parallel per-service parquet/WAL axis
+/// — which retention reclaims — nothing else ever removes one of these
+/// rows. Without this, a shipper cycling service names (a per-container
+/// name, an id in the name, or a hostile one) grows the app-state database
+/// monotonically for the life of the install.
+///
+/// Eviction is least-recently-seen, which is what makes the window cheap in
+/// meaning: every batch a live service compacts refreshes its `last_seen`,
+/// so a live service is never evicted by a cycling one — the rows that fall
+/// out are exactly the aged-out ones consumers are already told to window
+/// away. The table's worst case is `MAX_PINNED_FIELDS × MAX_SERVICES_PER_FIELD`
+/// rows, reachable only by a sender that maxes BOTH axes deliberately; its
+/// practical size stays `|fields| × |real services|`, and the cap is
+/// generous for the same reason [`MAX_PINNED_FIELDS`] is — a corpus with
+/// four figures of distinct service names carrying one field has a naming
+/// problem this should surface, not a capacity problem trawl should absorb.
+pub const MAX_SERVICES_PER_FIELD: i64 = 1_000;
 
 /// Maximum `field_conflicts` rows kept per field — the newest survive.
 ///
@@ -175,6 +201,7 @@ fn bump_rejected(reason: &'static str, count: usize) {
 pub struct CatalogStore {
     pool: PgPool,
     pin_cap: i64,
+    service_cap: i64,
     conflict_cap: i64,
 }
 
@@ -185,6 +212,7 @@ impl CatalogStore {
         Self {
             pool,
             pin_cap: MAX_PINNED_FIELDS,
+            service_cap: MAX_SERVICES_PER_FIELD,
             conflict_cap: MAX_CONFLICTS_PER_FIELD,
         }
     }
@@ -195,6 +223,15 @@ impl CatalogStore {
     #[must_use]
     pub fn with_pin_cap(mut self, cap: i64) -> Self {
         self.pin_cap = cap;
+        self
+    }
+
+    /// Override the per-field service-observation window. Same purpose as
+    /// [`Self::with_pin_cap`]: drive the boundary without writing
+    /// [`MAX_SERVICES_PER_FIELD`] rows.
+    #[must_use]
+    pub fn with_service_cap(mut self, cap: i64) -> Self {
+        self.service_cap = cap;
         self
     }
 
@@ -349,6 +386,12 @@ impl CatalogStore {
     /// Names that cannot be a catalog key are skipped for the same reason
     /// as in [`Self::pin_missing`] — `field_services` keys on
     /// `(field, service)`, so an over-long name overflows this btree too.
+    ///
+    /// Every field this call touched is then trimmed to its newest
+    /// [`MAX_SERVICES_PER_FIELD`] services, in the SAME transaction as the
+    /// upsert — see that constant for why the service axis needs a bound at
+    /// all. The rows this call wrote carry the transaction's `now()`, so
+    /// they are the window's newest and can never evict themselves.
     pub async fn touch_services(
         &self,
         service: &str,
@@ -367,6 +410,9 @@ impl CatalogStore {
         if fields.is_empty() {
             return Ok(());
         }
+
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             "INSERT INTO field_services (field, service, row_count)
              SELECT f, $2, $3 FROM UNNEST($1::text[]) AS t(f)
@@ -377,8 +423,32 @@ impl CatalogStore {
         .bind(&fields)
         .bind(service)
         .bind(i64::try_from(row_count).unwrap_or(i64::MAX))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        // Its own statement, not a CTE beside the insert: CTEs share the
+        // statement's snapshot, so a ranking CTE cannot see the row the
+        // insert alongside it just added — which is the row that pushes the
+        // window over. Ranking (not `last_seen < cutoff`) keeps the bound
+        // absolute: it holds however sparse or bursty the observations are.
+        sqlx::query(
+            "DELETE FROM field_services s
+             USING (
+                 SELECT field, service, row_number() OVER (
+                     PARTITION BY field ORDER BY last_seen DESC, service
+                 ) AS rn
+                 FROM field_services WHERE field = ANY($1)
+             ) ranked
+             WHERE s.field = ranked.field
+               AND s.service = ranked.service
+               AND ranked.rn > $2",
+        )
+        .bind(&fields)
+        .bind(self.service_cap)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 

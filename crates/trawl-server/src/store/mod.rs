@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 
 pub use catalog::{
     CatalogStore, FieldConflict, FieldConflictRow, FieldServiceRow, MAX_CONFLICTS_PER_FIELD,
-    MAX_PINNED_FIELDS, PinProposal,
+    MAX_PINNED_FIELDS, MAX_SERVICES_PER_FIELD, PinProposal,
 };
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
