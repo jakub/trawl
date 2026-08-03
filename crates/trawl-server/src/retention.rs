@@ -13,6 +13,12 @@
 //!
 //! Today's directory is never deleted (compaction writes there actively).
 //! Both policies can be independently disabled by setting their value to 0.
+//!
+//! Disk-pressure deletion is additionally suppressed while the ADR-0009
+//! set-aside root (`data.pre-schema-v2/`) exists: it is a sibling of
+//! `data/`, so it yields no deletion candidates while still occupying the
+//! filesystem free space is measured on — deleting fresh partitions could
+//! never reclaim it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -142,51 +148,9 @@ fn retention_tick(
 
     // Phase 2: disk-pressure retention.
     if config.min_free_disk_bytes > 0 {
-        loop {
-            let available = free_space_fn(data_dir)
-                .map_err(|e| format!("failed to check free disk space: {e}"))?;
-
-            if available >= config.min_free_disk_bytes {
-                break;
-            }
-
-            if candidates.is_empty() {
-                tracing::warn!(
-                    event_type = "retention_disk_pressure",
-                    available_bytes = available,
-                    threshold_bytes = config.min_free_disk_bytes,
-                    remaining_dirs = 0u64,
-                    "disk pressure: no more directories to delete (only today remains)"
-                );
-                break;
-            }
-
-            // Delete the oldest remaining dir.
-            let (date, path) = candidates.remove(0);
-            match delete_date_dir(&path) {
-                Ok(bytes) => {
-                    tracing::info!(
-                        event_type = "retention_delete",
-                        date = %date,
-                        bytes_freed = bytes,
-                        trigger = "disk_pressure",
-                        available_bytes = available,
-                        "deleted date directory due to disk pressure"
-                    );
-                    total_bytes_freed += bytes;
-                    total_dirs_deleted += 1;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        event_type = "retention_error",
-                        path = %path.display(),
-                        error = %e,
-                        "failed to delete date directory under disk pressure"
-                    );
-                    // Continue trying other dirs.
-                }
-            }
-        }
+        let (bytes, dirs) = disk_pressure_sweep(data_dir, config, candidates, free_space_fn)?;
+        total_bytes_freed += bytes;
+        total_dirs_deleted += dirs;
     }
 
     if total_dirs_deleted > 0 {
@@ -199,6 +163,89 @@ fn retention_tick(
     }
 
     Ok(())
+}
+
+/// Delete oldest-first until free space clears `min_free_disk_bytes` or
+/// there is nothing left to delete. Returns `(bytes_freed, dirs_deleted)`.
+fn disk_pressure_sweep(
+    data_dir: &Path,
+    config: &RetentionConfig,
+    mut candidates: Vec<(NaiveDate, PathBuf)>,
+    free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
+) -> Result<(u64, u64), String> {
+    let mut total_bytes_freed: u64 = 0;
+    let mut total_dirs_deleted: u64 = 0;
+
+    // The pre-cutover set-aside root (ADR-0009, `data.pre-schema-v2/`)
+    // is a *sibling* of `data/`: it yields no deletion candidates yet
+    // still occupies the filesystem `free_space_fn` measures. Deleting
+    // date dirs cannot reclaim it, so an unattended loop would destroy
+    // every non-today partition and remain under threshold. Refuse to
+    // delete anything under pressure while it exists, and say why.
+    let set_aside = crate::epoch::set_aside_path(data_dir);
+
+    loop {
+        let available =
+            free_space_fn(data_dir).map_err(|e| format!("failed to check free disk space: {e}"))?;
+
+        if available >= config.min_free_disk_bytes {
+            break;
+        }
+
+        if set_aside.exists() {
+            tracing::warn!(
+                event_type = "retention_disk_pressure_suppressed",
+                available_bytes = available,
+                threshold_bytes = config.min_free_disk_bytes,
+                set_aside_path = %set_aside.display(),
+                remaining_dirs = candidates.len(),
+                "disk pressure: refusing to delete data while the \
+                 pre-cutover set-aside directory still occupies the \
+                 filesystem — remove it to reclaim space and re-enable \
+                 disk-pressure retention"
+            );
+            break;
+        }
+
+        if candidates.is_empty() {
+            tracing::warn!(
+                event_type = "retention_disk_pressure",
+                available_bytes = available,
+                threshold_bytes = config.min_free_disk_bytes,
+                remaining_dirs = 0u64,
+                "disk pressure: no more directories to delete (only today remains)"
+            );
+            break;
+        }
+
+        // Delete the oldest remaining dir.
+        let (date, path) = candidates.remove(0);
+        match delete_date_dir(&path) {
+            Ok(bytes) => {
+                tracing::info!(
+                    event_type = "retention_delete",
+                    date = %date,
+                    bytes_freed = bytes,
+                    trigger = "disk_pressure",
+                    available_bytes = available,
+                    "deleted date directory due to disk pressure"
+                );
+                total_bytes_freed += bytes;
+                total_dirs_deleted += 1;
+            }
+            Err(e) => {
+                tracing::error!(
+                    event_type = "retention_error",
+                    path = %path.display(),
+                    error = %e,
+                    "failed to delete date directory under disk pressure"
+                );
+                // Continue trying other dirs.
+            }
+        }
+    }
+
+    Ok((total_bytes_freed, total_dirs_deleted))
 }
 
 /// Enumerate date-formatted directories across every env directory in
@@ -466,6 +513,75 @@ mod tests {
         assert!(!oldest.exists(), "oldest should be deleted first");
         assert!(middle.exists(), "middle should survive");
         assert!(newest.exists(), "newest should survive");
+    }
+
+    #[test]
+    fn disk_pressure_suppressed_while_set_aside_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // The set-aside root is a sibling of `data/` — invisible to the
+        // candidate scan, but it owns the disk the threshold measures.
+        std::fs::create_dir_all(tmp.path().join("data.pre-schema-v2/2025-01-01")).unwrap();
+
+        let oldest = data_dir.join("prod/2026-01-01");
+        let newest = data_dir.join("prod/2026-02-01");
+        for dir in [&oldest, &newest] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("data.parquet"), b"some data").unwrap();
+        }
+
+        // Permanently below threshold: without suppression this loop would
+        // delete every candidate and still report zero remaining dirs.
+        let config = make_config(0, 1_000_000);
+        retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
+
+        assert!(oldest.exists(), "no deletion while the set-aside exists");
+        assert!(newest.exists(), "no deletion while the set-aside exists");
+    }
+
+    #[test]
+    fn disk_pressure_resumes_once_set_aside_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let oldest = data_dir.join("prod/2026-01-01");
+        let newest = data_dir.join("prod/2026-02-01");
+        for dir in [&oldest, &newest] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("data.parquet"), b"some data").unwrap();
+        }
+
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let config = make_config(0, 1_000_000);
+        retention_tick(&data_dir, &config, |_| {
+            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 { Ok(500_000) } else { Ok(2_000_000) }
+        })
+        .unwrap();
+
+        assert!(!oldest.exists(), "oldest deleted once nothing is set aside");
+        assert!(newest.exists());
+    }
+
+    #[test]
+    fn age_based_still_runs_while_set_aside_exists() {
+        let today = chrono::Utc::now().date_naive();
+        let old_date = today - chrono::Duration::days(200);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(tmp.path().join("data.pre-schema-v2")).unwrap();
+        let old_dir = data_dir
+            .join("prod")
+            .join(old_date.format("%Y-%m-%d").to_string());
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("test.parquet"), b"old data").unwrap();
+
+        // The set-aside only gates disk-pressure deletion; the operator's
+        // explicit age policy is unaffected.
+        let config = make_config(90, 1_000_000);
+        retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
+
+        assert!(!old_dir.exists(), "age-based retention still applies");
     }
 
     #[test]

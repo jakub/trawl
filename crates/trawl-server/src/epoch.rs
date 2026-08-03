@@ -173,7 +173,11 @@ pub fn ensure_current_epoch(
 }
 
 /// The sibling set-aside path for a data root (`data.pre-schema-v2`).
-fn set_aside_path(data_root: &Path) -> PathBuf {
+///
+/// Retention consults this too: the set-aside is outside `data/`, so it
+/// contributes no deletion candidates while still occupying the
+/// filesystem free-space measurements are taken from.
+pub fn set_aside_path(data_root: &Path) -> PathBuf {
     sibling_with_suffix(data_root, SET_ASIDE_SUFFIX)
 }
 

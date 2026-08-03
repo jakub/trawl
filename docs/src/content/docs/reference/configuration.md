@@ -149,6 +149,8 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `min_free_disk_bytes` | byte size | `"1G"` | Delete oldest data when free disk drops below; `0` disables |
 | `retention_interval_secs` | integer | `3600` | Retention check frequency (default: 1 hour) |
 
+Disk-pressure deletion is suppressed while a pre-cutover `data.pre-schema-v2/` set-aside directory exists (it sits outside `data/`, so deleting partitions could never reclaim it); each tick under pressure logs `retention_disk_pressure_suppressed` instead. Remove the set-aside to reclaim the space and re-enable the policy. Age-based retention is unaffected.
+
 ### `[scheduler]`
 
 | Field | Type | Default | Description |
