@@ -67,7 +67,11 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
 /// alias for the rest of the pipeline, so `level` is simply not a usable
 /// column name. Search-stage `level` filters never reach here; the emitter
 /// turns those into band predicates.
-fn validate_level_references(stage: &PipeStage) -> Result<(), EmitError> {
+///
+/// The streaming plan compiler runs this over its own pipeline too, so
+/// live tail refuses exactly the shapes a batch query 400s on instead of
+/// reading an absent `level` key and streaming nothing.
+pub(crate) fn validate_level_references(stage: &PipeStage) -> Result<(), EmitError> {
     match stage {
         PipeStage::Stats(s) => validate_grouped_aggs(&s.group_by, &s.aggregations),
         PipeStage::EventStats(s) => validate_grouped_aggs(&s.group_by, &s.aggregations),

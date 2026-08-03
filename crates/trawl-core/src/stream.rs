@@ -63,7 +63,8 @@ pub enum StreamPlanError {
     InvalidUnit(String),
     /// A `strftime`/`strptime` format string literal contains an invalid code.
     InvalidFormat(String),
-    /// A `level` comparison names a token the severity ladder does not have.
+    /// A `level` reference the SQL emitter rejects: an unknown severity
+    /// token, or `level` named anywhere other than a comparison.
     InvalidLevel(String),
 }
 
@@ -88,6 +89,17 @@ impl std::error::Error for StreamPlanError {}
 /// Rejects unsupported stages (sort, pivot, multiple aggregations)
 /// with an error before the stream starts.
 pub fn compile_stream_plan(pipeline: &[Spanned<PipeStage>]) -> Result<StreamPlan, StreamPlanError> {
+    // `level` is a filter-only alias for the numeric `severity` column
+    // (ADR-0009), so every other use of the name — `stats … by level`,
+    // `table level`, `where level in (…)`, `where "error" == level`,
+    // `where isnull(level)` — is a batch-path error. Eval has no error
+    // channel: it would read an absent key, evaluate NULL and open a
+    // live-looking stream that can never match. Reject the same shapes the
+    // emitter does, from the same arbiter, so live tail and batch agree.
+    for spanned in pipeline {
+        reject_level_references(&spanned.node)?;
+    }
+
     // Find the first aggregation stage index (if any).
     let agg_idx = pipeline.iter().position(|s| is_agg_stage(&s.node));
 
@@ -124,6 +136,11 @@ pub fn compile_stream_plan(pipeline: &[Spanned<PipeStage>]) -> Result<StreamPlan
         }
         Ok(StreamPlan::PassThrough(stages))
     }
+}
+
+fn reject_level_references(stage: &PipeStage) -> Result<(), StreamPlanError> {
+    crate::emitter::validate_level_references(stage)
+        .map_err(|e| StreamPlanError::InvalidLevel(e.to_string()))
 }
 
 fn is_agg_stage(stage: &PipeStage) -> bool {
@@ -1582,6 +1599,45 @@ mod tests {
             "expected InvalidLevel, got {err:?}"
         );
         assert!(err.to_string().contains("unknown severity token"));
+    }
+
+    /// Every `level` shape the SQL emitter rejects is refused here too.
+    ///
+    /// `level` aliases the numeric `severity` column only inside a
+    /// comparison; anywhere else there is no such key to read, and eval —
+    /// having no error channel — would evaluate NULL and hold open a
+    /// healthy-looking stream that matches nothing, while the very same
+    /// query is a 400 on the batch path.
+    #[test]
+    fn rejects_level_outside_a_comparison() {
+        for dsl in [
+            r#"* | where level in ("error", "fatal")"#,
+            r#"* | where "error" == level"#,
+            "* | where isnull(level)",
+            "* | where level matches /err.*/",
+            "* | stats count() by level",
+            "* | table level",
+            "* | dedup level",
+            "* | rename level as lvl",
+            "* | let lvl = level",
+        ] {
+            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
+            let err = compile_stream_plan(&pipeline).unwrap_err();
+            assert!(
+                matches!(err, StreamPlanError::InvalidLevel(_)),
+                "{dsl}: expected InvalidLevel, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("filter-only alias"),
+                "{dsl}: {err}"
+            );
+        }
+
+        // the comparison itself is untouched
+        let ok = crate::parser::parse(r#"* | where level >= "warn""#)
+            .expect("parses")
+            .pipeline;
+        assert!(compile_stream_plan(&ok).is_ok());
     }
 
     // ── tier 2: let ────────────────────────────────────────────────

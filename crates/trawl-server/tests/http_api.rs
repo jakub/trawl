@@ -283,6 +283,38 @@ async fn vector_shaped_ingest_queryable_via_level_alias(pool: sqlx::PgPool) {
         body.contains("filter-only alias"),
         "the error must name the severity alias: {body}"
     );
+
+    // Live tail must refuse exactly what the batch path refuses. `level`
+    // inside an IN-list is not a comparison, so the streaming evaluator
+    // would read an absent key, match nothing, and hold open a
+    // healthy-looking SSE stream — the empty-200 failure in stream form.
+    let in_list = r#"service=vec-svc last=1h | where level in ("error", "fatal")"#;
+    let batch = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({ "query": in_list }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(batch.status(), 400, "`where level in (…)` is a batch error");
+
+    let sse = raw_client()
+        .get(format!("{}/api/v1/stream", server.url))
+        .query(&[("query", in_list)])
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sse.status(),
+        400,
+        "live tail must refuse the query the batch path rejects, not stream nothing"
+    );
+    let body = sse.text().await.unwrap();
+    assert!(
+        body.contains("filter-only alias"),
+        "the stream error must name the severity alias: {body}"
+    );
 }
 
 /// An event with an unlisted env is rejected per-event with a typed

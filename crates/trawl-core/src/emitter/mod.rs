@@ -26,6 +26,7 @@ pub(crate) use functions::{
     format_literal_position, unit_literal_positions, validate_format_literal, validate_unit_literal,
 };
 pub use state::{hot_source_reader, source_reader, validate_source_path};
+pub(crate) use validate::validate_level_references;
 pub use validate::validate_pipeline;
 
 use std::fmt;
