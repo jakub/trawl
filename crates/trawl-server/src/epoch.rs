@@ -32,6 +32,14 @@
 //! rename leaves *no* `data/` — which resumes via the first branch.
 //! trawl never deletes `data.pre-schema-v2/`; retention skips it; the
 //! operator removes it at leisure.
+//!
+//! One subtree does not move with the root: `scheduled/`, the report-run
+//! results. Those are not epoch-1 event data but materialized query
+//! results whose *relative* path lives in a postgres `report_runs` row the
+//! cutover deliberately does not touch, so they ride across into the fresh
+//! root (see [`carry_over_report_runs`]) — every boot that sees a
+//! set-aside re-runs that one rename, which is how a crash mid-cutover
+//! still ends with the rows resolving.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +51,10 @@ pub const EPOCH_FILE: &str = "EPOCH";
 
 /// Suffix of the set-aside directory for a pre-cutover root.
 pub const SET_ASIDE_SUFFIX: &str = ".pre-schema-v2";
+
+/// Report-run results under the data root (`scheduled/{name}/run_{id}.parquet`),
+/// referenced by relative path from postgres `report_runs.result_path`.
+pub const REPORT_RUNS_DIR: &str = "scheduled";
 
 /// Staging suffix for the fresh root assembled before the swap.
 const NEXT_SUFFIX: &str = ".next";
@@ -81,11 +93,25 @@ pub enum Outcome {
 /// `ingest_enabled` gates the destructive branch: a node that writes no
 /// data does not own the directory `[data] path` points at, so it never
 /// renames it.
+///
+/// Every branch that leaves this node owning `data_root` then finishes the
+/// [`carry_over_report_runs`] step, which is what keeps live postgres
+/// `report_runs` rows resolving across the cutover.
 pub fn ensure_current_epoch(
     data_root: &Path,
     wal_dir: &Path,
     ingest_enabled: bool,
 ) -> Result<Outcome, String> {
+    let outcome = decide(data_root, wal_dir, ingest_enabled)?;
+    if outcome != Outcome::CutoverDeferred {
+        carry_over_report_runs(&set_aside_path(data_root), data_root)?;
+    }
+    Ok(outcome)
+}
+
+/// The boot decision table itself. Every branch leaves `data_root` in a
+/// terminal state; only the report-run carry-over is still owed.
+fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outcome, String> {
     let aside = set_aside_path(data_root);
     let marker = data_root.join(EPOCH_FILE);
 
@@ -170,6 +196,64 @@ pub fn ensure_current_epoch(
             marker.display()
         )),
     }
+}
+
+/// Move `{aside}/scheduled/` into the current data root.
+///
+/// Report-run results are not epoch-1 event data: they are materialized
+/// query results whose *relative* path (`scheduled/{name}/run_{id}.parquet`)
+/// is recorded in a live postgres `report_runs` row, and the cutover
+/// deliberately touches no postgres state. Setting them aside with the
+/// event tree would dangle every one of those rows, and each consumer
+/// degrades quietly rather than loudly — the run-detail endpoint answers
+/// HTTP 200 with `result: null`, `from saved … run=latest|all` splices a
+/// path that no longer exists, and report retention warns about a file it
+/// can never clean up. So the subtree rides across instead.
+///
+/// Restartable by construction: one rename, attempted on every boot that
+/// sees a set-aside. A crash before it lands leaves the source untouched
+/// and the next boot — which takes the `Current` branch, the fresh root
+/// being already published — completes it.
+fn carry_over_report_runs(aside: &Path, data_root: &Path) -> Result<(), String> {
+    let src = aside.join(REPORT_RUNS_DIR);
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let dst = data_root.join(REPORT_RUNS_DIR);
+    if dst.exists() {
+        // Not reachable from the gate's own branches (the fresh root is
+        // empty but for its marker); reachable by hand. Merging two trees
+        // is a judgement call about someone's data — say so, don't guess.
+        tracing::warn!(
+            event_type = "epoch_report_runs_conflict",
+            set_aside = %src.display(),
+            current = %dst.display(),
+            "both the set-aside and the current data root hold report-run \
+             results — leaving both in place; report runs recorded before \
+             the cutover stay unreadable until the two are merged by hand"
+        );
+        return Ok(());
+    }
+
+    std::fs::rename(&src, &dst).map_err(|e| {
+        format!(
+            "failed to carry report-run results {} → {}: {e} — refusing to \
+             start rather than orphan the postgres report_runs rows that \
+             reference them by relative path",
+            src.display(),
+            dst.display()
+        )
+    })?;
+    fsync_dir_best_effort(data_root);
+
+    tracing::info!(
+        event_type = "epoch_report_runs_carried_over",
+        from = %src.display(),
+        to = %dst.display(),
+        "report-run results moved into the epoch-{CURRENT_EPOCH} root — \
+         their postgres report_runs rows keep resolving across the cutover"
+    );
+    Ok(())
 }
 
 /// The sibling set-aside path for a data root (`data.pre-schema-v2`).
@@ -300,7 +384,11 @@ fn set_aside_legacy_root(
     aside: &Path,
     wal_dir: &Path,
 ) -> Result<Outcome, String> {
-    let parquet_files = count_files_with_ext(data_root, "parquet");
+    // Report-run parquet is carried back into the fresh root, so it is not
+    // part of what the cutover sets aside — don't claim it in the count.
+    let parquet_files = count_files_with_ext(data_root, "parquet").saturating_sub(
+        count_files_with_ext(&data_root.join(REPORT_RUNS_DIR), "parquet"),
+    );
     let wal_files = count_files_with_ext(wal_dir, "ndjson");
 
     // An external WAL dir does not move with the root — set it aside
@@ -474,6 +562,123 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, vec![EPOCH_FILE.to_owned()]);
+    }
+
+    #[test]
+    fn report_run_results_ride_across_the_cutover() {
+        // `report_runs.result_path` in postgres is RELATIVE and the cutover
+        // touches no postgres state, so the files it names must land under
+        // the fresh root — not in the aside, where every row would dangle.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let legacy_parquet = data.join("2026-01-15").join("10");
+        std::fs::create_dir_all(&legacy_parquet).unwrap();
+        std::fs::write(legacy_parquet.join("nginx.parquet"), b"legacy bytes").unwrap();
+        let runs = data.join("scheduled").join("daily_errors");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("run_42.parquet"), b"report bytes").unwrap();
+        let wal = data.join("wal");
+
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("cutover applies");
+        assert_eq!(
+            outcome,
+            Outcome::LegacySetAside {
+                // The report run is carried over, so it is not "set aside".
+                parquet_files: 1,
+                wal_files: 0,
+                external_wal_set_aside: false,
+            }
+        );
+
+        assert_eq!(
+            std::fs::read(data.join("scheduled/daily_errors/run_42.parquet")).unwrap(),
+            b"report bytes",
+            "the DB-stored relative path still resolves"
+        );
+        let aside = tmp.path().join("data.pre-schema-v2");
+        assert!(
+            !aside.join("scheduled").exists(),
+            "report runs are not left in the aside"
+        );
+        assert!(
+            aside.join("2026-01-15/10/nginx.parquet").exists(),
+            "legacy event data is still dropped"
+        );
+    }
+
+    #[test]
+    fn a_crash_before_the_carry_over_is_finished_on_the_next_boot() {
+        // The fresh root is published but the report runs never moved: the
+        // next boot takes the `Current` branch and must complete the step.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = data.join("wal");
+        ensure_current_epoch(&data, &wal, true).unwrap();
+        let aside_runs = tmp.path().join("data.pre-schema-v2/scheduled/daily");
+        std::fs::create_dir_all(&aside_runs).unwrap();
+        std::fs::write(aside_runs.join("run_1.parquet"), b"report bytes").unwrap();
+
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("boots");
+        assert_eq!(
+            outcome,
+            Outcome::Current {
+                aside_present: true
+            }
+        );
+        assert_eq!(
+            std::fs::read(data.join("scheduled/daily/run_1.parquet")).unwrap(),
+            b"report bytes"
+        );
+    }
+
+    #[test]
+    fn report_runs_in_both_roots_are_left_alone() {
+        // Hand-made state: merging two trees is the operator's call, but it
+        // must never cost a boot.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = data.join("wal");
+        ensure_current_epoch(&data, &wal, true).unwrap();
+        let current_runs = data.join("scheduled/fresh");
+        std::fs::create_dir_all(&current_runs).unwrap();
+        std::fs::write(current_runs.join("run_2.parquet"), b"fresh").unwrap();
+        let aside_runs = tmp.path().join("data.pre-schema-v2/scheduled/old");
+        std::fs::create_dir_all(&aside_runs).unwrap();
+        std::fs::write(aside_runs.join("run_1.parquet"), b"old").unwrap();
+
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("still boots");
+        assert_eq!(
+            outcome,
+            Outcome::Current {
+                aside_present: true
+            }
+        );
+        assert_eq!(
+            std::fs::read(current_runs.join("run_2.parquet")).unwrap(),
+            b"fresh"
+        );
+        assert_eq!(
+            std::fs::read(aside_runs.join("run_1.parquet")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn a_query_only_node_carries_nothing_over() {
+        // Ingest disabled: the node owns neither root, so not even the
+        // report-run subtree may be moved between them.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("logs");
+        std::fs::create_dir_all(data.join("2026-01-15")).unwrap();
+        let aside_runs = tmp.path().join("logs.pre-schema-v2/scheduled/daily");
+        std::fs::create_dir_all(&aside_runs).unwrap();
+        std::fs::write(aside_runs.join("run_1.parquet"), b"not ours").unwrap();
+        let wal = data.join("wal");
+
+        let outcome = ensure_current_epoch(&data, &wal, false).expect("boots");
+        assert_eq!(outcome, Outcome::CutoverDeferred);
+        assert!(aside_runs.join("run_1.parquet").exists());
+        assert!(!data.join("scheduled").exists());
     }
 
     #[test]
