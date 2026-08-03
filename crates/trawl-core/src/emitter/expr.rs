@@ -102,28 +102,10 @@ fn try_level_comparison(
     op: BinaryOp,
     rhs: &Spanned<Expr>,
 ) -> Result<Option<String>, EmitError> {
-    use crate::ast::FilterOp;
-
-    let filter_op = match op {
-        BinaryOp::Eq => FilterOp::Eq,
-        BinaryOp::Ne => FilterOp::Ne,
-        BinaryOp::Gt => FilterOp::Gt,
-        BinaryOp::Gte => FilterOp::Gte,
-        BinaryOp::Lt => FilterOp::Lt,
-        BinaryOp::Lte => FilterOp::Lte,
-        _ => return Ok(None),
-    };
-
-    let token = match (&lhs.node, &rhs.node) {
-        (Expr::FieldRef(name), Expr::Literal(LiteralValue::String(s)))
-            if name == super::severity::LEVEL_FIELD =>
-        {
-            s
-        }
-        _ => return Ok(None),
-    };
-
-    super::severity::level_predicate(filter_op, token).map(Some)
+    match super::severity::as_level_comparison(lhs, op, rhs) {
+        Some((filter_op, token)) => super::severity::level_predicate(filter_op, token).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn emit_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {

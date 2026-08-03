@@ -10,7 +10,7 @@
 //! regex patterns — and unknown tokens — are emit-time errors pointing at
 //! `severity_text`, which still matches the original text literally.
 
-use crate::ast::FilterOp;
+use crate::ast::{BinaryOp, Expr, FilterOp, LiteralValue, Spanned};
 use crate::severity;
 
 use super::EmitError;
@@ -18,7 +18,41 @@ use super::EmitError;
 /// The DSL field name that aliases the numeric `severity` column.
 pub(crate) const LEVEL_FIELD: &str = "level";
 
-fn unknown_token_error(token: &str) -> EmitError {
+/// Match a pipeline expression of the shape `level <cmp> "token"` and
+/// restate it in search-stage terms.
+///
+/// The single place that decides what counts as a `level` comparison, so
+/// every path that must agree on it reads the same answer: the SQL
+/// emitter (band predicate), the streaming plan compiler (which rejects
+/// exactly the tokens the emitter rejects) and the in-memory evaluator
+/// (which decides the same events the same way). Returns `None` when the
+/// expression is not a level comparison and belongs on the generic path.
+pub(crate) fn as_level_comparison<'a>(
+    lhs: &Spanned<Expr>,
+    op: BinaryOp,
+    rhs: &'a Spanned<Expr>,
+) -> Option<(FilterOp, &'a str)> {
+    let filter_op = match op {
+        BinaryOp::Eq => FilterOp::Eq,
+        BinaryOp::Ne => FilterOp::Ne,
+        BinaryOp::Gt => FilterOp::Gt,
+        BinaryOp::Gte => FilterOp::Gte,
+        BinaryOp::Lt => FilterOp::Lt,
+        BinaryOp::Lte => FilterOp::Lte,
+        _ => return None,
+    };
+
+    match (&lhs.node, &rhs.node) {
+        (Expr::FieldRef(name), Expr::Literal(LiteralValue::String(token)))
+            if name == LEVEL_FIELD =>
+        {
+            Some((filter_op, token.as_str()))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn unknown_token_error(token: &str) -> EmitError {
     EmitError::UnsupportedOperation {
         message: format!(
             "unknown severity token '{token}' for level= (valid tokens: {}); \
@@ -28,7 +62,7 @@ fn unknown_token_error(token: &str) -> EmitError {
     }
 }
 
-fn pattern_error() -> EmitError {
+pub(crate) fn pattern_error() -> EmitError {
     EmitError::UnsupportedOperation {
         message: format!(
             "level= does not support glob or regex patterns — it maps severity \
@@ -40,7 +74,10 @@ fn pattern_error() -> EmitError {
 }
 
 /// Resolve a token to its number and containing band, or an emit error.
-fn resolve(token: &str) -> Result<(u8, (u8, u8)), EmitError> {
+///
+/// Shared with the in-memory filter (`crate::filter`) so the SSE path
+/// rejects the same `level=` tokens as the SQL path, with the same message.
+pub(crate) fn resolve(token: &str) -> Result<(u8, (u8, u8)), EmitError> {
     let number = severity::number_for_token(token).ok_or_else(|| unknown_token_error(token))?;
     let band = severity::band_of(number).expect("table numbers are in-ladder");
     Ok((number, band))

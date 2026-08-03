@@ -42,6 +42,7 @@ level=error                     # severity BETWEEN 17 AND 20 (the ERROR band)
 level!=info                     # NOT BETWEEN 9 AND 12, or severity IS NULL
 level=warn,error                # either band
 level>=warn                     # severity >= 13 (the token's exact number)
+| where level == "error"        # same band predicate, in a pipe stage
 ```
 
 - Equality/IN match the whole band containing the token (`notice` falls
@@ -53,9 +54,11 @@ level>=warn                     # severity >= 13 (the token's exact number)
   `alert`, `emerg`/`panic`. Anything else (or a glob/regex on `level`) is
   a query error — match the original spelling with
   `severity_text="..."` instead.
-- `level` works only in search-stage filters; in projections, `stats by`,
-  or `sort` use `severity`/`severity_text` (there is no stored `level`
-  column).
+- `level` works in search-stage filters and in `where` comparisons
+  against a token literal — both compile to the same band predicate, and
+  live tail (SSE) evaluates them identically to a batch query.
+- Everywhere else — projections, `stats by`, `sort`, `let` arithmetic —
+  use `severity`/`severity_text`; there is no stored `level` column.
 
 ### Time aliases
 
