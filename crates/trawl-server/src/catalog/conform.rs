@@ -229,9 +229,14 @@ pub async fn ensure_conformance(
     // Seed pins: declared fields came with the migration; custom fields by
     // most-rows-wins across files — rows CARRYING the field, not the files'
     // row counts — ties by ladder order.
+    // Unrationed: these proposals describe columns that are ALREADY on
+    // disk, and phase B rewrites whatever stays unpinned out of the files
+    // carrying it. The ingest path's half-the-free-slots ration exists to
+    // stop a burst from claiming the catalog; applying it here would only
+    // delete standing data to slow a sender who has already spent the slots.
     let proposals = most_rows_wins(&scan, &existing);
     store
-        .pin_missing(&proposals)
+        .pin_missing_unrationed(&proposals)
         .await
         .map_err(|e| format!("failed to seed pins: {e}"))?;
     let pins: HashMap<String, CanonicalType> = hydrate(store, cache).await?.into_iter().collect();

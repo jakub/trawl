@@ -105,6 +105,33 @@ pub struct FieldConflictRow {
 /// a real corpus that legitimately reaches five figures of distinct field
 /// names has a modelling problem this cap should surface, not a capacity
 /// problem trawl should silently absorb.
+///
+/// **FILLING the cap is the attack the cap itself invites.** A slot, once
+/// taken, is taken forever, and denial is silent in the data (the column is
+/// simply absent from every later parquet file). Left first-come-first-served
+/// the whole catalog was consumable in ONE compaction batch — a single
+/// request carrying ten thousand junk keys — after which every genuinely new
+/// field on the install, from every service, was permanently unstored. Two
+/// things keep that unreachable:
+///
+/// - Admission from the ingest path is RATIONED: one batch may take at most
+///   half the FREE slots ([`Ration::HalfOfFree`]), so exhaustion is a slope
+///   requiring sustained, repeated effort instead of a one-shot cliff, and
+///   there is always headroom left for the next field a legitimate sender
+///   introduces.
+/// - The fill level is a first-class signal —
+///   `trawl_catalog_pinned_fields` against `trawl_catalog_pin_capacity` —
+///   so an operator alerts on the slope, not on the wreckage. (The
+///   `catalog_pin_cap_reached` warning only fires once slots are already
+///   gone.)
+///
+/// What neither buys is a REMEDY: reclaiming a taken slot means proving no
+/// standing parquet carries the column and rewriting the ones that do, which
+/// is the shadow-generation rewrite of #53; a hand-run
+/// `DELETE FROM field_types` breaks the write-time conformance invariant for
+/// files already on disk and must not be recommended. Until #53, a sustained
+/// sender can still fill the catalog — the ration slows it and the gauges
+/// make it visible while it happens.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
 
 /// Maximum `field_services` observation rows kept per field — the
@@ -184,6 +211,31 @@ fn warn_unstorable(op: &str, rejected: &[String]) {
          not pinned (and so not stored), values remain in _raw"
     );
     bump_rejected("name_too_long", rejected.len());
+}
+
+/// How many of the free pin slots ONE call may consume.
+///
+/// The pin count is bounded ([`MAX_PINNED_FIELDS`]) but a slot is spent
+/// permanently, so *how fast* the free slots can be spent is its own
+/// property — a bound nothing can take in one gulp behaves very differently
+/// from one anything can. See [`MAX_PINNED_FIELDS`].
+#[derive(Debug, Clone, Copy)]
+enum Ration {
+    /// Ingest path: at most half the free slots, so no single batch — and
+    /// therefore no single ingest request — can consume the catalog.
+    HalfOfFree,
+    /// Boot conformance pass: every free slot, because there a denied pin
+    /// deletes a column that is already on disk
+    /// ([`CatalogStore::pin_missing_unrationed`]).
+    EveryFreeSlot,
+}
+
+/// Publish the catalog's fill level: `used` and the ceiling it is measured
+/// against, so an alert is a ratio and needs no knowledge of the constant.
+#[allow(clippy::cast_precision_loss)] // gauge values are f64; a 10k cap is exact
+fn set_fill_gauges(pinned: i64, cap: i64) {
+    metrics::gauge!(crate::metrics::CATALOG_PINNED_FIELDS).set(pinned as f64);
+    metrics::gauge!(crate::metrics::CATALOG_PIN_CAPACITY).set(cap as f64);
 }
 
 /// Count fields denied a pin, by reason. No field-name label: the names are
@@ -286,9 +338,42 @@ impl CatalogStore {
     /// full catalog pins nothing new and its novel columns are dropped from
     /// the parquet with their values still in `_raw` (never an `Err` — that
     /// would wedge compaction for a condition retrying cannot clear).
+    ///
+    /// This is the ingest path, so admission is RATIONED to half the free
+    /// slots ([`Ration::HalfOfFree`] — see [`MAX_PINNED_FIELDS`] for why a
+    /// batch that can take every remaining slot is the attack). A batch
+    /// proposing more novel fields than its ration keeps the surplus for its
+    /// next tick: an unpinned column is dropped from THIS file only, and a
+    /// field a sender keeps sending is proposed again ten seconds later.
     pub async fn pin_missing(
         &self,
         proposals: &[PinProposal],
+    ) -> Result<HashMap<String, CanonicalType>, StoreError> {
+        self.pin_missing_with(proposals, Ration::HalfOfFree).await
+    }
+
+    /// Pin proposals WITHOUT the per-batch ration — the boot conformance
+    /// pass only.
+    ///
+    /// That pass does not propose client input as it arrives: it proposes
+    /// what a standing parquet corpus already contains, and its next act is
+    /// to rewrite the files that disagree. There, a denied pin does not
+    /// decline to store a new column — it DELETES a column that is already
+    /// on disk. Rationing the seed would therefore destroy data to slow an
+    /// attacker who has already spent the slots, so the seed gets every free
+    /// slot the cap allows; [`MAX_PINNED_FIELDS`] still bounds it absolutely.
+    pub async fn pin_missing_unrationed(
+        &self,
+        proposals: &[PinProposal],
+    ) -> Result<HashMap<String, CanonicalType>, StoreError> {
+        self.pin_missing_with(proposals, Ration::EveryFreeSlot)
+            .await
+    }
+
+    async fn pin_missing_with(
+        &self,
+        proposals: &[PinProposal],
+        ration: Ration,
     ) -> Result<HashMap<String, CanonicalType>, StoreError> {
         let rejected = unstorable_names(proposals.iter().map(|p| p.field.as_str()));
         if !rejected.is_empty() {
@@ -305,18 +390,27 @@ impl CatalogStore {
         let types: Vec<&str> = proposals.iter().map(|p| p.ty.as_duckdb()).collect();
         let sources: Vec<&str> = proposals.iter().map(|p| p.pinned_from.as_str()).collect();
 
-        // Only the free slots under the cap are filled. Already-pinned
-        // proposals are excluded from `candidate` so they never consume a
-        // slot, and the surplus is ordered by name so an overflowing batch
-        // picks deterministically rather than by arrival accident.
+        // Only the free slots under the cap are filled, and on the ingest
+        // path only half of them (see `Ration`). Already-pinned proposals
+        // are excluded from `candidate` so they never consume a slot, and
+        // the surplus is ordered by name so an overflowing batch picks
+        // deterministically rather than by arrival accident — within one
+        // batch there is no legitimacy signal to rank by, which is exactly
+        // why the ration, not the ordering, is what protects the tail.
         sqlx::query(
             "WITH candidate AS (
                  SELECT u.f, u.t, u.s, row_number() OVER (ORDER BY u.f) AS rn
                  FROM UNNEST($1::text[], $2::text[], $3::text[]) AS u(f, t, s)
                  WHERE NOT EXISTS (SELECT 1 FROM field_types x WHERE x.field = u.f)
              ),
-             capacity AS (
+             free AS (
                  SELECT GREATEST($4::bigint - (SELECT count(*) FROM field_types), 0) AS slots
+             ),
+             capacity AS (
+                 -- Integer division rounds down, so `+ 1` keeps a lone free
+                 -- slot grantable: the ration bounds a burst, it never
+                 -- strands capacity.
+                 SELECT CASE WHEN $5 THEN slots ELSE (slots + 1) / 2 END AS slots FROM free
              )
              INSERT INTO field_types (field, duckdb_type, pinned_from)
              SELECT c.f, c.t, c.s FROM candidate c, capacity
@@ -327,8 +421,17 @@ impl CatalogStore {
         .bind(&types)
         .bind(&sources)
         .bind(self.pin_cap)
+        .bind(matches!(ration, Ration::EveryFreeSlot))
         .execute(&self.pool)
         .await?;
+
+        // The fill level is the signal an operator can act on BEFORE the cap
+        // bites; `catalog_pin_cap_reached` below only fires once the slots
+        // are already gone (and gone permanently, until #53).
+        let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
+            .fetch_one(&self.pool)
+            .await?;
+        set_fill_gauges(pinned_now, self.pin_cap);
 
         let rows = sqlx::query("SELECT field, duckdb_type FROM field_types WHERE field = ANY($1)")
             .bind(&fields)

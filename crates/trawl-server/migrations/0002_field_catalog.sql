@@ -7,6 +7,13 @@
 -- The pins. Key is the field name ALONE — global, not per-service:
 -- per-service typing would be locally correct and break cross-service
 -- queries, which are the ones worth having.
+--
+-- Bounded at store::catalog::MAX_PINNED_FIELDS rows, and a row here is
+-- permanent (add-only until the repin rewrite, #53) — so the ingest path
+-- may claim at most half the FREE rows per batch, keeping the table out of
+-- reach of a single burst. Never DELETE from this table by hand: a standing
+-- parquet file carrying the column would then be outside the write-time
+-- conformance invariant, which is what makes union_by_name safe.
 CREATE TABLE field_types (
     field       TEXT
         CONSTRAINT field_types_pkey PRIMARY KEY,

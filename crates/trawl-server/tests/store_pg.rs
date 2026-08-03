@@ -1517,6 +1517,7 @@ mod catalog {
         let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
         let store = catalog(&pool).with_pin_cap(seeded + 2);
 
+        // Two free slots, and one batch may take at most half of them.
         let pins = store
             .pin_missing(&[
                 proposal("a_field", CanonicalType::BigInt),
@@ -1527,11 +1528,24 @@ mod catalog {
             .await
             .expect("a full catalog must never error the batch — retrying cannot clear it");
 
-        assert_eq!(pins.len(), 2, "only the two free slots are filled");
+        assert_eq!(pins.len(), 1, "one batch takes at most half the free slots");
         assert!(
-            pins.contains_key("a_field") && pins.contains_key("b_field"),
+            pins.contains_key("a_field"),
             "an overflowing batch picks deterministically, by name"
         );
+
+        // One free slot left: the ration bounds a burst, it never strands
+        // the last slot.
+        let pins = store
+            .pin_missing(&[
+                proposal("b_field", CanonicalType::BigInt),
+                proposal("c_field", CanonicalType::BigInt),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(pins.len(), 1, "the last free slot is still grantable");
+        assert!(pins.contains_key("b_field"));
+
         let all = store.load_pins().await.unwrap();
         assert_eq!(
             i64::try_from(all.len()).unwrap(),
@@ -1559,6 +1573,53 @@ mod catalog {
             store.load_pins().await.unwrap().len(),
             all.len(),
             "a full catalog never grows"
+        );
+    }
+
+    #[sqlx::test]
+    async fn one_batch_cannot_consume_the_catalog_but_the_boot_seed_can(pool: PgPool) {
+        // A pin slot is spent PERMANENTLY (add-only until #53) and denial is
+        // silent in the data — the column is simply absent from every later
+        // parquet file. First-come-first-served therefore meant one ingest
+        // request carrying enough junk keys could permanently unstore every
+        // future field on the install, from every service. The ingest path
+        // takes at most half the free slots, so the tail always survives a
+        // burst.
+        let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
+        let store = catalog(&pool).with_pin_cap(seeded + 8);
+
+        let burst: Vec<PinProposal> = (0..8)
+            .map(|i| proposal(&format!("junk_{i:02}"), CanonicalType::BigInt))
+            .collect();
+        let pins = store.pin_missing(&burst).await.unwrap();
+        assert_eq!(
+            pins.len(),
+            4,
+            "half of the eight free slots, never all of them"
+        );
+
+        let pins = store
+            .pin_missing(&[proposal("legit_field", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        assert!(
+            pins.contains_key("legit_field"),
+            "a burst never leaves the next legitimate field homeless"
+        );
+
+        // The boot conformance pass is exempt: its proposals describe
+        // columns already ON DISK, so a denied pin there deletes standing
+        // data rather than declining to add a column.
+        let pins = store.pin_missing_unrationed(&burst).await.unwrap();
+        assert_eq!(
+            pins.len(),
+            7,
+            "the seed fills every free slot the cap allows"
+        );
+        assert_eq!(
+            i64::try_from(store.load_pins().await.unwrap().len()).unwrap(),
+            seeded + 8,
+            "and the cap still holds absolutely"
         );
     }
 

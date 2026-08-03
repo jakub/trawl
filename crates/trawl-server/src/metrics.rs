@@ -37,6 +37,8 @@ pub const CATALOG_ROWS_NULLED_TOTAL: &str = "trawl_catalog_rows_nulled_total";
 pub const CATALOG_CONFORM_REWRITES_TOTAL: &str = "trawl_catalog_conform_rewrites_total";
 pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_total";
 pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
+pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
+pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
 
 // -- description registration ------------------------------------------------
 
@@ -111,6 +113,18 @@ pub fn describe_metrics() {
         CATALOG_PINS_REJECTED_TOTAL,
         "Fields denied a catalog pin, labelled by reason (name_too_long, \
          cap); their columns are not stored and the values remain in _raw"
+    );
+    describe_gauge!(
+        CATALOG_PINNED_FIELDS,
+        "Field-catalog pins in use. A pin is permanent until the repin \
+         rewrite (#53), so this only ever climbs — alert on it against \
+         trawl_catalog_pin_capacity, well before the cap starts denying \
+         pins"
+    );
+    describe_gauge!(
+        CATALOG_PIN_CAPACITY,
+        "Field-catalog pin ceiling (store::catalog::MAX_PINNED_FIELDS); a \
+         field arriving at a full catalog is never stored as a column"
     );
 }
 
