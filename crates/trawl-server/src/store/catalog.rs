@@ -57,7 +57,8 @@ pub struct FieldServiceRow {
     /// Most recent observation (consumers window on this — rows are
     /// ever-observed and retention never reconciles them).
     pub last_seen: DateTime<Utc>,
-    /// Cumulative rows observed carrying the field.
+    /// Cumulative rows compacted in batches that wrote the field — the sum
+    /// of per-batch row counts, not a per-value non-null tally.
     pub row_count: i64,
 }
 
@@ -207,6 +208,10 @@ impl CatalogStore {
 
     /// Upsert per-service observations for a compacted batch: `first_seen`
     /// is set once, `last_seen` advances, `row_count` accumulates.
+    ///
+    /// `row_count` is ADDED to the stored value, so callers must pass the
+    /// rows THIS batch wrote — never a whole-file total, which would
+    /// re-count every earlier batch on every tick.
     ///
     /// Names that cannot be a catalog key are skipped for the same reason
     /// as in [`Self::pin_missing`] — `field_services` keys on

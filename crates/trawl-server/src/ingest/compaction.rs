@@ -1110,7 +1110,7 @@ async fn record_batch_bookkeeping(cat: &CatalogContext, service: &str, report: &
     }
     if let Err(e) = cat
         .store
-        .touch_services(service, &report.observed_fields, report.rows)
+        .touch_services(service, &report.observed_fields, report.batch_rows)
         .await
     {
         tracing::warn!(
@@ -1473,11 +1473,15 @@ struct PreparedBatch {
 
 /// Outcome of a conformant write, carried to the bookkeeping phase.
 struct WriteReport {
-    /// Rows in the written file (post-merge).
-    rows: u64,
+    /// Rows THIS batch contributed. Deliberately NOT the merged file's
+    /// total: `field_services.row_count` accumulates this value, so a
+    /// whole-file count would re-add every earlier batch on every tick.
+    batch_rows: u64,
     /// Conform casts that constitute recordable conflicts.
     conflicts: Vec<FieldConflict>,
-    /// Every field observed in the batch (for `field_services`).
+    /// Fields this batch actually WROTE (for `field_services`) — the
+    /// post-conform column set, so deferred-pin columns dropped by
+    /// [`conform_wal_batch`] are not claimed as observed.
     observed_fields: Vec<String>,
 }
 
@@ -1712,12 +1716,15 @@ fn conform_and_write(
         ..
     } = prep;
 
-    let conflicts = conform_wal_batch(&conn, &schema, pins, service)?;
-    let observed_fields: Vec<String> = schema
-        .iter()
-        .map(|c| c.name.clone())
+    let (conflicts, retained) = conform_wal_batch(&conn, &schema, pins, service)?;
+    let observed_fields: Vec<String> = retained
+        .into_iter()
         .filter(|n| !n.starts_with(WAL_FILE_COL))
         .collect();
+    // Counted before the merge: `merged` holds the whole hour file, and
+    // accumulating THAT into `field_services.row_count` would re-add every
+    // previously-compacted row on every tick.
+    let batch_rows = count_rows(&conn, "wal_batch")?;
 
     // Determine output directory from current time.
     let now = chrono::Utc::now();
@@ -1770,7 +1777,7 @@ fn conform_and_write(
         ))
         .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
 
-        count_rows(&conn, "wal_batch")?
+        batch_rows
     };
 
     conn.execute_batch("DROP TABLE IF EXISTS wal_batch")
@@ -1799,7 +1806,7 @@ fn conform_and_write(
     );
 
     Ok(WriteReport {
-        rows,
+        batch_rows,
         conflicts,
         observed_fields,
     })
@@ -1816,17 +1823,22 @@ fn conform_and_write(
 /// NULL, and writing typed NULLs would let a silent field pre-empt its own
 /// real type).
 ///
-/// Returns the recordable conflicts: one row per cast column that had at
-/// least one non-null value and either nulled rows or carried a concrete
-/// (non-JSON) disagreeing type. An all-null pinned column (e.g. a batch
-/// with no `_repairs`) casts silently — that is representation, not
-/// disagreement.
+/// Returns the recordable conflicts and the RETAINED column names.
+///
+/// Conflicts are one row per cast column that had at least one non-null
+/// value and either nulled rows or carried a concrete (non-JSON)
+/// disagreeing type. An all-null pinned column (e.g. a batch with no
+/// `_repairs`) casts silently — that is representation, not disagreement.
+///
+/// The retained names are the post-conform column set — the dropped
+/// deferred-pin columns are absent, so bookkeeping can never claim a
+/// service carried a field no parquet file holds.
 fn conform_wal_batch(
     conn: &duckdb::Connection,
     schema: &[ColInfo],
     pins: &HashMap<String, CanonicalType>,
     service: &str,
-) -> Result<Vec<FieldConflict>, String> {
+) -> Result<(Vec<FieldConflict>, Vec<String>), String> {
     struct CastEntry {
         name: String,
         dtype: String,
@@ -1835,6 +1847,7 @@ fn conform_wal_batch(
     }
 
     let mut select_list: Vec<String> = Vec::with_capacity(schema.len());
+    let mut retained: Vec<String> = Vec::with_capacity(schema.len());
     let mut casts: Vec<CastEntry> = Vec::new();
     let mut dropped: Vec<&str> = Vec::new();
 
@@ -1842,14 +1855,19 @@ fn conform_wal_batch(
         let quoted = quote_ident(&col.name);
         if trawl_core::schema::TIMESTAMP_COLUMNS.contains(&col.name.as_str()) {
             select_list.push(quoted);
+            retained.push(col.name.clone());
             continue;
         }
         match pins.get(&col.name) {
             None => dropped.push(&col.name),
             Some(pin) => match conform_expr(&quoted, &col.dtype, *pin) {
-                None => select_list.push(quoted),
+                None => {
+                    select_list.push(quoted);
+                    retained.push(col.name.clone());
+                }
                 Some(expr) => {
                     select_list.push(format!("{expr} AS {quoted}"));
+                    retained.push(col.name.clone());
                     casts.push(CastEntry {
                         name: col.name.clone(),
                         dtype: col.dtype.clone(),
@@ -1926,7 +1944,7 @@ fn conform_wal_batch(
         .map_err(|e| format!("catalog conform failed: {e}"))?;
     }
 
-    Ok(conflicts)
+    Ok((conflicts, retained))
 }
 
 /// Test-only convenience wrapper: prepare + local pins + conform/write,
@@ -2213,6 +2231,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2, "merged file should contain 2 rows");
+    }
+
+    /// `field_services.row_count` is accumulated by `touch_services`, so
+    /// the report must carry THIS batch's rows — the merged file's total
+    /// would re-add every earlier batch on every tick. And the observed
+    /// fields must be the post-conform set: a deferred-pin column is
+    /// dropped from the parquet, so claiming it as observed is a lie.
+    #[test]
+    fn write_report_counts_only_this_batch_and_written_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let report_for = |records: &[&str]| {
+            let files = vec![write_wal_file(&wal_dir, "nginx", records)];
+            let mut quarantined: u64 = 0;
+            let prep = prepare_service_batch(
+                &files,
+                &data_dir,
+                "nginx",
+                "2GB",
+                &mut quarantined,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .expect("batch survives");
+            let pins = local_pins(&prep.proposals);
+            conform_and_write(prep, &pins, &data_dir, "nginx").unwrap()
+        };
+
+        // `deferred` is all-null, so its pin defers and conform drops it.
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"one","deferred":null}"#;
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","message":"two","deferred":null}"#;
+        let first = report_for(&[r1, r2]);
+        assert_eq!(first.batch_rows, 2);
+        assert!(first.observed_fields.iter().any(|f| f == "message"));
+        assert!(
+            !first.observed_fields.iter().any(|f| f == "deferred"),
+            "a dropped deferred-pin column was never written: {:?}",
+            first.observed_fields
+        );
+
+        let r3 = r#"{"_time":"2026-01-01T00:00:02Z","_ingested":"2026-01-01T00:00:02Z","service":"nginx","message":"three"}"#;
+        let second = report_for(&[r3]);
+        assert_eq!(
+            second.batch_rows, 1,
+            "the merge tick must report its own rows, not the file total"
+        );
+
+        // The file really did merge to 3 rows — so 1 is the batch count,
+        // not an artefact of a failed merge.
+        let parquet_files = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet_files.len(), 1);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet_files[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "merged file holds both batches");
     }
 
     #[test]
