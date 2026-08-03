@@ -52,7 +52,7 @@ pub(crate) fn as_level_comparison<'a>(
     }
 }
 
-pub(crate) fn unknown_token_error(token: &str) -> EmitError {
+fn unknown_token_error(token: &str) -> EmitError {
     EmitError::UnsupportedOperation {
         message: format!(
             "unknown severity token '{token}' for level= (valid tokens: {}); \
@@ -62,7 +62,7 @@ pub(crate) fn unknown_token_error(token: &str) -> EmitError {
     }
 }
 
-pub(crate) fn pattern_error() -> EmitError {
+fn pattern_error() -> EmitError {
     EmitError::UnsupportedOperation {
         message: format!(
             "level= does not support glob or regex patterns — it maps severity \
@@ -75,9 +75,11 @@ pub(crate) fn pattern_error() -> EmitError {
 
 /// Resolve a token to its number and containing band, or an emit error.
 ///
-/// Shared with the in-memory filter (`crate::filter`) so the SSE path
-/// rejects the same `level=` tokens as the SQL path, with the same message.
-pub(crate) fn resolve(token: &str) -> Result<(u8, (u8, u8)), EmitError> {
+/// Module-private: every other consumer of `level` rejection — the
+/// in-memory filter and the streaming evaluator — goes through
+/// [`level_predicate`] / [`level_in_list`], so the predicate and its
+/// error message stay defined in exactly one place.
+fn resolve(token: &str) -> Result<(u8, (u8, u8)), EmitError> {
     let number = severity::number_for_token(token).ok_or_else(|| unknown_token_error(token))?;
     let band = severity::band_of(number).expect("table numbers are in-ladder");
     Ok((number, band))
