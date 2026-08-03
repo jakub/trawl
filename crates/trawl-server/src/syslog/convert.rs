@@ -30,54 +30,60 @@ const MAX_SD_PARAMS_TOTAL: usize = 128;
 /// Maximum length of a structured data field key (`sd_{id}_{param}`).
 const MAX_SD_KEY_LEN: usize = 256;
 
-/// Sanitize a service name: strip invalid characters, truncate, fallback.
-fn sanitize_service(raw: &str) -> Option<String> {
-    if raw.is_empty() {
-        return None;
-    }
+/// Last-resort service name when every candidate sanitizes away.
+const FALLBACK_SERVICE: &str = "syslog";
 
-    let sanitized: String = raw
+/// Map a candidate into the service charset: drop invalid characters,
+/// drop leading dots, truncate to the length cap. Returns `None` when
+/// nothing usable survives.
+///
+/// The result always satisfies [`pipeline::is_valid_service_name`] — the
+/// syslog listener is an input-mapping ingestor, so it maps rather than
+/// rejects, but it may never emit a name HTTP ingest would refuse
+/// (ADR-0009: the name reaches WAL filenames verbatim).
+fn sanitize_service(raw: &str) -> Option<String> {
+    let filtered: String = raw
         .bytes()
         .filter(|b| pipeline::is_valid_service_char(*b))
-        .map(|b| b as char)
+        .map(char::from)
         .collect();
 
-    if sanitized.is_empty() {
-        return None;
-    }
+    // Dot-leading names are `.`, `..` (path escape) or dotfiles; strip the
+    // leading run rather than rejecting the whole candidate.
+    let trimmed = filtered.trim_start_matches('.');
+    let capped = &trimmed[..trimmed.len().min(pipeline::MAX_SERVICE_NAME_LEN)];
 
-    if sanitized.len() > pipeline::MAX_SERVICE_NAME_LEN {
-        Some(sanitized[..pipeline::MAX_SERVICE_NAME_LEN].to_owned())
+    if capped.is_empty() {
+        None
     } else {
-        Some(sanitized)
+        Some(capped.to_owned())
     }
 }
 
 /// Derive the service name for a syslog event.
 ///
-/// Priority:
+/// Priority (each candidate sanitized, falling through when it maps to
+/// nothing):
 /// 1. `source_service_map` lookup by source IP (explicit user config)
-/// 2. APP-NAME / tag from the syslog message (sanitized)
+/// 2. APP-NAME / tag from the syslog message
 /// 3. `default_service` from config
+/// 4. [`FALLBACK_SERVICE`]
+///
+/// The return value always satisfies [`pipeline::is_valid_service_name`].
 pub fn derive_service<S: BuildHasher>(
     source_ip: IpAddr,
     appname: Option<&str>,
     source_service_map: &HashMap<String, String, S>,
     default_service: &str,
 ) -> String {
-    // 1. Check source IP mapping
     let ip_str = source_ip.to_string();
-    if let Some(mapped) = source_service_map.get(&ip_str) {
-        return mapped.clone();
-    }
-
-    // 2. Use APP-NAME/tag if valid
-    if let Some(sanitized) = appname.and_then(sanitize_service) {
-        return sanitized;
-    }
-
-    // 3. Fallback to default
-    default_service.to_owned()
+    source_service_map
+        .get(&ip_str)
+        .map(String::as_str)
+        .and_then(sanitize_service)
+        .or_else(|| appname.and_then(sanitize_service))
+        .or_else(|| sanitize_service(default_service))
+        .unwrap_or_else(|| FALLBACK_SERVICE.to_owned())
 }
 
 /// Format a syslog timestamp to RFC 3339 UTC at microsecond precision
@@ -329,6 +335,67 @@ mod tests {
         );
         assert_eq!(sanitize_service(""), None);
         assert_eq!(sanitize_service("///"), None);
+        // Dot-leading names would become dotfile parquets; `..` is a path
+        // escape. Both lose their leading dot run.
+        assert_eq!(sanitize_service(".foo"), Some("foo".to_string()));
+        assert_eq!(sanitize_service(".."), None);
+        assert_eq!(
+            sanitize_service("../../escaped"),
+            Some("escaped".to_string())
+        );
+    }
+
+    /// ADR-0009 injectivity: the on-disk name IS the service value, so
+    /// every `derive_service` path — including the two unvalidated config
+    /// fields — must yield a name HTTP ingest would also accept. Before
+    /// this was enforced, a mapped service of `../../escaped` wrote WAL
+    /// files outside the WAL root (silent data loss) and `Living Room AP`
+    /// produced a parquet glob the emitter refuses.
+    #[test]
+    fn derive_service_output_is_always_a_valid_service_name() {
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        let other: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let mut map = HashMap::new();
+        map.insert("192.168.1.1".to_string(), "../../escaped".to_string());
+        assert_eq!(derive_service(ip, None, &map, "syslog"), "escaped");
+
+        let mut map = HashMap::new();
+        map.insert("192.168.1.1".to_string(), "Living Room AP".to_string());
+        assert_eq!(derive_service(ip, None, &map, "syslog"), "LivingRoomAP");
+
+        // A map value that sanitizes to nothing falls through to appname.
+        let mut map = HashMap::new();
+        map.insert("192.168.1.1".to_string(), "..".to_string());
+        assert_eq!(derive_service(ip, Some("sshd"), &map, "syslog"), "sshd");
+
+        // Dot-leading appnames never become dotfiles.
+        assert_eq!(
+            derive_service(other, Some(".hidden"), &HashMap::new(), "syslog"),
+            "hidden"
+        );
+
+        // An unusable default_service still yields a valid name.
+        assert_eq!(
+            derive_service(other, None, &HashMap::new(), "/../"),
+            "syslog"
+        );
+
+        for candidate in [
+            "../../escaped",
+            "Living Room AP",
+            ".hidden",
+            "..",
+            "/../",
+            "",
+            &"x".repeat(200),
+        ] {
+            let derived = derive_service(other, Some(candidate), &HashMap::new(), candidate);
+            assert!(
+                pipeline::is_valid_service_name(&derived),
+                "derive_service({candidate:?}) yielded invalid name {derived:?}"
+            );
+        }
     }
 
     #[test]

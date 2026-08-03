@@ -374,6 +374,31 @@ pub fn is_valid_env_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
+/// Maximum service name length (ADR-0009 path segment cap).
+pub const MAX_SERVICE_NAME_LEN: usize = 128;
+
+/// Whether `b` is a byte allowed in a service name: alphanumeric, dash,
+/// underscore, dot — no spaces, no slashes.
+pub fn is_valid_service_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+}
+
+/// Whether `name` is a valid service name: non-empty, at most
+/// [`MAX_SERVICE_NAME_LEN`] bytes, [`is_valid_service_char`] throughout,
+/// and not dot-leading.
+///
+/// Path encoding is injective by validation (ADR-0009): service is a path
+/// segment carried verbatim into WAL filenames and parquet names, so this
+/// predicate is the whole safety argument — no slashes (path escape), no
+/// spaces (unquotable globs), no dot-leading names (`.`, `..`, dotfiles).
+/// Every ingestion path must funnel service names through it.
+pub fn is_valid_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SERVICE_NAME_LEN
+        && name.bytes().all(is_valid_service_char)
+        && !name.starts_with('.')
+}
+
 impl Default for IngestConfig {
     fn default() -> Self {
         Self {
@@ -1396,6 +1421,38 @@ impl Config {
             if self.syslog.tcp_enabled && self.syslog.tcp_idle_timeout_secs == 0 {
                 return Err(ConfigError::Validation(
                     "syslog.tcp_idle_timeout_secs must be > 0 when TCP is enabled".into(),
+                ));
+            }
+            self.validate_syslog_service_names()?;
+        }
+
+        Ok(())
+    }
+
+    /// Service names from syslog config reach WAL filenames verbatim
+    /// (ADR-0009), so they carry the same charset/dot obligations as
+    /// ingested ones — refuse to start rather than write outside the data
+    /// tree or produce a name no query can name.
+    fn validate_syslog_service_names(&self) -> Result<(), ConfigError> {
+        let invalid = |field: String, value: &String| {
+            ConfigError::Validation(format!(
+                "{field} {value:?} is not a valid service name \
+                 (1-{MAX_SERVICE_NAME_LEN} chars of [A-Za-z0-9._-], not \
+                 dot-leading)"
+            ))
+        };
+
+        if !is_valid_service_name(&self.syslog.default_service) {
+            return Err(invalid(
+                "syslog.default_service".to_owned(),
+                &self.syslog.default_service,
+            ));
+        }
+        for (ip, service) in &self.syslog.source_service_map {
+            if !is_valid_service_name(service) {
+                return Err(invalid(
+                    format!("syslog.source_service_map entry {ip:?} ="),
+                    service,
                 ));
             }
         }
@@ -2455,5 +2512,66 @@ envs = ["prod", "lab"]
         assert!(!is_valid_env_name("pro\\d"));
         assert!(!is_valid_env_name(&"a".repeat(33)));
         assert!(is_valid_env_name(&"a".repeat(32)));
+    }
+
+    #[test]
+    fn service_name_charset_helper() {
+        assert!(is_valid_service_name("nginx"));
+        assert!(is_valid_service_name("my-app_v2.0"));
+        assert!(is_valid_service_name("UniFi"));
+        assert!(!is_valid_service_name(""));
+        assert!(!is_valid_service_name("Living Room AP"));
+        assert!(!is_valid_service_name("../../escaped"));
+        assert!(!is_valid_service_name(".hidden"));
+        assert!(!is_valid_service_name(".."));
+        assert!(!is_valid_service_name(
+            &"a".repeat(MAX_SERVICE_NAME_LEN + 1)
+        ));
+        assert!(is_valid_service_name(&"a".repeat(MAX_SERVICE_NAME_LEN)));
+    }
+
+    /// Syslog service names reach WAL filenames verbatim (ADR-0009), so a
+    /// path-escaping or unqueryable config value must refuse to start
+    /// rather than silently write outside the data tree.
+    #[test]
+    fn syslog_service_config_is_validated_at_load() {
+        let with_syslog = |syslog: &str| {
+            Config::from_toml(&format!(
+                r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[syslog]
+enabled = true
+{syslog}
+"#
+            ))
+        };
+
+        let err = with_syslog(r#"default_service = "../../escaped""#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("syslog.default_service"), "got: {err}");
+
+        let err = with_syslog(
+            r#"
+[syslog.source_service_map]
+"192.168.1.1" = "Living Room AP"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("syslog.source_service_map"), "got: {err}");
+
+        with_syslog(
+            r#"
+default_service = "syslog"
+
+[syslog.source_service_map]
+"192.168.1.1" = "unifi-gateway"
+"#,
+        )
+        .expect("valid syslog service names must load");
     }
 }
