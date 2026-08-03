@@ -365,6 +365,16 @@ Available in `let`/`eval` and `where` expressions.
 | `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`) |
 | `tostring(x)` | Cast to string (`null` for null/array input) |
 
+### Nested fields (JSON)
+
+Nested objects and arrays are stringified at ingest: a field like `k8s: {"pod": "x", "ns": "default"}` is stored as its JSON text in a `VARCHAR` column (the field catalog pins it as such), never as a `STRUCT`. Reach into it with `json_extract_string`:
+
+```
+service=kubelet | eval pod = json_extract_string(k8s, "$.pod") | where isnotnull(pod)
+```
+
+Bare text search also matches inside the stringified value (it is part of `_raw` and of the column's text).
+
 ### Date and time functions
 
 Date/time functions operate on **timestamps** — the `timestamp` field is stored as a timezone-naive `TIMESTAMP` in both the batch and streaming paths. Ingest first canonicalizes the value to UTC, so an incoming offset is *applied* (`12:00:00+05:30` becomes `06:30:00Z`) rather than dropped in favour of its wall-clock components; the naive timestamp everything downstream sees is therefore UTC. See [Data flow](/architecture/data-flow/#timestamp-canonicalization) for the accepted input grammar.

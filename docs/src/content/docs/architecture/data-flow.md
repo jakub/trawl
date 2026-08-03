@@ -52,10 +52,21 @@ Every 10 seconds, the compaction task:
 2. Groups them by service
 3. For each service, spawns a blocking task with an ephemeral DuckDB connection:
    - `read_json_auto([wal files])` → repair `_time`/`_ingested` (below)
+   - pins any new columns in the field catalog, then conforms the batch to the pins (below)
    - `UNION ALL BY NAME` with existing parquet (if any)
    - `COPY TO data/{env}/YYYY-MM-DD/HH/{service}.parquet` (atomic rename)
 4. Drains the hot buffer entries for compacted batches (drain keys are `{env}/{wal-stem}`)
 5. Deletes processed WAL files
+
+### The field catalog: write-time type conformance
+
+Every custom field gets a *pin* — a canonical type (`BIGINT`, `DOUBLE`, `TIMESTAMP`, `BOOLEAN`, `VARCHAR`) recorded in a postgres-backed catalog the first time a typed batch carries the field (an all-null batch defers). The invariant: **every parquet file trawl writes conforms to the catalog**, so `union_by_name` across any set of trawl-written files can never hit a type conflict. Pins are made durable in postgres — and mirrored into the in-process cache the query path reads — strictly *before* any parquet carrying them is published; if the pin write fails, no parquet is written and the WAL is retained for the next tick.
+
+Conforming a batch `TRY_CAST`s each pinned column: a value that disagrees with its pin becomes `NULL`, the conflict is recorded in `field_conflicts` (field, service, expected/observed type, rows nulled) and counted on `/metrics` (`trawl_catalog_conflicts_total`, `trawl_catalog_rows_nulled_total`), and the original value stays findable in `_raw`. Nested objects/arrays are stringified to JSON text at ingest canonicalization, so they pin `VARCHAR` and stay reachable via `json_extract_string`.
+
+Because both sides of every merge are conformant, the compaction merge and the daily rollup run plain `UNION ALL BY NAME` with **no** cast-and-retry fallback: a conversion-class failure there can only mean a foreign file in the tree (dropped-in parquet, restore against a stale catalog), is logged as `catalog_invariant_violation`, and retries with the inputs retained — never a silent rewrite.
+
+The catalog also keeps `field_services` (which services ever carried a field, first/last seen). It is ever-observed: retention deleting old partitions deliberately never reconciles it.
 
 ### Timestamp repair
 
@@ -97,7 +108,7 @@ data/
       ...
 ```
 
-The envelope columns (`_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message`) are declared and enforced at ingest; user fields beyond them stay fully dynamic — `union_by_name=true` handles heterogeneous schemas across services. `_time`/`_ingested` are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
+The envelope columns (`_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message`) are declared and enforced at ingest; user fields beyond them stay dynamic in *name* — any field can appear at any time — but each name's *type* is pinned by the field catalog at first typed sight, so `union_by_name=true` reconciles heterogeneous column sets without ever facing a type conflict. `_time`/`_ingested` are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
 
 ### The epoch cutover
 
@@ -106,6 +117,10 @@ The envelope columns (`_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`
 The rename only ever fires on evidence that trawl wrote the directory — a `wal/` subdir, a `YYYY-MM-DD` partition dir, or a parquet file — and only when `ingest.enabled` is true. A marker-less directory with none of those (a pre-created empty root, a fresh mount holding `lost+found`, a mistyped `[data] path`) is adopted in place: the marker is written, the root itself does not move. An *external* `wal_dir` is judged separately in that case, since no rename of the data root covers it: if it still holds pre-cutover flat `{wal_dir}/*.ndjson` files it is set aside as `{wal_dir}.pre-schema-v2` (`epoch_external_wal_set_aside`) — the compactor walks `{wal_dir}/{env}/` only, so leaving them would strand them forever, never compacted and never deleted. A WAL dir that is empty or already in the epoch-2 env layout is left alone. And an ingest-disabled node — a query-only trawld pointed at a shared or read-only parquet archive — is left completely untouched, marker included, since it owns nothing under that path.
 
 One subtree survives the cutover: `scheduled/`, the report-run results. Those are materialized query results, not epoch-1 events, and each is named by a *relative* path in a live postgres `report_runs` row that the cutover deliberately does not touch — so the directory is carried back out of the set-aside into the fresh root (`epoch_report_runs_carried_over`) and every stored path keeps resolving. It is one rename, attempted on every boot that sees a set-aside, so a crash mid-cutover simply finishes the job on the next start; if both roots somehow hold report runs, trawld logs `epoch_report_runs_conflict` and leaves both alone rather than merging them for you.
+
+### The boot conformance pass and the `CATALOG` marker
+
+An ingest-enabled trawld proves the corpus conformant before serving queries. `data/CATALOG` holds the catalog's identity; when it is missing or disagrees with the postgres catalog (first boot after upgrade, a restored data root, a repointed `DATABASE_URL`), boot scans every parquet file under the data root — skipping `scheduled/`, which holds report-run results, not log events — seeds pins for unpinned columns by most-rows-wins across the corpus, rewrites any file that disagrees with a pin (staged `.tmp` + atomic rename, conflicts recorded like compaction's), hydrates the in-process pin cache, and publishes the marker **last**. The pass is restartable: a crash before the marker republishes on the next boot and rewrites nothing that already conforms. A conformance failure is fatal on ingest nodes — an unproven corpus must not serve queries once the read-time safety nets are gone. This also means an ingest-node boot requires reachable postgres.
 
 ### App-state store
 
@@ -140,9 +155,9 @@ A pool of N connections (default: `num_cpus`) sharing one in-memory DuckDB datab
 
 ### Hot buffer integration
 
-All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is written to a temp ndjson file and read by DuckDB alongside the parquet files. This ensures freshly ingested events (not yet compacted) are always visible. The union applies `TRY_CAST` to both of the hot side's TIMESTAMP columns (`_time`, `_ingested`) — a malformed hot value degrades that one row, never the whole union.
+All queries combine parquet sources with the hot buffer via `UNION ALL BY NAME`. The hot buffer snapshot is an atomic pair — the temp ndjson file plus the catalog pins intersected with the keys the snapshot's events actually carry, with the intersection recomputed on every snapshot call so a pin landing mid-compaction is reflected immediately. The emitter conforms the **hot branch only** to those pins: typed pins get `TRY_CAST` (a conflicting uncompacted value degrades to `NULL` for that row — the original stays in `_raw` — and the cold history remains fully visible), `VARCHAR` pins go through an untyped `json_extract_string(to_json(x), '$')` so strings land unquoted whatever type the snapshot's `read_json` inferred. Both of the hot side's TIMESTAMP columns (`_time`, `_ingested`) additionally keep their unconditional `TRY_CAST`s — a malformed hot value degrades that one row, never the whole union. The cold branch is deliberately plain: parquet is write-time conformant, and a defensive cold cast would mask a real invariant breach.
 
-When the two sides disagree on a column's type, the union is retried with the conflicting columns cast to `VARCHAR` on both sides, preserving hot **and** cold rows. What counts as such a conflict is decided from evidence, not from the error text: DuckDB reports both an irreconcilable schema and an unconvertible value as `Conversion`-class errors, so the retry only fires when describing the two sources actually turns up a column they type differently. A genuine data-conversion error turns up none, is not misread as a schema conflict, and falls through to the policy below.
+There is no read-time reconciliation beyond that: a type conflict surviving to execution means a corpus the catalog does not govern (foreign parquet dropped in post-boot, a restore against a stale catalog) and returns a loud error instead of a silently degraded result.
 
 A hot-only fallback is permitted only when it cannot hide cold data: on a genuine cold start (the glob matches no parquet files) or a missing-column user error. Any other database failure with cold files present returns an error — a cold-data drop is never a silent HTTP 200 (ADR-0008).
 
