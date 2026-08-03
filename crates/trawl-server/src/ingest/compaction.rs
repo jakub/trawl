@@ -96,10 +96,10 @@ pub fn spawn_compaction(
 
 /// Run one compaction cycle.
 ///
-/// Returns the number of per-service daily rollups that failed this cycle
-/// (0 on a clean run). WAL compaction errors are surfaced as `Err`; rollup
-/// failures are best-effort and reported via the count so the caller can
-/// track them without failing the whole cycle.
+/// Returns the number of failures this cycle (0 on a clean run): per-service
+/// daily rollups that failed, WAL files quarantined, and env WAL directories
+/// that could not be scanned. All of these are best-effort and reported via
+/// the count so the caller can track them without failing the whole cycle.
 ///
 /// Public for integration tests only — not part of the external API.
 /// Called internally by [`spawn_compaction`].
@@ -122,13 +122,18 @@ pub async fn compact_once(
     // data-loss signal, mirroring the rollup quarantine count.
     let mut wal_quarantined: u64 = 0;
 
+    // Tally of env WAL directories that could not be scanned this cycle.
+    let mut scan_failures: u64 = 0;
+
     // Env is the outermost storage dimension (ADR-0009): WAL lives in
     // `wal_dir/{env}/` and parquet in `data_dir/{env}/{date}/{HH}/`.
     // The per-env inner algorithm is unchanged.
     for (env, env_wal_dir) in list_env_dirs(wal_dir) {
         let env_data_dir = data_dir.join(&env);
-        let files =
-            scan_wal_files(&env_wal_dir, min_age).map_err(|e| format!("scan failed: {e}"))?;
+        let Some(files) = scan_env_wal_files(&env, &env_wal_dir, min_age) else {
+            scan_failures += 1;
+            continue;
+        };
 
         if files.is_empty() {
             continue;
@@ -245,7 +250,7 @@ pub async fn compact_once(
         0
     };
 
-    Ok(rollup_failures + wal_quarantined)
+    Ok(rollup_failures + wal_quarantined + scan_failures)
 }
 
 /// Consolidate hourly per-service parquet files into daily files.
@@ -1704,6 +1709,31 @@ fn remove_stale_tmp(path: &Path, max_age: Duration) {
     {
         let _ = std::fs::remove_file(path);
         tracing::debug!(event_type = "tmp_cleanup", path = %path.display(), "removed stale tmp file");
+    }
+}
+
+/// Scan one env's WAL directory, isolating a read failure to that env.
+///
+/// Returns `None` (after logging) when the directory cannot be read, so the
+/// compaction cycle can skip that env and carry on. Propagating instead
+/// would abort the whole cycle — every other env's WAL drain plus the daily
+/// rollup — for as long as the one bad directory stays unreadable, growing
+/// the WAL without bound and letting the hot buffer evict un-compacted
+/// events. A missing directory is not a failure: [`scan_wal_files`] already
+/// reports `NotFound` as an empty scan.
+fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Option<Vec<PathBuf>> {
+    match scan_wal_files(env_wal_dir, min_age) {
+        Ok(files) => Some(files),
+        Err(e) => {
+            tracing::error!(
+                event_type = "compaction_error",
+                compact_env = %env,
+                dir = %env_wal_dir.display(),
+                error = %e,
+                "failed to scan env WAL directory, skipping env this tick"
+            );
+            None
+        }
     }
 }
 
@@ -3584,6 +3614,60 @@ mod tests {
             read_strings(&hour_dir.join("api_v2.parquet"), "message"),
             vec!["underscored".to_owned()]
         );
+    }
+
+    /// One unreadable env WAL directory is isolated to its own env: it is
+    /// counted and skipped, never propagated. Envs are walked in sorted
+    /// order, so `broken` is scanned before `prod` — a propagated error
+    /// would stall `prod`'s WAL drain (and the rollup) indefinitely.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compact_once_isolates_unreadable_env_wal_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+
+        let broken = wal_dir.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::create_dir_all(wal_dir.join("prod")).unwrap();
+        let prod_wal = wal_dir.join("prod").join("svc_1730000000000_aaaa.ndjson");
+        std::fs::write(
+            &prod_wal,
+            r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","env":"prod","service":"svc","message":"prod-row"}"#,
+        )
+        .unwrap();
+
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&broken).is_ok() {
+            // Running as root: the mode bits are not enforced, so there is
+            // no unreadable directory to isolate. Nothing to assert.
+            return;
+        }
+
+        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, true, None, 500, "2GB")
+            .await
+            .expect("one unreadable env must not fail the whole cycle");
+        let _ = std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755));
+
+        assert_eq!(
+            errors, 1,
+            "the unreadable env is counted once as a failure, not propagated"
+        );
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let hour = chrono::Utc::now().format("%H").to_string();
+        assert!(
+            data_dir
+                .join("prod")
+                .join(&today)
+                .join(&hour)
+                .join("svc.parquet")
+                .exists(),
+            "a later env must still compact"
+        );
+        assert!(!prod_wal.exists(), "a later env's WAL must still drain");
     }
 
     /// One bad event does not affect its batch-mates: 1 bad + 2 good in one
