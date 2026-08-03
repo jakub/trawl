@@ -1618,22 +1618,40 @@ fn propose_pins(
     service: &str,
     known_pins: &HashMap<String, CanonicalType>,
 ) -> Result<Vec<PinProposal>, String> {
-    let mut proposals = Vec::new();
+    // One pass to classify, in schema order: a type that maps straight onto
+    // the canonical vocabulary pins from the DESCRIBE alone, everything else
+    // needs the values and is resolved in batch below (never per column —
+    // the batch is attacker-wide, see `run_pin_ladders`).
+    let mut candidates: Vec<(&String, Option<CanonicalType>)> = Vec::new();
+    let mut ladder_cols: Vec<&ColInfo> = Vec::new();
     for col in schema {
         if trawl_core::schema::TIMESTAMP_COLUMNS.contains(&col.name.as_str())
             || known_pins.contains_key(&col.name)
         {
             continue;
         }
-        let proposed = match normalize_duckdb_type(&col.dtype) {
-            TypeResolution::Pin(t) => Some(t),
+        match normalize_duckdb_type(&col.dtype) {
+            TypeResolution::Pin(t) => candidates.push((&col.name, Some(t))),
             TypeResolution::Ladder | TypeResolution::Json => {
-                run_pin_ladder(conn, &col.name, &col.dtype)?
+                candidates.push((&col.name, None));
+                ladder_cols.push(col);
             }
+        }
+    }
+
+    let mut laddered = run_pin_ladders(conn, &ladder_cols)?.into_iter();
+    let mut proposals = Vec::with_capacity(candidates.len());
+    for (field, direct) in candidates {
+        let proposed = match direct {
+            Some(t) => Some(t),
+            // Parallel to `ladder_cols` by construction.
+            None => laddered
+                .next()
+                .ok_or_else(|| "pin ladder returned fewer results than columns".to_owned())?,
         };
         if let Some(ty) = proposed {
             proposals.push(PinProposal {
-                field: col.name.clone(),
+                field: field.clone(),
                 ty,
                 pinned_from: service.to_owned(),
             });
@@ -1642,49 +1660,80 @@ fn propose_pins(
     Ok(proposals)
 }
 
-/// Run the candidate ladder over a column's actual values: the first
+/// How many columns one pin-ladder query may cover.
+///
+/// The ladder needs `LADDER.len() + 1` aggregates per column, and both
+/// extremes are pathological on a wide batch (measured by execution against
+/// the bundled `DuckDB` 1.5.5, 10k columns × 50 rows): one query PER column
+/// is superlinear because every query re-binds the whole table (27s, and
+/// ~n^1.4 in the column count), while ONE query over every column blows
+/// aggregate memory (a 40k-column batch OOMs outright). Chunking is flat in
+/// both: 10k columns take ~1.4s and 40k ~7.9s at this width, and the peak is
+/// bounded by the chunk, not the batch. 64…1024 all measure within 25% of
+/// each other, so this sits in the middle.
+const PIN_LADDER_CHUNK_COLS: usize = 256;
+
+/// Run the candidate ladder over the columns' actual values, resolving up to
+/// [`PIN_LADDER_CHUNK_COLS`] columns per aggregate pass: per column the first
 /// candidate whose `TRY_CAST` success rate over non-null values reaches
 /// [`LADDER_SUCCESS_THRESHOLD`] pins; none qualifying pins `VARCHAR`.
-/// Returns `None` for an all-null column — the pin defers.
+///
+/// Returns one entry per input column, in order; `None` for an all-null
+/// column — that pin defers.
 #[allow(clippy::cast_precision_loss)] // ratios over row counts
-fn run_pin_ladder(
+fn run_pin_ladders(
     conn: &duckdb::Connection,
-    column: &str,
-    dtype: &str,
-) -> Result<Option<CanonicalType>, String> {
-    let q = quote_ident(column);
-    let candidate_exprs: Vec<String> = LADDER
-        .iter()
-        .map(|t| conform_expr(&q, dtype, *t).unwrap_or_else(|| q.clone()))
-        .collect();
-    let sql = format!(
-        "SELECT count({q})::BIGINT, {} FROM wal_batch",
-        candidate_exprs
-            .iter()
-            .map(|e| format!("count({e})::BIGINT"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let (non_null, oks): (i64, Vec<i64>) = conn
-        .query_row(&sql, [], |row| {
-            let nn: i64 = row.get(0)?;
-            let mut oks = Vec::with_capacity(LADDER.len());
-            for i in 0..LADDER.len() {
-                oks.push(row.get::<_, i64>(i + 1)?);
-            }
-            Ok((nn, oks))
-        })
-        .map_err(|e| format!("pin ladder query failed: {e}"))?;
+    columns: &[&ColInfo],
+) -> Result<Vec<Option<CanonicalType>>, String> {
+    // Non-null count followed by one TRY_CAST count per ladder candidate.
+    let stride = LADDER.len() + 1;
+    let mut out = Vec::with_capacity(columns.len());
+    for chunk in columns.chunks(PIN_LADDER_CHUNK_COLS) {
+        let sql = format!(
+            "SELECT {} FROM wal_batch",
+            chunk
+                .iter()
+                .map(|col| {
+                    let q = quote_ident(&col.name);
+                    let mut aggs = Vec::with_capacity(stride);
+                    aggs.push(format!("count({q})::BIGINT"));
+                    aggs.extend(LADDER.iter().map(|t| {
+                        let expr = conform_expr(&q, &col.dtype, *t).unwrap_or_else(|| q.clone());
+                        format!("count({expr})::BIGINT")
+                    }));
+                    aggs.join(", ")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let counts: Vec<i64> = conn
+            .query_row(&sql, [], |row| {
+                let mut counts = Vec::with_capacity(chunk.len() * stride);
+                for i in 0..chunk.len() * stride {
+                    counts.push(row.get::<_, i64>(i)?);
+                }
+                Ok(counts)
+            })
+            .map_err(|e| format!("pin ladder query failed: {e}"))?;
 
-    if non_null == 0 {
-        return Ok(None);
-    }
-    for (candidate, ok) in LADDER.iter().zip(&oks) {
-        if (*ok as f64) / (non_null as f64) >= trawl_core::schema::LADDER_SUCCESS_THRESHOLD {
-            return Ok(Some(*candidate));
+        for slot in counts.chunks(stride) {
+            let non_null = slot[0];
+            if non_null == 0 {
+                out.push(None);
+                continue;
+            }
+            let pin = LADDER
+                .iter()
+                .zip(&slot[1..])
+                .find(|(_, ok)| {
+                    (**ok as f64) / (non_null as f64)
+                        >= trawl_core::schema::LADDER_SUCCESS_THRESHOLD
+                })
+                .map_or(CanonicalType::Varchar, |(candidate, _)| *candidate);
+            out.push(Some(pin));
         }
     }
-    Ok(Some(CanonicalType::Varchar))
+    Ok(out)
 }
 
 /// The SQL expression conforming one column to its pin, or `None` when the
@@ -2847,6 +2896,56 @@ mod tests {
         );
         assert_eq!(total, 21);
         assert_eq!(nn, 20, "the out-of-range outlier nulls");
+    }
+
+    /// A batch wider than one ladder chunk must pin every column to the type
+    /// its OWN values support: the ladder runs in batched aggregate passes,
+    /// so a slot-mapping slip would silently hand a column its neighbour's
+    /// verdict. Alternating verdicts across the chunk boundary catch that.
+    #[test]
+    fn pin_ladder_spans_chunk_boundary_without_crossing_verdicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Every column is mixed-typed (so every one takes the ladder), but
+        // every third is an even split that can only honestly pin VARCHAR.
+        let cols = PIN_LADDER_CHUNK_COLS + 5;
+        let varchar_col = |i: usize| i.is_multiple_of(3);
+        let records: Vec<String> = (0..21)
+            .map(|row| {
+                let fields: String = (0..cols)
+                    .map(|i| {
+                        let numeric = if varchar_col(i) { row < 10 } else { row < 20 };
+                        if numeric {
+                            format!(",\"f{i}\":{row}")
+                        } else {
+                            format!(",\"f{i}\":\"n/a\"")
+                        }
+                    })
+                    .collect();
+                format!(
+                    "{{\"_time\":\"2026-01-01T00:00:{row:02}Z\",\
+                     \"_ingested\":\"2026-01-01T00:00:{row:02}Z\",\
+                     \"service\":\"svc\"{fields}}}"
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+
+        // Probe both sides of the boundary, including the columns straddling
+        // it, plus the very first and last column of the batch.
+        let probes = [0, 1, 2, 254, 255, 256, 257, 258, cols - 2, cols - 1];
+        for i in probes {
+            let (dtype, _, total) = column_stats(&parquet[0], &format!("f{i}"));
+            let expected = if varchar_col(i) { "VARCHAR" } else { "BIGINT" };
+            assert_eq!(dtype, expected, "column f{i} pinned the wrong type");
+            assert_eq!(total, 21);
+        }
     }
 
     #[test]
