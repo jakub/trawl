@@ -98,6 +98,8 @@ The envelope columns (`_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`
 
 `data/EPOCH` (content `2`) marks the post-ADR-0009 layout; the legacy layout has none. At boot trawld runs a restartable, filesystem-only decision table: a fresh install creates the marked root; an epoch-2 root boots normally; a legacy root is renamed to `data.pre-schema-v2/` (an external `wal_dir` moves to `{wal_dir}.pre-schema-v2` with it) and a fresh marked root is created; a root with no marker AND an existing set-aside refuses to start with instructions. trawl never deletes the set-aside directory — remove it manually to reclaim disk.
 
+The rename only ever fires on evidence that trawl wrote the directory — a `wal/` subdir, a `YYYY-MM-DD` partition dir, or a parquet file — and only when `ingest.enabled` is true. A marker-less directory with none of those (a pre-created empty root, a fresh mount holding `lost+found`, a mistyped `[data] path`) is adopted in place: the marker is written, nothing moves. And an ingest-disabled node — a query-only trawld pointed at a shared or read-only parquet archive — is left completely untouched, marker included, since it owns nothing under that path.
+
 ### App-state store
 
 Log data is the parquet tree above; trawl's *app state* — query history, saved queries, schedules, and report run metadata — lives in a dedicated `trawl` postgres database. trawld migrates it automatically at boot and holds a session advisory lock for its lifetime (sole writer by design). Scheduled report *results* are written back into the data directory as parquet under `data/scheduled/{name}/run_{id}.parquet`, with only the relative path recorded in postgres.

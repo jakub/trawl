@@ -104,8 +104,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ADR-0009 storage-epoch gate: runs before any component touches the
     // data root. Refuses to start on the ambiguous branch.
-    let epoch_outcome =
-        trawl_server::epoch::ensure_current_epoch(&config.data.base_dir(), &config.wal_dir())?;
+    let epoch_outcome = trawl_server::epoch::ensure_current_epoch(
+        &config.data.base_dir(),
+        &config.wal_dir(),
+        config.ingest.enabled,
+    )?;
     tracing::info!(
         event_type = "epoch_gate",
         outcome = ?epoch_outcome,

@@ -12,10 +12,17 @@
 //!   also the crash-resume case)
 //! - `data/EPOCH` == `2` → normal boot; warn if `data.pre-schema-v2/`
 //!   still exists
-//! - `data/` without `EPOCH`, no `data.pre-schema-v2/` → legacy root:
-//!   rename `data/` → `data.pre-schema-v2/` (atomic), create fresh
-//!   `data/` + `EPOCH`, log loudly with counts of what was set aside
-//!   (parquet and WAL move together)
+//! - `data/` without `EPOCH`, ingest disabled → leave it alone entirely:
+//!   this node writes nothing here, so the directory is not ours to move
+//!   (a query-only node pointed at someone else's parquet archive)
+//! - `data/` without `EPOCH` and no evidence trawl wrote it (no `wal/`,
+//!   no `YYYY-MM-DD` partition dir, no parquet) → adopt in place by
+//!   writing `EPOCH`; nothing is renamed. Covers the pre-created empty
+//!   dir, a fresh mount with `lost+found`, and a mistyped `[data] path`
+//! - `data/` without `EPOCH`, legacy-looking, no `data.pre-schema-v2/` →
+//!   legacy root: rename `data/` → `data.pre-schema-v2/` (atomic), create
+//!   fresh `data/` + `EPOCH`, log loudly with counts of what was set
+//!   aside (parquet and WAL move together)
 //! - `data/` without `EPOCH` **and** `data.pre-schema-v2/` exists →
 //!   ambiguous; refuse to start with instructions
 //!
@@ -54,6 +61,13 @@ pub enum Outcome {
         wal_files: u64,
         external_wal_set_aside: bool,
     },
+    /// Marker-less root with no evidence trawl wrote it: the marker was
+    /// written in place and nothing was renamed.
+    AdoptedInPlace,
+    /// Marker-less root left completely untouched because ingest is
+    /// disabled — this node writes nothing here, so it does not own the
+    /// directory and must not migrate it.
+    CutoverDeferred,
 }
 
 /// Run the epoch gate. Called after config load, before any component
@@ -63,7 +77,15 @@ pub enum Outcome {
 /// `wal_dir` is the *effective* WAL directory: when it lies outside the
 /// data root, the legacy-rename branch sets it aside too
 /// (`{wal_dir}.pre-schema-v2`) — parquet and WAL move together.
-pub fn ensure_current_epoch(data_root: &Path, wal_dir: &Path) -> Result<Outcome, String> {
+///
+/// `ingest_enabled` gates the destructive branch: a node that writes no
+/// data does not own the directory `[data] path` points at, so it never
+/// renames it.
+pub fn ensure_current_epoch(
+    data_root: &Path,
+    wal_dir: &Path,
+    ingest_enabled: bool,
+) -> Result<Outcome, String> {
     let aside = set_aside_path(data_root);
     let marker = data_root.join(EPOCH_FILE);
 
@@ -100,6 +122,34 @@ pub fn ensure_current_epoch(data_root: &Path, wal_dir: &Path) -> Result<Outcome,
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !ingest_enabled {
+                // Query-only node: it writes nothing under the data root,
+                // so the root may be a shared archive or another node's.
+                // Renaming it would be an unconsented move of somebody
+                // else's data with a blast radius set by one config string.
+                tracing::info!(
+                    event_type = "epoch_cutover_deferred",
+                    path = %data_root.display(),
+                    "data root carries no {EPOCH_FILE} marker but ingest is \
+                     disabled — leaving it untouched; enable ingest to run \
+                     the schema-v2 cutover"
+                );
+                return Ok(Outcome::CutoverDeferred);
+            }
+            if !looks_like_trawl_root(data_root) {
+                // Nothing here says trawl wrote this directory: a
+                // pre-created empty root, a fresh mount (`lost+found`), or
+                // a mistyped path. Take the marker, move nothing.
+                adopt_in_place(data_root)?;
+                tracing::info!(
+                    event_type = "epoch_adopted_in_place",
+                    path = %data_root.display(),
+                    "data root holds no pre-cutover trawl data (no wal/, \
+                     partition dir or parquet) — marked as epoch \
+                     {CURRENT_EPOCH} in place; nothing was set aside"
+                );
+                return Ok(Outcome::AdoptedInPlace);
+            }
             if aside.exists() {
                 return Err(format!(
                     "ambiguous storage state: {} has no {EPOCH_FILE} marker AND \
@@ -134,6 +184,75 @@ fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{name}{suffix}"))
 }
 
+/// Is there any evidence trawl wrote this directory?
+///
+/// The legacy branch renames the *whole* root, so it may only fire on
+/// evidence — the `wal/` subdir, a legacy `YYYY-MM-DD` partition dir, or a
+/// parquet file. One cheap top-level `read_dir`, never a walk: the legacy
+/// layout puts all three at depth 0 or 1 (`data/{date}/{hour}/*.parquet`).
+fn looks_like_trawl_root(data_root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(data_root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let raw = entry.file_name();
+        let name = raw.to_string_lossy();
+        if name == "wal" || is_legacy_partition_dir(&name) {
+            entry.path().is_dir()
+        } else {
+            Path::new(name.as_ref())
+                .extension()
+                .is_some_and(|e| e == "parquet")
+        }
+    })
+}
+
+/// `YYYY-MM-DD` — the legacy top-level partition directory.
+fn is_legacy_partition_dir(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
+/// Mark an existing, trawl-data-free directory as the current epoch
+/// without moving it: write the marker to a temp name, fsync, rename into
+/// place — so a crash can never publish a half-written marker (which the
+/// next boot would reject as an unrecognized epoch).
+fn adopt_in_place(data_root: &Path) -> Result<(), String> {
+    let staged = data_root.join(format!("{EPOCH_FILE}{NEXT_SUFFIX}"));
+    std::fs::write(&staged, format!("{CURRENT_EPOCH}\n"))
+        .map_err(|e| format!("failed to write {}: {e}", staged.display()))?;
+    std::fs::File::open(&staged)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("failed to fsync {}: {e}", staged.display()))?;
+
+    let marker = data_root.join(EPOCH_FILE);
+    std::fs::rename(&staged, &marker)
+        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))?;
+    fsync_dir_best_effort(data_root);
+    Ok(())
+}
+
+/// fsync a directory so the rename entry inside it survives a crash. Never
+/// fatal: every branch of the gate is idempotent, so a lost entry simply
+/// re-runs the same decision on the next boot.
+fn fsync_dir_best_effort(dir: &Path) {
+    if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(
+            event_type = "epoch_dir_fsync_failed",
+            dir = %dir.display(),
+            error = %e,
+            "directory fsync failed; the epoch marker is in place but the \
+             rename entry may not survive a crash (safe: the boot gate is \
+             idempotent and would re-run)"
+        );
+    }
+}
+
 /// Assemble a fresh epoch-marked root at `data_root` via a staged sibling
 /// rename, so there is never a visible `data/` without its marker.
 fn create_fresh_root(data_root: &Path) -> Result<(), String> {
@@ -164,17 +283,8 @@ fn create_fresh_root(data_root: &Path) -> Result<(), String> {
         )
     })?;
     // Make the rename durable.
-    if let Some(parent) = data_root.parent()
-        && let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all())
-    {
-        tracing::warn!(
-            event_type = "epoch_dir_fsync_failed",
-            dir = %parent.display(),
-            error = %e,
-            "parent-dir fsync failed; the fresh root is in place but the \
-             rename entry may not survive a crash (safe: it would resume \
-             via the fresh-install branch)"
-        );
+    if let Some(parent) = data_root.parent() {
+        fsync_dir_best_effort(parent);
     }
     Ok(())
 }
@@ -280,7 +390,7 @@ mod tests {
         let data = tmp.path().join("data");
         let wal = data.join("wal");
 
-        let outcome = ensure_current_epoch(&data, &wal).expect("fresh install boots");
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("fresh install boots");
         assert_eq!(outcome, Outcome::FreshRoot);
         assert!(data.is_dir());
         assert_eq!(read_marker(&data), CURRENT_EPOCH);
@@ -291,10 +401,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let wal = data.join("wal");
-        ensure_current_epoch(&data, &wal).unwrap();
+        ensure_current_epoch(&data, &wal, true).unwrap();
 
         // Second boot: no-op, no aside warning.
-        let outcome = ensure_current_epoch(&data, &wal).expect("epoch-2 boots");
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("epoch-2 boots");
         assert_eq!(
             outcome,
             Outcome::Current {
@@ -308,10 +418,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let wal = data.join("wal");
-        ensure_current_epoch(&data, &wal).unwrap();
+        ensure_current_epoch(&data, &wal, true).unwrap();
         std::fs::create_dir_all(tmp.path().join("data.pre-schema-v2")).unwrap();
 
-        let outcome = ensure_current_epoch(&data, &wal).expect("must still boot");
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("must still boot");
         assert_eq!(
             outcome,
             Outcome::Current {
@@ -332,7 +442,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_wal).unwrap();
         std::fs::write(legacy_wal.join("nginx_1_aa.ndjson"), b"wal bytes").unwrap();
 
-        let outcome = ensure_current_epoch(&data, &legacy_wal).expect("cutover applies");
+        let outcome = ensure_current_epoch(&data, &legacy_wal, true).expect("cutover applies");
         assert_eq!(
             outcome,
             Outcome::LegacySetAside {
@@ -369,14 +479,101 @@ mod tests {
         std::fs::create_dir_all(data.join("2026-01-15")).unwrap();
         let wal = data.join("wal");
 
-        let first = ensure_current_epoch(&data, &wal).unwrap();
+        let first = ensure_current_epoch(&data, &wal, true).unwrap();
         assert!(matches!(first, Outcome::LegacySetAside { .. }));
 
-        let second = ensure_current_epoch(&data, &wal).unwrap();
+        let second = ensure_current_epoch(&data, &wal, true).unwrap();
         assert_eq!(
             second,
             Outcome::Current {
                 aside_present: true
+            }
+        );
+    }
+
+    #[test]
+    fn query_only_node_never_touches_a_marker_less_root() {
+        // `[data] path = "/mnt/logs/**/*.parquet"` on an ingest-disabled
+        // node: a shared archive trawld does not own. Nothing may move —
+        // not even a marker may be written into it.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("logs");
+        let day = data.join("2026-01-15");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("nginx.parquet"), b"someone else's bytes").unwrap();
+        let wal = data.join("wal");
+
+        let outcome = ensure_current_epoch(&data, &wal, false).expect("query-only node boots");
+        assert_eq!(outcome, Outcome::CutoverDeferred);
+        assert!(
+            !tmp.path().join("logs.pre-schema-v2").exists(),
+            "nothing is set aside"
+        );
+        assert!(!data.join(EPOCH_FILE).exists(), "no marker is written");
+        assert_eq!(
+            std::fs::read(day.join("nginx.parquet")).unwrap(),
+            b"someone else's bytes"
+        );
+    }
+
+    #[test]
+    fn directory_without_trawl_data_is_adopted_not_renamed() {
+        // A mistyped path, or a fresh mount with `lost+found`: no wal/, no
+        // partition dir, no parquet. Take the marker, move nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("lost+found")).unwrap();
+        std::fs::write(data.join("notes.txt"), b"not ours").unwrap();
+        let wal = data.join("wal");
+
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("adopts in place");
+        assert_eq!(outcome, Outcome::AdoptedInPlace);
+        assert!(
+            !tmp.path().join("data.pre-schema-v2").exists(),
+            "a non-trawl directory is never renamed"
+        );
+        assert_eq!(read_marker(&data), CURRENT_EPOCH);
+        assert_eq!(std::fs::read(data.join("notes.txt")).unwrap(), b"not ours");
+        assert!(data.join("lost+found").is_dir());
+
+        // And the adopted root is a normal epoch-2 root from then on.
+        let second = ensure_current_epoch(&data, &wal, true).unwrap();
+        assert_eq!(
+            second,
+            Outcome::Current {
+                aside_present: false
+            }
+        );
+    }
+
+    #[test]
+    fn pre_created_empty_root_is_adopted_in_place() {
+        // The .deb/helm pre-create case: the dir exists, holds nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let wal = data.join("wal");
+
+        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
+        assert_eq!(outcome, Outcome::AdoptedInPlace);
+        assert_eq!(read_marker(&data), CURRENT_EPOCH);
+    }
+
+    #[test]
+    fn a_bare_parquet_file_is_evidence_of_a_legacy_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("nginx.parquet"), b"legacy").unwrap();
+        let wal = data.join("wal");
+
+        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::LegacySetAside {
+                parquet_files: 1,
+                wal_files: 0,
+                external_wal_set_aside: false,
             }
         );
     }
@@ -391,7 +588,7 @@ mod tests {
         std::fs::create_dir_all(aside.join("2026-01-15")).unwrap();
         let wal = data.join("wal");
 
-        let outcome = ensure_current_epoch(&data, &wal).expect("crash-resume boots");
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("crash-resume boots");
         assert_eq!(outcome, Outcome::FreshRoot);
         assert_eq!(read_marker(&data), CURRENT_EPOCH);
         assert!(aside.exists(), "the aside is never touched");
@@ -407,7 +604,7 @@ mod tests {
         std::fs::write(tmp.path().join("data.next/garbage"), b"x").unwrap();
         let wal = data.join("wal");
 
-        let outcome = ensure_current_epoch(&data, &wal).unwrap();
+        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
         assert_eq!(outcome, Outcome::FreshRoot);
         assert!(!tmp.path().join("data.next").exists());
         assert!(!data.join("garbage").exists());
@@ -421,7 +618,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("data.pre-schema-v2")).unwrap();
         let wal = data.join("wal");
 
-        let err = ensure_current_epoch(&data, &wal).expect_err("must refuse");
+        let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");
         assert!(err.contains("ambiguous"), "got: {err}");
         assert!(err.contains("refusing to start"), "got: {err}");
         assert!(data.join("2026-01-15").exists(), "nothing is touched");
@@ -435,7 +632,7 @@ mod tests {
         std::fs::write(data.join(EPOCH_FILE), "3\n").unwrap();
         let wal = data.join("wal");
 
-        let err = ensure_current_epoch(&data, &wal).expect_err("must refuse");
+        let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");
         assert!(err.contains("unrecognized storage epoch"), "got: {err}");
     }
 
@@ -448,7 +645,7 @@ mod tests {
         std::fs::create_dir_all(&wal).unwrap();
         std::fs::write(wal.join("svc_1_aa.ndjson"), b"wal bytes").unwrap();
 
-        let outcome = ensure_current_epoch(&data, &wal).unwrap();
+        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
         assert_eq!(
             outcome,
             Outcome::LegacySetAside {
@@ -472,7 +669,7 @@ mod tests {
         std::fs::create_dir_all(&wal).unwrap();
         std::fs::write(wal.join("svc_1_aa.ndjson"), b"w").unwrap();
 
-        let outcome = ensure_current_epoch(&data, &wal).unwrap();
+        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
         assert_eq!(
             outcome,
             Outcome::LegacySetAside {
