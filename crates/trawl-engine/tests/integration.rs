@@ -10,6 +10,7 @@
 
 mod common;
 
+use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::Executor;
 use trawl_engine::value::{QueryResult, Value};
@@ -844,7 +845,14 @@ fn hot_cold_type_conflict_keeps_both_rows() {
     let exec = Executor::new().expect("executor should initialize");
     let source = format!("{}/*.parquet", dir.path().display());
     let result = exec
-        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+        .run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
         .unwrap();
 
     assert_eq!(
@@ -894,7 +902,14 @@ fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
         empty.display()
     );
     let result = exec
-        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+        .run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
         .expect("a repairable hot/cold conflict must not hard-error on a pruned list source");
 
     assert_eq!(
@@ -935,8 +950,15 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows() {
 
     let exec = Executor::new().expect("executor should initialize");
     let source = format!("{}/*.parquet", dir.path().display());
-    exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
-        .expect("a repairable hot/cold conflict must not hard-error the parquet export");
+    exec.export_parquet_with_hot(
+        "*",
+        &source,
+        hot.to_str().unwrap(),
+        &FieldTypes::new(),
+        &out,
+        1000,
+    )
+    .expect("a repairable hot/cold conflict must not hard-error the parquet export");
 
     let rows: i64 = conn
         .query_row(
@@ -991,8 +1013,15 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_sourc
         full.display(),
         empty.display()
     );
-    exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
-        .expect("a repairable conflict behind a pruned list source must not fail the export");
+    exec.export_parquet_with_hot(
+        "*",
+        &source,
+        hot.to_str().unwrap(),
+        &FieldTypes::new(),
+        &out,
+        1000,
+    )
+    .expect("a repairable conflict behind a pruned list source must not fail the export");
 
     let rows: i64 = conn
         .query_row(
@@ -1041,7 +1070,14 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
     let exec = Executor::new().expect("executor should initialize");
     let source = format!("{}/*.parquet", dir.path().display());
     let result = exec
-        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+        .run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
         .expect("hot+cold query must not error on a malformed hot timestamp");
 
     assert_eq!(
@@ -1099,7 +1135,14 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
         let exec = Executor::new().expect("executor should initialize");
         let source = format!("{}/*.parquet", dir.path().display());
         let result = exec
-            .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+            .run_query_with_hot(
+                "*",
+                &source,
+                hot.to_str().unwrap(),
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            )
             .expect("hot query must succeed");
 
         let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();

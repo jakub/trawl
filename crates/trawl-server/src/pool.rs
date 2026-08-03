@@ -147,15 +147,17 @@ fn run_query_blocking(
 ) {
     // Snapshot hot buffer to a temp ndjson file so fresh events
     // are visible to this query via UNION ALL BY NAME. Returns a
-    // cached Arc when the buffer hasn't changed since the last snapshot.
-    let hot_tempfile = hot_buffer.and_then(|hb| hb.snapshot());
+    // cached file when the buffer hasn't changed since the last snapshot;
+    // the snapshot also carries the catalog pins (∩ observed keys) the
+    // executor conforms the hot branch with.
+    let hot_snapshot = hot_buffer.and_then(|hb| hb.snapshot());
 
     // Filter out hot files whose paths aren't valid UTF-8 (required by
     // DuckDB's file reader). This is extremely unlikely on any modern OS
     // but avoids a panic in production.
-    let hot_tempfile = hot_tempfile.and_then(|f| {
-        if f.path().to_str().is_some() {
-            Some(f)
+    let hot_snapshot = hot_snapshot.and_then(|s| {
+        if s.path().to_str().is_some() {
+            Some(s)
         } else {
             tracing::warn!("hot buffer temp file path is not valid UTF-8, skipping hot source");
             None
@@ -178,11 +180,18 @@ fn run_query_blocking(
     // catch_unwind ensures the executor is always returned to the
     // pool even if DuckDB panics (e.g. corrupt parquet file).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Some(ref hot_file) = hot_tempfile {
+        if let Some(ref hot) = hot_snapshot {
             // Safety: we verified UTF-8 validity above.
-            let hot_path = hot_file.path().to_str().unwrap_or_default();
+            let hot_path = hot.path().to_str().unwrap_or_default();
             executor
-                .run_query_with_hot(dsl, source, hot_path, max_result_rows, utc_offset_secs)
+                .run_query_with_hot(
+                    dsl,
+                    source,
+                    hot_path,
+                    &hot.field_types,
+                    max_result_rows,
+                    utc_offset_secs,
+                )
                 .map_err(ServerError::from)
         } else {
             executor
@@ -190,7 +199,7 @@ fn run_query_blocking(
                 .map_err(ServerError::from)
         }
     }));
-    // hot_tempfile drops here → temp file auto-deleted
+    // hot_snapshot drops here → temp file auto-deleted
     let result = match result {
         Ok(r) => r,
         Err(payload) => {
@@ -775,15 +784,22 @@ impl ExecutorPool {
             let tmp_path = tmp.path().to_owned();
 
             // Snapshot hot buffer for fresh events.
-            let hot_tempfile = hot_buffer
+            let hot_snapshot = hot_buffer
                 .as_ref()
                 .and_then(|hb| hb.snapshot())
-                .filter(|f| f.path().to_str().is_some());
+                .filter(|s| s.path().to_str().is_some());
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(ref hot_file) = hot_tempfile {
-                    let hot_path = hot_file.path().to_str().unwrap_or_default();
-                    executor.export_parquet_with_hot(&dsl, &source, hot_path, &tmp_path, max_rows)
+                if let Some(ref hot) = hot_snapshot {
+                    let hot_path = hot.path().to_str().unwrap_or_default();
+                    executor.export_parquet_with_hot(
+                        &dsl,
+                        &source,
+                        hot_path,
+                        &hot.field_types,
+                        &tmp_path,
+                        max_rows,
+                    )
                 } else {
                     executor.export_parquet(&dsl, &source, &tmp_path, max_rows)
                 }

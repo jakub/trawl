@@ -434,10 +434,15 @@ impl AppState {
         let (wal_writer, event_bus, hot_buffer, pipeline) = if config.ingest.enabled {
             let writer = Arc::new(WalWriter::new(config.wal_dir()));
             let bus = Arc::new(LocalEventBus::new(config.ingest.event_bus_capacity));
-            let buffer = Arc::new(HotBuffer::new(HotBufferConfig {
-                max_events: config.ingest.hot_buffer_max_events,
-                max_bytes: config.ingest.hot_buffer_max_bytes,
-            }));
+            let buffer = Arc::new(
+                HotBuffer::new(HotBufferConfig {
+                    max_events: config.ingest.hot_buffer_max_events,
+                    max_bytes: config.ingest.hot_buffer_max_bytes,
+                })
+                // Snapshots carry the catalog pins so the hot branch of the
+                // query union is conformed to the write-time invariant.
+                .with_field_catalog(Arc::clone(&field_catalog)),
+            );
             let pipeline = Arc::new(PipelineWriter::new(
                 Arc::clone(&writer),
                 Some(Arc::clone(&buffer)),

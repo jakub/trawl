@@ -97,16 +97,18 @@ impl Executor {
     /// not taken as proof of that — it is re-checked against the files on
     /// disk, because a list source reports "no files" for a single empty
     /// element too (ADR-0008).
+    #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
         &self,
         dsl: &str,
         source: &str,
         hot_source: &str,
+        pins: &FieldTypes,
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, &FieldTypes::new())?;
+        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, pins)?;
         let mut outcome = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
 
         // A column type conflict between the hot and cold sources (e.g. a
@@ -137,8 +139,7 @@ impl Executor {
         if matches!(&outcome, Ok(r) if r.columns.is_empty())
             && let Some(pruned) = self.pruned_cold_source(source)
         {
-            let pruned_emitted =
-                emitter::emit_with_hot_source(&ast, &pruned, hot_source, &FieldTypes::new())?;
+            let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins)?;
             outcome = self.execute_emitted(&pruned_emitted, max_rows, utc_offset_secs);
             if let Some(cols) = self.hot_cold_conflict_columns(&outcome, &pruned, hot_source) {
                 let coerced =
@@ -716,16 +717,18 @@ impl Executor {
     /// list-source miss is retried over the pruned list, and a database failure
     /// over an existing cold corpus returns the error instead of silently
     /// exporting hot-only data (ADR-0008).
+    #[allow(clippy::too_many_arguments)]
     pub fn export_parquet_with_hot(
         &self,
         dsl: &str,
         source: &str,
         hot_source: &str,
+        pins: &FieldTypes,
         output_path: &Path,
         max_rows: usize,
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, &FieldTypes::new())?;
+        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, pins)?;
         let mut outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
         // Same coerced retry as `run_query_with_hot`: a column typed
@@ -759,8 +762,7 @@ impl Executor {
         if matches!(&outcome, Err(EngineError::Database(e)) if is_no_files_error(e))
             && let Some(pruned) = self.pruned_cold_source(source)
         {
-            let pruned_emitted =
-                emitter::emit_with_hot_source(&ast, &pruned, hot_source, &FieldTypes::new())?;
+            let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins)?;
             outcome = self.export_parquet_from_emitted(&pruned_emitted, output_path, max_rows);
             if let Some(cols) = self.hot_cold_conflict_columns(&outcome, &pruned, hot_source) {
                 let coerced =
@@ -1426,8 +1428,8 @@ mod tests {
     use duckdb::Connection;
 
     use super::{
-        ColdAction, Executor, HotColdOutcome, cold_action, error_class, glob_list_items,
-        is_complex_type, is_conversion_error, is_union_type_conflict,
+        ColdAction, Executor, FieldTypes, HotColdOutcome, cold_action, error_class,
+        glob_list_items, is_complex_type, is_conversion_error, is_union_type_conflict,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -1782,7 +1784,14 @@ mod tests {
         // Glob that matches no parquet files (cold start).
         let source = format!("{}/nonexistent/*.parquet", dir.path().display());
         let result = exec
-            .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+            .run_query_with_hot(
+                "*",
+                &source,
+                hot.to_str().unwrap(),
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            )
             .expect("cold-start query must return hot rows, not error");
         assert_eq!(
             result.row_count(),
@@ -1928,7 +1937,14 @@ mod tests {
 
         let exec = Executor::new().unwrap();
         let source = format!("{}/*.parquet", dir.path().display());
-        let result = exec.run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0);
+        let result = exec.run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        );
         assert!(
             result.is_err(),
             "an unreadable cold file must surface as an error, not hot-only success"
@@ -1957,6 +1973,7 @@ mod tests {
                 "nonexistent_field=value",
                 &source,
                 hot.to_str().unwrap(),
+                &FieldTypes::new(),
                 usize::MAX,
                 0,
             )
@@ -2044,7 +2061,14 @@ mod tests {
             empty_hour.display()
         );
         let result = exec
-            .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+            .run_query_with_hot(
+                "*",
+                &source,
+                hot.to_str().unwrap(),
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            )
             .expect("a partial list-source miss must not fail the query");
         assert_eq!(
             result.row_count(),
@@ -2071,8 +2095,14 @@ mod tests {
 
         let exec = Executor::new().unwrap();
         let source = format!("['{}/*.parquet']", hour.display());
-        let result =
-            exec.run_query_with_hot("*", &source, missing_hot.to_str().unwrap(), usize::MAX, 0);
+        let result = exec.run_query_with_hot(
+            "*",
+            &source,
+            missing_hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        );
         assert!(
             matches!(result, Err(crate::error::EngineError::ColdDataUnread)),
             "cold data on disk plus a no-files union must be an explicit \
@@ -2099,8 +2129,15 @@ mod tests {
 
         let exec = Executor::new().unwrap();
         let source = format!("['{}/*.parquet']", hour.display());
-        exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
-            .expect("hot-only export must succeed when the cold list matches no file");
+        exec.export_parquet_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            &out,
+            1000,
+        )
+        .expect("hot-only export must succeed when the cold list matches no file");
 
         let rows: i64 = exec
             .conn
@@ -2146,8 +2183,15 @@ mod tests {
             full_hour.display(),
             empty_hour.display()
         );
-        exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
-            .expect("a partial list-source miss must not fail the export");
+        exec.export_parquet_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            &out,
+            1000,
+        )
+        .expect("a partial list-source miss must not fail the export");
 
         let rows: i64 = exec
             .conn
