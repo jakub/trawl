@@ -11,9 +11,10 @@
 //! `union_by_name` across any set of trawl-written files can never
 //! conflict. Pins are add-only until the repin machinery (#53) — and
 //! because a pin is therefore permanent while its name is a client-chosen
-//! JSON key, the catalog is bounded on both axes: name length by
-//! [`trawl_core::schema::is_storable_field_name`], count by
-//! [`MAX_PINNED_FIELDS`].
+//! JSON key, the catalog is bounded on every axis a sender controls: name
+//! length by [`trawl_core::schema::is_storable_field_name`], pin count by
+//! [`MAX_PINNED_FIELDS`], and per-field conflict evidence by
+//! [`MAX_CONFLICTS_PER_FIELD`].
 
 use std::collections::HashMap;
 
@@ -38,7 +39,8 @@ pub struct PinProposal {
 /// pin NULLED at least one value. A cast that nulls nothing is convergence,
 /// not conflict, and is never recorded (see `ConformPlan::tally_conflicts`)
 /// — an append-only row per lossless cast per compaction tick would grow
-/// without bound.
+/// without bound. What a genuinely lossy sender appends is bounded instead
+/// by [`MAX_CONFLICTS_PER_FIELD`].
 #[derive(Debug, Clone)]
 pub struct FieldConflict {
     /// Field name.
@@ -103,6 +105,25 @@ pub struct FieldConflictRow {
 /// problem trawl should silently absorb.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
 
+/// Maximum `field_conflicts` rows kept per field — the newest survive.
+///
+/// [`MAX_PINNED_FIELDS`] bounds how many fields can exist; nothing bounds
+/// how often one of them disagrees with its pin. A field pinned `BIGINT`
+/// that keeps receiving strings appends a row per service per compaction
+/// tick — every ten seconds, forever — so without a per-field bound the
+/// evidence table grows without limit while the sender's behaviour, and
+/// therefore the evidence's information content, stays constant.
+///
+/// The bound is per FIELD, not per `(field, service)`: service names are
+/// client-chosen too, so a per-service window would only move the
+/// unbounded axis. A field conflicting across more services than the
+/// window is therefore sampled, not covered — the exhaustive, never-lossy
+/// tallies are the `trawl_catalog_conflicts_total` /
+/// `trawl_catalog_rows_nulled_total` counters; these rows exist to show an
+/// operator WHICH values a pin is currently costing them, and the newest
+/// evidence is the evidence they act on.
+pub const MAX_CONFLICTS_PER_FIELD: i64 = 100;
+
 /// One field name shortened for logging: a name can be as long as a client
 /// made it, so echoing it whole turns the log line into an amplifier of
 /// whatever was sent.
@@ -154,6 +175,7 @@ fn bump_rejected(reason: &'static str, count: usize) {
 pub struct CatalogStore {
     pool: PgPool,
     pin_cap: i64,
+    conflict_cap: i64,
 }
 
 impl CatalogStore {
@@ -163,6 +185,7 @@ impl CatalogStore {
         Self {
             pool,
             pin_cap: MAX_PINNED_FIELDS,
+            conflict_cap: MAX_CONFLICTS_PER_FIELD,
         }
     }
 
@@ -172,6 +195,15 @@ impl CatalogStore {
     #[must_use]
     pub fn with_pin_cap(mut self, cap: i64) -> Self {
         self.pin_cap = cap;
+        self
+    }
+
+    /// Override the per-field conflict-retention window. Same purpose as
+    /// [`Self::with_pin_cap`]: drive the boundary without writing
+    /// [`MAX_CONFLICTS_PER_FIELD`] rows.
+    #[must_use]
+    pub fn with_conflict_cap(mut self, cap: i64) -> Self {
+        self.conflict_cap = cap;
         self
     }
 
@@ -350,7 +382,18 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Append conflict evidence rows (never aggregated).
+    /// Append conflict evidence rows (never aggregated), then trim every
+    /// field this call touched back to its newest [`MAX_CONFLICTS_PER_FIELD`]
+    /// rows.
+    ///
+    /// Append + trim, not an upsert: the value of a conflict row is the
+    /// individual episode (when, which service, how many rows it cost), and
+    /// aggregating loses exactly that. Trimming only the touched fields
+    /// keeps the work proportional to the batch — a field that stops
+    /// conflicting keeps the evidence it already has and is never re-read.
+    ///
+    /// Both statements run in ONE transaction, so a reader never sees the
+    /// window overfull and a failed trim never leaves the insert behind.
     pub async fn record_conflicts(&self, conflicts: &[FieldConflict]) -> Result<(), StoreError> {
         if conflicts.is_empty() {
             return Ok(());
@@ -367,6 +410,8 @@ impl CatalogStore {
             .map(|c| i64::try_from(c.rows_nulled).unwrap_or(i64::MAX))
             .collect();
 
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             "INSERT INTO field_conflicts
                  (field, service, observed_type, expected_type, rows_nulled)
@@ -377,8 +422,29 @@ impl CatalogStore {
         .bind(&observed)
         .bind(&expected)
         .bind(&nulled)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        // The trim runs as its own statement rather than a CTE beside the
+        // insert: CTEs of one statement share its snapshot, so a ranking
+        // CTE cannot see the rows the insert alongside it just wrote —
+        // which is precisely the set the window has to rank.
+        sqlx::query(
+            "DELETE FROM field_conflicts c
+             USING (
+                 SELECT id, row_number() OVER (
+                     PARTITION BY field ORDER BY at DESC, id DESC
+                 ) AS rn
+                 FROM field_conflicts WHERE field = ANY($1)
+             ) ranked
+             WHERE c.id = ranked.id AND ranked.rn > $2",
+        )
+        .bind(&fields)
+        .bind(self.conflict_cap)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 

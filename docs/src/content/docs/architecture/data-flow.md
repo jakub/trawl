@@ -68,6 +68,8 @@ Because both sides of every merge are conformant, the compaction merge and the d
 
 The catalog also keeps `field_services` (which services ever carried a field, first/last seen). It is ever-observed: retention deleting old partitions deliberately never reconciles it.
 
+Both catalog tables are bounded, because field names and service names are client-chosen: at most 10,000 fields are ever pinned (a field arriving at a full catalog stays unpinned, so its column is not stored and its values remain in `_raw` — the denial warns as `catalog_pin_cap_reached` and counts on `trawl_catalog_pins_rejected_total`), and `field_conflicts` keeps a rolling window of the 100 newest rows *per field*, trimmed in the same transaction that appends. A sender that keeps disagreeing with a pin therefore costs a fixed amount of postgres, not a growing one; the exhaustive tally lives in the counters, which are never trimmed.
+
 ### Timestamp repair
 
 The partition key is never hard-CAST in emitted SQL (ADR-0008) — one malformed value must never wedge a batch. Compaction resolves each row's `_time` (and `_ingested`, same ladder) through a three-arm `COALESCE`:

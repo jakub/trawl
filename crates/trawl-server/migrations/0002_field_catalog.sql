@@ -34,10 +34,12 @@ CREATE TABLE field_services (
 
 -- Conflict evidence, powering the schema-health dashboard. APPEND-ONLY:
 -- one row per LOSSY conforming cast per batch (rows_nulled > 0), never
--- aggregated (retention for this table rides the #51/#53 follow-ons). A
--- cast that nulls nothing is not recorded: it would append a row per
--- (field, service) on every compaction tick forever for a sender that is
--- losing nothing.
+-- aggregated. A cast that nulls nothing is not recorded: it would append a
+-- row per (field, service) on every compaction tick forever for a sender
+-- that is losing nothing. What a genuinely lossy sender appends is bounded
+-- by a rolling per-field window (store::catalog::MAX_CONFLICTS_PER_FIELD),
+-- trimmed in the same transaction as the insert — the table is evidence,
+-- not a ledger, and its cardinality is client-chosen.
 CREATE TABLE field_conflicts (
     id            BIGSERIAL
         CONSTRAINT field_conflicts_pkey PRIMARY KEY,

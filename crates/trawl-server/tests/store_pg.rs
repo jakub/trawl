@@ -1628,6 +1628,81 @@ mod catalog {
     }
 
     #[sqlx::test]
+    async fn conflicts_keep_only_the_newest_rows_per_field(pool: PgPool) {
+        // A field pinned BIGINT that keeps receiving strings appends a row
+        // every compaction tick, forever, while its information content
+        // stays constant — so the evidence is a rolling window, trimmed per
+        // FIELD (service names are client-chosen too, so a per-service
+        // window would only move the unbounded axis).
+        let store = catalog(&pool).with_conflict_cap(3);
+        let conflict = |service: &str, nulled: u64| FieldConflict {
+            field: "duration".to_owned(),
+            service: service.to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: nulled,
+        };
+
+        for i in 0..6_u64 {
+            store
+                .record_conflicts(&[conflict(&format!("svc-{i}"), i)])
+                .await
+                .unwrap();
+        }
+        // An untouched field is never trimmed by another field's write.
+        store
+            .record_conflicts(&[FieldConflict {
+                field: "other".to_owned(),
+                ..conflict("svc-x", 1)
+            }])
+            .await
+            .unwrap();
+
+        let rows = store.conflicts_for_field("duration").await.unwrap();
+        assert_eq!(rows.len(), 3, "the window bounds the evidence per field");
+        let kept: Vec<&str> = rows.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["svc-5", "svc-4", "svc-3"],
+            "the newest rows survive, oldest first out"
+        );
+        assert_eq!(
+            store.conflicts_for_field("other").await.unwrap().len(),
+            1,
+            "trimming touches only the fields the call wrote"
+        );
+
+        // A single over-window batch is trimmed by the same statement that
+        // inserted it — the trim must see its own insert.
+        let store = catalog(&pool).with_conflict_cap(2);
+        store
+            .record_conflicts(&[
+                FieldConflict {
+                    field: "burst".to_owned(),
+                    ..conflict("svc-a", 1)
+                },
+                FieldConflict {
+                    field: "burst".to_owned(),
+                    ..conflict("svc-b", 2)
+                },
+                FieldConflict {
+                    field: "burst".to_owned(),
+                    ..conflict("svc-c", 3)
+                },
+            ])
+            .await
+            .unwrap();
+        let rows = store.conflicts_for_field("burst").await.unwrap();
+        assert_eq!(rows.len(), 2, "one oversized batch is trimmed on arrival");
+        let kept: Vec<&str> = rows.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["svc-c", "svc-b"],
+            "rows sharing an insert timestamp break the tie by id — newest last-written wins"
+        );
+    }
+
+    #[sqlx::test]
     async fn catalog_id_is_stable_and_conformance_flips_once(pool: PgPool) {
         let store = catalog(&pool);
         let id1 = store.catalog_id().await.unwrap();
