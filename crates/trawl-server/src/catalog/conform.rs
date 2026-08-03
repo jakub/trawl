@@ -53,7 +53,8 @@ use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb
 
 use super::FieldCatalog;
 use crate::ingest::compaction::{
-    ColInfo, ConformPlan, ConformPolicy, describe_source, is_valid_parquet, quote_ident,
+    AGG_CHUNK_COLS, ColInfo, ConformPlan, ConformPolicy, describe_source, is_valid_parquet,
+    quote_ident,
 };
 use crate::store::{CatalogStore, FieldConflict, PinProposal};
 
@@ -480,6 +481,13 @@ fn voting_columns(schema: &[ColInfo], pinned: &HashMap<String, CanonicalType>) -
 ///
 /// Only `voting` indices are counted; every other position is 0 and must
 /// not be read as evidence (see [`FileScan::non_null`]).
+///
+/// Counted in passes of at most [`AGG_CHUNK_COLS`] columns, for the same
+/// reason the pin ladder is chunked: the width is client-chosen, one
+/// aggregate per column over the full width degrades quadratically, and on a
+/// first boot (or a re-arm against an empty catalog) EVERY column votes —
+/// per file, in front of HTTP serving, where a slow pass is indistinguishable
+/// from a hang to a supervisor start timeout.
 fn count_non_null(
     conn: &duckdb::Connection,
     safe_path: &str,
@@ -487,28 +495,27 @@ fn count_non_null(
     voting: &[usize],
 ) -> Result<Vec<u64>, String> {
     let mut out = vec![0u64; schema.len()];
-    if voting.is_empty() {
-        return Ok(out);
-    }
-    let sql = format!(
-        "SELECT {} FROM read_parquet('{safe_path}')",
-        voting
-            .iter()
-            .map(|i| format!("count({})::BIGINT", quote_ident(&schema[*i].name)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let counts: Vec<u64> = conn
-        .query_row(&sql, [], |row| {
-            let mut counts = Vec::with_capacity(voting.len());
-            for i in 0..voting.len() {
-                counts.push(u64::try_from(row.get::<_, i64>(i)?).unwrap_or(0));
-            }
-            Ok(counts)
-        })
-        .map_err(|e| format!("non-null counts failed: {e}"))?;
-    for (idx, count) in voting.iter().zip(counts) {
-        out[*idx] = count;
+    for chunk in voting.chunks(AGG_CHUNK_COLS) {
+        let sql = format!(
+            "SELECT {} FROM read_parquet('{safe_path}')",
+            chunk
+                .iter()
+                .map(|i| format!("count({})::BIGINT", quote_ident(&schema[*i].name)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let counts: Vec<u64> = conn
+            .query_row(&sql, [], |row| {
+                let mut counts = Vec::with_capacity(chunk.len());
+                for i in 0..chunk.len() {
+                    counts.push(u64::try_from(row.get::<_, i64>(i)?).unwrap_or(0));
+                }
+                Ok(counts)
+            })
+            .map_err(|e| format!("non-null counts failed: {e}"))?;
+        for (idx, count) in chunk.iter().zip(counts) {
+            out[*idx] = count;
+        }
     }
     Ok(out)
 }
@@ -723,11 +730,46 @@ fn rewrite_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{FileScan, most_rows_wins, voting_columns};
-    use crate::ingest::compaction::ColInfo;
+    use super::{FileScan, count_non_null, most_rows_wins, voting_columns};
+    use crate::ingest::compaction::{AGG_CHUNK_COLS, ColInfo, describe_source};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use trawl_core::schema::CanonicalType;
+
+    /// The vote weights are read in batched aggregate passes, so a file wider
+    /// than one chunk must still attribute each count to the column it came
+    /// from — a slot-mapping slip would hand a field its neighbour's weight
+    /// and decide the pin on someone else's evidence.
+    #[test]
+    fn non_null_counts_span_chunk_boundary_without_crossing_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("svc.parquet");
+        let cols = AGG_CHUNK_COLS + 5;
+        // Column i carries a value in exactly `(i % 3) + 1` of the three rows.
+        let projection = (0..cols)
+            .map(|i| format!("CASE WHEN r <= {} THEN 1 END AS f{i}", i % 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT {projection} FROM (VALUES (0), (1), (2)) t(r)) \
+             TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+
+        let safe = path.to_string_lossy().replace('\'', "''");
+        let schema =
+            describe_source(&conn, &format!("SELECT * FROM read_parquet('{safe}')")).unwrap();
+        assert_eq!(schema.len(), cols);
+        let voting: Vec<usize> = (0..cols).collect();
+
+        let counts = count_non_null(&conn, &safe, &schema, &voting).unwrap();
+        for (i, count) in counts.iter().enumerate() {
+            let expected = u64::try_from(i % 3).unwrap() + 1;
+            assert_eq!(*count, expected, "column f{i} got the wrong non-null count");
+        }
+    }
 
     fn scan(name: &str, cols: &[(&str, &str, u64)]) -> FileScan {
         FileScan {

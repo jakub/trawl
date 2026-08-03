@@ -1661,21 +1661,29 @@ fn propose_pins(
     Ok(proposals)
 }
 
-/// How many columns one pin-ladder query may cover.
+/// How many columns one per-column aggregate query may cover.
 ///
-/// The ladder needs `LADDER.len() + 1` aggregates per column, and both
-/// extremes are pathological on a wide batch (measured by execution against
-/// the bundled `DuckDB` 1.5.5, 10k columns × 50 rows): one query PER column
-/// is superlinear because every query re-binds the whole table (27s, and
-/// ~n^1.4 in the column count), while ONE query over every column blows
-/// aggregate memory (a 40k-column batch OOMs outright). Chunking is flat in
-/// both: 10k columns take ~1.4s and 40k ~7.9s at this width, and the peak is
-/// bounded by the chunk, not the batch. 64…1024 all measure within 25% of
-/// each other, so this sits in the middle.
-const PIN_LADDER_CHUNK_COLS: usize = 256;
+/// The bound every wide-batch aggregate pass funnels through: the pin ladder
+/// (`LADDER.len() + 1` aggregates per column), [`ConformPlan::tally_conflicts`]
+/// (2 per cast column) and the boot scan's non-null vote weighting (1 per
+/// voting column). Column count is client-chosen — `MAX_PINNED_FIELDS` bounds
+/// the catalog at 10k fields — so none of them may fan out over the full
+/// width.
+///
+/// Both extremes are pathological on a wide batch (measured by execution
+/// against the bundled `DuckDB` 1.5.5, 10k columns × 50 rows): one query PER
+/// column is superlinear because every query re-binds the whole table (27s,
+/// and ~n^1.4 in the column count), while ONE query over every column blows
+/// aggregate memory (a 40k-column batch OOMs outright) and is roughly
+/// quadratic well before that (the 2-aggregate tally shape: 1k cols 0.68s,
+/// 5k 10.6s, 10k 38.5s). Chunking is flat in both: 10k ladder columns take
+/// ~1.4s and 40k ~7.9s at this width, and the peak is bounded by the chunk,
+/// not the batch. 64…1024 all measure within 25% of each other, so this sits
+/// in the middle.
+pub(crate) const AGG_CHUNK_COLS: usize = 256;
 
 /// Run the candidate ladder over the columns' actual values, resolving up to
-/// [`PIN_LADDER_CHUNK_COLS`] columns per aggregate pass: per column the first
+/// [`AGG_CHUNK_COLS`] columns per aggregate pass: per column the first
 /// candidate whose `TRY_CAST` success rate over non-null values reaches
 /// [`LADDER_SUCCESS_THRESHOLD`] pins; none qualifying pins `VARCHAR`.
 ///
@@ -1689,7 +1697,7 @@ fn run_pin_ladders(
     // Non-null count followed by one TRY_CAST count per ladder candidate.
     let stride = LADDER.len() + 1;
     let mut out = Vec::with_capacity(columns.len());
-    for chunk in columns.chunks(PIN_LADDER_CHUNK_COLS) {
+    for chunk in columns.chunks(AGG_CHUNK_COLS) {
         let sql = format!(
             "SELECT {} FROM wal_batch",
             chunk
@@ -1925,9 +1933,12 @@ impl ConformPlan {
         self.casts.len()
     }
 
-    /// Tally, in ONE aggregate pass over `source` (a FROM-clause source
-    /// expression), what each cast would null — necessarily BEFORE the plan
-    /// is applied, since applying it destroys the pre-cast values.
+    /// Tally what each cast would null over `source` (a FROM-clause source
+    /// expression) — necessarily BEFORE the plan is applied, since applying
+    /// it destroys the pre-cast values. Runs in aggregate passes of at most
+    /// [`AGG_CHUNK_COLS`] cast columns for the same reason the pin ladder
+    /// does: the width is client-chosen, and 2 aggregates × 10k columns in
+    /// one statement is quadratic (38.5s at 10k, vs ~1.4s chunked).
     ///
     /// A conflict is one row per cast column the conform actually NULLED.
     /// A cast that nulls nothing lost no data, whatever the two type names
@@ -1946,26 +1957,30 @@ impl ConformPlan {
         if self.casts.is_empty() {
             return Ok(Vec::new());
         }
-        let stats_sql = format!(
-            "SELECT {} FROM {source}",
-            self.casts
-                .iter()
-                .map(|c| {
-                    let q = quote_ident(&c.name);
-                    format!("count({q})::BIGINT, count({})::BIGINT", c.expr)
+        let mut stats: Vec<(i64, i64)> = Vec::with_capacity(self.casts.len());
+        for chunk in self.casts.chunks(AGG_CHUNK_COLS) {
+            let stats_sql = format!(
+                "SELECT {} FROM {source}",
+                chunk
+                    .iter()
+                    .map(|c| {
+                        let q = quote_ident(&c.name);
+                        format!("count({q})::BIGINT, count({})::BIGINT", c.expr)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let chunk_stats: Vec<(i64, i64)> = conn
+                .query_row(&stats_sql, [], |row| {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for i in 0..chunk.len() {
+                        out.push((row.get::<_, i64>(2 * i)?, row.get::<_, i64>(2 * i + 1)?));
+                    }
+                    Ok(out)
                 })
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let stats: Vec<(i64, i64)> = conn
-            .query_row(&stats_sql, [], |row| {
-                let mut out = Vec::with_capacity(self.casts.len());
-                for i in 0..self.casts.len() {
-                    out.push((row.get::<_, i64>(2 * i)?, row.get::<_, i64>(2 * i + 1)?));
-                }
-                Ok(out)
-            })
-            .map_err(|e| format!("conform stats query failed: {e}"))?;
+                .map_err(|e| format!("conform stats query failed: {e}"))?;
+            stats.extend(chunk_stats);
+        }
 
         let mut conflicts = Vec::new();
         for (cast, (non_null, ok)) in self.casts.iter().zip(&stats) {
@@ -2883,6 +2898,48 @@ mod tests {
         assert_eq!(conflicts[0].rows_nulled, 1, "'x' is the only nulled value");
     }
 
+    /// A plan wider than one aggregate chunk must blame the column the rows
+    /// were actually nulled in: the tally runs in batched passes, so a
+    /// slot-mapping slip would hand a lossless column its neighbour's
+    /// evidence. Alternating lossy/lossless across the boundary catches that.
+    #[test]
+    fn tally_conflicts_spans_chunk_boundary_without_crossing_columns() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let cols = AGG_CHUNK_COLS + 5;
+        let lossy = |i: usize| i.is_multiple_of(3);
+        let projection = (0..cols)
+            .map(|i| {
+                let value = if lossy(i) { "'x'" } else { "'1'" };
+                format!("{value} AS f{i}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!("CREATE TABLE wal_batch AS SELECT {projection}"))
+            .unwrap();
+
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = (0..cols)
+            .map(|i| (format!("f{i}"), CanonicalType::BigInt))
+            .collect();
+        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        assert_eq!(plan.cast_count(), cols, "every VARCHAR column casts");
+
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        let fields: Vec<String> = conflicts.iter().map(|c| c.field.clone()).collect();
+        let expected: Vec<String> = (0..cols)
+            .filter(|i| lossy(*i))
+            .map(|i| format!("f{i}"))
+            .collect();
+        assert_eq!(
+            fields, expected,
+            "only the unconvertible columns are evidence"
+        );
+        assert!(
+            conflicts.iter().all(|c| c.rows_nulled == 1),
+            "each lossy column nulled its one row"
+        );
+    }
+
     // --- the pin ladder is deterministic over mixed batches (ADR-0009) ---
 
     #[test]
@@ -2996,7 +3053,7 @@ mod tests {
 
         // Every column is mixed-typed (so every one takes the ladder), but
         // every third is an even split that can only honestly pin VARCHAR.
-        let cols = PIN_LADDER_CHUNK_COLS + 5;
+        let cols = AGG_CHUNK_COLS + 5;
         let varchar_col = |i: usize| i.is_multiple_of(3);
         let records: Vec<String> = (0..21)
             .map(|row| {

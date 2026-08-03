@@ -43,6 +43,11 @@ pub enum RepairCode {
     /// a field's NAME exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
     /// the field was dropped (its value stays findable in `_raw`).
     FieldNameTooLong,
+    /// a field's NAME differed only in ASCII case from a declared envelope
+    /// column (or compaction's provenance column) — one column as far as
+    /// `DuckDB` is concerned — so the field was dropped (its value stays
+    /// findable in `_raw`).
+    FieldNameReserved,
 }
 
 impl RepairCode {
@@ -57,6 +62,7 @@ impl RepairCode {
             Self::FieldTruncated => "field.truncated",
             Self::MetaStripped => "meta.stripped",
             Self::FieldNameTooLong => "field.name_too_long",
+            Self::FieldNameReserved => "field.name_reserved",
         }
     }
 }
@@ -527,6 +533,52 @@ fn strip_server_owned(out: &mut Map<String, Value>) -> bool {
     stripped
 }
 
+/// Whether `name` is a case-variant spelling — but not the exact spelling —
+/// of a name trawl owns: a declared envelope column or compaction's
+/// provenance column. ASCII-only, matching `DuckDB`'s own identifier
+/// comparison (`café` and `CAFÉ` stay distinct columns there).
+fn is_reserved_case_variant(name: &str) -> bool {
+    trawl_core::schema::ENVELOPE_TYPES
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(std::iter::once(compaction::WAL_FILE_COL))
+        .any(|reserved| reserved != name && reserved.eq_ignore_ascii_case(name))
+}
+
+/// Drop every client key that differs ONLY in ASCII case from a declared
+/// envelope column (or from compaction's provenance column), returning
+/// whether any were dropped (the `field.name_reserved` repair).
+///
+/// `DuckDB` identifiers are ASCII case-INSENSITIVE while JSON keys are not,
+/// so `_Time` and `_time` name ONE column downstream. Left in place, such a
+/// key rides the WAL next to the server's own canonical field and
+/// compaction's `read_json` binds whichever spelling it saw first — the
+/// client's, since `serde_json::Map` is sorted and uppercase sorts ahead of
+/// lowercase — while the `REPLACE (…)` list RENAMES the bound column, so the
+/// client's `_Time` literally becomes the parquet `_time` partition key and
+/// the canonical value is demoted to `_time_1`. That is full forgery of
+/// `_time`/`service`/`host`/`env`/`_repairs` by anyone holding `ingest`, and
+/// it would also make the hot side (which merges case-variants onto the
+/// server value, [`crate::hot_buffer::HotBuffer::snapshot`]) disagree with
+/// cold storage for the same event.
+///
+/// Dropping is the honest answer, same shape as [`drop_unstorable_names`]:
+/// the server owns these ten columns, nothing sane can be done with a second
+/// value for one of them, and `_raw` is captured before this runs so the key
+/// and its value stay recoverable. EXACT spellings are NOT touched here —
+/// the canonicalizer consumes them itself (strip, alias, validate, derive).
+fn drop_reserved_case_variants(out: &mut Map<String, Value>) -> bool {
+    let variants: Vec<String> = out
+        .keys()
+        .filter(|k| is_reserved_case_variant(k))
+        .cloned()
+        .collect();
+    for k in &variants {
+        out.remove(k);
+    }
+    !variants.is_empty()
+}
+
 /// Drop every field whose NAME cannot be a field-catalog key, returning
 /// whether any were dropped (the `field.name_too_long` repair).
 ///
@@ -560,6 +612,7 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
 /// 2. `_raw` capture — FIRST, before reserved-key stripping and every
 ///    repair, so the server's own fills never appear inside "what arrived".
 /// 3. Reserved-key strip (`meta.stripped`), `_trawl_wal_file` silent drop,
+///    case-variant-of-a-declared-name drop (`field.name_reserved`),
 ///    over-long field-name drop (`field.name_too_long`).
 /// 4. `_time` from the wire aliases (`_time`/`timestamp`/`@timestamp`,
 ///    consumed), ADR-0008 grammar, `time.from_ingest`/`time.out_of_range`.
@@ -613,6 +666,12 @@ pub fn canonicalize(
     // 3. Server-owned metadata is never client-settable.
     if strip_server_owned(&mut out) {
         push_repair(&mut repairs, RepairCode::MetaStripped);
+    }
+
+    // 3.1. A key `DuckDB` cannot tell apart from a column trawl owns would
+    // overwrite it in cold storage (see [`drop_reserved_case_variants`]).
+    if drop_reserved_case_variants(&mut out) {
+        push_repair(&mut repairs, RepairCode::FieldNameReserved);
     }
 
     // 3.2. Names too long to be a catalog key never become columns.
@@ -1326,6 +1385,80 @@ mod tests {
         let multibyte = "é".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES / 2 + 1);
         assert!(multibyte.chars().count() <= trawl_core::schema::MAX_FIELD_NAME_BYTES);
         assert!(!trawl_core::schema::is_storable_field_name(&multibyte));
+    }
+
+    // --- reserved-name case variants (DuckDB folds ASCII case) ---
+
+    #[test]
+    fn case_variant_of_a_declared_name_cannot_shadow_it() {
+        // `_Time`/`Service` survive canonicalization only if matched
+        // exactly; downstream `read_json` folds ASCII case, binds the
+        // client's spelling as THE column, and the REPLACE list renames it
+        // — the client's value becomes the parquet `_time` partition key.
+        let c = canon(
+            r#"{"service":"realsvc","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","_Time":"1999-01-01T00:00:00Z",
+                "Service":"spoofed","HOST":"spoofed","Env":"lab",
+                "_Repairs":"none","_RAW":"forged","_Trawl_Wal_File":"x",
+                "Message":"m","SEVERITY":3,"Severity_Text":"nope"}"#,
+        );
+        for forged in [
+            "_Time",
+            "Service",
+            "HOST",
+            "Env",
+            "_Repairs",
+            "_RAW",
+            "_Trawl_Wal_File",
+            "Message",
+            "SEVERITY",
+            "Severity_Text",
+        ] {
+            assert!(
+                !c.obj.contains_key(forged),
+                "{forged} must not reach the WAL"
+            );
+        }
+        assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
+        assert_eq!(c.service, "realsvc");
+        assert_eq!(c.obj["service"], "realsvc");
+        assert_eq!(c.obj["host"], "h");
+        assert_eq!(c.obj["env"], "prod");
+        assert!(codes(&c).contains(&"field.name_reserved"));
+        // Nothing is lost: the forged keys stay findable in `_raw`.
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(raw.contains("spoofed"), "got: {raw}");
+    }
+
+    #[test]
+    fn exact_and_unrelated_names_are_untouched() {
+        // Only case-VARIANTS are dropped: the exact spellings are the
+        // envelope itself, and a field merely resembling one is user data.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","message":"m",
+                "hostname":"h2","service_id":7,"CAFÉ":"unicode stays"}"#,
+        );
+        assert_eq!(c.obj["message"], "m");
+        assert_eq!(c.obj["hostname"], "h2");
+        assert_eq!(c.obj["service_id"], 7);
+        // ASCII-only folding, matching DuckDB's identifier comparison.
+        assert_eq!(c.obj["CAFÉ"], "unicode stays");
+        assert!(c.repairs.is_empty(), "clean event: {:?}", c.repairs);
+    }
+
+    #[test]
+    fn case_variant_severity_input_is_dropped_not_derived_from() {
+        // The severity chain reads exact keys; a `LEVEL` spelling is not a
+        // declared column at all, so it stays an ordinary field.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","Severity":"error","LEVEL":"warn"}"#,
+        );
+        assert!(!c.obj.contains_key("Severity"));
+        assert!(!c.obj.contains_key("severity"), "no severity was derived");
+        assert_eq!(c.obj["LEVEL"], "warn");
+        assert_eq!(codes(&c), vec!["field.name_reserved"]);
     }
 
     // --- _time grammar (the ADR-0008 corpus, moved verbatim) ---
