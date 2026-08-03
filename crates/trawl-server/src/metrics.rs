@@ -290,6 +290,31 @@ fn wal_cache() -> &'static Mutex<CachedWalStats> {
     })
 }
 
+/// Recursively tally `.ndjson` files under `dir` into `file_count`/`total_bytes`.
+///
+/// Recursive by necessity: WAL files live one level down in `wal_dir/{env}/`
+/// (ADR-0009), so a flat scan of `wal_dir` sees only directories and reports
+/// 0/0 forever — blinding the operator's only stalled-compaction signal.
+/// Unreadable directories and entries are skipped rather than aborting the
+/// walk, so one bad env still yields the rest of the fleet's numbers.
+fn walk_wal_files(dir: &Path, file_count: &mut u64, total_bytes: &mut u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_wal_files(&entry.path(), file_count, total_bytes);
+        } else if ft.is_file() && entry.path().extension().is_some_and(|ext| ext == "ndjson") {
+            *file_count += 1;
+            if let Ok(meta) = entry.metadata() {
+                *total_bytes += meta.len();
+            }
+        }
+    }
+}
+
 /// Scan WAL directory for `.ndjson` files and update gauge metrics.
 ///
 /// Uses a 30s TTL cache to avoid repeated directory scans.
@@ -317,17 +342,7 @@ fn collect_wal_gauges(wal_dir: &Path) {
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
 
-    if let Ok(entries) = std::fs::read_dir(wal_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "ndjson") {
-                file_count += 1;
-                if let Ok(meta) = entry.metadata() {
-                    total_bytes += meta.len();
-                }
-            }
-        }
-    }
+    walk_wal_files(wal_dir, &mut file_count, &mut total_bytes);
 
     metrics::gauge!(WAL_FILES).set(file_count as f64);
     metrics::gauge!(WAL_BYTES).set(total_bytes as f64);
@@ -365,6 +380,33 @@ mod tests {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let _handle = builder.install_recorder().expect("install test recorder");
         describe_metrics();
+    }
+
+    #[test]
+    fn wal_walk_counts_files_inside_env_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wal_dir = tmp.path();
+
+        // WAL files land in `wal_dir/{env}/` (ADR-0009) — a flat scan of
+        // `wal_dir` would see only directories and report 0/0.
+        for (env, service, bytes) in [("prod", "nginx", "aaaa"), ("dev", "api", "bb")] {
+            let env_dir = wal_dir.join(env);
+            std::fs::create_dir_all(&env_dir).expect("create env dir");
+            std::fs::write(env_dir.join(format!("{service}_1_abcd.ndjson")), bytes)
+                .expect("write wal file");
+            // Non-ndjson siblings (in-flight tmp, quarantined) must not count.
+            std::fs::write(env_dir.join(format!("{service}_2_abcd.tmp")), "zzzz")
+                .expect("write tmp file");
+            std::fs::write(env_dir.join(format!("{service}_3_abcd.corrupt")), "zzzz")
+                .expect("write corrupt file");
+        }
+
+        let mut file_count = 0;
+        let mut total_bytes = 0;
+        walk_wal_files(wal_dir, &mut file_count, &mut total_bytes);
+
+        assert_eq!(file_count, 2);
+        assert_eq!(total_bytes, 6);
     }
 
     #[test]
