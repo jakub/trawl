@@ -25,7 +25,7 @@
 //! turning an opt-in debug feature into a boot failure.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -51,17 +51,18 @@ struct Inner {
 /// Open `path` for appending, owner-only on Unix (`0600` at creation,
 /// and a pre-existing looser file is tightened).
 fn open_owner_only(path: &Path) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
+    // The helper sets `0600` at creation AND re-applies it to a
+    // pre-existing looser file, handing back a failed `chmod` instead of
+    // raising it — the tolerance below is this log's own policy.
+    let (file, chmod_error) = trawl_config::fs::open_with_mode(path, 0o600, |opts| {
+        opts.create(true).append(true);
+    })?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+    if let Some(err) = chmod_error {
+        tolerate_chmod_failure(&file, path, &err)?;
     }
-    let file = opts.open(path)?;
-    // `mode` only applies at creation — tighten a pre-existing file too.
-    #[cfg(unix)]
-    tighten_to_owner_only(&file, path)?;
+    #[cfg(not(unix))]
+    let _ = chmod_error;
     Ok(file)
 }
 
@@ -73,15 +74,12 @@ fn chmod_failure_is_fatal(mode: Option<u32>) -> bool {
     mode.is_none_or(|m| m & 0o077 != 0)
 }
 
-/// `chmod 0600` an already-open log file, tolerating the one failure
-/// that carries no exposure: a foreign-owned file that is already
-/// owner-only (see the module docs).
+/// Decide what a failed `chmod 0600` on an already-open log file means,
+/// tolerating the one failure that carries no exposure: a foreign-owned
+/// file that is already owner-only (see the module docs).
 #[cfg(unix)]
-fn tighten_to_owner_only(file: &File, path: &Path) -> io::Result<()> {
+fn tolerate_chmod_failure(file: &File, path: &Path, chmod_err: &io::Error) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    let Err(chmod_err) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) else {
-        return Ok(());
-    };
     let mode = file
         .metadata()
         .ok()

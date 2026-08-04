@@ -527,19 +527,15 @@ async fn driver_send(
 /// tightening a pre-existing looser file) — tracing output can carry
 /// query text and server responses.
 fn open_tui_log(path: &std::path::Path) -> io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let file = opts.open(path)?;
-    // `mode` only applies at creation — tighten a pre-existing file too.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let (file, chmod_error) = trawl_config::fs::open_with_mode(path, 0o600, |opts| {
+        opts.create(true).write(true).truncate(true);
+    })?;
+    // A log we cannot tighten is a log we do not write: unlike the
+    // server's opt-in query log, this one is created fresh per run under
+    // a user-chosen path, so a failing chmod means something is wrong
+    // with that path rather than with an inherited file.
+    if let Some(err) = chmod_error {
+        return Err(err);
     }
     Ok(file)
 }

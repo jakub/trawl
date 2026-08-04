@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+pub mod fs;
+
 /// Top-level daemon configuration, loaded from TOML.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {

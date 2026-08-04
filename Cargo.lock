@@ -6293,6 +6293,7 @@ dependencies = [
  "tracing-subscriber",
  "trawl-api",
  "trawl-client",
+ "trawl-config",
  "trawl-core",
  "trawl-dashboard",
  "trawl-engine",
@@ -6322,6 +6323,7 @@ dependencies = [
  "chrono",
  "serde",
  "shellexpand",
+ "tempfile",
  "thiserror 2.0.19",
  "toml",
 ]
