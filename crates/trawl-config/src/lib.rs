@@ -310,6 +310,19 @@ pub struct IngestConfig {
     #[serde(default = "default_telemetry_flush_interval_secs")]
     pub telemetry_flush_interval_secs: u64,
 
+    /// Cap on memory retained by the internal-telemetry retry queue while
+    /// the WAL is unhealthy. Default: 16 MiB. Accepts human-readable sizes
+    /// like `"16M"`. Like `hot_buffer_max_bytes`, the charge is an
+    /// estimate: serialized ndjson bytes plus the retained event maps
+    /// (which hold roughly the same payload again) plus a fixed per-event
+    /// overhead. On overflow the oldest batches are dropped and counted
+    /// in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}`.
+    #[serde(
+        default = "default_telemetry_buffer_max_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub telemetry_buffer_max_bytes: usize,
+
     /// Maximum WAL files per compaction chunk. Larger backlogs are split
     /// into chunks of this size and merged incrementally. Default: 500.
     #[serde(default = "default_compaction_chunk_size")]
@@ -413,6 +426,7 @@ impl Default for IngestConfig {
             hot_buffer_max_bytes: default_hot_buffer_max_bytes(),
             stats_interval_secs: DEFAULT_STATS_INTERVAL_SECS,
             telemetry_flush_interval_secs: DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS,
+            telemetry_buffer_max_bytes: default_telemetry_buffer_max_bytes(),
             compaction_chunk_size: DEFAULT_COMPACTION_CHUNK_SIZE,
             compaction_memory_limit: DEFAULT_COMPACTION_MEMORY_LIMIT.to_string(),
             default_env: default_env_name(),
@@ -894,6 +908,13 @@ fn default_stats_interval_secs() -> u64 {
 
 fn default_telemetry_flush_interval_secs() -> u64 {
     DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS
+}
+
+/// Default telemetry retry-queue memory cap (16 MiB, estimated charge).
+pub const DEFAULT_TELEMETRY_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn default_telemetry_buffer_max_bytes() -> usize {
+    DEFAULT_TELEMETRY_BUFFER_MAX_BYTES
 }
 
 /// Default key audit polling interval (seconds).

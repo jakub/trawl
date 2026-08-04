@@ -525,7 +525,11 @@ fn init_tracing(
     if use_telemetry {
         // WAL layer replaces the JSON file logger.
         let handle = WalHandle::new();
-        let wal_layer = WalLayer::new(handle.clone(), &config.ingest.default_env);
+        let wal_layer = WalLayer::new_with_buffer_cap(
+            handle.clone(),
+            &config.ingest.default_env,
+            config.ingest.telemetry_buffer_max_bytes,
+        );
         let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>
 
         if monitor_active {

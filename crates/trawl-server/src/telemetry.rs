@@ -7,31 +7,74 @@
 //!
 //! ## Bootstrap
 //!
-//! The tracing subscriber is initialized before the WAL writer exists (we
-//! need tracing for config-loading logs). [`WalHandle`] wraps an
-//! [`OnceLock`] — the layer registers at init time and buffers events
-//! in memory until [`WalHandle::set`] injects the writer after startup.
-//! This ensures bootstrap events (config loading, cert generation, etc.)
-//! are captured rather than silently dropped. A 1 MiB cap prevents
-//! unbounded growth if the writer is never set.
+//! The tracing subscriber is initialized right after the top-level config
+//! parses. A config read/parse/validation failure happens BEFORE any
+//! subscriber exists and surfaces only through an explicit stderr
+//! diagnostic in `main` — it is never captured here. Post-parse
+//! initialization events (cert generation, epoch gate, etc.) ARE
+//! captured: [`WalHandle`] wraps an [`OnceLock`] — the layer registers at
+//! init time and buffers events in memory until [`WalHandle::set`]
+//! injects the writer after startup. A 1 MiB cap bounds that pre-init
+//! buffer if the writer is never set; drops past it are counted under
+//! reason `preinit_cap` (event count exact; bytes estimated from the
+//! mean buffered line size, because the drop happens before
+//! serialization and the telemetry-disabled path must stay cheap).
 //!
-//! ## Buffering
+//! ## Buffering and the bounded retry queue
 //!
-//! Events are serialized to ndjson and accumulated in an in-memory buffer.
-//! A background task flushes the buffer to the WAL every second. This
-//! avoids creating hundreds of tiny WAL files under load while keeping
-//! latency low.
+//! Events are serialized to ndjson and accumulated in an active buffer
+//! (bytes + their event maps, swapped together). Each flush cycle stages
+//! the active buffer as one [`Batch`] on a FIFO retry queue, then writes
+//! pending batches oldest-first. One batch per WAL write — the hot-buffer
+//! `batch_id` must stay `{env}/{wal-file-stem}` of the file THAT batch
+//! landed in, so batches are never merged.
+//!
+//! A failed write RETAINS the batch for retry (rate-limited stderr +
+//! `trawl_telemetry_wal_write_failures_total`); a transient storage error
+//! no longer loses the batch. Total retained memory is capped by
+//! `[ingest] telemetry_buffer_max_bytes` — the charge is an ESTIMATE
+//! (serialized ndjson counted twice, once for the bytes and once for the
+//! retained maps which hold roughly the same payload, plus a fixed
+//! per-event map overhead), mirroring the hot-buffer setting's estimate
+//! semantics. On overflow the OLDEST batches are dropped (the newest is
+//! always kept, so current operational state stays observable and one
+//! pathological batch cannot deadlock the queue) with exact event counts
+//! and byte totals under reason `buffer_cap`.
+//!
+//! ## Durability before visibility
+//!
+//! A batch is inserted into the hot buffer and published to the event bus
+//! strictly AFTER its WAL write succeeds, exactly once (the batch is
+//! popped on success, so re-publication is structurally impossible).
+//! Queries and SSE can never observe telemetry that would disappear after
+//! a restart.
+//!
+//! ## Blocking I/O and shutdown
+//!
+//! The async flush task runs each WAL write (create, write, fsync,
+//! rename, dir-fsync) on the blocking pool via `spawn_blocking` —
+//! [`WalLayer::flush`] stays synchronous for tests only. On shutdown the
+//! final drain runs under a wall-clock budget; the timeout abandons the
+//! await, not the blocking thread, so a truly wedged fsync leaves one
+//! lingering blocking thread at process exit (accepted and preferable to
+//! hanging shutdown).
 //!
 //! ## Infinite recursion guard
 //!
-//! [`WalLayerInner::flush`] uses `eprintln!` for error reporting, NEVER
-//! `tracing::*`. A tracing event inside the layer's own flush path would
-//! re-enter `on_event` and loop forever.
+//! The flush path uses `eprintln!` for error reporting, NEVER
+//! `tracing::*`: a tracing event inside the layer's own flush path would
+//! re-enter `on_event` and loop forever. Two narrow exceptions hold
+//! because `on_event` only BUFFERS (it takes the active-buffer lock,
+//! which the flush path never holds while emitting): the
+//! `telemetry_dropped` recovery event after a successful write, and
+//! `WalWriter::write`'s own best-effort dir-fsync warning. The invariant
+//! is: **no locks are held across `writer.write`, and flush-path tracing
+//! may only buffer.**
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::json;
@@ -159,28 +202,81 @@ pub struct WalLayer {
     inner: Arc<WalLayerInner>,
 }
 
+/// One staged flush unit: the serialized ndjson lines and the event maps
+/// they were serialized from. Written to the WAL as ONE file, so the
+/// hot-buffer `batch_id` ↔ WAL-filename-stem contract holds per batch.
+struct Batch {
+    bytes: Vec<u8>,
+    events: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Documented per-event overhead estimate charged on top of the serialized
+/// bytes for a retained event map (allocator overhead, map buckets,
+/// `String` headers). Like the hot buffer's `max_bytes`, the resulting
+/// charge is an estimate, not an exact accounting.
+const EVENT_MAP_OVERHEAD_BYTES: usize = 256;
+
+/// Estimated memory charged against `telemetry_buffer_max_bytes` for one
+/// pending batch: the ndjson bytes counted twice (the serialized buffer
+/// plus the retained maps, which hold roughly the same payload again) plus
+/// [`EVENT_MAP_OVERHEAD_BYTES`] per event.
+fn batch_charge(batch: &Batch) -> usize {
+    batch.bytes.len() * 2 + batch.events.len() * EVENT_MAP_OVERHEAD_BYTES
+}
+
+/// The active (not yet staged) buffer: ndjson bytes and their event maps,
+/// under ONE lock so the two representations can never skew.
+#[derive(Default)]
+struct ActiveBuffer {
+    bytes: Vec<u8>,
+    events: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Drop accounting, reset when the `telemetry_dropped` recovery event is
+/// emitted after a successful write.
+#[derive(Default)]
+struct DropCounters {
+    /// Events dropped by the pre-init 1 MiB cap (exact).
+    preinit_events: AtomicU64,
+    /// Bytes dropped by the pre-init cap (mean-line-size estimate — the
+    /// drop happens before serialization).
+    preinit_bytes: AtomicU64,
+    /// Events dropped by retry-queue overflow (exact).
+    cap_events: AtomicU64,
+    /// ndjson bytes dropped by retry-queue overflow (exact).
+    cap_bytes: AtomicU64,
+}
+
 struct WalLayerInner {
     /// Env stamped onto telemetry events (`default_env`).
     env: String,
     handle: WalHandle,
-    buffer: Mutex<Vec<u8>>,
+    /// Active buffer: events accumulated since the last stage.
+    active: Mutex<ActiveBuffer>,
+    /// FIFO retry queue of staged batches awaiting a successful WAL write.
+    pending: Mutex<VecDeque<Batch>>,
+    /// Cap on the estimated memory charged by `pending`
+    /// (`[ingest] telemetry_buffer_max_bytes`). Atomic so tests can
+    /// tighten it after construction.
+    max_pending_bytes: AtomicUsize,
     /// Cached hostname, resolved once at layer creation.
     host: String,
-    /// Bytes lost due to WAL write failures (accumulated, reset on report).
-    dropped_bytes: AtomicU64,
+    /// Loss accounting for the recovery event and metrics.
+    dropped: DropCounters,
+    /// Last time a WAL failure was reported to stderr (rate limit).
+    last_stderr: Mutex<Option<Instant>>,
     /// Deferred event bus for real-time fanout (SSE streaming).
     bus: OnceLock<Arc<crate::bus::LocalEventBus>>,
     /// Deferred hot buffer for synchronous insertion (query freshness).
     hot_buffer: OnceLock<Arc<crate::hot_buffer::HotBuffer>>,
-    /// Event maps accumulated since last flush, for bus/hot buffer publishing.
-    event_maps: Mutex<Vec<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl std::fmt::Debug for WalLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WalLayer")
             .field("active", &self.inner.handle.get().is_some())
-            .field("buffer_bytes", &self.inner.buffer.lock().len())
+            .field("buffer_bytes", &self.inner.active.lock().bytes.len())
+            .field("pending_batches", &self.inner.pending.lock().len())
             .finish()
     }
 }
@@ -189,7 +285,20 @@ impl WalLayer {
     /// Create a new layer backed by the given handle. `env` is the env
     /// telemetry events are stamped with (`default_env`) — the records
     /// carry it as a column, matching where the WAL handle files them.
+    /// Uses the default retry-queue cap; production passes the configured
+    /// `[ingest] telemetry_buffer_max_bytes` via
+    /// [`WalLayer::new_with_buffer_cap`].
     pub fn new(handle: WalHandle, env: &str) -> Self {
+        Self::new_with_buffer_cap(
+            handle,
+            env,
+            trawl_config::DEFAULT_TELEMETRY_BUFFER_MAX_BYTES,
+        )
+    }
+
+    /// [`WalLayer::new`] with an explicit retry-queue memory cap
+    /// (`[ingest] telemetry_buffer_max_bytes`).
+    pub fn new_with_buffer_cap(handle: WalHandle, env: &str, max_buffer_bytes: usize) -> Self {
         let host = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -197,13 +306,18 @@ impl WalLayer {
         Self {
             inner: Arc::new(WalLayerInner {
                 handle,
-                buffer: Mutex::new(Vec::with_capacity(8192)),
+                active: Mutex::new(ActiveBuffer {
+                    bytes: Vec::with_capacity(8192),
+                    events: Vec::new(),
+                }),
+                pending: Mutex::new(VecDeque::new()),
+                max_pending_bytes: AtomicUsize::new(max_buffer_bytes),
                 host,
                 env: env.to_owned(),
-                dropped_bytes: AtomicU64::new(0),
+                dropped: DropCounters::default(),
+                last_stderr: Mutex::new(None),
                 bus: OnceLock::new(),
                 hot_buffer: OnceLock::new(),
-                event_maps: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -222,80 +336,202 @@ impl WalLayer {
         let _ = self.inner.hot_buffer.set(buf);
     }
 
-    /// Flush the buffer to the WAL. Called periodically by the background
-    /// task and on shutdown.
+    /// Synchronous flush: stage the active buffer and drain the retry
+    /// queue with direct (non-`spawn_blocking`) writes.
+    ///
+    /// Test-only convenience — the production flush task's sole write path
+    /// is [`WalLayer::flush_cycle`], which runs the durability barriers on
+    /// the blocking pool.
     pub fn flush(&self) {
-        self.inner.flush();
+        let Some((writer, env)) = self.inner.handle.get() else {
+            return;
+        };
+        self.inner.stage();
+        while let Some(batch) = self.inner.pop_oldest() {
+            match writer.write(env, "trawld", &batch.bytes) {
+                Ok(wal_path) => self.inner.publish(env, &wal_path, batch),
+                Err(e) => {
+                    self.inner.record_write_failure(&e);
+                    self.inner.requeue_front(batch);
+                    break;
+                }
+            }
+        }
+        self.inner.update_gauges();
+    }
+
+    /// Async flush cycle: stage the active buffer, then write pending
+    /// batches oldest-first with each WAL write (and both of its
+    /// durability barriers) on the blocking pool. Stops at the first
+    /// failure, retaining the failed batch at the queue front.
+    pub async fn flush_cycle(&self) {
+        let Some((writer, env)) = self.inner.handle.get() else {
+            return;
+        };
+        self.inner.stage();
+        while let Some(batch) = self.inner.pop_oldest() {
+            let w = Arc::clone(writer);
+            let batch_env = Arc::clone(env);
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = w.write(&batch_env, "trawld", &batch.bytes);
+                (result, batch)
+            })
+            .await;
+            match joined {
+                Ok((Ok(wal_path), batch)) => self.inner.publish(env, &wal_path, batch),
+                Ok((Err(e), batch)) => {
+                    self.inner.record_write_failure(&e);
+                    self.inner.requeue_front(batch);
+                    break;
+                }
+                Err(join_err) => {
+                    // The batch was consumed by the panicked/cancelled
+                    // closure and cannot be recovered. WalWriter::write
+                    // does not panic in practice.
+                    self.inner
+                        .record_write_failure(&std::io::Error::other(join_err));
+                    break;
+                }
+            }
+        }
+        self.inner.update_gauges();
     }
 }
 
 impl WalLayerInner {
-    /// Swap out the buffer and write its contents to the WAL.
-    fn flush(&self) {
-        let Some((writer, env)) = self.handle.get() else {
+    /// Swap the active buffer into a pending [`Batch`] and enforce the
+    /// retry-queue memory cap by dropping the OLDEST batches (never the
+    /// newest — current operational state must stay observable).
+    ///
+    /// No-op until the writer is set: pre-init events stay in the active
+    /// buffer under the pre-init cap, preserving the bootstrap-buffering
+    /// contract.
+    fn stage(&self) {
+        if self.handle.get().is_none() {
             return;
-        };
-
-        let data = {
-            let mut buf = self.buffer.lock();
-            if buf.is_empty() {
+        }
+        let batch = {
+            let mut active = self.active.lock();
+            if active.bytes.is_empty() {
                 return;
             }
-            std::mem::take(&mut *buf)
+            Batch {
+                bytes: std::mem::take(&mut active.bytes),
+                events: std::mem::take(&mut active.events),
+            }
         };
 
-        // Drain event maps regardless of WAL write outcome — they mirror
-        // the byte buffer and must stay in sync.
-        let maps = std::mem::take(&mut *self.event_maps.lock());
-
-        match writer.write(env, "trawld", &data) {
-            Err(e) => {
-                // MUST NOT use tracing here — infinite recursion.
-                eprintln!("[trawl-telemetry] WAL write failed: {e}");
-                self.dropped_bytes
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-            }
-            Ok(wal_path) if !maps.is_empty() => {
-                // Insert into hot buffer synchronously (query freshness),
-                // then publish to event bus for SSE streaming.
-                // batch_id MUST match the WAL filename stem so compaction
-                // can drain the hot buffer after writing parquet.
-                use crate::bus::{EventBus, IngestBatch};
-                let batch_id: Arc<str> = format!(
-                    "{env}/{}",
-                    wal_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("trawld_unknown")
-                )
-                .into();
-                let batch = Arc::new(IngestBatch {
-                    batch_id,
-                    service: "trawld".into(),
-                    events: maps,
-                    byte_size: data.len(),
-                });
-                if let Some(buf) = self.hot_buffer.get() {
-                    buf.insert(Arc::clone(&batch));
-                }
-                if let Some(bus) = self.bus.get() {
-                    let _ = bus.publish(batch);
-                }
-
-                // Report any previously dropped bytes. Safe from recursion:
-                // on_event only buffers, the tracing event will be picked up
-                // on the NEXT flush cycle.
-                let prev = self.dropped_bytes.swap(0, Ordering::Relaxed);
-                if prev > 0 {
-                    tracing::warn!(
-                        event_type = "telemetry_dropped",
-                        dropped_bytes = prev,
-                        "telemetry events were lost due to WAL write failure"
-                    );
-                }
-            }
-            Ok(_) => {}
+        let mut pending = self.pending.lock();
+        pending.push_back(batch);
+        let cap = self.max_pending_bytes.load(Ordering::Relaxed);
+        let mut total: usize = pending.iter().map(batch_charge).sum();
+        while total > cap && pending.len() > 1 {
+            let dropped = pending.pop_front().expect("len > 1");
+            total -= batch_charge(&dropped);
+            let events = dropped.events.len() as u64;
+            let bytes = dropped.bytes.len() as u64;
+            self.dropped.cap_events.fetch_add(events, Ordering::Relaxed);
+            self.dropped.cap_bytes.fetch_add(bytes, Ordering::Relaxed);
+            metrics::counter!(
+                crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
+                "reason" => "buffer_cap"
+            )
+            .increment(events);
+            metrics::counter!(
+                crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
+                "reason" => "buffer_cap"
+            )
+            .increment(bytes);
         }
+    }
+
+    /// Pop the oldest pending batch for a write attempt. No lock is held
+    /// by the caller across the write itself.
+    fn pop_oldest(&self) -> Option<Batch> {
+        self.pending.lock().pop_front()
+    }
+
+    /// Put a failed batch back at the queue front, preserving FIFO order.
+    fn requeue_front(&self, batch: Batch) {
+        self.pending.lock().push_front(batch);
+    }
+
+    /// Publish a durably-written batch to the hot buffer and event bus —
+    /// strictly after WAL success, exactly once (the batch was popped).
+    /// Then emit the `telemetry_dropped` recovery record if any loss
+    /// accumulated (safe from recursion: `on_event` only buffers).
+    fn publish(&self, env: &str, wal_path: &std::path::Path, batch: Batch) {
+        if !batch.events.is_empty() {
+            // batch_id MUST match the WAL filename stem so compaction can
+            // drain the hot buffer after writing parquet.
+            use crate::bus::{EventBus, IngestBatch};
+            let batch_id: Arc<str> = format!(
+                "{env}/{}",
+                wal_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("trawld_unknown")
+            )
+            .into();
+            let byte_size = batch.bytes.len();
+            let batch = Arc::new(IngestBatch {
+                batch_id,
+                service: "trawld".into(),
+                events: batch.events,
+                byte_size,
+            });
+            if let Some(buf) = self.hot_buffer.get() {
+                buf.insert(Arc::clone(&batch));
+            }
+            if let Some(bus) = self.bus.get() {
+                let _ = bus.publish(batch);
+            }
+        }
+
+        let preinit_events = self.dropped.preinit_events.swap(0, Ordering::Relaxed);
+        let preinit_bytes = self.dropped.preinit_bytes.swap(0, Ordering::Relaxed);
+        let cap_events = self.dropped.cap_events.swap(0, Ordering::Relaxed);
+        let cap_bytes = self.dropped.cap_bytes.swap(0, Ordering::Relaxed);
+        if preinit_events + cap_events > 0 {
+            tracing::warn!(
+                event_type = "telemetry_dropped",
+                dropped_events = preinit_events + cap_events,
+                dropped_bytes = preinit_bytes + cap_bytes,
+                dropped_events_preinit_cap = preinit_events,
+                dropped_bytes_preinit_cap = preinit_bytes,
+                dropped_events_buffer_cap = cap_events,
+                dropped_bytes_buffer_cap = cap_bytes,
+                "telemetry events were lost (see reason totals; \
+                 preinit_cap bytes are a mean-line-size estimate)"
+            );
+        }
+    }
+
+    /// Record a WAL write failure: scrapeable counter plus rate-limited
+    /// stderr (the independent last-resort channel while self-ingestion
+    /// is unavailable). MUST NOT use tracing — see the module docs.
+    fn record_write_failure(&self, e: &std::io::Error) {
+        metrics::counter!(crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL).increment(1);
+        let mut last = self.last_stderr.lock();
+        let due = last.is_none_or(|t| t.elapsed() >= Duration::from_mins(1));
+        if due {
+            eprintln!("[trawl-telemetry] WAL write failed (batch retained for retry): {e}");
+            *last = Some(Instant::now());
+        }
+    }
+
+    /// Refresh the retry-queue depth gauges (per flush cycle).
+    #[allow(clippy::cast_precision_loss)]
+    fn update_gauges(&self) {
+        let (events, bytes) = {
+            let pending = self.pending.lock();
+            (
+                pending.iter().map(|b| b.events.len()).sum::<usize>(),
+                pending.iter().map(batch_charge).sum::<usize>(),
+            )
+        };
+        metrics::gauge!(crate::metrics::TELEMETRY_BUFFER_EVENTS).set(events as f64);
+        metrics::gauge!(crate::metrics::TELEMETRY_BUFFER_BYTES).set(bytes as f64);
     }
 }
 
@@ -402,9 +638,40 @@ where
         // Pre-init cap: if the writer isn't set yet and the buffer is
         // already over 1 MiB, drop this event to prevent unbounded growth
         // (e.g. if telemetry is disabled and the writer is never injected).
+        // The drop is counted: event count exact, bytes estimated from the
+        // mean buffered line size — it happens before serialization and
+        // the telemetry-disabled path must stay cheap.
         const PRE_INIT_CAP: usize = 1024 * 1024;
-        if self.inner.handle.get().is_none() && self.inner.buffer.lock().len() >= PRE_INIT_CAP {
-            return;
+        if self.inner.handle.get().is_none() {
+            let estimate = {
+                let active = self.inner.active.lock();
+                if active.bytes.len() < PRE_INIT_CAP {
+                    None
+                } else {
+                    Some((active.bytes.len() / active.events.len().max(1)) as u64)
+                }
+            };
+            if let Some(mean_line_bytes) = estimate {
+                self.inner
+                    .dropped
+                    .preinit_events
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .dropped
+                    .preinit_bytes
+                    .fetch_add(mean_line_bytes, Ordering::Relaxed);
+                metrics::counter!(
+                    crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
+                    "reason" => "preinit_cap"
+                )
+                .increment(1);
+                metrics::counter!(
+                    crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
+                    "reason" => "preinit_cap"
+                )
+                .increment(mean_line_bytes);
+                return;
+            }
         }
 
         // Collect event-level fields.
@@ -469,15 +736,17 @@ where
         let raw = serde_json::Value::Object(record.clone()).to_string();
         record.insert("_raw".into(), json!(raw));
 
-        // Clone the map for event bus publishing (before moving into Value).
-        self.inner.event_maps.lock().push(record.clone());
-
-        // Serialize and buffer. serde_json::to_vec on Value cannot fail.
-        let mut line = serde_json::to_vec(&serde_json::Value::Object(record))
+        // Serialize, then push bytes and map under ONE lock so the two
+        // representations of the active buffer can never skew (a stage
+        // between the two pushes would publish a map whose bytes never
+        // reached the WAL). serde_json::to_vec on Value cannot fail.
+        let mut line = serde_json::to_vec(&serde_json::Value::Object(record.clone()))
             .expect("JSON serialization of Value is infallible");
         line.push(b'\n');
 
-        self.inner.buffer.lock().extend_from_slice(&line);
+        let mut active = self.inner.active.lock();
+        active.bytes.extend_from_slice(&line);
+        active.events.push(record);
     }
 }
 
@@ -518,11 +787,17 @@ fn message_to_event_type(message: &str) -> String {
 // Flush task
 // ---------------------------------------------------------------------------
 
+/// Wall-clock budget for the final shutdown flush. The timeout abandons
+/// the await, not the blocking thread — a wedged fsync leaves one
+/// lingering blocking thread at process exit rather than hanging shutdown.
+const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
+
 /// Spawn the periodic buffer flush task.
 ///
-/// Flushes every `interval` to batch WAL writes. Returns a [`JoinHandle`]
+/// Flushes every `interval` to batch WAL writes, with the write itself on
+/// the blocking pool ([`WalLayer::flush_cycle`]). Returns a [`JoinHandle`]
 /// for shutdown coordination. Send `true` on `shutdown_rx` to trigger a
-/// final flush and exit.
+/// final bounded flush and exit.
 pub fn spawn_flush_task(
     layer: WalLayer,
     interval: Duration,
@@ -532,10 +807,10 @@ pub fn spawn_flush_task(
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    layer.flush();
+                    layer.flush_cycle().await;
                 }
                 _ = shutdown_rx.changed() => {
-                    layer.flush();
+                    let _ = tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, layer.flush_cycle()).await;
                     break;
                 }
             }
@@ -700,11 +975,11 @@ mod tests {
 
         // Emit event before writer is available — should be buffered.
         tracing::info!(event_type = "bootstrap", "pre-init event");
-        assert!(!layer_ref.inner.buffer.lock().is_empty());
+        assert!(!layer_ref.inner.active.lock().bytes.is_empty());
 
         // Flush without writer — buffer should be retained (not drained).
         layer_ref.flush();
-        assert!(!layer_ref.inner.buffer.lock().is_empty());
+        assert!(!layer_ref.inner.active.lock().bytes.is_empty());
 
         // Now inject the writer and flush — buffer should drain.
         let tmp = tempfile::tempdir().unwrap();
@@ -713,7 +988,7 @@ mod tests {
         handle.set(Arc::clone(&writer), "prod");
 
         layer_ref.flush();
-        assert!(layer_ref.inner.buffer.lock().is_empty());
+        assert!(layer_ref.inner.active.lock().bytes.is_empty());
 
         // Verify the bootstrap event reached the WAL.
         let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
@@ -794,11 +1069,11 @@ mod tests {
         );
 
         // Buffer should have data now.
-        assert!(!layer_ref.inner.buffer.lock().is_empty());
+        assert!(!layer_ref.inner.active.lock().bytes.is_empty());
 
         // Flush to WAL.
         layer_ref.flush();
-        assert!(layer_ref.inner.buffer.lock().is_empty());
+        assert!(layer_ref.inner.active.lock().bytes.is_empty());
 
         // Verify WAL file was written.
         let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
@@ -954,6 +1229,331 @@ mod tests {
 
         assert_eq!(parsed["event_type"], "custom_type");
         assert_eq!(parsed["message"], "some random message");
+    }
+
+    // -- bounded retry queue (issue #56 F2/F3) ------------------------------
+
+    /// A WAL root that is a FILE makes every write fail (`create_dir_all`
+    /// of `wal_root/{env}` errors), simulating a broken volume that can be
+    /// repaired by replacing the file with a directory.
+    fn broken_wal_root(tmp: &std::path::Path) -> PathBuf {
+        let root = tmp.join("wal");
+        std::fs::write(&root, b"not a directory").unwrap();
+        root
+    }
+
+    fn repair_wal_root(root: &std::path::Path) {
+        std::fs::remove_file(root).unwrap();
+        std::fs::create_dir_all(root).unwrap();
+    }
+
+    fn read_wal_events(env_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut files: Vec<_> = std::fs::read_dir(env_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        // WAL filenames embed unix millis but same-millisecond writes tie;
+        // mtime has nanosecond resolution and each write fsyncs, so it
+        // reflects write order.
+        files.sort_by_key(|p| std::fs::metadata(p).unwrap().modified().unwrap());
+        files
+            .iter()
+            .flat_map(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn wal_failure_retains_batch_then_publishes_exactly_once_after_retry() {
+        use crate::bus::{EventBus, EventSubscriber, LocalEventBus};
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = broken_wal_root(tmp.path());
+        let writer = Arc::new(WalWriter::new(wal_root.clone()));
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+
+        let bus = Arc::new(LocalEventBus::new(16));
+        let mut sub = bus.subscribe();
+        let hot = Arc::new(crate::hot_buffer::HotBuffer::new(
+            crate::hot_buffer::HotBufferConfig {
+                max_events: 1000,
+                max_bytes: 1024 * 1024,
+            },
+        ));
+
+        let layer = WalLayer::new(handle, "prod");
+        layer.set_bus(Arc::clone(&bus));
+        layer.set_hot_buffer(Arc::clone(&hot));
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!(event_type = "retry_test", "event before outage");
+
+        // Write fails: the batch must be RETAINED, and nothing published.
+        layer_ref.flush_cycle().await;
+        assert_eq!(
+            hot.event_count(),
+            0,
+            "no hot-buffer insert before durability"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "no bus publish before durability"
+        );
+        assert_eq!(
+            layer_ref.inner.pending.lock().len(),
+            1,
+            "failed batch retained for retry"
+        );
+
+        // Repair the volume, retry WITHOUT emitting new events.
+        repair_wal_root(&wal_root);
+        layer_ref.flush_cycle().await;
+
+        // Durable now: published exactly once.
+        let batch = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("timed out waiting for batch")
+            .expect("recv failed");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0]["event_type"], "retry_test");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "batch published exactly once"
+        );
+        assert_eq!(
+            hot.event_count(),
+            1,
+            "hot buffer got the batch exactly once"
+        );
+        assert!(layer_ref.inner.pending.lock().is_empty());
+
+        let events = read_wal_events(&wal_root.join("prod"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "retry_test");
+    }
+
+    #[tokio::test]
+    async fn prolonged_failure_drops_oldest_batches_at_cap_with_exact_accounting() {
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = broken_wal_root(tmp.path());
+        let writer = Arc::new(WalWriter::new(wal_root.clone()));
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+
+        let layer = WalLayer::new(handle, "prod");
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Three flush cycles against a broken volume → three pending batches.
+        tracing::info!(event_type = "batch_a", "first");
+        layer_ref.flush_cycle().await;
+        tracing::info!(event_type = "batch_b", "second");
+        layer_ref.flush_cycle().await;
+
+        // Cap: exactly what A+B charge — staging C must evict A alone.
+        let (a_bytes, cap) = {
+            let pending = layer_ref.inner.pending.lock();
+            assert_eq!(pending.len(), 2);
+            (
+                pending[0].bytes.len() as u64,
+                pending.iter().map(batch_charge).sum::<usize>(),
+            )
+        };
+        layer_ref
+            .inner
+            .max_pending_bytes
+            .store(cap, Ordering::Relaxed);
+
+        tracing::info!(event_type = "batch_c", "third");
+        layer_ref.flush_cycle().await;
+
+        {
+            let pending = layer_ref.inner.pending.lock();
+            assert_eq!(pending.len(), 2, "oldest batch dropped at cap");
+        }
+        assert_eq!(
+            layer_ref.inner.dropped.cap_events.load(Ordering::Relaxed),
+            1,
+            "exact dropped event count"
+        );
+        assert_eq!(
+            layer_ref.inner.dropped.cap_bytes.load(Ordering::Relaxed),
+            a_bytes,
+            "exact dropped byte total"
+        );
+
+        // Repair; survivors drain in FIFO order. The recovery record is
+        // emitted during the draining cycle but — flush-path tracing may
+        // only BUFFER — reaches the WAL on the cycle after it.
+        repair_wal_root(&wal_root);
+        layer_ref.flush_cycle().await;
+        assert!(layer_ref.inner.pending.lock().is_empty());
+        layer_ref.flush_cycle().await;
+
+        let events = read_wal_events(&wal_root.join("prod"));
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["event_type"].as_str())
+            .filter(|t| t.starts_with("batch_"))
+            .collect();
+        assert_eq!(types, vec!["batch_b", "batch_c"], "FIFO order of survivors");
+
+        // The recovery record carries counts and per-reason totals.
+        let dropped_report: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "telemetry_dropped")
+            .collect();
+        assert_eq!(dropped_report.len(), 1, "one recovery event: {events:?}");
+        assert_eq!(dropped_report[0]["dropped_events"], 1);
+        assert_eq!(dropped_report[0]["dropped_events_buffer_cap"], 1);
+        assert_eq!(dropped_report[0]["dropped_bytes_buffer_cap"], a_bytes);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_with_failing_writer_exits_within_budget() {
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = broken_wal_root(tmp.path());
+        let writer = Arc::new(WalWriter::new(wal_root));
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+
+        let layer = WalLayer::new(handle, "prod");
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer_ref);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!(event_type = "shutdown_test", "buffered event");
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let join = spawn_flush_task(layer, Duration::from_hours(1), shutdown_rx);
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(30), join)
+            .await
+            .expect("flush task must exit within the shutdown budget")
+            .expect("flush task panicked");
+    }
+
+    #[tokio::test]
+    async fn telemetry_metrics_series_are_exposed() {
+        use tracing_subscriber::prelude::*;
+
+        let recorder_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .install_recorder()
+            .expect("install test recorder");
+        crate::metrics::describe_metrics();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = broken_wal_root(tmp.path());
+        let writer = Arc::new(WalWriter::new(wal_root));
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+
+        let layer = WalLayer::new(handle, "prod");
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // One failed write, then force a buffer_cap drop.
+        tracing::info!(event_type = "m1", "first");
+        layer_ref.flush_cycle().await;
+        tracing::info!(event_type = "m2", "second");
+        layer_ref.flush_cycle().await;
+        layer_ref
+            .inner
+            .max_pending_bytes
+            .store(1, Ordering::Relaxed);
+        tracing::info!(event_type = "m3", "third");
+        layer_ref.flush_cycle().await;
+
+        let rendered = recorder_handle.render();
+        assert!(
+            rendered.contains("trawl_telemetry_wal_write_failures_total"),
+            "missing failure counter: {rendered}"
+        );
+        assert!(
+            rendered.contains("trawl_telemetry_events_dropped_total{reason=\"buffer_cap\"}"),
+            "missing events-dropped counter: {rendered}"
+        );
+        assert!(
+            rendered.contains("trawl_telemetry_bytes_dropped_total{reason=\"buffer_cap\"}"),
+            "missing bytes-dropped counter: {rendered}"
+        );
+        assert!(
+            rendered.contains("trawl_telemetry_buffer_events"),
+            "missing buffer-events gauge: {rendered}"
+        );
+        assert!(
+            rendered.contains("trawl_telemetry_buffer_bytes"),
+            "missing buffer-bytes gauge: {rendered}"
+        );
+    }
+
+    #[test]
+    fn preinit_cap_drops_are_counted() {
+        use tracing_subscriber::prelude::*;
+
+        // Writer never set: the pre-init cap must drop events once the
+        // active buffer exceeds 1 MiB, and count them (bytes best-estimate).
+        let handle = WalHandle::new();
+        let layer = WalLayer::new(handle, "prod");
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let filler = "x".repeat(16 * 1024);
+        for _ in 0..80 {
+            tracing::info!(event_type = "spam", payload = %filler, "fill");
+        }
+        assert!(
+            layer_ref
+                .inner
+                .dropped
+                .preinit_events
+                .load(Ordering::Relaxed)
+                > 0,
+            "pre-init cap drops must be counted"
+        );
+        assert!(
+            layer_ref
+                .inner
+                .dropped
+                .preinit_bytes
+                .load(Ordering::Relaxed)
+                > 0,
+            "pre-init cap byte estimate must be non-zero"
+        );
     }
 
     #[tokio::test]
