@@ -71,13 +71,15 @@ pub enum StreamEvent {
 // -- re-exports from trawl-api -----------------------------------------------
 
 pub use trawl_api::{
-    ActiveQuerySnapshot, CancelResponse, CompletedQuerySnapshot, CreateSavedRequest,
-    DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, ErrorCode, ErrorDetail,
-    ErrorEnvelope, ErrorResponse, ErrorSpan, ExportFormat, ExportRequest, FieldValuesResponse,
-    GlobalRunSummary, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
-    IngestEventError, IngestResponse, ListAllRunsResponse, ListReportRunsResponse,
-    ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest, QueryResponse, QueryStatus,
-    ReportRunResponse, ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
-    SchemaColumnResponse, SchemaResponse, ServiceColumnStats, ServiceSchema, ServiceSchemaResponse,
-    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    ActiveQuerySnapshot, CancelResponse, CatalogConflictRow, CatalogConflictsResponse,
+    CatalogFieldResponse, CatalogFieldServiceRow, CatalogFieldSummary, CatalogFieldsResponse,
+    CompletedQuerySnapshot, CreateSavedRequest, DashboardSnapshot, DeleteSavedResponse,
+    DeleteScheduleResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse, ErrorSpan,
+    ExportFormat, ExportRequest, FieldValuesResponse, GlobalRunSummary, HealthResponse,
+    HealthStatus, HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse,
+    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta,
+    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary,
+    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
+    ServiceColumnStats, ServiceSchema, ServiceSchemaResponse, SetScheduleRequest, StatsResponse,
+    UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };

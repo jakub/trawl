@@ -12,11 +12,12 @@ use zeroize::Zeroizing;
 
 use crate::error::ClientError;
 use crate::types::{
-    CancelResponse, DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse,
-    FieldValuesResponse, HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse,
-    ListReportRunsResponse, ListSavedResponse, QueriesResponse, QueryResponse, ReportRunResponse,
-    ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse,
-    ServiceSchemaResponse, StatsResponse, ValidationResponse, WhoAmIResponse,
+    CancelResponse, CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse,
+    DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldValuesResponse,
+    HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse, ListReportRunsResponse,
+    ListSavedResponse, QueriesResponse, QueryResponse, ReportRunResponse, ReportRunSummary,
+    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse, ServiceSchemaResponse,
+    StatsResponse, ValidationResponse, WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
@@ -372,6 +373,66 @@ impl HttpClient {
     pub async fn dashboard(&self) -> Result<DashboardSnapshot, ClientError> {
         let url = self.endpoint("/api/v1/dashboard");
         let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// List pinned fields with aggregates (`GET /api/v1/schema/fields`).
+    ///
+    /// `since_secs` windows on the last observation; `limit` is clamped
+    /// server-side.
+    pub async fn catalog_fields(
+        &self,
+        service: Option<&str>,
+        since_secs: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<CatalogFieldsResponse, ClientError> {
+        let url = self.endpoint("/api/v1/schema/fields");
+        let mut req = self.client.get(&url);
+        if let Some(svc) = service {
+            req = req.query(&[("service", svc)]);
+        }
+        if let Some(s) = since_secs {
+            req = req.query(&[("since_secs", s.to_string())]);
+        }
+        if let Some(l) = limit {
+            req = req.query(&[("limit", l.to_string())]);
+        }
+        self.send_authenticated(req).await
+    }
+
+    /// Fetch one field's pin, observations, and conflict evidence
+    /// (`GET /api/v1/schema/field?name=`).
+    ///
+    /// The name travels as a query parameter — `req.query` percent-encodes
+    /// it, so names containing `/`, `?`, or `%` survive intact.
+    pub async fn catalog_field(&self, name: &str) -> Result<CatalogFieldResponse, ClientError> {
+        let url = self.endpoint("/api/v1/schema/field");
+        let req = self.client.get(&url).query(&[("name", name)]);
+        self.send_authenticated(req).await
+    }
+
+    /// List recent type conflicts (`GET /api/v1/schema/conflicts`).
+    pub async fn catalog_conflicts(
+        &self,
+        field: Option<&str>,
+        service: Option<&str>,
+        since_secs: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<CatalogConflictsResponse, ClientError> {
+        let url = self.endpoint("/api/v1/schema/conflicts");
+        let mut req = self.client.get(&url);
+        if let Some(f) = field {
+            req = req.query(&[("field", f)]);
+        }
+        if let Some(svc) = service {
+            req = req.query(&[("service", svc)]);
+        }
+        if let Some(s) = since_secs {
+            req = req.query(&[("since_secs", s.to_string())]);
+        }
+        if let Some(l) = limit {
+            req = req.query(&[("limit", l.to_string())]);
+        }
         self.send_authenticated(req).await
     }
 

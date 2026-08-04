@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 
 mod cli;
 mod config;
+mod schema;
 mod tui;
 
 /// trawl — search your logs with a pipeline DSL.
@@ -74,6 +75,12 @@ enum Command {
         query: String,
     },
 
+    /// Inspect the field catalog (pinned types, observations, conflicts).
+    Schema {
+        #[command(subcommand)]
+        cmd: SchemaSubcommand,
+    },
+
     /// Control a running TUI via driver socket.
     Driver {
         /// Path to the driver unix socket.
@@ -82,6 +89,66 @@ enum Command {
 
         #[command(subcommand)]
         cmd: DriverSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchemaSubcommand {
+    /// List pinned fields with types, observations, and conflict counts.
+    Fields {
+        /// Only fields observed for this service.
+        #[arg(long)]
+        service: Option<String>,
+
+        /// Only fields observed within this window (e.g. "24h", "7d").
+        #[arg(long)]
+        last: Option<String>,
+
+        /// Maximum fields to list (server clamps to the pin cap).
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Parquet glob for embedded mode (names + physical types only,
+        /// no server needed).
+        #[arg(long)]
+        data: Option<String>,
+
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
+
+    /// Show one field's pin, per-service observations, and conflicts.
+    Field {
+        /// Field name (folded to the catalog's ASCII-lowercase spelling).
+        name: String,
+
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
+
+    /// List recent type conflicts (schema-health dashboard).
+    Conflicts {
+        /// Only conflicts for this field.
+        #[arg(long)]
+        field: Option<String>,
+
+        /// Only conflicts from this service.
+        #[arg(long)]
+        service: Option<String>,
+
+        /// Only conflicts recorded within this window (e.g. "7d").
+        #[arg(long)]
+        last: Option<String>,
+
+        /// Maximum rows to list (server clamps at 1000).
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
     },
 }
 
@@ -260,12 +327,74 @@ async fn run(args: Cli) -> Result<(), CliError> {
             cli::run_validate(&query, conn).await?;
         }
 
+        Some(Command::Schema { cmd }) => {
+            run_schema(cmd, &cfg, args.token.as_deref()).await?;
+        }
+
         Some(Command::Driver { socket, cmd }) => {
             run_driver(&socket, cmd).await?;
         }
     }
 
     Ok(())
+}
+
+/// Dispatch `trawl schema <cmd>`. Connection resolution mirrors `validate`:
+/// embedded `--data` needs no server, everything else does.
+async fn run_schema(
+    cmd: SchemaSubcommand,
+    cfg: &config::Config,
+    token: Option<&str>,
+) -> Result<(), CliError> {
+    let conn = |token: Option<&str>| -> Option<cli::ConnectionParams> {
+        cfg.load_token(token)
+            .ok()
+            .map(|token| cli::ConnectionParams {
+                url: cfg.server.url.clone(),
+                token,
+                insecure: cfg.server.insecure,
+            })
+    };
+    match cmd {
+        SchemaSubcommand::Fields {
+            service,
+            last,
+            limit,
+            data,
+            format,
+        } => {
+            let conn = if data.is_some() { None } else { conn(token) };
+            schema::run_fields(
+                conn,
+                data.as_deref(),
+                service.as_deref(),
+                last.as_deref(),
+                limit,
+                format,
+            )
+            .await
+        }
+        SchemaSubcommand::Field { name, format } => {
+            schema::run_field(conn(token), &name, format).await
+        }
+        SchemaSubcommand::Conflicts {
+            field,
+            service,
+            last,
+            limit,
+            format,
+        } => {
+            schema::run_conflicts(
+                conn(token),
+                field.as_deref(),
+                service.as_deref(),
+                last.as_deref(),
+                limit,
+                format,
+            )
+            .await
+        }
+    }
 }
 
 async fn run_driver(socket: &str, cmd: DriverSubcommand) -> Result<(), CliError> {
