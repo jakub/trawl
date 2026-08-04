@@ -1083,6 +1083,7 @@ mod boot {
             service: Some(service.to_owned()),
             since: None,
             limit: 100,
+            with_conflicts: true,
         };
         let (rows, _) = store.list_fields(&by_service("svc-a")).await.unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r.field.as_str()).collect();
@@ -1119,6 +1120,7 @@ mod boot {
                         .into(),
                 ),
                 limit: 100,
+                with_conflicts: true,
             })
             .await
             .unwrap();

@@ -583,6 +583,10 @@ async fn catalog_schema_columns(
     let filter = crate::store::FieldListFilter {
         service,
         since,
+        // Names and types only — never pay for the conflict evidence on the
+        // endpoint autocomplete polls (and whose `?service=` form is
+        // deliberately uncached).
+        with_conflicts: false,
         ..Default::default()
     };
     let (fields, _truncated) = state.storage.catalog.list_fields(&filter).await?;
@@ -992,6 +996,9 @@ pub async fn catalog_fields(
         service: params.service.clone(),
         since: since_from_secs(params.since_secs),
         limit,
+        // This listing IS the conflict evidence surface, and the second
+        // query it costs is keyed on the page `limit` bounds.
+        with_conflicts: true,
     };
     let (mut rows, truncated) = state.storage.catalog.list_fields(&filter).await?;
     let (pinned_total, pin_capacity) = state.storage.catalog.pin_stats().await?;

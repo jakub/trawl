@@ -159,6 +159,11 @@ pub struct FieldListFilter {
     pub since: Option<DateTime<Utc>>,
     /// Maximum rows returned (the caller clamps; see the route handlers).
     pub limit: i64,
+    /// Fetch the per-field conflict evidence (`conflict_count`,
+    /// `rows_nulled`). Costs a second, page-scoped query against
+    /// `field_conflicts`; callers that only want names and types
+    /// (`/api/v1/schema`) set this `false` and read zeroes.
+    pub with_conflicts: bool,
 }
 
 impl Default for FieldListFilter {
@@ -167,6 +172,7 @@ impl Default for FieldListFilter {
             service: None,
             since: None,
             limit: MAX_PINNED_FIELDS,
+            with_conflicts: true,
         }
     }
 }
@@ -901,11 +907,11 @@ impl CatalogStore {
     /// List pins with their aggregated observation and conflict evidence —
     /// the read model behind `/api/v1/schema` and `/api/v1/schema/fields`.
     ///
-    /// One query: `field_types` LEFT JOIN grouped `field_services` LEFT
-    /// JOIN grouped `field_conflicts`. LEFT joins are load-bearing: a pin
-    /// with no observations (the envelope seed on a fresh install, or a
-    /// boot-pass pin over standing parquet) must always appear — windowing
-    /// only hides fields whose evidence says they aged out.
+    /// The pin page is one query: `field_types` LEFT JOIN grouped
+    /// `field_services`. The LEFT join is load-bearing: a pin with no
+    /// observations (the envelope seed on a fresh install, or a boot-pass
+    /// pin over standing parquet) must always appear — windowing only hides
+    /// fields whose evidence says they aged out.
     ///
     /// `filter.service` scopes the AGGREGATE, not just the row set: the
     /// predicate goes INSIDE the `field_services` grouping, so a scoped
@@ -916,6 +922,18 @@ impl CatalogStore {
     /// window because somebody ELSE still sends it. The `EXISTS` stays as
     /// the presence test — a pin the service never carried has no group
     /// row, and the never-observed rule would otherwise show it.
+    ///
+    /// The conflict evidence is a SECOND query, keyed on the field names
+    /// this page actually returned, and skipped entirely when
+    /// `filter.with_conflicts` is false. Joining a grouped
+    /// `SELECT ... FROM field_conflicts GROUP BY field` instead carried no
+    /// predicate a planner could push down, so every call — including the
+    /// deliberately uncached `?service=` one — materialised an aggregate
+    /// over the whole table, which is bounded only by
+    /// [`MAX_CONFLICTS_PER_FIELD`] x [`MAX_PINNED_FIELDS`] and not by the
+    /// pin cap the scoped listing promises. Keyed on the page it rides
+    /// 0002's `(field, at DESC)` index and reads at most
+    /// `limit` x [`MAX_CONFLICTS_PER_FIELD`] rows.
     ///
     /// Returns `(rows, truncated)`; `truncated` is set when more rows
     /// matched than `filter.limit` allowed back.
@@ -928,9 +946,7 @@ impl CatalogStore {
             "SELECT t.field, t.duckdb_type, t.pinned_from, t.pinned_at,
                     COALESCE(s.service_count, 0)::bigint AS service_count,
                     COALESCE(s.row_count, 0)::bigint     AS row_count,
-                    s.first_seen, s.last_seen,
-                    COALESCE(c.conflict_count, 0)::bigint AS conflict_count,
-                    COALESCE(c.rows_nulled, 0)::bigint    AS rows_nulled
+                    s.first_seen, s.last_seen
              FROM field_types t
              LEFT JOIN (
                  SELECT field, count(*) AS service_count, sum(row_count) AS row_count,
@@ -939,10 +955,6 @@ impl CatalogStore {
                  WHERE ($1::text IS NULL OR service = $1)
                  GROUP BY field
              ) s ON s.field = t.field
-             LEFT JOIN (
-                 SELECT field, count(*) AS conflict_count, sum(rows_nulled) AS rows_nulled
-                 FROM field_conflicts GROUP BY field
-             ) c ON c.field = t.field
              WHERE ($1::text IS NULL OR EXISTS (
                         SELECT 1 FROM field_services fs
                         WHERE fs.field = t.field AND fs.service = $1))
@@ -961,7 +973,8 @@ impl CatalogStore {
 
         let truncated = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
         let take = usize::try_from(limit).unwrap_or(usize::MAX);
-        rows.iter()
+        let mut summaries = rows
+            .iter()
             .take(take)
             .map(|row| {
                 Ok(FieldSummaryRow {
@@ -973,13 +986,45 @@ impl CatalogStore {
                     row_count: row.try_get("row_count")?,
                     first_seen: row.try_get("first_seen")?,
                     last_seen: row.try_get("last_seen")?,
-                    conflict_count: row.try_get("conflict_count")?,
-                    rows_nulled: row.try_get("rows_nulled")?,
+                    conflict_count: 0,
+                    rows_nulled: 0,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map(|rows| (rows, truncated))
-            .map_err(StoreError::from)
+            .map_err(StoreError::from)?;
+
+        if filter.with_conflicts && !summaries.is_empty() {
+            let names: Vec<String> = summaries.iter().map(|r| r.field.clone()).collect();
+            let evidence = sqlx::query(
+                "SELECT field,
+                        count(*)::bigint                    AS conflict_count,
+                        COALESCE(sum(rows_nulled), 0)::bigint AS rows_nulled
+                 FROM field_conflicts
+                 WHERE field = ANY($1)
+                 GROUP BY field",
+            )
+            .bind(&names)
+            .fetch_all(&self.pool)
+            .await?;
+            let by_field: HashMap<String, (i64, i64)> = evidence
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get("field")?,
+                        (row.try_get("conflict_count")?, row.try_get("rows_nulled")?),
+                    ))
+                })
+                .collect::<Result<_, sqlx::Error>>()
+                .map_err(StoreError::from)?;
+            for summary in &mut summaries {
+                if let Some(&(conflict_count, rows_nulled)) = by_field.get(&summary.field) {
+                    summary.conflict_count = conflict_count;
+                    summary.rows_nulled = rows_nulled;
+                }
+            }
+        }
+
+        Ok((summaries, truncated))
     }
 
     /// The catalog's fill level: `(pinned, capacity)` — the same pair the

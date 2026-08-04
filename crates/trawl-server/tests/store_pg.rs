@@ -1971,6 +1971,101 @@ mod catalog {
         assert_eq!(rows.len(), ENVELOPE_TYPES.len() + 2);
     }
 
+    /// `/api/v1/schema` wants names and types only. It must not pay for the
+    /// conflict evidence — the columns-only listing reads zeroes and skips
+    /// the `field_conflicts` query entirely.
+    #[sqlx::test]
+    async fn list_fields_without_conflicts_reads_zeroes(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[proposal("duration", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        store
+            .touch_services("svc-a", &["duration".to_owned()], 3)
+            .await
+            .unwrap();
+        store
+            .record_conflicts(&[FieldConflict {
+                field: "duration".to_owned(),
+                service: "svc-a".to_owned(),
+                observed_type: "VARCHAR".to_owned(),
+                expected_type: CanonicalType::BigInt,
+                rows_nulled: 7,
+            }])
+            .await
+            .unwrap();
+
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                with_conflicts: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let duration = rows.iter().find(|r| r.field == "duration").unwrap();
+        assert_eq!(duration.duckdb_type, "BIGINT");
+        assert_eq!(duration.row_count, 3, "observation aggregates still land");
+        assert_eq!(duration.conflict_count, 0, "evidence not requested");
+        assert_eq!(duration.rows_nulled, 0, "evidence not requested");
+
+        // The same filter WITH the evidence sees it — proving the zeroes
+        // above are the skip, not a missing conflict row.
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter::default())
+            .await
+            .unwrap();
+        let duration = rows.iter().find(|r| r.field == "duration").unwrap();
+        assert_eq!(duration.conflict_count, 1);
+        assert_eq!(duration.rows_nulled, 7);
+    }
+
+    /// The evidence query is keyed on the page the pin listing returned, so
+    /// a conflict on a field the page truncated away is never read.
+    #[sqlx::test]
+    async fn list_fields_conflict_evidence_is_page_scoped(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[
+                proposal("aaa", CanonicalType::BigInt),
+                proposal("zzz", CanonicalType::BigInt),
+            ])
+            .await
+            .unwrap();
+        store
+            .touch_services("svc-a", &["aaa".to_owned(), "zzz".to_owned()], 1)
+            .await
+            .unwrap();
+        store
+            .record_conflicts(&[FieldConflict {
+                field: "zzz".to_owned(),
+                service: "svc-a".to_owned(),
+                observed_type: "VARCHAR".to_owned(),
+                expected_type: CanonicalType::BigInt,
+                rows_nulled: 4,
+            }])
+            .await
+            .unwrap();
+
+        // Scoped to svc-a the candidates are exactly `aaa` and `zzz`, so a
+        // one-row page holds `aaa` and cannot contain `zzz`.
+        let scoped = |limit: i64| trawl_server::store::FieldListFilter {
+            service: Some("svc-a".to_owned()),
+            limit,
+            ..Default::default()
+        };
+        let (rows, truncated) = store.list_fields(&scoped(1)).await.unwrap();
+        assert!(truncated);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].field, "aaa");
+        assert_eq!(rows[0].conflict_count, 0);
+
+        let (rows, _) = store.list_fields(&scoped(10)).await.unwrap();
+        let zzz = rows.iter().find(|r| r.field == "zzz").unwrap();
+        assert_eq!(zzz.conflict_count, 1, "the full page still sees it");
+        assert_eq!(zzz.rows_nulled, 4);
+    }
+
     #[sqlx::test]
     async fn list_fields_service_filter_via_observations(pool: PgPool) {
         let store = catalog(&pool);
