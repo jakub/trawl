@@ -188,6 +188,20 @@ async fn hydrate(
     Ok(pins)
 }
 
+/// What the dual-sided marker proved about the archive a query-only node is
+/// about to serve. Every variant boots; the refusal is an `Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveIdentity {
+    /// `data/{CATALOG_MARKER}` names the catalog this node is connected to.
+    Proven,
+    /// The archive positively holds no parquet — a cold start, with no
+    /// schema to get wrong.
+    Empty,
+    /// The archive holds parquet and carries no marker at all: nothing
+    /// proves it is this catalog's, and nothing proves it is not.
+    Unproven,
+}
+
 /// Query-only boot gate: prove the standing archive was written by the
 /// catalog this node is connected to.
 ///
@@ -199,61 +213,75 @@ async fn hydrate(
 /// at a shared or read-only archive with a fresh `trawl` database and
 /// `/schema` advertises the seeded envelope while queries read entirely
 /// different physical columns. So the same dual-sided marker that lets the
-/// pass skip itself is checked here as a gate, and a mismatch refuses the
-/// boot rather than serving a schema about someone else's data.
+/// pass skip itself is checked here as a gate.
 ///
-/// Returns whether the marker proved the identity; `false` means the archive
-/// positively holds no parquet (a cold start — nothing there to misdescribe).
+/// The refusal is deliberately narrow: only a marker naming ANOTHER catalog
+/// is fatal, because only that is positive proof of the wrong pairing. A
+/// MISSING marker is not proof of anything — and it is an ordinary state,
+/// since [`publish_completion`] withholds the marker whenever the pass
+/// skipped a path (`catalog_conform_incomplete`; an operator's export
+/// subtree under the data root is enough), warns, and serves. Refusing the
+/// boot for that same corpus would make "disable ingest and restart to
+/// investigate" a startup failure curable only by re-enabling ingest, and
+/// would answer identical state with warn-and-serve on one node and
+/// fail-closed on the other. So an unmarked archive returns
+/// [`ArchiveIdentity::Unproven`] and the caller warns, exactly as the ingest
+/// node does.
+///
 /// Only the unproven path walks the tree, so a matching marker costs one
 /// `read_to_string`.
 pub async fn verify_archive_identity(
     store: &CatalogStore,
     data_dir: &Path,
-) -> Result<bool, String> {
+) -> Result<ArchiveIdentity, String> {
     let catalog_id = store
         .catalog_id()
         .await
         .map_err(|e| format!("failed to read catalog identity: {e}"))?;
     let marker = read_marker(data_dir);
     if marker.as_deref() == Some(catalog_id.as_str()) {
-        return Ok(true);
+        return Ok(ArchiveIdentity::Proven);
     }
-    if archive_is_empty(data_dir)? {
-        return Ok(false);
+    if archive_is_empty(data_dir) {
+        return Ok(ArchiveIdentity::Empty);
     }
-    Err(format!(
-        "the parquet archive at {} was not written by the catalog this node is \
-         connected to (data/{CATALOG_MARKER} = {}, catalog_state.catalog_id = \
-         {catalog_id}), so its columns are not the pins /api/v1/schema would \
-         advertise. Point the app database at the catalog that owns this \
-         archive, or boot once with [ingest] enabled = true to run the \
-         conformance pass and adopt it",
-        data_dir.display(),
-        marker.as_deref().unwrap_or("<absent>"),
-    ))
+    match marker {
+        Some(other) => Err(format!(
+            "the parquet archive at {} was written by a different catalog than \
+             the one this node is connected to (data/{CATALOG_MARKER} = \
+             {other}, catalog_state.catalog_id = {catalog_id}), so its columns \
+             are not the pins /api/v1/schema would advertise. Point the app \
+             database at the catalog that owns this archive, or boot once with \
+             [ingest] enabled = true to run the conformance pass and adopt it",
+            data_dir.display(),
+        )),
+        None => Ok(ArchiveIdentity::Unproven),
+    }
 }
 
 /// Whether the data root positively holds no parquet — the only state in
-/// which an unprovable identity is harmless.
+/// which an unprovable identity is provably harmless.
 ///
 /// A walk failure is NOT emptiness: the subtree it could not enumerate may
-/// hold the whole corpus, so it fails the gate exactly like a mismatched
-/// marker. Unlike the conformance pass — which isolates a bad path so one
-/// unreadable corner cannot keep an ingest node down — this gate has nothing
-/// to isolate: it is proving a negative, and an unread directory is no proof.
-fn archive_is_empty(data_dir: &Path) -> Result<bool, String> {
+/// hold the whole corpus, so it reads as standing data. That is conservative
+/// where it matters (a foreign marker still refuses) and costs nothing where
+/// it does not (an unmarked archive warns either way).
+fn archive_is_empty(data_dir: &Path) -> bool {
     if !data_dir.is_dir() {
-        return Ok(true);
+        return true;
     }
     let (files, errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
     if let Some((path, e)) = errors.into_iter().next() {
-        return Err(format!(
-            "cannot enumerate {} ({e}), so the archive cannot be proven empty and \
-             its identity cannot be proven either",
-            path.display()
-        ));
+        tracing::warn!(
+            event_type = "catalog_identity_walk_failed",
+            file = %path.display(),
+            error = %e,
+            "cannot enumerate the data root, so the archive cannot be proven \
+             empty; treating it as holding standing data"
+        );
+        return false;
     }
-    Ok(files.is_empty())
+    files.is_empty()
 }
 
 /// Run the boot conformance pass unless the dual-sided identity says it

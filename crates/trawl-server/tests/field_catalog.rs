@@ -1403,26 +1403,13 @@ mod boot {
     /// A query-only node (`[ingest] enabled = false`) never runs the pass,
     /// so nothing else proves the archive it serves came from the catalog it
     /// is connected to. `/api/v1/schema` answers from that catalog's pins, so
-    /// a fresh app database over a populated foreign archive would advertise
-    /// the seeded envelope while queries read entirely different physical
-    /// columns. The boot gate refuses instead — whether the marker is absent
-    /// (never conformed) or names another catalog (repointed database).
+    /// a repointed app database over a populated foreign archive would
+    /// advertise the seeded envelope while queries read entirely different
+    /// physical columns. A marker naming another catalog is positive proof of
+    /// that pairing, and the boot gate refuses it.
     #[sqlx::test]
     async fn query_only_boot_refuses_an_archive_from_another_catalog(pool: sqlx::PgPool) {
         let store = CatalogStore::new(pool.clone());
-
-        // Fresh app database (only the envelope seed pins), populated archive
-        // that no conformance pass ever adopted: no marker.
-        let unmarked = tempfile::tempdir().unwrap();
-        let unmarked_data = unmarked.path().join("data");
-        plant_disagreeing_corpus(&unmarked_data);
-        let err = conform::verify_archive_identity(&store, &unmarked_data)
-            .await
-            .expect_err("an unadopted archive must not be served as this catalog's schema");
-        assert!(
-            err.contains("was not written by the catalog") && err.contains("<absent>"),
-            "the refusal must name the missing marker: {err}"
-        );
 
         // Marker naming a different catalog (the app database was repointed,
         // or the data root was restored from another install's backup).
@@ -1443,6 +1430,51 @@ mod boot {
         );
     }
 
+    /// An archive with NO marker is not proof of a foreign catalog — it is
+    /// what an incomplete conformance pass leaves behind (any skipped path
+    /// withholds `data/CATALOG`), and an ingest node warns and serves it. The
+    /// query-only gate must answer that identical state the same way, or
+    /// "disable ingest and restart to investigate" becomes a startup failure
+    /// curable only by re-enabling ingest.
+    #[sqlx::test]
+    async fn query_only_boot_serves_an_unmarked_archive_unproven(pool: sqlx::PgPool) {
+        let store = CatalogStore::new(pool.clone());
+
+        let unmarked = tempfile::tempdir().unwrap();
+        let unmarked_data = unmarked.path().join("data");
+        plant_disagreeing_corpus(&unmarked_data);
+        assert_eq!(
+            conform::verify_archive_identity(&store, &unmarked_data)
+                .await
+                .expect("an unmarked archive must not refuse the boot"),
+            conform::ArchiveIdentity::Unproven,
+            "no marker means unproven, not foreign"
+        );
+
+        // The state a pass that skipped a path actually leaves: it ran, it
+        // rewrote what it owned, and it withheld the marker.
+        let cache = FieldCatalog::new();
+        let skipped = tempfile::tempdir().unwrap();
+        let skipped_data = skipped.path().join("data");
+        plant_disagreeing_corpus(&skipped_data);
+        std::fs::create_dir_all(skipped_data.join("exports")).unwrap();
+        std::fs::copy(
+            skipped_data.join("prod/2026-08-01/10/svc-a.parquet"),
+            skipped_data.join("exports/report.parquet"),
+        )
+        .unwrap();
+        let summary = conform::ensure_conformance(&store, &cache, &skipped_data, "2GB")
+            .await
+            .expect("an operator's export subtree is skipped, not fatal");
+        assert!(summary.skipped > 0 && !skipped_data.join("CATALOG").exists());
+        assert_eq!(
+            conform::verify_archive_identity(&store, &skipped_data)
+                .await
+                .expect("the same corpus must boot a query-only node too"),
+            conform::ArchiveIdentity::Unproven
+        );
+    }
+
     /// The gate is identity, not paranoia: an archive this catalog conformed
     /// passes, and so does a cold start with no parquet at all (there is no
     /// schema to get wrong).
@@ -1457,18 +1489,20 @@ mod boot {
         conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
             .await
             .expect("boot pass runs");
-        assert!(
+        assert_eq!(
             conform::verify_archive_identity(&store, &data_dir)
                 .await
                 .expect("an archive this catalog conformed must pass the gate"),
+            conform::ArchiveIdentity::Proven,
             "the published marker proves the identity"
         );
 
         let empty = tempfile::tempdir().unwrap();
-        assert!(
-            !conform::verify_archive_identity(&store, &empty.path().join("data"))
+        assert_eq!(
+            conform::verify_archive_identity(&store, &empty.path().join("data"))
                 .await
                 .expect("a cold start has no archive to misdescribe"),
+            conform::ArchiveIdentity::Empty,
             "an empty archive is unproven but harmless"
         );
     }
