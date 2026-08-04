@@ -80,6 +80,10 @@ trawl-server = { path = ".", default-features = false, features = ["test-support
 tokio = { workspace = true, features = ["test-util"] }
 fleet-auth = { workspace = true, features = ["axum", "fast-hash"] }
 trawl-client = { workspace = true }
+# The CLI's catalog read commands are driven against a real booted server in
+# `tests/catalog_surface.rs`. default-features = false for the same reason as
+# the self-dependency above (no `bundled` under --no-default-features).
+trawl-cli = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true }
 

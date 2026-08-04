@@ -512,6 +512,166 @@ async fn field_detail_pages_a_large_service_history(pool: sqlx::PgPool) {
     assert_eq!(status, 400);
 }
 
+/// Acceptance: the three `trawl schema` read commands render populated
+/// output against a seeded catalog.
+///
+/// This is the whole vertical, joined: `run_*` → the typed client's URL and
+/// query-param construction → the real routes → the real catalog → the
+/// shared driver renderer. The CLI's own unit tests cover the converters
+/// from synthetic structs; only this test proves the client actually asks
+/// the server the question the flags describe.
+#[sqlx::test(migrations = false)]
+async fn read_commands_render_populated_output(pool: sqlx::PgPool) {
+    use trawl_cli::cli::{ConnectionParams, OutputFormat};
+
+    let h = harness(pool).await;
+    // svc-a pins `duration` and `latency` BIGINT; svc-b's strings disagree,
+    // so the catalog carries two pins, two service observations each, and a
+    // conflict per field — two, so `--field` has something to exclude.
+    ingest_and_compact(
+        &h,
+        &[event("svc-a", &json!({"duration": 4200, "latency": 5}))],
+    )
+    .await;
+    ingest_and_compact(
+        &h,
+        &[event(
+            "svc-b",
+            &json!({"duration": "N/A", "latency": "slow"}),
+        )],
+    )
+    .await;
+
+    let conn = ConnectionParams {
+        url: h.server.url.clone(),
+        token: h.server.analyst_token.clone(),
+        insecure: true,
+    };
+
+    // `trawl schema fields --service svc-a --last 1h --limit 50`: every flag
+    // travels as a query param, so a mis-built URL shows up as empty output.
+    let mut out = Vec::new();
+    trawl_cli::schema::run_fields(
+        &mut out,
+        Some(conn.clone()),
+        None,
+        Some("svc-a"),
+        Some("1h"),
+        Some(50),
+        Some(OutputFormat::Table),
+    )
+    .await
+    .expect("schema fields");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains("duration"), "{text}");
+    assert!(text.contains("BIGINT"), "{text}");
+    assert!(
+        text.lines().any(|l| l.ends_with(" row(s)")) && !text.contains("\n0 row(s)"),
+        "the scoped listing is populated: {text}"
+    );
+
+    // The `--service` scope really reached the server: svc-b's rows are the
+    // only ones nulled, so svc-a's listing reports no conflict.
+    let mut out = Vec::new();
+    trawl_cli::schema::run_fields(
+        &mut out,
+        Some(conn.clone()),
+        None,
+        Some("nope"),
+        None,
+        None,
+        Some(OutputFormat::Json),
+    )
+    .await
+    .expect("schema fields --service nope");
+    assert!(
+        String::from_utf8(out).unwrap().trim().is_empty(),
+        "an unknown service scopes the listing to nothing"
+    );
+
+    // `trawl schema field DURATION` — the name folds server-side, the header
+    // block and BOTH tables (services, conflicts) render.
+    let mut out = Vec::new();
+    trawl_cli::schema::run_field(
+        &mut out,
+        Some(conn.clone()),
+        "DURATION",
+        Some(10),
+        None,
+        Some(OutputFormat::Table),
+    )
+    .await
+    .expect("schema field");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains("field:       duration"), "{text}");
+    assert!(text.contains("type:        BIGINT"), "{text}");
+    assert!(text.contains("svc-a") && text.contains("svc-b"), "{text}");
+    assert!(text.contains("recent conflicts:"), "{text}");
+    assert!(
+        text.contains("VARCHAR"),
+        "the observed type renders: {text}"
+    );
+
+    // `trawl schema conflicts --last 7d` as ndjson: both conflicts.
+    let mut out = Vec::new();
+    trawl_cli::schema::run_conflicts(
+        &mut out,
+        Some(conn.clone()),
+        None,
+        None,
+        Some("7d"),
+        Some(50),
+        Some(OutputFormat::Json),
+    )
+    .await
+    .expect("schema conflicts");
+    let fields = ndjson_field_names(&out);
+    assert!(fields.iter().any(|f| f == "duration"), "{fields:?}");
+    assert!(fields.iter().any(|f| f == "latency"), "{fields:?}");
+
+    // `--field duration` must reach the server as a query param: the same
+    // call with the filter drops `latency` and keeps the evidence populated.
+    let mut out = Vec::new();
+    trawl_cli::schema::run_conflicts(
+        &mut out,
+        Some(conn),
+        Some("duration"),
+        None,
+        Some("7d"),
+        Some(50),
+        Some(OutputFormat::Json),
+    )
+    .await
+    .expect("schema conflicts --field duration");
+    let text = String::from_utf8(out).expect("utf8");
+    let fields = ndjson_field_names(text.as_bytes());
+    assert_eq!(
+        fields,
+        vec!["duration"],
+        "the --field filter reached the server"
+    );
+    let row: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("at least one conflict row"))
+            .expect("ndjson row");
+    assert_eq!(row["service"], "svc-b");
+    assert_eq!(row["expected_type"], "BIGINT");
+    assert_eq!(row["rows_nulled"], 1);
+}
+
+/// The `field` column of every ndjson row the conflicts renderer emitted.
+fn ndjson_field_names(out: &[u8]) -> Vec<String> {
+    std::str::from_utf8(out)
+        .expect("utf8")
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).expect("ndjson row")["field"]
+                .as_str()
+                .expect("field column")
+                .to_owned()
+        })
+        .collect()
+}
+
 /// All three read routes gate on `schema_read`: a key without it is denied
 /// (401 insufficient-permissions per the handler convention; a key with no
 /// trawl grant at all is the 403 case), the reader key passes.

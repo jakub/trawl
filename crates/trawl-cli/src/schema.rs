@@ -9,7 +9,7 @@
 //! `fields --data <glob>` is the embedded path: a plain `DESCRIBE` over local
 //! parquet with no server and no postgres.
 
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal, Write};
 
 use serde_json::Value as Json;
 use trawl_client::{CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse};
@@ -193,16 +193,20 @@ fn make_client(conn: &ConnectionParams) -> Result<trawl_client::HttpClient, CliE
     Ok(client)
 }
 
-fn render(columns: &[String], rows: &[Vec<Json>], format: OutputFormat) -> Result<(), CliError> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    render_driver_results(columns, rows, format, &mut out)?;
+fn render<W: Write>(
+    out: &mut W,
+    columns: &[String],
+    rows: &[Vec<Json>],
+    format: OutputFormat,
+) -> Result<(), CliError> {
+    render_driver_results(columns, rows, format, out)?;
     out.flush()?;
     Ok(())
 }
 
 /// `trawl schema fields [--service] [--last] [--limit] [--data]`.
-pub async fn run_fields(
+pub async fn run_fields<W: Write>(
+    out: &mut W,
     conn: Option<ConnectionParams>,
     data: Option<&str>,
     service: Option<&str>,
@@ -219,7 +223,7 @@ pub async fn run_fields(
             "note: --data lists names and physical types only; catalog metadata \
              (pins, observations, conflicts) requires a server"
         );
-        return render(&columns, &rows, format);
+        return render(out, &columns, &rows, format);
     }
 
     let conn = conn.ok_or_else(|| {
@@ -230,7 +234,7 @@ pub async fn run_fields(
     let resp = client.catalog_fields(service, since_secs, limit).await?;
 
     let (columns, rows) = fields_to_rows(&resp);
-    render(&columns, &rows, format)?;
+    render(out, &columns, &rows, format)?;
     eprintln!(
         "{}/{} pins used{}",
         resp.pinned_total,
@@ -245,7 +249,8 @@ pub async fn run_fields(
 }
 
 /// `trawl schema field <name> [--limit] [--after]`.
-pub async fn run_field(
+pub async fn run_field<W: Write>(
+    out: &mut W,
     conn: Option<ConnectionParams>,
     name: &str,
     limit: Option<usize>,
@@ -257,31 +262,33 @@ pub async fn run_field(
     let client = make_client(&conn)?;
     let resp = client.catalog_field(name, limit, after).await?;
 
-    println!("field:       {}", resp.name);
-    println!("type:        {}", resp.data_type);
-    println!(
+    writeln!(out, "field:       {}", resp.name)?;
+    writeln!(out, "type:        {}", resp.data_type)?;
+    writeln!(
+        out,
         "pinned from: {}",
         resp.pinned_from.as_deref().unwrap_or("(unknown)")
-    );
-    println!("pinned at:   {}", resp.pinned_at);
+    )?;
+    writeln!(out, "pinned at:   {}", resp.pinned_at)?;
 
-    println!("\nservices:");
+    writeln!(out, "\nservices:")?;
     let (columns, rows) = field_services_to_rows(&resp);
-    render(&columns, &rows, format)?;
+    render(out, &columns, &rows, format)?;
     if let Some(cursor) = &resp.services_cursor {
         eprintln!("(more services — rerun with --after {cursor})");
     }
 
     if !resp.conflicts.is_empty() {
-        println!("\nrecent conflicts:");
+        writeln!(out, "\nrecent conflicts:")?;
         let (columns, rows) = field_conflicts_to_rows(&resp);
-        render(&columns, &rows, format)?;
+        render(out, &columns, &rows, format)?;
     }
     Ok(())
 }
 
 /// `trawl schema conflicts [--field] [--service] [--last] [--limit]`.
-pub async fn run_conflicts(
+pub async fn run_conflicts<W: Write>(
+    out: &mut W,
     conn: Option<ConnectionParams>,
     field: Option<&str>,
     service: Option<&str>,
@@ -298,7 +305,7 @@ pub async fn run_conflicts(
         .await?;
 
     let (columns, rows) = conflicts_to_rows(&resp);
-    render(&columns, &rows, format)?;
+    render(out, &columns, &rows, format)?;
     if resp.truncated {
         eprintln!("(listing truncated — raise --limit)");
     }

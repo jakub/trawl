@@ -6423,6 +6423,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trawl-api",
+ "trawl-cli",
  "trawl-client",
  "trawl-config",
  "trawl-core",
