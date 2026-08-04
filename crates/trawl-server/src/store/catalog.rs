@@ -146,14 +146,16 @@ impl ServiceCursor {
 /// Filter for [`CatalogStore::list_fields`].
 #[derive(Debug, Clone)]
 pub struct FieldListFilter {
-    /// Only fields observed for this service (`EXISTS` over
-    /// `field_services`). `None` lists every pin.
+    /// Only fields observed for this service — and every aggregate below
+    /// (`service_count`, `row_count`, `first_seen`, `last_seen`, and the
+    /// `since` window read off them) is computed from THAT service's
+    /// observations alone. `None` lists every pin over every service.
     pub service: Option<String>,
     /// Window on the field's most recent observation: a field whose
-    /// `max(last_seen)` predates this instant is hidden. A field with NO
-    /// observations at all (e.g. the envelope seed on a fresh install) is
-    /// ALWAYS shown — there is nothing to age out. `None` disables the
-    /// window.
+    /// `max(last_seen)` — within `service`, when set — predates this
+    /// instant is hidden. A field with NO observations at all (e.g. the
+    /// envelope seed on a fresh install) is ALWAYS shown — there is
+    /// nothing to age out. `None` disables the window.
     pub since: Option<DateTime<Utc>>,
     /// Maximum rows returned (the caller clamps; see the route handlers).
     pub limit: i64,
@@ -182,13 +184,16 @@ pub struct FieldSummaryRow {
     pub pinned_from: Option<String>,
     /// When the pin was written.
     pub pinned_at: DateTime<Utc>,
-    /// Distinct services that ever carried the field.
+    // The four observation aggregates below span every service that ever
+    // carried the field — or exactly the one service, when the listing was
+    // scoped by [`FieldListFilter::service`].
+    /// Distinct services that ever carried the field (1 when scoped).
     pub service_count: i64,
-    /// Cumulative rows across all services' observations.
+    /// Cumulative rows across the observations in scope.
     pub row_count: i64,
-    /// Earliest observation across services (`None` when never observed).
+    /// Earliest observation in scope (`None` when never observed).
     pub first_seen: Option<DateTime<Utc>>,
-    /// Most recent observation across services (`None` when never observed).
+    /// Most recent observation in scope (`None` when never observed).
     pub last_seen: Option<DateTime<Utc>>,
     /// Conflict evidence rows currently retained for the field.
     pub conflict_count: i64,
@@ -890,6 +895,16 @@ impl CatalogStore {
     /// boot-pass pin over standing parquet) must always appear — windowing
     /// only hides fields whose evidence says they aged out.
     ///
+    /// `filter.service` scopes the AGGREGATE, not just the row set: the
+    /// predicate goes INSIDE the `field_services` grouping, so a scoped
+    /// listing reports that service's own counts and instants, and the
+    /// `since` window is evaluated against that service's `last_seen`.
+    /// Filtering only in the `WHERE` clause would leak every other
+    /// service's numbers into the listing and keep a field alive in the
+    /// window because somebody ELSE still sends it. The `EXISTS` stays as
+    /// the presence test — a pin the service never carried has no group
+    /// row, and the never-observed rule would otherwise show it.
+    ///
     /// Returns `(rows, truncated)`; `truncated` is set when more rows
     /// matched than `filter.limit` allowed back.
     pub async fn list_fields(
@@ -908,7 +923,9 @@ impl CatalogStore {
              LEFT JOIN (
                  SELECT field, count(*) AS service_count, sum(row_count) AS row_count,
                         min(first_seen) AS first_seen, max(last_seen) AS last_seen
-                 FROM field_services GROUP BY field
+                 FROM field_services
+                 WHERE ($1::text IS NULL OR service = $1)
+                 GROUP BY field
              ) s ON s.field = t.field
              LEFT JOIN (
                  SELECT field, count(*) AS conflict_count, sum(rows_nulled) AS rows_nulled

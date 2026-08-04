@@ -114,6 +114,12 @@ first/last observation, and conflict counts. The response carries
 `pinned_total` / `pin_capacity` (catalog fill) and `truncated` (the
 default limit is 500, clamped to the pin cap).
 
+`?service=` scopes the numbers, not just the row set: `service_count`,
+`row_count`, `first_seen`, `last_seen` and the `?since_secs=` window all
+describe that one service's observations, so a field another service is
+still sending does not keep showing up under a service that stopped. The
+same holds for `?service=` on `/api/v1/schema` above.
+
 ```
 GET /api/v1/schema/field?name=duration
 GET /api/v1/schema/field?name=duration&limit=500&after=<services_cursor>

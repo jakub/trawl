@@ -2006,6 +2006,63 @@ mod catalog {
     }
 
     #[sqlx::test]
+    async fn list_fields_service_filter_scopes_the_aggregates(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[proposal("shared", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        store
+            .touch_services("svc-a", &["shared".to_owned()], 1)
+            .await
+            .unwrap();
+        store
+            .touch_services("svc-b", &["shared".to_owned()], 3)
+            .await
+            .unwrap();
+
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                service: Some("svc-a".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let shared = rows.iter().find(|r| r.field == "shared").unwrap();
+        assert_eq!(shared.service_count, 1, "svc-a's own service count");
+        assert_eq!(shared.row_count, 1, "svc-b's 3 rows must not leak in");
+
+        // The window reads svc-a's last_seen, not the global max: svc-b is
+        // still sending, but that cannot keep the field alive for svc-a.
+        age_observation(&pool, "shared", "svc-a", 100).await;
+        let since = chrono::Utc::now() - chrono::Duration::days(90);
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                service: Some("svc-a".to_owned()),
+                since: Some(since),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !rows.iter().any(|r| r.field == "shared"),
+            "aged out for svc-a even though svc-b still observes it"
+        );
+
+        // svc-b, and the unscoped listing, still see it.
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                service: Some("svc-b".to_owned()),
+                since: Some(since),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let shared = rows.iter().find(|r| r.field == "shared").unwrap();
+        assert_eq!(shared.row_count, 3);
+    }
+
+    #[sqlx::test]
     async fn list_fields_windows_on_last_seen_keeping_never_observed(pool: PgPool) {
         let store = catalog(&pool);
         store
