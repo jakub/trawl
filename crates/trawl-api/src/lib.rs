@@ -767,9 +767,16 @@ pub struct CatalogFieldResponse {
     pub pinned_from: Option<String>,
     /// When the pin was written (ISO 8601 UTC).
     pub pinned_at: String,
-    /// Per-service observations, most recent first.
+    /// One PAGE of per-service observations, most recent first. The service
+    /// axis is client-chosen and never pruned, so the detail never carries
+    /// the whole history — page with `services_cursor`.
     pub services: Vec<CatalogFieldServiceRow>,
-    /// Retained conflict evidence, most recent first.
+    /// Opaque cursor for the next page of `services` (pass as `?after=`).
+    /// Absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services_cursor: Option<String>,
+    /// Retained conflict evidence, most recent first. Bounded by the
+    /// catalog's per-field evidence cap, so it needs no cursor.
     pub conflicts: Vec<CatalogConflictRow>,
 }
 
@@ -1107,6 +1114,7 @@ mod tests {
                 last_seen: "2026-08-02T10:00:00Z".into(),
                 row_count: 5,
             }],
+            services_cursor: Some("2026-08-02T10:00:00.000000Z|nginx".into()),
             conflicts: vec![CatalogConflictRow {
                 field: "duration".into(),
                 service: "envoy".into(),
@@ -1118,6 +1126,11 @@ mod tests {
         };
         let rt = roundtrip(&resp);
         assert_eq!(rt.name, "duration");
+        assert_eq!(
+            rt.services_cursor.as_deref(),
+            Some("2026-08-02T10:00:00.000000Z|nginx"),
+            "the page cursor survives the wire"
+        );
         assert_eq!(rt.services.len(), 1);
         assert_eq!(rt.services[0].service, "nginx");
         assert_eq!(rt.conflicts.len(), 1);

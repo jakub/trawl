@@ -123,6 +123,15 @@ enum SchemaSubcommand {
         /// Field name (folded to the catalog's ASCII-lowercase spelling).
         name: String,
 
+        /// Maximum service observations per page (server clamps at 1000).
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Resume after a previous run's printed cursor (next page of
+        /// service observations).
+        #[arg(long)]
+        after: Option<String>,
+
         /// Output format (auto-detected if omitted).
         #[arg(long, short, value_enum)]
         format: Option<cli::OutputFormat>,
@@ -374,9 +383,12 @@ async fn run_schema(
             )
             .await
         }
-        SchemaSubcommand::Field { name, format } => {
-            schema::run_field(conn(token), &name, format).await
-        }
+        SchemaSubcommand::Field {
+            name,
+            limit,
+            after,
+            format,
+        } => schema::run_field(conn(token), &name, limit, after.as_deref(), format).await,
         SchemaSubcommand::Conflicts {
             field,
             service,

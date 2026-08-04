@@ -1633,8 +1633,23 @@ mod catalog {
             .await
             .expect("an unstorable name must not fail the observation upsert");
 
-        assert!(store.field_services(&huge).await.unwrap().is_empty());
-        assert_eq!(store.field_services("duration").await.unwrap().len(), 1);
+        assert!(
+            store
+                .field_services(&huge, None, 1000)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .field_services("duration", None, 1000)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
     }
 
     #[sqlx::test]
@@ -1643,7 +1658,11 @@ mod catalog {
         let fields = vec!["duration".to_owned()];
 
         store.touch_services("svc-a", &fields, 10).await.unwrap();
-        let first = store.field_services("duration").await.unwrap();
+        let first = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].service, "svc-a");
         assert_eq!(first[0].row_count, 10);
@@ -1651,7 +1670,11 @@ mod catalog {
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         store.touch_services("svc-a", &fields, 5).await.unwrap();
-        let second = store.field_services("duration").await.unwrap();
+        let second = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
         assert_eq!(second.len(), 1, "upsert, not append");
         assert_eq!(second[0].row_count, 15, "row_count accumulates");
         assert_eq!(
@@ -1678,13 +1701,100 @@ mod catalog {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let rows = store.field_services("duration").await.unwrap();
+        let rows = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
         let kept: Vec<&str> = rows.iter().map(|r| r.service.as_str()).collect();
         assert_eq!(
             kept,
             vec!["svc-e", "svc-d", "svc-c", "svc-b", "svc-a"],
             "every service ever observed is still there, most recent first"
         );
+    }
+
+    /// The service axis is client-chosen and never pruned, so the read
+    /// surface pages it: a cursor walk over a large history delivers every
+    /// row exactly once, in order, and terminates.
+    #[sqlx::test]
+    async fn field_services_pages_a_large_history_without_gaps(pool: PgPool) {
+        let store = catalog(&pool);
+
+        // 250 services carrying one common field — no pin slot spent, and
+        // nothing ever removes a row.
+        sqlx::query(
+            "INSERT INTO field_services (field, service, first_seen, last_seen, row_count)
+             SELECT 'duration', 'svc-' || lpad(g::text, 4, '0'),
+                    now() - interval '1 day', now() - (g || ' seconds')::interval, 1
+             FROM generate_series(1, 250) g",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0;
+        loop {
+            let (rows, next) = store
+                .field_services("duration", cursor.as_ref(), 60)
+                .await
+                .unwrap();
+            assert!(rows.len() <= 60, "a page never exceeds its limit");
+            pages += 1;
+            assert!(pages <= 10, "the walk must terminate");
+            seen.extend(rows.iter().map(|r| r.service.clone()));
+            match next {
+                Some(c) => {
+                    assert_eq!(
+                        c.service,
+                        rows.last().unwrap().service,
+                        "the cursor names the last row delivered"
+                    );
+                    cursor = Some(c);
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(pages, 5, "250 rows at 60 per page");
+        assert_eq!(seen.len(), 250, "every row delivered");
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 250, "no row delivered twice: {seen:?}");
+        assert_eq!(
+            seen.first().unwrap(),
+            "svc-0001",
+            "most recent observation first"
+        );
+        assert_eq!(seen.last().unwrap(), "svc-0250", "oldest last");
+    }
+
+    /// Rows sharing a `last_seen` still page deterministically: the cursor
+    /// is `(last_seen, service)`, so the tie breaks on the service name.
+    #[sqlx::test]
+    async fn field_services_cursor_breaks_last_seen_ties(pool: PgPool) {
+        let store = catalog(&pool);
+        sqlx::query(
+            "INSERT INTO field_services (field, service, first_seen, last_seen, row_count)
+             SELECT 'duration', 'svc-' || g, now() - interval '1 day', now(), 1
+             FROM generate_series(1, 5) g",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (first, next) = store.field_services("duration", None, 2).await.unwrap();
+        let names: Vec<&str> = first.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(names, vec!["svc-1", "svc-2"]);
+        let (second, _) = store
+            .field_services("duration", next.as_ref(), 2)
+            .await
+            .unwrap();
+        let names: Vec<&str> = second.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(names, vec!["svc-3", "svc-4"], "no repeat across the tie");
     }
 
     #[sqlx::test]

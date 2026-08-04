@@ -378,6 +378,102 @@ async fn field_detail_folds_name_and_404s_unpinned(pool: sqlx::PgPool) {
     assert_eq!(status, 404);
 }
 
+/// The detail route never hands back an unbounded service history: the
+/// page is capped (and the cap survives a hostile `?limit=`), and the
+/// cursor walks the rest exactly once.
+///
+/// `field_services` rows are ever-observed, cost no pin slot, and their
+/// service axis is client-chosen — so a common envelope field's history is
+/// the one part of the catalog a sender can grow without limit.
+#[sqlx::test(migrations = false)]
+async fn field_detail_pages_a_large_service_history(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    ingest_and_compact(&h, &[event("nginx", &json!({"duration": 42}))]).await;
+
+    // 1100 services carrying `duration`, none of which spent a pin slot.
+    let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+    sqlx::query(
+        "INSERT INTO field_services (field, service, first_seen, last_seen, row_count)
+         SELECT 'duration', 'svc-' || lpad(g::text, 5, '0'),
+                now() - interval '1 day', now() - (g || ' seconds')::interval, 1
+         FROM generate_series(1, 1100) g",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a large service history");
+
+    // Default page: bounded, with a cursor for the rest.
+    let (status, body) = h
+        .get(&h.server.analyst_token, "/schema/field?name=duration")
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["services"].as_array().unwrap().len(),
+        100,
+        "the default page is bounded"
+    );
+    assert!(
+        body["services_cursor"].is_string(),
+        "a truncated page advertises its cursor"
+    );
+
+    // A caller asking for everything still gets a bounded response.
+    let (_, body) = h
+        .get(
+            &h.server.analyst_token,
+            "/schema/field?name=duration&limit=100000",
+        )
+        .await;
+    assert_eq!(
+        body["services"].as_array().unwrap().len(),
+        1000,
+        "?limit= is clamped to the hard ceiling"
+    );
+    assert!(body["services_cursor"].is_string());
+
+    // The cursor walk covers the whole history exactly once.
+    let mut seen: Vec<String> = Vec::new();
+    let mut path = "/schema/field?name=duration&limit=500".to_owned();
+    for _ in 0..10 {
+        let (status, body) = h.get(&h.server.analyst_token, &path).await;
+        assert_eq!(status, 200);
+        seen.extend(
+            body["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["service"].as_str().unwrap().to_owned()),
+        );
+        let Some(cursor) = body["services_cursor"].as_str() else {
+            break;
+        };
+        // Percent-encode the two characters the cursor spelling carries
+        // that a query string may not (`:` from RFC 3339, `|` separator).
+        let escaped = cursor
+            .replace('%', "%25")
+            .replace(':', "%3A")
+            .replace('|', "%7C");
+        path = format!("/schema/field?name=duration&limit=500&after={escaped}");
+    }
+    assert_eq!(seen.len(), 1101, "1100 seeded services plus nginx");
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), seen.len(), "no service delivered twice");
+    assert_eq!(seen[0], "nginx", "most recent observation first");
+
+    // A garbled cursor is a client error, not a silent restart at page one.
+    let (status, _) = h
+        .get(
+            &h.server.analyst_token,
+            "/schema/field?name=duration&after=nonsense",
+        )
+        .await;
+    assert_eq!(status, 400);
+}
+
 /// All three read routes gate on `schema_read`: a key without it is denied
 /// (401 insufficient-permissions per the handler convention; a key with no
 /// trawl grant at all is the 403 case), the reader key passes.

@@ -93,6 +93,16 @@ catalog fill (`N/M pins used`) to stderr; `--limit` raises the listing
 caps (fields default 500, conflicts default 100/max 1000). `--last`
 accepts DSL-style windows (`s`, `m`, `h`, `d`, `w`).
 
+`field` pages its service observations — the service axis is client-chosen
+and never pruned, so the server caps a page at 1000 rows (default 100).
+When more remain, a cursor is printed to stderr; pass it to `--after` for
+the next page:
+
+```bash
+trawl schema field duration --limit 500
+trawl schema field duration --limit 500 --after '2026-08-02T10:00:00.000000Z|nginx'
+```
+
 Embedded mode works for the field listing only — a plain `DESCRIBE` over
 local parquet, no server or postgres needed:
 

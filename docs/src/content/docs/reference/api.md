@@ -116,12 +116,22 @@ default limit is 500, clamped to the pin cap).
 
 ```
 GET /api/v1/schema/field?name=duration
+GET /api/v1/schema/field?name=duration&limit=500&after=<services_cursor>
 ```
 
-One field's detail: the pin, per-service observations, and retained
-conflict evidence. The name is a **query parameter** (a catalog key may
-contain `/`) and is ASCII-lowercased before lookup, mirroring ingest's
-fold; an unpinned name returns 404.
+One field's detail: the pin, one page of per-service observations, and
+retained conflict evidence. The name is a **query parameter** (a catalog
+key may contain `/`) and is ASCII-lowercased before lookup, mirroring
+ingest's fold; an unpinned name returns 404.
+
+Observations are **paged**: service names are client-chosen and their
+observation rows are never removed, so one field's history can grow
+without bound (it costs no pin slot). `limit` defaults to 100 and is
+clamped to 1000 regardless of what the caller asks for; when more rows
+follow, the response carries `services_cursor` — pass it back as `after`
+for the next page. The cursor is opaque and keyset-based (a garbled one
+returns 400, never a silent restart at page one). Conflict evidence needs
+no cursor: it is capped per field at write time.
 
 ```
 GET /api/v1/schema/conflicts

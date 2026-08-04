@@ -244,16 +244,18 @@ pub async fn run_fields(
     Ok(())
 }
 
-/// `trawl schema field <name>`.
+/// `trawl schema field <name> [--limit] [--after]`.
 pub async fn run_field(
     conn: Option<ConnectionParams>,
     name: &str,
+    limit: Option<usize>,
+    after: Option<&str>,
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
     let format = resolve_format(format)?;
     let conn = conn.ok_or_else(|| CliError::Usage("schema field requires a server".into()))?;
     let client = make_client(&conn)?;
-    let resp = client.catalog_field(name).await?;
+    let resp = client.catalog_field(name, limit, after).await?;
 
     println!("field:       {}", resp.name);
     println!("type:        {}", resp.data_type);
@@ -266,6 +268,9 @@ pub async fn run_field(
     println!("\nservices:");
     let (columns, rows) = field_services_to_rows(&resp);
     render(&columns, &rows, format)?;
+    if let Some(cursor) = &resp.services_cursor {
+        eprintln!("(more services — rerun with --after {cursor})");
+    }
 
     if !resp.conflicts.is_empty() {
         println!("\nrecent conflicts:");
@@ -398,6 +403,7 @@ mod tests {
                 last_seen: "2026-08-02T10:00:00Z".into(),
                 row_count: 5,
             }],
+            services_cursor: None,
             conflicts: sample_conflicts().conflicts,
         };
         let (cols, rows) = field_services_to_rows(&resp);

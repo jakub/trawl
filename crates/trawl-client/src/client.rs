@@ -400,14 +400,29 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Fetch one field's pin, observations, and conflict evidence
-    /// (`GET /api/v1/schema/field?name=`).
+    /// Fetch one field's pin, one page of its observations, and its
+    /// conflict evidence (`GET /api/v1/schema/field?name=`).
     ///
     /// The name travels as a query parameter — `req.query` percent-encodes
     /// it, so names containing `/`, `?`, or `%` survive intact.
-    pub async fn catalog_field(&self, name: &str) -> Result<CatalogFieldResponse, ClientError> {
+    ///
+    /// The service axis is client-chosen and unpruned, so observations are
+    /// paged: `limit` is clamped server-side, and `after` takes the previous
+    /// response's `services_cursor` to fetch the next page.
+    pub async fn catalog_field(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+        after: Option<&str>,
+    ) -> Result<CatalogFieldResponse, ClientError> {
         let url = self.endpoint("/api/v1/schema/field");
-        let req = self.client.get(&url).query(&[("name", name)]);
+        let mut req = self.client.get(&url).query(&[("name", name)]);
+        if let Some(l) = limit {
+            req = req.query(&[("limit", l.to_string())]);
+        }
+        if let Some(cursor) = after {
+            req = req.query(&[("after", cursor)]);
+        }
         self.send_authenticated(req).await
     }
 

@@ -17,7 +17,10 @@
 //! [`MAX_CONFLICTS_PER_FIELD`]. `field_services` rows are deliberately
 //! ever-observed — nothing removes one — and its worst case is bounded by
 //! the pin cap on the field axis times the services a deployment really
-//! runs; consumers window on `last_seen`.
+//! runs; consumers window on `last_seen`. Its SERVICE axis has no cap at
+//! all (service names are client-chosen and no row is ever removed), so the
+//! read surface pages it: [`CatalogStore::field_services`] takes a bounded
+//! limit and a [`ServiceCursor`], never the whole history.
 
 use std::collections::HashMap;
 
@@ -91,6 +94,53 @@ pub struct FieldServiceRow {
     /// Cumulative rows compacted in batches that wrote the field — the sum
     /// of per-batch row counts, not a per-value non-null tally.
     pub row_count: i64,
+}
+
+/// A position inside one field's observation listing: the
+/// `(last_seen, service)` of the last row already delivered.
+///
+/// `(last_seen, service)` is unique per field — `(field, service)` is the
+/// primary key — so the pair identifies an exact row, and resuming after it
+/// can neither repeat nor skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceCursor {
+    /// Last observation instant of the row the page stopped at.
+    pub last_seen: DateTime<Utc>,
+    /// Service name of the row the page stopped at.
+    pub service: String,
+}
+
+impl ServiceCursor {
+    /// Wire spelling: `<rfc3339-micros>|<service>`.
+    ///
+    /// `|` is outside the service charset (`[A-Za-z0-9._-]`, enforced at
+    /// every ingest door), and RFC 3339 has no `|` either, so splitting at
+    /// the LAST `|` recovers both halves unambiguously.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!(
+            "{}|{}",
+            self.last_seen
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            self.service
+        )
+    }
+
+    /// Parse a cursor the server previously issued. `None` for anything
+    /// malformed — a cursor is opaque to clients, so a garbled one is a
+    /// client error, never a silently ignored filter.
+    #[must_use]
+    pub fn decode(raw: &str) -> Option<Self> {
+        let (ts, service) = raw.rsplit_once('|')?;
+        if service.is_empty() {
+            return None;
+        }
+        let last_seen = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+        Some(Self {
+            last_seen,
+            service: service.to_owned(),
+        })
+    }
 }
 
 /// Filter for [`CatalogStore::list_fields`].
@@ -737,17 +787,51 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Read the observation rows for one field, most recent first.
-    pub async fn field_services(&self, field: &str) -> Result<Vec<FieldServiceRow>, StoreError> {
+    /// Read ONE PAGE of the observation rows for one field, most recent
+    /// first, resuming after `after`.
+    ///
+    /// Paged, never whole: `field_services` is bounded on the field axis by
+    /// the pin cap but NOT on the service axis — service names are
+    /// client-chosen and rows are ever-observed, so the history of a common
+    /// envelope field grows with every service a sender ever invents,
+    /// without spending a pin slot. An unpaged read would hand one
+    /// `schema_read` request an arbitrarily large database read, allocation,
+    /// and response body.
+    ///
+    /// Keyset, not `OFFSET`: the page walks `(last_seen DESC, service ASC)`,
+    /// which is unique per field (`(field, service)` is the primary key), so
+    /// a cursor names an exact position and a concurrent observation update
+    /// cannot make a page repeat or skip a row it already delivered.
+    ///
+    /// Returns `(rows, next)`; `next` is `Some` when more rows follow.
+    pub async fn field_services(
+        &self,
+        field: &str,
+        after: Option<&ServiceCursor>,
+        limit: i64,
+    ) -> Result<(Vec<FieldServiceRow>, Option<ServiceCursor>), StoreError> {
+        let limit = limit.max(1);
         let rows = sqlx::query(
             "SELECT service, first_seen, last_seen, row_count
-             FROM field_services WHERE field = $1
-             ORDER BY last_seen DESC, service",
+             FROM field_services
+             WHERE field = $1
+               AND ($2::timestamptz IS NULL
+                    OR last_seen < $2
+                    OR (last_seen = $2 AND service > $3))
+             ORDER BY last_seen DESC, service
+             LIMIT $4",
         )
         .bind(field)
+        .bind(after.map(|c| c.last_seen))
+        .bind(after.map_or("", |c| c.service.as_str()))
+        // Fetch one extra row purely to learn whether a next page exists.
+        .bind(limit.saturating_add(1))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
+
+        let has_more = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+        let mut rows = rows
+            .iter()
             .map(|row| {
                 Ok(FieldServiceRow {
                     service: row.try_get("service")?,
@@ -757,7 +841,17 @@ impl CatalogStore {
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(StoreError::from)
+            .map_err(StoreError::from)?;
+        rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+
+        let next = has_more.then(|| {
+            let last = rows.last().expect("a truncating page has a last row");
+            ServiceCursor {
+                last_seen: last.last_seen,
+                service: last.service.clone(),
+            }
+        });
+        Ok((rows, next))
     }
 
     /// Read the conflict rows for one field, most recent first.
@@ -963,5 +1057,44 @@ impl CatalogStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cursor is opaque to clients but must round-trip exactly: a
+    /// microsecond lost in the encoding would re-deliver or skip the row it
+    /// names. Service names carry `.`, `-`, and `_`; none is `|`.
+    #[test]
+    fn service_cursor_roundtrips_exactly() {
+        for service in ["nginx", "api.v2", "svc-a_b", "x"] {
+            let cursor = ServiceCursor {
+                last_seen: DateTime::parse_from_rfc3339("2026-08-02T10:00:00.123456Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                service: service.to_owned(),
+            };
+            let decoded = ServiceCursor::decode(&cursor.encode()).expect("decodes");
+            assert_eq!(decoded, cursor, "{service}");
+        }
+    }
+
+    /// A malformed cursor is a client error, never a silently dropped
+    /// filter: decoding fails so the handler can 400 instead of restarting
+    /// the walk at page one.
+    #[test]
+    fn service_cursor_rejects_garbage() {
+        for raw in [
+            "",
+            "nginx",
+            "|nginx",
+            "2026-08-02T10:00:00Z|",
+            "not-a-time|nginx",
+            "2026-08-02T10:00:00Z",
+        ] {
+            assert!(ServiceCursor::decode(raw).is_none(), "{raw:?}");
+        }
     }
 }

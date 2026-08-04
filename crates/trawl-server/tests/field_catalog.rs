@@ -587,9 +587,10 @@ async fn field_services_is_ever_observed(pool: sqlx::PgPool) {
         .state
         .storage
         .catalog
-        .field_services("duration")
+        .field_services("duration", None, 1000)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].service, "svc-obs");
 
@@ -601,9 +602,10 @@ async fn field_services_is_ever_observed(pool: sqlx::PgPool) {
         .state
         .storage
         .catalog
-        .field_services("duration")
+        .field_services("duration", None, 1000)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(
         second[0].last_seen > first[0].last_seen,
         "compaction advances last_seen"
@@ -624,9 +626,10 @@ async fn field_services_is_ever_observed(pool: sqlx::PgPool) {
         .state
         .storage
         .catalog
-        .field_services("duration")
+        .field_services("duration", None, 1000)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(
         after.len(),
         1,
@@ -1094,7 +1097,11 @@ mod boot {
 
         // Observations are stamped from the partition directory, not now(),
         // and weighed by the rows the files hold.
-        let obs = store.field_services("duration").await.unwrap();
+        let obs = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].service, "svc-a");
         assert_eq!(obs[0].row_count, 3);
@@ -1133,7 +1140,11 @@ mod boot {
             .await
             .unwrap();
         assert!(rerun.ran, "a missing marker forces the re-run");
-        let again = store.field_services("duration").await.unwrap();
+        let again = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
         assert_eq!(again[0].row_count, 3, "the backfill is idempotent");
         assert_eq!(again[0].first_seen, obs[0].first_seen);
         assert_eq!(again[0].last_seen, obs[0].last_seen);
@@ -1168,7 +1179,11 @@ mod boot {
             .await
             .unwrap();
 
-        let obs = store.field_services("duration").await.unwrap();
+        let obs = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
         assert_eq!(obs[0].row_count, 903, "the live count stands");
         assert!(
             obs[0].last_seen > obs[0].first_seen,

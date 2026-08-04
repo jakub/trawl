@@ -970,10 +970,29 @@ pub async fn catalog_fields(
 pub struct CatalogFieldParams {
     /// Field name (ASCII-folded before lookup, mirroring ingest's fold).
     pub name: String,
+    /// Maximum service observations returned
+    /// (default [`DEFAULT_FIELD_SERVICES_LIMIT`], max
+    /// [`MAX_FIELD_SERVICES_LIMIT`]).
+    pub limit: Option<i64>,
+    /// Opaque cursor from a previous response's `services_cursor`.
+    pub after: Option<String>,
 }
 
-/// `GET /api/v1/schema/field?name=` — one field's pin, per-service
-/// observations, and retained conflict evidence (`trawl schema field`).
+/// Default page size for the field detail's service observations.
+const DEFAULT_FIELD_SERVICES_LIMIT: i64 = 100;
+
+/// Hard ceiling for the field detail's `?limit=`.
+///
+/// `field_services` rows are ever-observed and their service axis is
+/// client-chosen — a common envelope field accumulates one row per service
+/// name a sender ever invented, none of which spends a pin slot. So the
+/// detail's response size is capped here regardless of what the caller asks
+/// for, and the rest is reached by paging.
+const MAX_FIELD_SERVICES_LIMIT: i64 = 1000;
+
+/// `GET /api/v1/schema/field?name=` — one field's pin, one PAGE of its
+/// per-service observations, and its retained conflict evidence
+/// (`trawl schema field`).
 pub async fn catalog_field(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -987,10 +1006,28 @@ pub async fn catalog_field(
     // folded at every ingest door) — fold the lookup the same way.
     let name = params.name.to_ascii_lowercase();
 
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_FIELD_SERVICES_LIMIT)
+        .clamp(1, MAX_FIELD_SERVICES_LIMIT);
+    let after = match params.after.as_deref() {
+        None => None,
+        Some(raw) => Some(crate::store::ServiceCursor::decode(raw).ok_or_else(|| {
+            ServerError::BadRequest("invalid `after` cursor: pass a `services_cursor` back".into())
+        })?),
+    };
+
     let Some(pin) = state.storage.catalog.field_pin(&name).await? else {
         return Err(ServerError::NotFound(format!("field not pinned: {name}")));
     };
-    let services = state.storage.catalog.field_services(&name).await?;
+    let (services, next) = state
+        .storage
+        .catalog
+        .field_services(&name, after.as_ref(), limit)
+        .await?;
+    // Conflict evidence needs no cursor: `field_conflicts` is trimmed to
+    // MAX_CONFLICTS_PER_FIELD newest rows per field in the writing
+    // transaction, so this read is bounded by construction.
     let conflicts = state.storage.catalog.conflicts_for_field(&name).await?;
 
     Ok(Json(trawl_api::CatalogFieldResponse {
@@ -1007,6 +1044,7 @@ pub async fn catalog_field(
                 row_count: u64::try_from(s.row_count).unwrap_or(0),
             })
             .collect(),
+        services_cursor: next.map(|c| c.encode()),
         conflicts: conflicts
             .into_iter()
             .map(|c| trawl_api::CatalogConflictRow {
