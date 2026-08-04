@@ -71,20 +71,33 @@ pub async fn query(
         )));
     }
 
+    // One id from the pool's counter keys the tracker entry AND the pool's
+    // interrupt map, so cancel-by-id interrupts the query the client sees.
+    // Allocated BEFORE query_start so every lifecycle event correlates on
+    // query_id without carrying the query text (issue #56 F5).
+    let query_id = state.query.pool.allocate_query_id();
+    state.query.tracker.start(query_id, &verified, &req.query);
+
+    // Default-filter lifecycle events carry metadata only — never the raw
+    // DSL, which can contain customer identifiers or incident indicators.
+    // Full text lives in authenticated history, the tracker, the opt-in
+    // query debug log, and the DEBUG-only query_text event below.
     tracing::info!(
         event_type = "query_start",
         user = %verified.name,
         roles = %verified.roles_display(),
-        query = %req.query,
+        query_id,
+        query_len = req.query.len(),
         limit,
         offset,
         "executing query"
     );
-
-    // One id from the pool's counter keys the tracker entry AND the pool's
-    // interrupt map, so cancel-by-id interrupts the query the client sees.
-    let query_id = state.query.pool.allocate_query_id();
-    state.query.tracker.start(query_id, &verified, &req.query);
+    tracing::debug!(
+        event_type = "query_text",
+        query_id,
+        query = %req.query,
+        "raw query text (DEBUG-only: never stored under the default filter)"
+    );
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
     // Resolve timezone from request (default to UTC when absent).
@@ -168,10 +181,10 @@ pub async fn query(
             tracing::info!(
                 event_type = "query_complete",
                 user = %verified.name,
-                query = %req.query,
+                query_id,
+                query_len = req.query.len(),
                 total_rows = total,
                 returned_rows = returned,
-                query_id,
                 duration_ms,
                 "query complete"
             );
@@ -215,8 +228,8 @@ pub async fn query(
             tracing::warn!(
                 event_type = "query_timeout",
                 user = %verified.name,
-                query = %req.query,
                 query_id,
+                query_len = req.query.len(),
                 duration_ms,
                 timeout_secs = state.query.timeout_secs,
                 "query timed out"
@@ -251,8 +264,8 @@ pub async fn query(
                         event_type = "query_failed",
                         error_type = "parse",
                         user = %verified.name,
-                        query = %req.query,
                         query_id,
+                        query_len = req.query.len(),
                         duration_ms,
                         error = %safe_msg,
                         "query failed: bad request"
@@ -265,8 +278,8 @@ pub async fn query(
                         event_type = "query_failed",
                         error_type = "engine",
                         user = %verified.name,
-                        query = %req.query,
                         query_id,
+                        query_len = req.query.len(),
                         duration_ms,
                         error = %e,
                         safe_error = %safe_msg,

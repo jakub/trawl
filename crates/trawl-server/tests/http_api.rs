@@ -105,6 +105,161 @@ async fn query_rejects_bad_dsl(pool: sqlx::PgPool) {
     }
 }
 
+// -- query lifecycle telemetry (issue #56 F5) --------------------------------
+
+mod lifecycle_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// One captured tracing event: level plus stringified fields.
+    #[derive(Debug, Clone)]
+    pub struct Captured {
+        pub level: String,
+        pub fields: BTreeMap<String, String>,
+    }
+
+    /// Capture layer recording every event's fields as strings.
+    #[derive(Clone, Default)]
+    pub struct Capture {
+        events: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl Capture {
+        pub fn events(&self) -> Vec<Captured> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    struct Visitor<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut Visitor(&mut fields));
+            self.events.lock().unwrap().push(Captured {
+                level: event.metadata().level().as_str().to_owned(),
+                fields,
+            });
+        }
+    }
+}
+
+/// Default-filter query lifecycle events share a `query_id` and contain no
+/// raw DSL; the raw text survives only as a separate DEBUG-level
+/// `query_text` event that `trawl_server=info` never stores.
+#[sqlx::test(migrations = false)]
+async fn query_lifecycle_events_share_query_id_and_carry_no_raw_dsl(pool: sqlx::PgPool) {
+    use lifecycle_capture::Capture;
+    use tracing_subscriber::prelude::*;
+
+    let info_capture = Capture::default();
+    let debug_capture = Capture::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            info_capture
+                .clone()
+                .with_filter(tracing_subscriber::EnvFilter::new(
+                    trawl_server::telemetry::DEFAULT_LOG_FILTER,
+                )),
+        )
+        .with(
+            debug_capture
+                .clone()
+                .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=debug")),
+        );
+    // Global (not thread-local) — the server runs on other tokio workers.
+    tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+
+    let server = setup(pool).await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // The sentinel is a bare-text search term: valid DSL, matches nothing.
+    let dsl = "service=nginx zz_sentinel_needle";
+    client.query_paginated(dsl, None, None).await.unwrap();
+
+    let info_events = info_capture.events();
+    let start = info_events
+        .iter()
+        .find(|e| {
+            e.fields
+                .get("event_type")
+                .is_some_and(|t| t.contains("query_start"))
+        })
+        .expect("query_start captured at info");
+    let complete = info_events
+        .iter()
+        .find(|e| {
+            e.fields
+                .get("event_type")
+                .is_some_and(|t| t.contains("query_complete"))
+        })
+        .expect("query_complete captured at info");
+
+    // Correlatable without query text: same allocated query_id...
+    let start_id = start
+        .fields
+        .get("query_id")
+        .expect("query_start has query_id");
+    let complete_id = complete
+        .fields
+        .get("query_id")
+        .expect("query_complete has query_id");
+    assert_eq!(start_id, complete_id, "lifecycle events share the query_id");
+
+    // ...plus query_len for pathological-request diagnosis.
+    assert_eq!(
+        start.fields.get("query_len").map(String::as_str),
+        Some(dsl.len().to_string().as_str()),
+        "query_start carries query_len"
+    );
+
+    // No raw DSL anywhere in the default-filter stream.
+    for event in &info_events {
+        for (name, value) in &event.fields {
+            assert!(
+                !value.contains("zz_sentinel_needle"),
+                "raw DSL leaked into default-filter telemetry: field {name} of {event:?}"
+            );
+        }
+    }
+
+    // The raw text IS available — as a separate DEBUG-only event.
+    let query_text = debug_capture
+        .events()
+        .into_iter()
+        .find(|e| {
+            e.fields
+                .get("event_type")
+                .is_some_and(|t| t.contains("query_text"))
+        })
+        .expect("query_text event captured at debug");
+    assert_eq!(query_text.level, "DEBUG");
+    assert!(
+        query_text
+            .fields
+            .get("query")
+            .is_some_and(|q| q.contains("zz_sentinel_needle")),
+        "DEBUG query_text carries the raw DSL: {query_text:?}"
+    );
+    assert!(
+        query_text.fields.contains_key("query_id"),
+        "query_text is keyed on query_id"
+    );
+}
+
 // -- schema endpoint tests ---------------------------------------------------
 
 /// The fixture corpus is dated 2024-01-15 — years outside the default
