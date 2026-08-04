@@ -36,10 +36,21 @@
 //! (serialized ndjson counted twice, once for the bytes and once for the
 //! retained maps which hold roughly the same payload, plus a fixed
 //! per-event map overhead), mirroring the hot-buffer setting's estimate
-//! semantics. On overflow the OLDEST batches are dropped (the newest is
-//! always kept, so current operational state stays observable and one
-//! pathological batch cannot deadlock the queue) with exact event counts
-//! and byte totals under reason `buffer_cap`.
+//! semantics.
+//!
+//! The budget is ONE shared allowance over every byte the layer holds —
+//! the active buffer, the retry queue, and the batch currently in flight
+//! through a WAL write (popped from the queue but still in memory) — and
+//! it is enforced at EVENT INSERTION, not at staging. A cap applied only
+//! to the queue after staging would be no cap at all: while a wedged
+//! `spawn_blocking` write holds a batch, `on_event` would keep appending
+//! to the active buffer without any bound. Admission sheds the OLDEST
+//! staged batches first (current operational state is worth more than
+//! history), and when there is nothing left to shed — the in-flight batch
+//! cannot be reclaimed — it drops the incoming event rather than
+//! exempting it. Every drop is counted exactly under reason `buffer_cap`,
+//! and `trawl_telemetry_buffer_{events,bytes}` gauge the WHOLE charge, not
+//! just the queue.
 //!
 //! ## Durability before visibility
 //!
@@ -219,12 +230,20 @@ struct Batch {
 /// charge is an estimate, not an exact accounting.
 const EVENT_MAP_OVERHEAD_BYTES: usize = 256;
 
-/// Estimated memory charged against `telemetry_buffer_max_bytes` for one
-/// pending batch: the ndjson bytes counted twice (the serialized buffer
-/// plus the retained maps, which hold roughly the same payload again) plus
-/// [`EVENT_MAP_OVERHEAD_BYTES`] per event.
+/// Estimated memory charged against `telemetry_buffer_max_bytes` for
+/// `bytes` of serialized ndjson holding `events` retained maps: the ndjson
+/// counted twice (the serialized buffer plus the retained maps, which hold
+/// roughly the same payload again) plus [`EVENT_MAP_OVERHEAD_BYTES`] per
+/// event. The same formula charges the active buffer, a queued batch and
+/// an in-flight batch, so the shared budget is comparable across all three
+/// and staging moves charge without changing the total.
+fn charge_of(bytes: usize, events: usize) -> usize {
+    bytes * 2 + events * EVENT_MAP_OVERHEAD_BYTES
+}
+
+/// [`charge_of`] for one staged batch.
 fn batch_charge(batch: &Batch) -> usize {
-    batch.bytes.len() * 2 + batch.events.len() * EVENT_MAP_OVERHEAD_BYTES
+    charge_of(batch.bytes.len(), batch.events.len())
 }
 
 /// The active (not yet staged) buffer: ndjson bytes and their event maps,
@@ -233,6 +252,48 @@ fn batch_charge(batch: &Batch) -> usize {
 struct ActiveBuffer {
     bytes: Vec<u8>,
     events: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ActiveBuffer {
+    fn charge(&self) -> usize {
+        charge_of(self.bytes.len(), self.events.len())
+    }
+}
+
+/// Running charge of STAGED memory: everything queued in `pending` plus
+/// the batch currently in flight through a WAL write. Tracked as counters
+/// rather than derived from `pending` for two reasons: the in-flight batch
+/// is not in the queue and would otherwise vanish from the accounting
+/// while a wedged write holds it, and `on_event` can then evaluate the
+/// shared budget without walking or locking the queue.
+#[derive(Default)]
+struct StagedCharge {
+    events: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl StagedCharge {
+    /// Charge a batch on staging.
+    fn charge(&self, batch: &Batch) {
+        self.events.fetch_add(batch.events.len(), Ordering::Relaxed);
+        self.bytes.fetch_add(batch_charge(batch), Ordering::Relaxed);
+    }
+
+    /// Release a batch's charge once it leaves memory — published after a
+    /// durable write, shed at the cap, or lost with a panicked write task.
+    /// Saturating: the accounting is an estimate, never a panic source.
+    fn release(&self, events: usize, bytes: usize) {
+        let _ = self
+            .events
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(events))
+            });
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(bytes))
+            });
+    }
 }
 
 /// Drop accounting, reset when the `telemetry_dropped` recovery event is
@@ -258,10 +319,13 @@ struct WalLayerInner {
     active: Mutex<ActiveBuffer>,
     /// FIFO retry queue of staged batches awaiting a successful WAL write.
     pending: Mutex<VecDeque<Batch>>,
-    /// Cap on the estimated memory charged by `pending`
+    /// Charge of `pending` PLUS any batch in flight through a WAL write.
+    staged: StagedCharge,
+    /// The ONE cap on estimated memory charged by the active buffer, the
+    /// retry queue and the in-flight batch together
     /// (`[ingest] telemetry_buffer_max_bytes`). Atomic so tests can
     /// tighten it after construction.
-    max_pending_bytes: AtomicUsize,
+    max_buffer_bytes: AtomicUsize,
     /// Cached hostname, resolved once at layer creation.
     host: String,
     /// Loss accounting for the recovery event and metrics.
@@ -288,7 +352,7 @@ impl WalLayer {
     /// Create a new layer backed by the given handle. `env` is the env
     /// telemetry events are stamped with (`default_env`) — the records
     /// carry it as a column, matching where the WAL handle files them.
-    /// Uses the default retry-queue cap; production passes the configured
+    /// Uses the default memory budget; production passes the configured
     /// `[ingest] telemetry_buffer_max_bytes` via
     /// [`WalLayer::new_with_buffer_cap`].
     pub fn new(handle: WalHandle, env: &str) -> Self {
@@ -299,7 +363,8 @@ impl WalLayer {
         )
     }
 
-    /// [`WalLayer::new`] with an explicit retry-queue memory cap
+    /// [`WalLayer::new`] with an explicit shared memory budget over the
+    /// active buffer, retry queue and in-flight batch
     /// (`[ingest] telemetry_buffer_max_bytes`).
     pub fn new_with_buffer_cap(handle: WalHandle, env: &str, max_buffer_bytes: usize) -> Self {
         let host = hostname::get()
@@ -314,7 +379,8 @@ impl WalLayer {
                     events: Vec::new(),
                 }),
                 pending: Mutex::new(VecDeque::new()),
-                max_pending_bytes: AtomicUsize::new(max_buffer_bytes),
+                staged: StagedCharge::default(),
+                max_buffer_bytes: AtomicUsize::new(max_buffer_bytes),
                 host,
                 env: env.to_owned(),
                 dropped: DropCounters::default(),
@@ -375,6 +441,9 @@ impl WalLayer {
         while let Some(batch) = self.inner.pop_oldest() {
             let w = Arc::clone(writer);
             let batch_env = Arc::clone(env);
+            // Captured before the batch moves into the closure, so a lost
+            // batch can still be released from the shared accounting.
+            let in_flight = (batch.events.len(), batch_charge(&batch));
             let joined = tokio::task::spawn_blocking(move || {
                 let result = w.write(&batch_env, "trawld", &batch.bytes);
                 (result, batch)
@@ -391,6 +460,7 @@ impl WalLayer {
                     // The batch was consumed by the panicked/cancelled
                     // closure and cannot be recovered. WalWriter::write
                     // does not panic in practice.
+                    self.inner.staged.release(in_flight.0, in_flight.1);
                     self.inner
                         .record_write_failure(&std::io::Error::other(join_err));
                     break;
@@ -402,9 +472,13 @@ impl WalLayer {
 }
 
 impl WalLayerInner {
-    /// Swap the active buffer into a pending [`Batch`] and enforce the
-    /// retry-queue memory cap by dropping the OLDEST batches (never the
-    /// newest — current operational state must stay observable).
+    /// Swap the active buffer into a pending [`Batch`].
+    ///
+    /// Staging MOVES charge from the active buffer onto the queue without
+    /// changing the total, so it enforces no cap of its own — the shared
+    /// budget is enforced at event insertion ([`Self::admit`]), which is
+    /// the only place that can bound the active buffer while a wedged
+    /// write holds a batch in flight.
     ///
     /// No-op until the writer is set: pre-init events stay in the active
     /// buffer under the pre-init cap, preserving the bootstrap-buffering
@@ -423,33 +497,77 @@ impl WalLayerInner {
                 events: std::mem::take(&mut active.events),
             }
         };
+        self.staged.charge(&batch);
+        self.pending.lock().push_back(batch);
+    }
 
-        let mut pending = self.pending.lock();
-        pending.push_back(batch);
-        let cap = self.max_pending_bytes.load(Ordering::Relaxed);
-        let mut total: usize = pending.iter().map(batch_charge).sum();
-        while total > cap && pending.len() > 1 {
-            let dropped = pending.pop_front().expect("len > 1");
-            total -= batch_charge(&dropped);
-            let events = dropped.events.len() as u64;
-            let bytes = dropped.bytes.len() as u64;
-            self.dropped.cap_events.fetch_add(events, Ordering::Relaxed);
-            self.dropped.cap_bytes.fetch_add(bytes, Ordering::Relaxed);
-            metrics::counter!(
-                crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
-                "reason" => "buffer_cap"
-            )
-            .increment(events);
-            metrics::counter!(
-                crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
-                "reason" => "buffer_cap"
-            )
-            .increment(bytes);
+    /// Admit one serialized event of `line_len` ndjson bytes against the
+    /// shared budget, shedding staged batches if that is what it takes.
+    ///
+    /// Returns `false` when the event must be dropped — which happens only
+    /// once the queue is empty and the active buffer plus the
+    /// unreclaimable in-flight batch already fill the budget. Dropping the
+    /// NEWEST event is the honest end of the ladder: exempting it (as a
+    /// `len() > 1` queue guard does) is what turns a cap into unbounded
+    /// growth under a WAL stall.
+    fn admit(&self, line_len: usize) -> bool {
+        let cap = self.max_buffer_bytes.load(Ordering::Relaxed);
+        let incoming = charge_of(line_len, 1);
+        let over = {
+            let active = self.active.lock();
+            (active.charge() + self.staged.bytes.load(Ordering::Relaxed) + incoming)
+                .saturating_sub(cap)
+        };
+        if over == 0 {
+            return true;
         }
+
+        // Shed the OLDEST staged batches first: current operational state
+        // is worth more than history, and the in-flight batch is already
+        // owned by the write task and cannot be reclaimed.
+        let mut reclaimed = 0usize;
+        {
+            let mut pending = self.pending.lock();
+            while reclaimed < over {
+                let Some(dropped) = pending.pop_front() else {
+                    break;
+                };
+                reclaimed += batch_charge(&dropped);
+                self.staged
+                    .release(dropped.events.len(), batch_charge(&dropped));
+                self.record_cap_drop(dropped.events.len() as u64, dropped.bytes.len() as u64);
+            }
+        }
+        if reclaimed >= over {
+            return true;
+        }
+
+        self.record_cap_drop(1, line_len as u64);
+        false
+    }
+
+    /// Count `events`/`bytes` lost to the shared budget: local accounting
+    /// for the `telemetry_dropped` recovery record plus the scrapeable
+    /// counters (which stay visible precisely while self-ingestion is not).
+    fn record_cap_drop(&self, events: u64, bytes: u64) {
+        self.dropped.cap_events.fetch_add(events, Ordering::Relaxed);
+        self.dropped.cap_bytes.fetch_add(bytes, Ordering::Relaxed);
+        metrics::counter!(
+            crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
+            "reason" => "buffer_cap"
+        )
+        .increment(events);
+        metrics::counter!(
+            crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
+            "reason" => "buffer_cap"
+        )
+        .increment(bytes);
     }
 
     /// Pop the oldest pending batch for a write attempt. No lock is held
-    /// by the caller across the write itself.
+    /// by the caller across the write itself. The batch stays charged to
+    /// [`Self::staged`] while it is in flight — it is still resident
+    /// memory, and a wedged write must not make it invisible to the cap.
     fn pop_oldest(&self) -> Option<Batch> {
         self.pending.lock().pop_front()
     }
@@ -464,6 +582,11 @@ impl WalLayerInner {
     /// Then emit the `telemetry_dropped` recovery record if any loss
     /// accumulated (safe from recursion: `on_event` only buffers).
     fn publish(&self, env: &str, wal_path: &std::path::Path, batch: Batch) {
+        // The batch leaves the layer's accounting here: the hot buffer
+        // takes ownership under its OWN `hot_buffer_max_bytes` budget.
+        self.staged
+            .release(batch.events.len(), batch_charge(&batch));
+
         if !batch.events.is_empty() {
             // batch_id MUST match the WAL filename stem so compaction can
             // drain the hot buffer after writing parquet.
@@ -523,16 +646,18 @@ impl WalLayerInner {
         }
     }
 
-    /// Refresh the retry-queue depth gauges (per flush cycle).
+    /// Refresh the buffer-depth gauges (per flush cycle). They report the
+    /// WHOLE charge against `telemetry_buffer_max_bytes` — active buffer,
+    /// retry queue and in-flight batch — so the exported number is the one
+    /// the cap is applied to.
     #[allow(clippy::cast_precision_loss)]
     fn update_gauges(&self) {
-        let (events, bytes) = {
-            let pending = self.pending.lock();
-            (
-                pending.iter().map(|b| b.events.len()).sum::<usize>(),
-                pending.iter().map(batch_charge).sum::<usize>(),
-            )
+        let (active_events, active_bytes) = {
+            let active = self.active.lock();
+            (active.events.len(), active.charge())
         };
+        let events = active_events + self.staged.events.load(Ordering::Relaxed);
+        let bytes = active_bytes + self.staged.bytes.load(Ordering::Relaxed);
         metrics::gauge!(crate::metrics::TELEMETRY_BUFFER_EVENTS).set(events as f64);
         metrics::gauge!(crate::metrics::TELEMETRY_BUFFER_BYTES).set(bytes as f64);
     }
@@ -746,6 +871,13 @@ where
         let mut line = serde_json::to_vec(&serde_json::Value::Object(record.clone()))
             .expect("JSON serialization of Value is infallible");
         line.push(b'\n');
+
+        // The shared budget is enforced HERE, over the active buffer, the
+        // retry queue and any in-flight batch together — the only point
+        // that bounds memory while a wedged WAL write holds a batch.
+        if !self.inner.admit(line.len()) {
+            return;
+        }
 
         let mut active = self.inner.active.lock();
         active.bytes.extend_from_slice(&line);
@@ -1411,7 +1543,8 @@ mod tests {
         tracing::info!(event_type = "batch_b", "second");
         layer_ref.flush_cycle().await;
 
-        // Cap: exactly what A+B charge — staging C must evict A alone.
+        // Cap: exactly what A+B charge — admitting C (same shape as A, so
+        // the same charge) must shed A alone.
         let (a_bytes, cap) = {
             let pending = layer_ref.inner.pending.lock();
             assert_eq!(pending.len(), 2);
@@ -1422,7 +1555,7 @@ mod tests {
         };
         layer_ref
             .inner
-            .max_pending_bytes
+            .max_buffer_bytes
             .store(cap, Ordering::Relaxed);
 
         tracing::info!(event_type = "batch_c", "third");
@@ -1441,6 +1574,15 @@ mod tests {
             layer_ref.inner.dropped.cap_bytes.load(Ordering::Relaxed),
             a_bytes,
             "exact dropped byte total"
+        );
+
+        // Accounting proven. Restore a normal budget before draining: the
+        // recovery record is itself an event under the SAME shared budget,
+        // and a cap sized for exactly two events would shed a survivor to
+        // make room for it.
+        layer_ref.inner.max_buffer_bytes.store(
+            trawl_config::DEFAULT_TELEMETRY_BUFFER_MAX_BYTES,
+            Ordering::Relaxed,
         );
 
         // Repair; survivors drain in FIFO order. The recovery record is
@@ -1468,6 +1610,90 @@ mod tests {
         assert_eq!(dropped_report[0]["dropped_events"], 1);
         assert_eq!(dropped_report[0]["dropped_events_buffer_cap"], 1);
         assert_eq!(dropped_report[0]["dropped_bytes_buffer_cap"], a_bytes);
+    }
+
+    /// The budget must cover ACTIVE and IN-FLIGHT memory, not just the
+    /// queue. A batch handed to a wedged write is popped from `pending`
+    /// but still resident; if the cap ignored it (and exempted the newest
+    /// batch), a WAL stall plus a log burst would grow memory without
+    /// bound.
+    #[tokio::test]
+    async fn shared_budget_covers_active_and_in_flight_memory() {
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = broken_wal_root(tmp.path());
+        let writer = Arc::new(WalWriter::new(wal_root));
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+
+        let layer = WalLayer::new(handle, "prod");
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // One batch staged, then handed to a "write" that never returns:
+        // popped from the queue, still in memory.
+        tracing::info!(event_type = "wedged", "in flight");
+        layer_ref.inner.stage();
+        let in_flight = layer_ref.inner.pop_oldest().expect("batch staged");
+        let charge = batch_charge(&in_flight);
+        assert!(layer_ref.inner.pending.lock().is_empty());
+        assert_eq!(
+            layer_ref.inner.staged.bytes.load(Ordering::Relaxed),
+            charge,
+            "an in-flight batch stays charged to the shared budget"
+        );
+
+        // Budget is now fully spent by the in-flight batch alone: nothing
+        // is left to shed, so the burst must be dropped, not buffered.
+        layer_ref
+            .inner
+            .max_buffer_bytes
+            .store(charge, Ordering::Relaxed);
+        let filler = "y".repeat(4096);
+        for _ in 0..50 {
+            tracing::info!(event_type = "burst", payload = %filler, "stall burst");
+        }
+
+        {
+            let active = layer_ref.inner.active.lock();
+            assert!(
+                active.bytes.is_empty() && active.events.is_empty(),
+                "active buffer must not grow past the shared budget"
+            );
+        }
+        assert_eq!(
+            layer_ref.inner.dropped.cap_events.load(Ordering::Relaxed),
+            50,
+            "every dropped event is counted — the newest is not exempt"
+        );
+        assert!(
+            layer_ref.inner.dropped.cap_bytes.load(Ordering::Relaxed) > 0,
+            "dropped bytes are counted"
+        );
+
+        // The gauge reports the whole charge, in-flight batch included.
+        layer_ref.inner.update_gauges();
+        assert_eq!(
+            layer_ref.inner.staged.events.load(Ordering::Relaxed),
+            in_flight.events.len()
+        );
+
+        // Releasing the in-flight batch frees the budget again.
+        layer_ref
+            .inner
+            .staged
+            .release(in_flight.events.len(), charge);
+        assert_eq!(layer_ref.inner.staged.bytes.load(Ordering::Relaxed), 0);
+        layer_ref.inner.max_buffer_bytes.store(
+            trawl_config::DEFAULT_TELEMETRY_BUFFER_MAX_BYTES,
+            Ordering::Relaxed,
+        );
+        tracing::info!(event_type = "after", "buffering resumes");
+        assert!(!layer_ref.inner.active.lock().events.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1590,10 +1816,7 @@ mod tests {
         layer_ref.flush_cycle().await;
         tracing::info!(event_type = "m2", "second");
         layer_ref.flush_cycle().await;
-        layer_ref
-            .inner
-            .max_pending_bytes
-            .store(1, Ordering::Relaxed);
+        layer_ref.inner.max_buffer_bytes.store(1, Ordering::Relaxed);
         tracing::info!(event_type = "m3", "third");
         layer_ref.flush_cycle().await;
 

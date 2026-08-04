@@ -172,11 +172,13 @@ database_url = "postgres://fleet:fleet@localhost:5433/trawl"
 # disk I/O from more frequent small writes.
 # telemetry_flush_interval_secs = 1
 
-# Memory cap for the internal-telemetry retry queue while the WAL is
-# unhealthy (a failed flush retains its batch for retry instead of
-# dropping it). Like hot_buffer_max_bytes this is an estimate: serialized
-# ndjson plus the retained event maps plus per-event overhead. On
-# overflow the OLDEST batches are dropped, counted in
+# ONE memory budget for everything internal telemetry holds while the WAL
+# is unhealthy: the active buffer, the retry queue (a failed flush retains
+# its batch instead of dropping it) and the batch in flight through a
+# write. Like hot_buffer_max_bytes this is an estimate: serialized ndjson
+# plus the retained event maps plus per-event overhead. It is enforced as
+# events arrive — over budget, the OLDEST queued batches are shed first
+# and then the incoming event itself is dropped, all counted in
 # trawl_telemetry_events_dropped_total{reason="buffer_cap"}.
 # telemetry_buffer_max_bytes = "16M"
 

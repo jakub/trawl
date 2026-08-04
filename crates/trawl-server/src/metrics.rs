@@ -142,7 +142,8 @@ pub fn describe_metrics() {
         TELEMETRY_EVENTS_DROPPED_TOTAL,
         "Self-telemetry events dropped, labelled by reason (preinit_cap = \
          bootstrap buffer overflow before the WAL writer was injected, \
-         buffer_cap = retry-queue overflow during a prolonged WAL outage)"
+         buffer_cap = the shared active+queue+in-flight memory budget was \
+         full during a prolonged WAL outage)"
     );
     describe_counter!(
         TELEMETRY_BYTES_DROPPED_TOTAL,
@@ -152,15 +153,15 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         TELEMETRY_BUFFER_EVENTS,
-        "Events retained in the self-telemetry retry queue awaiting a \
-         successful WAL write; nonzero across cycles means the WAL is \
-         unhealthy — warns before loss begins"
+        "Self-telemetry events held in memory — active buffer, retry queue \
+         and the batch in flight through a WAL write; nonzero across cycles \
+         means the WAL is unhealthy — warns before loss begins"
     );
     describe_gauge!(
         TELEMETRY_BUFFER_BYTES,
         "Estimated bytes charged against ingest.telemetry_buffer_max_bytes \
-         by the self-telemetry retry queue (serialized bytes plus retained \
-         event maps)"
+         by ALL self-telemetry memory — active buffer, retry queue and the \
+         in-flight batch (serialized bytes plus retained event maps)"
     );
 }
 

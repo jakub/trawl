@@ -324,12 +324,14 @@ pub struct IngestConfig {
     #[serde(default = "default_telemetry_flush_interval_secs")]
     pub telemetry_flush_interval_secs: u64,
 
-    /// Cap on memory retained by the internal-telemetry retry queue while
-    /// the WAL is unhealthy. Default: 16 MiB. Accepts human-readable sizes
-    /// like `"16M"`. Like `hot_buffer_max_bytes`, the charge is an
+    /// One cap on ALL memory internal telemetry holds while the WAL is
+    /// unhealthy: the active buffer, the retry queue, and the batch in
+    /// flight through a write. Default: 16 MiB. Accepts human-readable
+    /// sizes like `"16M"`. Like `hot_buffer_max_bytes`, the charge is an
     /// estimate: serialized ndjson bytes plus the retained event maps
     /// (which hold roughly the same payload again) plus a fixed per-event
-    /// overhead. On overflow the oldest batches are dropped and counted
+    /// overhead. Enforced as events arrive: over budget the oldest queued
+    /// batches are shed first and then the incoming event itself, counted
     /// in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}`.
     #[serde(
         default = "default_telemetry_buffer_max_bytes",
