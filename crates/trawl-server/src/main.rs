@@ -35,6 +35,14 @@ struct Cli {
     no_monitor: bool,
 }
 
+/// Wall-clock cap on how long process exit waits for blocking-pool work
+/// that has already STARTED — chiefly the telemetry/WAL durability
+/// barriers (fsync, dir-fsync). Dropping a Tokio runtime normally waits on
+/// those forever, so a frozen volume would stall restarts and rolling
+/// deployments indefinitely; past this budget the runtime is abandoned and
+/// the process exits with the wedged thread still parked in the kernel.
+const RUNTIME_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Install crash-dump capture before any threads are spawned or the async
     // runtime is built: the minidump monitor is launched by re-execing this
@@ -42,10 +50,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // monitor mode this never returns. Held for the whole process lifetime.
     let _crashdump = trawl_crashdump::init();
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(async_main())
+        .build()?;
+    let result = runtime.block_on(async_main());
+    // Bounded exit: `async_main` has already run the graceful shutdown
+    // sequence (each task under its own budget), so anything still running
+    // here is a wedged blocking operation, not pending work worth waiting on.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_BUDGET);
+    result
 }
 
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive

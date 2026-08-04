@@ -53,11 +53,14 @@
 //!
 //! The async flush task runs each WAL write (create, write, fsync,
 //! rename, dir-fsync) on the blocking pool via `spawn_blocking` —
-//! [`WalLayer::flush`] stays synchronous for tests only. On shutdown the
-//! final drain runs under a wall-clock budget; the timeout abandons the
-//! await, not the blocking thread, so a truly wedged fsync leaves one
-//! lingering blocking thread at process exit (accepted and preferable to
-//! hanging shutdown).
+//! [`WalLayer::flush`] stays synchronous for tests only. Shutdown is
+//! bounded end to end on a frozen volume: the periodic flush is raced
+//! against the shutdown signal (so a wedged fsync cannot keep the task
+//! from OBSERVING it), the final drain runs under a wall-clock budget,
+//! and `trawld`'s `Runtime::shutdown_timeout` bounds the process exit
+//! itself — a plain runtime drop waits on started blocking tasks forever.
+//! A truly wedged fsync therefore leaves one lingering blocking thread at
+//! process exit (accepted and preferable to hanging shutdown).
 //!
 //! ## Infinite recursion guard
 //!
@@ -790,6 +793,9 @@ fn message_to_event_type(message: &str) -> String {
 /// Wall-clock budget for the final shutdown flush. The timeout abandons
 /// the await, not the blocking thread — a wedged fsync leaves one
 /// lingering blocking thread at process exit rather than hanging shutdown.
+/// The process-exit side of that contract is `trawld`'s
+/// `Runtime::shutdown_timeout`, which stops the runtime drop from waiting
+/// on that thread forever.
 const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 
 /// Spawn the periodic buffer flush task.
@@ -798,6 +804,13 @@ const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(5);
 /// the blocking pool ([`WalLayer::flush_cycle`]). Returns a [`JoinHandle`]
 /// for shutdown coordination. Send `true` on `shutdown_rx` to trigger a
 /// final bounded flush and exit.
+///
+/// Shutdown is bounded even while a PERIODIC flush is wedged: the periodic
+/// flush is itself raced against `shutdown_rx`, so the signal is observed
+/// without waiting for an fsync that may never return. Abandoning an
+/// in-flight flush costs the in-flight batch's VISIBILITY, never its
+/// durability — the blocking write it was handed to keeps running, and
+/// anything it lands in the WAL is picked up by compaction.
 pub fn spawn_flush_task(
     layer: WalLayer,
     interval: Duration,
@@ -807,15 +820,39 @@ pub fn spawn_flush_task(
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    layer.flush_cycle().await;
+                    tokio::select! {
+                        () = layer.flush_cycle() => {}
+                        _ = shutdown_rx.changed() => {
+                            final_flush(&layer).await;
+                            break;
+                        }
+                    }
                 }
                 _ = shutdown_rx.changed() => {
-                    let _ = tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, layer.flush_cycle()).await;
+                    final_flush(&layer).await;
                     break;
                 }
             }
         }
     })
+}
+
+/// The final drain, capped at [`SHUTDOWN_FLUSH_BUDGET`].
+///
+/// Reports an exhausted budget on stderr, not through `tracing`: this runs
+/// inside the flush path, and the layer's buffer is about to be abandoned
+/// anyway, so a tracing event would be both re-entrant risk and invisible.
+async fn final_flush(layer: &WalLayer) {
+    if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, layer.flush_cycle())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "[trawld] telemetry shutdown flush exceeded {}s budget; \
+             abandoning buffered telemetry events",
+            SHUTDOWN_FLUSH_BUDGET.as_secs()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,6 +1497,70 @@ mod tests {
             .await
             .expect("flush task must exit within the shutdown budget")
             .expect("flush task panicked");
+    }
+
+    /// The frozen-volume case: the flush is BLOCKED, not failing. A wedged
+    /// fsync is modelled by saturating the blocking pool the WAL write is
+    /// dispatched to — `flush_cycle` then parks with no error to report,
+    /// exactly as it would behind a hung `sync_all`. The periodic flush is
+    /// in flight when the signal arrives, so this fails (hangs) unless
+    /// shutdown is raced against it.
+    #[test]
+    fn shutdown_exits_while_a_periodic_flush_is_blocked() {
+        use tracing_subscriber::prelude::*;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+
+        rt.block_on(async {
+            // Occupy the pool's ONLY blocking thread: every later
+            // `spawn_blocking` — the WAL write included — is queued and
+            // never runs.
+            tokio::task::spawn_blocking(move || {
+                parked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            parked_rx.recv().unwrap();
+
+            // A healthy WAL root: the write would SUCCEED if it ever ran,
+            // so nothing here is an error path.
+            let tmp = tempfile::tempdir().unwrap();
+            let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
+            writer.ensure_dir().unwrap();
+
+            let handle = WalHandle::new();
+            handle.set(Arc::clone(&writer), "prod");
+
+            let layer = WalLayer::new(handle, "prod");
+            let subscriber = tracing_subscriber::registry().with(layer.clone());
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            tracing::info!(event_type = "shutdown_test", "buffered event");
+
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let join = spawn_flush_task(layer, Duration::from_millis(10), shutdown_rx);
+
+            // Let the periodic flush start and wedge before signalling.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            shutdown_tx.send(true).unwrap();
+
+            tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET * 4, join)
+                .await
+                .expect("flush task must exit while a flush is wedged")
+                .expect("flush task panicked");
+        });
+
+        // Release the parked thread, then bound the runtime drop the same
+        // way `trawld`'s `main` does.
+        drop(release_tx);
+        rt.shutdown_timeout(Duration::from_secs(5));
     }
 
     #[tokio::test]
