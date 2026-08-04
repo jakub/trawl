@@ -358,21 +358,23 @@ async fn run(args: Cli) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Dispatch `trawl schema <cmd>`. Connection resolution mirrors `validate`:
-/// embedded `--data` needs no server, everything else does.
+/// Dispatch `trawl schema <cmd>`. Connection resolution mirrors `query`,
+/// not `validate`: only `fields --data` has a serverless fallback, so for
+/// everything else a token-resolution failure IS the answer and must
+/// surface as itself — swallowing it into `Option` used to re-report a
+/// broken profile as "schema field requires a server".
 async fn run_schema(
     cmd: SchemaSubcommand,
     cfg: &config::Config,
     token: Option<&str>,
 ) -> Result<(), CliError> {
-    let conn = |token: Option<&str>| -> Option<cli::ConnectionParams> {
-        cfg.load_token(token)
-            .ok()
-            .map(|token| cli::ConnectionParams {
-                url: cfg.server.url.clone(),
-                token,
-                insecure: cfg.server.insecure,
-            })
+    let conn = |token: Option<&str>| -> Result<cli::ConnectionParams, CliError> {
+        let token = cfg.load_token(token)?;
+        Ok(cli::ConnectionParams {
+            url: cfg.server.url.clone(),
+            token,
+            insecure: cfg.server.insecure,
+        })
     };
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -384,7 +386,11 @@ async fn run_schema(
             data,
             format,
         } => {
-            let conn = if data.is_some() { None } else { conn(token) };
+            let conn = if data.is_some() {
+                None
+            } else {
+                Some(conn(token)?)
+            };
             schema::run_fields(
                 &mut out,
                 conn,
@@ -404,7 +410,7 @@ async fn run_schema(
         } => {
             schema::run_field(
                 &mut out,
-                conn(token),
+                Some(conn(token)?),
                 &name,
                 limit,
                 after.as_deref(),
@@ -421,7 +427,7 @@ async fn run_schema(
         } => {
             schema::run_conflicts(
                 &mut out,
-                conn(token),
+                Some(conn(token)?),
                 field.as_deref(),
                 service.as_deref(),
                 last.as_deref(),
