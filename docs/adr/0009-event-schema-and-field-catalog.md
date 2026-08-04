@@ -239,7 +239,13 @@ late-arriving data. Nothing records what the server changed about an event.
   the other way.]**
 - `/api/v1/schema` stops being a corpus-wide `DESCRIBE` behind a TTL cache and
   becomes a `SELECT`. It gains the per-service answer it cannot give today, which
-  is the question a schema browser is actually for.
+  is the question a schema browser is actually for. **[Slice 3 (#51) as built:
+  the `DESCRIBE` is gone, but the TTL is not — the *unscoped* column set
+  aggregates observations across every client-chosen service and is what
+  autocomplete polls, so it went back behind the same `schema_cache_ttl_secs`.
+  A `?service=` request is always served fresh; it is bounded by the pin cap
+  through a `field_services (service, field)` index, and keying a cache on a
+  client-chosen service name would be an unbounded cache.]**
 - Embedded mode (`trawl query --data '*.parquet'`) needs no catalog: the files it
   reads are conformant because a server holding a catalog wrote them.
 - An early bad sample can still pin a field wrongly. This is why the repin path
