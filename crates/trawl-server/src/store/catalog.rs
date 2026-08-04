@@ -59,6 +59,24 @@ pub struct FieldConflict {
     pub rows_nulled: u64,
 }
 
+/// One `(field, service)` observation reconstructed from a standing parquet
+/// file rather than reported by the batch that wrote it — the boot
+/// conformance pass's backfill ([`CatalogStore::backfill_services`]).
+#[derive(Debug, Clone)]
+pub struct ServiceObservation {
+    /// Field name (already ASCII-folded — a catalog key).
+    pub field: String,
+    /// Service that carries the field.
+    pub service: String,
+    /// Earliest instant the corpus attests to (the oldest partition
+    /// directory carrying the column).
+    pub first_seen: DateTime<Utc>,
+    /// Latest instant the corpus attests to (the newest such partition).
+    pub last_seen: DateTime<Utc>,
+    /// Rows the corpus holds for this `(field, service)` pair.
+    pub row_count: i64,
+}
+
 /// A `field_services` observation row.
 #[derive(Debug, Clone)]
 pub struct FieldServiceRow {
@@ -238,6 +256,11 @@ pub const MAX_PINNED_FIELDS: i64 = 10_000;
 /// operator WHICH values a pin is currently costing them, and the newest
 /// evidence is the evidence they act on.
 pub const MAX_CONFLICTS_PER_FIELD: i64 = 100;
+
+/// Rows per statement in [`CatalogStore::backfill_services`]. The backfill's
+/// size is (pinned fields x services), which nothing bounds below five
+/// figures, so it is written in chunks rather than one array-of-everything.
+const BACKFILL_CHUNK: usize = 1_000;
 
 /// One field name shortened for logging: a name can be as long as a client
 /// made it, so echoing it whole turns the log line into an amplifier of
@@ -578,6 +601,73 @@ impl CatalogStore {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    /// Backfill observations for a corpus that predates the catalog — the
+    /// boot conformance pass, not the ingest path.
+    ///
+    /// `field_services` is the authority behind `?service=` and the
+    /// `last_seen` window on the schema surfaces, and only compaction ever
+    /// wrote it: on an upgrade, migration 0002 creates the table EMPTY while
+    /// the boot pass pins (and rewrites) a corpus that no live batch will
+    /// re-observe until its service next sends the field. A service that
+    /// stopped sending — or an env retired but retained — would therefore
+    /// answer `?service=` with nothing at all, and its pins would sit outside
+    /// the `last_seen` window forever (a never-observed pin is always shown,
+    /// by design). This closes that gap from the standing files themselves.
+    ///
+    /// **Idempotent**, because the pass re-runs on every boot until the
+    /// corpus is proven conformant: `first_seen` only moves earlier,
+    /// `last_seen` only later, and `row_count` takes the MAX rather than
+    /// accumulating — so re-running over the same corpus is a no-op and a
+    /// live tick's accumulated count is never clobbered downward by a
+    /// backfill that sees a retention-shrunk corpus.
+    ///
+    /// Callers must pass at most one row per `(field, service)`: postgres
+    /// refuses to let one `ON CONFLICT DO UPDATE` statement touch a row
+    /// twice. The only caller aggregates into a map keyed by exactly that
+    /// pair.
+    pub async fn backfill_services(
+        &self,
+        observations: &[ServiceObservation],
+    ) -> Result<(), StoreError> {
+        let rejected = unstorable_names(observations.iter().map(|o| o.field.as_str()));
+        if !rejected.is_empty() {
+            warn_unstorable("backfill", &rejected);
+        }
+        let storable: Vec<&ServiceObservation> = observations
+            .iter()
+            .filter(|o| trawl_core::schema::is_storable_field_name(&o.field))
+            .collect();
+
+        // Chunked: the row count is (pinned fields x services a deployment
+        // ships), which the pin cap bounds at five figures on one axis alone
+        // — too many parameters' worth of arrays for a single statement.
+        for chunk in storable.chunks(BACKFILL_CHUNK) {
+            let fields: Vec<&str> = chunk.iter().map(|o| o.field.as_str()).collect();
+            let services: Vec<&str> = chunk.iter().map(|o| o.service.as_str()).collect();
+            let first: Vec<DateTime<Utc>> = chunk.iter().map(|o| o.first_seen).collect();
+            let last: Vec<DateTime<Utc>> = chunk.iter().map(|o| o.last_seen).collect();
+            let rows: Vec<i64> = chunk.iter().map(|o| o.row_count).collect();
+
+            sqlx::query(
+                "INSERT INTO field_services (field, service, first_seen, last_seen, row_count)
+                 SELECT * FROM UNNEST(
+                     $1::text[], $2::text[], $3::timestamptz[], $4::timestamptz[], $5::bigint[])
+                 ON CONFLICT (field, service) DO UPDATE
+                 SET first_seen = LEAST(field_services.first_seen, EXCLUDED.first_seen),
+                     last_seen  = GREATEST(field_services.last_seen, EXCLUDED.last_seen),
+                     row_count  = GREATEST(field_services.row_count, EXCLUDED.row_count)",
+            )
+            .bind(&fields)
+            .bind(&services)
+            .bind(&first)
+            .bind(&last)
+            .bind(&rows)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 

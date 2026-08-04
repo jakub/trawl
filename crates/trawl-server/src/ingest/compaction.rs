@@ -1119,31 +1119,79 @@ pub(crate) fn record_conflict_metrics(service: &str, conflicts: &[FieldConflict]
     }
 }
 
-/// Best-effort catalog bookkeeping after a successful conformant write:
-/// conflict rows and per-service field observations. Failures warn — the
-/// parquet is already durable and conformant, so retrying the batch for a
-/// bookkeeping error would duplicate data.
+/// Attempts a bookkeeping write gets before it is given up on, and the base
+/// of its exponential backoff.
+///
+/// The parquet is already durable when these run, so a failure cannot fail
+/// the batch — but it can leave a permanent hole: `field_services` is the
+/// authority behind `?service=` and the `last_seen` window, and a lost
+/// observation is re-made only when that service next sends that field,
+/// which for a field it has stopped sending is never. A momentary postgres
+/// blip (failover, restart, a full pool) is therefore worth riding out
+/// in-tick — bounded well under the compaction interval so a sustained
+/// outage stalls nothing.
+const BOOKKEEPING_ATTEMPTS: u32 = 3;
+/// Base delay between bookkeeping attempts; doubles per attempt.
+const BOOKKEEPING_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Run one bookkeeping write, retrying a transient failure.
+///
+/// Both writes are safe to repeat after a failure: `touch_services` is an
+/// upsert and `record_conflicts` commits atomically. The one case a retry
+/// can double is a LOST ACK (postgres committed, the answer never arrived),
+/// which over-counts a `row_count` that is already an approximation or
+/// re-appends conflict evidence the per-field trim bounds anyway — both
+/// strictly better than the gap the retry exists to prevent.
+async fn retry_bookkeeping<F, Fut>(what: &'static str, service: &str, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), crate::store::StoreError>>,
+{
+    for n in 1..=BOOKKEEPING_ATTEMPTS {
+        let Err(e) = attempt().await else {
+            return;
+        };
+        if n == BOOKKEEPING_ATTEMPTS {
+            tracing::warn!(
+                event_type = "catalog_bookkeeping_error",
+                compact_service = %service,
+                write = what,
+                attempts = n,
+                error = %e,
+                "catalog bookkeeping write failed and was given up on"
+            );
+            return;
+        }
+        tracing::debug!(
+            event_type = "catalog_bookkeeping_retry",
+            compact_service = %service,
+            write = what,
+            attempt = n,
+            error = %e,
+            "catalog bookkeeping write failed; retrying"
+        );
+        tokio::time::sleep(BOOKKEEPING_BACKOFF * 2u32.pow(n - 1)).await;
+    }
+}
+
+/// Catalog bookkeeping after a successful conformant write: conflict rows
+/// and per-service field observations. Retried, then warned — the parquet is
+/// already durable and conformant, so retrying the BATCH for a bookkeeping
+/// error would duplicate data.
 async fn record_batch_bookkeeping(cat: &CatalogContext, service: &str, report: &WriteReport) {
-    if let Err(e) = cat.store.record_conflicts(&report.conflicts).await {
-        tracing::warn!(
-            event_type = "catalog_bookkeeping_error",
-            compact_service = %service,
-            error = %e,
-            "failed to record field_conflicts rows"
-        );
-    }
-    if let Err(e) = cat
-        .store
-        .touch_services(service, &report.observed_fields, report.batch_rows)
-        .await
-    {
-        tracing::warn!(
-            event_type = "catalog_bookkeeping_error",
-            compact_service = %service,
-            error = %e,
-            "failed to update field_services observations"
-        );
-    }
+    let store = &cat.store;
+    let conflicts = &report.conflicts;
+    retry_bookkeeping("field_conflicts", service, move || {
+        store.record_conflicts(conflicts)
+    })
+    .await;
+
+    let observed = &report.observed_fields;
+    let rows = report.batch_rows;
+    retry_bookkeeping("field_services", service, move || {
+        store.touch_services(service, observed, rows)
+    })
+    .await;
 }
 
 /// Count rows in a `DuckDB` table. Used to capture row counts before

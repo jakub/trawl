@@ -189,6 +189,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             scanned = summary.scanned,
             rewritten = summary.rewritten,
             skipped = summary.skipped,
+            observed = summary.observed,
             "boot conformance pass finished"
         );
     } else {

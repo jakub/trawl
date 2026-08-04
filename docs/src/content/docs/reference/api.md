@@ -96,6 +96,13 @@ Parameters:
 | `service` | Only fields that service has carried. |
 | `all` | `true` lifts the retention window: by default a field whose most recent observation predates `[retention] max_age_days` (default 90; 0 disables) is hidden. A field with no observations at all (e.g. the envelope on a fresh install) is always shown. |
 
+Observations come from compaction, and — for a corpus that predates the
+catalog — from the boot conformance pass, which backfills them from the
+files it adopts (timestamps taken from each file's partition hour, not from
+boot time). So `?service=` and the window answer for historical data too;
+a corpus older than `max_age_days` that retention has not yet pruned needs
+`?all=true` to list its fields.
+
 ```
 GET /api/v1/schema/fields
 GET /api/v1/schema/fields?service=nginx&since_secs=604800&limit=100

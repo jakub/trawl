@@ -107,12 +107,25 @@ async fn query_rejects_bad_dsl(pool: sqlx::PgPool) {
 
 // -- schema endpoint tests ---------------------------------------------------
 
+/// The fixture corpus is dated 2024-01-15 — years outside the default
+/// 90-day retention window — and the boot conformance pass backfills
+/// `field_services` from the partition directories it adopted, so its fields
+/// are legitimately aged out of the DEFAULT listing. `?all=true` is the
+/// window-lifted view this test wants (the windowing itself is covered by
+/// `catalog_surface::aged_out_field_windowed_away_unless_all`).
 #[sqlx::test(migrations = false)]
 async fn schema_returns_columns(pool: sqlx::PgPool) {
     let server = setup(pool).await;
-    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    let schema = client.schema().await.unwrap();
+    let schema: trawl_api::SchemaResponse = raw_client()
+        .get(format!("{}/api/v1/schema?all=true", server.url))
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert!(!schema.columns.is_empty());
 
     // Our test fixture has these exact columns.
@@ -144,6 +157,16 @@ async fn schema_returns_columns(pool: sqlx::PgPool) {
         .find(|c| c.name == "severity")
         .unwrap();
     assert_eq!(severity.data_type, "BIGINT");
+
+    // And the default listing really does window: the backfilled
+    // observations put the fixture's own fields outside 90 days, leaving
+    // only pins no file carries (which have nothing to age out).
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let windowed = client.schema().await.unwrap();
+    assert!(
+        windowed.columns.len() < schema.columns.len(),
+        "a 2024 corpus must not all be inside a 90-day window"
+    );
 }
 
 #[sqlx::test(migrations = false)]

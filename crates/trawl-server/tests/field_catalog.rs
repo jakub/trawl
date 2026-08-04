@@ -1040,6 +1040,142 @@ mod boot {
         );
     }
 
+    /// The upgrade path: migration 0002 creates `field_services` EMPTY, and
+    /// only live compaction ever wrote it — so a corpus that predates the
+    /// catalog gets pins (and rewrites) but no observations, and the filters
+    /// those rows are authoritative for silently answer wrong: `?service=`
+    /// returns nothing for a service whose data all predates the upgrade,
+    /// and its pins sit outside the `last_seen` window forever (a
+    /// never-observed pin is always shown, by design). The boot pass must
+    /// backfill from the files it adopted.
+    #[sqlx::test]
+    async fn boot_pass_backfills_observations_for_a_pre_catalog_corpus(pool: sqlx::PgPool) {
+        use trawl_server::store::FieldListFilter;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // Two services with disjoint custom fields, three and two rows.
+        plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS duration FROM (VALUES (410), (420), (430)) t(x)",
+        );
+        plant(
+            &data_dir,
+            "prod/2026-08-01/11/svc-b.parquet",
+            "SELECT TIMESTAMP '2026-08-01 11:00:00' AS \"_time\", 'svc-b' AS service, \
+             '/api' AS path FROM (VALUES (1), (2)) t(x)",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+        assert!(summary.observed > 0, "the standing corpus must be observed");
+
+        // `?service=` answers for a service that has sent nothing since.
+        let by_service = |service: &str| FieldListFilter {
+            service: Some(service.to_owned()),
+            since: None,
+            limit: 100,
+        };
+        let (rows, _) = store.list_fields(&by_service("svc-a")).await.unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.field.as_str()).collect();
+        assert!(
+            names.contains(&"duration") && names.contains(&"_time"),
+            "svc-a's own columns must be listed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"path"),
+            "svc-b's column must not leak into svc-a's listing: {names:?}"
+        );
+
+        // Observations are stamped from the partition directory, not now(),
+        // and weighed by the rows the files hold.
+        let obs = store.field_services("duration").await.unwrap();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].service, "svc-a");
+        assert_eq!(obs[0].row_count, 3);
+        assert_eq!(obs[0].first_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
+        assert_eq!(obs[0].last_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
+
+        // So the `last_seen` window can age the corpus out at all — before
+        // the backfill these pins were unwindowable.
+        let (windowed, _) = store
+            .list_fields(&FieldListFilter {
+                service: None,
+                since: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+                        .unwrap()
+                        .into(),
+                ),
+                limit: 100,
+            })
+            .await
+            .unwrap();
+        let windowed: Vec<&str> = windowed.iter().map(|r| r.field.as_str()).collect();
+        assert!(
+            !windowed.contains(&"duration"),
+            "an observed-but-aged-out field must leave the window: {windowed:?}"
+        );
+        assert!(
+            windowed.contains(&"message"),
+            "a never-observed pin is always shown: {windowed:?}"
+        );
+
+        // Idempotent: the pass re-runs until the corpus is proven conformant
+        // (missing marker, restored data root), and a re-run must not
+        // re-accumulate the row counts it already recorded.
+        std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
+        let rerun = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(rerun.ran, "a missing marker forces the re-run");
+        let again = store.field_services("duration").await.unwrap();
+        assert_eq!(again[0].row_count, 3, "the backfill is idempotent");
+        assert_eq!(again[0].first_seen, obs[0].first_seen);
+        assert_eq!(again[0].last_seen, obs[0].last_seen);
+    }
+
+    /// A live tick's accumulated `row_count` must survive a later backfill
+    /// that sees a retention-shrunk corpus: the backfill takes the MAX, it
+    /// never rewrites a count downward.
+    #[sqlx::test]
+    async fn backfill_never_clobbers_a_live_count_downward(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS duration FROM (VALUES (410), (420), (430)) t(x)",
+        );
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        // Live compaction accumulates past the corpus the pass saw.
+        store
+            .touch_services("svc-a", &["duration".to_owned()], 900)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+
+        let obs = store.field_services("duration").await.unwrap();
+        assert_eq!(obs[0].row_count, 903, "the live count stands");
+        assert!(
+            obs[0].last_seen > obs[0].first_seen,
+            "the live touch's now() stays the latest observation"
+        );
+    }
+
     /// `data/scheduled/**` holds report-run outputs, not the log corpus —
     /// the boot pass must never scan it: no pins from its columns, no
     /// rewrite of its files.

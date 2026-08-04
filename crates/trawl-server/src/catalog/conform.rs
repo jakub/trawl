@@ -56,6 +56,15 @@
 //! because "readable" is not "mine", and silently rewriting someone else's
 //! file would be the destructive surprise [`skip_file`] exists to refuse.
 //!
+//! The pass also BACKFILLS `field_services` from the files it adopted. Those
+//! rows are the authority behind `?service=` and the `last_seen` window on
+//! the schema surfaces, and until this they were written only by live
+//! compaction — so on an upgrade the migration created the table empty and a
+//! service whose data all predates the catalog answered `?service=` with
+//! nothing while its pins sat outside every window forever. The backfill is
+//! idempotent (the pass re-runs until the corpus is proven conformant) and
+//! stamped from each file's partition directory, never `now()`.
+//!
 //! This machinery is deliberately the embryo of the repin rewriter (#53).
 
 use std::collections::HashMap;
@@ -68,7 +77,7 @@ use crate::ingest::compaction::{
     AGG_CHUNK_COLS, ColInfo, ConformPlan, ConformPolicy, describe_source, is_valid_parquet,
     quote_ident,
 };
-use crate::store::{CatalogStore, FieldConflict, PinProposal};
+use crate::store::{CatalogStore, FieldConflict, PinProposal, ServiceObservation};
 
 /// Marker file mirroring `catalog_state.catalog_id` into the data root.
 const CATALOG_MARKER: &str = "CATALOG";
@@ -88,6 +97,8 @@ pub struct ConformSummary {
     /// Files skipped as unreadable or foreign (nonzero = the corpus was not
     /// proven conformant, so completion is withheld and the next boot re-runs).
     pub skipped: usize,
+    /// `(field, service)` observations backfilled from the standing corpus.
+    pub observed: usize,
 }
 
 /// One scanned parquet file. Only ever built for a path that read back as
@@ -97,8 +108,13 @@ struct FileScan {
     path: PathBuf,
     service: String,
     /// The instant this file's partition directory claims — the rewrite's
-    /// never-NULL `_time`/`_ingested` fallback (see [`layout_path`]).
+    /// never-NULL `_time`/`_ingested` fallback (see [`layout_path`]), and
+    /// the `first_seen`/`last_seen` the observation backfill attributes to
+    /// every field the file carries.
     time_fallback: chrono::DateTime<chrono::Utc>,
+    /// Rows in the file, straight from its footer — the weight the
+    /// observation backfill gives this file (see [`corpus_observations`]).
+    rows: u64,
     schema: Vec<ColInfo>,
     /// Non-null row count per column, positionally parallel to `schema`.
     /// This — not the file's total row count — is a column's voting weight:
@@ -264,6 +280,7 @@ pub async fn ensure_conformance(
             scanned: 0,
             rewritten: 0,
             skipped: 0,
+            observed: 0,
         });
     }
 
@@ -309,6 +326,11 @@ pub async fn ensure_conformance(
         .map_err(|e| format!("failed to seed pins: {e}"))?;
     let pins: HashMap<String, CanonicalType> = hydrate(store, cache).await?.into_iter().collect();
 
+    // What the standing corpus attests to, read off the scan before it is
+    // consumed by the rewrite. Written after phase B, so a crash mid-rewrite
+    // cannot leave observations claiming files that were never conformed.
+    let observations = corpus_observations(&scan, &pins);
+
     // Phase B (blocking): rewrite the nonconforming files.
     let scanned = scan.len();
     let (rewritten, rewrite_skipped, conflicts) = {
@@ -323,38 +345,31 @@ pub async fn ensure_conformance(
     let skipped = scan_skipped + rewrite_skipped;
 
     record_boot_conflicts(store, &conflicts).await;
+
+    // NOT best-effort, unlike the conflict evidence: `field_services` is the
+    // authority behind `?service=` and the `last_seen` window, and this pass
+    // is the ONLY thing that will ever observe a corpus no live batch
+    // re-sends. Dropping it with a warning would publish the marker over a
+    // permanent gap; failing the boot leaves the pass armed for the retry.
+    let observed = observations.len();
+    store
+        .backfill_services(&observations)
+        .await
+        .map_err(|e| format!("failed to backfill field_services observations: {e}"))?;
+
     if rewritten > 0 {
         metrics::counter!(crate::metrics::CATALOG_CONFORM_REWRITES_TOTAL)
             .increment(rewritten as u64);
     }
 
-    // Publish completion LAST: postgres side, then the marker file — and
-    // only when every file was accounted for. Skipped files mean the corpus
-    // is not proven conformant, so the identity stays unpublished and the
-    // next boot re-runs the pass rather than declaring victory forever.
-    if skipped == 0 {
-        store
-            .mark_conformed()
-            .await
-            .map_err(|e| format!("failed to record conformance completion: {e}"))?;
-        publish_marker(data_dir, &catalog_id)?;
-    } else {
-        tracing::warn!(
-            event_type = "catalog_conform_incomplete",
-            scanned,
-            rewritten,
-            skipped,
-            "boot conformance pass skipped unreadable or foreign paths; the \
-             corpus is not proven conformant and the pass will re-run on the \
-             next boot — inspect the skipped paths (queries touching them error)"
-        );
-    }
+    publish_completion(store, data_dir, &catalog_id, scanned, rewritten, skipped).await?;
 
     tracing::info!(
         event_type = "catalog_conform_complete",
         scanned,
         rewritten,
         skipped,
+        observed,
         conflicts = conflicts.len(),
         "boot conformance pass complete"
     );
@@ -364,7 +379,39 @@ pub async fn ensure_conformance(
         scanned,
         rewritten,
         skipped,
+        observed,
     })
+}
+
+/// Publish completion LAST: postgres side, then the marker file — and only
+/// when every file was accounted for. Skipped files mean the corpus is not
+/// proven conformant, so the identity stays unpublished and the next boot
+/// re-runs the pass rather than declaring victory forever.
+async fn publish_completion(
+    store: &CatalogStore,
+    data_dir: &Path,
+    catalog_id: &str,
+    scanned: usize,
+    rewritten: usize,
+    skipped: usize,
+) -> Result<(), String> {
+    if skipped > 0 {
+        tracing::warn!(
+            event_type = "catalog_conform_incomplete",
+            scanned,
+            rewritten,
+            skipped,
+            "boot conformance pass skipped unreadable or foreign paths; the \
+             corpus is not proven conformant and the pass will re-run on the \
+             next boot — inspect the skipped paths (queries touching them error)"
+        );
+        return Ok(());
+    }
+    store
+        .mark_conformed()
+        .await
+        .map_err(|e| format!("failed to record conformance completion: {e}"))?;
+    publish_marker(data_dir, catalog_id)
 }
 
 /// Isolate one bad path: warn, count, leave it exactly where it is.
@@ -617,11 +664,31 @@ fn scan_file(
     }
     let safe = path.to_string_lossy().replace('\'', "''");
     let schema = describe_source(conn, &format!("SELECT * FROM read_parquet('{safe}')"))?;
+    // Footer-only (never a `count(*)` scan), and via the pure-Rust reader
+    // for the same reason `schema_refresh` uses it: a poisoned footer must
+    // be a catchable error, never a `SIGSEGV` inside `DuckDB`'s
+    // `parquet_metadata()`. A file `DuckDB` just described but this reader
+    // cannot is NOT a skip — the pass proves type conformance, and a missing
+    // row count costs only an observation's weight.
+    let rows = trawl_engine::parquet_stats::read_file_stats(&path).map_or_else(
+        |e| {
+            tracing::warn!(
+                event_type = "catalog_conform_row_count_unreadable",
+                file = %path.display(),
+                error = %e,
+                "parquet footer row count unreadable; the file still conforms, \
+                 its field_services observation carries no row weight"
+            );
+            0
+        },
+        |stats| stats.num_rows,
+    );
     let non_null = count_non_null(conn, &safe, &schema, &voting_columns(&schema, pinned))?;
     Ok(FileScan {
         path,
         service: layout.service.clone(),
         time_fallback: layout.instant,
+        rows,
         schema,
         non_null,
     })
@@ -766,6 +833,71 @@ fn most_rows_wins(
     proposals
 }
 
+/// The `field_services` observations the standing corpus attests to, one
+/// row per `(field, service)` pair — the input to
+/// [`CatalogStore::backfill_services`].
+///
+/// Only PINNED fields are observed, which is exactly the post-rewrite column
+/// set: phase B drops every unpinned column from the files carrying it, and
+/// `field_services`'s field axis is bounded by the pin cap precisely because
+/// an unpinned field is never observed.
+///
+/// The timestamps come from the partition directory rather than from
+/// `now()`: an observation stamped "now" for a file written two years ago
+/// would place a dead field inside every `last_seen` window, which is the
+/// opposite of what the windowing exists to do. The row weight is the file's
+/// own row count — the same quantity compaction accumulates per batch, since
+/// a file is the sum of the batches that built it.
+///
+/// Names are ASCII-folded and de-duplicated per file: a pre-fold corpus can
+/// carry `Dur` and `dur` as separate physical columns of ONE catalog field,
+/// and counting the file twice for it would inflate the weight.
+fn corpus_observations(
+    scan: &[FileScan],
+    pins: &HashMap<String, CanonicalType>,
+) -> Vec<ServiceObservation> {
+    type Agg = (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        u64,
+    );
+    let mut agg: HashMap<(String, String), Agg> = HashMap::new();
+    for file in scan {
+        let mut folded: Vec<String> = file
+            .schema
+            .iter()
+            .map(|c| c.name.to_ascii_lowercase())
+            .filter(|n| pins.contains_key(n))
+            .collect();
+        folded.sort_unstable();
+        folded.dedup();
+        for field in folded {
+            let entry = agg.entry((field, file.service.clone())).or_insert((
+                file.time_fallback,
+                file.time_fallback,
+                0,
+            ));
+            entry.0 = entry.0.min(file.time_fallback);
+            entry.1 = entry.1.max(file.time_fallback);
+            entry.2 = entry.2.saturating_add(file.rows);
+        }
+    }
+    let mut out: Vec<ServiceObservation> = agg
+        .into_iter()
+        .map(
+            |((field, service), (first_seen, last_seen, rows))| ServiceObservation {
+                field,
+                service,
+                first_seen,
+                last_seen,
+                row_count: i64::try_from(rows).unwrap_or(i64::MAX),
+            },
+        )
+        .collect();
+    out.sort_by(|a, b| (&a.field, &a.service).cmp(&(&b.field, &b.service)));
+    out
+}
+
 /// Rewrite every file whose columns disagree with the pins: `TRY_CAST` to
 /// the pin, staged `.tmp` write, atomic rename. Returns the rewrite count,
 /// the count of files skipped because their rewrite failed, and the conflict
@@ -874,7 +1006,7 @@ fn rewrite_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{FileScan, count_non_null, most_rows_wins, voting_columns};
+    use super::{FileScan, corpus_observations, count_non_null, most_rows_wins, voting_columns};
     use crate::ingest::compaction::{AGG_CHUNK_COLS, ColInfo, describe_source};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -920,6 +1052,7 @@ mod tests {
             path: PathBuf::from(format!("/data/prod/2026-08-01/10/{name}.parquet")),
             service: name.to_owned(),
             time_fallback: chrono::Utc::now(),
+            rows: cols.iter().map(|(_, _, rows)| *rows).max().unwrap_or(0),
             schema: cols
                 .iter()
                 .map(|(n, t, _)| ColInfo {
@@ -998,6 +1131,79 @@ mod tests {
         assert!(
             voting_columns(&file.schema, &pinned).is_empty(),
             "an all-pinned schema must skip the count query entirely"
+        );
+    }
+
+    /// One scanned file at a chosen partition instant, carrying `rows` rows.
+    fn scan_at(service: &str, hour: u32, rows: u64, cols: &[&str]) -> FileScan {
+        FileScan {
+            path: PathBuf::from(format!("/data/prod/2026-08-01/{hour:02}/{service}.parquet")),
+            service: service.to_owned(),
+            time_fallback: chrono::NaiveDate::from_ymd_opt(2026, 8, 1)
+                .unwrap()
+                .and_hms_opt(hour, 0, 0)
+                .unwrap()
+                .and_utc(),
+            rows,
+            schema: cols
+                .iter()
+                .map(|n| ColInfo {
+                    name: (*n).to_owned(),
+                    dtype: "VARCHAR".to_owned(),
+                })
+                .collect(),
+            non_null: vec![0; cols.len()],
+        }
+    }
+
+    /// The backfill's shape: one row per (field, service), spanning the
+    /// partition instants the corpus actually sits at and weighted by the
+    /// rows the files hold. An unpinned column is never observed — phase B
+    /// drops it, and `field_services`' field axis is bounded by the pin cap
+    /// precisely because only pinned fields land here.
+    #[test]
+    fn observations_span_the_corpus_and_cover_only_pinned_fields() {
+        let corpus = vec![
+            scan_at("svc-a", 10, 3, &["duration", "unpinned"]),
+            scan_at("svc-a", 12, 4, &["duration"]),
+            scan_at("svc-b", 11, 5, &["duration"]),
+        ];
+        let pins = HashMap::from([("duration".to_owned(), CanonicalType::BigInt)]);
+        let obs = corpus_observations(&corpus, &pins);
+
+        assert_eq!(obs.len(), 2, "one row per (field, service): {obs:?}");
+        let a = &obs[0];
+        assert_eq!(
+            (a.field.as_str(), a.service.as_str()),
+            ("duration", "svc-a")
+        );
+        assert_eq!(a.row_count, 7, "both of svc-a's files weigh in");
+        assert_eq!(a.first_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
+        assert_eq!(
+            a.last_seen.to_rfc3339(),
+            "2026-08-01T12:00:00+00:00",
+            "stamped from the partition directory, never now()"
+        );
+        assert_eq!(obs[1].service, "svc-b");
+        assert!(
+            obs.iter().all(|o| o.field != "unpinned"),
+            "an unpinned column is not an observation"
+        );
+    }
+
+    /// A pre-fold corpus can carry `Dur` and `dur` as separate physical
+    /// columns of ONE catalog field: that is one observation counted once,
+    /// not the file's rows charged twice.
+    #[test]
+    fn case_variant_columns_are_one_observation() {
+        let corpus = vec![scan_at("svc-a", 10, 6, &["Dur", "dur"])];
+        let pins = HashMap::from([("dur".to_owned(), CanonicalType::Varchar)]);
+        let obs = corpus_observations(&corpus, &pins);
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].field, "dur");
+        assert_eq!(
+            obs[0].row_count, 6,
+            "the file is weighed once, not per column"
         );
     }
 
