@@ -10,6 +10,7 @@
 //! [`Value`] uses custom serde impls to serialize as JSON primitives
 //! (not tagged enums), so these types double as the HTTP wire format.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use serde::de::{self, Visitor};
@@ -195,10 +196,8 @@ pub const TRAILING_LOG_FIELDS: &[&str] = &["_raw", "_ingested", "_repairs"];
 /// order), `1` = custom field, `2` = trailing metadata
 /// ([`TRAILING_LOG_FIELDS`], in declared order).
 ///
-/// Sort by `(field_display_rank(name), name)` so schema listings — the
-/// `/api/v1/schema` columns, `/api/v1/schema/services` columns, and the CLI
-/// field tables — present columns the way query results order them, instead
-/// of a raw alphabetical sort that would put `_ingested` first.
+/// Callers do not sort on this directly — [`sort_by_display_rank`] owns the
+/// `(rank, name)` ordering every schema listing shares.
 #[must_use]
 pub fn field_display_rank(name: &str) -> (u8, usize) {
     if let Some(i) = WELL_KNOWN_LOG_FIELDS.iter().position(|f| *f == name) {
@@ -208,6 +207,27 @@ pub fn field_display_rank(name: &str) -> (u8, usize) {
     } else {
         (1, 0)
     }
+}
+
+/// Compare two field names in schema display order: [`field_display_rank`]
+/// first, name as the tie-break.
+#[must_use]
+pub fn cmp_by_display_rank(a: &str, b: &str) -> Ordering {
+    field_display_rank(a)
+        .cmp(&field_display_rank(b))
+        .then_with(|| a.cmp(b))
+}
+
+/// Sort a schema listing into display order, keying each item by its field
+/// name via `name`.
+///
+/// The single home of this ordering, so the `/api/v1/schema` columns,
+/// `/api/v1/schema/fields` rows, `/api/v1/schema/services` columns, and the
+/// CLI field tables can never drift apart: they present columns the way query
+/// results order them, instead of a raw alphabetical sort that would put
+/// `_ingested` first.
+pub fn sort_by_display_rank<T>(items: &mut [T], name: impl Fn(&T) -> &str) {
+    items.sort_by(|a, b| cmp_by_display_rank(name(a), name(b)));
 }
 
 /// Column metadata from a query result.
@@ -394,11 +414,7 @@ mod tests {
         // envelope first, custom alphabetical, metadata last — never
         // `_ingested` alphabetically first.
         let mut names = vec!["duration", "_ingested", "service", "_time", "alpha"];
-        names.sort_by(|a, b| {
-            field_display_rank(a)
-                .cmp(&field_display_rank(b))
-                .then_with(|| a.cmp(b))
-        });
+        sort_by_display_rank(&mut names, |n| n);
         assert_eq!(
             names,
             vec!["_time", "service", "alpha", "duration", "_ingested"]

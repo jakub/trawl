@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
-use trawl_api::value::field_display_rank;
+use trawl_api::value::sort_by_display_rank;
 use trawl_api::{DailyCount, ServiceColumnStats, ServiceSchema};
 use trawl_engine::parquet_stats::{self, StatsAccumulator};
 
@@ -285,11 +285,7 @@ fn build_service_schema(
             }
         })
         .collect();
-    columns.sort_by(|a, b| {
-        field_display_rank(&a.name)
-            .cmp(&field_display_rank(&b.name))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    sort_by_display_rank(&mut columns, |c| &c.name);
 
     let daily_event_counts: Vec<DailyCount> = daily_counts
         .into_iter()

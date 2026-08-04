@@ -502,11 +502,7 @@ pub async fn schema(
         .collect();
     // Query-result display order: envelope first, metadata last, custom
     // fields alphabetical in between.
-    columns.sort_by(|a, b| {
-        trawl_api::value::field_display_rank(&a.name)
-            .cmp(&trawl_api::value::field_display_rank(&b.name))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    trawl_api::value::sort_by_display_rank(&mut columns, |c| &c.name);
 
     // Corpus facts: hold the mutex for the full check-then-refresh cycle to
     // prevent thundering herd — only one request walks while others wait.
@@ -946,11 +942,7 @@ pub async fn catalog_fields(
     let (mut rows, truncated) = state.storage.catalog.list_fields(&filter).await?;
     let (pinned_total, pin_capacity) = state.storage.catalog.pin_stats().await?;
 
-    rows.sort_by(|a, b| {
-        trawl_api::value::field_display_rank(&a.field)
-            .cmp(&trawl_api::value::field_display_rank(&b.field))
-            .then_with(|| a.field.cmp(&b.field))
-    });
+    trawl_api::value::sort_by_display_rank(&mut rows, |r| &r.field);
     let fields = rows
         .into_iter()
         .map(|r| trawl_api::CatalogFieldSummary {
