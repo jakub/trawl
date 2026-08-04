@@ -79,9 +79,60 @@ Validate DSL syntax without executing.
 
 ```
 GET /api/v1/schema
+GET /api/v1/schema?service=nginx
+GET /api/v1/schema?all=true
 ```
 
-Returns column names and types discovered from the data.
+Returns column names and types, served from the **field catalog** — the
+write-time type authority — never a parquet `DESCRIBE`. Corpus facts
+(dates, sizes, services, file count) come from a TTL-cached filesystem
+walk; `cached` reports whether *they* were cached (columns are always
+fresh).
+
+Parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `service` | Only fields that service has carried. |
+| `all` | `true` lifts the retention window: by default a field whose most recent observation predates `[retention] max_age_days` (default 90; 0 disables) is hidden. A field with no observations at all (e.g. the envelope on a fresh install) is always shown. |
+
+```
+GET /api/v1/schema/fields
+GET /api/v1/schema/fields?service=nginx&since_secs=604800&limit=100
+```
+
+Lists pinned fields with aggregated evidence: type, pin provenance
+(`pinned_from`, `pinned_at`), per-field service count, cumulative rows,
+first/last observation, and conflict counts. The response carries
+`pinned_total` / `pin_capacity` (catalog fill) and `truncated` (the
+default limit is 500, clamped to the pin cap).
+
+```
+GET /api/v1/schema/field?name=duration
+```
+
+One field's detail: the pin, per-service observations, and retained
+conflict evidence. The name is a **query parameter** (a catalog key may
+contain `/`) and is ASCII-lowercased before lookup, mirroring ingest's
+fold; an unpinned name returns 404.
+
+```
+GET /api/v1/schema/conflicts
+GET /api/v1/schema/conflicts?field=duration&service=envoy&since_secs=604800
+```
+
+The schema-health dashboard: recent type conflicts (a batch column whose
+conforming cast nulled rows), most recent first. Filter by `field`,
+`service`, and `since_secs`; `limit` defaults to 100 (max 1000).
+
+```
+GET /api/v1/schema/services
+```
+
+Rich per-service schema (per-column null counts, min/max, sizes, daily
+volumes) from the background footer scan. Types come from the catalog's
+in-process pin cache; a physically-present column with no pin (foreign or
+boot-skipped parquet) reports the sentinel type `UNPINNED`.
 
 ```
 GET /api/v1/schema/values/{field}

@@ -325,9 +325,9 @@ impl Executor {
     /// reconciled type.
     ///
     /// Errors PROPAGATE. The read-time reconcilers that used to degrade an
-    /// irreconcilable cross-file mix to `VARCHAR`
-    /// (`describe_schema_columns_coerced` and friends) are deleted (ADR-0009
-    /// slice 2): every trawl-written file conforms to the field catalog at
+    /// irreconcilable cross-file mix to `VARCHAR` via per-file describes are
+    /// deleted (ADR-0009 slice 2): every trawl-written file conforms to the
+    /// field catalog at
     /// write time, so a union conflict can only mean foreign/nonconformant
     /// parquet — and that errors loudly instead of being papered over. The
     /// server's `/api/v1/schema` no longer calls this at all (it reads the

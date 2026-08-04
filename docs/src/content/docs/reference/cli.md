@@ -73,6 +73,38 @@ trawl validate "level=error | stats count() by host"
 trawl validate -p dev "..."     # validate against dev server
 ```
 
+## Schema mode
+
+Inspect the field catalog — pinned types, per-service observations, and
+type-conflict evidence:
+
+```bash
+trawl schema fields                    # pinned fields, types, conflict counts
+trawl schema fields --service nginx    # only fields that service has carried
+trawl schema fields --last 7d          # only fields observed in the window
+trawl schema field duration            # detail: type, when/where pinned, which services
+trawl schema conflicts --last 7d       # schema-health dashboard
+trawl schema conflicts --field duration --service envoy
+```
+
+`fields` and `conflicts` render through the standard output formats
+(`-f table|json|csv`, auto-detected like `query`). `fields` prints the
+catalog fill (`N/M pins used`) to stderr; `--limit` raises the listing
+caps (fields default 500, conflicts default 100/max 1000). `--last`
+accepts DSL-style windows (`s`, `m`, `h`, `d`, `w`).
+
+Embedded mode works for the field listing only — a plain `DESCRIBE` over
+local parquet, no server or postgres needed:
+
+```bash
+trawl schema fields --data 'data/**/*.parquet'   # names + physical types only
+```
+
+Catalog metadata (pins, observations, conflicts) requires a server. Note
+that over foreign parquet with irreconcilably drifted columns, embedded
+queries error loudly instead of silently coercing to `VARCHAR` — trawl's
+own files can never conflict (write-time catalog conformance).
+
 ## Global flags
 
 | Flag | Environment variable | Description |
