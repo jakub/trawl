@@ -20,7 +20,13 @@ use crate::cli::{ConnectionParams, OutputFormat, render_driver_results};
 /// Parse a `--last` window like `30m`, `2h`, `7d`, `1w` into seconds.
 pub fn parse_last(input: &str) -> Result<u64, CliError> {
     let input = input.trim();
-    let (num, unit) = input.split_at(input.len().saturating_sub(1));
+    // Split off the last CHAR, not the last byte: `split_at` panics off a
+    // char boundary, and the unit position is exactly where a multi-byte
+    // char lands (`--last 7µ` must be a usage error, not a crash).
+    let (num, unit) = match input.char_indices().next_back() {
+        Some((idx, _)) => input.split_at(idx),
+        None => ("", ""),
+    };
     let n: u64 = num
         .parse()
         .map_err(|_| CliError::Usage(format!("invalid --last window: {input:?}")))?;
@@ -193,6 +199,19 @@ fn make_client(conn: &ConnectionParams) -> Result<trawl_client::HttpClient, CliE
     Ok(client)
 }
 
+/// Write a human preamble/section line for `run_field`. The labels exist
+/// for the table view; on a machine format (auto-selected on a pipe) they
+/// would interleave with the ndjson/CSV stream, so they go to stderr —
+/// like `run_fields`' pin summary — and stdout stays parseable.
+fn label<W: Write>(out: &mut W, human: bool, text: &str) -> Result<(), CliError> {
+    if human {
+        writeln!(out, "{text}")?;
+    } else {
+        eprintln!("{text}");
+    }
+    Ok(())
+}
+
 fn render<W: Write>(
     out: &mut W,
     columns: &[String],
@@ -262,16 +281,20 @@ pub async fn run_field<W: Write>(
     let client = make_client(&conn)?;
     let resp = client.catalog_field(name, limit, after).await?;
 
-    writeln!(out, "field:       {}", resp.name)?;
-    writeln!(out, "type:        {}", resp.data_type)?;
-    writeln!(
+    let human = format == OutputFormat::Table;
+    label(out, human, &format!("field:       {}", resp.name))?;
+    label(out, human, &format!("type:        {}", resp.data_type))?;
+    label(
         out,
-        "pinned from: {}",
-        resp.pinned_from.as_deref().unwrap_or("(unknown)")
+        human,
+        &format!(
+            "pinned from: {}",
+            resp.pinned_from.as_deref().unwrap_or("(unknown)")
+        ),
     )?;
-    writeln!(out, "pinned at:   {}", resp.pinned_at)?;
+    label(out, human, &format!("pinned at:   {}", resp.pinned_at))?;
 
-    writeln!(out, "\nservices:")?;
+    label(out, human, "\nservices:")?;
     let (columns, rows) = field_services_to_rows(&resp);
     render(out, &columns, &rows, format)?;
     if let Some(cursor) = &resp.services_cursor {
@@ -279,7 +302,7 @@ pub async fn run_field<W: Write>(
     }
 
     if !resp.conflicts.is_empty() {
-        writeln!(out, "\nrecent conflicts:")?;
+        label(out, human, "\nrecent conflicts:")?;
         let (columns, rows) = field_conflicts_to_rows(&resp);
         render(out, &columns, &rows, format)?;
     }
@@ -362,6 +385,11 @@ mod tests {
         assert!(parse_last("d7").is_err());
         assert!(parse_last("").is_err());
         assert!(parse_last("7y").is_err());
+        // Multi-byte trailing chars are usage errors, not char-boundary
+        // panics out of `split_at`.
+        assert!(parse_last("7µ").is_err());
+        assert!(parse_last("µ").is_err());
+        assert!(parse_last("7é").is_err());
     }
 
     #[test]
