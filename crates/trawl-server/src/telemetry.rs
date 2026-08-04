@@ -20,6 +20,17 @@
 //! mean buffered line size, because the drop happens before
 //! serialization and the telemetry-disabled path must stay cheap).
 //!
+//! ## What is persisted (the stdout/telemetry split)
+//!
+//! The stdout logger and this layer build their filters from the SAME
+//! resolved directive string, but they are not the same filter: the WAL
+//! layer additionally refuses the targets in
+//! [`PRE_AUTH_TARGETS`]. Those events are emitted from fleet-auth's bearer
+//! shell, which runs BEFORE the rate limiter — persisting them would let
+//! an unauthenticated client turn a request flood into durable corpus
+//! growth. They stay on stdout, where retention is the operator's log
+//! pipeline rather than trawl's own disk.
+//!
 //! ## Buffering and the bounded retry queue
 //!
 //! Events are serialized to ndjson and accumulated in an active buffer
@@ -122,8 +133,66 @@ use crate::ingest::wal::WalWriter;
 /// - `fleet_auth` — the auth middleware crate;
 /// - `auth.backend` / `storage.backend` — deliberately-overridden targets
 ///   that make backend failures independently alarmable.
+///
+/// This is the STDOUT filter. Persistence is narrower: see
+/// [`PRE_AUTH_TARGETS`] and [`wal_filter`].
 pub const DEFAULT_LOG_FILTER: &str =
     "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info";
+
+/// Targets emitted from the PRE-AUTHENTICATION request path: logged, never
+/// persisted as `service=trawld` telemetry.
+///
+/// fleet-auth's bearer shell warns on every missing/malformed header and
+/// every invalid or revoked key, and reports keystore trouble under
+/// `auth.backend` — all of it from middleware that sits OUTSIDE
+/// `rate_limit_middleware` (the limiter needs a verified key, so it cannot
+/// run before authn). Writing those events to the WAL would hand an
+/// unauthenticated client a durable-write amplifier: one ~400-byte record
+/// per rejected request, compacted into the corpus and competing with real
+/// log data for retention.
+///
+/// The events are not lost — they keep flowing to stdout (and to the
+/// legacy JSON log file) under the same directives, where retention is the
+/// operator's log pipeline. What is lost from the corpus is only the
+/// per-request repetition: trawld's own post-authn `auth_failure`
+/// (`trawl_server`), `storage.backend`, and the catalog/health events that
+/// a backend outage also produces all still persist.
+///
+/// Matching is by target segment, so `fleet_auth` covers
+/// `fleet_auth::middleware` but never a `fleet_authority` target.
+pub const PRE_AUTH_TARGETS: [&str; 2] = ["fleet_auth", "auth.backend"];
+
+/// Whether events on `target` may be persisted as telemetry — false for
+/// every [`PRE_AUTH_TARGETS`] entry and its module descendants.
+#[must_use]
+pub fn is_persisted_target(target: &str) -> bool {
+    !PRE_AUTH_TARGETS.iter().any(|excluded| {
+        target == *excluded
+            || target
+                .strip_prefix(excluded)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
+}
+
+/// The [`WalLayer`]'s filter: the resolved directives AND
+/// [`is_persisted_target`].
+///
+/// A second, non-configurable predicate rather than an appended
+/// `fleet_auth=off` directive: `EnvFilter` resolves by specificity, so an
+/// operator `RUST_LOG` naming `fleet_auth::middleware=info` would outrank
+/// an appended target-level `off` and quietly restore the amplifier. The
+/// pre-auth exclusion is an invariant of what trawl writes to its own
+/// disk, not a log level.
+pub fn wal_filter<S>(directives: &str) -> impl tracing_subscriber::layer::Filter<S> + 'static
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    use tracing_subscriber::filter::FilterExt;
+
+    tracing_subscriber::EnvFilter::new(directives).and(tracing_subscriber::filter::filter_fn(
+        |meta: &tracing::Metadata<'_>| is_persisted_target(meta.target()),
+    ))
+}
 
 /// A resolved log filter: the directive string to install plus an optional
 /// warning to emit once the subscriber is up.
@@ -1052,6 +1121,58 @@ mod tests {
             !targets.contains(&"hyper::proto"),
             "dependency INFO must NOT pass the default filter; saw {targets:?}"
         );
+    }
+
+    #[test]
+    fn pre_auth_targets_are_never_persisted() {
+        assert!(!is_persisted_target("fleet_auth"));
+        assert!(!is_persisted_target("fleet_auth::middleware"));
+        assert!(!is_persisted_target("auth.backend"));
+        // Prefix matching is per segment, not per byte.
+        assert!(is_persisted_target("fleet_authority"));
+        assert!(is_persisted_target("fleet_auth_shim::x"));
+        // Everything trawld emits itself keeps persisting, including the
+        // post-authn auth_failure event and the storage alarm target.
+        assert!(is_persisted_target("trawl_server::policy"));
+        assert!(is_persisted_target("trawld"));
+        assert!(is_persisted_target("storage.backend"));
+    }
+
+    /// The pre-authn auth events are logged (previous test) but must never
+    /// reach the WAL layer: fleet-auth's bearer shell runs OUTSIDE the rate
+    /// limiter, so persisting them would let an unauthenticated flood grow
+    /// the corpus one durable record per rejected request.
+    #[test]
+    fn wal_filter_drops_pre_auth_targets_the_stdout_filter_keeps() {
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::default();
+        let events = Arc::clone(&capture.events);
+        let subscriber = tracing_subscriber::registry()
+            .with(capture.with_filter(wal_filter(DEFAULT_LOG_FILTER)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::warn!(target: "fleet_auth::middleware", "auth: missing or malformed bearer header");
+        tracing::warn!(target: "fleet_auth::middleware", "auth: invalid or revoked key");
+        tracing::error!(target: "auth.backend", "auth: db error");
+        tracing::info!(target: "trawl_server::policy", "policy: auth failure (post-authn)");
+        tracing::error!(target: "storage.backend", "app-state store error");
+        tracing::info!(target: "trawld", "starting trawld");
+
+        let seen = events.lock();
+        let targets: Vec<&str> = seen.iter().map(|(t, _)| t.as_str()).collect();
+        for excluded in ["fleet_auth::middleware", "auth.backend"] {
+            assert!(
+                !targets.contains(&excluded),
+                "pre-authn target {excluded} must not be persisted; saw {targets:?}"
+            );
+        }
+        for kept in ["trawl_server::policy", "storage.backend", "trawld"] {
+            assert!(
+                targets.contains(&kept),
+                "target {kept} must still be persisted; saw {targets:?}"
+            );
+        }
     }
 
     #[test]

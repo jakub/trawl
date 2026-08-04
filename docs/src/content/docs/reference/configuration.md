@@ -96,7 +96,7 @@ The `tls_reload_interval_secs` setting polls the cert/key files for content chan
 
 #### Logging filter (`RUST_LOG`)
 
-trawld's stdout log and its internal telemetry ([`internal_telemetry`](#ingest)) share one tracing filter, resolved explicitly at startup:
+trawld's stdout log and its internal telemetry ([`internal_telemetry`](#ingest)) build their filters from one directive string, resolved explicitly at startup:
 
 - **`RUST_LOG` unset** → the shipped default filter:
 
@@ -109,6 +109,8 @@ trawld's stdout log and its internal telemetry ([`internal_telemetry`](#ingest))
 - **`RUST_LOG` set but unparseable** → the default filter is installed and exactly one `config_warning` event reports the parse error (never the raw environment value).
 
 A configuration-file failure happens *before* any tracing subscriber exists: it is reported on stderr with the resolved config path, not through telemetry.
+
+**Pre-authentication auth events are logged, never persisted.** Whatever the directives say, the `fleet_auth` and `auth.backend` targets are excluded from `service=trawld` telemetry (they still print on stdout, and to `log_file` when telemetry is disabled). Those events come from the bearer middleware, which necessarily runs *before* per-key rate limiting — persisting them would let an unauthenticated client turn a request flood into durable corpus growth, one record per rejected request. Failed authentication is therefore a stdout/log-pipeline signal; the corpus still carries trawld's own post-authn `auth_failure` events, the `storage.backend` alarm target, and the catalog/health events a backend outage produces.
 
 **`trawl-web` filters separately.** The session proxy is a different process with a different target, so it must never inherit trawld's filter — a target-only filter that omits `trawl_web` silences the proxy completely. Its own default is:
 

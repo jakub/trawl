@@ -535,7 +535,9 @@ fn init_tracing(
 ) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
     // The directives were resolved (and validated when operator-supplied) by
     // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
-    // from the same string.
+    // from the same string. The WAL layer builds a narrower one
+    // (`telemetry::wal_filter`): pre-authn auth events are logged but never
+    // persisted, so an unauthenticated flood cannot grow the corpus.
     let make_filter = || EnvFilter::new(filter_directives);
 
     let use_telemetry = config.internal_telemetry_enabled();
@@ -553,13 +555,13 @@ fn init_tracing(
         if monitor_active {
             // Skip stdout layer — TUI owns the terminal.
             tracing_subscriber::registry()
-                .with(wal_layer.with_filter(make_filter()))
+                .with(wal_layer.with_filter(telemetry::wal_filter(filter_directives)))
                 .init();
         } else {
             let stdout_layer = fmt::layer().with_filter(make_filter());
             tracing_subscriber::registry()
                 .with(stdout_layer)
-                .with(wal_layer.with_filter(make_filter()))
+                .with(wal_layer.with_filter(telemetry::wal_filter(filter_directives)))
                 .init();
         }
         Ok(Some((handle, flush_layer)))
