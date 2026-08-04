@@ -708,6 +708,111 @@ pub struct DailyCount {
     pub count: u64,
 }
 
+// -- field catalog (schema-health surfaces, #51) ------------------------------
+
+/// Response from `GET /api/v1/schema/fields` — the pinned-field listing
+/// with aggregated observation and conflict evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogFieldsResponse {
+    /// Pinned fields (envelope-first display order).
+    pub fields: Vec<CatalogFieldSummary>,
+    /// Total pins in the catalog (unfiltered).
+    pub pinned_total: u64,
+    /// The pin-count ceiling the total is measured against.
+    pub pin_capacity: u64,
+    /// Whether the listing was cut short by the (clamped) limit.
+    pub truncated: bool,
+}
+
+/// One pinned field with its aggregates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogFieldSummary {
+    /// Field name.
+    pub name: String,
+    /// Pinned `DuckDB` type (e.g. "BIGINT").
+    #[serde(rename = "type")]
+    pub data_type: String,
+    /// Which service's batch set the pin (`_declared` for the envelope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_from: Option<String>,
+    /// When the pin was written (ISO 8601 UTC).
+    pub pinned_at: String,
+    /// Distinct services that ever carried the field.
+    pub service_count: u64,
+    /// Cumulative rows across all services' observations.
+    pub row_count: u64,
+    /// Earliest observation (ISO 8601 UTC; absent when never observed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen: Option<String>,
+    /// Most recent observation (ISO 8601 UTC; absent when never observed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
+    /// Conflict evidence rows currently retained.
+    pub conflict_count: u64,
+    /// Total rows nulled across the retained evidence.
+    pub rows_nulled: u64,
+}
+
+/// Response from `GET /api/v1/schema/field?name=` — one field's pin,
+/// per-service observations, and recent conflict evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogFieldResponse {
+    /// Field name (catalog spelling — ASCII-lowercase).
+    pub name: String,
+    /// Pinned `DuckDB` type.
+    #[serde(rename = "type")]
+    pub data_type: String,
+    /// Which service's batch set the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_from: Option<String>,
+    /// When the pin was written (ISO 8601 UTC).
+    pub pinned_at: String,
+    /// Per-service observations, most recent first.
+    pub services: Vec<CatalogFieldServiceRow>,
+    /// Retained conflict evidence, most recent first.
+    pub conflicts: Vec<CatalogConflictRow>,
+}
+
+/// One service's observation of a field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogFieldServiceRow {
+    /// Service name.
+    pub service: String,
+    /// First observation (ISO 8601 UTC).
+    pub first_seen: String,
+    /// Most recent observation (ISO 8601 UTC).
+    pub last_seen: String,
+    /// Cumulative rows in batches that wrote the field.
+    pub row_count: u64,
+}
+
+/// Response from `GET /api/v1/schema/conflicts` — the schema-health
+/// dashboard listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogConflictsResponse {
+    /// Conflict evidence, most recent first.
+    pub conflicts: Vec<CatalogConflictRow>,
+    /// Whether the listing was cut short by the (clamped) limit.
+    pub truncated: bool,
+}
+
+/// One recorded conflict: a batch column whose conforming cast nulled rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogConflictRow {
+    /// Field name.
+    pub field: String,
+    /// Service whose batch disagreed with the pin.
+    pub service: String,
+    /// The `DuckDB` type the batch actually carried.
+    pub observed_type: String,
+    /// The pinned type the values were cast to.
+    pub expected_type: String,
+    /// Rows whose value the cast nulled (recoverable from `_raw`).
+    pub rows_nulled: u64,
+    /// When the conflict was recorded (ISO 8601 UTC).
+    pub at: String,
+}
+
 // -- history -----------------------------------------------------------------
 
 /// Response from the history endpoint.
@@ -953,6 +1058,180 @@ mod tests {
     fn roundtrip<T: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug>(value: &T) -> T {
         let json = serde_json::to_string(value).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn catalog_fields_response_roundtrip() {
+        let resp = CatalogFieldsResponse {
+            fields: vec![CatalogFieldSummary {
+                name: "duration".into(),
+                data_type: "BIGINT".into(),
+                pinned_from: Some("nginx".into()),
+                pinned_at: "2026-08-01T10:00:00Z".into(),
+                service_count: 2,
+                row_count: 5,
+                first_seen: Some("2026-08-01T10:00:00Z".into()),
+                last_seen: Some("2026-08-02T10:00:00Z".into()),
+                conflict_count: 1,
+                rows_nulled: 1,
+            }],
+            pinned_total: 12,
+            pin_capacity: 10_000,
+            truncated: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains("\"type\":\"BIGINT\""),
+            "the type key follows the schema-response convention: {json}"
+        );
+        let rt = roundtrip(&resp);
+        assert_eq!(rt.fields.len(), 1);
+        assert_eq!(rt.fields[0].name, "duration");
+        assert_eq!(rt.fields[0].data_type, "BIGINT");
+        assert_eq!(rt.fields[0].service_count, 2);
+        assert_eq!(rt.pinned_total, 12);
+        assert_eq!(rt.pin_capacity, 10_000);
+        assert!(!rt.truncated);
+    }
+
+    #[test]
+    fn catalog_field_response_roundtrip() {
+        let resp = CatalogFieldResponse {
+            name: "duration".into(),
+            data_type: "BIGINT".into(),
+            pinned_from: Some("nginx".into()),
+            pinned_at: "2026-08-01T10:00:00Z".into(),
+            services: vec![CatalogFieldServiceRow {
+                service: "nginx".into(),
+                first_seen: "2026-08-01T10:00:00Z".into(),
+                last_seen: "2026-08-02T10:00:00Z".into(),
+                row_count: 5,
+            }],
+            conflicts: vec![CatalogConflictRow {
+                field: "duration".into(),
+                service: "envoy".into(),
+                observed_type: "VARCHAR".into(),
+                expected_type: "BIGINT".into(),
+                rows_nulled: 1,
+                at: "2026-08-02T11:00:00Z".into(),
+            }],
+        };
+        let rt = roundtrip(&resp);
+        assert_eq!(rt.name, "duration");
+        assert_eq!(rt.services.len(), 1);
+        assert_eq!(rt.services[0].service, "nginx");
+        assert_eq!(rt.conflicts.len(), 1);
+        assert_eq!(rt.conflicts[0].expected_type, "BIGINT");
+    }
+
+    #[test]
+    fn catalog_conflicts_response_roundtrip() {
+        let resp = CatalogConflictsResponse {
+            conflicts: vec![CatalogConflictRow {
+                field: "duration".into(),
+                service: "envoy".into(),
+                observed_type: "VARCHAR".into(),
+                expected_type: "BIGINT".into(),
+                rows_nulled: 3,
+                at: "2026-08-02T11:00:00Z".into(),
+            }],
+            truncated: true,
+        };
+        let rt = roundtrip(&resp);
+        assert_eq!(rt.conflicts.len(), 1);
+        assert_eq!(rt.conflicts[0].rows_nulled, 3);
+        assert!(rt.truncated);
+    }
+
+    /// The `/api/v1/schema/services` wire shape is the TUI and SPA contract
+    /// for the #51 cutover: types now come from the catalog, but the JSON
+    /// keys must stay byte-identical. Golden-pin every key.
+    #[test]
+    fn service_schema_wire_keys_are_pinned() {
+        let resp = ServiceSchemaResponse {
+            services: vec![ServiceSchema {
+                name: "nginx".into(),
+                columns: vec![ServiceColumnStats {
+                    name: "status".into(),
+                    data_type: "BIGINT".into(),
+                    null_count: 0,
+                    total_count: 1,
+                    min_value: Some("1".into()),
+                    max_value: Some("2".into()),
+                    compressed_bytes: 10,
+                }],
+                earliest_date: Some("2026-01-01".into()),
+                latest_date: Some("2026-01-02".into()),
+                file_count: 1,
+                total_bytes: 10,
+                total_events: 1,
+                daily_event_counts: vec![DailyCount {
+                    date: "2026-01-01".into(),
+                    count: 1,
+                }],
+            }],
+            cached: true,
+            hot_buffer_events: Some(1),
+            hot_buffer_bytes: Some(2),
+        };
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+
+        // serde_json::Value sorts object keys, so pin the sorted key SETS —
+        // key names are the wire contract, their order is not.
+        let top: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            top,
+            vec![
+                "cached",
+                "hot_buffer_bytes",
+                "hot_buffer_events",
+                "services"
+            ]
+        );
+
+        let svc: Vec<&str> = json["services"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            svc,
+            vec![
+                "columns",
+                "daily_event_counts",
+                "earliest_date",
+                "file_count",
+                "latest_date",
+                "name",
+                "total_bytes",
+                "total_events"
+            ]
+        );
+
+        let col: Vec<&str> = json["services"][0]["columns"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            col,
+            vec![
+                "compressed_bytes",
+                "max_value",
+                "min_value",
+                "name",
+                "null_count",
+                "total_count",
+                "type"
+            ]
+        );
     }
 
     #[test]
