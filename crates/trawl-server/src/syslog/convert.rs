@@ -28,7 +28,13 @@ const MAX_SD_ELEMENTS: usize = 32;
 /// Maximum total structured data params across all elements.
 const MAX_SD_PARAMS_TOTAL: usize = 128;
 /// Maximum length of a structured data field key (`sd_{id}_{param}`).
-const MAX_SD_KEY_LEN: usize = 256;
+///
+/// Exactly the catalog's own field-name bound: the syslog listener writes
+/// straight into the pipeline (it does not route through
+/// `envelope::canonicalize`), so a key admitted here becomes a column with
+/// no further gate — one byte over the catalog bound and the field could
+/// never be pinned.
+const MAX_SD_KEY_LEN: usize = trawl_core::schema::MAX_FIELD_NAME_BYTES;
 
 /// Last-resort service name when every candidate sanitizes away.
 const FALLBACK_SERVICE: &str = "syslog";
@@ -169,17 +175,26 @@ pub fn syslog_to_event<S: BuildHasher>(
 
     // Flatten RFC 5424 structured data elements (bounded to prevent
     // memory exhaustion from malicious messages with huge SD payloads).
+    //
+    // Keys are ASCII-lowercased at construction — the fold-at-the-door
+    // rule (ADR-0009): this path writes straight into the pipeline without
+    // routing through `envelope::canonicalize`, and SD-IDs/param names are
+    // conventionally mixed-case (`exampleSDID@32473`, `eventID`), so an
+    // unfolded key here would reach the WAL and hot buffer under a
+    // spelling the (folded) catalog pin never matches. Two params folding
+    // to one key keep the FIRST value, mirroring the canonicalizer's
+    // collision rule.
     let mut sd_param_count: usize = 0;
     'outer: for element in msg.structured_data.iter().take(MAX_SD_ELEMENTS) {
         for (param_name, param_value) in &element.params {
             if sd_param_count >= MAX_SD_PARAMS_TOTAL {
                 break 'outer;
             }
-            let key = format!("sd_{}_{}", element.id, param_name);
+            let key = format!("sd_{}_{}", element.id, param_name).to_ascii_lowercase();
             if key.len() > MAX_SD_KEY_LEN {
                 continue;
             }
-            map.insert(key, json!(param_value));
+            map.entry(key).or_insert_with(|| json!(param_value));
             sd_param_count += 1;
         }
     }
@@ -321,6 +336,49 @@ mod tests {
         assert_eq!(map["env"], "lab");
         assert!(!map.contains_key("level"), "level is never stored");
         assert!(!map.contains_key("timestamp"), "timestamp is never stored");
+    }
+
+    /// RFC 5424 SD-IDs and param names are conventionally mixed-case
+    /// (`exampleSDID@32473`, `eventID`), and this path does NOT route
+    /// through `envelope::canonicalize` — so the fold happens at key
+    /// construction, or the key would reach the WAL and hot buffer under a
+    /// spelling the folded catalog pin never matches.
+    #[test]
+    fn sd_keys_are_ascii_folded_at_construction() {
+        let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [exampleSDID@32473 eventID="1011" eventSource="Application"] boom"#;
+        let parsed = parse_syslog(raw);
+        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let (_s, map) = syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
+
+        assert_eq!(map["sd_examplesdid@32473_eventid"], "1011");
+        assert_eq!(map["sd_examplesdid@32473_eventsource"], "Application");
+        assert!(
+            map.keys()
+                .all(|k| !k.bytes().any(|b| b.is_ascii_uppercase())),
+            "no key may carry ASCII uppercase: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Two params folding to one key keep the FIRST value — the same
+    /// deterministic collision rule as the canonicalizer's.
+    #[test]
+    fn sd_key_collision_after_folding_keeps_the_first_value() {
+        let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [x@1 eventID="first" EVENTID="second"] boom"#;
+        let parsed = parse_syslog(raw);
+        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let (_s, map) = syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
+        assert_eq!(
+            map["sd_x@1_eventid"], "first",
+            "the first spelling in document order wins"
+        );
+    }
+
+    /// The SD key bound IS the catalog's field-name bound: one byte over
+    /// and the key could be admitted here but never pinned.
+    #[test]
+    fn sd_key_bound_matches_the_catalog_field_name_bound() {
+        assert_eq!(MAX_SD_KEY_LEN, trawl_core::schema::MAX_FIELD_NAME_BYTES);
     }
 
     #[test]

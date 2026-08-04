@@ -42,6 +42,44 @@ pub struct HotBufferConfig {
     pub max_bytes: usize,
 }
 
+/// An atomic view of the hot buffer for one query: the snapshot file and
+/// the catalog pins that apply to it.
+///
+/// `field_types` is the catalog's pins intersected with the key set the
+/// snapshot's events actually carry, computed fresh on every
+/// [`HotBuffer::snapshot`] call — never cached per generation. Compaction
+/// makes pins durable and refreshes the in-process cache strictly BEFORE
+/// the atomic rename publishes the conformant parquet, but the hot drain
+/// that bumps the buffer generation happens AFTER the rename; a
+/// generation-cached pin set would be stale in that window and the union
+/// would hard-error. Intersecting with the observed keys also guarantees the
+/// emitter's `REPLACE` never names a column absent from the snapshot.
+#[derive(Debug, Clone)]
+pub struct HotSnapshot {
+    /// The ndjson snapshot file (shared across concurrent queries).
+    pub file: Arc<tempfile::NamedTempFile>,
+    /// Catalog pins ∩ observed keys — what the emitter conforms the hot
+    /// branch of the union with.
+    pub field_types: Arc<trawl_core::schema::FieldTypes>,
+}
+
+impl HotSnapshot {
+    /// Path of the snapshot file (delegates to the temp file).
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        self.file.path()
+    }
+}
+
+/// One cache slot: the generation it was built at, the snapshot file, and
+/// the key set the file actually carries (the same pass that finds the
+/// schema pioneers — pins are intersected against it on every call).
+struct CachedSnapshot {
+    generation: u64,
+    file: Arc<tempfile::NamedTempFile>,
+    keys: Vec<String>,
+}
+
 /// Batch-keyed in-memory event store.
 ///
 /// Uses an `IndexMap` for insertion-order iteration (oldest-first
@@ -54,10 +92,14 @@ pub struct HotBuffer {
     /// Monotonic counter bumped on every mutation (insert, drain).
     /// Used to invalidate the snapshot cache.
     generation: AtomicU64,
-    /// Cached snapshot: `(generation, temp_file)`. Reused across concurrent
-    /// queries when the buffer hasn't changed, avoiding O(events × queries)
-    /// I/O. Old snapshots stay alive via Arc until all queries using them finish.
-    snapshot_cache: Mutex<Option<(u64, Arc<tempfile::NamedTempFile>)>>,
+    /// Cached snapshot, reused across concurrent queries when the buffer
+    /// hasn't changed, avoiding O(events × queries) I/O. Old snapshots stay
+    /// alive via Arc until all queries using them finish.
+    snapshot_cache: Mutex<Option<CachedSnapshot>>,
+    /// Shared in-process pin cache; empty for a catalog-less buffer
+    /// (embedded mode, unit tests), which yields empty `field_types` on
+    /// every snapshot.
+    field_catalog: Arc<crate::catalog::FieldCatalog>,
 }
 
 impl std::fmt::Debug for HotBuffer {
@@ -72,7 +114,8 @@ impl std::fmt::Debug for HotBuffer {
 }
 
 impl HotBuffer {
-    /// Create a new hot buffer with the given limits.
+    /// Create a new hot buffer with the given limits (catalog-less — every
+    /// snapshot carries empty `field_types`).
     pub fn new(config: HotBufferConfig) -> Self {
         Self {
             batches: RwLock::new(IndexMap::new()),
@@ -81,7 +124,16 @@ impl HotBuffer {
             config,
             generation: AtomicU64::new(0),
             snapshot_cache: Mutex::new(None),
+            field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
         }
+    }
+
+    /// Attach the shared in-process pin cache; snapshots then carry the
+    /// pins intersected with their observed key set.
+    #[must_use]
+    pub fn with_field_catalog(mut self, catalog: Arc<crate::catalog::FieldCatalog>) -> Self {
+        self.field_catalog = catalog;
+        self
     }
 
     /// Insert a batch into the buffer.
@@ -144,17 +196,24 @@ impl HotBuffer {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Get a snapshot of all buffered events as a temporary ndjson file.
+    /// Get a snapshot of all buffered events as a temporary ndjson file,
+    /// paired with the catalog pins that apply to it.
     ///
     /// Returns `None` if the buffer is empty.
     /// Uses a generation-based cache: concurrent queries against an unchanged
     /// buffer share a single snapshot file (1 disk write instead of N).
     /// The `Arc` ensures the temp file stays alive until all queries using it finish.
     ///
-    /// The snapshot cache mutex is held for the entire build to serialize
-    /// concurrent misses — one thread builds while others wait ~40ms and
-    /// get the cached result, preventing thundering herd I/O.
-    pub fn snapshot(&self) -> Option<Arc<tempfile::NamedTempFile>> {
+    /// The FILE is cached per generation; the PIN INTERSECTION is not — see
+    /// [`HotSnapshot`] for why a generation-cached pin set would be stale in
+    /// the compaction rename-to-drain window. The intersect is O(observed
+    /// keys) over an in-process map, negligible next to the query itself.
+    ///
+    /// The snapshot cache mutex is held for the entire check-then-build
+    /// cycle to serialize concurrent misses — one thread builds while
+    /// others wait ~40ms and get the cached result, preventing thundering
+    /// herd I/O.
+    pub fn snapshot(&self) -> Option<HotSnapshot> {
         // Fast path: no events at all → skip locking entirely.
         if self.total_events.load(Ordering::Relaxed) == 0 {
             return None;
@@ -162,28 +221,56 @@ impl HotBuffer {
 
         let current_gen = self.generation.load(Ordering::Relaxed);
 
-        // Hold the mutex for the full check-then-build cycle to serialize
-        // concurrent cache misses (only one thread builds).
         let mut cache = self.snapshot_cache.lock();
 
-        if let Some((cached_gen, ref file)) = *cache
-            && cached_gen == current_gen
+        if let Some(cached) = cache.as_ref()
+            && cached.generation == current_gen
         {
-            return Some(Arc::clone(file));
+            return Some(HotSnapshot {
+                field_types: Arc::new(self.pins_for(&cached.keys)),
+                file: Arc::clone(&cached.file),
+            });
         }
 
         // Cache miss — build under lock so concurrent queries wait.
-        let snapshot = Arc::new(self.build_snapshot()?);
-        *cache = Some((current_gen, Arc::clone(&snapshot)));
+        let (file, keys) = self.build_snapshot()?;
+        let file = Arc::new(file);
+        let field_types = Arc::new(self.pins_for(&keys));
+        *cache = Some(CachedSnapshot {
+            generation: current_gen,
+            file: Arc::clone(&file),
+            keys,
+        });
 
-        Some(snapshot)
+        Some(HotSnapshot { file, field_types })
     }
 
-    /// Build a fresh snapshot file from the current buffer contents.
+    /// The pins that apply to one snapshot: the catalog intersected with
+    /// the keys the file carries. An exact-name lookup on both sides —
+    /// every producer ASCII-folds field names before they can reach
+    /// [`HotBuffer::insert`], so key set and catalog agree on one spelling
+    /// per `DuckDB` identifier (see [`Self::insert`]).
+    fn pins_for(&self, keys: &[String]) -> trawl_core::schema::FieldTypes {
+        self.field_catalog
+            .intersect(keys.iter().map(String::as_str))
+    }
+
+    /// Build a fresh snapshot file from the current buffer contents,
+    /// returning it with the key set the file carries.
     ///
-    /// Events are written schema-pioneers-first (see [`schema_pioneers`]) so
+    /// Events are written schema-pioneers-first (see [`survey_schema`]) so
     /// that the reader can rely on `DuckDB`'s cheap default schema sample.
-    fn build_snapshot(&self) -> Option<tempfile::NamedTempFile> {
+    ///
+    /// The key set is ASCII-lowercase by construction — no case merging is
+    /// needed here (the former `CaseMerge` rewrite is deliberately gone):
+    /// [`HotBuffer::insert`]'s production callers are exactly
+    /// `PipelineWriter::publish` and telemetry's flush, and every event
+    /// reaching either has its field names folded at the producer's own
+    /// door (HTTP ingest in `envelope::canonicalize`, the syslog listener
+    /// at SD-key construction, telemetry in its `JsonVisitor`). Test-only
+    /// direct constructors that insert unfolded keys get the loud
+    /// behaviour: an unnameable `x_1` twin column, not a silent merge.
+    fn build_snapshot(&self) -> Option<(tempfile::NamedTempFile, Vec<String>)> {
         let map = self.batches.read();
         if map.is_empty() {
             return None;
@@ -193,7 +280,7 @@ impl HotBuffer {
             .values()
             .flat_map(|batch| batch.events.iter().map(move |e| (&batch.batch_id, e)))
             .collect();
-        let pioneer = schema_pioneers(events.iter().map(|(_, e)| *e));
+        let (pioneer, keys) = survey_schema(events.iter().map(|(_, e)| *e));
 
         let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
         let mut wrote_any = false;
@@ -202,13 +289,10 @@ impl HotBuffer {
             .filter(|&i| pioneer[i])
             .chain((0..events.len()).filter(|&i| !pioneer[i]));
         for (batch_id, event) in order.map(|i| events[i]) {
-            // Coerce object/array values to their JSON text so the
-            // snapshot's read_json infers them as VARCHAR (see
-            // `coerce_complex_values`). Returns None when there is
-            // nothing to coerce, avoiding a clone on the common path.
-            let coerced = coerce_complex_values(event);
-            let event = coerced.as_ref().unwrap_or(event);
-
+            // Events are written verbatim: ingest canonicalization already
+            // stringified top-level object/array values (ADR-0009 slice 2),
+            // so every value here is a scalar.
+            //
             // Serialization failure here is very unlikely (we parsed it
             // successfully during ingest), but log and skip rather than
             // poisoning the entire snapshot.
@@ -241,7 +325,7 @@ impl HotBuffer {
             return None;
         }
 
-        Some(tmpfile)
+        Some((tmpfile, keys))
     }
 
     /// Total number of events across all batches.
@@ -265,8 +349,8 @@ impl HotBuffer {
     }
 }
 
-/// Flag the events that introduce a key no earlier event carried — the
-/// "schema pioneers" of the snapshot.
+/// Survey the events in one pass: flag the schema pioneers and collect the
+/// full observed key set.
 ///
 /// `DuckDB`'s `read_json` auto-detection infers the schema from a bounded
 /// prefix of the file (~20480 records) and then hard-errors — `unknown key`
@@ -287,9 +371,13 @@ impl HotBuffer {
 ///
 /// A homogeneous buffer has exactly one pioneer (the first event), so the
 /// snapshot order is unchanged in the common case.
-fn schema_pioneers<'a>(events: impl Iterator<Item = &'a Event>) -> Vec<bool> {
+///
+/// The key set falls out of the same pass for free — its seen-set IS the
+/// union of every event's keys. The caller intersects catalog pins against
+/// it, so the emitter's `REPLACE` can never name an absent column.
+fn survey_schema<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<bool>, Vec<String>) {
     let mut seen: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
-    events
+    let pioneers = events
         .map(|event| {
             let mut novel = false;
             for key in event.keys() {
@@ -297,36 +385,9 @@ fn schema_pioneers<'a>(events: impl Iterator<Item = &'a Event>) -> Vec<bool> {
             }
             novel
         })
-        .collect()
-}
-
-/// Replace top-level object/array values in an event with their JSON-text
-/// serialization, returning `None` when the event has no such values.
-///
-/// Compaction coerces complex-typed parquet columns (STRUCT/JSON/LIST) to
-/// VARCHAR for a stable on-disk schema (see
-/// `compaction::coerce_complex_columns_to_varchar`). The hot buffer must
-/// match: if a field is an object here but VARCHAR in parquet, the
-/// query-time `UNION ALL BY NAME` of the hot and cold sources hits a type
-/// conflict and the executor silently drops the cold (parquet) rows.
-/// Stringifying nested values makes the snapshot's `read_json` infer the
-/// column as VARCHAR, keeping both sides aligned. Scalars are untouched.
-fn coerce_complex_values(
-    event: &serde_json::Map<String, serde_json::Value>,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    use serde_json::Value;
-
-    if !event.values().any(|v| v.is_object() || v.is_array()) {
-        return None;
-    }
-
-    let mut coerced = event.clone();
-    for value in coerced.values_mut() {
-        if value.is_object() || value.is_array() {
-            *value = Value::String(value.to_string());
-        }
-    }
-    Some(coerced)
+        .collect();
+    let keys = seen.into_iter().map(str::to_owned).collect();
+    (pioneers, keys)
 }
 
 #[cfg(test)]
@@ -388,50 +449,6 @@ mod tests {
         assert_eq!(content.lines().count(), 3);
         assert!(content.contains("event_0"));
         assert!(content.contains("event_2"));
-    }
-
-    #[test]
-    fn snapshot_stringifies_complex_values() {
-        // An object-valued field must be serialized as a JSON string so the
-        // snapshot's read_json infers it as VARCHAR — matching the parquet
-        // side and avoiding a hot/cold union type conflict that would
-        // silently drop cold rows. Scalars stay as-is.
-        let buf = HotBuffer::new(HotBufferConfig {
-            max_events: 1000,
-            max_bytes: 10_000_000,
-        });
-
-        let mut ev = serde_json::Map::new();
-        ev.insert("service".into(), serde_json::Value::String("k".into()));
-        ev.insert("count".into(), serde_json::Value::from(5));
-        ev.insert(
-            "containerID".into(),
-            serde_json::json!({"id": "abc", "rt": "containerd"}),
-        );
-        buf.insert(Arc::new(IngestBatch {
-            batch_id: "b1".into(),
-            service: "k".into(),
-            byte_size: 100,
-            events: vec![ev],
-        }));
-
-        let tmpfile = buf.snapshot().expect("should have events");
-        let content = std::fs::read_to_string(tmpfile.path()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-
-        assert!(
-            parsed["containerID"].is_string(),
-            "object field should be stringified: {content}"
-        );
-        assert!(
-            parsed["containerID"].as_str().unwrap().contains("abc"),
-            "stringified JSON should preserve content"
-        );
-        assert!(
-            parsed["count"].is_number(),
-            "scalar field must not be stringified"
-        );
-        assert!(parsed["service"].is_string());
     }
 
     /// Build `n` plain events plus one carrying the sparse `_repairs`
@@ -553,7 +570,14 @@ mod tests {
             let exec = Executor::new().expect("executor should initialize");
             let source = format!("{}/*.parquet", dir.path().display());
             let result = exec
-                .run_query_with_hot("*", &source, hot, usize::MAX, 0)
+                .run_query_with_hot(
+                    "*",
+                    &source,
+                    hot,
+                    &trawl_core::schema::FieldTypes::new(),
+                    usize::MAX,
+                    0,
+                )
                 .expect("hot query must succeed");
 
             let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
@@ -563,6 +587,98 @@ mod tests {
                  got columns {col_names:?}"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_field_types_is_pins_intersect_observed_keys() {
+        // The snapshot's pin set is the catalog intersected with the keys
+        // the buffered events actually carry: a pin on a field no event has
+        // must NOT reach the emitter (REPLACE on an absent column throws),
+        // and an observed key without a pin contributes nothing.
+        use trawl_core::schema::CanonicalType;
+
+        let catalog = Arc::new(crate::catalog::FieldCatalog::new());
+        catalog.replace([
+            ("duration".to_string(), CanonicalType::BigInt),
+            ("absent_field".to_string(), CanonicalType::Varchar),
+        ]);
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog));
+
+        let mut ev = serde_json::Map::new();
+        ev.insert("service".into(), serde_json::Value::String("svc".into()));
+        ev.insert("duration".into(), serde_json::Value::from(42));
+        buf.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 100,
+            events: vec![ev],
+        }));
+
+        let snap = buf.snapshot().expect("should have events");
+        assert_eq!(
+            snap.field_types.get("duration"),
+            Some(CanonicalType::BigInt),
+            "pinned + observed field must be conformed"
+        );
+        assert_eq!(
+            snap.field_types.get("absent_field"),
+            None,
+            "a pin on a field no event carries must not reach the emitter"
+        );
+        assert_eq!(snap.field_types.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_reflects_new_pins_at_same_generation() {
+        // Compaction makes pins durable and refreshes the cache BEFORE the
+        // atomic rename publishes the conformant parquet, but the hot drain
+        // that bumps the generation happens AFTER. A generation-cached pin
+        // set would be stale in that window — a hard union error once the
+        // coerced retry is gone. Pins must therefore be intersected on
+        // EVERY snapshot() call, even a cache hit.
+        use trawl_core::schema::CanonicalType;
+
+        let catalog = Arc::new(crate::catalog::FieldCatalog::new());
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog));
+
+        let mut ev = serde_json::Map::new();
+        ev.insert("service".into(), serde_json::Value::String("svc".into()));
+        ev.insert("duration".into(), serde_json::Value::from(42));
+        buf.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 100,
+            events: vec![ev],
+        }));
+
+        let first = buf.snapshot().expect("should have events");
+        assert!(
+            first.field_types.is_empty(),
+            "no pins yet — nothing to conform"
+        );
+
+        // Pin lands mid-window: no buffer mutation, same generation.
+        catalog.replace([("duration".to_string(), CanonicalType::BigInt)]);
+
+        let second = buf.snapshot().expect("should have events");
+        assert!(
+            Arc::ptr_eq(&first.file, &second.file),
+            "same generation must reuse the cached snapshot file"
+        );
+        assert_eq!(
+            second.field_types.get("duration"),
+            Some(CanonicalType::BigInt),
+            "a pin added between snapshots at the SAME generation must be \
+             reflected immediately"
+        );
     }
 
     #[test]

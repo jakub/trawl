@@ -116,20 +116,30 @@ use trawl_server::transport::http;
 
 /// Create a `PrometheusHandle` for test contexts.
 ///
-/// Installs the recorder globally (nextest is process-per-test, so this
-/// cannot collide across tests) so `/metrics` reflects the counters the
-/// handlers emit via `metrics::counter!`. Falls back to a detached
-/// recorder when a global one is already installed (a test that builds
-/// two servers) — that second handle renders empty, which no test relies
-/// on.
+/// The prometheus recorder is PROCESS-global: `metrics::counter!` always
+/// records into whichever recorder was installed first, regardless of
+/// which handle a given server renders `/metrics` from. Under nextest
+/// (process-per-test) that is always the test's own; under plain
+/// `cargo test` every test in the binary shares one process, so a second
+/// server's freshly-built recorder would never see the counters the
+/// handlers emit — its `/metrics` renders empty and any assertion on it
+/// fails only under `cargo test`. Runner-independence therefore requires
+/// every harness server in the process to render the SAME handle: the
+/// first call installs the global recorder and caches its handle, and
+/// every later call clones it.
 pub fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
-    metrics_exporter_prometheus::PrometheusBuilder::new()
-        .install_recorder()
-        .unwrap_or_else(|_| {
+    static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+        std::sync::OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
             metrics_exporter_prometheus::PrometheusBuilder::new()
-                .build_recorder()
-                .handle()
+                .install_recorder()
+                .expect(
+                    "the harness owns recorder installation for this process; \
+                     nothing else may install one first",
+                )
         })
+        .clone()
 }
 
 /// Find an available port by binding to :0 and reading back the assigned port.
@@ -399,7 +409,7 @@ pub fn ensure_fixtures() -> String {
                 env VARCHAR,
                 service VARCHAR,
                 host VARCHAR,
-                severity INTEGER,
+                severity BIGINT,
                 severity_text VARCHAR,
                 message VARCHAR
             )",
@@ -683,8 +693,10 @@ pub async fn setup_in_dir_with_data(
         .await
         .expect("failed to create app state");
 
+    boot_conformance_pass(&state, &config).await;
+
     // Snapshot collector: makes GET /api/v1/dashboard live in tests, same
-    // as trawld's main() does in production.
+    // as trawld's `main()` does in production.
     let _collector = trawl_server::monitor::spawn_snapshot_collector(
         state.clone(),
         addr.clone(),
@@ -693,6 +705,29 @@ pub async fn setup_in_dir_with_data(
         false,
     );
 
+    serve_and_wait(&state, &config, http_config, &addr).await;
+
+    TestServer {
+        url: format!("https://{addr}"),
+        analyst_token,
+        admin_token,
+        reader_token,
+        ingest_token,
+        coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
+        fleet_pool: pool,
+        fleet_db_url,
+        app_db_url,
+        state,
+    }
+}
+
+/// Spawn the HTTPS server task and wait for it to answer on `addr`.
+async fn serve_and_wait(
+    state: &AppState,
+    config: &Config,
+    http_config: trawl_server::state::HttpConfig,
+    addr: &str,
+) {
     let server_config = config.server.clone();
     let state_dir = config.state_dir();
     let spawned_state = state.clone();
@@ -707,19 +742,21 @@ pub async fn setup_in_dir_with_data(
         .await
         .unwrap();
     });
-    wait_for_ready(&addr).await;
+    wait_for_ready(addr).await;
+}
 
-    TestServer {
-        url: format!("https://{addr}"),
-        analyst_token,
-        admin_token,
-        reader_token,
-        ingest_token,
-        coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
-        fleet_pool: pool,
-        fleet_db_url,
-        app_db_url,
-        state,
+/// Boot conformance pass, same as trawld's `main()` does in production
+/// (ingest is enabled in the test config default).
+async fn boot_conformance_pass(state: &trawl_server::state::AppState, config: &Config) {
+    if config.ingest.enabled {
+        trawl_server::catalog::conform::ensure_conformance(
+            &state.storage.catalog,
+            &state.query.field_catalog,
+            &config.data.base_dir(),
+            &config.ingest.compaction_memory_limit,
+        )
+        .await
+        .expect("boot conformance pass must succeed");
     }
 }
 

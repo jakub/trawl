@@ -1370,3 +1370,440 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool
     }
     panic!("replacement never acquired the freed lock: {last_err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// field catalog (ADR-0009 slice 2)
+// ---------------------------------------------------------------------------
+
+mod catalog {
+    use super::*;
+    use trawl_core::schema::{CanonicalType, ENVELOPE_TYPES};
+    use trawl_server::store::{CatalogStore, FieldConflict, PinProposal};
+
+    fn catalog(pool: &PgPool) -> CatalogStore {
+        CatalogStore::new(pool.clone())
+    }
+
+    fn proposal(field: &str, ty: CanonicalType) -> PinProposal {
+        PinProposal {
+            field: field.to_owned(),
+            ty,
+            pinned_from: "svc-a".to_owned(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn migration_seed_matches_envelope_types(pool: PgPool) {
+        // The declared schema is the catalog's first citizen: the migration
+        // seed must mirror trawl-core's ENVELOPE_TYPES exactly.
+        let pins = catalog(&pool).load_pins().await.unwrap();
+        for (field, ty) in ENVELOPE_TYPES {
+            let pinned = pins.iter().find(|(f, _)| f == field);
+            assert_eq!(
+                pinned.map(|(_, t)| *t),
+                Some(*ty),
+                "envelope field {field} must be pre-seeded with its declared type"
+            );
+        }
+        assert_eq!(
+            pins.len(),
+            ENVELOPE_TYPES.len(),
+            "a fresh catalog holds exactly the declared envelope"
+        );
+    }
+
+    #[sqlx::test]
+    async fn pin_missing_is_first_writer_wins(pool: PgPool) {
+        let store = catalog(&pool);
+
+        let pins = store
+            .pin_missing(&[proposal("duration", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        assert_eq!(pins.get("duration"), Some(&CanonicalType::BigInt));
+
+        // A later batch proposing a different type does NOT repin — the
+        // authoritative pin comes back instead.
+        let pins = store
+            .pin_missing(&[proposal("duration", CanonicalType::Varchar)])
+            .await
+            .unwrap();
+        assert_eq!(
+            pins.get("duration"),
+            Some(&CanonicalType::BigInt),
+            "an existing pin is never overwritten by pin_missing"
+        );
+    }
+
+    #[sqlx::test]
+    async fn pin_missing_race_converges_on_one_pin(pool: PgPool) {
+        // Two concurrent proposals for the same unpinned field with
+        // different types: both callers must come back with the SAME
+        // authoritative pin (INSERT ... ON CONFLICT DO NOTHING + re-read).
+        let a = catalog(&pool);
+        let b = catalog(&pool);
+        let pa_prop = [proposal("racy", CanonicalType::BigInt)];
+        let pb_prop = [proposal("racy", CanonicalType::Varchar)];
+        let (ra, rb) = tokio::join!(a.pin_missing(&pa_prop), b.pin_missing(&pb_prop));
+        let pa = ra.unwrap();
+        let pb = rb.unwrap();
+        assert_eq!(
+            pa.get("racy"),
+            pb.get("racy"),
+            "both racers must observe the same authoritative pin"
+        );
+        assert!(pa.contains_key("racy"));
+    }
+
+    /// A name no btree key can hold: 3000 pseudo-random printable bytes.
+    ///
+    /// The wide alphabet is load-bearing. Postgres pglz-compresses an
+    /// oversized index value before giving up, so a repeated-character
+    /// name of the same length slips under the limit and would not
+    /// exercise the failure at all; this one reproduces
+    /// `index row size 3016 exceeds btree version 4 maximum 2704`
+    /// verbatim against `field_types_pkey`.
+    fn unstorable_field_name() -> String {
+        let mut x: u32 = 0x1234_5678;
+        std::iter::repeat_with(|| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            char::from(33 + u8::try_from((x >> 16) % 93).unwrap())
+        })
+        .take(3000)
+        .collect()
+    }
+
+    #[sqlx::test]
+    async fn pin_missing_skips_unstorable_names_instead_of_failing(pool: PgPool) {
+        // An over-long field name must never error the pin statement:
+        // pinning gates every parquet write, so an Err here retains the
+        // batch and re-fails on every compaction tick, forever.
+        let store = catalog(&pool);
+        let huge = unstorable_field_name();
+
+        let pins = store
+            .pin_missing(&[
+                proposal(&huge, CanonicalType::Varchar),
+                proposal("duration", CanonicalType::BigInt),
+            ])
+            .await
+            .expect("an unstorable name must not fail the batch's pins");
+
+        assert!(
+            !pins.contains_key(&huge),
+            "the unstorable name is not pinned — leaving it unpinned is what \
+             makes the conform step drop the column"
+        );
+        assert_eq!(
+            pins.get("duration"),
+            Some(&CanonicalType::BigInt),
+            "every other field in the batch still pins"
+        );
+
+        // And it really is absent from the catalog, not silently stored.
+        let all = store.load_pins().await.unwrap();
+        assert!(all.iter().all(|(f, _)| f != &huge));
+    }
+
+    #[sqlx::test]
+    async fn pin_missing_caps_catalog_cardinality(pool: PgPool) {
+        // Field names are client-chosen JSON keys and a pin is permanent
+        // (add-only until #53, and retention never reconciles the catalog),
+        // so an uncapped catalog is an unbounded postgres table AND an
+        // unbounded in-process cache that a sender embedding identifiers in
+        // its keys grows for free. Only the free slots under the cap are
+        // filled; the surplus stays unpinned, which is what makes the
+        // conform step drop the column with its values still in `_raw`.
+        let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
+        let store = catalog(&pool).with_pin_cap(seeded + 2);
+
+        // Two free slots, and one batch may take at most half of them.
+        let pins = store
+            .pin_missing(&[
+                proposal("a_field", CanonicalType::BigInt),
+                proposal("b_field", CanonicalType::BigInt),
+                proposal("c_field", CanonicalType::BigInt),
+                proposal("d_field", CanonicalType::BigInt),
+            ])
+            .await
+            .expect("a full catalog must never error the batch — retrying cannot clear it");
+
+        assert_eq!(pins.len(), 1, "one batch takes at most half the free slots");
+        assert!(
+            pins.contains_key("a_field"),
+            "an overflowing batch picks deterministically, by name"
+        );
+
+        // One free slot left: the ration bounds a burst, it never strands
+        // the last slot.
+        let pins = store
+            .pin_missing(&[
+                proposal("b_field", CanonicalType::BigInt),
+                proposal("c_field", CanonicalType::BigInt),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(pins.len(), 1, "the last free slot is still grantable");
+        assert!(pins.contains_key("b_field"));
+
+        let all = store.load_pins().await.unwrap();
+        assert_eq!(
+            i64::try_from(all.len()).unwrap(),
+            seeded + 2,
+            "the catalog never exceeds the cap"
+        );
+
+        // A later batch against a full catalog pins nothing new — but must
+        // still resolve the pins that DO exist, or every known column of
+        // every batch would start being dropped once the cap is reached.
+        let pins = store
+            .pin_missing(&[
+                proposal("e_field", CanonicalType::BigInt),
+                proposal("a_field", CanonicalType::Varchar),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            pins.get("a_field"),
+            Some(&CanonicalType::BigInt),
+            "existing pins still resolve at a full catalog"
+        );
+        assert!(!pins.contains_key("e_field"), "no new pin fits");
+        assert_eq!(
+            store.load_pins().await.unwrap().len(),
+            all.len(),
+            "a full catalog never grows"
+        );
+    }
+
+    #[sqlx::test]
+    async fn one_batch_cannot_consume_the_catalog_but_the_boot_seed_can(pool: PgPool) {
+        // A pin slot is spent PERMANENTLY (add-only until #53) and denial is
+        // silent in the data — the column is simply absent from every later
+        // parquet file. First-come-first-served therefore meant one ingest
+        // request carrying enough junk keys could permanently unstore every
+        // future field on the install, from every service. The ingest path
+        // takes at most half the free slots, so the tail always survives a
+        // burst.
+        let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
+        let store = catalog(&pool).with_pin_cap(seeded + 8);
+
+        let burst: Vec<PinProposal> = (0..8)
+            .map(|i| proposal(&format!("junk_{i:02}"), CanonicalType::BigInt))
+            .collect();
+        let pins = store.pin_missing(&burst).await.unwrap();
+        assert_eq!(
+            pins.len(),
+            4,
+            "half of the eight free slots, never all of them"
+        );
+
+        let pins = store
+            .pin_missing(&[proposal("legit_field", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        assert!(
+            pins.contains_key("legit_field"),
+            "a burst never leaves the next legitimate field homeless"
+        );
+
+        // The boot conformance pass is exempt: its proposals describe
+        // columns already ON DISK, so a denied pin there deletes standing
+        // data rather than declining to add a column.
+        let pins = store.pin_missing_unrationed(&burst).await.unwrap();
+        assert_eq!(
+            pins.len(),
+            7,
+            "the seed fills every free slot the cap allows"
+        );
+        assert_eq!(
+            i64::try_from(store.load_pins().await.unwrap().len()).unwrap(),
+            seeded + 8,
+            "and the cap still holds absolutely"
+        );
+    }
+
+    #[sqlx::test]
+    async fn touch_services_skips_unstorable_names_instead_of_failing(pool: PgPool) {
+        let store = catalog(&pool);
+        let huge = unstorable_field_name();
+
+        store
+            .touch_services("svc-a", &[huge.clone(), "duration".to_owned()], 7)
+            .await
+            .expect("an unstorable name must not fail the observation upsert");
+
+        assert!(store.field_services(&huge).await.unwrap().is_empty());
+        assert_eq!(store.field_services("duration").await.unwrap().len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn touch_services_advances_only_last_seen(pool: PgPool) {
+        let store = catalog(&pool);
+        let fields = vec!["duration".to_owned()];
+
+        store.touch_services("svc-a", &fields, 10).await.unwrap();
+        let first = store.field_services("duration").await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].service, "svc-a");
+        assert_eq!(first[0].row_count, 10);
+        assert_eq!(first[0].first_seen, first[0].last_seen);
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        store.touch_services("svc-a", &fields, 5).await.unwrap();
+        let second = store.field_services("duration").await.unwrap();
+        assert_eq!(second.len(), 1, "upsert, not append");
+        assert_eq!(second[0].row_count, 15, "row_count accumulates");
+        assert_eq!(
+            second[0].first_seen, first[0].first_seen,
+            "first_seen never moves"
+        );
+        assert!(
+            second[0].last_seen > first[0].last_seen,
+            "last_seen advances"
+        );
+    }
+
+    #[sqlx::test]
+    async fn touch_services_is_ever_observed_no_eviction(pool: PgPool) {
+        // The acceptance criterion: `field_services` rows are ever-observed.
+        // No window, no eviction — a service observed once stays observed,
+        // however many other services later carry the field. Consumers
+        // window on `last_seen`.
+        let store = catalog(&pool);
+        let fields = vec!["duration".to_owned()];
+
+        for name in ["svc-a", "svc-b", "svc-c", "svc-d", "svc-e"] {
+            store.touch_services(name, &fields, 1).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let rows = store.field_services("duration").await.unwrap();
+        let kept: Vec<&str> = rows.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["svc-e", "svc-d", "svc-c", "svc-b", "svc-a"],
+            "every service ever observed is still there, most recent first"
+        );
+    }
+
+    #[sqlx::test]
+    async fn conflicts_append_and_never_aggregate(pool: PgPool) {
+        let store = catalog(&pool);
+        let row = FieldConflict {
+            field: "duration".to_owned(),
+            service: "svc-b".to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 3,
+        };
+        store
+            .record_conflicts(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+        store.record_conflicts(&[row]).await.unwrap();
+
+        let rows = store.conflicts_for_field("duration").await.unwrap();
+        assert_eq!(rows.len(), 2, "field_conflicts is append-only");
+        assert_eq!(rows[0].service, "svc-b");
+        assert_eq!(rows[0].observed_type, "VARCHAR");
+        assert_eq!(rows[0].expected_type, "BIGINT");
+        assert_eq!(rows[0].rows_nulled, 3);
+    }
+
+    #[sqlx::test]
+    async fn conflicts_keep_only_the_newest_rows_per_field(pool: PgPool) {
+        // A field pinned BIGINT that keeps receiving strings appends a row
+        // every compaction tick, forever, while its information content
+        // stays constant — so the evidence is a rolling window, trimmed per
+        // FIELD (service names are client-chosen too, so a per-service
+        // window would only move the unbounded axis).
+        let store = catalog(&pool).with_conflict_cap(3);
+        let conflict = |service: &str, nulled: u64| FieldConflict {
+            field: "duration".to_owned(),
+            service: service.to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: nulled,
+        };
+
+        for i in 0..6_u64 {
+            store
+                .record_conflicts(&[conflict(&format!("svc-{i}"), i)])
+                .await
+                .unwrap();
+        }
+        // An untouched field is never trimmed by another field's write.
+        store
+            .record_conflicts(&[FieldConflict {
+                field: "other".to_owned(),
+                ..conflict("svc-x", 1)
+            }])
+            .await
+            .unwrap();
+
+        let rows = store.conflicts_for_field("duration").await.unwrap();
+        assert_eq!(rows.len(), 3, "the window bounds the evidence per field");
+        let kept: Vec<&str> = rows.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["svc-5", "svc-4", "svc-3"],
+            "the newest rows survive, oldest first out"
+        );
+        assert_eq!(
+            store.conflicts_for_field("other").await.unwrap().len(),
+            1,
+            "trimming touches only the fields the call wrote"
+        );
+
+        // A single over-window batch is trimmed by the same statement that
+        // inserted it — the trim must see its own insert.
+        let store = catalog(&pool).with_conflict_cap(2);
+        store
+            .record_conflicts(&[
+                FieldConflict {
+                    field: "burst".to_owned(),
+                    ..conflict("svc-a", 1)
+                },
+                FieldConflict {
+                    field: "burst".to_owned(),
+                    ..conflict("svc-b", 2)
+                },
+                FieldConflict {
+                    field: "burst".to_owned(),
+                    ..conflict("svc-c", 3)
+                },
+            ])
+            .await
+            .unwrap();
+        let rows = store.conflicts_for_field("burst").await.unwrap();
+        assert_eq!(rows.len(), 2, "one oversized batch is trimmed on arrival");
+        let kept: Vec<&str> = rows.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["svc-c", "svc-b"],
+            "rows sharing an insert timestamp break the tie by id — newest last-written wins"
+        );
+    }
+
+    #[sqlx::test]
+    async fn catalog_id_is_stable_and_conformance_flips_once(pool: PgPool) {
+        let store = catalog(&pool);
+        let id1 = store.catalog_id().await.unwrap();
+        let id2 = store.catalog_id().await.unwrap();
+        assert_eq!(id1, id2, "catalog_id is a stable identity");
+        assert!(!id1.is_empty());
+
+        assert!(
+            !store.is_conformed().await.unwrap(),
+            "a fresh catalog has not run the boot conformance pass"
+        );
+        store.mark_conformed().await.unwrap();
+        assert!(store.is_conformed().await.unwrap());
+        assert_eq!(
+            store.catalog_id().await.unwrap(),
+            id1,
+            "conformance marking must not rotate the identity"
+        );
+    }
+}

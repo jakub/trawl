@@ -120,6 +120,7 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         Some(&hot_buffer),
         500,
         "2GB",
+        None,
     )
     .await
     .expect("compaction should succeed");
@@ -209,6 +210,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         Some(&hot_buffer),
         500,
         "2GB",
+        None,
     )
     .await
     .expect("compaction 1 should succeed");
@@ -248,6 +250,234 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     );
 }
 
+/// Hot/cold agreement through the REAL pin plumbing: a compaction tick
+/// with the catalog wired seeds the pin, a later conflicting event sits in
+/// a `HotBuffer` sharing the same `FieldCatalog`, and the query returns
+/// every cold row with the hot value nulled — proving the pins flow
+/// buffer → snapshot → pool → emitter without any test-side shortcut.
+#[sqlx::test]
+async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) {
+    use trawl_server::catalog::{CatalogContext, FieldCatalog};
+    use trawl_server::store::CatalogStore;
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let wal_dir = tmp.path().join("wal");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let catalog = Arc::new(FieldCatalog::new());
+    let ctx = CatalogContext {
+        store: CatalogStore::new(pool),
+        cache: Arc::clone(&catalog),
+    };
+    let hot_buffer = Arc::new(
+        HotBuffer::new(HotBufferConfig {
+            max_events: 10_000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog)),
+    );
+    let exec_pool = ExecutorPool::new(
+        data_dir.to_str().unwrap().to_owned(),
+        1,
+        1000,
+        Some(Arc::clone(&hot_buffer)),
+    );
+
+    // Cold batch: integer durations, compacted with the catalog wired —
+    // the tick seeds the BIGINT pin.
+    let cold: Vec<Map<String, Value>> = (0..2)
+        .map(|i| {
+            let mut m = make_event("nginx", &format!("cold{i}"));
+            m.insert("duration".into(), json!(4200 + i));
+            m
+        })
+        .collect();
+    let wal_writer = WalWriter::new(wal_dir.clone());
+    wal_writer.ensure_dir().unwrap();
+    let ndjson = events_to_ndjson(&cold);
+    wal_writer.write("prod", "nginx", &ndjson).unwrap();
+    trawl_server::ingest::compaction::compact_once(
+        &wal_dir,
+        &data_dir,
+        Duration::ZERO,
+        false,
+        Some(&hot_buffer),
+        500,
+        "2GB",
+        Some(&ctx),
+    )
+    .await
+    .expect("compaction should succeed");
+    assert_eq!(
+        catalog.get("duration"),
+        Some(trawl_core::schema::CanonicalType::BigInt),
+        "the compaction tick must seed the pin"
+    );
+
+    // Conflicting hot event — never compacted.
+    let mut hot = make_event("nginx", "hot-conflict");
+    hot.insert("duration".into(), json!("n/a"));
+    hot_buffer.insert(Arc::new(IngestBatch {
+        batch_id: "hot_manual".into(),
+        service: "nginx".into(),
+        byte_size: 64,
+        events: vec![hot],
+    }));
+
+    let result = exec_pool
+        .execute(
+            exec_pool.allocate_query_id(),
+            "* | head 100",
+            Duration::from_secs(10),
+            false,
+            0,
+        )
+        .await;
+    let query_result = result.result.expect("pinned hot conflict must not error");
+    assert_eq!(
+        query_result.rows.len(),
+        3,
+        "ALL cold rows plus the hot row must be present — never hot-only"
+    );
+    let dur = query_result
+        .columns
+        .iter()
+        .position(|c| c.name == "duration")
+        .expect("duration column present");
+    let ints = query_result
+        .rows
+        .iter()
+        .filter(|r| matches!(r[dur], trawl_api::value::Value::Integer(_)))
+        .count();
+    let nulls = query_result
+        .rows
+        .iter()
+        .filter(|r| matches!(r[dur], trawl_api::value::Value::Null))
+        .count();
+    assert_eq!(
+        (ints, nulls),
+        (2, 1),
+        "cold values stay integers; the hot conflict degrades to NULL"
+    );
+}
+
+// NOTE: the former `hot_case_variant_of_a_pinned_cold_field_does_not_throw_
+// the_union` test is deliberately gone with the `FieldCatalog::intersect`
+// case-variant defence it exercised: every producer ASCII-folds field names
+// at its own door BEFORE anything reaches the pipeline — HTTP ingest in
+// `envelope::canonicalize`, the syslog listener at SD-key construction
+// (`syslog::convert`), and telemetry in its `JsonVisitor` — so a hot buffer
+// carrying a mixed-case spelling of a pinned field cannot be produced by
+// the wired system. The end-to-end proofs are
+// `case_variant_field_names_fold_to_one_column_across_services` in
+// tests/field_catalog.rs and `syslog_mixed_case_sd_param_lands_folded_and_
+// pins_folded` below.
+
+/// The syslog producer does NOT route through `envelope::canonicalize`
+/// (`syslog_to_event` → `PipelineWriter::write`), so its fold lives at
+/// SD-key construction. This proves the whole journey: a mixed-case RFC
+/// 5424 SD param reaches the hot buffer folded, and compaction pins it
+/// under the folded name.
+#[sqlx::test]
+async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgPool) {
+    use indexmap::IndexMap;
+    use trawl_server::catalog::{CatalogContext, FieldCatalog};
+    use trawl_server::ingest::pipeline::{PipelineWriter, ServiceBatch};
+    use trawl_server::store::CatalogStore;
+    use trawl_server::syslog::convert::syslog_to_event;
+    use trawl_server::syslog::parse::parse_syslog;
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let wal_dir = tmp.path().join("wal");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let catalog = Arc::new(FieldCatalog::new());
+    let hot_buffer = Arc::new(
+        HotBuffer::new(HotBufferConfig {
+            max_events: 10_000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog)),
+    );
+    let wal_writer = Arc::new(WalWriter::new(wal_dir.clone()));
+    wal_writer.ensure_dir().unwrap();
+    let pipeline = PipelineWriter::new(
+        Arc::clone(&wal_writer),
+        Some(Arc::clone(&hot_buffer)),
+        None,
+        "prod".into(),
+    );
+
+    let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [exampleSDID@32473 eventID="1011"] boom"#;
+    let parsed = parse_syslog(raw);
+    let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+    let (service, map) = syslog_to_event(
+        raw,
+        &parsed,
+        ip,
+        &std::collections::HashMap::new(),
+        "syslog",
+        "prod",
+    );
+    assert_eq!(map["sd_examplesdid@32473_eventid"], "1011");
+    assert!(
+        map.keys()
+            .all(|k| !k.bytes().any(|b| b.is_ascii_uppercase())),
+        "the syslog producer must emit folded keys only: {:?}",
+        map.keys().collect::<Vec<_>>()
+    );
+
+    let mut batch = ServiceBatch::default();
+    batch.push(map);
+    let mut batches = IndexMap::new();
+    batches.insert(service, batch);
+    assert_eq!(pipeline.write(batches), 1);
+
+    // The hot snapshot carries the folded key and no unfolded spelling.
+    let snap = hot_buffer
+        .snapshot()
+        .expect("event must be in the hot buffer");
+    let content = std::fs::read_to_string(snap.path()).unwrap();
+    assert!(
+        content.contains("sd_examplesdid@32473_eventid"),
+        "hot snapshot must carry the folded key: {content}"
+    );
+    assert!(
+        !content.contains("\"sd_exampleSDID@32473_eventID\""),
+        "no unfolded KEY may reach the hot buffer (the wire spelling still \
+         lives in _raw's value, correctly): {content}"
+    );
+
+    // Compaction pins under the folded name, never the wire spelling.
+    let ctx = CatalogContext {
+        store: CatalogStore::new(pool),
+        cache: Arc::clone(&catalog),
+    };
+    trawl_server::ingest::compaction::compact_once(
+        &wal_dir,
+        &data_dir,
+        Duration::ZERO,
+        false,
+        Some(&hot_buffer),
+        500,
+        "2GB",
+        Some(&ctx),
+    )
+    .await
+    .expect("compaction should succeed");
+    assert!(
+        catalog.get("sd_examplesdid@32473_eventid").is_some(),
+        "the folded name must be pinned"
+    );
+    assert!(
+        catalog.get("sd_exampleSDID@32473_eventID").is_none(),
+        "the wire spelling must not exist as a pin"
+    );
+}
+
 #[tokio::test]
 async fn query_works_without_hot_buffer() {
     // Verify the query path still works when no hot buffer is configured.
@@ -275,6 +505,7 @@ async fn query_works_without_hot_buffer() {
         None,
         500,
         "2GB",
+        None,
     )
     .await
     .expect("compaction without hot buffer should succeed");

@@ -162,29 +162,22 @@ pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
 /// Emit SQL that unions the primary parquet source with a hot buffer ndjson file.
 ///
 /// Produces a `UNION ALL BY NAME` composite source so that fresh events
-/// in the hot buffer are visible alongside compacted parquet data.
+/// in the hot buffer are visible alongside compacted parquet data. `pins`
+/// is the field catalog's pinned types intersected with the snapshot's
+/// observed keys: each pinned field is conformed on the HOT branch only
+/// (`TRY_CAST` for typed pins, the untyped json path for VARCHAR), so a
+/// hot value disagreeing with the write-time pin degrades to NULL instead
+/// of throwing the union. Empty `pins` (embedded mode, catalog-less
+/// buffer) leaves the union plain apart from the unconditional envelope
+/// timestamp `TRY_CAST`s (ADR-0008).
 pub fn emit_with_hot_source(
     query: &Query,
     source: &str,
     hot_source: &str,
-) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || EmitterState::with_hot_source(source, hot_source))
-}
-
-/// Emit a hot+cold union query with `varchar_cols` coerced to VARCHAR on
-/// both sides.
-///
-/// The executor calls this to retry a query whose hot+cold union failed on
-/// a column type conflict, coercing the conflicting columns so both the hot
-/// and cold rows survive instead of dropping the cold side.
-pub fn emit_with_hot_source_coerced(
-    query: &Query,
-    source: &str,
-    hot_source: &str,
-    varchar_cols: &[String],
+    pins: &crate::schema::FieldTypes,
 ) -> Result<EmittedQuery, EmitError> {
     emit_with_raw_fallback(query, || {
-        EmitterState::with_hot_source_coerced(source, hot_source, varchar_cols)
+        EmitterState::with_hot_source(source, hot_source, pins)
     })
 }
 
@@ -1321,54 +1314,126 @@ mod tests {
     #[test]
     fn hot_source_emits_union_all() {
         let query = parser::parse("service=nginx").unwrap();
-        let result = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson").unwrap();
+        let result = emit_with_hot_source(
+            &query,
+            SRC,
+            "/tmp/hot_abc123.ndjson",
+            &crate::schema::FieldTypes::new(),
+        )
+        .unwrap();
         assert_snapshot!(format_result(&result));
     }
 
     #[test]
     fn hot_source_rejects_invalid_path() {
         let query = parser::parse("*").unwrap();
-        let err = emit_with_hot_source(&query, SRC, "/tmp/bad;path.ndjson").unwrap_err();
+        let err = emit_with_hot_source(
+            &query,
+            SRC,
+            "/tmp/bad;path.ndjson",
+            &crate::schema::FieldTypes::new(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]
-    fn hot_source_coerced_empty_matches_plain() {
-        // The empty-coercion path must be byte-identical to the plain hot
-        // source so the common case is unchanged.
-        let query = parser::parse("service=nginx").unwrap();
-        let plain = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson").unwrap();
-        let coerced =
-            emit_with_hot_source_coerced(&query, SRC, "/tmp/hot_abc123.ndjson", &[]).unwrap();
-        assert_eq!(plain.sql, coerced.sql);
+    fn hot_source_pins_cast_hot_branch_only() {
+        let query = parser::parse("*").unwrap();
+        let mut pins = crate::schema::FieldTypes::new();
+        pins.insert("duration", crate::schema::CanonicalType::BigInt);
+        pins.insert("note", crate::schema::CanonicalType::Varchar);
+        let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
+            .unwrap()
+            .sql;
+        // Typed pin: TRY_CAST on the hot branch (NULL on mismatch, never a
+        // union throw — ADR-0008).
+        assert!(
+            sql.contains(r#"TRY_CAST("duration" AS BIGINT) AS "duration""#),
+            "hot branch must conform the BIGINT pin: {sql}"
+        );
+        // VARCHAR pin: the untyped json path, so strings land unquoted
+        // whatever the snapshot column inferred as.
+        assert!(
+            sql.contains(r#"json_extract_string(to_json("note"), '$') AS "note""#),
+            "hot branch must conform the VARCHAR pin untyped: {sql}"
+        );
+        // The pin casts appear ONCE — on the hot branch only. The cold
+        // branch is plain: parquet is write-time conformant, and a
+        // defensive cold cast would mask a real invariant breach.
+        assert_eq!(sql.matches(r#"TRY_CAST("duration""#).count(), 1);
+        assert!(
+            sql.contains("(SELECT * FROM read_parquet("),
+            "cold branch must have no REPLACE: {sql}"
+        );
     }
 
     #[test]
-    fn hot_source_coerced_casts_columns_both_sides() {
+    fn hot_source_pinned_timestamp_columns_not_duplicated() {
+        // The two envelope TIMESTAMP columns get their unconditional
+        // TRY_CASTs; a pin on them must not add a second REPLACE entry.
         let query = parser::parse("*").unwrap();
-        let cols = vec!["status".to_string(), "containerID".to_string()];
-        let sql = emit_with_hot_source_coerced(&query, SRC, "/tmp/hot_abc123.ndjson", &cols)
+        let mut pins = crate::schema::FieldTypes::new();
+        pins.insert("_time", crate::schema::CanonicalType::Timestamp);
+        pins.insert("_ingested", crate::schema::CanonicalType::Timestamp);
+        let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
             .unwrap()
             .sql;
-        // Cold (parquet) side casts the conflicting columns to VARCHAR.
+        assert_eq!(sql.matches(r#"AS "_time""#).count(), 1, "{sql}");
+        assert_eq!(sql.matches(r#"AS "_ingested""#).count(), 1, "{sql}");
+    }
+
+    #[test]
+    fn hot_source_non_ascii_distinct_pins_each_get_an_entry() {
+        // DuckDB folds identifiers over ASCII only, so `café` and `cafÉ`
+        // (the ingest-folded form of `CAFÉ`) are two distinct columns and
+        // two distinct pins — each must keep its own REPLACE entry.
+        let query = parser::parse("*").unwrap();
+        let mut pins = crate::schema::FieldTypes::new();
+        pins.insert("café", crate::schema::CanonicalType::Varchar);
+        pins.insert("cafÉ", crate::schema::CanonicalType::BigInt);
+        let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
+            .unwrap()
+            .sql;
         assert!(
-            sql.contains(r#"REPLACE (CAST("status" AS VARCHAR) AS "status""#),
-            "cold side should cast status: {sql}"
+            sql.contains(r#"json_extract_string(to_json("café"), '$') AS "café""#),
+            "{sql}"
         );
         assert!(
-            sql.contains(r#"CAST("containerID" AS VARCHAR) AS "containerID""#),
-            "should cast containerID: {sql}"
+            sql.contains(r#"TRY_CAST("cafÉ" AS BIGINT) AS "cafÉ""#),
+            "{sql}"
         );
-        // Hot side keeps the casts for BOTH envelope timestamp columns
-        // (TRY_CAST — the partition key is never hard-CAST, ADR-0008)
-        // and adds the VARCHAR casts.
+    }
+
+    #[test]
+    fn hot_source_empty_pins_is_plain_union_with_timestamp_casts() {
+        // Empty pins (embedded mode, catalog-less buffer) must emit exactly
+        // the shape the coerced path emits for zero coercions: plain cold
+        // select, hot side with only the two timestamp TRY_CASTs.
+        let query = parser::parse("service=nginx").unwrap();
+        let sql = emit_with_hot_source(
+            &query,
+            SRC,
+            "/tmp/hot_abc123.ndjson",
+            &crate::schema::FieldTypes::new(),
+        )
+        .unwrap()
+        .sql;
         assert!(
-            sql.contains(r#"TRY_CAST("_time" AS TIMESTAMP) AS "_time""#),
-            "hot side keeps _time TRY_CAST: {sql}"
+            sql.contains("(SELECT * FROM read_parquet("),
+            "cold branch must be plain: {sql}"
         );
         assert!(
-            sql.contains(r#"TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested""#),
-            "hot side keeps _ingested TRY_CAST: {sql}"
+            sql.contains(
+                r#"REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested") FROM read_json("#
+            ),
+            "hot branch must carry exactly the two timestamp TRY_CASTs \
+             (TRY_CAST — the partition key is never hard-CAST, ADR-0008): {sql}"
+        );
+        assert_eq!(
+            sql.matches("REPLACE").count(),
+            1,
+            "empty pins must add no further REPLACE entries: {sql}"
         );
     }
 

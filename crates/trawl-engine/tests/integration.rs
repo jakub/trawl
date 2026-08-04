@@ -10,6 +10,7 @@
 
 mod common;
 
+use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::Executor;
 use trawl_engine::value::{QueryResult, Value};
@@ -813,79 +814,130 @@ fn export_parquet_rejects_rust_stages() {
     std::fs::remove_file(&path).ok();
 }
 
-#[test]
-fn hot_cold_type_conflict_keeps_both_rows() {
-    // Cold parquet has `meta` as a STRUCT (object value); the hot snapshot
-    // has it as a plain string (VARCHAR). The hot+cold UNION ALL BY NAME
-    // raises a Conversion Error. The executor must detect the conflict,
-    // coerce `meta` to VARCHAR on both sides, and keep BOTH the cold and hot
-    // rows — not silently fall back to hot-only and drop the cold row.
+/// Write a one-row cold parquet with a BIGINT `duration` next to a hot
+/// ndjson whose `duration` is the string `"n/a"` — the hot-side conflict
+/// shape the field catalog resolves via pins. Returns the hot path.
+fn write_pin_conflict_corpus(cold_dir: &std::path::Path, hot: &std::path::Path) {
     use duckdb::Connection;
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
+                      'svc' AS service, 410 AS duration) \
+         TO '{}' (FORMAT PARQUET)",
+        cold_dir.join("cold.parquet").display()
+    ))
+    .unwrap();
+    std::fs::write(
+        hot,
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"duration\":\"n/a\"}\n",
+    )
+    .unwrap();
+}
 
-    let dir = tempfile::tempdir().unwrap();
-    let cold = dir.path().join("cold.parquet");
-    let hot = dir.path().join("hot.ndjson");
-
+/// Write a one-row cold parquet whose `meta` is a STRUCT next to a hot
+/// ndjson whose `meta` is a plain string — a FOREIGN nonconformant corpus:
+/// server-written parquet can never hold a STRUCT (write-time conformance,
+/// ADR-0009 slice 2), so no catalog pin exists for it.
+fn write_foreign_struct_corpus(cold_dir: &std::path::Path, hot: &std::path::Path) {
+    use duckdb::Connection;
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
         "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
                       'svc' AS service, {{'a': 1}} AS meta) \
          TO '{}' (FORMAT PARQUET)",
-        cold.display()
+        cold_dir.join("cold.parquet").display()
     ))
     .unwrap();
-
     std::fs::write(
-        &hot,
+        hot,
         "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
     )
     .unwrap();
+}
 
-    let exec = Executor::new().expect("executor should initialize");
-    let source = format!("{}/*.parquet", dir.path().display());
-    let result = exec
-        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
-        .unwrap();
+/// The catalog pins for the pin-conflict corpus: `duration` is BIGINT.
+fn duration_bigint_pins() -> FieldTypes {
+    let mut pins = FieldTypes::new();
+    pins.insert("duration", trawl_core::schema::CanonicalType::BigInt);
+    pins
+}
 
+/// Assert the pin-conflict result: BOTH rows present from ONE execution of
+/// the pin-conformed union — the cold value still a BIGINT integer, the
+/// nonconforming hot value degraded to NULL. The deleted coerced retry
+/// would instead have stringified BOTH sides to VARCHAR ("410"/"n/a"), so
+/// any String in the duration column proves a second, coercing execution.
+fn assert_pin_conflict_rows(columns: &[trawl_engine::value::Column], rows: &[Vec<Value>]) {
+    let dur = columns
+        .iter()
+        .position(|c| c.name == "duration")
+        .expect("duration column must be present");
+    assert_eq!(rows.len(), 2, "both cold and hot rows must survive");
+    let mut values: Vec<&Value> = rows.iter().map(|r| &r[dur]).collect();
+    values.sort_by_key(|v| matches!(v, Value::Null));
     assert_eq!(
-        result.row_count(),
-        2,
-        "both cold (struct meta) and hot (string meta) rows must survive the coerced retry"
+        *values[0],
+        Value::Integer(410),
+        "the cold value must stay BIGINT — a String here means the deleted \
+         coerced retry ran a second, stringifying execution"
+    );
+    assert_eq!(
+        *values[1],
+        Value::Null,
+        "the nonconforming hot value must degrade to NULL, not a string"
     );
 }
 
 #[test]
-fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
-    // Same STRUCT-vs-VARCHAR `meta` conflict as above, but behind the LIST
-    // source shape the server emits for every time-filtered query, with one
-    // element pointing at an hour dir holding no file (routine for a
-    // sparse-traffic service). The first read of that list reports "no files"
-    // — so the conflict cannot surface until the empty element is pruned, and
-    // the pruned read must get the coerced retry too. Pre-fix it did not, and
-    // the repairable conflict fell through the outcome policy as a hard error.
-    use duckdb::Connection;
+fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
+    // Cold parquet has `duration` as BIGINT (write-time conformant); the hot
+    // snapshot carries "n/a" for it. Under the BIGINT pin the emitter
+    // TRY_CASTs the hot branch, so ONE execution returns both rows with the
+    // hot value NULL — no retry, no VARCHAR coercion, cold data intact.
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    write_pin_conflict_corpus(dir.path(), &hot);
 
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!("{}/*.parquet", dir.path().display());
+    let result = exec
+        .run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &duration_bigint_pins(),
+            usize::MAX,
+            0,
+        )
+        .expect("a pinned hot conflict must resolve in one execution");
+
+    assert_pin_conflict_rows(&result.columns, &result.rows);
+}
+
+// NOTE: the former `hot_case_variant_pins_do_not_wedge_the_union` test is
+// deliberately gone with the emitter's runtime case-folding it exercised:
+// field names are ASCII-folded at every producer's own door (HTTP ingest
+// canonicalization, the syslog listener's SD-key construction, telemetry's
+// JsonVisitor) and again at the catalog's entry points (boot seeding,
+// compaction proposals), so a `FieldTypes` carrying two spellings of one
+// DuckDB identifier cannot be produced by the wired system — the
+// end-to-end proofs live in trawl-server's
+// `case_variant_field_names_fold_to_one_column_across_services` and
+// `syslog_mixed_case_sd_param_lands_folded_and_pins_folded`.
+
+#[test]
+fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
+    // Same pinned conflict behind the LIST source shape the server emits,
+    // with one element pointing at an hour dir holding no file. The pruned
+    // retry (which survives — it only lost its conflict branch) must carry
+    // the pins too.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
     std::fs::create_dir_all(&full).unwrap();
     std::fs::create_dir_all(&empty).unwrap();
     let hot = dir.path().join("hot.ndjson");
-
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
-                      'svc' AS service, {{'a': 1}} AS meta) \
-         TO '{}' (FORMAT PARQUET)",
-        full.join("cold.parquet").display()
-    ))
-    .unwrap();
-
-    std::fs::write(
-        &hot,
-        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
-    )
-    .unwrap();
+    write_pin_conflict_corpus(&full, &hot);
 
     let exec = Executor::new().expect("executor should initialize");
     let source = format!(
@@ -894,50 +946,95 @@ fn hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
         empty.display()
     );
     let result = exec
-        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
-        .expect("a repairable hot/cold conflict must not hard-error on a pruned list source");
+        .run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &duration_bigint_pins(),
+            usize::MAX,
+            0,
+        )
+        .expect("a pinned hot conflict behind a pruned list source must resolve");
 
+    assert_pin_conflict_rows(&result.columns, &result.rows);
+}
+
+#[test]
+fn export_parquet_hot_pin_conflict_nulls_hot_value() {
+    // The export lane of the pinned conflict: both rows land in the exported
+    // parquet, with `duration` still BIGINT (a VARCHAR column would mean the
+    // deleted coercion ran).
+    use duckdb::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    let out = dir.path().join("export.parquet");
+    write_pin_conflict_corpus(dir.path(), &hot);
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!("{}/*.parquet", dir.path().display());
+    exec.export_parquet_with_hot(
+        "*",
+        &source,
+        hot.to_str().unwrap(),
+        &duration_bigint_pins(),
+        &out,
+        1000,
+    )
+    .expect("a pinned hot conflict must not fail the parquet export");
+
+    let conn = Connection::open_in_memory().unwrap();
+    let (rows, dtype): (i64, String) = conn
+        .query_row(
+            &format!(
+                "SELECT count(*)::BIGINT, \
+                        (SELECT typeof(duration) FROM read_parquet('{p}') \
+                          WHERE duration IS NOT NULL) \
+                 FROM read_parquet('{p}')",
+                p = out.display()
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rows, 2, "both rows must land in the exported parquet");
     assert_eq!(
-        result.row_count(),
-        2,
-        "both cold (struct meta) and hot (string meta) rows must survive the coerced retry"
+        dtype, "BIGINT",
+        "the pinned column must stay BIGINT in the export"
     );
 }
 
 #[test]
-fn export_parquet_hot_cold_type_conflict_keeps_both_rows() {
-    // The export lane of `hot_cold_type_conflict_keeps_both_rows`: same
-    // STRUCT-vs-VARCHAR `meta` conflict, exported instead of queried. The
-    // conflict is repairable, so the coerced retry must keep BOTH rows.
-    // Pre-fix only the query path retried, so the very same query succeeded as
-    // CSV/JSON (which route through the query path) and 500'd as parquet.
+fn export_parquet_hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
+    // Export lane crossed with the pruned-list source shape.
     use duckdb::Connection;
 
     let dir = tempfile::tempdir().unwrap();
-    let cold = dir.path().join("cold.parquet");
+    let full = dir.path().join("full");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::create_dir_all(&empty).unwrap();
     let hot = dir.path().join("hot.ndjson");
     let out = dir.path().join("export.parquet");
-
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
-                      'svc' AS service, {{'a': 1}} AS meta) \
-         TO '{}' (FORMAT PARQUET)",
-        cold.display()
-    ))
-    .unwrap();
-
-    std::fs::write(
-        &hot,
-        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
-    )
-    .unwrap();
+    write_pin_conflict_corpus(&full, &hot);
 
     let exec = Executor::new().expect("executor should initialize");
-    let source = format!("{}/*.parquet", dir.path().display());
-    exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
-        .expect("a repairable hot/cold conflict must not hard-error the parquet export");
+    let source = format!(
+        "['{}/*.parquet', '{}/*.parquet']",
+        full.display(),
+        empty.display()
+    );
+    exec.export_parquet_with_hot(
+        "*",
+        &source,
+        hot.to_str().unwrap(),
+        &duration_bigint_pins(),
+        &out,
+        1000,
+    )
+    .expect("a pinned conflict behind a pruned list source must not fail the export");
 
+    let conn = Connection::open_in_memory().unwrap();
     let rows: i64 = conn
         .query_row(
             &format!(
@@ -948,42 +1045,50 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(
-        rows, 2,
-        "both cold (struct meta) and hot (string meta) rows must land in the exported parquet"
+    assert_eq!(rows, 2, "both rows must land in the exported parquet");
+}
+
+#[test]
+fn foreign_nonconformant_corpus_errors_loudly() {
+    // A STRUCT-typed parquet column can only come from foreign parquet
+    // dropped into the data root (the boot pass conforms everything else),
+    // so no pin exists and the union hard-errors. The old behavior —
+    // silently degrading to a coerced or hot-only result — hid the breach;
+    // the honest contract is a loud error the operator can act on.
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    write_foreign_struct_corpus(dir.path(), &hot);
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!("{}/*.parquet", dir.path().display());
+    let err = exec
+        .run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
+        .expect_err("a nonconformant corpus with cold files present must error, not 200");
+    assert!(
+        matches!(err, EngineError::Database(_)),
+        "expected a loud database error, got: {err}"
     );
 }
 
 #[test]
-fn export_parquet_hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_source() {
-    // The export lane of the pruned-list conflict: the first read of the list
-    // reports "no files" because one element points at an hour dir holding no
-    // file, so the conflict cannot surface until the empty element is pruned —
-    // and the pruned export must get the coerced retry too.
-    use duckdb::Connection;
-
+fn foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
+    // Same foreign corpus behind the pruned-list shape: the conflict only
+    // surfaces on the pruned (first real) read, which must also error loudly
+    // rather than fall back hot-only past existing cold files.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
     std::fs::create_dir_all(&full).unwrap();
     std::fs::create_dir_all(&empty).unwrap();
     let hot = dir.path().join("hot.ndjson");
-    let out = dir.path().join("export.parquet");
-
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&format!(
-        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
-                      'svc' AS service, {{'a': 1}} AS meta) \
-         TO '{}' (FORMAT PARQUET)",
-        full.join("cold.parquet").display()
-    ))
-    .unwrap();
-
-    std::fs::write(
-        &hot,
-        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"meta\":\"plain\"}\n",
-    )
-    .unwrap();
+    write_foreign_struct_corpus(&full, &hot);
 
     let exec = Executor::new().expect("executor should initialize");
     let source = format!(
@@ -991,22 +1096,83 @@ fn export_parquet_hot_cold_type_conflict_keeps_both_rows_for_a_pruned_list_sourc
         full.display(),
         empty.display()
     );
-    exec.export_parquet_with_hot("*", &source, hot.to_str().unwrap(), &out, 1000)
-        .expect("a repairable conflict behind a pruned list source must not fail the export");
-
-    let rows: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT count(*)::BIGINT FROM read_parquet('{}')",
-                out.display()
-            ),
-            [],
-            |row| row.get(0),
+    let err = exec
+        .run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
         )
-        .unwrap();
-    assert_eq!(
-        rows, 2,
-        "both cold (struct meta) and hot (string meta) rows must land in the exported parquet"
+        .expect_err("a nonconformant corpus behind a pruned list must error, not 200");
+    assert!(
+        matches!(err, EngineError::Database(_)),
+        "expected a loud database error, got: {err}"
+    );
+}
+
+#[test]
+fn export_parquet_foreign_nonconformant_corpus_errors_loudly() {
+    // Export lane of the foreign-corpus contract: error, not a hot-only file.
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    let out = dir.path().join("export.parquet");
+    write_foreign_struct_corpus(dir.path(), &hot);
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!("{}/*.parquet", dir.path().display());
+    let err = exec
+        .export_parquet_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            &out,
+            1000,
+        )
+        .expect_err("a nonconformant corpus must fail the export loudly");
+    assert!(
+        matches!(err, EngineError::Database(_)),
+        "expected a loud database error, got: {err}"
+    );
+    assert!(
+        !out.exists(),
+        "no partial hot-only export may be left behind"
+    );
+}
+
+#[test]
+fn export_parquet_foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
+    // Export lane crossed with the pruned-list source shape.
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::create_dir_all(&empty).unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    let out = dir.path().join("export.parquet");
+    write_foreign_struct_corpus(&full, &hot);
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = format!(
+        "['{}/*.parquet', '{}/*.parquet']",
+        full.display(),
+        empty.display()
+    );
+    let err = exec
+        .export_parquet_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            &out,
+            1000,
+        )
+        .expect_err("a nonconformant corpus behind a pruned list must fail the export");
+    assert!(
+        matches!(err, EngineError::Database(_)),
+        "expected a loud database error, got: {err}"
     );
 }
 
@@ -1040,8 +1206,13 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
 
     let exec = Executor::new().expect("executor should initialize");
     let source = format!("{}/*.parquet", dir.path().display());
+    // The envelope timestamp pins ride along, as in production: they must
+    // not double up on the union's unconditional timestamp TRY_CASTs.
+    let mut pins = FieldTypes::new();
+    pins.insert("_time", trawl_core::schema::CanonicalType::Timestamp);
+    pins.insert("_ingested", trawl_core::schema::CanonicalType::Timestamp);
     let result = exec
-        .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+        .run_query_with_hot("*", &source, hot.to_str().unwrap(), &pins, usize::MAX, 0)
         .expect("hot+cold query must not error on a malformed hot timestamp");
 
     assert_eq!(
@@ -1099,7 +1270,14 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
         let exec = Executor::new().expect("executor should initialize");
         let source = format!("{}/*.parquet", dir.path().display());
         let result = exec
-            .run_query_with_hot("*", &source, hot.to_str().unwrap(), usize::MAX, 0)
+            .run_query_with_hot(
+                "*",
+                &source,
+                hot.to_str().unwrap(),
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            )
             .expect("hot query must succeed");
 
         let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();

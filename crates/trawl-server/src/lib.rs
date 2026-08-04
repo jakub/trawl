@@ -9,6 +9,7 @@
 
 pub mod audit;
 pub mod bus;
+pub mod catalog;
 pub mod config;
 pub(crate) mod env_dirs;
 pub mod epoch;

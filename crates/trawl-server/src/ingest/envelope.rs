@@ -40,6 +40,20 @@ pub enum RepairCode {
     /// client sent a server-owned field (`_ingested`, `_repairs`, or a
     /// non-string `_raw`); value dropped and replaced.
     MetaStripped,
+    /// a field's NAME exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
+    /// the field was dropped (its value stays findable in `_raw`).
+    FieldNameTooLong,
+    /// a field's NAME carried ASCII uppercase and was folded to lowercase —
+    /// `DuckDB` identifiers are ASCII case-insensitive, so the lowercase
+    /// form is the one spelling every downstream layer (catalog, parquet,
+    /// hot snapshot) agrees on. The original spelling stays in `_raw`.
+    FieldNameCaseFolded,
+    /// two field NAMES in one event differed only in ASCII case — one
+    /// column as far as `DuckDB` is concerned — so the losing key was
+    /// dropped (its value stays findable in `_raw`). The exact-lowercase
+    /// spelling wins when present; otherwise the ASCII-lexicographically
+    /// first variant does.
+    FieldNameCaseCollision,
 }
 
 impl RepairCode {
@@ -53,6 +67,9 @@ impl RepairCode {
             Self::SeverityUnmapped => "severity.unmapped",
             Self::FieldTruncated => "field.truncated",
             Self::MetaStripped => "meta.stripped",
+            Self::FieldNameTooLong => "field.name_too_long",
+            Self::FieldNameCaseFolded => "field.name_case_folded",
+            Self::FieldNameCaseCollision => "field.name_case_collision",
         }
     }
 }
@@ -484,13 +501,151 @@ fn resolve_severity(out: &mut Map<String, Value>) -> bool {
     unmapped
 }
 
+/// Stringify top-level object/array values to their JSON text (ADR-0009
+/// slice 2): with nothing left to flatten, a `read_json` "Duplicate name"
+/// collision is structurally impossible, so compaction never has to choose
+/// between draining a batch and keeping its columns.
+///
+/// Runs AFTER the `_raw` capture (the nesting stays findable there) and
+/// AFTER the reserved-key strip (a forged object `_raw` must strip as
+/// meta, not be laundered into a string). This is a canonicalization like
+/// RFC 3339 time reformatting, NOT a repair — a code firing on every k8s
+/// event would destroy `_repairs`'s NULL-dominance. Reach nested values
+/// with `json_extract_string(k8s, '$.pod')`.
+fn stringify_nested_values(out: &mut Map<String, Value>) {
+    for value in out.values_mut() {
+        if value.is_object() || value.is_array() {
+            *value = Value::String(value.to_string());
+        }
+    }
+}
+
+/// Remove the fields a client may never set, returning whether any were
+/// present (the `meta.stripped` repair): honouring them would let a sender
+/// forge its own handling history. `_trawl_wal_file` — compaction's
+/// synthetic provenance column, trawl's key rather than the client's — goes
+/// silently, since a row carrying it wedges `read_json`.
+fn strip_server_owned(out: &mut Map<String, Value>) -> bool {
+    let mut stripped = false;
+    for key in trawl_core::schema::RESERVED_CLIENT_FIELDS {
+        if out.remove(*key).is_some() {
+            stripped = true;
+        }
+    }
+    if matches!(out.get("_raw"), Some(v) if !v.is_string()) {
+        out.remove("_raw");
+        stripped = true;
+    }
+    out.remove(compaction::WAL_FILE_COL);
+    stripped
+}
+
+/// One event's field names after ASCII case-folding ([`fold_field_names`]).
+struct FoldedNames {
+    /// The event with every field name ASCII-lowercased.
+    obj: Map<String, Value>,
+    /// Whether any name was actually folded (the `field.name_case_folded`
+    /// repair — recorded only when folding changed something).
+    folded: bool,
+    /// Whether any key was dropped because another key claims the same
+    /// folded name (the `field.name_case_collision` repair).
+    collided: bool,
+}
+
+/// ASCII-lowercase every field name, dropping the losers of any resulting
+/// collision.
+///
+/// `DuckDB` identifiers are ASCII case-INSENSITIVE while JSON keys are not,
+/// so `Dur` and `dur` — or `_Time` and `_time` — name ONE column
+/// downstream, while every layer that keys on the exact string (the
+/// postgres field catalog, the envelope's own alias/reserved handling, the
+/// hot snapshot's key set) would treat them as two. Folding at the door
+/// means exactly one code path ever sees one spelling: a client `_Time`
+/// becomes the `_time` wire input, `_Ingested` strips as server-owned meta,
+/// `Service` validates as `service`, and a custom `Dur` pins and stores as
+/// `dur`. Per-character ASCII lowercase is precisely `DuckDB`'s identifier
+/// equivalence: `CAFÉ` folds to `cafÉ` (its class's canonical form) while
+/// `café` — a DIFFERENT `DuckDB` identifier — is untouched (probed in
+/// `trawl-engine/tests/duckdb_probe.rs`).
+///
+/// In-event collisions after folding keep ONE value, deterministically: the
+/// exact (already-lowercase) spelling wins when the event carries it;
+/// otherwise the ASCII-lexicographically first variant does
+/// (`serde_json::Map` iterates sorted, so "first in map order" is exactly
+/// that). Nothing honest can be done with two values for what `DuckDB`
+/// reads as one column; the dropped key and its value stay findable in
+/// `_raw`, which is captured from the pre-fold object.
+fn fold_field_names(obj: &Map<String, Value>) -> FoldedNames {
+    let mut out = Map::new();
+    // Pass 1: exact (already-folded) spellings — the collision winners.
+    for (key, value) in obj {
+        if !key.bytes().any(|b| b.is_ascii_uppercase()) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    // Pass 2: fold the rest, first variant in (sorted) map order wins.
+    let mut folded = false;
+    let mut collided = false;
+    for (key, value) in obj {
+        if !key.bytes().any(|b| b.is_ascii_uppercase()) {
+            continue;
+        }
+        let lower = key.to_ascii_lowercase();
+        if out.contains_key(&lower) {
+            collided = true;
+        } else {
+            out.insert(lower, value.clone());
+            folded = true;
+        }
+    }
+    FoldedNames {
+        obj: out,
+        folded,
+        collided,
+    }
+}
+
+/// Drop every field whose NAME cannot be a field-catalog key, returning
+/// whether any were dropped (the `field.name_too_long` repair).
+///
+/// This is the only seam that sees a client-chosen key before it becomes a
+/// column. Compaction pins every dynamic column in postgres BEFORE writing
+/// the parquet that carries it, and an over-long name overflows the btree
+/// key behind `field_types.field`: the insert errors, the batch is retained
+/// for retry, and the same WAL re-fails on every tick — permanently, for
+/// that service. Bounding the name here is what keeps that unreachable.
+///
+/// Dropping the field is a repair with an honest answer rather than a
+/// guess: `_raw` is captured before this runs, so the name and its value
+/// both stay recoverable, and no other field in the event is punished for
+/// one bad key (rejecting the event would throw away good data).
+fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
+    let unstorable: Vec<String> = out
+        .keys()
+        .filter(|k| !trawl_core::schema::is_storable_field_name(k))
+        .cloned()
+        .collect();
+    for k in &unstorable {
+        out.remove(k);
+    }
+    !unstorable.is_empty()
+}
+
 /// Canonicalize one parsed event object into the declared envelope.
 ///
 /// Field order of operations is load-bearing:
+/// 0. Field-name ASCII case-fold ([`fold_field_names`]) — BEFORE anything
+///    that keys on a name (service validation, reserved-key strip, wire
+///    aliases, stringification), so one code path sees one spelling.
+///    Recorded as `field.name_case_folded` / `field.name_case_collision`
+///    only when it changed something.
 /// 1. `service` validation (reject path — nothing else runs).
 /// 2. `_raw` capture — FIRST, before reserved-key stripping and every
-///    repair, so the server's own fills never appear inside "what arrived".
-/// 3. Reserved-key strip (`meta.stripped`), `_trawl_wal_file` silent drop.
+///    repair, so the server's own fills never appear inside "what arrived"
+///    (the serialization fallback uses the PRE-fold object, so dropped and
+///    folded spellings stay findable).
+/// 3. Reserved-key strip (`meta.stripped`), `_trawl_wal_file` silent drop,
+///    over-long field-name drop (`field.name_too_long`).
 /// 4. `_time` from the wire aliases (`_time`/`timestamp`/`@timestamp`,
 ///    consumed), ADR-0008 grammar, `time.from_ingest`/`time.out_of_range`.
 /// 5. `_ingested` stamp.
@@ -503,10 +658,14 @@ pub fn canonicalize(
     obj: &Map<String, Value>,
     ctx: &EnvelopeContext<'_>,
 ) -> Result<Canonical, (String, RejectReason)> {
-    let service = validate_service(obj)?;
+    // 0. One spelling per DuckDB identifier, before anything reads a name.
+    let fold = fold_field_names(obj);
+    let folded_obj = fold.obj;
+
+    let service = validate_service(&folded_obj)?;
     // Env and host decide rejection before any mutation happens.
-    let (env, env_defaulted) = resolve_env(obj, ctx)?;
-    let host_missing = matches!(obj.get("host"), None | Some(Value::Null));
+    let (env, env_defaulted) = resolve_env(&folded_obj, ctx)?;
+    let host_missing = matches!(folded_obj.get("host"), None | Some(Value::Null));
     if host_missing && ctx.peer_is_trusted_relay {
         return Err((
             format!(
@@ -525,39 +684,40 @@ pub fn canonicalize(
             repairs.push(code);
         }
     };
+    if fold.folded {
+        push_repair(&mut repairs, RepairCode::FieldNameCaseFolded);
+    }
+    if fold.collided {
+        push_repair(&mut repairs, RepairCode::FieldNameCaseCollision);
+    }
 
     // 2. Capture `_raw` before anything is stripped or repaired: a
     // client-supplied string `_raw` (a collector preserving its pre-parse
-    // line) is kept verbatim; otherwise the canonical pre-repair
-    // serialization of the parsed object is the most original form
-    // available (wire-exact bytes do not exist — events arrive inside JSON
-    // arrays and the WAL re-serializes anyway).
-    let raw_string = match obj.get("_raw") {
+    // line, under any spelling of the name) is kept verbatim; otherwise
+    // the canonical pre-repair serialization of the parsed object — the
+    // PRE-fold original, so folded-away spellings stay findable — is the
+    // most original form available (wire-exact bytes do not exist —
+    // events arrive inside JSON arrays and the WAL re-serializes anyway).
+    let raw_string = match folded_obj.get("_raw") {
         Some(Value::String(s)) => s.clone(),
         _ => serde_json::to_string(obj).unwrap_or_default(),
     };
     let (raw_string, truncated) = truncate_chars(raw_string, MAX_RAW_CHARS);
 
-    let mut out = obj.clone();
+    let mut out = folded_obj;
 
-    // 3. Server-owned metadata is never client-settable: honouring it would
-    // let a sender forge its own handling history.
-    let mut stripped_meta = false;
-    for key in trawl_core::schema::RESERVED_CLIENT_FIELDS {
-        if out.remove(*key).is_some() {
-            stripped_meta = true;
-        }
-    }
-    if matches!(out.get("_raw"), Some(v) if !v.is_string()) {
-        out.remove("_raw");
-        stripped_meta = true;
-    }
-    if stripped_meta {
+    // 3. Server-owned metadata is never client-settable.
+    if strip_server_owned(&mut out) {
         push_repair(&mut repairs, RepairCode::MetaStripped);
     }
-    // Compaction's synthetic provenance column: trawl's key, not the
-    // client's — silently dropped (a row carrying it wedges read_json).
-    out.remove(compaction::WAL_FILE_COL);
+
+    // 3.2. Names too long to be a catalog key never become columns.
+    if drop_unstorable_names(&mut out) {
+        push_repair(&mut repairs, RepairCode::FieldNameTooLong);
+    }
+
+    // 3.5. Nested values become JSON text (see [`stringify_nested_values`]).
+    stringify_nested_values(&mut out);
 
     // 4. `_time` from the first present wire alias; all aliases consumed.
     let time_input = trawl_core::schema::TIME_ALIASES
@@ -723,6 +883,102 @@ mod tests {
         let c = canon(r#"{"service":"s","env":"prod","_time":"2025-12-31T23:00:00Z"}"#);
         assert_eq!(c.obj["host"], "10.0.4.55");
         assert!(codes(&c).contains(&"host.from_peer"));
+    }
+
+    // --- nested-value stringification (ADR-0009 slice 2) ---
+
+    #[test]
+    fn object_values_are_stringified_to_json_text() {
+        // Killing the duplicate-name class structurally: with nothing to
+        // flatten, `read_json` can never raise a "Duplicate name" collision
+        // and the explicit-columns fallback is deleted rather than fixed.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z",
+                "k8s":{"pod":"x","ns":"default"}}"#,
+        );
+        let k8s = c.obj["k8s"]
+            .as_str()
+            .expect("object value becomes a string");
+        let parsed: Value = serde_json::from_str(k8s).expect("the string is JSON text");
+        assert_eq!(parsed["pod"], "x");
+        assert_eq!(parsed["ns"], "default");
+    }
+
+    #[test]
+    fn array_values_are_stringified_to_json_text() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","tags":["a","b"]}"#,
+        );
+        let tags = c.obj["tags"]
+            .as_str()
+            .expect("array value becomes a string");
+        assert_eq!(
+            serde_json::from_str::<Value>(tags).unwrap(),
+            serde_json::json!(["a", "b"])
+        );
+    }
+
+    #[test]
+    fn stringification_is_canonicalization_not_a_repair() {
+        // NO RepairCode: this is a canonicalization like RFC 3339
+        // reformatting — a code firing on every k8s event would destroy the
+        // NULL-dominance of `_repairs`.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","k8s":{"pod":"x"}}"#,
+        );
+        assert!(
+            c.repairs.is_empty(),
+            "no repair for stringification: {:?}",
+            c.repairs
+        );
+        assert!(!c.obj.contains_key("_repairs"));
+    }
+
+    #[test]
+    fn stringification_leaves_scalars_untouched() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z",
+                "count":42,"ratio":1.5,"ok":true,"note":"plain"}"#,
+        );
+        assert_eq!(c.obj["count"], 42);
+        assert_eq!(c.obj["ratio"], 1.5);
+        assert_eq!(c.obj["ok"], true);
+        assert_eq!(c.obj["note"], "plain");
+    }
+
+    #[test]
+    fn raw_preserves_the_original_nesting() {
+        // `_raw` is captured BEFORE stringification, so the original
+        // structure stays findable there.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","k8s":{"pod":"x"}}"#,
+        );
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(
+            raw.contains(r#""k8s":{"pod":"x"}"#),
+            "_raw must hold the pre-stringification nesting: {raw}"
+        );
+    }
+
+    #[test]
+    fn non_string_raw_is_still_stripped_before_stringification() {
+        // A client object `_raw` must strip with meta.stripped — the
+        // stringify pass must not first turn it into an honourable string.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","_raw":{"forged":true}}"#,
+        );
+        assert!(codes(&c).contains(&"meta.stripped"));
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(
+            raw.contains("forged"),
+            "server-filled _raw is the pre-repair serialization: {raw}"
+        );
     }
 
     #[test]
@@ -1126,6 +1382,227 @@ mod tests {
         assert_eq!(raw.chars().count(), MAX_RAW_CHARS);
         assert_eq!(raw, "é".repeat(MAX_RAW_CHARS));
         assert!(codes(&c).contains(&"field.truncated"));
+    }
+
+    // --- field-name bound (catalog key safety) ---
+
+    #[test]
+    fn overlong_field_name_is_dropped_not_fatal() {
+        // An unbounded key would be proposed as a catalog pin and overflow
+        // the `field_types.field` btree, retaining the batch for retry on
+        // every compaction tick forever.
+        let long = "k".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
+        let c = canon(&format!(
+            r#"{{"service":"s","env":"prod","host":"h",
+                 "_time":"2025-12-31T23:00:00Z","{long}":"v","ok":"kept"}}"#
+        ));
+        assert!(!c.obj.contains_key(&long), "over-long key must not survive");
+        assert_eq!(c.obj["ok"], "kept", "other fields are untouched");
+        assert!(codes(&c).contains(&"field.name_too_long"));
+        // The value stays recoverable: `_raw` is captured before the drop.
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(raw.contains(&long), "dropped key must remain in _raw");
+    }
+
+    #[test]
+    fn field_name_at_the_cap_is_kept() {
+        let at_cap = "k".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES);
+        let c = canon(&format!(
+            r#"{{"service":"s","env":"prod","host":"h",
+                 "_time":"2025-12-31T23:00:00Z","{at_cap}":"v"}}"#
+        ));
+        assert_eq!(c.obj[&at_cap], "v");
+        assert!(c.repairs.is_empty(), "clean event: {:?}", c.repairs);
+    }
+
+    #[test]
+    fn field_name_bound_counts_bytes_not_chars() {
+        // The constraint respected is postgres' byte-sized btree key limit,
+        // so a multi-byte name under the char count still has to fit.
+        let multibyte = "é".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES / 2 + 1);
+        assert!(multibyte.chars().count() <= trawl_core::schema::MAX_FIELD_NAME_BYTES);
+        assert!(!trawl_core::schema::is_storable_field_name(&multibyte));
+    }
+
+    // --- field-name ASCII case-folding (DuckDB folds ASCII case) ---
+
+    #[test]
+    fn exact_envelope_keys_cannot_be_shadowed_by_case_variants() {
+        // A case-variant of an envelope column names the SAME DuckDB
+        // column; when the exact spelling is present too, the exact one
+        // wins and the variant's value is dropped — anything else would let
+        // a sender holding `ingest` forge `_time`/`service`/`host`/etc.
+        let c = canon(
+            r#"{"service":"realsvc","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","_Time":"1999-01-01T00:00:00Z",
+                "Service":"spoofed","HOST":"spoofed","Env":"lab",
+                "_Repairs":"none","_Trawl_Wal_File":"x"}"#,
+        );
+        for forged in [
+            "_Time",
+            "Service",
+            "HOST",
+            "Env",
+            "_Repairs",
+            "_Trawl_Wal_File",
+        ] {
+            assert!(
+                !c.obj.contains_key(forged),
+                "{forged} must not reach the WAL"
+            );
+        }
+        assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
+        assert_eq!(c.service, "realsvc");
+        assert_eq!(c.obj["service"], "realsvc");
+        assert_eq!(c.obj["host"], "h");
+        assert_eq!(c.obj["env"], "prod");
+        assert!(codes(&c).contains(&"field.name_case_collision"));
+        // Nothing is lost: the dropped keys stay findable in `_raw`.
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(raw.contains("spoofed"), "got: {raw}");
+    }
+
+    #[test]
+    fn lone_case_variant_envelope_keys_fold_and_are_consumed_canonically() {
+        // With no exact counterpart, a case-variant IS the field: `_Time`
+        // becomes the `_time` wire input, `Message` becomes `message`,
+        // `SEVERITY` joins the severity chain — one code path, one spelling.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_Time":"2025-12-31T23:00:00Z","Message":"m",
+                "SEVERITY":"error","Custom_Field":1}"#,
+        );
+        assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
+        assert_eq!(c.obj["message"], "m");
+        assert_eq!(c.obj["severity"], 17, "folded severity joins the chain");
+        assert_eq!(c.obj["custom_field"], 1);
+        for original in ["_Time", "Message", "SEVERITY", "Custom_Field"] {
+            assert!(!c.obj.contains_key(original), "{original} must be folded");
+        }
+        assert!(codes(&c).contains(&"field.name_case_folded"));
+        assert!(
+            !codes(&c).contains(&"field.name_case_collision"),
+            "no two keys collided: {:?}",
+            codes(&c)
+        );
+        assert!(
+            !codes(&c).contains(&"time.from_ingest"),
+            "the folded _Time is a valid time input, not a repair"
+        );
+        // The original spellings stay findable in `_raw`.
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(raw.contains("Custom_Field"), "got: {raw}");
+    }
+
+    #[test]
+    fn case_variant_ingested_folds_then_strips_as_server_owned() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","_Ingested":"1999-01-01T00:00:00Z"}"#,
+        );
+        assert_eq!(c.obj["_ingested"], ARRIVAL, "server stamp wins");
+        assert!(codes(&c).contains(&"meta.stripped"));
+        assert!(codes(&c).contains(&"field.name_case_folded"));
+    }
+
+    #[test]
+    fn in_event_collision_keeps_the_exact_spelling_deterministically() {
+        // {"Status":200,"status":"ok"}: one DuckDB column, two values. The
+        // exact-lowercase spelling wins; the variant is dropped with a code.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","Status":200,"status":"ok"}"#,
+        );
+        assert_eq!(c.obj["status"], "ok", "the exact spelling's value wins");
+        assert!(!c.obj.contains_key("Status"));
+        assert!(codes(&c).contains(&"field.name_case_collision"));
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(
+            raw.contains("200"),
+            "the dropped value stays in _raw: {raw}"
+        );
+    }
+
+    #[test]
+    fn variant_only_collision_takes_the_lexicographically_first_key() {
+        // No exact spelling present: serde_json::Map iterates sorted, so
+        // "STATUS" < "Status" and the first variant's value wins.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","Status":2,"STATUS":1}"#,
+        );
+        assert_eq!(c.obj["status"], 1);
+        assert!(codes(&c).contains(&"field.name_case_folded"));
+        assert!(codes(&c).contains(&"field.name_case_collision"));
+    }
+
+    #[test]
+    fn folding_is_ascii_only_and_lowercase_names_are_untouched() {
+        // Per-character ASCII lowercase is exactly DuckDB's identifier
+        // equivalence: `CAFÉ` folds to `cafÉ` (same DuckDB identifier),
+        // which stays DISTINCT from an all-lowercase `café`. Names with no
+        // ASCII uppercase are untouched and record nothing.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","message":"m",
+                "hostname":"h2","service_id":7,"café":"lower","CAFÉ":"upper"}"#,
+        );
+        assert_eq!(c.obj["message"], "m");
+        assert_eq!(c.obj["hostname"], "h2");
+        assert_eq!(c.obj["service_id"], 7);
+        assert_eq!(c.obj["café"], "lower");
+        assert_eq!(c.obj["cafÉ"], "upper", "ASCII chars fold, é does not");
+        assert!(!c.obj.contains_key("CAFÉ"));
+        assert_eq!(codes(&c), vec!["field.name_case_folded"]);
+    }
+
+    #[test]
+    fn all_lowercase_event_records_no_fold_repair() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","duration":410}"#,
+        );
+        assert!(c.repairs.is_empty(), "clean event: {:?}", c.repairs);
+    }
+
+    #[test]
+    fn folded_severity_inputs_join_the_derivation_chain() {
+        // Pre-fold these were dropped as reserved variants; now `Severity`
+        // IS `severity` and `LEVEL` IS `level` — same chain, one spelling.
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","Severity":"error","LEVEL":"warn"}"#,
+        );
+        assert!(!c.obj.contains_key("Severity"));
+        assert!(!c.obj.contains_key("LEVEL"));
+        assert!(!c.obj.contains_key("level"), "level is consumed");
+        assert_eq!(c.obj["severity"], 17, "string severity leads");
+        assert_eq!(
+            c.obj["severity_text"], "warn",
+            "the level value still lands as the label"
+        );
+        assert!(codes(&c).contains(&"field.name_case_folded"));
+    }
+
+    #[test]
+    fn service_supplied_under_a_case_variant_validates() {
+        let c = canon(
+            r#"{"Service":"api.v2","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z"}"#,
+        );
+        assert_eq!(c.service, "api.v2");
+        assert_eq!(c.obj["service"], "api.v2");
+        assert!(codes(&c).contains(&"field.name_case_folded"));
+    }
+
+    #[test]
+    fn client_raw_under_a_case_variant_is_honoured_verbatim() {
+        let c = canon(
+            r#"{"service":"s","env":"prod","host":"h",
+                "_time":"2025-12-31T23:00:00Z","_RAW":"<134>1 the wire line"}"#,
+        );
+        assert_eq!(c.obj["_raw"], "<134>1 the wire line");
+        assert!(codes(&c).contains(&"field.name_case_folded"));
     }
 
     // --- _time grammar (the ADR-0008 corpus, moved verbatim) ---

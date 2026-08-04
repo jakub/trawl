@@ -19,6 +19,13 @@
 //! `data/`, so it yields no deletion candidates while still occupying the
 //! filesystem free space is measured on — deleting fresh partitions could
 //! never reclaim it.
+//!
+//! The field catalog's `field_services` observations are ever-observed:
+//! retention deleting a partition deliberately never reconciles them, and
+//! nothing else removes a row either (ADR-0009 slice 2 — "which services
+//! ever carried this field" is historical fact, not an index over live
+//! files). Consumers window on `last_seen`; the field axis is bounded by
+//! the pin cap ([`crate::store::MAX_PINNED_FIELDS`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

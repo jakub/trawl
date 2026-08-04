@@ -7,18 +7,20 @@
 //! Periodically scans the WAL directory for `.ndjson` files, groups
 //! them by service, and uses `DuckDB` to convert each batch to parquet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
-use trawl_engine::{is_complex_type, is_conversion_error};
+use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb_type};
 
+use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
 use crate::hot_buffer::HotBuffer;
 use crate::state::CompactionStats;
+use crate::store::{FieldConflict, PinProposal};
 
 /// Default compaction chunk size, used when config is not threaded
 /// through (e.g. in direct `compact_once` calls from tests).
@@ -42,6 +44,7 @@ pub fn spawn_compaction(
     memory_limit: String,
     hot_buffer: Option<Arc<HotBuffer>>,
     compaction_stats: Option<Arc<CompactionStats>>,
+    catalog: Option<CatalogContext>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -60,7 +63,7 @@ pub fn spawn_compaction(
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    match compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit).await {
+                    match compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit, catalog.as_ref()).await {
                         Ok(data_loss) => {
                             if let Some(ref stats) = compaction_stats {
                                 stats.total_runs.fetch_add(1, Ordering::Relaxed);
@@ -103,6 +106,11 @@ pub fn spawn_compaction(
 ///
 /// Public for integration tests only — not part of the external API.
 /// Called internally by [`spawn_compaction`].
+///
+/// `catalog` carries the field-catalog store + pin cache (ADR-0009 slice
+/// 2). `None` (tests, embedded-style callers) conforms each batch against
+/// the envelope seed plus its own local pins, without persistence.
+#[allow(clippy::too_many_arguments)] // internal API, config struct is overkill here
 pub async fn compact_once(
     wal_dir: &Path,
     data_dir: &Path,
@@ -111,6 +119,7 @@ pub async fn compact_once(
     hot_buffer: Option<&Arc<HotBuffer>>,
     chunk_size: usize,
     memory_limit: &str,
+    catalog: Option<&CatalogContext>,
 ) -> Result<u64, String> {
     // Remove orphaned .parquet.tmp files from interrupted compaction runs.
     for (_env, env_data_dir) in list_env_dirs(data_dir) {
@@ -196,7 +205,8 @@ pub async fn compact_once(
                 let batch_ids: Vec<&str> = batch_ids.iter().map(String::as_str).collect();
 
                 let outcome =
-                    compact_service_batch(chunk, &env_data_dir, service, memory_limit).await;
+                    compact_service_batch(chunk, &env_data_dir, service, memory_limit, catalog)
+                        .await;
 
                 // Fold the quarantine count UNCONDITIONALLY — quarantining
                 // renames the corrupt file to `.corrupt`, so a retry can't
@@ -574,7 +584,7 @@ const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// they reach `read_parquet`, where they otherwise surface as
 /// "File ... too small to be a Parquet file" and wedge the rollup forever
 /// — no amount of retrying repairs a truncated file.
-fn is_valid_parquet(path: &Path) -> bool {
+pub(crate) fn is_valid_parquet(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
 
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -832,13 +842,12 @@ fn rollup_day_inner(
         .join(", ");
     let tmp_path = day_dir.join(format!("{service}.parquet.tmp"));
 
-    // Read, merge, sort by timestamp, and write to tmp file. The fast path
-    // leans on `union_by_name` to reconcile heterogeneous schemas, but that
-    // only unifies by column NAME — it cannot bridge a column that is JSON
-    // or STRUCT in one hourly file and VARCHAR in another (independent
-    // per-batch type inference at write time produces exactly this drift).
-    // On that bind-time type/remap error, fall back to describing each file
-    // and casting the conflicting columns to VARCHAR before unioning.
+    // Read, merge, sort by timestamp, and write to tmp file. Every hourly
+    // file is write-time conformant to the field catalog (ADR-0009 slice 2),
+    // so `union_by_name` cannot hit a type conflict on trawl-written files —
+    // a conversion-class failure here means foreign parquet in the tree and
+    // errors loudly (inputs retained, retried next tick) rather than being
+    // silently rewritten by the deleted VARCHAR-cast fallback.
     let fast = conn.execute_batch(&format!(
         "COPY (\
              SELECT * FROM read_parquet([{file_list_sql}], union_by_name=true) \
@@ -847,36 +856,20 @@ fn rollup_day_inner(
              BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
         tmp_path.to_string_lossy(),
     ));
-    match fast {
-        Ok(()) => {}
-        // A conversion-class failure is the trigger, not the verdict: the
-        // fallback per-file-describes the inputs and only casts columns that
-        // genuinely carry more than one type, so a failure that is not a
-        // schema conflict simply re-raises from there (ADR-0008).
-        Err(e) if is_conversion_error(&e) => {
-            tracing::warn!(
-                event_type = "rollup_fallback",
-                compact_service = %service,
-                error = %e,
-                "rollup type conflict across hourly files, falling back to VARCHAR casts"
-            );
-            rollup_with_casts(&conn, &all_files, &tmp_path, service)?;
-        }
-        Err(e) => {
-            // S2: this file passed `is_valid_parquet`'s magic-byte sniff but
-            // is unreadable by `read_parquet` for a non-type, non-corruption
-            // reason (e.g. a valid header/trailer but a corrupt MIDDLE). The
-            // sniff can't catch that, and no amount of retrying repairs it —
-            // surface it distinctly at error level so the rare forever-retry
-            // is visible on the dashboard rather than buried in the count.
-            tracing::error!(
-                event_type = "rollup_unreadable",
-                compact_service = %service,
-                error = %e,
-                "rollup input passed magic-byte validation but is unreadable; will retry indefinitely"
-            );
-            return Err(format!("rollup COPY failed: {e}"));
-        }
+    if let Err(e) = fast {
+        // S2: a file that passed `is_valid_parquet`'s magic-byte sniff but
+        // fails `read_parquet` — corrupt middle, or a schema the catalog
+        // invariant says trawl cannot have written. No amount of retrying
+        // repairs either — surface it distinctly at error level so the rare
+        // forever-retry is visible on the dashboard rather than buried in
+        // the count.
+        tracing::error!(
+            event_type = "rollup_unreadable",
+            compact_service = %service,
+            error = %e,
+            "rollup inputs unreadable or nonconformant (foreign parquet?); will retry indefinitely"
+        );
+        return Err(format!("rollup COPY failed: {e}"));
     }
 
     // Write marker BEFORE rename so recovery knows which hourlies to clean up.
@@ -914,79 +907,6 @@ fn rollup_day_inner(
     Ok(())
 }
 
-/// Rollup fallback: union hourly parquet files when their schemas conflict.
-///
-/// The fast-path `read_parquet([...], union_by_name=true)` fails at bind
-/// time when the same column name has incompatible physical types across
-/// files (e.g. JSON/STRUCT in one hour, VARCHAR in another). This rebuilds
-/// the merge explicitly: `DESCRIBE` every file, find columns whose type
-/// differs across files, cast those to `VARCHAR` in each branch, and
-/// `UNION ALL BY NAME` so heterogeneous column sets still line up (missing
-/// columns become NULL). Mirrors [`merge_with_existing`] but generalised
-/// to N files for the daily rollup.
-fn rollup_with_casts(
-    conn: &duckdb::Connection,
-    files: &[PathBuf],
-    tmp_path: &Path,
-    service: &str,
-) -> Result<(), String> {
-    // Describe every input file and accumulate the set of types seen per
-    // column name across all files.
-    let mut col_types: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut schemas: Vec<Vec<ColInfo>> = Vec::with_capacity(files.len());
-    for f in files {
-        let schema = describe_source(
-            conn,
-            &format!("SELECT * FROM read_parquet('{}')", f.display()),
-        )?;
-        for col in &schema {
-            col_types
-                .entry(col.name.clone())
-                .or_default()
-                .insert(col.dtype.clone());
-        }
-        schemas.push(schema);
-    }
-
-    // A column conflicts when it appears with more than one distinct type.
-    let conflicts: Vec<String> = col_types
-        .into_iter()
-        .filter(|(_, types)| types.len() > 1)
-        .map(|(name, _)| name)
-        .collect();
-
-    tracing::info!(
-        event_type = "rollup_fallback",
-        compact_service = %service,
-        conflicting_columns = ?conflicts,
-        "casting conflicting columns to VARCHAR for rollup"
-    );
-
-    // Build one casting SELECT per file and union them by name.
-    // Path provenance: service is sanitized to [A-Za-z0-9_-] at ingest
-    // (ingest service charset validation) and data_dir is operator-trusted,
-    // so direct interpolation cannot inject. No quote-escaping needed.
-    let union_sql = files
-        .iter()
-        .zip(&schemas)
-        .map(|(f, schema)| {
-            format!(
-                "SELECT {} FROM read_parquet('{}')",
-                build_cast_select(schema, &conflicts),
-                f.display()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" UNION ALL BY NAME ");
-
-    conn.execute_batch(&format!(
-        "COPY (SELECT * FROM ({union_sql}) ORDER BY \"_time\") TO '{}' \
-         (FORMAT PARQUET, COMPRESSION SNAPPY, BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
-        tmp_path.to_string_lossy(),
-    ))
-    .map_err(|e| format!("rollup (type fallback) failed: {e}"))
-}
-
 /// Outcome of one per-service WAL compaction batch.
 ///
 /// Mirrors [`RollupOutcome`]: carries `quarantined` alongside `result` so the
@@ -1003,39 +923,226 @@ struct CompactOutcome {
     result: Result<(), String>,
 }
 
-/// Compact a batch of WAL files for a single service into parquet.
+/// Compact a batch of WAL files for a single service into parquet,
+/// enforcing the write-time invariant (ADR-0009 slice 2): A PARQUET FILE
+/// IS NEVER WRITTEN BEFORE ITS COLUMNS' PINS ARE DURABLE IN POSTGRES.
+///
+/// Four phases:
+/// 1. blocking — read the WAL into `wal_batch`, `DESCRIBE` it, and derive
+///    pin proposals for unpinned columns (candidate ladder over values).
+/// 2. async — `pin_missing` the proposals; the AUTHORITATIVE pins come
+///    back and are folded into the in-process cache (skipped entirely when
+///    the batch proposes nothing — the common case). A store failure is `Err`:
+///    the WAL is retained and retried next tick — never an unconformant
+///    parquet write.
+/// 3. blocking — conform `wal_batch` to the pins (`TRY_CAST` on mismatch,
+///    drop deferred all-null unpinned columns), then merge/sort/COPY/
+///    atomic-rename exactly as before.
+/// 4. async, best-effort — record `field_conflicts`, touch
+///    `field_services`, bump metrics. A failure here warns and moves on
+///    (the data is already durable and conformant).
+///
+/// With `catalog: None` (tests, embedded-style callers) the pins are the
+/// envelope seed plus this batch's own proposals — same conform algebra,
+/// no persistence and no invariant across processes.
 async fn compact_service_batch(
     wal_files: &[PathBuf],
     data_dir: &Path,
     service: &str,
     memory_limit: &str,
+    catalog: Option<&CatalogContext>,
 ) -> CompactOutcome {
     let wal_files = wal_files.to_vec();
-    let data_dir = data_dir.to_path_buf();
-    let service = service.to_owned();
+    let data_dir_owned = data_dir.to_path_buf();
+    let service_owned = service.to_owned();
     let memory_limit = memory_limit.to_owned();
+    let known = catalog.map_or_else(HashMap::new, |c| c.cache.snapshot());
 
-    match tokio::task::spawn_blocking(move || {
+    // Phase 1: read + infer + propose (blocking). `known` comes back out of
+    // the closure rather than being cloned into it: phase 2 folds this
+    // batch's new pins into it instead of re-reading the whole catalog.
+    let phase1 = tokio::task::spawn_blocking(move || {
         let mut quarantined: u64 = 0;
-        let result = compact_service_inner(
+        let result = prepare_service_batch(
             &wal_files,
-            &data_dir,
-            &service,
+            &data_dir_owned,
+            &service_owned,
             &memory_limit,
             &mut quarantined,
+            &known,
         );
-        CompactOutcome {
-            quarantined,
-            result,
-        }
+        (result, quarantined, known)
     })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(e) => CompactOutcome {
-            quarantined: 0,
-            result: Err(format!("compaction task panicked: {e}")),
+    .await;
+    let (prep_result, quarantined, known) = match phase1 {
+        Ok(v) => v,
+        Err(e) => {
+            return CompactOutcome {
+                quarantined: 0,
+                result: Err(format!("compaction task panicked: {e}")),
+            };
+        }
+    };
+    let prep = match prep_result {
+        Ok(Some(p)) => p,
+        // All inputs corrupt — data loss surfaced via the quarantine count.
+        Ok(None) => {
+            return CompactOutcome {
+                quarantined,
+                result: Ok(()),
+            };
+        }
+        Err(e) => {
+            return CompactOutcome {
+                quarantined,
+                result: Err(e),
+            };
+        }
+    };
+
+    // Phase 2: pins become durable BEFORE any parquet write.
+    let pins = match catalog {
+        Some(cat) => match resolve_pins_durable(cat, known, &prep.proposals).await {
+            Ok(pins) => pins,
+            Err(e) => {
+                return CompactOutcome {
+                    quarantined,
+                    result: Err(format!(
+                        "field catalog unavailable, batch retained for retry: {e}"
+                    )),
+                };
+            }
         },
+        None => local_pins(&prep.proposals),
+    };
+
+    // Phase 3: conform + write (blocking).
+    let data_dir_owned = data_dir.to_path_buf();
+    let service_owned = service.to_owned();
+    let phase3 = tokio::task::spawn_blocking(move || {
+        conform_and_write(prep, &pins, &data_dir_owned, &service_owned)
+    })
+    .await;
+    let report = match phase3 {
+        Ok(Ok(report)) => report,
+        Ok(Err(e)) => {
+            return CompactOutcome {
+                quarantined,
+                result: Err(e),
+            };
+        }
+        Err(e) => {
+            return CompactOutcome {
+                quarantined,
+                result: Err(format!("compaction task panicked: {e}")),
+            };
+        }
+    };
+
+    // Phase 4: bookkeeping (best-effort — the parquet is already durable).
+    record_conflict_metrics(service, &report.conflicts);
+    if let Some(cat) = catalog {
+        record_batch_bookkeeping(cat, service, &report).await;
+    }
+
+    CompactOutcome {
+        quarantined,
+        result: Ok(()),
+    }
+}
+
+/// Make the batch's pin proposals durable and return the authoritative pins
+/// for this batch's columns, folding the new ones into the in-process cache
+/// on the way.
+///
+/// `known` is the cache snapshot phase 1 proposed against, and the two
+/// together cover every column of the batch by construction: `propose_pins`
+/// emits a proposal for exactly the columns `known` did not already pin, and
+/// `pin_missing` returns the AUTHORITATIVE pin for each proposal (a racing
+/// batch's pin, not ours, when it got there first). Pins are add-only until
+/// #53, so a `known` entry cannot have gone stale meanwhile.
+///
+/// Deliberately NOT a `load_pins` + `replace` per batch. A pin row exists
+/// for every distinct JSON key ever ingested, so reloading it per chunk per
+/// service per tick is O(catalog) work whose size a noisy or hostile sender
+/// picks — up to [`crate::store::MAX_PINNED_FIELDS`], which is what keeps
+/// that "up to" a number at all. The common case (nothing new to pin) now
+/// costs no postgres round trip at all.
+async fn resolve_pins_durable(
+    cat: &CatalogContext,
+    mut known: HashMap<String, CanonicalType>,
+    proposals: &[PinProposal],
+) -> Result<HashMap<String, CanonicalType>, crate::store::StoreError> {
+    if proposals.is_empty() {
+        return Ok(known);
+    }
+    let pinned = cat.store.pin_missing(proposals).await?;
+    if !pinned.is_empty() {
+        cat.cache.merge(pinned.iter().map(|(f, t)| (f.clone(), *t)));
+        known.extend(pinned);
+    }
+    Ok(known)
+}
+
+/// The no-catalog pin map: the declared envelope plus this batch's own
+/// proposals. Same conform algebra as production, no persistence.
+fn local_pins(proposals: &[PinProposal]) -> HashMap<String, CanonicalType> {
+    let mut pins: HashMap<String, CanonicalType> = trawl_core::schema::ENVELOPE_TYPES
+        .iter()
+        .map(|(f, t)| ((*f).to_owned(), *t))
+        .collect();
+    for p in proposals {
+        pins.entry(p.field.clone()).or_insert(p.ty);
+    }
+    pins
+}
+
+/// Bump the conflict counters (bounded by the shared service-label cap;
+/// never a field-name label).
+pub(crate) fn record_conflict_metrics(service: &str, conflicts: &[FieldConflict]) {
+    if conflicts.is_empty() {
+        return;
+    }
+    let label = crate::metrics::repair_service_label(service);
+    let nulled: u64 = conflicts.iter().map(|c| c.rows_nulled).sum();
+    metrics::counter!(
+        crate::metrics::CATALOG_CONFLICTS_TOTAL,
+        "service" => label.clone()
+    )
+    .increment(conflicts.len() as u64);
+    if nulled > 0 {
+        metrics::counter!(
+            crate::metrics::CATALOG_ROWS_NULLED_TOTAL,
+            "service" => label
+        )
+        .increment(nulled);
+    }
+}
+
+/// Best-effort catalog bookkeeping after a successful conformant write:
+/// conflict rows and per-service field observations. Failures warn — the
+/// parquet is already durable and conformant, so retrying the batch for a
+/// bookkeeping error would duplicate data.
+async fn record_batch_bookkeeping(cat: &CatalogContext, service: &str, report: &WriteReport) {
+    if let Err(e) = cat.store.record_conflicts(&report.conflicts).await {
+        tracing::warn!(
+            event_type = "catalog_bookkeeping_error",
+            compact_service = %service,
+            error = %e,
+            "failed to record field_conflicts rows"
+        );
+    }
+    if let Err(e) = cat
+        .store
+        .touch_services(service, &report.observed_fields, report.batch_rows)
+        .await
+    {
+        tracing::warn!(
+            event_type = "catalog_bookkeeping_error",
+            compact_service = %service,
+            error = %e,
+            "failed to update field_services observations"
+        );
     }
 }
 
@@ -1064,9 +1171,10 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
 /// set aside. Returns `Ok(0)` when every file turned out corrupt (the caller
 /// treats that as data-loss, not error).
 ///
-/// After the table is built, any column `DuckDB` inferred as a complex type
-/// (STRUCT/MAP/JSON/LIST) is coerced to VARCHAR — see
-/// [`coerce_complex_columns_to_varchar`] for why.
+/// Complex-typed columns cannot arise here: ingest canonicalization
+/// stringifies top-level object/array values before the WAL is written, and
+/// the conform phase pins every column to a canonical scalar type before
+/// the parquet write (ADR-0009 slice 2).
 fn read_wal_to_table(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -1075,10 +1183,7 @@ fn read_wal_to_table(
 ) -> Result<usize, String> {
     // Fast path: read the whole batch in one scan. The common case.
     match build_wal_batch(conn, wal_files, service) {
-        Ok(()) => {
-            coerce_complex_columns_to_varchar(conn, service)?;
-            return Ok(wal_files.len());
-        }
+        Ok(()) => return Ok(wal_files.len()),
         Err(e) => {
             // A non-"Duplicate name" read error means at least one file is
             // malformed-but-textual. Without isolation that one file fails
@@ -1114,7 +1219,6 @@ fn read_wal_to_table(
     // poison pill — surface it as Err to retry next tick.
     build_wal_batch(conn, &survivors, service)
         .map_err(|e| format!("{e} (after isolating corrupt files)"))?;
-    coerce_complex_columns_to_varchar(conn, service)?;
     Ok(survivors.len())
 }
 
@@ -1164,32 +1268,29 @@ fn timestamp_repair_list(prov_col: &str) -> String {
         .join(", ")
 }
 
-/// Does this `read_json` error mean a projected column collided, rather than
-/// that the data is unreadable? Neither shape is a reason to quarantine:
-///
-/// - `Duplicate name` — nested JSON keys that collide when flattened.
-///   Resolved by the explicit-columns fallback.
-/// - `Option filename adds column "…", but a column with this name is also in
-///   the file` — a WAL row literally carrying [`WAL_FILE_COL`]. Ingest strips
-///   that key now, but WAL written before it did would otherwise fail this
-///   read on every tick forever: never drained, never quarantined (the
-///   isolation path's `probe_ndjson` omits `filename=`, so the file parses
-///   cleanly and survives), taking every batch-mate for the service with it.
-///   Resolved losslessly by retrying under a renamed provenance column
-///   ([`is_filename_collision`]).
-fn is_column_collision(e: &duckdb::Error) -> bool {
-    is_filename_collision(e) || e.to_string().contains("Duplicate name")
+/// The nested-key collision shape: keys inside a nested object that
+/// collide (case-insensitively) when `DuckDB` builds the auto-detected
+/// STRUCT at `maximum_depth=2`. Verified by execution: only reachable via
+/// nested values, which ingest stringifies since ADR-0009 slice 2 — so
+/// this fires only on legacy/hand-written WAL, and the depth-1 retry
+/// ([`build_wal_batch`]) drains it losslessly.
+fn is_duplicate_name(e: &duckdb::Error) -> bool {
+    e.to_string().contains("Duplicate name")
 }
 
-/// The [`is_column_collision`] shape specific to the `filename=` option: the
-/// data itself carries a column named like the synthetic provenance column.
+/// The collision shape specific to the `filename=` option: the data itself
+/// carries a column named like the synthetic provenance column
+/// ([`WAL_FILE_COL`]). Ingest strips that key now, but WAL written before
+/// it did would otherwise fail this read on every tick forever — resolved
+/// losslessly by retrying under a renamed provenance column.
 fn is_filename_collision(e: &duckdb::Error) -> bool {
     e.to_string().contains("adds column")
 }
 
 /// Build the `wal_batch` table from a multi-file `read_json`.
 ///
-/// A three-step ladder, lossless until the last resort:
+/// A lossless ladder — the explicit ten-column fallback (which dropped
+/// every custom column for the batch) is DELETED (ADR-0009 slice 2):
 ///
 /// 1. Auto-detection (`maximum_depth=2`) with [`WAL_FILE_COL`] as the
 ///    provenance column.
@@ -1198,11 +1299,11 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 ///    a randomized provenance name. Lossless: every user field survives, and
 ///    the row's literal `_trawl_wal_file` value lands in parquet as ordinary
 ///    data — it never feeds [`repair_expr`].
-/// 3. On a flatten collision (`Duplicate name`), an explicit column list with
-///    `json` typed as opaque JSON. This keeps only the stable vector envelope
-///    (plus `_repairs`): user fields outside it are dropped for the
-///    whole batch — the disclosed price of draining a batch whose flattened
-///    keys collide, and the pre-existing behavior for that shape.
+/// 3. On a nested-key collision ([`is_duplicate_name`] — only reachable
+///    from legacy pre-stringification WAL), the same read at
+///    `maximum_depth=1`: every top-level field arrives as an opaque JSON
+///    column and the catalog conform step types it via the lattice. No
+///    column is ever dropped.
 ///
 /// Any other read error is returned so the caller can isolate the offending
 /// file. A malformed `timestamp` is never fatal here: see
@@ -1214,7 +1315,7 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 /// bigger than the sample it fell outside the inferred schema and
 /// `union_by_name` dropped it with no error at all, losing the evidence
 /// ADR-0008 promises to preserve. Any other sparse user field was equally
-/// exposed. The explicit-columns fallback lists it for the same reason.
+/// exposed.
 fn build_wal_batch(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -1225,23 +1326,40 @@ fn build_wal_batch(
         .map(|p| format!("'{}'", p.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(", ");
-    let auto_read = |prov_col: &str| {
+    let auto_read = |prov_col: &str, depth: i32| {
         let repair = timestamp_repair_list(prov_col);
         conn.execute_batch(&format!(
             "CREATE TABLE wal_batch AS \
              SELECT * EXCLUDE ({prov_col}) REPLACE ({repair}) \
              FROM read_json([{file_list_sql}], format='newline_delimited', \
              records=true, auto_detect=true, union_by_name=true, \
-             field_appearance_threshold=0, maximum_depth=2, sample_size=-1, \
+             field_appearance_threshold=0, maximum_depth={depth}, sample_size=-1, \
              filename='{prov_col}')"
         ))
     };
+    // Depth 2, then — on a nested-key collision — depth 1, where nothing
+    // can collide (nested values stay opaque JSON; the conform step types
+    // them via the lattice, so batch-mates keep every column).
+    let read_with_depth_ladder = |prov_col: &str| match auto_read(prov_col, 2) {
+        Ok(()) => Ok(()),
+        Err(e) if is_duplicate_name(&e) => {
+            tracing::warn!(
+                event_type = "compaction_depth_fallback",
+                compact_service = %service,
+                error = %e,
+                "nested keys collide at depth 2 (legacy pre-stringification \
+                 WAL); retrying at maximum_depth=1 — no columns dropped"
+            );
+            let _ = conn.execute_batch("DROP TABLE IF EXISTS wal_batch");
+            auto_read(prov_col, 1)
+        }
+        Err(e) => Err(e),
+    };
 
-    let collision = match auto_read(WAL_FILE_COL) {
-        Ok(()) => return Ok(()),
+    match read_with_depth_ladder(WAL_FILE_COL) {
+        Ok(()) => Ok(()),
         Err(e) if is_filename_collision(&e) => {
-            // Randomized so legacy data cannot collide with it too; if it
-            // somehow does, the explicit-columns rung below still drains.
+            // Randomized so legacy data cannot collide with it too.
             let alt = format!("{WAL_FILE_COL}_{:08x}", rand::random::<u32>());
             tracing::warn!(
                 event_type = "compaction_provenance_rename",
@@ -1249,41 +1367,12 @@ fn build_wal_batch(
                 error = %e,
                 "WAL data carries the provenance column name; retrying under a renamed column"
             );
-            match auto_read(&alt) {
-                Ok(()) => return Ok(()),
-                Err(e2) if is_column_collision(&e2) => e2,
-                Err(e2) => return Err(format!("read_json (renamed provenance) failed: {e2}")),
-            }
+            let _ = conn.execute_batch("DROP TABLE IF EXISTS wal_batch");
+            read_with_depth_ladder(&alt)
+                .map_err(|e2| format!("read_json (renamed provenance) failed: {e2}"))
         }
-        Err(e) if is_column_collision(&e) => e,
-        Err(e) => return Err(format!("read_json failed: {e}")),
-    };
-
-    tracing::warn!(
-        event_type = "compaction_fallback",
-        compact_service = %service,
-        error = %collision,
-        "falling back to explicit columns to avoid a column-name collision; \
-         user fields outside the envelope are dropped for this batch"
-    );
-    // Explicit columns: the stable vector envelope, with `json` as
-    // opaque JSON to prevent struct flattening that causes collisions.
-    let repair = timestamp_repair_list(WAL_FILE_COL);
-    conn.execute_batch(&format!(
-        "CREATE TABLE wal_batch AS \
-         SELECT * EXCLUDE ({WAL_FILE_COL}) REPLACE ({repair}) \
-         FROM read_json([{file_list_sql}], format='newline_delimited', \
-         records=true, union_by_name=true, filename='{WAL_FILE_COL}', \
-         columns={{\
-         \"_time\": 'VARCHAR', \"_ingested\": 'VARCHAR', \
-         \"_raw\": 'VARCHAR', \"_repairs\": 'VARCHAR', \
-         env: 'VARCHAR', service: 'VARCHAR', host: 'VARCHAR', \
-         severity: 'BIGINT', severity_text: 'VARCHAR', \
-         message: 'VARCHAR', json: 'JSON', \
-         k8s_container: 'VARCHAR', k8s_namespace: 'VARCHAR', \
-         k8s_node: 'VARCHAR', k8s_pod: 'VARCHAR'}})"
-    ))
-    .map_err(|e| format!("read_json (explicit columns) failed: {e}"))
+        Err(e) => Err(format!("read_json failed: {e}")),
+    }
 }
 
 /// Probe a single WAL file by fully scanning it through `read_json`.
@@ -1291,81 +1380,44 @@ fn build_wal_batch(
 /// Returns `Err` only if the file is genuinely unparseable — the
 /// malformed-but-textual corruption the byte sniff can't catch. A full
 /// `count(*)` scan forces every record to parse, so a malformed line anywhere
-/// in the file surfaces. A "Duplicate name" collision is NOT corruption (the
-/// explicit-columns fallback in [`build_wal_batch`] handles it), so such a
-/// file is reported valid and kept as a survivor.
+/// in the file surfaces. A "Duplicate name" collision is NOT corruption —
+/// [`build_wal_batch`]'s depth-1 rung drains it — so a colliding file is
+/// re-probed at `maximum_depth=1` and only quarantined when both depths
+/// fail.
 fn probe_ndjson(conn: &duckdb::Connection, file: &Path) -> Result<(), String> {
     let path = file.to_string_lossy();
-    match conn.query_row(
-        &format!(
-            "SELECT count(*) FROM read_json(['{path}'], format='newline_delimited', \
-             records=true, auto_detect=true, union_by_name=true, \
-             field_appearance_threshold=0, maximum_depth=2)"
-        ),
-        [],
-        |_| Ok(()),
-    ) {
+    let probe_at = |depth: i32| {
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM read_json(['{path}'], format='newline_delimited', \
+                 records=true, auto_detect=true, union_by_name=true, \
+                 field_appearance_threshold=0, maximum_depth={depth})"
+            ),
+            [],
+            |_| Ok(()),
+        )
+    };
+    match probe_at(2) {
         Ok(()) => Ok(()),
-        Err(e) if e.to_string().contains("Duplicate name") => Ok(()),
+        Err(e) if is_duplicate_name(&e) => {
+            probe_at(1).map_err(|e| format!("probe read_json (depth 1) failed: {e}"))
+        }
         Err(e) => Err(format!("probe read_json failed: {e}")),
     }
 }
 
-/// Coerce every complex-typed column in `wal_batch` to VARCHAR.
-///
-/// This is the root-cause fix for cross-file schema drift. `DuckDB` infers
-/// each column's type independently per compaction batch, so a field that
-/// is object-valued in one batch (→ STRUCT/JSON) but only ever a string in
-/// another (→ VARCHAR) lands with different physical types across hourly
-/// parquet files. Those later collide under `read_parquet(...,
-/// union_by_name=true)` at both rollup AND query time (which has no
-/// fallback and degrades to dropping cold rows).
-///
-/// Forcing complex columns to VARCHAR converges both cases: an object
-/// becomes its JSON text and a plain string stays a string — both VARCHAR —
-/// so every hourly file shares a stable schema for that column. Scalars
-/// (numbers, booleans, timestamps) keep their types. The DSL never relies
-/// on a column being JSON/STRUCT-typed (dotted fields are flat identifiers;
-/// `json()`/`json_extract()` accept VARCHAR), so this is transparent to
-/// queries. The hot-buffer snapshot is coerced symmetrically so the
-/// query-time union of hot + cold sources stays type-aligned.
-fn coerce_complex_columns_to_varchar(
-    conn: &duckdb::Connection,
-    service: &str,
-) -> Result<(), String> {
-    let schema = describe_source(conn, "SELECT * FROM wal_batch")?;
-    let complex: Vec<String> = schema
-        .iter()
-        .filter(|c| is_complex_type(&c.dtype))
-        .map(|c| c.name.clone())
-        .collect();
-
-    if complex.is_empty() {
-        return Ok(());
-    }
-
-    tracing::debug!(
-        event_type = "compaction_coerce",
-        compact_service = %service,
-        columns = ?complex,
-        "coercing complex columns to VARCHAR for a stable on-disk schema"
-    );
-
-    let select = build_cast_select(&schema, &complex);
-    conn.execute_batch(&format!(
-        "CREATE OR REPLACE TABLE wal_batch AS SELECT {select} FROM wal_batch"
-    ))
-    .map_err(|e| format!("complex column coercion failed: {e}"))
-}
-
-/// Column name and type from `DuckDB` `DESCRIBE`.
-struct ColInfo {
-    name: String,
-    dtype: String,
+/// Column name and type from `DuckDB` `DESCRIBE`. Shared with the boot
+/// conformance pass (`crate::catalog::conform`).
+pub(crate) struct ColInfo {
+    pub(crate) name: String,
+    pub(crate) dtype: String,
 }
 
 /// Run `DESCRIBE <query>` and return the column names and types.
-fn describe_source(conn: &duckdb::Connection, query: &str) -> Result<Vec<ColInfo>, String> {
+pub(crate) fn describe_source(
+    conn: &duckdb::Connection,
+    query: &str,
+) -> Result<Vec<ColInfo>, String> {
     let mut stmt = conn
         .prepare(&format!("DESCRIBE {query}"))
         .map_err(|e| format!("DESCRIBE failed: {e}"))?;
@@ -1386,35 +1438,21 @@ fn describe_source(conn: &duckdb::Connection, query: &str) -> Result<Vec<ColInfo
 /// Escape a `DuckDB` identifier: wrap in double-quotes, doubling any
 /// embedded double-quotes. Column names come from ingested JSON keys
 /// (user-controlled), so this prevents SQL injection in the fallback path.
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// Build a SELECT list that casts conflicting columns to `VARCHAR`.
-///
-/// Non-conflicting columns pass through quoted (`"col"`); conflicting
-/// ones become `CAST("col" AS VARCHAR) AS "col"`.
-fn build_cast_select(schema: &[ColInfo], conflicts: &[String]) -> String {
-    schema
-        .iter()
-        .map(|col| {
-            let quoted = quote_ident(&col.name);
-            if conflicts.contains(&col.name) {
-                format!("CAST({quoted} AS VARCHAR) AS {quoted}")
-            } else {
-                quoted
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Merge `wal_batch` with an existing parquet file via `UNION ALL BY NAME`.
 ///
-/// Fast path: direct union. If that fails with a type mismatch (e.g.
-/// JSON vs VARCHAR for the same column), falls back to `DESCRIBE`-ing
-/// both sides, finding the conflicting columns, and casting them to
-/// `VARCHAR` before retrying.
+/// The batch is conformed to the catalog pins before this runs, and every
+/// trawl-written parquet file is write-time conformant too (ADR-0009 slice
+/// 2), so the direct union cannot conflict on trawl's own files. A failure
+/// here therefore means the existing file violates the invariant — foreign
+/// parquet dropped into the tree, or a restore against a stale catalog —
+/// and is surfaced as `catalog_invariant_violation`: the batch errors, the
+/// WAL files are retained, and the tick retries. The cast-and-retry
+/// fallback that used to rewrite both sides silently is deliberately gone
+/// and must not be rebuilt.
 fn merge_with_existing(
     conn: &duckdb::Connection,
     canonical_path: &Path,
@@ -1422,96 +1460,74 @@ fn merge_with_existing(
 ) -> Result<(), String> {
     let pq_path = canonical_path.display();
 
-    // Fast path: direct union.
-    let result = conn.execute_batch(&format!(
+    conn.execute_batch(&format!(
         "CREATE TABLE merged AS \
          SELECT * FROM read_parquet('{pq_path}') \
          UNION ALL BY NAME \
          SELECT * FROM wal_batch",
-    ));
-
-    match result {
-        Ok(()) => Ok(()),
-        // Trigger, not verdict: the fallback below describes both sides and
-        // re-raises the original error when they hold no conflicting column
-        // — so a genuine data-conversion error is not treated as a schema
-        // conflict here either (ADR-0008).
-        Err(e) if is_conversion_error(&e) => {
-            tracing::warn!(
-                event_type = "compaction_fallback",
-                compact_service = %service,
-                error = %e,
-                "type mismatch during merge, falling back to explicit casts"
-            );
-
-            // Get schemas for both sides.
-            let pq_schema =
-                describe_source(conn, &format!("SELECT * FROM read_parquet('{pq_path}')"))?;
-            let wb_schema = describe_source(conn, "SELECT * FROM wal_batch")?;
-
-            // Build a lookup of wal_batch column types.
-            let wb_types: HashMap<&str, &str> = wb_schema
-                .iter()
-                .map(|c| (c.name.as_str(), c.dtype.as_str()))
-                .collect();
-
-            // Find columns present in both with different types.
-            let conflicts: Vec<String> = pq_schema
-                .iter()
-                .filter(|col| {
-                    wb_types
-                        .get(col.name.as_str())
-                        .is_some_and(|wb_type| *wb_type != col.dtype)
-                })
-                .map(|col| col.name.clone())
-                .collect();
-
-            if conflicts.is_empty() {
-                // Not actually a type conflict — re-raise original error.
-                return Err(format!("merge read_parquet failed: {e}"));
-            }
-
-            tracing::info!(
-                event_type = "compaction_fallback",
-                compact_service = %service,
-                conflicting_columns = ?conflicts,
-                "casting conflicting columns to VARCHAR"
-            );
-
-            let pq_select = build_cast_select(&pq_schema, &conflicts);
-            let wb_select = build_cast_select(&wb_schema, &conflicts);
-
-            conn.execute_batch(&format!(
-                "CREATE TABLE merged AS \
-                 SELECT {pq_select} FROM read_parquet('{pq_path}') \
-                 UNION ALL BY NAME \
-                 SELECT {wb_select} FROM wal_batch",
-            ))
-            .map_err(|e| format!("merge (type fallback) failed: {e}"))
-        }
-        Err(e) => Err(format!("merge read_parquet failed: {e}")),
-    }
+    ))
+    .map_err(|e| {
+        tracing::error!(
+            event_type = "catalog_invariant_violation",
+            compact_service = %service,
+            path = %canonical_path.display(),
+            error = %e,
+            "merge with existing parquet failed — write-time conformance makes this \
+             impossible for trawl-written files (foreign parquet at this path?); \
+             WAL retained, batch retried next tick"
+        );
+        format!("merge read_parquet failed: {e}")
+    })
 }
 
-/// Blocking compaction: open `DuckDB`, read ndjson, write parquet.
+/// A batch staged in `DuckDB` between the read/infer phase and the
+/// conform/write phase. The `Connection` moves across the two
+/// `spawn_blocking` calls so the async pin phase can sit between them.
+struct PreparedBatch {
+    conn: duckdb::Connection,
+    /// `DESCRIBE` of `wal_batch` as read.
+    schema: Vec<ColInfo>,
+    /// Pin proposals for columns absent from the known-pin set.
+    proposals: Vec<PinProposal>,
+    /// WAL files that contributed rows.
+    survivors: usize,
+    /// Start instant for the completion log.
+    compact_start: std::time::Instant,
+}
+
+/// Outcome of a conformant write, carried to the bookkeeping phase.
+struct WriteReport {
+    /// Rows THIS batch contributed. Deliberately NOT the merged file's
+    /// total: `field_services.row_count` accumulates this value, so a
+    /// whole-file count would re-add every earlier batch on every tick.
+    batch_rows: u64,
+    /// Conform casts that constitute recordable conflicts.
+    conflicts: Vec<FieldConflict>,
+    /// Fields this batch actually WROTE (for `field_services`) — the
+    /// post-conform column set, so deferred-pin columns dropped by
+    /// [`conform_wal_batch`] are not claimed as observed.
+    observed_fields: Vec<String>,
+}
+
+/// Blocking phase 1: validate + read WAL files into a `wal_batch` table,
+/// `DESCRIBE` it, and derive pin proposals for unpinned columns.
 ///
-/// Uses a canonical filename (`{service}.parquet`) per service per
-/// hour-directory. When a canonical file already exists, merges the
-/// new WAL data with it via `UNION ALL`. Writes to a `.tmp` file
-/// first, then does an atomic `rename()` for crash safety.
+/// Returns `Ok(None)` when every input was corrupt (data loss surfaced via
+/// the quarantine count — nothing to retry).
 ///
 /// `*quarantined` accumulates corrupt WAL files set aside during this batch
 /// (both the byte sniff and read isolation). It is threaded by reference so
 /// the count survives an `Err` from any later step — see [`CompactOutcome`]
 /// (mirrors the rollup [`RollupOutcome`] pattern). Every quarantine is
 /// permanent (`.corrupt` rename), so a retry can't re-count it.
-fn compact_service_inner(
+fn prepare_service_batch(
     wal_files: &[PathBuf],
     data_dir: &Path,
     service: &str,
     memory_limit: &str,
     quarantined: &mut u64,
-) -> Result<(), String> {
+    known_pins: &HashMap<String, CanonicalType>,
+) -> Result<Option<PreparedBatch>, String> {
     let compact_start = std::time::Instant::now();
 
     // Validate WAL inputs before they reach `read_json`. A single corrupt
@@ -1541,7 +1557,7 @@ fn compact_service_inner(
             quarantined = *quarantined,
             "all WAL files in batch were corrupt — no parquet produced, DATA LOSS"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let conn =
@@ -1574,8 +1590,536 @@ fn compact_service_inner(
             quarantined = *quarantined,
             "all WAL files corrupt after read isolation — no parquet produced, DATA LOSS"
         );
-        return Ok(());
+        return Ok(None);
     }
+
+    let schema = describe_source(&conn, "SELECT * FROM wal_batch")?;
+    let proposals = propose_pins(&conn, &schema, service, known_pins)?;
+
+    Ok(Some(PreparedBatch {
+        conn,
+        schema,
+        proposals,
+        survivors,
+        compact_start,
+    }))
+}
+
+/// Derive pin proposals for every column not already pinned.
+///
+/// This is *pin on first complete batch*, not first value: mixed and
+/// out-of-range inferences run the candidate [`LADDER`] over the batch's
+/// actual values, and an all-null unpinned column proposes nothing (the
+/// pin defers and the column is dropped from this batch's output).
+/// `_time`/`_ingested` are excluded — the ADR-0008 repair ladder owns
+/// them and they are already TIMESTAMP by the time this runs.
+fn propose_pins(
+    conn: &duckdb::Connection,
+    schema: &[ColInfo],
+    service: &str,
+    known_pins: &HashMap<String, CanonicalType>,
+) -> Result<Vec<PinProposal>, String> {
+    // One pass to classify, in schema order: a type that maps straight onto
+    // the canonical vocabulary pins from the DESCRIBE alone, everything else
+    // needs the values and is resolved in batch below (never per column —
+    // the batch is attacker-wide, see `run_pin_ladders`).
+    //
+    // Names are ASCII-case-folded for both the lookup and the proposal: the
+    // catalog holds folded names only (ingest folds at canonicalization),
+    // and a legacy mixed-case WAL column must pin — and be conformed — under
+    // the same key its data will be stored as.
+    let mut candidates: Vec<(String, Option<CanonicalType>)> = Vec::new();
+    let mut ladder_cols: Vec<&ColInfo> = Vec::new();
+    for col in schema {
+        let folded = col.name.to_ascii_lowercase();
+        if trawl_core::schema::TIMESTAMP_COLUMNS.contains(&folded.as_str())
+            || known_pins.contains_key(&folded)
+        {
+            continue;
+        }
+        match normalize_duckdb_type(&col.dtype) {
+            TypeResolution::Pin(t) => candidates.push((folded, Some(t))),
+            TypeResolution::Ladder | TypeResolution::Json => {
+                candidates.push((folded, None));
+                ladder_cols.push(col);
+            }
+        }
+    }
+
+    let mut laddered = run_pin_ladders(conn, &ladder_cols)?.into_iter();
+    let mut proposals = Vec::with_capacity(candidates.len());
+    for (field, direct) in candidates {
+        let proposed = match direct {
+            Some(t) => Some(t),
+            // Parallel to `ladder_cols` by construction.
+            None => laddered
+                .next()
+                .ok_or_else(|| "pin ladder returned fewer results than columns".to_owned())?,
+        };
+        if let Some(ty) = proposed {
+            proposals.push(PinProposal {
+                field,
+                ty,
+                pinned_from: service.to_owned(),
+            });
+        }
+    }
+    Ok(proposals)
+}
+
+/// How many columns one per-column aggregate query may cover.
+///
+/// The bound every wide-batch aggregate pass funnels through: the pin ladder
+/// (`LADDER.len() + 1` aggregates per column), [`ConformPlan::tally_conflicts`]
+/// (2 per cast column) and the boot scan's non-null vote weighting (1 per
+/// voting column). Column count is client-chosen — `MAX_PINNED_FIELDS` bounds
+/// the catalog at 10k fields — so none of them may fan out over the full
+/// width.
+///
+/// Both extremes are pathological on a wide batch (measured by execution
+/// against the bundled `DuckDB` 1.5.5, 10k columns × 50 rows): one query PER
+/// column is superlinear because every query re-binds the whole table (27s,
+/// and ~n^1.4 in the column count), while ONE query over every column blows
+/// aggregate memory (a 40k-column batch OOMs outright) and is roughly
+/// quadratic well before that (the 2-aggregate tally shape: 1k cols 0.68s,
+/// 5k 10.6s, 10k 38.5s). Chunking is flat in both: 10k ladder columns take
+/// ~1.4s and 40k ~7.9s at this width, and the peak is bounded by the chunk,
+/// not the batch. 64…1024 all measure within 25% of each other, so this sits
+/// in the middle.
+pub(crate) const AGG_CHUNK_COLS: usize = 256;
+
+/// Run the candidate ladder over the columns' actual values, resolving up to
+/// [`AGG_CHUNK_COLS`] columns per aggregate pass: per column the first
+/// candidate whose `TRY_CAST` success rate over non-null values reaches
+/// [`LADDER_SUCCESS_THRESHOLD`] pins; none qualifying pins `VARCHAR`.
+///
+/// Returns one entry per input column, in order; `None` for an all-null
+/// column — that pin defers.
+#[allow(clippy::cast_precision_loss)] // ratios over row counts
+fn run_pin_ladders(
+    conn: &duckdb::Connection,
+    columns: &[&ColInfo],
+) -> Result<Vec<Option<CanonicalType>>, String> {
+    // Non-null count followed by one TRY_CAST count per ladder candidate.
+    let stride = LADDER.len() + 1;
+    let mut out = Vec::with_capacity(columns.len());
+    for chunk in columns.chunks(AGG_CHUNK_COLS) {
+        let sql = format!(
+            "SELECT {} FROM wal_batch",
+            chunk
+                .iter()
+                .map(|col| {
+                    let q = quote_ident(&col.name);
+                    let mut aggs = Vec::with_capacity(stride);
+                    aggs.push(format!("count({q})::BIGINT"));
+                    aggs.extend(LADDER.iter().map(|t| {
+                        let expr = conform_expr(&q, &col.dtype, *t).unwrap_or_else(|| q.clone());
+                        format!("count({expr})::BIGINT")
+                    }));
+                    aggs.join(", ")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let counts: Vec<i64> = conn
+            .query_row(&sql, [], |row| {
+                let mut counts = Vec::with_capacity(chunk.len() * stride);
+                for i in 0..chunk.len() * stride {
+                    counts.push(row.get::<_, i64>(i)?);
+                }
+                Ok(counts)
+            })
+            .map_err(|e| format!("pin ladder query failed: {e}"))?;
+
+        for slot in counts.chunks(stride) {
+            let non_null = slot[0];
+            if non_null == 0 {
+                out.push(None);
+                continue;
+            }
+            let pin = LADDER
+                .iter()
+                .zip(&slot[1..])
+                .find(|(_, ok)| {
+                    (**ok as f64) / (non_null as f64)
+                        >= trawl_core::schema::LADDER_SUCCESS_THRESHOLD
+                })
+                .map_or(CanonicalType::Varchar, |(candidate, _)| *candidate);
+            out.push(Some(pin));
+        }
+    }
+    Ok(out)
+}
+
+/// The SQL expression conforming one column to its pin, or `None` when the
+/// observed type already matches (pass-through).
+///
+/// All cast semantics verified by execution against the bundled `DuckDB`
+/// (`trawl-engine/tests/duckdb_probe.rs`):
+/// - a bare `TRY_CAST` to a numeric type ROUNDS rather than fails —
+///   `1.5 → 2` from JSON, VARCHAR and DOUBLE sources alike — so every
+///   typed cast is wrapped in a round-trip guard ([`lossless_cast`]): a
+///   value that does not survive the cast unchanged becomes NULL (and so
+///   counts into `field_conflicts` via the tally, and scores as a FAILURE
+///   in the pin ladder) instead of being silently altered;
+/// - `JSON → VARCHAR` goes through `json_extract_string(col, '$')` so
+///   strings land UNQUOTED (`n/a`, not `"n/a"`) while numbers/objects
+///   become their text;
+/// - legacy complex types (STRUCT/MAP/LIST from pre-stringification WAL)
+///   go through `to_json()` so the VARCHAR is real JSON text, reachable
+///   with `json_extract_string`.
+pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Option<String> {
+    if dtype == pin.as_duckdb() {
+        return None;
+    }
+    let upper = dtype.trim().to_ascii_uppercase();
+    let is_complex = upper.starts_with("STRUCT")
+        || upper.starts_with("MAP")
+        || upper.starts_with("LIST")
+        || upper.starts_with("UNION")
+        || upper.ends_with("[]");
+    Some(match pin {
+        CanonicalType::Varchar if upper == "JSON" => {
+            format!("json_extract_string({quoted}, '$')")
+        }
+        CanonicalType::Varchar if is_complex => {
+            format!("CAST(to_json({quoted}) AS VARCHAR)")
+        }
+        // Stringification is lossless by construction; no guard needed.
+        CanonicalType::Varchar => format!("TRY_CAST({quoted} AS VARCHAR)"),
+        typed => lossless_cast(quoted, &upper, typed),
+    })
+}
+
+/// A typed cast that succeeds only when the value survives the round trip
+/// unchanged — `CASE WHEN <round-trips> THEN TRY_CAST(...) END` — because
+/// `TRY_CAST` alone ROUNDS instead of failing (`1.5 → 2`, `true → 1`;
+/// probed by execution in `trawl-engine/tests/duckdb_probe.rs`). Without
+/// the guard, a 95%-fractional batch scores ≥90% "success" on the BIGINT
+/// rung and pins BIGINT, silently rounding every value on write forever
+/// with no `field_conflicts` row.
+///
+/// The comparison space is chosen per rung (all probed by execution):
+/// - `BIGINT` compares the cast against the value's canonical text
+///   re-parsed as `DECIMAL(38,6)` — an EXACT integer space across the whole
+///   BIGINT range. A DOUBLE-space comparison was blind above 2^53 (both
+///   sides collapse to the same double, so `1735689600123456710.7`
+///   conformed BIGINT as `...711` with no conflict — the original
+///   silent-rounding failure mode, moved up the number line). DECIMAL
+///   keeps every currently-accepted case (`4.0 = 4`, `"042" = 42`,
+///   `1e3 = 1000`, `2^53 ± 1` exact, `i64::MAX`/`MIN`) and every rejection
+///   (`1.5`, `n/a`, `0x10`, `''`, `u64::MAX` still NULLs the cast), while
+///   correctly refusing >2^53 fractional values. Residual tolerance: a
+///   fraction below `DECIMAL(38,6)`'s half-microstep (`4.0000001`)
+///   quantizes to the integer and is absorbed as representation drift —
+///   rounding is refused above `0.5e-6`, not below;
+/// - `DOUBLE` compares in DOUBLE space, which is deliberately
+///   precision-tolerant: `u64::MAX` must pass the DOUBLE rung despite
+///   DOUBLE's >2^53 precision loss — a strict text comparison would fail
+///   it (`1.8446744073709552e+19 ≠ 18446744073709551615`) and regress the
+///   u64-range-pins-DOUBLE acceptance case; pinning DOUBLE *means*
+///   accepting DOUBLE's precision;
+/// - `TIMESTAMP` compares in TIMESTAMP space, tolerating format drift
+///   (RFC 3339 `T`/`Z` vs `DuckDB`'s space-separated rendering, `DATE` at
+///   midnight) — a text no parser reads still becomes NULL;
+/// - `BOOLEAN` compares strict text, so only real `true`/`false` values
+///   conform — `1` never becomes `true` — which is also what makes the
+///   Boolean ladder rung reachable at all (`TRY_CAST(true AS BIGINT)` is 1,
+///   so under bare counting a boolean batch scored ≥90% BIGINT first).
+///
+/// The canonical text is `json_extract_string(x, '$')` for a JSON column
+/// (unquoted strings) and `CAST(x AS VARCHAR)` for every other source.
+fn lossless_cast(quoted: &str, upper_dtype: &str, pin: CanonicalType) -> String {
+    let canon = if upper_dtype == "JSON" {
+        format!("json_extract_string({quoted}, '$')")
+    } else {
+        format!("CAST({quoted} AS VARCHAR)")
+    };
+    let cast = format!("TRY_CAST({quoted} AS {})", pin.as_duckdb());
+    let ok = match pin {
+        CanonicalType::BigInt => {
+            format!("TRY_CAST({canon} AS DECIMAL(38,6)) = TRY_CAST({cast} AS DECIMAL(38,6))")
+        }
+        CanonicalType::Double => {
+            format!("TRY_CAST({canon} AS DOUBLE) = {cast}")
+        }
+        CanonicalType::Timestamp => format!("TRY_CAST({canon} AS TIMESTAMP) = {cast}"),
+        CanonicalType::Boolean => format!("CAST({cast} AS VARCHAR) = {canon}"),
+        // Handled by the caller's VARCHAR arms; never a guarded cast.
+        CanonicalType::Varchar => unreachable!("VARCHAR conforms are lossless by construction"),
+    };
+    format!("(CASE WHEN {ok} THEN {cast} END)")
+}
+
+/// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
+/// arm, so conforming a standing file can never manufacture a NULL partition
+/// key (the boot-pass counterpart of [`repair_expr`]'s third arm, ADR-0008).
+///
+/// Only fires for [`ConformPolicy::StandingFile`] on a
+/// [`trawl_core::schema::TIMESTAMP_COLUMNS`] member actually pinned
+/// TIMESTAMP: a `_time` pinned VARCHAR is plain text and needs no partition
+/// guard (and could not take a TIMESTAMP literal anyway).
+fn guard_partition_key(
+    policy: ConformPolicy,
+    is_time_col: bool,
+    pin: CanonicalType,
+    expr: &str,
+) -> String {
+    match policy {
+        ConformPolicy::StandingFile { time_fallback }
+            if is_time_col && pin == CanonicalType::Timestamp =>
+        {
+            format!(
+                "COALESCE({expr}, TIMESTAMP '{}')",
+                time_fallback.format("%Y-%m-%d %H:%M:%S%.6f")
+            )
+        }
+        _ => expr.to_owned(),
+    }
+}
+
+/// Which corpus a [`ConformPlan`] is being built over. The two conform
+/// sites agree on every rule except these, so the difference is named
+/// rather than duplicated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConformPolicy {
+    /// A freshly-read WAL batch (compaction). `_time`/`_ingested` pass
+    /// through untouched — the ADR-0008 repair ladder already made them
+    /// TIMESTAMP and they must never be re-cast — and a column with NO pin
+    /// is DROPPED: `union_by_name` reads an absent column as NULL, and
+    /// writing typed NULLs would let a silent field pre-empt its own real
+    /// type. Unpinned means either a deferred pin (all-null column) or a
+    /// denied one (unstorable name, or the catalog at
+    /// [`crate::store::MAX_PINNED_FIELDS`]); both keep their values in
+    /// `_raw`.
+    WalBatch,
+    /// A standing parquet file (boot conformance pass). Every column is
+    /// conformed, `_time` included — a legacy file whose timestamp column
+    /// is mistyped is exactly what that pass exists to fix — and a column
+    /// with no pin is kept verbatim (pins cover every scanned field, so
+    /// this is unreachable in practice).
+    ///
+    /// `time_fallback` is the last arm of the TIMESTAMP-pinned envelope
+    /// columns' conform, exactly as [`repair_expr`] is for WAL: a value the
+    /// `TRY_CAST` cannot read must NOT be written as NULL, because a NULL
+    /// partition key sorts first and falls outside every `last=Xh` filter
+    /// — the row would survive the rewrite yet become permanently
+    /// unqueryable by time (ADR-0008). The boot pass has no WAL filename to
+    /// recover an instant from, so the caller supplies the file's own
+    /// partition instant (its `{date}/{HH}` directory), or the conform
+    /// instant when the path carries none.
+    StandingFile {
+        time_fallback: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// One column the plan will `TRY_CAST`.
+struct CastEntry {
+    /// The FOLDED (catalog-key) name — conflict evidence is attributed to
+    /// the field as the catalog knows it, not to a legacy spelling.
+    name: String,
+    dtype: String,
+    pin: CanonicalType,
+    expr: String,
+}
+
+/// The per-column select list that conforms a source to the pins, plus the
+/// bookkeeping needed to tally what the casts nulled.
+///
+/// Shared by compaction (conforming `wal_batch` in place) and the boot pass
+/// (rewriting a standing parquet file): both build the same select list from
+/// [`conform_expr`] and record the same [`FieldConflict`] evidence, and only
+/// differ in where the rows come from ([`ConformPlan::tally_conflicts`]'s
+/// `source`) and how the result is applied.
+///
+/// Column names are ASCII-case-folded on the OUTPUT side: pins are keyed by
+/// the folded name (ingest folds every field name at canonicalization), so
+/// the lookup folds too, and a column whose stored spelling still carries
+/// uppercase (parquet written before the fold shipped) is RENAMED to the
+/// folded form as part of the conform — a rename with no cast still counts
+/// as a rewrite ([`Self::is_noop`]).
+pub(crate) struct ConformPlan {
+    /// Per-column SELECT expressions, in schema order.
+    pub(crate) select_list: Vec<String>,
+    /// The RETAINED column names (folded) — the post-conform column set,
+    /// so bookkeeping can never claim a service carried a field no parquet
+    /// file holds.
+    pub(crate) retained: Vec<String>,
+    /// Columns omitted from the output because their pin deferred.
+    pub(crate) dropped: Vec<String>,
+    casts: Vec<CastEntry>,
+    /// Columns whose only change is the case-fold rename.
+    renamed: usize,
+}
+
+impl ConformPlan {
+    /// Plan the conform of `schema` against `pins` under `policy`.
+    pub(crate) fn build(
+        schema: &[ColInfo],
+        pins: &HashMap<String, CanonicalType>,
+        policy: ConformPolicy,
+    ) -> Self {
+        let mut plan = Self {
+            select_list: Vec::with_capacity(schema.len()),
+            retained: Vec::with_capacity(schema.len()),
+            dropped: Vec::new(),
+            casts: Vec::new(),
+            renamed: 0,
+        };
+        for col in schema {
+            let quoted = quote_ident(&col.name);
+            let folded = col.name.to_ascii_lowercase();
+            let is_time_col = trawl_core::schema::TIMESTAMP_COLUMNS.contains(&folded.as_str());
+            if policy == ConformPolicy::WalBatch && is_time_col {
+                plan.keep(col, &folded, quoted);
+                continue;
+            }
+            match pins.get(&folded).copied() {
+                None if policy == ConformPolicy::WalBatch => plan.dropped.push(col.name.clone()),
+                None => plan.keep(col, &folded, quoted),
+                Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
+                    None => plan.keep(col, &folded, quoted),
+                    Some(expr) => {
+                        // The written expression may carry a never-NULL last
+                        // arm; the tallied one never does. `tally_conflicts`
+                        // counts what the CAST could not read, and a fallback
+                        // that substitutes an instant has still destroyed the
+                        // original value — evidence worth recording.
+                        let written = guard_partition_key(policy, is_time_col, pin, &expr);
+                        plan.select_list
+                            .push(format!("{written} AS {}", quote_ident(&folded)));
+                        plan.retained.push(folded.clone());
+                        plan.casts.push(CastEntry {
+                            name: folded,
+                            dtype: col.dtype.clone(),
+                            pin,
+                            expr,
+                        });
+                    }
+                },
+            }
+        }
+        plan
+    }
+
+    /// Pass one column through — renamed to its folded spelling when the
+    /// stored one differs, untouched otherwise.
+    fn keep(&mut self, col: &ColInfo, folded: &str, quoted: String) {
+        if folded == col.name {
+            self.select_list.push(quoted);
+        } else {
+            self.select_list
+                .push(format!("{quoted} AS {}", quote_ident(folded)));
+            self.renamed += 1;
+        }
+        self.retained.push(folded.to_owned());
+    }
+
+    /// Whether the plan rewrites anything at all (a cast, a deferred-pin
+    /// drop, or a case-fold rename).
+    pub(crate) fn is_noop(&self) -> bool {
+        self.casts.is_empty() && self.dropped.is_empty() && self.renamed == 0
+    }
+
+    /// How many columns the plan casts (a no-cast plan can still drop or
+    /// rename columns, so this is not the inverse of [`Self::is_noop`]).
+    pub(crate) fn cast_count(&self) -> usize {
+        self.casts.len()
+    }
+
+    /// Tally what each cast would null over `source` (a FROM-clause source
+    /// expression) — necessarily BEFORE the plan is applied, since applying
+    /// it destroys the pre-cast values. Runs in aggregate passes of at most
+    /// [`AGG_CHUNK_COLS`] cast columns for the same reason the pin ladder
+    /// does: the width is client-chosen, and 2 aggregates × 10k columns in
+    /// one statement is quadratic (38.5s at 10k, vs ~1.4s chunked).
+    ///
+    /// A conflict is one row per cast column the conform actually NULLED.
+    /// A cast that nulls nothing lost no data, whatever the two type names
+    /// say: an all-null pinned column (a batch with no `_repairs`), a JSON
+    /// source that converts fully, and a VARCHAR-pinned field whose batch
+    /// happened to carry only numbers are all honest convergence. Recording
+    /// those would append a row per (field, service) to the APPEND-ONLY
+    /// `field_conflicts` on every compaction tick, forever, for a sender
+    /// that is losing nothing — noise that outgrows the evidence.
+    pub(crate) fn tally_conflicts(
+        &self,
+        conn: &duckdb::Connection,
+        source: &str,
+        service: &str,
+    ) -> Result<Vec<FieldConflict>, String> {
+        if self.casts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stats: Vec<(i64, i64)> = Vec::with_capacity(self.casts.len());
+        for chunk in self.casts.chunks(AGG_CHUNK_COLS) {
+            let stats_sql = format!(
+                "SELECT {} FROM {source}",
+                chunk
+                    .iter()
+                    .map(|c| {
+                        let q = quote_ident(&c.name);
+                        format!("count({q})::BIGINT, count({})::BIGINT", c.expr)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let chunk_stats: Vec<(i64, i64)> = conn
+                .query_row(&stats_sql, [], |row| {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for i in 0..chunk.len() {
+                        out.push((row.get::<_, i64>(2 * i)?, row.get::<_, i64>(2 * i + 1)?));
+                    }
+                    Ok(out)
+                })
+                .map_err(|e| format!("conform stats query failed: {e}"))?;
+            stats.extend(chunk_stats);
+        }
+
+        let mut conflicts = Vec::new();
+        for (cast, (non_null, ok)) in self.casts.iter().zip(&stats) {
+            let rows_nulled = u64::try_from(non_null - ok).unwrap_or(0);
+            if rows_nulled > 0 {
+                conflicts.push(FieldConflict {
+                    field: cast.name.clone(),
+                    service: service.to_owned(),
+                    observed_type: cast.dtype.clone(),
+                    expected_type: cast.pin,
+                    rows_nulled,
+                });
+            }
+        }
+        Ok(conflicts)
+    }
+}
+
+/// Blocking phase 3: conform `wal_batch` to the authoritative pins, then
+/// write parquet exactly as before (canonical `{service}.parquet` per
+/// hour-directory, merge with the existing file when present, `.tmp` +
+/// atomic `rename()` for crash safety).
+fn conform_and_write(
+    prep: PreparedBatch,
+    pins: &HashMap<String, CanonicalType>,
+    data_dir: &Path,
+    service: &str,
+) -> Result<WriteReport, String> {
+    let PreparedBatch {
+        conn,
+        schema,
+        survivors,
+        compact_start,
+        ..
+    } = prep;
+
+    let (conflicts, retained) = conform_wal_batch(&conn, &schema, pins, service)?;
+    let observed_fields: Vec<String> = retained
+        .into_iter()
+        .filter(|n| !n.starts_with(WAL_FILE_COL))
+        .collect();
+    // Counted before the merge: `merged` holds the whole hour file, and
+    // accumulating THAT into `field_services.row_count` would re-add every
+    // previously-compacted row on every tick.
+    let batch_rows = count_rows(&conn, "wal_batch")?;
 
     // Determine output directory from current time.
     let now = chrono::Utc::now();
@@ -1597,7 +2141,8 @@ fn compact_service_inner(
         // Merge: union existing parquet rows with new WAL batch.
         // BY NAME handles heterogeneous schemas (different events have
         // different fields) — missing columns become NULL in parquet.
-        // Falls back to explicit casts if column types conflict.
+        // Both sides are catalog-conformant, so a type conflict here means
+        // a foreign file and errors loudly (WAL retained, retried).
         merge_with_existing(&conn, &canonical_path, service)?;
 
         // ORDER BY timestamp so row-group min/max stats enable range
@@ -1627,7 +2172,7 @@ fn compact_service_inner(
         ))
         .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
 
-        count_rows(&conn, "wal_batch")?
+        batch_rows
     };
 
     conn.execute_batch("DROP TABLE IF EXISTS wal_batch")
@@ -1649,17 +2194,65 @@ fn compact_service_inner(
         wal_files = survivors,
         merged,
         rows,
+        conflicts = conflicts.len(),
         output_bytes,
         duration_ms,
         "compaction complete"
     );
 
-    Ok(())
+    Ok(WriteReport {
+        batch_rows,
+        conflicts,
+        observed_fields,
+    })
 }
 
-/// Test-only convenience wrapper over [`compact_service_inner`]: folds the
-/// quarantine count into the `Ok` value. Production goes through
-/// [`compact_service_batch`], which preserves the count on `Err` too.
+/// Conform `wal_batch` to the pins in place, per [`ConformPolicy::WalBatch`].
+///
+/// Returns the recordable conflicts (see [`ConformPlan::tally_conflicts`])
+/// and the RETAINED column names.
+fn conform_wal_batch(
+    conn: &duckdb::Connection,
+    schema: &[ColInfo],
+    pins: &HashMap<String, CanonicalType>,
+    service: &str,
+) -> Result<(Vec<FieldConflict>, Vec<String>), String> {
+    let plan = ConformPlan::build(schema, pins, ConformPolicy::WalBatch);
+    if plan.select_list.is_empty() {
+        return Err("conform produced an empty column list".to_owned());
+    }
+
+    // Tallied BEFORE the table is replaced.
+    let conflicts = plan.tally_conflicts(conn, "wal_batch", service)?;
+
+    if !plan.dropped.is_empty() {
+        tracing::info!(
+            event_type = "catalog_pin_deferred",
+            compact_service = %service,
+            columns = ?plan.dropped,
+            "unpinned columns absent from this file (pin deferred as all-null, \
+             or denied — see catalog_pin_cap_reached / \
+             catalog_field_name_unstorable); values remain in _raw"
+        );
+    }
+
+    if !plan.is_noop() {
+        conn.execute_batch(&format!(
+            "CREATE TABLE wal_conformed AS SELECT {} FROM wal_batch; \
+             DROP TABLE wal_batch; \
+             ALTER TABLE wal_conformed RENAME TO wal_batch",
+            plan.select_list.join(", ")
+        ))
+        .map_err(|e| format!("catalog conform failed: {e}"))?;
+    }
+
+    Ok((conflicts, plan.retained))
+}
+
+/// Test-only convenience wrapper: prepare + local pins + conform/write,
+/// folding the quarantine count into the `Ok` value. Production goes
+/// through [`compact_service_batch`], which persists pins first and
+/// preserves the count on `Err` too.
 #[cfg(test)]
 fn compact_service_blocking(
     wal_files: &[PathBuf],
@@ -1668,8 +2261,19 @@ fn compact_service_blocking(
     memory_limit: &str,
 ) -> Result<u64, String> {
     let mut quarantined: u64 = 0;
-    compact_service_inner(wal_files, data_dir, service, memory_limit, &mut quarantined)
-        .map(|()| quarantined)
+    let prep = prepare_service_batch(
+        wal_files,
+        data_dir,
+        service,
+        memory_limit,
+        &mut quarantined,
+        &HashMap::new(),
+    )?;
+    if let Some(prep) = prep {
+        let pins = local_pins(&prep.proposals);
+        conform_and_write(prep, &pins, data_dir, service)?;
+    }
+    Ok(quarantined)
 }
 
 /// Remove stale `.parquet.tmp` files left by interrupted compaction or
@@ -1931,6 +2535,72 @@ mod tests {
         assert_eq!(count, 2, "merged file should contain 2 rows");
     }
 
+    /// `field_services.row_count` is accumulated by `touch_services`, so
+    /// the report must carry THIS batch's rows — the merged file's total
+    /// would re-add every earlier batch on every tick. And the observed
+    /// fields must be the post-conform set: a deferred-pin column is
+    /// dropped from the parquet, so claiming it as observed is a lie.
+    #[test]
+    fn write_report_counts_only_this_batch_and_written_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let report_for = |records: &[&str]| {
+            let files = vec![write_wal_file(&wal_dir, "nginx", records)];
+            let mut quarantined: u64 = 0;
+            let prep = prepare_service_batch(
+                &files,
+                &data_dir,
+                "nginx",
+                "2GB",
+                &mut quarantined,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .expect("batch survives");
+            let pins = local_pins(&prep.proposals);
+            conform_and_write(prep, &pins, &data_dir, "nginx").unwrap()
+        };
+
+        // `deferred` is all-null, so its pin defers and conform drops it.
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"one","deferred":null}"#;
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","message":"two","deferred":null}"#;
+        let first = report_for(&[r1, r2]);
+        assert_eq!(first.batch_rows, 2);
+        assert!(first.observed_fields.iter().any(|f| f == "message"));
+        assert!(
+            !first.observed_fields.iter().any(|f| f == "deferred"),
+            "a dropped deferred-pin column was never written: {:?}",
+            first.observed_fields
+        );
+
+        let r3 = r#"{"_time":"2026-01-01T00:00:02Z","_ingested":"2026-01-01T00:00:02Z","service":"nginx","message":"three"}"#;
+        let second = report_for(&[r3]);
+        assert_eq!(
+            second.batch_rows, 1,
+            "the merge tick must report its own rows, not the file total"
+        );
+
+        // The file really did merge to 3 rows — so 1 is the batch count,
+        // not an artefact of a failed merge.
+        let parquet_files = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet_files.len(), 1);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    parquet_files[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "merged file holds both batches");
+    }
+
     #[test]
     fn compact_sorts_rows_by_timestamp() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2146,10 +2816,11 @@ mod tests {
 
     #[test]
     fn compact_merges_despite_type_conflict() {
-        // Simulates the k8s containerID scenario: first compaction writes
-        // a parquet file where `container_id` is a JSON object, second
-        // compaction has WAL data where `container_id` is a plain string.
-        // The merge should succeed by falling back to VARCHAR casts.
+        // Simulates the k8s containerID scenario: first batch carries
+        // `container_id` as a JSON object, second as a plain string. The
+        // cast-fallback that used to rescue this is deleted (ADR-0009 slice
+        // 2) — instead the conform pipeline pins the column VARCHAR at the
+        // FIRST write, so the second batch merges with no conflict at all.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
@@ -2248,6 +2919,650 @@ mod tests {
             )
             .unwrap();
         assert_ne!(count_ty, "VARCHAR", "scalar field must keep its type");
+    }
+
+    /// Read `(column_type, non_null_count, total_count)` for one column of a
+    /// parquet file.
+    fn column_stats(parquet: &Path, column: &str) -> (String, i64, i64) {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let dtype: String = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "DESCRIBE SELECT \"{column}\" FROM read_parquet('{}')",
+                    parquet.display()
+                ))
+                .unwrap();
+            stmt.query_row([], |row| row.get(1)).unwrap()
+        };
+        let (nn, total): (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT count(\"{column}\")::BIGINT, count(*)::BIGINT \
+                     FROM read_parquet('{}')",
+                    parquet.display()
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        (dtype, nn, total)
+    }
+
+    /// One canonical envelope record with a custom field value spliced in.
+    fn record_with(field: &str, value: &str, i: usize) -> String {
+        format!(
+            "{{\"_time\":\"2026-01-01T00:00:{:02}Z\",\"_ingested\":\"2026-01-01T00:00:{:02}Z\",\
+             \"service\":\"svc\",\"message\":\"m{i}\",\"{field}\":{value}}}",
+            i % 60,
+            i % 60,
+        )
+    }
+
+    /// Only a cast that NULLED something is conflict evidence.
+    /// `field_conflicts` is append-only and compaction ticks every few
+    /// seconds, so recording a lossless conform (here: a VARCHAR-pinned
+    /// field whose batch happened to carry only numbers) would append a row
+    /// per (field, service) forever for a sender losing nothing.
+    #[test]
+    fn lossless_conform_is_not_recorded_as_a_conflict() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT * FROM (VALUES (7, '8'), (9, 'x')) t(num, txt)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("num".to_owned(), CanonicalType::Varchar),
+            ("txt".to_owned(), CanonicalType::BigInt),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        assert_eq!(plan.cast_count(), 2, "both columns disagree with their pin");
+
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "only the lossy cast is evidence: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].field, "txt");
+        assert_eq!(conflicts[0].rows_nulled, 1, "'x' is the only nulled value");
+    }
+
+    /// A plan wider than one aggregate chunk must blame the column the rows
+    /// were actually nulled in: the tally runs in batched passes, so a
+    /// slot-mapping slip would hand a lossless column its neighbour's
+    /// evidence. Alternating lossy/lossless across the boundary catches that.
+    #[test]
+    fn tally_conflicts_spans_chunk_boundary_without_crossing_columns() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let cols = AGG_CHUNK_COLS + 5;
+        let lossy = |i: usize| i.is_multiple_of(3);
+        let projection = (0..cols)
+            .map(|i| {
+                let value = if lossy(i) { "'x'" } else { "'1'" };
+                format!("{value} AS f{i}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!("CREATE TABLE wal_batch AS SELECT {projection}"))
+            .unwrap();
+
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = (0..cols)
+            .map(|i| (format!("f{i}"), CanonicalType::BigInt))
+            .collect();
+        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        assert_eq!(plan.cast_count(), cols, "every VARCHAR column casts");
+
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        let fields: Vec<String> = conflicts.iter().map(|c| c.field.clone()).collect();
+        let expected: Vec<String> = (0..cols)
+            .filter(|i| lossy(*i))
+            .map(|i| format!("f{i}"))
+            .collect();
+        assert_eq!(
+            fields, expected,
+            "only the unconvertible columns are evidence"
+        );
+        assert!(
+            conflicts.iter().all(|c| c.rows_nulled == 1),
+            "each lossy column nulled its one row"
+        );
+    }
+
+    // --- the pin ladder is deterministic over mixed batches (ADR-0009) ---
+
+    #[test]
+    fn pin_ladder_one_outlier_among_integers_pins_bigint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..20)
+            .map(|i| record_with("duration", &i.to_string(), i))
+            .collect();
+        records.push(record_with("duration", "\"N/A\"", 20));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "duration");
+        assert_eq!(dtype, "BIGINT", "1-of-21 outlier must pin BIGINT");
+        assert_eq!(total, 21);
+        assert_eq!(nn, 20, "the outlier nulls (recoverable from _raw)");
+    }
+
+    #[test]
+    fn pin_ladder_even_split_pins_varchar_unquoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..10)
+            .map(|i| record_with("duration", &i.to_string(), i))
+            .collect();
+        records.extend((10..20).map(|i| record_with("duration", "\"n/a\"", i)));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "duration");
+        assert_eq!(dtype, "VARCHAR", "a 50/50 batch honestly pins VARCHAR");
+        assert_eq!((nn, total), (20, 20), "nothing nulls on a VARCHAR pin");
+
+        // The JSON-typed source column must land UNQUOTED: '5' and 'n/a',
+        // never '"n/a"'.
+        let values = read_strings(&parquet[0], "DISTINCT duration");
+        assert!(
+            values.contains(&"n/a".to_owned()),
+            "unquoted string: {values:?}"
+        );
+        assert!(
+            values.contains(&"5".to_owned()),
+            "stringified number: {values:?}"
+        );
+    }
+
+    #[test]
+    fn pin_ladder_u64_range_batch_pins_double() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let records: Vec<String> = (0..3)
+            .map(|i| record_with("duration", "18446744073709551615", i))
+            .collect();
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "duration");
+        assert_eq!(
+            dtype, "DOUBLE",
+            "u64-range values pin DOUBLE via the ladder"
+        );
+        assert_eq!((nn, total), (3, 3));
+    }
+
+    #[test]
+    fn pin_ladder_huge_outlier_among_integers_pins_bigint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..20)
+            .map(|i| record_with("duration", &i.to_string(), i))
+            .collect();
+        records.push(record_with("duration", "18446744073709551615", 20));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "duration");
+        assert_eq!(
+            dtype, "BIGINT",
+            "one huge value among twenty integers pins BIGINT"
+        );
+        assert_eq!(total, 21);
+        assert_eq!(nn, 20, "the out-of-range outlier nulls");
+    }
+
+    /// The lossless-cast fix's headline case: 19 fractional values + one
+    /// string infer JSON, and under bare `count(TRY_CAST(...))` scoring the
+    /// BIGINT rung counted `1.5 → 2` as success (19/20 ≥ 90%) — pinning
+    /// BIGINT and silently rounding every value on write, with no
+    /// `field_conflicts` row. Round-trip scoring fails the BIGINT rung
+    /// (rounding is not lossless) and pins DOUBLE.
+    #[test]
+    fn pin_ladder_fractional_majority_pins_double_not_bigint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..19).map(|i| record_with("duration", "1.5", i)).collect();
+        records.push(record_with("duration", "\"n/a\"", 19));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "duration");
+        assert_eq!(
+            dtype, "DOUBLE",
+            "a fractional majority must pin DOUBLE — BIGINT would round"
+        );
+        assert_eq!(total, 20);
+        assert_eq!(nn, 19, "only the string nulls (recoverable from _raw)");
+        let mut values = read_strings(
+            &parquet[0],
+            "DISTINCT COALESCE(CAST(duration AS VARCHAR), '<null>')",
+        );
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            vec!["1.5".to_owned(), "<null>".to_owned()],
+            "the fractional values survive unrounded"
+        );
+    }
+
+    /// The >2^53 boundary: a DOUBLE-space round-trip is blind up there
+    /// (both sides collapse to one double), so a nanosecond-epoch-magnitude
+    /// fractional batch scored 100% on the BIGINT rung and conformed as
+    /// silently rounded integers. The DECIMAL(38,6) comparison refuses it —
+    /// the batch pins DOUBLE — while a >2^53 INTEGER batch still pins
+    /// BIGINT exactly.
+    #[test]
+    fn pin_ladder_beyond_2_pow_53_fractional_pins_double_integer_pins_bigint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..19)
+            .map(|i| record_with("ns_frac", "1735689600123456710.7", i))
+            .collect();
+        records.push(record_with("ns_frac", "\"n/a\"", 19));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "ns_frac");
+        assert_eq!(
+            dtype, "DOUBLE",
+            ">2^53 fractional must NOT pin BIGINT (DOUBLE-space was blind here)"
+        );
+        assert_eq!((nn, total), (19, 20));
+
+        // Same magnitude, integral: exact in DECIMAL space, pins BIGINT.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let (wal_dir2, data_dir2) = (tmp2.path().join("wal"), tmp2.path().join("data"));
+        std::fs::create_dir_all(&wal_dir2).unwrap();
+        let mut records: Vec<String> = (0..19)
+            .map(|i| record_with("ns_int", "1735689600123456710", i))
+            .collect();
+        records.push(record_with("ns_int", "\"n/a\"", 19));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir2, "svc", &refs);
+        compact_service_blocking(&[f], &data_dir2, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir2, "parquet");
+        let (dtype, nn, _) = column_stats(&parquet[0], "ns_int");
+        assert_eq!(dtype, "BIGINT", ">2^53 integers are exact and pin BIGINT");
+        assert_eq!(nn, 19);
+        let values = read_strings(
+            &parquet[0],
+            "DISTINCT COALESCE(CAST(ns_int AS VARCHAR), '<null>')",
+        );
+        assert!(
+            values.contains(&"1735689600123456710".to_owned()),
+            "the integer survives bit-exact, no double round-off: {values:?}"
+        );
+    }
+
+    /// Conform-time twin of the boundary case: against an existing BIGINT
+    /// pin, a >2^53 fractional value must NULL and tally — never write the
+    /// rounded `...711`.
+    #[test]
+    fn conform_to_bigint_pin_nulls_beyond_2_pow_53_fractionals() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT * FROM (VALUES ('1735689600123456710.7'), ('1735689600123456710')) t(ns)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [("ns".to_owned(), CanonicalType::BigInt)]
+            .into_iter()
+            .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].rows_nulled, 1,
+            "exactly the fractional row is a recorded loss"
+        );
+
+        let rows: Vec<Option<i64>> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {} FROM wal_batch ORDER BY 1 NULLS FIRST",
+                    plan.select_list.join(", ")
+                ))
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![None, Some(1_735_689_600_123_456_710)],
+            "the fractional writes NULL (never ...711); the integer is exact"
+        );
+    }
+
+    /// With lossless scoring the Boolean rung is reachable: under the old
+    /// counting, `TRY_CAST(true AS BIGINT)` = 1 scored a boolean batch ≥90%
+    /// on the BIGINT rung first, so no batch could ever pin BOOLEAN.
+    #[test]
+    fn pin_ladder_boolean_majority_pins_boolean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..19)
+            .map(|i| record_with("healthy", if i % 2 == 0 { "true" } else { "false" }, i))
+            .collect();
+        records.push(record_with("healthy", "\"n/a\"", 19));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "healthy");
+        assert_eq!(
+            dtype, "BOOLEAN",
+            "a ≥90%-boolean batch must pin BOOLEAN — the rung is reachable now"
+        );
+        assert_eq!(total, 20);
+        assert_eq!(nn, 19, "only the string nulls");
+    }
+
+    /// The catalog holds ASCII-folded names only, so the conform plan must
+    /// fold a legacy mixed-case column onto its pin — a type-matching
+    /// column still gets a RENAME (a rewrite, not a no-op), and a cast
+    /// column lands under the folded alias with its conflict evidence
+    /// attributed to the catalog key.
+    #[test]
+    fn conform_plan_folds_mixed_case_columns_onto_their_pins() {
+        let schema = vec![
+            ColInfo {
+                name: "Dur".to_owned(),
+                dtype: "BIGINT".to_owned(),
+            },
+            ColInfo {
+                name: "Note".to_owned(),
+                dtype: "BIGINT".to_owned(),
+            },
+        ];
+        let pins: HashMap<String, CanonicalType> = [
+            ("dur".to_owned(), CanonicalType::BigInt),
+            ("note".to_owned(), CanonicalType::Varchar),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(
+            &schema,
+            &pins,
+            ConformPolicy::StandingFile {
+                time_fallback: chrono::Utc::now(),
+            },
+        );
+        assert!(!plan.is_noop(), "a rename-only plan is still a rewrite");
+        assert_eq!(plan.cast_count(), 1, "only `Note` needs a cast");
+        assert_eq!(plan.retained, vec!["dur", "note"]);
+        assert_eq!(plan.select_list[0], r#""Dur" AS "dur""#);
+        assert!(
+            plan.select_list[1].ends_with(r#" AS "note""#),
+            "the cast lands under the folded alias: {}",
+            plan.select_list[1]
+        );
+
+        // WalBatch: an unpinned mixed-case column is judged by its FOLDED
+        // name — pinned under `dur`, so it is conformed, not dropped.
+        let wal_plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        assert!(wal_plan.dropped.is_empty(), "{:?}", wal_plan.dropped);
+        assert_eq!(wal_plan.retained, vec!["dur", "note"]);
+    }
+
+    /// Conform-time lossless guarantee: a batch disagreeing with an
+    /// existing typed pin must NULL (and tally) every value the cast would
+    /// alter — never write a silently rounded one. Numeric-space tolerance
+    /// keeps genuinely lossless drift (`4.0 → 4`).
+    #[test]
+    fn conform_to_bigint_pin_nulls_rounded_values_and_records_them() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        // A DOUBLE column (a sender flip-flopping JSON number encodings)
+        // and a VARCHAR column, both against a BIGINT pin.
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT * FROM (VALUES (1.5::DOUBLE, '1.5'), (4.0::DOUBLE, '42')) t(frac, txt)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("frac".to_owned(), CanonicalType::BigInt),
+            ("txt".to_owned(), CanonicalType::BigInt),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        assert_eq!(plan.cast_count(), 2);
+
+        // The tally counts the rounded values as NULLED — they are losses.
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        let nulled: HashMap<&str, u64> = conflicts
+            .iter()
+            .map(|c| (c.field.as_str(), c.rows_nulled))
+            .collect();
+        assert_eq!(
+            nulled,
+            HashMap::from([("frac", 1), ("txt", 1)]),
+            "each column's fractional value is evidence: {conflicts:?}"
+        );
+
+        // And the written values match: NULL where rounding would have
+        // altered, the exact integer where the round trip holds.
+        let select = plan.select_list.join(", ");
+        let rows: Vec<(Option<i64>, Option<i64>)> = {
+            let mut stmt = conn
+                .prepare(&format!("SELECT {select} FROM wal_batch ORDER BY txt"))
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![(Some(4), Some(42)), (None, None)],
+            "1.5 and '1.5' must write NULL, never 2; 4.0 and '42' round-trip"
+        );
+    }
+
+    /// A batch wider than one ladder chunk must pin every column to the type
+    /// its OWN values support: the ladder runs in batched aggregate passes,
+    /// so a slot-mapping slip would silently hand a column its neighbour's
+    /// verdict. Alternating verdicts across the chunk boundary catch that.
+    #[test]
+    fn pin_ladder_spans_chunk_boundary_without_crossing_verdicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Every column is mixed-typed (so every one takes the ladder), but
+        // every third is an even split that can only honestly pin VARCHAR.
+        let cols = AGG_CHUNK_COLS + 5;
+        let varchar_col = |i: usize| i.is_multiple_of(3);
+        let records: Vec<String> = (0..21)
+            .map(|row| {
+                let fields: String = (0..cols)
+                    .map(|i| {
+                        let numeric = if varchar_col(i) { row < 10 } else { row < 20 };
+                        if numeric {
+                            format!(",\"f{i}\":{row}")
+                        } else {
+                            format!(",\"f{i}\":\"n/a\"")
+                        }
+                    })
+                    .collect();
+                format!(
+                    "{{\"_time\":\"2026-01-01T00:00:{row:02}Z\",\
+                     \"_ingested\":\"2026-01-01T00:00:{row:02}Z\",\
+                     \"service\":\"svc\"{fields}}}"
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+
+        // Probe both sides of the boundary, including the columns straddling
+        // it, plus the very first and last column of the batch.
+        let probes = [0, 1, 2, 254, 255, 256, 257, 258, cols - 2, cols - 1];
+        for i in probes {
+            let (dtype, _, total) = column_stats(&parquet[0], &format!("f{i}"));
+            let expected = if varchar_col(i) { "VARCHAR" } else { "BIGINT" };
+            assert_eq!(dtype, expected, "column f{i} pinned the wrong type");
+            assert_eq!(total, 21);
+        }
+    }
+
+    #[test]
+    fn all_null_unpinned_column_defers_then_later_batch_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Batch 1: `maybe` is all-null and unpinned → the column must be
+        // ABSENT from the file (union_by_name reads absent as NULL; typed
+        // NULLs would pre-empt the field's real type).
+        let r1 = record_with("maybe", "null", 0);
+        let f1 = write_wal_file(&wal_dir, "svc", &[r1.as_str()]);
+        compact_service_blocking(&[f1], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "DESCRIBE SELECT * FROM read_parquet('{}')",
+                    parquet[0].display()
+                ))
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert!(
+            !cols.contains(&"maybe".to_owned()),
+            "an all-null unpinned column defers (absent from the file): {cols:?}"
+        );
+
+        // Batch 2: real values arrive → the field pins and both batches
+        // read cleanly through one union.
+        let r2 = record_with("maybe", "7", 1);
+        let f2 = write_wal_file(&wal_dir, "svc", &[r2.as_str()]);
+        compact_service_blocking(&[f2], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        let (dtype, nn, total) = column_stats(&parquet[0], "maybe");
+        assert_eq!(dtype, "BIGINT");
+        assert_eq!(
+            (nn, total),
+            (1, 2),
+            "deferred rows read as NULL after the pin"
+        );
+    }
+
+    #[test]
+    fn nested_object_keeps_batchmates_columns_and_stays_reachable() {
+        // Legacy WAL shape (pre-stringification): a nested object infers
+        // STRUCT at depth 2 and must conform to VARCHAR JSON text without
+        // dropping any batch-mate's custom column.
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let r1 = record_with("k8s", "{\"pod\":\"x\"}", 0);
+        let r2 = record_with("status", "418", 1);
+        let f = write_wal_file(&wal_dir, "svc", &[r1.as_str(), r2.as_str()]);
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (k8s_ty, k8s_nn, _) = column_stats(&parquet[0], "k8s");
+        assert_eq!(k8s_ty, "VARCHAR", "nested object conforms to VARCHAR");
+        assert_eq!(k8s_nn, 1);
+        let (status_ty, status_nn, total) = column_stats(&parquet[0], "status");
+        assert_eq!(status_ty, "BIGINT", "batch-mate custom column survives");
+        assert_eq!((status_nn, total), (1, 2));
+
+        // The nested value stays reachable as JSON text.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let pod: String = conn
+            .query_row(
+                &format!(
+                    "SELECT json_extract_string(k8s, '$.pod') \
+                     FROM read_parquet('{}') WHERE k8s IS NOT NULL",
+                    parquet[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pod, "x", "json_extract_string must reach the nested value");
+    }
+
+    #[test]
+    fn duplicate_name_collision_drains_at_depth_1_keeping_all_columns() {
+        // Case-colliding keys INSIDE a nested object are the one shape that
+        // still raises "Duplicate name" at depth 2 (verified by execution).
+        // The depth-1 retry reads every top-level field as JSON and the
+        // conform step types them — no ten-column fallback, no column drop.
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let r1 = record_with("k8s", "{\"Pod\":\"x\",\"pod\":\"y\"}", 0);
+        let r2 = record_with("status", "418", 1);
+        let f = write_wal_file(&wal_dir, "svc", &[r1.as_str(), r2.as_str()]);
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1, "the batch must drain");
+        let (status_ty, status_nn, total) = column_stats(&parquet[0], "status");
+        assert_eq!(
+            (status_ty.as_str(), status_nn, total),
+            ("BIGINT", 1, 2),
+            "batch-mates' custom columns survive the depth-1 rung"
+        );
+        let (k8s_ty, k8s_nn, _) = column_stats(&parquet[0], "k8s");
+        assert_eq!(k8s_ty, "VARCHAR");
+        assert_eq!(k8s_nn, 1);
+        let (msg_ty, msg_nn, _) = column_stats(&parquet[0], "message");
+        assert_eq!(msg_ty, "VARCHAR", "envelope pin holds at depth 1");
+        assert_eq!(msg_nn, 2);
     }
 
     #[test]
@@ -2459,11 +3774,14 @@ mod tests {
     }
 
     #[test]
-    fn rollup_merges_despite_type_conflict_across_hours() {
-        // The prod failure: hour 01 wrote `offset` as a JSON/STRUCT object,
-        // hour 02 wrote it as a plain string ("540.203µs"). The bare
-        // read_parquet(union_by_name=true) raises a bind-time type/remap
-        // error; the rollup must fall back to VARCHAR casts and still merge.
+    fn rollup_of_nonconformant_hourlies_errors_loudly_and_retains_inputs() {
+        // Hour 01 carries `offset` as a STRUCT, hour 02 as a plain string —
+        // a mix write-time conformance can no longer produce, so it can only
+        // mean foreign parquet dropped into the tree. The VARCHAR-cast
+        // fallback that used to rewrite both sides silently is deleted
+        // (ADR-0009 slice 2): the rollup must fail loudly and RETAIN the
+        // hourly inputs for the operator (retried next tick), never
+        // half-produce a daily file.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -2474,40 +3792,64 @@ mod tests {
         let f2 = write_hourly_parquet(&data_dir, date, "02", "ctrl", &[r2]);
 
         let day_dir = data_dir.join(date);
-        rollup_day_blocking(&day_dir, "ctrl", &[f1.clone(), f2.clone()], "2GB")
-            .result
-            .unwrap();
+        let outcome = rollup_day_blocking(&day_dir, "ctrl", &[f1.clone(), f2.clone()], "2GB");
+        assert!(
+            outcome.result.is_err(),
+            "a nonconformant hourly set must fail the rollup loudly"
+        );
+        assert!(
+            f1.exists() && f2.exists(),
+            "the hourly inputs must be retained for repair/retry"
+        );
+        assert!(
+            !day_dir.join("ctrl.parquet").exists(),
+            "no daily file may be produced from a nonconformant set"
+        );
+    }
 
-        let daily = day_dir.join("ctrl.parquet");
-        assert!(daily.exists(), "daily parquet should exist after fallback");
-        assert!(!f1.exists(), "hourly file 1 should be deleted");
-        assert!(!f2.exists(), "hourly file 2 should be deleted");
+    #[test]
+    fn merge_into_foreign_nonconformant_parquet_errors_and_retains_wal() {
+        // The canonical hourly file already holds `container_id` as a STRUCT
+        // (foreign parquet — the conform pipeline always writes VARCHAR for
+        // it). Merging a conformant WAL batch into it hits a union type
+        // conflict; the deleted cast-and-retry must NOT be rebuilt: the
+        // batch errors (logged as catalog_invariant_violation), the WAL file
+        // survives for the next tick, and the existing file is untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        let count: i64 = conn
-            .query_row(
-                &format!(
-                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
-                    daily.display()
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2, "both rows present despite offset type conflict");
+        // Foreign file at the canonical path the batch will target — the
+        // output dir is derived from the compaction instant, so place it at
+        // today's date/hour with a genuinely STRUCT-typed column.
+        let now = chrono::Utc::now();
+        let existing = write_hourly_parquet(
+            &data_dir,
+            &now.format("%Y-%m-%d").to_string(),
+            &now.format("%H").to_string(),
+            "kubelet",
+            &[
+                r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"kubelet","message":"start","container_id":{"id":"abc123","runtime":"containerd"}}"#,
+            ],
+        );
+        let before = std::fs::metadata(&existing).unwrap().len();
 
-        // The conflicting column must be unified to VARCHAR.
-        let col_type: String = conn
-            .query_row(
-                &format!(
-                    "SELECT typeof(\"offset\") FROM read_parquet('{}') LIMIT 1",
-                    daily.display()
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(col_type, "VARCHAR", "offset should be cast to VARCHAR");
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"kubelet","message":"running","container_id":"def456"}"#;
+        let f2 = write_wal_file(&wal_dir, "kubelet", &[r2]);
+
+        let err = compact_service_blocking(std::slice::from_ref(&f2), &data_dir, "kubelet", "2GB")
+            .expect_err("merging into a foreign nonconformant file must error");
+        assert!(
+            err.contains("merge"),
+            "the error must surface from the merge step: {err}"
+        );
+        assert!(f2.exists(), "the WAL file must survive for the next tick");
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().len(),
+            before,
+            "the existing parquet must be untouched"
+        );
     }
 
     #[test]
@@ -2566,6 +3908,7 @@ mod tests {
             None,
             DEFAULT_CHUNK_SIZE,
             "2GB",
+            None,
         )
         .await
         .unwrap();
@@ -2923,13 +4266,19 @@ mod tests {
         std::fs::write(&nul_file, [0u8; 128]).unwrap();
 
         let mut quarantined: u64 = 0;
-        let result = compact_service_inner(
+        let result = prepare_service_batch(
             &[good_file, nul_file.clone()],
             &data_file,
             "svc",
             "2GB",
             &mut quarantined,
-        );
+            &HashMap::new(),
+        )
+        .and_then(|prep| {
+            let prep = prep.expect("the good file survives");
+            let pins = local_pins(&prep.proposals);
+            conform_and_write(prep, &pins, &data_file, "svc").map(|_| ())
+        });
 
         assert!(result.is_err(), "a step after the quarantine must error");
         assert_eq!(
@@ -3120,6 +4469,7 @@ mod tests {
                 None,
                 DEFAULT_CHUNK_SIZE,
                 "2GB",
+                None,
             ))
             .unwrap();
 
@@ -3587,9 +4937,18 @@ mod tests {
         )
         .unwrap();
 
-        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")
-            .await
-            .expect("compaction tick must succeed");
+        let errors = compact_once(
+            &wal_dir,
+            &data_dir,
+            Duration::ZERO,
+            false,
+            None,
+            500,
+            "2GB",
+            None,
+        )
+        .await
+        .expect("compaction tick must succeed");
         assert_eq!(errors, 0);
 
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -3660,9 +5019,18 @@ mod tests {
             return;
         }
 
-        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, true, None, 500, "2GB")
-            .await
-            .expect("one unreadable env must not fail the whole cycle");
+        let errors = compact_once(
+            &wal_dir,
+            &data_dir,
+            Duration::ZERO,
+            true,
+            None,
+            500,
+            "2GB",
+            None,
+        )
+        .await
+        .expect("one unreadable env must not fail the whole cycle");
         let _ = std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755));
 
         assert_eq!(
@@ -3707,8 +5075,17 @@ mod tests {
             return;
         }
 
-        let result =
-            compact_once(&wal_dir, &data_dir, Duration::ZERO, true, None, 500, "2GB").await;
+        let result = compact_once(
+            &wal_dir,
+            &data_dir,
+            Duration::ZERO,
+            true,
+            None,
+            500,
+            "2GB",
+            None,
+        )
+        .await;
         // Teardown first: a leaked 0o000 dir would break tempdir cleanup.
         std::fs::set_permissions(&wal_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -3728,9 +5105,18 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, true, None, 500, "2GB")
-            .await
-            .expect("a missing WAL root is a cold start, not a failure");
+        let errors = compact_once(
+            &wal_dir,
+            &data_dir,
+            Duration::ZERO,
+            true,
+            None,
+            500,
+            "2GB",
+            None,
+        )
+        .await
+        .expect("a missing WAL root is a cold start, not a failure");
         assert_eq!(errors, 0, "a cold start reports no errors");
     }
 
@@ -3753,9 +5139,18 @@ mod tests {
         let wal = wal_dir.join("prod").join("nginx_1730000000000_abcd.ndjson");
         std::fs::write(&wal, [good1, bad, good2].join("\n")).unwrap();
 
-        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")
-            .await
-            .expect("compaction tick must succeed");
+        let errors = compact_once(
+            &wal_dir,
+            &data_dir,
+            Duration::ZERO,
+            false,
+            None,
+            500,
+            "2GB",
+            None,
+        )
+        .await
+        .expect("compaction tick must succeed");
         assert_eq!(errors, 0, "a bad timestamp must not count as an error");
 
         assert!(!wal.exists(), "consumed WAL file must be deleted");
@@ -3832,9 +5227,18 @@ mod tests {
         let wal = wal_dir.join("prod").join("nginx_1730000000000_abcd.ndjson");
         std::fs::write(&wal, [poison, innocent].join("\n")).unwrap();
 
-        let errors = compact_once(&wal_dir, &data_dir, Duration::ZERO, false, None, 500, "2GB")
-            .await
-            .expect("compaction tick must succeed");
+        let errors = compact_once(
+            &wal_dir,
+            &data_dir,
+            Duration::ZERO,
+            false,
+            None,
+            500,
+            "2GB",
+            None,
+        )
+        .await
+        .expect("compaction tick must succeed");
         assert_eq!(errors, 0, "a reserved-key row must not count as an error");
 
         assert!(!wal.exists(), "consumed WAL file must be deleted");

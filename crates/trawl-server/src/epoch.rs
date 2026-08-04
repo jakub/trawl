@@ -342,7 +342,7 @@ fn adopt_in_place(data_root: &Path) -> Result<(), String> {
 /// fsync a directory so the rename entry inside it survives a crash. Never
 /// fatal: every branch of the gate is idempotent, so a lost entry simply
 /// re-runs the same decision on the next boot.
-fn fsync_dir_best_effort(dir: &Path) {
+pub(crate) fn fsync_dir_best_effort(dir: &Path) {
     if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
         tracing::warn!(
             event_type = "epoch_dir_fsync_failed",

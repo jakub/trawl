@@ -167,6 +167,32 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // ADR-0009 boot conformance pass: make the write-time invariant true
+    // over the standing corpus before anything reads or writes it. Only on
+    // ingest-enabled nodes (a query-only node does not own the data root).
+    // Fatal on failure, like the epoch gate — a data root not proven
+    // conformant must not serve queries. Per-path failures are NOT that:
+    // an unreadable or foreign parquet file, or a subdirectory the walk
+    // cannot enumerate, is skipped and counted inside the pass, so one bad
+    // path cannot keep the daemon down.
+    if config.ingest.enabled {
+        let summary = trawl_server::catalog::conform::ensure_conformance(
+            &state.storage.catalog,
+            &state.query.field_catalog,
+            &config.data.base_dir(),
+            &config.ingest.compaction_memory_limit,
+        )
+        .await?;
+        tracing::info!(
+            event_type = "catalog_conform",
+            ran = summary.ran,
+            scanned = summary.scanned,
+            rewritten = summary.rewritten,
+            skipped = summary.skipped,
+            "boot conformance pass finished"
+        );
+    }
+
     let compaction_handle = spawn_ingest_pipeline(&config, &state)?;
 
     // Spawn syslog listeners if enabled (requires ingest to be enabled).
@@ -370,6 +396,14 @@ fn spawn_ingest_pipeline(
         "ingest pipeline enabled"
     );
 
+    // Compaction is the only parquet writer: it pins every field's type in
+    // the catalog BEFORE writing, and conforms every batch to the pins
+    // (ADR-0009 slice 2).
+    let catalog = trawl_server::catalog::CatalogContext {
+        store: state.storage.catalog.clone(),
+        cache: state.query.field_catalog.clone(),
+    };
+
     let handle = trawl_server::ingest::compaction::spawn_compaction(
         wal_dir,
         data_dir,
@@ -379,6 +413,7 @@ fn spawn_ingest_pipeline(
         config.ingest.compaction_memory_limit.clone(),
         state.query.hot_buffer.clone(),
         state.ingest.compaction_stats.clone(),
+        Some(catalog),
         shutdown_rx,
     );
 

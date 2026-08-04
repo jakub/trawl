@@ -32,6 +32,13 @@ pub const SYSLOG_EVENTS_DROPPED_TOTAL: &str = "trawl_syslog_events_dropped_total
 pub const SYSLOG_TCP_CONNECTIONS: &str = "trawl_syslog_tcp_connections";
 pub const WAL_FILES: &str = "trawl_wal_files";
 pub const WAL_BYTES: &str = "trawl_wal_bytes";
+pub const CATALOG_CONFLICTS_TOTAL: &str = "trawl_catalog_conflicts_total";
+pub const CATALOG_ROWS_NULLED_TOTAL: &str = "trawl_catalog_rows_nulled_total";
+pub const CATALOG_CONFORM_REWRITES_TOTAL: &str = "trawl_catalog_conform_rewrites_total";
+pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_total";
+pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
+pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
+pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
 
 // -- description registration ------------------------------------------------
 
@@ -80,6 +87,45 @@ pub fn describe_metrics() {
     );
     describe_gauge!(WAL_FILES, "Number of pending WAL (ndjson) files");
     describe_gauge!(WAL_BYTES, "Total byte size of pending WAL files");
+    describe_counter!(
+        CATALOG_CONFLICTS_TOTAL,
+        "Field-catalog type conflicts recorded at compaction (a batch column \
+         TRY_CAST to its pinned type), labelled by service (same 256-service \
+         cap as trawl_ingest_repairs_total; never a field-name label)"
+    );
+    describe_counter!(
+        CATALOG_ROWS_NULLED_TOTAL,
+        "Rows whose value a catalog-conforming cast nulled (original \
+         recoverable from _raw), labelled by service"
+    );
+    describe_counter!(
+        CATALOG_CONFORM_REWRITES_TOTAL,
+        "Parquet files rewritten by the boot conformance pass to match the \
+         field catalog"
+    );
+    describe_counter!(
+        CATALOG_CONFORM_SKIPPED_TOTAL,
+        "Parquet files the boot conformance pass could not read (truncated, \
+         bit-rotted, or foreign) and skipped; they stay outside the catalog \
+         invariant and the pass re-runs on the next boot"
+    );
+    describe_counter!(
+        CATALOG_PINS_REJECTED_TOTAL,
+        "Fields denied a catalog pin, labelled by reason (name_too_long, \
+         cap); their columns are not stored and the values remain in _raw"
+    );
+    describe_gauge!(
+        CATALOG_PINNED_FIELDS,
+        "Field-catalog pins in use. A pin is permanent until the repin \
+         rewrite (#53), so this only ever climbs — alert on it against \
+         trawl_catalog_pin_capacity, well before the cap starts denying \
+         pins"
+    );
+    describe_gauge!(
+        CATALOG_PIN_CAPACITY,
+        "Field-catalog pin ceiling (store::catalog::MAX_PINNED_FIELDS); a \
+         field arriving at a full catalog is never stored as a column"
+    );
 }
 
 // -- bounded label values ----------------------------------------------------
@@ -235,35 +281,78 @@ fn collect_parquet_gauges(fallback_glob: &str) {
     cached.last_updated = Some(Instant::now());
 }
 
+/// One walked `.parquet` file and its size on disk.
+pub(crate) type ParquetEntry = (std::path::PathBuf, u64);
+
+/// One path the walk could not enumerate, and why.
+pub(crate) type WalkError = (std::path::PathBuf, std::io::Error);
+
 /// Recursively walk a directory collecting `.parquet` file paths and sizes.
-pub(crate) fn walk_parquet_files(dir: &Path) -> std::io::Result<Vec<(std::path::PathBuf, u64)>> {
-    let mut results = Vec::new();
-    walk_dir_recursive(dir, &mut results)?;
-    Ok(results)
+///
+/// Strict: any IO error anywhere under `dir` fails the whole walk. A caller
+/// that must not be taken down by one unreadable corner of the tree wants
+/// [`walk_parquet_files_lossy`] instead.
+pub(crate) fn walk_parquet_files(dir: &Path) -> std::io::Result<Vec<ParquetEntry>> {
+    let (results, errors) = walk_parquet_files_lossy(dir);
+    match errors.into_iter().next() {
+        Some((_, e)) => Err(e),
+        None => Ok(results),
+    }
 }
 
-fn walk_dir_recursive(
-    dir: &Path,
-    results: &mut Vec<(std::path::PathBuf, u64)>,
-) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
+/// The same walk, isolating IO failures instead of aborting on the first:
+/// returns every file that WAS enumerable plus one `(path, error)` pair per
+/// directory or entry that was not.
+///
+/// A caller that treats an unreadable path as a per-path skip — the boot
+/// conformance pass, where one unreadable subdirectory must not keep the
+/// daemon down — needs the readable remainder, not an early return.
+pub(crate) fn walk_parquet_files_lossy(dir: &Path) -> (Vec<ParquetEntry>, Vec<WalkError>) {
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    walk_dir_recursive(dir, &mut results, &mut errors);
+    (results, errors)
+}
+
+fn walk_dir_recursive(dir: &Path, results: &mut Vec<ParquetEntry>, errors: &mut Vec<WalkError>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            errors.push((dir.to_path_buf(), e));
+            return;
+        }
+    };
+    for entry in entries {
+        // A failed entry has no path of its own to name, so it is attributed
+        // to the directory being read.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push((dir.to_path_buf(), e));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                errors.push((path, e));
+                continue;
+            }
+        };
         if ft.is_dir() {
             // Skip `scheduled/` — contains saved query result parquet, not ingested logs.
             if entry.file_name() == "scheduled" {
                 continue;
             }
-            walk_dir_recursive(&entry.path(), results)?;
-        } else if ft.is_file() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "parquet") {
-                let size = entry.metadata()?.len();
-                results.push((path, size));
+            walk_dir_recursive(&path, results, errors);
+        } else if ft.is_file() && path.extension().is_some_and(|ext| ext == "parquet") {
+            match entry.metadata() {
+                Ok(meta) => results.push((path, meta.len())),
+                Err(e) => errors.push((path, e)),
             }
         }
     }
-    Ok(())
 }
 
 // -- WAL gauge collection ----------------------------------------------------
