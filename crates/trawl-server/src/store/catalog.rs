@@ -808,6 +808,18 @@ impl CatalogStore {
     /// a cursor names an exact position and a concurrent observation update
     /// cannot make a page repeat or skip a row it already delivered.
     ///
+    /// The cursor predicate is deliberately written as
+    /// `last_seen <= cursor AND (last_seen < cursor OR service > $3)` rather
+    /// than the equivalent single `OR` chain, and `COALESCE`s the absent
+    /// cursor to `infinity` rather than guarding it with `IS NULL`. Both
+    /// shapes select the same rows, but only this one is *sargable*: the
+    /// leading conjunct is a bound postgres can push into
+    /// `field_services_field_last_seen_idx` (migration 0004) as an index
+    /// scan key, so the page STARTS at the cursor. Under the `OR` chain the
+    /// whole thing degrades to a filter and every page re-reads the field's
+    /// entire history — bounding the allocation and the response body, but
+    /// not the read, which makes walking the pages quadratic.
+    ///
     /// Returns `(rows, next)`; `next` is `Some` when more rows follow.
     pub async fn field_services(
         &self,
@@ -820,9 +832,9 @@ impl CatalogStore {
             "SELECT service, first_seen, last_seen, row_count
              FROM field_services
              WHERE field = $1
-               AND ($2::timestamptz IS NULL
-                    OR last_seen < $2
-                    OR (last_seen = $2 AND service > $3))
+               AND last_seen <= COALESCE($2::timestamptz, 'infinity')
+               AND (last_seen < COALESCE($2::timestamptz, 'infinity')
+                    OR service > $3)
              ORDER BY last_seen DESC, service
              LIMIT $4",
         )
