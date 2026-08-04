@@ -11,11 +11,14 @@
 //! (#53), so the cache never needs invalidation — boot hydrates it and
 //! every `pin_missing` refresh only ever adds entries.
 //!
-//! Every name in the catalog is ASCII-lowercase by construction: the
-//! ingest canonicalizer folds field names before anything reads them, the
-//! boot pass folds when seeding from standing parquet, and compaction
-//! folds when proposing from a stale WAL. One `DuckDB` identifier therefore
-//! has exactly one catalog spelling, and lookups are plain exact-name.
+//! Every name in the catalog is ASCII-lowercase by construction: each
+//! producer folds field names at its own door — HTTP ingest in
+//! `envelope::canonicalize`, the syslog listener at SD-key construction
+//! (`crate::syslog::convert`), telemetry in its `JsonVisitor` — and the
+//! catalog folds again at its own entry points (the boot pass when seeding
+//! from standing parquet, compaction when proposing from a stale WAL). One
+//! `DuckDB` identifier therefore has exactly one catalog spelling, and
+//! lookups are plain exact-name.
 
 pub mod conform;
 
@@ -80,13 +83,14 @@ impl FieldCatalog {
     /// Zero postgres I/O: this is the whole point of the cache.
     ///
     /// A plain exact-name lookup: catalog names AND hot-snapshot keys are
-    /// both ASCII-folded at their sources (ingest canonicalization; boot
-    /// seeding), so two spellings of one `DuckDB` identifier cannot meet
-    /// here. The former case-variant defence — degrading any colliding
-    /// spelling to `VARCHAR` — is deliberately gone: with folded names it
-    /// could never fire on real pins again, and while it existed it broke
-    /// every numeric comparison on a field the (unfolded) catalog held two
-    /// spellings of, permanently.
+    /// both ASCII-folded at their sources (every producer folds at its own
+    /// door — see the module doc; boot seeding and compaction proposals
+    /// fold on the catalog side), so two spellings of one `DuckDB`
+    /// identifier cannot meet here. The former case-variant defence —
+    /// degrading any colliding spelling to `VARCHAR` — is deliberately
+    /// gone: with folded names it could never fire on real pins again, and
+    /// while it existed it broke every numeric comparison on a field the
+    /// (unfolded) catalog held two spellings of, permanently.
     #[must_use]
     pub fn intersect<'a>(&self, keys: impl IntoIterator<Item = &'a str>) -> FieldTypes {
         let pins = self.pins.read();

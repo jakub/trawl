@@ -248,40 +248,51 @@ impl JsonVisitor {
             fields: BTreeMap::new(),
         }
     }
+
+    /// Store one field under its ASCII-folded name — the fold-at-the-door
+    /// rule (ADR-0009). Telemetry writes straight into the WAL and hot
+    /// buffer without routing through `envelope::canonicalize`, and a
+    /// tracing field name is any Rust-side identifier
+    /// (`tracing::info!(myField = 1)` is legal), so an unfolded name here
+    /// would become a column spelling the (folded) catalog pin never
+    /// matches. Trawl's own call sites are `snake_case`; this makes that a
+    /// guarantee instead of a convention.
+    fn insert_folded(&mut self, field: &Field, value: serde_json::Value) {
+        self.fields.insert(field.name().to_ascii_lowercase(), value);
+    }
 }
 
 impl Visit for JsonVisitor {
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.fields.insert(field.name().to_owned(), json!(value));
+        self.insert_folded(field, json!(value));
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(field.name().to_owned(), json!(value));
+        self.insert_folded(field, json!(value));
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(field.name().to_owned(), json!(value));
+        self.insert_folded(field, json!(value));
     }
 
     fn record_i128(&mut self, field: &Field, value: i128) {
-        self.fields.insert(field.name().to_owned(), json!(value));
+        self.insert_folded(field, json!(value));
     }
 
     fn record_u128(&mut self, field: &Field, value: u128) {
-        self.fields.insert(field.name().to_owned(), json!(value));
+        self.insert_folded(field, json!(value));
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_owned(), json!(value));
+        self.insert_folded(field, json!(value));
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.fields.insert(field.name().to_owned(), json!(value));
+        self.insert_folded(field, json!(value));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.fields
-            .insert(field.name().to_owned(), json!(format!("{value:?}")));
+        self.insert_folded(field, json!(format!("{value:?}")));
     }
 }
 
@@ -656,6 +667,53 @@ mod tests {
         assert_eq!(parsed["severity"], 9, "tracing info maps to OTel 9");
         assert_eq!(parsed["severity_text"], "info");
         assert!(parsed["target"].is_string());
+    }
+
+    /// Tracing field names are Rust-side identifiers and CAN be mixed case
+    /// (`tracing::info!(myField = 1)` is legal); this path writes straight
+    /// into the WAL/hot buffer without `envelope::canonicalize`, so the
+    /// visitor folds at collection — an unfolded name would become a
+    /// column spelling the folded catalog pin never matches.
+    #[test]
+    fn mixed_case_tracing_field_names_are_ascii_folded() {
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+
+        let layer = WalLayer::new(handle, "prod");
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        #[allow(non_snake_case)]
+        {
+            tracing::info!(event_type = "fold_test", myField = 42u64, "folded");
+        }
+
+        layer_ref.flush();
+
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+
+        assert_eq!(
+            parsed["myfield"], 42,
+            "the field lands under the folded name"
+        );
+        assert!(
+            parsed.get("myField").is_none(),
+            "the unfolded spelling must not exist: {parsed}"
+        );
     }
 
     #[test]

@@ -916,11 +916,14 @@ fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
 
 // NOTE: the former `hot_case_variant_pins_do_not_wedge_the_union` test is
 // deliberately gone with the emitter's runtime case-folding it exercised:
-// field names are ASCII-folded at ingest, at boot seeding, and in
-// compaction's proposals, so a `FieldTypes` carrying two spellings of one
+// field names are ASCII-folded at every producer's own door (HTTP ingest
+// canonicalization, the syslog listener's SD-key construction, telemetry's
+// JsonVisitor) and again at the catalog's entry points (boot seeding,
+// compaction proposals), so a `FieldTypes` carrying two spellings of one
 // DuckDB identifier cannot be produced by the wired system — the
-// end-to-end proof lives in trawl-server's
-// `case_variant_field_names_fold_to_one_column_across_services`.
+// end-to-end proofs live in trawl-server's
+// `case_variant_field_names_fold_to_one_column_across_services` and
+// `syslog_mixed_case_sd_param_lands_folded_and_pins_folded`.
 
 #[test]
 fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
