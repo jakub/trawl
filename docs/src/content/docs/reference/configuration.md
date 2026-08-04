@@ -58,7 +58,8 @@ HTTPS listener, query limits, TLS, and rate limiting.
 | `tls_key_path` | path | *(auto-generated)* | PEM private key path |
 | `tls_reload_interval_secs` | integer | `300` | Poll cert/key files for changes; `0` disables |
 | `cors_allowed_origins` | string array | `[]` | Allowed CORS origins; empty disables CORS |
-| `query_log` | path | *(none)* | ndjson debug log (one entry per query execution) |
+| `query_log` | path | *(none)* | ndjson debug log (one entry per query execution) — see [the query debug log](#the-query-debug-log) |
+| `query_log_max_bytes` | byte size | `"100M"` | Query debug log size cap with single-file rollover to `<path>.1`; `0` disables rollover |
 | `log_file` | path | *(none)* | JSON log file; superseded by `internal_telemetry` |
 
 #### `[server.rate_limit]`
@@ -92,6 +93,34 @@ Re-tiering is in place and non-destructive: `fleet-admin roles set-rate shipper 
 When `tls_cert_path` and `tls_key_path` are omitted, trawld generates a self-signed ECDSA P-256 certificate at startup with SANs for `localhost`, `127.0.0.1`, and `::1`. The cert and key are written to `{state_dir}/tls/` (where `state_dir` is the parent of `data.path`). Clients connecting to a self-signed server need `insecure = true` in their config or the `--insecure` flag.
 
 The `tls_reload_interval_secs` setting polls the cert/key files for content changes and hot-reloads them without restarting the server.
+
+#### Logging filter (`RUST_LOG`)
+
+trawld's stdout log and its internal telemetry ([`internal_telemetry`](#ingest)) share one tracing filter, resolved explicitly at startup:
+
+- **`RUST_LOG` unset** → the shipped default filter:
+
+  ```text
+  trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info
+  ```
+
+  This exact string is a cross-packaging contract — the code fallback, the Helm chart's `logLevel`, and the Debian environment example all carry it. It enumerates every target trawl emits under: `trawl_server` (the library — handlers, ingest, compaction), `trawld` (the binary — startup banner, config warnings, task panics), `fleet_auth` (auth middleware), and the deliberately-overridden `auth.backend` / `storage.backend` targets that make backend failures independently alarmable. When customizing, keep all five — dropping the backend targets makes backend errors invisible. A global `info` is deliberately not the default: it would enable noisy dependency targets.
+- **`RUST_LOG` set and valid** → your value is authoritative, verbatim.
+- **`RUST_LOG` set but unparseable** → the default filter is installed and exactly one `config_warning` event reports the parse error (never the raw environment value).
+
+A configuration-file failure happens *before* any tracing subscriber exists: it is reported on stderr with the resolved config path, not through telemetry.
+
+#### The query debug log
+
+`server.query_log` (or `TRAWL_QUERY_LOG` / `--query-log`) enables an ndjson debug log with one entry per query execution — built for `tail -f | jq` debugging.
+
+**Sensitivity.** Each entry combines the authenticated identity, the raw DSL, the generated SQL *with parameter values*, source file paths, hot-buffer state, and a sample of result rows — more sensitive than the event corpus it debugs. trawld therefore:
+
+- creates the file **owner-only** (`0600` on Unix) and tightens a pre-existing looser file at open;
+- emits a startup `warn` naming the path and its contents whenever the log is enabled;
+- bounds it with `server.query_log_max_bytes` (default 100 MiB): past the cap the file rolls over to a single retained `<path>.1` (also `0600`); `0` disables rollover.
+
+Retention is exactly those two files — there is no multi-generation rotation or age-based cleanup; delete them when done debugging. Result samples never enter default `service=trawld` telemetry, which since issue #56 carries query metadata (`query_id`, `query_len`, actor, outcome, timing) but not raw query text — the full text lives in authenticated query history, this debug log, and a DEBUG-only `query_text` tracing event.
 
 ### `[data]`
 
@@ -137,6 +166,7 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `hot_buffer_max_bytes` | byte size | `"100M"` | Max hot buffer size (serialized) |
 | `stats_interval_secs` | integer | `60` | Server stats telemetry interval; `0` disables |
 | `telemetry_flush_interval_secs` | integer | `1` | Telemetry WAL flush interval |
+| `telemetry_buffer_max_bytes` | byte size | `"16M"` | Memory cap for the telemetry retry queue while the WAL is unhealthy (estimated charge, like `hot_buffer_max_bytes`); overflow drops the oldest batches, counted in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}` |
 | `default_env` | string | `"prod"` | Fills a missing `env` on ingested events (repair code `env.defaulted`). Must pass the env charset and be a member of `envs` |
 | `envs` | string list | `[default_env]` | Environment allowlist (ADR-0009). Events with an unlisted `env` hard-reject. Entries must match `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved. Validated at load — trawld refuses to start otherwise. The allowlist gates writes, not reads: removing an env stops new ingest but its directories stay queryable and age out normally |
 | `trusted_relays` | CIDR list | `[]` | Peers (collectors/relays) whose address must never be stamped as an event's `host`: a host-less event from one of these is rejected instead of peer-repaired. Invalid entries are boot-fatal |

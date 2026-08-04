@@ -180,3 +180,20 @@ A hot-only fallback is permitted only when it cannot hide cold data: on a genuin
 A completely separate code path from SQL queries. `CompiledFilter` compiles the search stage of the DSL into an in-memory matcher using aho-corasick for text search and regex for glob patterns. Events are filtered against the broadcast channel, not DuckDB.
 
 Bounded by an SSE semaphore (default: 32 concurrent streams). Back-pressure is communicated to clients via `StreamEvent::Lagged` events.
+
+## Internal telemetry
+
+When `[ingest] internal_telemetry` is enabled (the default), a custom tracing layer inside `trawld` turns the daemon's own structured events into ordinary `service=trawld` records: serialized to ndjson, written durably through the ingest WAL, inserted into the hot buffer, published to the event bus, and eventually compacted to parquet like any other service.
+
+**Durability before visibility.** Each flush cycle (default 1s) stages the buffered events as one batch and writes it to the WAL on Tokio's blocking pool — the fsync barriers never run on an async executor worker. Only after the WAL write succeeds is the batch inserted into the hot buffer and published to SSE, exactly once; queries can never observe telemetry that would disappear after a restart.
+
+**Bounded retry, accounted loss.** A failed WAL write retains its batch on a FIFO retry queue (reported via rate-limited stderr and `trawl_telemetry_wal_write_failures_total`) — a transient storage error loses nothing. Retained memory is capped by `[ingest] telemetry_buffer_max_bytes` (default 16 MiB, an estimated charge like the hot buffer's); on overflow the oldest batches are dropped with exact event/byte accounting in `trawl_telemetry_{events,bytes}_dropped_total{reason="buffer_cap"}` (`reason="preinit_cap"` covers the bootstrap buffer before the WAL writer exists). `trawl_telemetry_buffer_{events,bytes}` gauge the queue depth — nonzero across scrapes warns *before* loss begins, and all of these series are Prometheus-scrapeable precisely while self-ingestion is unavailable. After recovery, a searchable `telemetry_dropped` event records what was lost. Graceful shutdown attempts a final flush under a wall-clock budget so an unhealthy volume cannot hang the daemon.
+
+**What internal telemetry covers — and what it does not.** `service=trawld` is the *daemon's* self-observation, not a deployment-wide or transactional audit trail:
+
+- **trawld only.** `trawl-web` and the CLIs (`trawl`, `trawl-admin`, `fleet-admin`) log to stdout/stderr; capturing those is the deployment's job (journald, container logs).
+- **Fleet mutations are observed by polling.** The key-audit task snapshots keystore state at startup and emits diffs every `audit_interval_secs` (default 30s): events are *eventual*, multiple changes inside one interval coalesce, and a create-then-delete entirely between polls is missed. It is a monitoring aid, not a transactional mutation ledger — a real Fleet audit table/outbox would be a separate security feature.
+- **Query lifecycle events carry metadata, not query text.** `query_start`/`query_complete`/`query_timeout`/`query_failed` share a `query_id` and carry actor, roles, outcome, timing, pagination, row counts, and `query_len` — never the raw DSL. Full text lives in authenticated query history, the opt-in [query debug log](/reference/configuration/#the-query-debug-log), and a separate DEBUG-only `query_text` event that the default filter never stores.
+- **No OTLP export.** There is no OpenTelemetry trace/log export; HTTP request correlation comes from trawld's own spans, and metrics are Prometheus-only.
+
+Events pass the same [`RUST_LOG` filter](/reference/configuration/#logging-filter-rust_log) as stdout; pre-tracing failures (config file errors) surface only on stderr.
