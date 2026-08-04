@@ -914,40 +914,13 @@ fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
     assert_pin_conflict_rows(&result.columns, &result.rows);
 }
 
-#[test]
-fn hot_case_variant_pins_do_not_wedge_the_union() {
-    // Field names are never case-normalised at ingest and the catalog key is
-    // case-sensitive, so `Status` (one service) and `status` (another)
-    // coexist as pins while naming ONE case-insensitive DuckDB column. Two
-    // REPLACE entries for it is `Parser Error: Duplicate entry`, and with
-    // cold parquet present that is returned as a hard error — every query
-    // and SSE poll failing while such events sit in the hot buffer.
-    let dir = tempfile::tempdir().unwrap();
-    let hot = dir.path().join("hot.ndjson");
-    write_pin_conflict_corpus(dir.path(), &hot);
-    // Keep the corpus's cold parquet; rewrite the hot side to carry the
-    // case-collision instead of the type-conflict this helper writes.
-    std::fs::write(
-        &hot,
-        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\
-          \"service\":\"svc\",\"status\":\"ok\"}\n",
-    )
-    .unwrap();
-
-    let mut pins = FieldTypes::new();
-    pins.insert("status", trawl_core::schema::CanonicalType::Varchar);
-    pins.insert("Status", trawl_core::schema::CanonicalType::BigInt);
-    // A case-variant of an envelope TIMESTAMP column is a pin like any other.
-    pins.insert("_Time", trawl_core::schema::CanonicalType::Varchar);
-
-    let exec = Executor::new().expect("executor should initialize");
-    let source = format!("{}/*.parquet", dir.path().display());
-    let result = exec
-        .run_query_with_hot("*", &source, hot.to_str().unwrap(), &pins, usize::MAX, 0)
-        .expect("case-variant pins must not wedge the hot+cold union");
-
-    assert_eq!(result.rows.len(), 2, "both cold and hot rows must survive");
-}
+// NOTE: the former `hot_case_variant_pins_do_not_wedge_the_union` test is
+// deliberately gone with the emitter's runtime case-folding it exercised:
+// field names are ASCII-folded at ingest, at boot seeding, and in
+// compaction's proposals, so a `FieldTypes` carrying two spellings of one
+// DuckDB identifier cannot be produced by the wired system — the
+// end-to-end proof lives in trawl-server's
+// `case_variant_field_names_fold_to_one_column_across_services`.
 
 #[test]
 fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {

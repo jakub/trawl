@@ -286,12 +286,13 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     );
 }
 
-/// `DuckDB` identifiers are case-INSENSITIVE, but only over ASCII. Catalog
-/// pins are case-SENSITIVE names taken from client JSON keys, so two pins
-/// can name one hot column — and a `REPLACE` list carrying both is a hard
-/// parse error, not a degraded read. This pins both halves of the fold in
-/// `trawl-core`'s `fold_case_variants`: what must collapse, and what must
-/// NOT (folding `CAFÉ` onto `café` would silently drop a real pin).
+/// `DuckDB` identifiers are case-INSENSITIVE, but only over ASCII — a
+/// `REPLACE` list naming two ASCII case-variants is a hard parse error,
+/// not a degraded read. This pins both halves of the equivalence the
+/// ingest canonicalizer's field-name fold is built on
+/// (`envelope::fold_field_names`, ADR-0009): what `DuckDB` collapses
+/// (ASCII case) and what it must NOT (folding `CAFÉ` onto `café` would
+/// merge two real columns — the fold maps `CAFÉ` to `cafÉ` instead).
 #[test]
 fn replace_list_identifier_folding_is_ascii_only() {
     let dir = tempfile::tempdir().unwrap();

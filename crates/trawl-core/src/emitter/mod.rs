@@ -1384,76 +1384,14 @@ mod tests {
     }
 
     #[test]
-    fn hot_source_case_variant_pins_collapse_to_one_replace_entry() {
-        // Field names are never case-normalised at ingest and the catalog
-        // key is case-sensitive, so `Status` (service A) and `status`
-        // (service B) coexist as pins — but they name ONE case-insensitive
-        // DuckDB column. Naming both is `Parser Error: Duplicate entry`,
-        // which would fail every query and SSE poll while such events sit
-        // in the buffer.
-        let query = parser::parse("*").unwrap();
-        let mut pins = crate::schema::FieldTypes::new();
-        pins.insert("Status", crate::schema::CanonicalType::BigInt);
-        pins.insert("status", crate::schema::CanonicalType::Varchar);
-        pins.insert("HOST", crate::schema::CanonicalType::Varchar);
-        pins.insert("host", crate::schema::CanonicalType::Varchar);
-        let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
-            .unwrap()
-            .sql;
-        // One entry per DuckDB identifier, whatever the pin spelling.
-        assert_eq!(
-            sql.to_ascii_uppercase().matches(r#"AS "STATUS""#).count(),
-            1,
-            "case-variant pins must fold onto one REPLACE entry: {sql}"
-        );
-        assert_eq!(
-            sql.to_ascii_uppercase().matches(r#"AS "HOST""#).count(),
-            1,
-            "case-variant pins must fold onto one REPLACE entry: {sql}"
-        );
-        // Disagreeing variants degrade to the lossless VARCHAR conform;
-        // picking BIGINT would TRY_CAST the string variant's values to NULL.
-        assert!(
-            !sql.contains("BIGINT"),
-            "a case collision on disagreeing pins must not keep a typed \
-             cast that nulls the other variant: {sql}"
-        );
-        // Agreeing variants keep their (shared) type.
-        assert!(
-            sql.contains(r#"json_extract_string(to_json("HOST"), '$') AS "HOST""#),
-            "agreeing case-variants keep their pin: {sql}"
-        );
-    }
-
-    #[test]
-    fn hot_source_case_variant_timestamp_pin_adds_no_entry() {
-        // A client-sent `_Time` becomes a catalog pin in its own right; it
-        // still names the envelope's `_time` column, which already carries
-        // the unconditional TRY_CAST.
-        let query = parser::parse("*").unwrap();
-        let mut pins = crate::schema::FieldTypes::new();
-        pins.insert("_Time", crate::schema::CanonicalType::Varchar);
-        pins.insert("_INGESTED", crate::schema::CanonicalType::Varchar);
-        let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
-            .unwrap()
-            .sql;
-        let upper = sql.to_ascii_uppercase();
-        assert_eq!(upper.matches(r#"AS "_TIME""#).count(), 1, "{sql}");
-        assert_eq!(upper.matches(r#"AS "_INGESTED""#).count(), 1, "{sql}");
-        assert!(
-            sql.contains(r#"TRY_CAST("_time" AS TIMESTAMP) AS "_time""#),
-            "the timestamp cast must survive the fold: {sql}"
-        );
-    }
-
-    #[test]
-    fn hot_source_non_ascii_case_variant_pins_stay_distinct() {
-        // DuckDB folds identifiers over ASCII only, so `café` and `CAFÉ`
-        // are two columns — folding them would silently drop a real pin.
+    fn hot_source_non_ascii_distinct_pins_each_get_an_entry() {
+        // DuckDB folds identifiers over ASCII only, so `café` and `cafÉ`
+        // (the ingest-folded form of `CAFÉ`) are two distinct columns and
+        // two distinct pins — each must keep its own REPLACE entry.
         let query = parser::parse("*").unwrap();
         let mut pins = crate::schema::FieldTypes::new();
         pins.insert("café", crate::schema::CanonicalType::Varchar);
-        pins.insert("CAFÉ", crate::schema::CanonicalType::BigInt);
+        pins.insert("cafÉ", crate::schema::CanonicalType::BigInt);
         let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
             .unwrap()
             .sql;
@@ -1462,7 +1400,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.contains(r#"TRY_CAST("CAFÉ" AS BIGINT) AS "CAFÉ""#),
+            sql.contains(r#"TRY_CAST("cafÉ" AS BIGINT) AS "cafÉ""#),
             "{sql}"
         );
     }

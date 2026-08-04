@@ -463,6 +463,109 @@ async fn hot_conflicting_event_is_nulled_and_cold_history_survives(pool: sqlx::P
     );
 }
 
+/// End-to-end regression for the case-variant blockers: two services
+/// shipping `Dur` and `dur` used to pin independently (case-sensitive
+/// catalog keys), each file conformed to its own pin, and
+/// `read_parquet(union_by_name)` folded them into one column — a hard
+/// `Conversion` error on every spanning query; the in-loop mitigation then
+/// degraded the pin to VARCHAR, permanently breaking numeric comparisons.
+/// With ingest-time folding there is ONE spelling, one pin, one column,
+/// and numeric predicates keep working across services.
+#[sqlx::test(migrations = false)]
+async fn case_variant_field_names_fold_to_one_column_across_services(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // svc-a ships `Dur` (uppercase), numeric. Compacted first: pins `dur`.
+    let a_events: Vec<serde_json::Value> = (0..3)
+        .map(|i| {
+            json!({
+                "service": "svc-a", "env": "prod", "host": "web01",
+                "timestamp": now_ts(),
+                "message": format!("a{i}"), "Dur": 4200 + i,
+            })
+        })
+        .collect();
+    assert_eq!(
+        h.ingest.ingest(&a_events).await.expect("ingest A").accepted,
+        3
+    );
+    compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
+
+    // svc-b ships `dur` (lowercase), numeric too.
+    let b_events: Vec<serde_json::Value> = (0..2)
+        .map(|i| {
+            json!({
+                "service": "svc-b", "env": "prod", "host": "web02",
+                "timestamp": now_ts(),
+                "message": format!("b{i}"), "dur": 100 + i,
+            })
+        })
+        .collect();
+    assert_eq!(
+        h.ingest.ingest(&b_events).await.expect("ingest B").accepted,
+        2
+    );
+    compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
+
+    // ONE pin, under the folded spelling.
+    assert_eq!(
+        h.server.state.query.field_catalog.get("dur"),
+        Some(trawl_core::schema::CanonicalType::BigInt),
+        "both spellings must resolve to one folded pin"
+    );
+    assert_eq!(
+        h.server.state.query.field_catalog.get("Dur"),
+        None,
+        "no mixed-case pin may exist"
+    );
+
+    // A spanning query returns ALL rows — no Conversion error, no
+    // hot-only degrade, and ONE column in the result.
+    let all = h
+        .query
+        .query_paginated("last=1h", None, None)
+        .await
+        .expect("the spanning query must not hit a union conflict");
+    assert_eq!(all.result.row_count(), 5, "both services fully visible");
+    assert!(
+        column_index(&all.result, "dur").is_some(),
+        "the folded column is the one column: {:?}",
+        all.result.columns
+    );
+    assert!(
+        column_index(&all.result, "Dur").is_none(),
+        "the unfolded spelling must not be a column: {:?}",
+        all.result.columns
+    );
+
+    // Numeric comparison works across services — the VARCHAR degrade that
+    // used to break this is gone.
+    let big = h
+        .query
+        .query_paginated("last=1h | where dur > 1000", None, None)
+        .await
+        .expect("numeric comparison on the folded column must bind");
+    assert_eq!(
+        big.result.row_count(),
+        3,
+        "svc-a's values compare numerically"
+    );
+
+    // The fold is visible in _repairs for the folded sender.
+    let a_rows = h
+        .query
+        .query_paginated("service=svc-a last=1h", None, None)
+        .await
+        .expect("query A");
+    let repairs = column_values(&a_rows.result, "_repairs");
+    assert!(
+        repairs
+            .iter()
+            .all(|v| matches!(v, Value::String(s) if s.contains("field.name_case_folded"))),
+        "folding is recorded per event: {repairs:?}"
+    );
+}
+
 /// Acceptance: `field_services` is ever-observed — compaction advances
 /// `last_seen`, and retention deleting a date directory leaves the rows in
 /// place (documented semantics, not a leak).

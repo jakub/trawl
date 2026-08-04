@@ -363,111 +363,14 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
     );
 }
 
-/// A hot field that is a brand-new ASCII case variant of an already-pinned
-/// cold field must not throw the union. `DuckDB` folds `Duration` and
-/// `duration` into ONE union column, so an unpinned hot spelling reaches the
-/// union at whatever `read_json` inferred (JSON, for a mixed-type window) and
-/// meets the cold pin head-on — failing EVERY query, including ones that
-/// never name the field, until the next compaction tick pins the spelling.
-#[sqlx::test]
-async fn hot_case_variant_of_a_pinned_cold_field_does_not_throw_the_union(pool: sqlx::PgPool) {
-    use trawl_server::catalog::{CatalogContext, FieldCatalog};
-    use trawl_server::store::CatalogStore;
-
-    let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let wal_dir = tmp.path().join("wal");
-    let data_dir = tmp.path().join("data");
-    std::fs::create_dir_all(&wal_dir).unwrap();
-    std::fs::create_dir_all(&data_dir).unwrap();
-
-    let catalog = Arc::new(FieldCatalog::new());
-    let ctx = CatalogContext {
-        store: CatalogStore::new(pool),
-        cache: Arc::clone(&catalog),
-    };
-    let hot_buffer = Arc::new(
-        HotBuffer::new(HotBufferConfig {
-            max_events: 10_000,
-            max_bytes: 10_000_000,
-        })
-        .with_field_catalog(Arc::clone(&catalog)),
-    );
-    let exec_pool = ExecutorPool::new(
-        data_dir.to_str().unwrap().to_owned(),
-        1,
-        1000,
-        Some(Arc::clone(&hot_buffer)),
-    );
-
-    // Cold batch pins the lowercase spelling VARCHAR — the cold type that
-    // cannot absorb a JSON hot column (probed in
-    // `trawl-engine/tests/duckdb_probe.rs`).
-    let cold: Vec<Map<String, Value>> = (0..2)
-        .map(|i| {
-            let mut m = make_event("nginx", &format!("cold{i}"));
-            m.insert("duration".into(), json!(format!("{i}.5s")));
-            m
-        })
-        .collect();
-    let wal_writer = WalWriter::new(wal_dir.clone());
-    wal_writer.ensure_dir().unwrap();
-    let ndjson = events_to_ndjson(&cold);
-    wal_writer.write("prod", "nginx", &ndjson).unwrap();
-    trawl_server::ingest::compaction::compact_once(
-        &wal_dir,
-        &data_dir,
-        Duration::ZERO,
-        false,
-        Some(&hot_buffer),
-        500,
-        "2GB",
-        Some(&ctx),
-    )
-    .await
-    .expect("compaction should succeed");
-    assert_eq!(
-        catalog.get("duration"),
-        Some(trawl_core::schema::CanonicalType::Varchar),
-        "the compaction tick must seed the lowercase pin"
-    );
-    assert!(
-        catalog.get("Duration").is_none(),
-        "the capitalised spelling has never been compacted"
-    );
-
-    // Hot window carrying ONLY the capitalised spelling, with mixed value
-    // types so read_json infers JSON rather than a scalar.
-    let mut mixed_a = make_event("nginx", "hot-a");
-    mixed_a.insert("Duration".into(), json!("n/a"));
-    let mut mixed_b = make_event("nginx", "hot-b");
-    mixed_b.insert("Duration".into(), json!(17));
-    hot_buffer.insert(Arc::new(IngestBatch {
-        batch_id: "hot_case_variant".into(),
-        service: "nginx".into(),
-        byte_size: 128,
-        events: vec![mixed_a, mixed_b],
-    }));
-
-    // A query that never names the field: the union binds every column, so
-    // an unconformed hot column fails this too.
-    let result = exec_pool
-        .execute(
-            exec_pool.allocate_query_id(),
-            "* | head 100",
-            Duration::from_secs(10),
-            false,
-            0,
-        )
-        .await;
-    let query_result = result
-        .result
-        .expect("a new case variant in the hot buffer must not fail the query");
-    assert_eq!(
-        query_result.rows.len(),
-        4,
-        "both cold rows and both hot rows must be present — never hot-only"
-    );
-}
+// NOTE: the former `hot_case_variant_of_a_pinned_cold_field_does_not_throw_
+// the_union` test is deliberately gone with the `FieldCatalog::intersect`
+// case-variant defence it exercised: field names are ASCII-folded at ingest
+// canonicalization (every producer — HTTP, syslog, telemetry — routes
+// through `envelope::canonicalize`), so a hot buffer carrying a mixed-case
+// spelling of a pinned field cannot be produced by the wired system. The
+// end-to-end proof is `case_variant_field_names_fold_to_one_column_across_
+// services` in tests/field_catalog.rs.
 
 #[tokio::test]
 async fn query_works_without_hot_buffer() {
