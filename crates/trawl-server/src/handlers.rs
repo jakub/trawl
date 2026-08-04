@@ -886,6 +886,200 @@ pub async fn schema_services(
     }
 }
 
+/// Format a UTC instant as the wire's ISO 8601 string.
+fn iso8601(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// Convert a `?since_secs=` window into an absolute instant.
+fn since_from_secs(since_secs: Option<u64>) -> Option<chrono::DateTime<chrono::Utc>> {
+    since_secs.map(|s| {
+        chrono::Utc::now() - chrono::Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX))
+    })
+}
+
+/// Query parameters for `GET /api/v1/schema/fields`.
+#[derive(Debug, Deserialize)]
+pub struct CatalogFieldsParams {
+    /// Only fields observed for this service.
+    pub service: Option<String>,
+    /// Only fields observed within the last N seconds.
+    pub since_secs: Option<u64>,
+    /// Maximum fields returned (default 500, clamped to the pin cap).
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/v1/schema/fields` — the pinned-field listing with aggregated
+/// observation and conflict evidence (`trawl schema fields`).
+pub async fn catalog_fields(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<CatalogFieldsParams>,
+) -> Result<Json<trawl_api::CatalogFieldsResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let limit = params
+        .limit
+        .unwrap_or(500)
+        .clamp(1, crate::store::MAX_PINNED_FIELDS);
+    let filter = crate::store::FieldListFilter {
+        service: params.service.clone(),
+        since: since_from_secs(params.since_secs),
+        limit,
+    };
+    let (mut rows, truncated) = state.storage.catalog.list_fields(&filter).await?;
+    let (pinned_total, pin_capacity) = state.storage.catalog.pin_stats().await?;
+
+    rows.sort_by(|a, b| {
+        trawl_api::value::field_display_rank(&a.field)
+            .cmp(&trawl_api::value::field_display_rank(&b.field))
+            .then_with(|| a.field.cmp(&b.field))
+    });
+    let fields = rows
+        .into_iter()
+        .map(|r| trawl_api::CatalogFieldSummary {
+            name: r.field,
+            data_type: r.duckdb_type,
+            pinned_from: r.pinned_from,
+            pinned_at: iso8601(r.pinned_at),
+            service_count: u64::try_from(r.service_count).unwrap_or(0),
+            row_count: u64::try_from(r.row_count).unwrap_or(0),
+            first_seen: r.first_seen.map(iso8601),
+            last_seen: r.last_seen.map(iso8601),
+            conflict_count: u64::try_from(r.conflict_count).unwrap_or(0),
+            rows_nulled: u64::try_from(r.rows_nulled).unwrap_or(0),
+        })
+        .collect();
+
+    Ok(Json(trawl_api::CatalogFieldsResponse {
+        fields,
+        pinned_total: u64::try_from(pinned_total).unwrap_or(0),
+        pin_capacity: u64::try_from(pin_capacity).unwrap_or(0),
+        truncated,
+    }))
+}
+
+/// Query parameters for `GET /api/v1/schema/field`.
+///
+/// The field name travels as a QUERY parameter, never a path segment: a
+/// catalog key is any ASCII-folded client JSON key ≤255 bytes — it may
+/// contain `/`, `?`, or `%`, which a path segment cannot carry reliably.
+#[derive(Debug, Deserialize)]
+pub struct CatalogFieldParams {
+    /// Field name (ASCII-folded before lookup, mirroring ingest's fold).
+    pub name: String,
+}
+
+/// `GET /api/v1/schema/field?name=` — one field's pin, per-service
+/// observations, and retained conflict evidence (`trawl schema field`).
+pub async fn catalog_field(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<CatalogFieldParams>,
+) -> Result<Json<trawl_api::CatalogFieldResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    // One DuckDB identifier has exactly one catalog spelling (ASCII-lower,
+    // folded at every ingest door) — fold the lookup the same way.
+    let name = params.name.to_ascii_lowercase();
+
+    let Some(pin) = state.storage.catalog.field_pin(&name).await? else {
+        return Err(ServerError::NotFound(format!("field not pinned: {name}")));
+    };
+    let services = state.storage.catalog.field_services(&name).await?;
+    let conflicts = state.storage.catalog.conflicts_for_field(&name).await?;
+
+    Ok(Json(trawl_api::CatalogFieldResponse {
+        name: pin.field,
+        data_type: pin.duckdb_type,
+        pinned_from: pin.pinned_from,
+        pinned_at: iso8601(pin.pinned_at),
+        services: services
+            .into_iter()
+            .map(|s| trawl_api::CatalogFieldServiceRow {
+                service: s.service,
+                first_seen: iso8601(s.first_seen),
+                last_seen: iso8601(s.last_seen),
+                row_count: u64::try_from(s.row_count).unwrap_or(0),
+            })
+            .collect(),
+        conflicts: conflicts
+            .into_iter()
+            .map(|c| trawl_api::CatalogConflictRow {
+                field: name.clone(),
+                service: c.service,
+                observed_type: c.observed_type,
+                expected_type: c.expected_type,
+                rows_nulled: u64::try_from(c.rows_nulled).unwrap_or(0),
+                at: iso8601(c.at),
+            })
+            .collect(),
+    }))
+}
+
+/// Query parameters for `GET /api/v1/schema/conflicts`.
+#[derive(Debug, Deserialize)]
+pub struct CatalogConflictsParams {
+    /// Only conflicts for this field.
+    pub field: Option<String>,
+    /// Only conflicts from this service.
+    pub service: Option<String>,
+    /// Only conflicts recorded within the last N seconds.
+    pub since_secs: Option<u64>,
+    /// Maximum rows returned (default 100, max 1000).
+    pub limit: Option<i64>,
+}
+
+/// Ceiling for `GET /api/v1/schema/conflicts` `?limit=`.
+const MAX_CONFLICT_LIST_LIMIT: i64 = 1000;
+
+/// `GET /api/v1/schema/conflicts` — the schema-health dashboard listing
+/// (`trawl schema conflicts --last 7d`).
+pub async fn catalog_conflicts(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<CatalogConflictsParams>,
+) -> Result<Json<trawl_api::CatalogConflictsResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let limit = params
+        .limit
+        .unwrap_or(100)
+        .clamp(1, MAX_CONFLICT_LIST_LIMIT);
+    let field = params.field.as_deref().map(str::to_ascii_lowercase);
+    let (rows, truncated) = state
+        .storage
+        .catalog
+        .recent_conflicts(
+            field.as_deref(),
+            params.service.as_deref(),
+            since_from_secs(params.since_secs),
+            limit,
+        )
+        .await?;
+
+    Ok(Json(trawl_api::CatalogConflictsResponse {
+        conflicts: rows
+            .into_iter()
+            .map(|c| trawl_api::CatalogConflictRow {
+                field: c.field,
+                service: c.service,
+                observed_type: c.observed_type,
+                expected_type: c.expected_type,
+                rows_nulled: u64::try_from(c.rows_nulled).unwrap_or(0),
+                at: iso8601(c.at),
+            })
+            .collect(),
+        truncated,
+    }))
+}
+
 /// `GET /api/v1/schema/values/{field}` — sample distinct values for autocomplete.
 pub async fn field_values(
     State(state): State<AppState>,

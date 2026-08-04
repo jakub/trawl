@@ -128,6 +128,19 @@ pub struct FieldSummaryRow {
     pub rows_nulled: i64,
 }
 
+/// One field's pin row ([`CatalogStore::field_pin`]).
+#[derive(Debug, Clone)]
+pub struct FieldPinRow {
+    /// Field name.
+    pub field: String,
+    /// Pinned `DuckDB` type spelling.
+    pub duckdb_type: String,
+    /// Which service's batch set the pin.
+    pub pinned_from: Option<String>,
+    /// When the pin was written.
+    pub pinned_at: DateTime<Utc>,
+}
+
 /// A `field_conflicts` row with its field name — the cross-field listing
 /// shape ([`CatalogStore::recent_conflicts`]).
 #[derive(Debug, Clone)]
@@ -812,6 +825,27 @@ impl CatalogStore {
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map(|rows| (rows, truncated))
             .map_err(StoreError::from)
+    }
+
+    /// Read one field's pin row, or `None` when the field is not pinned.
+    pub async fn field_pin(&self, field: &str) -> Result<Option<FieldPinRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT field, duckdb_type, pinned_from, pinned_at
+             FROM field_types WHERE field = $1",
+        )
+        .bind(field)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(FieldPinRow {
+                field: row.try_get("field")?,
+                duckdb_type: row.try_get("duckdb_type")?,
+                pinned_from: row.try_get("pinned_from")?,
+                pinned_at: row.try_get("pinned_at")?,
+            })
+        })
+        .transpose()
+        .map_err(|e: sqlx::Error| StoreError::from(e))
     }
 
     /// The catalog's stable identity (mirrored into the `data/CATALOG`

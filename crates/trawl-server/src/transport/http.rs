@@ -64,6 +64,11 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/validate", post(handlers::validate_query))
         .route("/schema", get(handlers::schema))
         .route("/schema/services", get(handlers::schema_services))
+        // Catalog read routes (#51). The field DETAIL takes `?name=` rather
+        // than a path segment: a catalog key may contain `/`.
+        .route("/schema/fields", get(handlers::catalog_fields))
+        .route("/schema/field", get(handlers::catalog_field))
+        .route("/schema/conflicts", get(handlers::catalog_conflicts))
         .route("/schema/values/{field}", get(handlers::field_values))
         .route("/queries", get(handlers::queries))
         .route("/queries/{id}", delete(handlers::cancel_query))

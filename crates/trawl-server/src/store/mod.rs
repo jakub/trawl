@@ -35,7 +35,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 pub use catalog::{
-    CatalogStore, ConflictListRow, FieldConflict, FieldConflictRow, FieldListFilter,
+    CatalogStore, ConflictListRow, FieldConflict, FieldConflictRow, FieldListFilter, FieldPinRow,
     FieldServiceRow, FieldSummaryRow, MAX_CONFLICTS_PER_FIELD, MAX_PINNED_FIELDS, PinProposal,
 };
 pub use error::StoreError;
