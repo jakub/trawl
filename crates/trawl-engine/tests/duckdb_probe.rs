@@ -429,8 +429,9 @@ fn replace_list_identifier_folding_is_ascii_only() {
 /// and a `REPLACE` naming either spelling binds the FIRST column. So a pin
 /// applied there conforms the WRONG column — retyping one service's values
 /// while the pinned field's own data sits untouched in `Duration_1`. This is
-/// the execution evidence for the hot buffer merging case-variant keys as it
-/// writes the snapshot, rather than trying to pin either spelling.
+/// the execution evidence for folding field names at every producer's door
+/// (ADR-0009) rather than trying to pin either spelling once both have
+/// reached a snapshot.
 #[test]
 fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
     let dir = tempfile::tempdir().unwrap();
@@ -480,8 +481,9 @@ fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
     );
 }
 
-/// Two engine assumptions the hot buffer's case-variant merge rests on
-/// (`HotBuffer::build_snapshot`'s `CaseMerge`, ADR-0009 slice 2):
+/// Two engine facts behind the fold-at-every-producer-door policy
+/// (ADR-0009 — `envelope::canonicalize`, `syslog::convert`'s SD keys,
+/// telemetry's `JsonVisitor`):
 ///
 /// 1. an UNCONFORMED hot column can throw the WHOLE composite source — the
 ///    union binds types for every column, so a query whose DSL never names
@@ -489,9 +491,10 @@ fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
 /// 2. `UNION ALL BY NAME` matches column names case-INSENSITIVELY, and a
 ///    `VARCHAR` hot column unions with every cold scalar type.
 ///
-/// Together: merging the collided spellings into one column and pinning it
-/// `VARCHAR` is safe under EITHER spelling, while leaving the `_1` twin
-/// unconformed is not.
+/// Together: two spellings of one identifier in a hot snapshot leave an
+/// unnameable `_1` twin that can fail every query, which is why field
+/// names are folded to one spelling BEFORE they can reach the buffer —
+/// and why a `VARCHAR` conform under the surviving spelling is safe.
 #[test]
 fn unconformed_hot_column_throws_the_union_and_varchar_conform_saves_it() {
     let dir = tempfile::tempdir().unwrap();
