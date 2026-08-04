@@ -19,15 +19,10 @@ pub mod timezone;
 // continue to work without changes.
 pub use trawl_api::value;
 
-// The conversion-error classifier is shared with trawl-server's compaction
-// path so both lanes agree on which `DuckDB` errors warrant a
-// cast-to-`VARCHAR` fallback (vs quarantine/abort). It reports "a cast
-// failed", NOT "the schemas conflict" — the two are indistinguishable from
-// the error alone (ADR-0008), so each caller confirms the schema conflict
-// with the per-source describes its fallback performs anyway.
+// The conversion-error classifier reports "a cast failed", NOT "the schemas
+// conflict" — the two are indistinguishable from the error alone (ADR-0008).
+// No production path classifies conversion errors any more (the read-time
+// cast-to-`VARCHAR` fallbacks are deleted, ADR-0009 slice 2); it stays
+// exported because the ADR-evidence tests pin the `DuckDB` behaviour the
+// no-classifier design rests on.
 pub use executor::is_conversion_error;
-
-// The complex-type classifier is likewise shared with compaction's write-time
-// coercion, so the schema describe and the compaction writer agree on exactly
-// which `DuckDB` types get folded to `VARCHAR`.
-pub use executor::is_complex_type;
