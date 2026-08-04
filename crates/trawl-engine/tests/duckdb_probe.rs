@@ -71,6 +71,221 @@ fn untyped_varchar_conform_expression_is_unquoted_across_inference_classes() {
     );
 }
 
+/// The pin ladder and the conform step guard every typed cast with a
+/// round-trip check (ADR-0009 slice 2 amendment): `TRY_CAST` to a numeric
+/// type ROUNDS rather than fails — `1.5 → 2` counts as a "success" — so a
+/// bare `count(TRY_CAST(...))` would score a fractional batch ≥90% BIGINT
+/// and silently round every value on write, forever, with no
+/// `field_conflicts` row. This pins BOTH halves across the inference
+/// classes the WAL can produce (VARCHAR, JSON-mixed, HUGEINT numeric):
+///
+/// 1. the PREMISE: the unguarded cast really does round (a `DuckDB` bump
+///    that makes it fail instead would let the guard be simplified), and
+/// 2. the GUARD as compaction emits it (`conform_expr`): BIGINT/DOUBLE
+///    compare the cast against the value's canonical text re-parsed in
+///    DOUBLE space (tolerating representation drift — `4.0 → 4`,
+///    `"042" → 42`, and `u64::MAX` → DOUBLE with precision loss, which the
+///    AC requires); TIMESTAMP compares in TIMESTAMP space (tolerating
+///    format drift — RFC 3339 `T`/`Z` vs `DuckDB`'s space-separated
+///    rendering); BOOLEAN compares strict text (`true`/`false` only, so
+///    `1` never conforms to a BOOLEAN pin).
+#[test]
+#[allow(clippy::too_many_lines)] // one probe per comparison-space decision, kept together
+fn typed_casts_round_so_the_conform_guard_must_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+
+    let describe_type = |sql: &str| -> String {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {sql}")).unwrap();
+        stmt.query_row([], |row| row.get(1)).unwrap()
+    };
+
+    // --- inference classes: mixed values infer JSON, u64-range HUGEINT ---
+    let mixed = dir.path().join("mixed.ndjson");
+    {
+        let mut f = std::fs::File::create(&mixed).unwrap();
+        writeln!(f, r#"{{"m":1.5,"u":18446744073709551615}}"#).unwrap();
+        writeln!(f, r#"{{"m":"n/a","u":9007199254740993}}"#).unwrap();
+        f.sync_all().unwrap();
+    }
+    let reader = hot_reader(&mixed);
+    assert_eq!(
+        describe_type(&format!("SELECT m FROM {reader}")).as_str(),
+        "JSON",
+        "mixed values must infer JSON (the class the ladder exists for)"
+    );
+    assert_eq!(
+        describe_type(&format!("SELECT u FROM {reader}")).as_str(),
+        "HUGEINT",
+        "u64-range integers must infer HUGEINT"
+    );
+
+    // --- the premise: TRY_CAST rounds, it does not fail ---
+    let one = |sql: &str| -> Option<i64> { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    assert_eq!(
+        one("SELECT TRY_CAST(m AS BIGINT) FROM (SELECT m FROM read_json('MIXED', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0)) WHERE json_extract_string(m,'$') = '1.5'"
+            .replace("MIXED", &mixed.display().to_string())
+            .as_str()),
+        Some(2),
+        "TRY_CAST(JSON 1.5 AS BIGINT) rounds to 2 — the silent-loss premise"
+    );
+    assert_eq!(
+        one("SELECT TRY_CAST('1.5' AS BIGINT)"),
+        Some(2),
+        "TRY_CAST(VARCHAR '1.5' AS BIGINT) rounds too"
+    );
+    assert_eq!(
+        one("SELECT TRY_CAST(1.5::DOUBLE AS BIGINT)"),
+        Some(2),
+        "TRY_CAST(DOUBLE 1.5 AS BIGINT) rounds too"
+    );
+    assert_eq!(
+        one(&format!(
+            "SELECT TRY_CAST(m AS BIGINT) FROM {reader} WHERE json_extract_string(m,'$') = '1.5'"
+        )),
+        Some(2),
+        "the JSON class rounds through the real reader as well"
+    );
+
+    // --- the guard, exactly as conform_expr emits it ---
+    // canon(x) is json_extract_string(x,'$') for a JSON column, else
+    // CAST(x AS VARCHAR).
+    let guard_bigint_json = "(CASE WHEN TRY_CAST(json_extract_string(m, '$') AS DOUBLE) = TRY_CAST(m AS BIGINT) \
+          THEN TRY_CAST(m AS BIGINT) END)";
+    let rows: Vec<(String, Option<i64>)> = {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT json_extract_string(m, '$'), {guard_bigint_json} FROM {reader} \
+                 ORDER BY 1"
+            ))
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        rows,
+        vec![("1.5".into(), None), ("n/a".into(), None)],
+        "the guarded BIGINT cast must NULL a fractional value instead of rounding"
+    );
+
+    // VARCHAR class: strings that survive vs strings that round.
+    let varchar_cases: Vec<(String, Option<i64>)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT v, (CASE WHEN TRY_CAST(CAST(v AS VARCHAR) AS DOUBLE) = \
+                 TRY_CAST(v AS BIGINT) THEN TRY_CAST(v AS BIGINT) END) \
+                 FROM (VALUES ('42'), ('042'), ('1.5'), ('n/a')) t(v) ORDER BY v",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        varchar_cases,
+        vec![
+            ("042".into(), Some(42)), // representation drift tolerated (numeric space)
+            ("1.5".into(), None),     // rounding refused
+            ("42".into(), Some(42)),
+            ("n/a".into(), None),
+        ],
+        "VARCHAR class: numeric-space round-trip"
+    );
+
+    // HUGEINT class: u64::MAX must fail BIGINT but pass the DOUBLE guard —
+    // DOUBLE-space comparison deliberately tolerates the precision loss the
+    // AC requires (a u64-range batch pins DOUBLE).
+    let (bi_ok, db_ok): (i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT count(CASE WHEN TRY_CAST(CAST(u AS VARCHAR) AS DOUBLE) = \
+                        TRY_CAST(u AS BIGINT) THEN 1 END)::BIGINT, \
+                        count(CASE WHEN TRY_CAST(CAST(u AS VARCHAR) AS DOUBLE) = \
+                        TRY_CAST(u AS DOUBLE) THEN 1 END)::BIGINT FROM {reader} \
+                 WHERE CAST(u AS VARCHAR) = '18446744073709551615'"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (bi_ok, db_ok),
+        (0, 1),
+        "u64::MAX: BIGINT round-trip fails (cast NULLs), DOUBLE round-trip passes"
+    );
+
+    // BOOLEAN: TRY_CAST(true AS BIGINT) = 1 makes the BIGINT rung score
+    // booleans under the OLD counting; with the guard they fail BIGINT and
+    // pass only the strict-text BOOLEAN rung — the rung is reachable now.
+    let bools = dir.path().join("bools.ndjson");
+    {
+        let mut f = std::fs::File::create(&bools).unwrap();
+        for i in 0..19 {
+            writeln!(
+                f,
+                r#"{{"b":{}}}"#,
+                if i % 2 == 0 { "true" } else { "false" }
+            )
+            .unwrap();
+        }
+        writeln!(f, r#"{{"b":"n/a"}}"#).unwrap();
+        f.sync_all().unwrap();
+    }
+    let breader = hot_reader(&bools);
+    assert_eq!(
+        describe_type(&format!("SELECT b FROM {breader}")).as_str(),
+        "JSON"
+    );
+    let (raw_bi, ok_bi, ok_bool): (i64, i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT count(TRY_CAST(b AS BIGINT))::BIGINT, \
+                        count(CASE WHEN TRY_CAST(json_extract_string(b,'$') AS DOUBLE) = \
+                        TRY_CAST(b AS BIGINT) THEN 1 END)::BIGINT, \
+                        count(CASE WHEN CAST(TRY_CAST(b AS BOOLEAN) AS VARCHAR) = \
+                        json_extract_string(b,'$') THEN 1 END)::BIGINT FROM {breader}"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        raw_bi, 19,
+        "premise: TRY_CAST(bool AS BIGINT) succeeds (1/0) — the old counting \
+         scored a boolean batch ≥90% BIGINT, making the Boolean rung unreachable"
+    );
+    assert_eq!((ok_bi, ok_bool), (0, 19), "guarded: booleans pin BOOLEAN");
+
+    // TIMESTAMP: TIMESTAMP-space comparison tolerates format drift (RFC
+    // 3339 'T'/'Z' vs DuckDB's rendering) — a parse failure still NULLs.
+    let ts_cases: Vec<(String, bool)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT v, (TRY_CAST(CAST(v AS VARCHAR) AS TIMESTAMP) = \
+                 TRY_CAST(v AS TIMESTAMP)) IS NOT DISTINCT FROM true \
+                 FROM (VALUES ('2024-01-15T09:00:00Z'), ('2024-01-15'), ('yesterday-ish')) t(v) \
+                 ORDER BY v",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        ts_cases,
+        vec![
+            ("2024-01-15".into(), true),
+            ("2024-01-15T09:00:00Z".into(), true),
+            ("yesterday-ish".into(), false),
+        ],
+        "TIMESTAMP round-trip is format-tolerant, parse failures still fail"
+    );
+}
+
 /// `DuckDB` identifiers are case-INSENSITIVE, but only over ASCII. Catalog
 /// pins are case-SENSITIVE names taken from client JSON keys, so two pins
 /// can name one hot column — and a `REPLACE` list carrying both is a hard

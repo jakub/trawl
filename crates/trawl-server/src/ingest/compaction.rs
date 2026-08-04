@@ -1748,10 +1748,14 @@ fn run_pin_ladders(
 /// The SQL expression conforming one column to its pin, or `None` when the
 /// observed type already matches (pass-through).
 ///
-/// All cast semantics verified by execution against the bundled `DuckDB`:
-/// - `TRY_CAST(JSON AS BIGINT/DOUBLE/TIMESTAMP/BOOLEAN)` converts
-///   element-wise (quoted numbers and date strings included) and nulls
-///   what cannot convert;
+/// All cast semantics verified by execution against the bundled `DuckDB`
+/// (`trawl-engine/tests/duckdb_probe.rs`):
+/// - a bare `TRY_CAST` to a numeric type ROUNDS rather than fails —
+///   `1.5 → 2` from JSON, VARCHAR and DOUBLE sources alike — so every
+///   typed cast is wrapped in a round-trip guard ([`lossless_cast`]): a
+///   value that does not survive the cast unchanged becomes NULL (and so
+///   counts into `field_conflicts` via the tally, and scores as a FAILURE
+///   in the pin ladder) instead of being silently altered;
 /// - `JSON → VARCHAR` goes through `json_extract_string(col, '$')` so
 ///   strings land UNQUOTED (`n/a`, not `"n/a"`) while numbers/objects
 ///   become their text;
@@ -1775,8 +1779,55 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
         CanonicalType::Varchar if is_complex => {
             format!("CAST(to_json({quoted}) AS VARCHAR)")
         }
-        other => format!("TRY_CAST({quoted} AS {})", other.as_duckdb()),
+        // Stringification is lossless by construction; no guard needed.
+        CanonicalType::Varchar => format!("TRY_CAST({quoted} AS VARCHAR)"),
+        typed => lossless_cast(quoted, &upper, typed),
     })
+}
+
+/// A typed cast that succeeds only when the value survives the round trip
+/// unchanged — `CASE WHEN <round-trips> THEN TRY_CAST(...) END` — because
+/// `TRY_CAST` alone ROUNDS instead of failing (`1.5 → 2`, `true → 1`;
+/// probed by execution in `trawl-engine/tests/duckdb_probe.rs`). Without
+/// the guard, a 95%-fractional batch scores ≥90% "success" on the BIGINT
+/// rung and pins BIGINT, silently rounding every value on write forever
+/// with no `field_conflicts` row.
+///
+/// The comparison space is chosen per rung (all probed by execution):
+/// - `BIGINT`/`DOUBLE` compare the cast against the value's canonical text
+///   re-parsed in DOUBLE space: rounding is refused (`1.5 ≠ 2`) while
+///   representation drift is tolerated (`4.0 = 4`, `"042" = 42`), and
+///   `u64::MAX` passes the DOUBLE rung despite DOUBLE's >2^53 precision loss
+///   — a strict text comparison would fail it
+///   (`1.8446744073709552e+19 ≠ 18446744073709551615`) and regress the
+///   u64-range-pins-DOUBLE acceptance case;
+/// - `TIMESTAMP` compares in TIMESTAMP space, tolerating format drift
+///   (RFC 3339 `T`/`Z` vs `DuckDB`'s space-separated rendering, `DATE` at
+///   midnight) — a text no parser reads still becomes NULL;
+/// - `BOOLEAN` compares strict text, so only real `true`/`false` values
+///   conform — `1` never becomes `true` — which is also what makes the
+///   Boolean ladder rung reachable at all (`TRY_CAST(true AS BIGINT)` is 1,
+///   so under bare counting a boolean batch scored ≥90% BIGINT first).
+///
+/// The canonical text is `json_extract_string(x, '$')` for a JSON column
+/// (unquoted strings) and `CAST(x AS VARCHAR)` for every other source.
+fn lossless_cast(quoted: &str, upper_dtype: &str, pin: CanonicalType) -> String {
+    let canon = if upper_dtype == "JSON" {
+        format!("json_extract_string({quoted}, '$')")
+    } else {
+        format!("CAST({quoted} AS VARCHAR)")
+    };
+    let cast = format!("TRY_CAST({quoted} AS {})", pin.as_duckdb());
+    let ok = match pin {
+        CanonicalType::BigInt | CanonicalType::Double => {
+            format!("TRY_CAST({canon} AS DOUBLE) = {cast}")
+        }
+        CanonicalType::Timestamp => format!("TRY_CAST({canon} AS TIMESTAMP) = {cast}"),
+        CanonicalType::Boolean => format!("CAST({cast} AS VARCHAR) = {canon}"),
+        // Handled by the caller's VARCHAR arms; never a guarded cast.
+        CanonicalType::Varchar => unreachable!("VARCHAR conforms are lossless by construction"),
+    };
+    format!("(CASE WHEN {ok} THEN {cast} END)")
 }
 
 /// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
@@ -3039,6 +3090,127 @@ mod tests {
         );
         assert_eq!(total, 21);
         assert_eq!(nn, 20, "the out-of-range outlier nulls");
+    }
+
+    /// The lossless-cast fix's headline case: 19 fractional values + one
+    /// string infer JSON, and under bare `count(TRY_CAST(...))` scoring the
+    /// BIGINT rung counted `1.5 → 2` as success (19/20 ≥ 90%) — pinning
+    /// BIGINT and silently rounding every value on write, with no
+    /// `field_conflicts` row. Round-trip scoring fails the BIGINT rung
+    /// (rounding is not lossless) and pins DOUBLE.
+    #[test]
+    fn pin_ladder_fractional_majority_pins_double_not_bigint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..19).map(|i| record_with("duration", "1.5", i)).collect();
+        records.push(record_with("duration", "\"n/a\"", 19));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "duration");
+        assert_eq!(
+            dtype, "DOUBLE",
+            "a fractional majority must pin DOUBLE — BIGINT would round"
+        );
+        assert_eq!(total, 20);
+        assert_eq!(nn, 19, "only the string nulls (recoverable from _raw)");
+        let mut values = read_strings(
+            &parquet[0],
+            "DISTINCT COALESCE(CAST(duration AS VARCHAR), '<null>')",
+        );
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            vec!["1.5".to_owned(), "<null>".to_owned()],
+            "the fractional values survive unrounded"
+        );
+    }
+
+    /// With lossless scoring the Boolean rung is reachable: under the old
+    /// counting, `TRY_CAST(true AS BIGINT)` = 1 scored a boolean batch ≥90%
+    /// on the BIGINT rung first, so no batch could ever pin BOOLEAN.
+    #[test]
+    fn pin_ladder_boolean_majority_pins_boolean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..19)
+            .map(|i| record_with("healthy", if i % 2 == 0 { "true" } else { "false" }, i))
+            .collect();
+        records.push(record_with("healthy", "\"n/a\"", 19));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "healthy");
+        assert_eq!(
+            dtype, "BOOLEAN",
+            "a ≥90%-boolean batch must pin BOOLEAN — the rung is reachable now"
+        );
+        assert_eq!(total, 20);
+        assert_eq!(nn, 19, "only the string nulls");
+    }
+
+    /// Conform-time lossless guarantee: a batch disagreeing with an
+    /// existing typed pin must NULL (and tally) every value the cast would
+    /// alter — never write a silently rounded one. Numeric-space tolerance
+    /// keeps genuinely lossless drift (`4.0 → 4`).
+    #[test]
+    fn conform_to_bigint_pin_nulls_rounded_values_and_records_them() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        // A DOUBLE column (a sender flip-flopping JSON number encodings)
+        // and a VARCHAR column, both against a BIGINT pin.
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT * FROM (VALUES (1.5::DOUBLE, '1.5'), (4.0::DOUBLE, '42')) t(frac, txt)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("frac".to_owned(), CanonicalType::BigInt),
+            ("txt".to_owned(), CanonicalType::BigInt),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        assert_eq!(plan.cast_count(), 2);
+
+        // The tally counts the rounded values as NULLED — they are losses.
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        let nulled: HashMap<&str, u64> = conflicts
+            .iter()
+            .map(|c| (c.field.as_str(), c.rows_nulled))
+            .collect();
+        assert_eq!(
+            nulled,
+            HashMap::from([("frac", 1), ("txt", 1)]),
+            "each column's fractional value is evidence: {conflicts:?}"
+        );
+
+        // And the written values match: NULL where rounding would have
+        // altered, the exact integer where the round trip holds.
+        let select = plan.select_list.join(", ");
+        let rows: Vec<(Option<i64>, Option<i64>)> = {
+            let mut stmt = conn
+                .prepare(&format!("SELECT {select} FROM wal_batch ORDER BY txt"))
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![(Some(4), Some(42)), (None, None)],
+            "1.5 and '1.5' must write NULL, never 2; 4.0 and '42' round-trip"
+        );
     }
 
     /// A batch wider than one ladder chunk must pin every column to the type
