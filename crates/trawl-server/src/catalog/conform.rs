@@ -568,11 +568,15 @@ fn scan_file(
 /// corpus. When this comes back empty (a catalog that already pins every
 /// field the file carries), the file is described from its footer and never
 /// read at all.
+///
+/// The lookup ASCII-case-folds the stored spelling: the catalog holds
+/// folded names only, and a standing `Dur` column is the pinned `dur`
+/// field as far as any vote is concerned.
 fn voting_columns(schema: &[ColInfo], pinned: &HashMap<String, CanonicalType>) -> Vec<usize> {
     schema
         .iter()
         .enumerate()
-        .filter(|(_, c)| !pinned.contains_key(&c.name))
+        .filter(|(_, c)| !pinned.contains_key(&c.name.to_ascii_lowercase()))
         .map(|(i, _)| i)
         .collect()
 }
@@ -648,18 +652,27 @@ fn ladder_rank(ty: CanonicalType) -> usize {
 /// all-but-empty column in a large file describes no values and so gets no
 /// say over a fully populated column in a smaller one. Since the losers get
 /// `TRY_CAST` to the winner's pin, a misweighted vote is a data loss.
+///
+/// Votes are grouped by the ASCII-case-FOLDED name and the proposal carries
+/// the folded spelling: the catalog holds folded names only (ingest folds
+/// at canonicalization), while parquet written before the fold shipped can
+/// carry mixed-case column names — `Dur` in one file and `dur` in another
+/// are one `DuckDB` column and must be one pin, decided by most-rows-wins
+/// within the folded group. The rewrite then renames such columns to the
+/// folded form ([`crate::ingest::compaction::ConformPlan`]).
 fn most_rows_wins(
     scan: &[FileScan],
     existing: &HashMap<String, CanonicalType>,
 ) -> Vec<PinProposal> {
-    let mut votes: HashMap<&str, HashMap<CanonicalType, u64>> = HashMap::new();
+    let mut votes: HashMap<String, HashMap<CanonicalType, u64>> = HashMap::new();
     for file in scan {
         for (col, rows) in file.schema.iter().zip(&file.non_null) {
-            if existing.contains_key(&col.name) {
+            let folded = col.name.to_ascii_lowercase();
+            if existing.contains_key(&folded) {
                 continue;
             }
             *votes
-                .entry(col.name.as_str())
+                .entry(folded)
                 .or_default()
                 .entry(boot_candidate(&col.dtype))
                 .or_default() += *rows;
@@ -675,7 +688,7 @@ fn most_rows_wins(
                 })
                 .map_or(CanonicalType::Varchar, |(t, _)| t);
             PinProposal {
-                field: field.to_owned(),
+                field,
                 ty,
                 pinned_from: BOOT_PIN_SOURCE.to_owned(),
             }
@@ -737,7 +750,7 @@ fn rewrite_file(
             time_fallback: file.time_fallback,
         },
     );
-    if plan.cast_count() == 0 {
+    if plan.is_noop() {
         return Ok(None);
     }
 

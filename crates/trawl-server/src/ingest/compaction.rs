@@ -1623,18 +1623,24 @@ fn propose_pins(
     // the canonical vocabulary pins from the DESCRIBE alone, everything else
     // needs the values and is resolved in batch below (never per column —
     // the batch is attacker-wide, see `run_pin_ladders`).
-    let mut candidates: Vec<(&String, Option<CanonicalType>)> = Vec::new();
+    //
+    // Names are ASCII-case-folded for both the lookup and the proposal: the
+    // catalog holds folded names only (ingest folds at canonicalization),
+    // and a legacy mixed-case WAL column must pin — and be conformed — under
+    // the same key its data will be stored as.
+    let mut candidates: Vec<(String, Option<CanonicalType>)> = Vec::new();
     let mut ladder_cols: Vec<&ColInfo> = Vec::new();
     for col in schema {
-        if trawl_core::schema::TIMESTAMP_COLUMNS.contains(&col.name.as_str())
-            || known_pins.contains_key(&col.name)
+        let folded = col.name.to_ascii_lowercase();
+        if trawl_core::schema::TIMESTAMP_COLUMNS.contains(&folded.as_str())
+            || known_pins.contains_key(&folded)
         {
             continue;
         }
         match normalize_duckdb_type(&col.dtype) {
-            TypeResolution::Pin(t) => candidates.push((&col.name, Some(t))),
+            TypeResolution::Pin(t) => candidates.push((folded, Some(t))),
             TypeResolution::Ladder | TypeResolution::Json => {
-                candidates.push((&col.name, None));
+                candidates.push((folded, None));
                 ladder_cols.push(col);
             }
         }
@@ -1652,7 +1658,7 @@ fn propose_pins(
         };
         if let Some(ty) = proposed {
             proposals.push(PinProposal {
-                field: field.clone(),
+                field,
                 ty,
                 pinned_from: service.to_owned(),
             });
@@ -1894,6 +1900,8 @@ pub(crate) enum ConformPolicy {
 
 /// One column the plan will `TRY_CAST`.
 struct CastEntry {
+    /// The FOLDED (catalog-key) name — conflict evidence is attributed to
+    /// the field as the catalog knows it, not to a legacy spelling.
     name: String,
     dtype: String,
     pin: CanonicalType,
@@ -1908,16 +1916,25 @@ struct CastEntry {
 /// [`conform_expr`] and record the same [`FieldConflict`] evidence, and only
 /// differ in where the rows come from ([`ConformPlan::tally_conflicts`]'s
 /// `source`) and how the result is applied.
+///
+/// Column names are ASCII-case-folded on the OUTPUT side: pins are keyed by
+/// the folded name (ingest folds every field name at canonicalization), so
+/// the lookup folds too, and a column whose stored spelling still carries
+/// uppercase (parquet written before the fold shipped) is RENAMED to the
+/// folded form as part of the conform — a rename with no cast still counts
+/// as a rewrite ([`Self::is_noop`]).
 pub(crate) struct ConformPlan {
     /// Per-column SELECT expressions, in schema order.
     pub(crate) select_list: Vec<String>,
-    /// The RETAINED column names — the post-conform column set, so
-    /// bookkeeping can never claim a service carried a field no parquet
+    /// The RETAINED column names (folded) — the post-conform column set,
+    /// so bookkeeping can never claim a service carried a field no parquet
     /// file holds.
     pub(crate) retained: Vec<String>,
     /// Columns omitted from the output because their pin deferred.
     pub(crate) dropped: Vec<String>,
     casts: Vec<CastEntry>,
+    /// Columns whose only change is the case-fold rename.
+    renamed: usize,
 }
 
 impl ConformPlan {
@@ -1932,19 +1949,21 @@ impl ConformPlan {
             retained: Vec::with_capacity(schema.len()),
             dropped: Vec::new(),
             casts: Vec::new(),
+            renamed: 0,
         };
         for col in schema {
             let quoted = quote_ident(&col.name);
-            let is_time_col = trawl_core::schema::TIMESTAMP_COLUMNS.contains(&col.name.as_str());
+            let folded = col.name.to_ascii_lowercase();
+            let is_time_col = trawl_core::schema::TIMESTAMP_COLUMNS.contains(&folded.as_str());
             if policy == ConformPolicy::WalBatch && is_time_col {
-                plan.keep(col, quoted);
+                plan.keep(col, &folded, quoted);
                 continue;
             }
-            match pins.get(&col.name).copied() {
+            match pins.get(&folded).copied() {
                 None if policy == ConformPolicy::WalBatch => plan.dropped.push(col.name.clone()),
-                None => plan.keep(col, quoted),
+                None => plan.keep(col, &folded, quoted),
                 Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
-                    None => plan.keep(col, quoted),
+                    None => plan.keep(col, &folded, quoted),
                     Some(expr) => {
                         // The written expression may carry a never-NULL last
                         // arm; the tallied one never does. `tally_conflicts`
@@ -1952,10 +1971,11 @@ impl ConformPlan {
                         // that substitutes an instant has still destroyed the
                         // original value — evidence worth recording.
                         let written = guard_partition_key(policy, is_time_col, pin, &expr);
-                        plan.select_list.push(format!("{written} AS {quoted}"));
-                        plan.retained.push(col.name.clone());
+                        plan.select_list
+                            .push(format!("{written} AS {}", quote_ident(&folded)));
+                        plan.retained.push(folded.clone());
                         plan.casts.push(CastEntry {
-                            name: col.name.clone(),
+                            name: folded,
                             dtype: col.dtype.clone(),
                             pin,
                             expr,
@@ -1967,19 +1987,27 @@ impl ConformPlan {
         plan
     }
 
-    /// Pass one column through untouched.
-    fn keep(&mut self, col: &ColInfo, quoted: String) {
-        self.select_list.push(quoted);
-        self.retained.push(col.name.clone());
+    /// Pass one column through — renamed to its folded spelling when the
+    /// stored one differs, untouched otherwise.
+    fn keep(&mut self, col: &ColInfo, folded: &str, quoted: String) {
+        if folded == col.name {
+            self.select_list.push(quoted);
+        } else {
+            self.select_list
+                .push(format!("{quoted} AS {}", quote_ident(folded)));
+            self.renamed += 1;
+        }
+        self.retained.push(folded.to_owned());
     }
 
-    /// Whether the plan rewrites anything at all.
+    /// Whether the plan rewrites anything at all (a cast, a deferred-pin
+    /// drop, or a case-fold rename).
     pub(crate) fn is_noop(&self) -> bool {
-        self.casts.is_empty() && self.dropped.is_empty()
+        self.casts.is_empty() && self.dropped.is_empty() && self.renamed == 0
     }
 
-    /// How many columns the plan casts (a no-cast plan can still drop
-    /// columns, so this is not the inverse of [`Self::is_noop`]).
+    /// How many columns the plan casts (a no-cast plan can still drop or
+    /// rename columns, so this is not the inverse of [`Self::is_noop`]).
     pub(crate) fn cast_count(&self) -> usize {
         self.casts.len()
     }
@@ -3155,6 +3183,54 @@ mod tests {
         );
         assert_eq!(total, 20);
         assert_eq!(nn, 19, "only the string nulls");
+    }
+
+    /// The catalog holds ASCII-folded names only, so the conform plan must
+    /// fold a legacy mixed-case column onto its pin — a type-matching
+    /// column still gets a RENAME (a rewrite, not a no-op), and a cast
+    /// column lands under the folded alias with its conflict evidence
+    /// attributed to the catalog key.
+    #[test]
+    fn conform_plan_folds_mixed_case_columns_onto_their_pins() {
+        let schema = vec![
+            ColInfo {
+                name: "Dur".to_owned(),
+                dtype: "BIGINT".to_owned(),
+            },
+            ColInfo {
+                name: "Note".to_owned(),
+                dtype: "BIGINT".to_owned(),
+            },
+        ];
+        let pins: HashMap<String, CanonicalType> = [
+            ("dur".to_owned(), CanonicalType::BigInt),
+            ("note".to_owned(), CanonicalType::Varchar),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(
+            &schema,
+            &pins,
+            ConformPolicy::StandingFile {
+                time_fallback: chrono::Utc::now(),
+            },
+        );
+        assert!(!plan.is_noop(), "a rename-only plan is still a rewrite");
+        assert_eq!(plan.cast_count(), 1, "only `Note` needs a cast");
+        assert_eq!(plan.retained, vec!["dur", "note"]);
+        assert_eq!(plan.select_list[0], r#""Dur" AS "dur""#);
+        assert!(
+            plan.select_list[1].ends_with(r#" AS "note""#),
+            "the cast lands under the folded alias: {}",
+            plan.select_list[1]
+        );
+
+        // WalBatch: an unpinned mixed-case column is judged by its FOLDED
+        // name — pinned under `dur`, so it is conformed, not dropped.
+        let wal_plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        assert!(wal_plan.dropped.is_empty(), "{:?}", wal_plan.dropped);
+        assert_eq!(wal_plan.retained, vec!["dur", "note"]);
     }
 
     /// Conform-time lossless guarantee: a batch disagreeing with an

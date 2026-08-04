@@ -768,6 +768,89 @@ mod boot {
         assert_eq!(kept, 2, "no populated value was TRY_CAST away");
     }
 
+    fn column_names(path: &std::path::Path) -> Vec<String> {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "DESCRIBE SELECT * FROM read_parquet('{}')",
+                path.display()
+            ))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Parquet written before ingest folded field names can carry
+    /// mixed-case column names. The boot pass folds when seeding — `Dur`
+    /// and `dur` form ONE folded group, most-rows-wins inside it — and the
+    /// rewrite renames columns to the folded form, so the corpus comes out
+    /// with one spelling, one pin, and a clean cross-file union.
+    #[sqlx::test]
+    async fn mixed_case_columns_fold_to_one_pin_and_are_renamed(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // Majority spelling `Dur`, BIGINT, 3 populated rows.
+        let majority = plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS \"Dur\" FROM (VALUES (410), (420), (430)) t(x)",
+        );
+        // Minority spelling `dur`, VARCHAR, 1 row.
+        let minority = plant(
+            &data_dir,
+            "prod/2026-08-01/11/svc-b.parquet",
+            "SELECT TIMESTAMP '2026-08-01 11:00:00' AS \"_time\", 'svc-b' AS service, \
+             '1.5s' AS dur",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+        assert_eq!(
+            summary.rewritten, 2,
+            "the majority file is renamed, the minority file is cast"
+        );
+
+        // ONE pin, under the folded name, decided by most rows in the group.
+        assert_eq!(
+            cache.get("dur"),
+            Some(trawl_core::schema::CanonicalType::BigInt),
+            "the folded group pins once, most-rows-wins"
+        );
+        assert_eq!(cache.get("Dur"), None, "no mixed-case pin may exist");
+
+        // Both files store the FOLDED spelling at the pinned type.
+        for file in [&majority, &minority] {
+            let names = column_names(file);
+            assert!(
+                names.contains(&"dur".to_owned()) && !names.contains(&"Dur".to_owned()),
+                "rewritten file must carry the folded column: {names:?}"
+            );
+            assert_eq!(column_type(file, "dur"), "BIGINT");
+        }
+
+        // The whole corpus reads through one union, one column, all rows.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let (rows, kept): (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT, count(dur)::BIGINT FROM \
+                     read_parquet('{}/**/*.parquet', union_by_name=true)",
+                    data_dir.display()
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 4, "no rows lost");
+        assert_eq!(kept, 3, "the unconvertible '1.5s' nulled (in _raw)");
+    }
+
     #[sqlx::test]
     async fn second_boot_is_a_noop(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
