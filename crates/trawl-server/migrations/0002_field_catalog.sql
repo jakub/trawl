@@ -30,16 +30,12 @@ CREATE TABLE field_types (
 -- compaction and retention never reconciles them — consumers must window
 -- on last_seen so aged-out fields are not offered as live.
 --
--- Bounded on BOTH client-chosen axes: field by the pin cap
+-- Rows are ever-observed: nothing removes one, deliberately — "which
+-- services ever carried this field" is historical fact, not an index over
+-- live files. The field axis is bounded by the pin cap
 -- (store::catalog::MAX_PINNED_FIELDS — an unpinned field is never
--- observed), service by a rolling per-field window of the
--- most-recently-seen store::catalog::MAX_SERVICES_PER_FIELD, trimmed in the
--- same transaction as the upsert. Nothing else ever reclaims a row here
--- (unlike the parallel per-service parquet/WAL axis, which retention
--- reclaims), so without that window a shipper cycling service names would
--- grow this table for the life of the install. Eviction is
--- least-recently-seen, so a live service — refreshed by every batch it
--- compacts — is never evicted by a cycling one.
+-- observed); the service axis is whatever service names a deployment
+-- really ships.
 CREATE TABLE field_services (
     field      TEXT        NOT NULL,
     service    TEXT        NOT NULL,

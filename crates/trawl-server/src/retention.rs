@@ -21,13 +21,11 @@
 //! never reclaim it.
 //!
 //! The field catalog's `field_services` observations are ever-observed:
-//! retention deleting a partition deliberately never reconciles them
-//! (ADR-0009 slice 2 — "which services ever carried this field" is
-//! historical fact, not an index over live files). That table is kept
-//! bounded where it is written instead, by a least-recently-seen window per
-//! field ([`crate::store::MAX_SERVICES_PER_FIELD`]) — service names are
-//! client-chosen, so the axis retention reclaims for parquet needs its own
-//! bound in postgres.
+//! retention deleting a partition deliberately never reconciles them, and
+//! nothing else removes a row either (ADR-0009 slice 2 — "which services
+//! ever carried this field" is historical fact, not an index over live
+//! files). Consumers window on `last_seen`; the field axis is bounded by
+//! the pin cap ([`crate::store::MAX_PINNED_FIELDS`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

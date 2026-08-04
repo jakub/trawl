@@ -1665,21 +1665,13 @@ mod catalog {
     }
 
     #[sqlx::test]
-    async fn touch_services_keeps_only_the_newest_services_per_field(pool: PgPool) {
-        // Service names are client-chosen and nothing else ever reclaims a
-        // `field_services` row (retention reclaims the parallel parquet/WAL
-        // axis, never this one), so the service axis needs its own bound —
-        // otherwise a shipper cycling names grows postgres for the life of
-        // the install.
-        let store = catalog(&pool).with_service_cap(3);
+    async fn touch_services_is_ever_observed_no_eviction(pool: PgPool) {
+        // The acceptance criterion: `field_services` rows are ever-observed.
+        // No window, no eviction — a service observed once stays observed,
+        // however many other services later carry the field. Consumers
+        // window on `last_seen`.
+        let store = catalog(&pool);
         let fields = vec!["duration".to_owned()];
-
-        // A field this call never touches is never ranked, so another
-        // field's write cannot trim it.
-        store
-            .touch_services("svc-a", &["other".to_owned()], 1)
-            .await
-            .unwrap();
 
         for name in ["svc-a", "svc-b", "svc-c", "svc-d", "svc-e"] {
             store.touch_services(name, &fields, 1).await.unwrap();
@@ -1690,31 +1682,8 @@ mod catalog {
         let kept: Vec<&str> = rows.iter().map(|r| r.service.as_str()).collect();
         assert_eq!(
             kept,
-            vec!["svc-e", "svc-d", "svc-c"],
-            "the window bounds the observations per field, least-recently-seen out first"
-        );
-        assert_eq!(
-            store.field_services("other").await.unwrap().len(),
-            1,
-            "trimming touches only the fields the call wrote"
-        );
-
-        // Eviction is least-recently-seen, so a service that is still
-        // shipping survives any number of one-shot names cycling past it.
-        store.touch_services("svc-c", &fields, 1).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        store.touch_services("svc-f", &fields, 1).await.unwrap();
-
-        let rows = store.field_services("duration").await.unwrap();
-        let kept: Vec<&str> = rows.iter().map(|r| r.service.as_str()).collect();
-        assert_eq!(
-            kept,
-            vec!["svc-f", "svc-c", "svc-e"],
-            "a live service is never evicted by a cycling one"
-        );
-        assert_eq!(
-            rows[1].row_count, 2,
-            "a surviving row keeps its accumulated observations"
+            vec!["svc-e", "svc-d", "svc-c", "svc-b", "svc-a"],
+            "every service ever observed is still there, most recent first"
         );
     }
 
