@@ -496,21 +496,22 @@ pub async fn schema(
         catalog_schema_columns(&state, params.service.clone(), since).await?
     } else {
         // Hold the mutex for the full check-then-refresh cycle, like the
-        // corpus facts below: only one request runs the aggregate.
+        // corpus facts below: only one request runs the aggregate. The two
+        // request shapes (windowed / `?all=true`) each own a slot, so
+        // alternating traffic cannot evict the other shape's entry — see
+        // `schema_columns_cache` in state.rs.
         let mut cache = state.query.schema_columns_cache.lock().await;
-        let windowed = since.is_some();
-        let fresh = cache.as_ref().and_then(|c| {
-            let live = c.windowed == windowed
-                && c.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs;
-            live.then(|| c.columns.clone())
+        let slot = &mut cache[usize::from(since.is_some())];
+        let fresh = slot.as_ref().and_then(|c| {
+            (c.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs)
+                .then(|| c.columns.clone())
         });
         if let Some(columns) = fresh {
             columns
         } else {
             let columns = catalog_schema_columns(&state, None, since).await?;
-            *cache = Some(crate::state::CachedSchemaColumns {
+            *slot = Some(crate::state::CachedSchemaColumns {
                 columns: columns.clone(),
-                windowed,
                 cached_at: std::time::Instant::now(),
             });
             columns

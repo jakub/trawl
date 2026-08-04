@@ -78,8 +78,15 @@ pub struct QueryState {
     pub schema_cache: Arc<tokio::sync::Mutex<Option<CachedCorpusFacts>>>,
     /// Cached UNSCOPED `/api/v1/schema` column set (a catalog SELECT that
     /// aggregates every service's observations), under the same TTL and the
-    /// same thundering-herd discipline as the corpus facts.
-    pub schema_columns_cache: Arc<tokio::sync::Mutex<Option<CachedSchemaColumns>>>,
+    /// same thundering-herd discipline as the corpus facts. Two slots —
+    /// windowed at `usize::from(windowed)` — because there are exactly two
+    /// unscoped request shapes (`?all=true` lifts the retention window) and
+    /// each entry must survive requests of the OTHER shape: this cache is
+    /// the only bound on the whole-table aggregate behind it (migration
+    /// 0003), and a single shared slot let alternating `/schema` /
+    /// `/schema?all=true` traffic evict each other into a 100% miss rate,
+    /// every miss running the aggregate while holding the mutex.
+    pub schema_columns_cache: Arc<tokio::sync::Mutex<[Option<CachedSchemaColumns>; 2]>>,
     /// Cached field value samples for autocomplete (shared TTL with schema cache).
     pub field_values_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedFieldValues>>>,
     /// Hot buffer for fresh events not yet compacted to parquet.
@@ -345,15 +352,12 @@ pub struct CachedCorpusFacts {
 /// scoped listing is already bounded by the pin cap through the
 /// `field_services (service, field)` index (migration 0003), while the
 /// unscoped one aggregates every service's observations and is what the
-/// autocomplete polls.
+/// autocomplete polls. The windowed/unwindowed shape lives in WHICH slot
+/// of `schema_columns_cache` holds the entry, not in the entry itself.
 #[derive(Debug, Clone)]
 pub struct CachedSchemaColumns {
     /// The catalog-served columns, already in display order.
     pub columns: Vec<SchemaColumnResponse>,
-    /// Whether the retention window was applied (`?all=true` lifts it). A
-    /// request of the other shape is a miss and replaces the entry — there
-    /// are only ever these two shapes, so the cache stays a single slot.
-    pub windowed: bool,
     /// When this cache entry was created.
     pub cached_at: Instant,
 }
@@ -499,7 +503,7 @@ impl AppState {
                 retention_max_age_days: config.retention.max_age_days,
                 max_export_rows: config.server.max_export_rows,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
-                schema_columns_cache: Arc::new(tokio::sync::Mutex::new(None)),
+                schema_columns_cache: Arc::new(tokio::sync::Mutex::new([None, None])),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 field_catalog,
                 hot_buffer,
