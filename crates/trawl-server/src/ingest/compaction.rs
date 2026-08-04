@@ -1800,13 +1800,25 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
 /// with no `field_conflicts` row.
 ///
 /// The comparison space is chosen per rung (all probed by execution):
-/// - `BIGINT`/`DOUBLE` compare the cast against the value's canonical text
-///   re-parsed in DOUBLE space: rounding is refused (`1.5 ≠ 2`) while
-///   representation drift is tolerated (`4.0 = 4`, `"042" = 42`), and
-///   `u64::MAX` passes the DOUBLE rung despite DOUBLE's >2^53 precision loss
-///   — a strict text comparison would fail it
-///   (`1.8446744073709552e+19 ≠ 18446744073709551615`) and regress the
-///   u64-range-pins-DOUBLE acceptance case;
+/// - `BIGINT` compares the cast against the value's canonical text
+///   re-parsed as `DECIMAL(38,6)` — an EXACT integer space across the whole
+///   BIGINT range. A DOUBLE-space comparison was blind above 2^53 (both
+///   sides collapse to the same double, so `1735689600123456710.7`
+///   conformed BIGINT as `...711` with no conflict — the original
+///   silent-rounding failure mode, moved up the number line). DECIMAL
+///   keeps every currently-accepted case (`4.0 = 4`, `"042" = 42`,
+///   `1e3 = 1000`, `2^53 ± 1` exact, `i64::MAX`/`MIN`) and every rejection
+///   (`1.5`, `n/a`, `0x10`, `''`, `u64::MAX` still NULLs the cast), while
+///   correctly refusing >2^53 fractional values. Residual tolerance: a
+///   fraction below `DECIMAL(38,6)`'s half-microstep (`4.0000001`)
+///   quantizes to the integer and is absorbed as representation drift —
+///   rounding is refused above `0.5e-6`, not below;
+/// - `DOUBLE` compares in DOUBLE space, which is deliberately
+///   precision-tolerant: `u64::MAX` must pass the DOUBLE rung despite
+///   DOUBLE's >2^53 precision loss — a strict text comparison would fail
+///   it (`1.8446744073709552e+19 ≠ 18446744073709551615`) and regress the
+///   u64-range-pins-DOUBLE acceptance case; pinning DOUBLE *means*
+///   accepting DOUBLE's precision;
 /// - `TIMESTAMP` compares in TIMESTAMP space, tolerating format drift
 ///   (RFC 3339 `T`/`Z` vs `DuckDB`'s space-separated rendering, `DATE` at
 ///   midnight) — a text no parser reads still becomes NULL;
@@ -1825,7 +1837,10 @@ fn lossless_cast(quoted: &str, upper_dtype: &str, pin: CanonicalType) -> String 
     };
     let cast = format!("TRY_CAST({quoted} AS {})", pin.as_duckdb());
     let ok = match pin {
-        CanonicalType::BigInt | CanonicalType::Double => {
+        CanonicalType::BigInt => {
+            format!("TRY_CAST({canon} AS DECIMAL(38,6)) = TRY_CAST({cast} AS DECIMAL(38,6))")
+        }
+        CanonicalType::Double => {
             format!("TRY_CAST({canon} AS DOUBLE) = {cast}")
         }
         CanonicalType::Timestamp => format!("TRY_CAST({canon} AS TIMESTAMP) = {cast}"),
@@ -3155,6 +3170,101 @@ mod tests {
             values,
             vec!["1.5".to_owned(), "<null>".to_owned()],
             "the fractional values survive unrounded"
+        );
+    }
+
+    /// The >2^53 boundary: a DOUBLE-space round-trip is blind up there
+    /// (both sides collapse to one double), so a nanosecond-epoch-magnitude
+    /// fractional batch scored 100% on the BIGINT rung and conformed as
+    /// silently rounded integers. The DECIMAL(38,6) comparison refuses it —
+    /// the batch pins DOUBLE — while a >2^53 INTEGER batch still pins
+    /// BIGINT exactly.
+    #[test]
+    fn pin_ladder_beyond_2_pow_53_fractional_pins_double_integer_pins_bigint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut records: Vec<String> = (0..19)
+            .map(|i| record_with("ns_frac", "1735689600123456710.7", i))
+            .collect();
+        records.push(record_with("ns_frac", "\"n/a\"", 19));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir, "svc", &refs);
+        compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        let (dtype, nn, total) = column_stats(&parquet[0], "ns_frac");
+        assert_eq!(
+            dtype, "DOUBLE",
+            ">2^53 fractional must NOT pin BIGINT (DOUBLE-space was blind here)"
+        );
+        assert_eq!((nn, total), (19, 20));
+
+        // Same magnitude, integral: exact in DECIMAL space, pins BIGINT.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let (wal_dir2, data_dir2) = (tmp2.path().join("wal"), tmp2.path().join("data"));
+        std::fs::create_dir_all(&wal_dir2).unwrap();
+        let mut records: Vec<String> = (0..19)
+            .map(|i| record_with("ns_int", "1735689600123456710", i))
+            .collect();
+        records.push(record_with("ns_int", "\"n/a\"", 19));
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let f = write_wal_file(&wal_dir2, "svc", &refs);
+        compact_service_blocking(&[f], &data_dir2, "svc", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir2, "parquet");
+        let (dtype, nn, _) = column_stats(&parquet[0], "ns_int");
+        assert_eq!(dtype, "BIGINT", ">2^53 integers are exact and pin BIGINT");
+        assert_eq!(nn, 19);
+        let values = read_strings(
+            &parquet[0],
+            "DISTINCT COALESCE(CAST(ns_int AS VARCHAR), '<null>')",
+        );
+        assert!(
+            values.contains(&"1735689600123456710".to_owned()),
+            "the integer survives bit-exact, no double round-off: {values:?}"
+        );
+    }
+
+    /// Conform-time twin of the boundary case: against an existing BIGINT
+    /// pin, a >2^53 fractional value must NULL and tally — never write the
+    /// rounded `...711`.
+    #[test]
+    fn conform_to_bigint_pin_nulls_beyond_2_pow_53_fractionals() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT * FROM (VALUES ('1735689600123456710.7'), ('1735689600123456710')) t(ns)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [("ns".to_owned(), CanonicalType::BigInt)]
+            .into_iter()
+            .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].rows_nulled, 1,
+            "exactly the fractional row is a recorded loss"
+        );
+
+        let rows: Vec<Option<i64>> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {} FROM wal_batch ORDER BY 1 NULLS FIRST",
+                    plan.select_list.join(", ")
+                ))
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![None, Some(1_735_689_600_123_456_710)],
+            "the fractional writes NULL (never ...711); the integer is exact"
         );
     }
 

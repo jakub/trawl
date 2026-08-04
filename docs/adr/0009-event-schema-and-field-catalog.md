@@ -368,15 +368,22 @@ the bundled DuckDB 1.5.5 and are pinned in
   which fixes ladder scoring, the written value, and the conflict tally in
   one expression: a lossy cast scores as a rung failure, writes NULL, and
   counts into `field_conflicts`/`rows_nulled`. Comparison spaces are chosen
-  per rung, from probe evidence: BIGINT/DOUBLE compare the cast against the
-  value's canonical text re-parsed in DOUBLE space (rounding refused,
-  representation drift tolerated — `4.0 = 4`, and u64::MAX still pins
-  DOUBLE, since pinning DOUBLE *means* accepting DOUBLE's >2^53 precision);
-  TIMESTAMP compares in TIMESTAMP space (format drift tolerated, parse
-  failures still NULL); BOOLEAN compares strict text, so `1` never conforms
-  to `true`. A corollary: `TRY_CAST(true AS BIGINT) = 1` no longer counts,
-  so the previously-unreachable Boolean rung is live — a ≥90%-boolean batch
-  pins BOOLEAN.
+  per rung, from probe evidence: BIGINT compares the cast against the
+  value's canonical text re-parsed as `DECIMAL(38,6)` — exact across the
+  whole BIGINT range, because a DOUBLE-space comparison is blind above 2^53
+  (both sides collapse to one double, so a nanosecond-epoch-magnitude
+  fractional like `1735689600123456710.7` conformed BIGINT silently — the
+  same failure mode, moved up the number line); rounding is refused above
+  `DECIMAL(38,6)`'s half-microstep while representation drift is tolerated
+  (`4.0 = 4`, `"042" = 42`, and a sub-microstep fraction like `4.0000001`
+  quantizes away — the residual, documented tolerance). DOUBLE compares in
+  DOUBLE space (u64::MAX still pins DOUBLE, since pinning DOUBLE *means*
+  accepting DOUBLE's >2^53 precision); TIMESTAMP compares in TIMESTAMP
+  space (format drift tolerated, parse failures still NULL); BOOLEAN
+  compares strict text, so `1` never conforms to `true`. A corollary:
+  `TRY_CAST(true AS BIGINT) = 1` no longer counts, so the
+  previously-unreachable Boolean rung is live — a ≥90%-boolean batch pins
+  BOOLEAN.
 - **Field names are ASCII-lowercased at ingest, before anything reads
   them.** Catalog pins were case-sensitive (postgres TEXT keys on raw
   client JSON spellings) while DuckDB identifiers are ASCII

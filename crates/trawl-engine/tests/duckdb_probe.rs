@@ -81,14 +81,19 @@ fn untyped_varchar_conform_expression_is_unquoted_across_inference_classes() {
 ///
 /// 1. the PREMISE: the unguarded cast really does round (a `DuckDB` bump
 ///    that makes it fail instead would let the guard be simplified), and
-/// 2. the GUARD as compaction emits it (`conform_expr`): BIGINT/DOUBLE
-///    compare the cast against the value's canonical text re-parsed in
-///    DOUBLE space (tolerating representation drift — `4.0 → 4`,
-///    `"042" → 42`, and `u64::MAX` → DOUBLE with precision loss, which the
-///    AC requires); TIMESTAMP compares in TIMESTAMP space (tolerating
-///    format drift — RFC 3339 `T`/`Z` vs `DuckDB`'s space-separated
-///    rendering); BOOLEAN compares strict text (`true`/`false` only, so
-///    `1` never conforms to a BOOLEAN pin).
+/// 2. the GUARD as compaction emits it (`conform_expr`): BIGINT compares
+///    the cast against the value's canonical text re-parsed as
+///    `DECIMAL(38,6)` — exact across the whole BIGINT range, where a
+///    DOUBLE-space comparison is blind above 2^53 (both sides collapse to
+///    one double, so `1735689600123456710.7` conformed BIGINT silently);
+///    representation drift is still tolerated (`4.0 → 4`, `"042" → 42`),
+///    as is a fraction below DECIMAL(38,6)'s half-microstep
+///    (`4.0000001 → 4` — the residual, documented tolerance). DOUBLE
+///    compares in DOUBLE space (`u64::MAX` → DOUBLE with precision loss,
+///    which the AC requires); TIMESTAMP compares in TIMESTAMP space
+///    (tolerating format drift — RFC 3339 `T`/`Z` vs `DuckDB`'s
+///    space-separated rendering); BOOLEAN compares strict text
+///    (`true`/`false` only, so `1` never conforms to a BOOLEAN pin).
 #[test]
 #[allow(clippy::too_many_lines)] // one probe per comparison-space decision, kept together
 fn typed_casts_round_so_the_conform_guard_must_round_trip() {
@@ -150,7 +155,8 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     // --- the guard, exactly as conform_expr emits it ---
     // canon(x) is json_extract_string(x,'$') for a JSON column, else
     // CAST(x AS VARCHAR).
-    let guard_bigint_json = "(CASE WHEN TRY_CAST(json_extract_string(m, '$') AS DOUBLE) = TRY_CAST(m AS BIGINT) \
+    let guard_bigint_json = "(CASE WHEN TRY_CAST(json_extract_string(m, '$') AS DECIMAL(38,6)) = \
+          TRY_CAST(TRY_CAST(m AS BIGINT) AS DECIMAL(38,6)) \
           THEN TRY_CAST(m AS BIGINT) END)";
     let rows: Vec<(String, Option<i64>)> = {
         let mut stmt = conn
@@ -174,8 +180,9 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     let varchar_cases: Vec<(String, Option<i64>)> = {
         let mut stmt = conn
             .prepare(
-                "SELECT v, (CASE WHEN TRY_CAST(CAST(v AS VARCHAR) AS DOUBLE) = \
-                 TRY_CAST(v AS BIGINT) THEN TRY_CAST(v AS BIGINT) END) \
+                "SELECT v, (CASE WHEN TRY_CAST(CAST(v AS VARCHAR) AS DECIMAL(38,6)) = \
+                 TRY_CAST(TRY_CAST(v AS BIGINT) AS DECIMAL(38,6)) \
+                 THEN TRY_CAST(v AS BIGINT) END) \
                  FROM (VALUES ('42'), ('042'), ('1.5'), ('n/a')) t(v) ORDER BY v",
             )
             .unwrap();
@@ -201,8 +208,8 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     let (bi_ok, db_ok): (i64, i64) = conn
         .query_row(
             &format!(
-                "SELECT count(CASE WHEN TRY_CAST(CAST(u AS VARCHAR) AS DOUBLE) = \
-                        TRY_CAST(u AS BIGINT) THEN 1 END)::BIGINT, \
+                "SELECT count(CASE WHEN TRY_CAST(CAST(u AS VARCHAR) AS DECIMAL(38,6)) = \
+                        TRY_CAST(TRY_CAST(u AS BIGINT) AS DECIMAL(38,6)) THEN 1 END)::BIGINT, \
                         count(CASE WHEN TRY_CAST(CAST(u AS VARCHAR) AS DOUBLE) = \
                         TRY_CAST(u AS DOUBLE) THEN 1 END)::BIGINT FROM {reader} \
                  WHERE CAST(u AS VARCHAR) = '18446744073709551615'"
@@ -243,8 +250,8 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         .query_row(
             &format!(
                 "SELECT count(TRY_CAST(b AS BIGINT))::BIGINT, \
-                        count(CASE WHEN TRY_CAST(json_extract_string(b,'$') AS DOUBLE) = \
-                        TRY_CAST(b AS BIGINT) THEN 1 END)::BIGINT, \
+                        count(CASE WHEN TRY_CAST(json_extract_string(b,'$') AS DECIMAL(38,6)) = \
+                        TRY_CAST(TRY_CAST(b AS BIGINT) AS DECIMAL(38,6)) THEN 1 END)::BIGINT, \
                         count(CASE WHEN CAST(TRY_CAST(b AS BOOLEAN) AS VARCHAR) = \
                         json_extract_string(b,'$') THEN 1 END)::BIGINT FROM {breader}"
             ),
@@ -284,6 +291,90 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         ],
         "TIMESTAMP round-trip is format-tolerant, parse failures still fail"
     );
+}
+
+/// Why the BIGINT rung compares in `DECIMAL(38,6)` space and not DOUBLE:
+/// above 2^53 both sides of a DOUBLE comparison collapse to the same
+/// double, so a nanosecond-epoch-magnitude fractional value
+/// (`1735689600123456710.7`) "round-tripped" and conformed BIGINT as
+/// `...711` — the silent-rounding failure mode the guard exists to refuse,
+/// moved up the number line. This pins the boundary classes: 2^53 ± 1 must
+/// stay exact accepts, the >2^53 fractional must fail, a >2^53 INTEGER must
+/// still pass (DECIMAL is exact where DOUBLE-space merely could not
+/// distinguish), `u64::MAX` still NULLs the cast, and the residual
+/// tolerance — a fraction below DECIMAL(38,6)'s half-microstep quantizes
+/// away (`4.0000001 → 4` accepted, `4.5` refused) — is deliberate and
+/// documented, not an accident a bump may silently change.
+#[test]
+fn bigint_round_trip_is_exact_in_decimal_space_beyond_2_pow_53() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+
+    // The DOUBLE-space blindness this replaces, kept as the premise.
+    let blind: bool = conn
+        .query_row(
+            "SELECT TRY_CAST('1735689600123456710.7' AS DOUBLE) = \
+             TRY_CAST('1735689600123456710.7' AS BIGINT)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        blind,
+        "premise: DOUBLE-space comparison is blind above 2^53 — if a DuckDB \
+         bump changes this, the DECIMAL space is defence, not necessity"
+    );
+
+    let cases: Vec<(String, Option<i64>)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT v, (CASE WHEN TRY_CAST(CAST(v AS VARCHAR) AS DECIMAL(38,6)) = \
+                 TRY_CAST(TRY_CAST(v AS BIGINT) AS DECIMAL(38,6)) \
+                 THEN TRY_CAST(v AS BIGINT) END) \
+                 FROM (VALUES ('9007199254740991'), ('9007199254740992'), \
+                              ('9007199254740993'), ('1735689600123456710.7'), \
+                              ('1735689600123456710'), ('18446744073709551615'), \
+                              ('9223372036854775807'), ('-9223372036854775808'), \
+                              ('4.0000001'), ('4.5')) t(v)",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        cases,
+        vec![
+            ("9007199254740991".into(), Some(9_007_199_254_740_991)),
+            ("9007199254740992".into(), Some(9_007_199_254_740_992)),
+            ("9007199254740993".into(), Some(9_007_199_254_740_993)),
+            ("1735689600123456710.7".into(), None),
+            (
+                "1735689600123456710".into(),
+                Some(1_735_689_600_123_456_710)
+            ),
+            ("18446744073709551615".into(), None),
+            ("9223372036854775807".into(), Some(i64::MAX)),
+            ("-9223372036854775808".into(), Some(i64::MIN)),
+            ("4.0000001".into(), Some(4)),
+            ("4.5".into(), None),
+        ],
+        "DECIMAL(38,6) round-trip: exact across the BIGINT range, refusing \
+         rounding above the half-microstep"
+    );
+
+    // The DOUBLE rung deliberately keeps DOUBLE space: the >2^53 fractional
+    // that the BIGINT rung now refuses still passes DOUBLE (it pins DOUBLE
+    // with DOUBLE's precision, which is what pinning DOUBLE means).
+    let db_ok: bool = conn
+        .query_row(
+            "SELECT TRY_CAST('1735689600123456710.7' AS DOUBLE) = \
+             TRY_CAST('1735689600123456710.7' AS DOUBLE)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(db_ok, "the value stays representable on the DOUBLE rung");
 }
 
 /// `DuckDB` identifiers are case-INSENSITIVE, but only over ASCII — a
