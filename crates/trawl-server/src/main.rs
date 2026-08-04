@@ -139,12 +139,17 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
     if let Some(ref path) = query_log_path {
-        let log = trawl_server::query_log::QueryLog::open(path)
-            .map_err(|e| format!("failed to open query log {}: {e}", path.display()))?;
-        tracing::info!(
-            event_type = "lifecycle",
+        let log =
+            trawl_server::query_log::QueryLog::open(path, config.server.query_log_max_bytes as u64)
+                .map_err(|e| format!("failed to open query log {}: {e}", path.display()))?;
+        tracing::warn!(
+            event_type = "query_log_enabled",
             path = %path.display(),
-            "query debug log enabled"
+            max_bytes = config.server.query_log_max_bytes,
+            "query debug log enabled — this file records raw query text, \
+             SQL parameter values, and result samples; it is owner-only \
+             (0600) and rolls over to a single retained .1 sibling at \
+             query_log_max_bytes (0 = unbounded)"
         );
         state.query.query_log = Some(Arc::new(log));
     }

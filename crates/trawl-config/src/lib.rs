@@ -96,7 +96,21 @@ pub struct ServerConfig {
 
     /// Optional query debug log path. When set, every query execution is
     /// logged as ndjson to this file for `tail -f | jq` debugging.
+    ///
+    /// Sensitive: entries combine identity, raw query text, SQL parameter
+    /// values, source paths, and result samples. The file is owner-only
+    /// (`0600`) on Unix and bounded by `query_log_max_bytes`.
     pub query_log: Option<PathBuf>,
+
+    /// Size cap for the query debug log. Past it the file rolls over to a
+    /// single retained `<path>.1`. Default: 100 MiB. `0` disables
+    /// rollover (unbounded file). Accepts human-readable sizes like
+    /// `"100M"`.
+    #[serde(
+        default = "default_query_log_max_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub query_log_max_bytes: usize,
 
     /// Allowed CORS origins (e.g. `["https://trawl.example.com"]`).
     /// Empty list (default) means no CORS headers are sent, so the browser's
@@ -1136,6 +1150,13 @@ fn default_schema_cache_ttl_secs() -> u64 {
 
 fn default_max_query_history() -> usize {
     DEFAULT_MAX_QUERY_HISTORY
+}
+
+/// Default query debug log size cap (100 MiB; `0` disables rollover).
+pub const DEFAULT_QUERY_LOG_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+fn default_query_log_max_bytes() -> usize {
+    DEFAULT_QUERY_LOG_MAX_BYTES
 }
 
 fn default_max_sse_connections() -> usize {

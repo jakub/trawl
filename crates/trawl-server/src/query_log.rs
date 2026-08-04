@@ -7,31 +7,78 @@
 //! One JSON object per query execution, capturing DSL, generated SQL,
 //! source paths, hot buffer state, result sample, and timing. Designed
 //! for `tail -f /tmp/trawl-query.log | jq` debugging workflows.
+//!
+//! This file is MORE sensitive than the underlying event corpus: one
+//! record combines identity, raw query text, SQL parameter values,
+//! filesystem layout, and result samples. It is therefore owner-only
+//! (`0600` on Unix, tightening a pre-existing looser file at open) and
+//! size-bounded: past `server.query_log_max_bytes` the file rolls over
+//! to a single retained `<path>.1` (also owner-only; `0` disables
+//! rollover).
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-/// Append-only ndjson query debug log.
+/// Append-only ndjson query debug log with owner-only permissions and
+/// single-file rollover.
 pub struct QueryLog {
-    writer: Mutex<BufWriter<File>>,
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    writer: BufWriter<File>,
+    path: PathBuf,
+    /// Rollover threshold in bytes; `0` disables rollover.
+    max_bytes: u64,
+    /// Current size of the active file.
+    size: u64,
+}
+
+/// Open `path` for appending, owner-only on Unix (`0600` at creation,
+/// and a pre-existing looser file is tightened).
+fn open_owner_only(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    // `mode` only applies at creation — tighten a pre-existing file too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 impl QueryLog {
-    /// Open (or create) a query log file in append mode.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+    /// Open (or create) a query log file in append mode, owner-only on
+    /// Unix. `max_bytes` bounds the file: past it the log rolls over to a
+    /// single retained `<path>.1`; `0` disables rollover.
+    pub fn open(path: &Path, max_bytes: u64) -> io::Result<Self> {
+        let file = open_owner_only(path)?;
+        let size = file.metadata()?.len();
         Ok(Self {
-            writer: Mutex::new(BufWriter::new(file)),
+            inner: Mutex::new(Inner {
+                writer: BufWriter::new(file),
+                path: path.to_path_buf(),
+                max_bytes,
+                size,
+            }),
         })
     }
 
-    /// Serialize and append an entry. Never panics or propagates errors —
+    /// Serialize and append an entry, rolling the file over first when it
+    /// would exceed the size cap. Never panics or propagates errors —
     /// serialization failure is a bug, I/O failure is logged via tracing.
     pub fn write(&self, entry: &QueryLogEntry) {
         let line = match serde_json::to_string(entry) {
@@ -41,17 +88,43 @@ impl QueryLog {
                 return;
             }
         };
-        let Ok(mut writer) = self.writer.lock() else {
+        let Ok(mut inner) = self.inner.lock() else {
             tracing::warn!("query log mutex poisoned, skipping entry");
             return;
         };
-        if let Err(e) = writeln!(writer, "{line}") {
+        let line_bytes = line.len() as u64 + 1;
+        if inner.max_bytes > 0
+            && inner.size > 0
+            && inner.size + line_bytes > inner.max_bytes
+            && let Err(e) = inner.rollover()
+        {
+            // Keep writing to the over-cap file rather than lose the
+            // entry — the cap is a bound, not a durability contract.
+            tracing::warn!(error = %e, "query log rollover failed; continuing in current file");
+        }
+        if let Err(e) = writeln!(inner.writer, "{line}") {
             tracing::warn!(error = %e, "failed to write query log entry");
             return;
         }
-        if let Err(e) = writer.flush() {
+        inner.size += line_bytes;
+        if let Err(e) = inner.writer.flush() {
             tracing::warn!(error = %e, "failed to flush query log");
         }
+    }
+}
+
+impl Inner {
+    /// Roll the active file over to `<path>.1` (replacing any previous
+    /// rotated file — exactly one previous generation is retained) and
+    /// reopen a fresh active file. The rename preserves the `0600` mode.
+    fn rollover(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        let mut rotated = self.path.clone().into_os_string();
+        rotated.push(".1");
+        std::fs::rename(&self.path, PathBuf::from(rotated))?;
+        self.writer = BufWriter::new(open_owner_only(&self.path)?);
+        self.size = 0;
+        Ok(())
     }
 }
 
@@ -136,4 +209,139 @@ pub struct TimingDebug {
     pub pool_wait: u64,
     /// Total query execution time (ms).
     pub total: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn entry(marker: &str) -> QueryLogEntry {
+        QueryLogEntry {
+            ts: "2026-01-01T00:00:00Z".into(),
+            user: "tester".into(),
+            role: "analyst".into(),
+            dsl: marker.to_owned(),
+            source: SourceDebug {
+                computed: String::new(),
+                globs: 0,
+                service_filter: None,
+                time_filter_secs: None,
+                is_fallback: false,
+            },
+            hot_buffer: HotBufferDebug {
+                status: "disabled",
+                events: 0,
+                batches: 0,
+                bytes: 0,
+            },
+            sql: "SELECT 1".into(),
+            params: vec![],
+            result: ResultDebug {
+                status: "success",
+                columns: vec![],
+                row_count: 0,
+                sample: vec![],
+            },
+            timing_ms: TimingDebug {
+                pool_wait: 0,
+                total: 0,
+            },
+            error: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_owner_only_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let _log = QueryLog::open(&path, 0).unwrap();
+        assert_eq!(mode_of(&path), 0o600, "query log must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_tightens_existing_looser_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        std::fs::write(&path, "{}\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _log = QueryLog::open(&path, 0).unwrap();
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "pre-existing query log must be tightened to owner-only"
+        );
+    }
+
+    #[test]
+    fn rollover_at_cap_leaves_current_and_one_previous_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let rotated = tmp.path().join("query.log.1");
+
+        // Cap small enough that the second entry triggers a rollover.
+        let probe = serde_json::to_string(&entry("first")).unwrap();
+        let cap = (probe.len() + 10) as u64;
+
+        let log = QueryLog::open(&path, cap).unwrap();
+        log.write(&entry("first"));
+        log.write(&entry("second"));
+
+        assert!(rotated.exists(), "rollover must create <path>.1");
+        let old = std::fs::read_to_string(&rotated).unwrap();
+        let new = std::fs::read_to_string(&path).unwrap();
+        assert!(old.contains("first"), "rotated file keeps older entries");
+        assert!(new.contains("second"), "current file has newer entries");
+        assert!(!new.contains("first"), "entries are split, not duplicated");
+
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_of(&path), 0o600);
+            assert_eq!(mode_of(&rotated), 0o600, "rotated file stays owner-only");
+        }
+    }
+
+    #[test]
+    fn rollover_replaces_previous_rotated_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let rotated = tmp.path().join("query.log.1");
+
+        let probe = serde_json::to_string(&entry("aaaaa")).unwrap();
+        let cap = (probe.len() + 10) as u64;
+
+        let log = QueryLog::open(&path, cap).unwrap();
+        log.write(&entry("aaaaa"));
+        log.write(&entry("bbbbb")); // rotates: .1 = aaaaa
+        log.write(&entry("ccccc")); // rotates: .1 = bbbbb
+
+        let old = std::fs::read_to_string(&rotated).unwrap();
+        assert!(old.contains("bbbbb"), "only ONE previous file is retained");
+        assert!(!old.contains("aaaaa"), "oldest generation is gone");
+        let files: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        assert_eq!(files.len(), 2, "exactly path + path.1");
+    }
+
+    #[test]
+    fn zero_cap_disables_rollover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+
+        let log = QueryLog::open(&path, 0).unwrap();
+        for i in 0..50 {
+            log.write(&entry(&format!("entry_{i}")));
+        }
+        assert!(!tmp.path().join("query.log.1").exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("entry_0") && content.contains("entry_49"));
+    }
 }

@@ -277,11 +277,7 @@ async fn run(args: Cli) -> Result<(), CliError> {
             // TUI mode — tracing goes to a log file, not stderr (which corrupts the UI).
             let log_dir = shellexpand::tilde("~/.config/trawl");
             std::fs::create_dir_all(log_dir.as_ref())?;
-            let log_file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(format!("{log_dir}/tui.log"))?;
+            let log_file = open_tui_log(std::path::Path::new(&format!("{log_dir}/tui.log")))?;
 
             tracing_subscriber::fmt()
                 .with_writer(Mutex::new(log_file))
@@ -525,6 +521,57 @@ async fn driver_send(
         ));
     }
     Ok(resp)
+}
+
+/// Open the TUI trace log truncated and owner-only on Unix (`0600`,
+/// tightening a pre-existing looser file) — tracing output can carry
+/// query text and server responses.
+fn open_tui_log(path: &std::path::Path) -> io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    // `mode` only applies at creation — tighten a pre-existing file too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+#[cfg(all(test, unix))]
+mod tui_log_tests {
+    use super::open_tui_log;
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn tui_log_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tui.log");
+        let _file = open_tui_log(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn tui_log_tightens_existing_looser_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tui.log");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _file = open_tui_log(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
 }
 
 /// Render driver response data containing columns + rows.
