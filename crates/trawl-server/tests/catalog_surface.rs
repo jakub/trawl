@@ -198,6 +198,44 @@ async fn schema_service_param_scopes_fields(pool: sqlx::PgPool) {
     );
 }
 
+/// Regression: the UNSCOPED column set is TTL-cached (its aggregate spans
+/// every service, and the service axis is client-chosen and unbounded)
+/// while `?service=` is served fresh. The two must not share a slot — a
+/// scoped request must neither be answered from the unscoped cache nor
+/// poison it for the next unscoped caller.
+#[sqlx::test(migrations = false)]
+async fn schema_service_scope_bypasses_the_unscoped_cache(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    ingest_and_compact(&h, &[event("svc-a", &json!({"alpha_field": 1}))]).await;
+    ingest_and_compact(&h, &[event("svc-b", &json!({"beta_field": 2}))]).await;
+
+    // Prime the unscoped cache: both services' fields.
+    let (_, schema) = h.get(&h.server.analyst_token, "/schema").await;
+    let names = Harness::column_names(&schema);
+    assert!(
+        names.iter().any(|n| n == "beta_field"),
+        "unscoped listing spans services: {names:?}"
+    );
+
+    // Scoped: bypasses the cache entirely, so svc-b's field is gone.
+    let (_, schema) = h
+        .get(&h.server.analyst_token, "/schema?service=svc-a")
+        .await;
+    let names = Harness::column_names(&schema);
+    assert!(
+        !names.iter().any(|n| n == "beta_field"),
+        "a scoped request is never served the cached unscoped listing: {names:?}"
+    );
+
+    // And the unscoped listing is unchanged after it.
+    let (_, schema) = h.get(&h.server.analyst_token, "/schema").await;
+    let names = Harness::column_names(&schema);
+    assert!(
+        names.iter().any(|n| n == "beta_field"),
+        "a scoped request must not poison the unscoped cache: {names:?}"
+    );
+}
+
 /// Acceptance: a field whose last observation predates the retention window
 /// is absent from `/schema` by default and present with `?all=true`.
 #[sqlx::test(migrations = false)]

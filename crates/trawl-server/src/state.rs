@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
-use trawl_api::{DashboardSnapshot, ServiceSchema};
+use trawl_api::{DashboardSnapshot, SchemaColumnResponse, ServiceSchema};
 
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
@@ -71,13 +71,15 @@ pub struct QueryState {
     /// Maximum rows for export responses (bypasses `max_result_rows`).
     pub max_export_rows: usize,
     /// Cached corpus facts (dates/bytes/services/file count from the
-    /// filesystem walk) with TTL. The schema COLUMNS are no longer cached —
-    /// they are a catalog SELECT (ADR-0009 slice 3); only the FS walk keeps
-    /// its TTL cache.
+    /// filesystem walk) with TTL.
     ///
     /// Uses `Mutex` (not `RwLock`) to prevent thundering herd: only one
     /// request refreshes the cache while others wait on the lock.
     pub schema_cache: Arc<tokio::sync::Mutex<Option<CachedCorpusFacts>>>,
+    /// Cached UNSCOPED `/api/v1/schema` column set (a catalog SELECT that
+    /// aggregates every service's observations), under the same TTL and the
+    /// same thundering-herd discipline as the corpus facts.
+    pub schema_columns_cache: Arc<tokio::sync::Mutex<Option<CachedSchemaColumns>>>,
     /// Cached field value samples for autocomplete (shared TTL with schema cache).
     pub field_values_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedFieldValues>>>,
     /// Hot buffer for fresh events not yet compacted to parquet.
@@ -336,6 +338,26 @@ pub struct CachedCorpusFacts {
     pub file_count: u64,
 }
 
+/// A cached `/api/v1/schema` column set, with an expiry timestamp.
+///
+/// Only the UNSCOPED listing is cached. `?service=` is client-chosen and
+/// unbounded, so keying a map on it would be an unbounded cache — and the
+/// scoped listing is already bounded by the pin cap through the
+/// `field_services (service, field)` index (migration 0003), while the
+/// unscoped one aggregates every service's observations and is what the
+/// autocomplete polls.
+#[derive(Debug, Clone)]
+pub struct CachedSchemaColumns {
+    /// The catalog-served columns, already in display order.
+    pub columns: Vec<SchemaColumnResponse>,
+    /// Whether the retention window was applied (`?all=true` lifts it). A
+    /// request of the other shape is a miss and replaces the entry — there
+    /// are only ever these two shapes, so the cache stays a single slot.
+    pub windowed: bool,
+    /// When this cache entry was created.
+    pub cached_at: Instant,
+}
+
 /// A cached field value sample with an expiry timestamp.
 #[derive(Debug, Clone)]
 pub struct CachedFieldValues {
@@ -477,6 +499,7 @@ impl AppState {
                 retention_max_age_days: config.retention.max_age_days,
                 max_export_rows: config.server.max_export_rows,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
+                schema_columns_cache: Arc::new(tokio::sync::Mutex::new(None)),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 field_catalog,
                 hot_buffer,

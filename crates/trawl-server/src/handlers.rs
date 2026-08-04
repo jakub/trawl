@@ -464,6 +464,13 @@ pub struct SchemaParams {
 ///
 /// Corpus facts (dates, sizes, services, file count) stay a TTL-cached
 /// filesystem walk; `cached` reports whether THEY came from the cache.
+///
+/// The UNSCOPED column set is TTL-cached too (same TTL): it aggregates
+/// `field_services` across every service, and the service axis is
+/// client-chosen and unbounded while this endpoint is what autocomplete
+/// polls. A `?service=` listing is served straight from postgres — it is
+/// bounded by the pin cap through `field_services (service, field)`, and
+/// caching per client-chosen service name would be an unbounded cache.
 pub async fn schema(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -476,9 +483,9 @@ pub async fn schema(
     // Hot buffer stats are cheap atomics — always read fresh (never cached).
     let (hot_events, hot_bytes) = hot_buffer_stats(&state);
 
-    // Columns: a catalog SELECT on every request. Postgres down → 503 (the
-    // same dependency history/saved already have). Deliberately NO fallback
-    // to the in-process pin cache: that would fork schema truth again.
+    // Columns: a catalog SELECT. Postgres down → 503 (the same dependency
+    // history/saved already have). Deliberately NO fallback to the
+    // in-process pin cache: that would fork schema truth again.
     let window_days = state.query.retention_max_age_days;
     let since = if params.all == Some(true) || window_days == 0 {
         None
@@ -486,23 +493,31 @@ pub async fn schema(
         let days = i64::try_from(window_days).unwrap_or(i64::MAX);
         chrono::Utc::now().checked_sub_signed(chrono::Duration::days(days))
     };
-    let filter = crate::store::FieldListFilter {
-        service: params.service.clone(),
-        since,
-        ..Default::default()
-    };
-    let (fields, _truncated) = state.storage.catalog.list_fields(&filter).await?;
 
-    let mut columns: Vec<SchemaColumnResponse> = fields
-        .into_iter()
-        .map(|f| SchemaColumnResponse {
-            name: f.field,
-            data_type: f.duckdb_type,
-        })
-        .collect();
-    // Query-result display order: envelope first, metadata last, custom
-    // fields alphabetical in between.
-    trawl_api::value::sort_by_display_rank(&mut columns, |c| &c.name);
+    let columns = if params.service.is_some() {
+        catalog_schema_columns(&state, params.service.clone(), since).await?
+    } else {
+        // Hold the mutex for the full check-then-refresh cycle, like the
+        // corpus facts below: only one request runs the aggregate.
+        let mut cache = state.query.schema_columns_cache.lock().await;
+        let windowed = since.is_some();
+        let fresh = cache.as_ref().and_then(|c| {
+            let live = c.windowed == windowed
+                && c.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs;
+            live.then(|| c.columns.clone())
+        });
+        if let Some(columns) = fresh {
+            columns
+        } else {
+            let columns = catalog_schema_columns(&state, None, since).await?;
+            *cache = Some(crate::state::CachedSchemaColumns {
+                columns: columns.clone(),
+                windowed,
+                cached_at: std::time::Instant::now(),
+            });
+            columns
+        }
+    };
 
     // Corpus facts: hold the mutex for the full check-then-refresh cycle to
     // prevent thundering herd — only one request walks while others wait.
@@ -557,6 +572,31 @@ pub async fn schema(
         hot_buffer_events: hot_events,
         hot_buffer_bytes: hot_bytes,
     }))
+}
+
+/// The `/api/v1/schema` column set: the catalog listing, mapped to the wire
+/// type and sorted into query-result display order (envelope first,
+/// metadata last, custom fields alphabetical in between).
+async fn catalog_schema_columns(
+    state: &AppState,
+    service: Option<String>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Vec<SchemaColumnResponse>, ServerError> {
+    let filter = crate::store::FieldListFilter {
+        service,
+        since,
+        ..Default::default()
+    };
+    let (fields, _truncated) = state.storage.catalog.list_fields(&filter).await?;
+    let mut columns: Vec<SchemaColumnResponse> = fields
+        .into_iter()
+        .map(|f| SchemaColumnResponse {
+            name: f.field,
+            data_type: f.duckdb_type,
+        })
+        .collect();
+    trawl_api::value::sort_by_display_rank(&mut columns, |c| &c.name);
+    Ok(columns)
 }
 
 /// Read hot buffer event count and byte size (cheap atomic loads).

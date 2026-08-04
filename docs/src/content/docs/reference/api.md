@@ -86,8 +86,10 @@ GET /api/v1/schema?all=true
 Returns column names and types, served from the **field catalog** — the
 write-time type authority — never a parquet `DESCRIBE`. Corpus facts
 (dates, sizes, services, file count) come from a TTL-cached filesystem
-walk; `cached` reports whether *they* were cached (columns are always
-fresh).
+walk; `cached` reports whether *they* were cached. The column set is
+cached under the same TTL (`schema_cache_ttl_secs`) when the request is
+unscoped, so a newly pinned field can take up to that long to appear; a
+`?service=` request is always served fresh from the catalog.
 
 Parameters:
 
