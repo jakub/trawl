@@ -126,6 +126,54 @@ async fn schema_returns_columns(pool: sqlx::PgPool) {
     assert!(names.contains(&"severity"), "missing severity column");
     assert!(names.contains(&"message"), "missing message column");
     assert_eq!(schema.file_count, 2);
+
+    // Columns follow query-result display order: envelope first (in the
+    // declared order), trailing metadata demoted to the very end — never a
+    // raw alphabetical listing with `_ingested` first.
+    assert_eq!(names[0], "_time", "envelope leads: {names:?}");
+    assert_eq!(
+        &names[names.len() - 3..],
+        &["_raw", "_ingested", "_repairs"],
+        "metadata trails: {names:?}"
+    );
+
+    // Types are the catalog pins, not a DESCRIBE.
+    let severity = schema
+        .columns
+        .iter()
+        .find(|c| c.name == "severity")
+        .unwrap();
+    assert_eq!(severity.data_type, "BIGINT");
+}
+
+#[sqlx::test(migrations = false)]
+async fn schema_columns_come_from_the_catalog_not_describe(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // Pin a field that exists in NO parquet file anywhere: a DESCRIBE sweep
+    // could never see it, so its presence in the response proves the columns
+    // are a catalog SELECT. (The DESCRIBE code path itself is deleted —
+    // Pool::describe_schema no longer exists — this pins the behaviour.)
+    server
+        .state
+        .storage
+        .catalog
+        .pin_missing(&[trawl_server::store::PinProposal {
+            field: "zz_catalog_only".to_owned(),
+            ty: trawl_core::schema::CanonicalType::BigInt,
+            pinned_from: "test".to_owned(),
+        }])
+        .await
+        .unwrap();
+
+    let schema = client.schema().await.unwrap();
+    let col = schema
+        .columns
+        .iter()
+        .find(|c| c.name == "zz_catalog_only")
+        .expect("a pinned-but-never-written field must appear (catalog-served)");
+    assert_eq!(col.data_type, "BIGINT");
 }
 
 #[sqlx::test(migrations = false)]

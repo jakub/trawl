@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use trawl_api::{DashboardSnapshot, ServiceSchema};
-use trawl_engine::value::SchemaResult;
 
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
@@ -64,13 +63,21 @@ pub struct QueryState {
     pub tracker: Arc<QueryTracker>,
     /// Schema cache TTL in seconds.
     pub schema_cache_ttl_secs: u64,
+    /// Retention window in days (`[retention] max_age_days`; 0 disables).
+    /// `/api/v1/schema` windows catalog fields on `last_seen` against it so
+    /// autocomplete stops offering fields whose data has aged out
+    /// (`?all=true` lifts the window).
+    pub retention_max_age_days: u64,
     /// Maximum rows for export responses (bypasses `max_result_rows`).
     pub max_export_rows: usize,
-    /// Cached schema introspection result with TTL.
+    /// Cached corpus facts (dates/bytes/services/file count from the
+    /// filesystem walk) with TTL. The schema COLUMNS are no longer cached —
+    /// they are a catalog SELECT (ADR-0009 slice 3); only the FS walk keeps
+    /// its TTL cache.
     ///
     /// Uses `Mutex` (not `RwLock`) to prevent thundering herd: only one
     /// request refreshes the cache while others wait on the lock.
-    pub schema_cache: Arc<tokio::sync::Mutex<Option<CachedSchema>>>,
+    pub schema_cache: Arc<tokio::sync::Mutex<Option<CachedCorpusFacts>>>,
     /// Cached field value samples for autocomplete (shared TTL with schema cache).
     pub field_values_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedFieldValues>>>,
     /// Hot buffer for fresh events not yet compacted to parquet.
@@ -310,11 +317,11 @@ pub struct HttpConfig {
     pub rate_limit: RateLimitConfig,
 }
 
-/// A cached schema result with an expiry timestamp.
+/// Cached corpus facts from the parquet filesystem walk, with an expiry
+/// timestamp. Purely filesystem truth — schema columns come from the field
+/// catalog and are never cached here.
 #[derive(Debug, Clone)]
-pub struct CachedSchema {
-    /// The cached schema data.
-    pub result: SchemaResult,
+pub struct CachedCorpusFacts {
     /// When this cache entry was created.
     pub cached_at: Instant,
     /// Earliest date from partition directory names (YYYY-MM-DD).
@@ -325,6 +332,8 @@ pub struct CachedSchema {
     pub total_bytes: u64,
     /// Distinct service names from parquet filenames.
     pub services: Vec<String>,
+    /// Number of parquet files on disk.
+    pub file_count: u64,
 }
 
 /// A cached field value sample with an expiry timestamp.
@@ -465,6 +474,7 @@ impl AppState {
                 timeout_secs: config.server.timeout_secs,
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
                 schema_cache_ttl_secs: config.server.schema_cache_ttl_secs,
+                retention_max_age_days: config.retention.max_age_days,
                 max_export_rows: config.server.max_export_rows,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

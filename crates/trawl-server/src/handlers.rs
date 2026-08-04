@@ -34,7 +34,7 @@ use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
 use crate::scheduler::execute_scheduled_query;
-use crate::state::{AppState, CachedFieldValues, CachedSchema};
+use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
     HistoryEntry, ReportRun, RunClaim, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
     format_interval, parse_interval,
@@ -443,13 +443,31 @@ fn derive_health_status(
     HealthStatus::Ok
 }
 
-/// `GET /api/v1/schema` — introspect the data source schema.
+/// Query parameters for `GET /api/v1/schema`.
+#[derive(Debug, Deserialize)]
+pub struct SchemaParams {
+    /// Only fields observed for this service.
+    pub service: Option<String>,
+    /// Lift the `last_seen` retention window (show aged-out fields too).
+    pub all: Option<bool>,
+}
+
+/// `GET /api/v1/schema` — the data schema, served from the field catalog.
 ///
-/// Returns column names and types from the configured parquet data.
-/// Results are cached for `schema_cache_ttl_secs` seconds (default: 60).
+/// Columns are a `SELECT` over `field_types` LEFT JOIN `field_services`
+/// (ADR-0009 slice 3) — the write-time type authority, never a `DESCRIBE`.
+/// By default fields whose most recent observation predates the retention
+/// window (`[retention] max_age_days`; 0 disables) are hidden; `?all=true`
+/// lifts the window, and a never-observed pin (e.g. the envelope seed) is
+/// always shown. `?service=` scopes the listing to fields that service has
+/// carried.
+///
+/// Corpus facts (dates, sizes, services, file count) stay a TTL-cached
+/// filesystem walk; `cached` reports whether THEY came from the cache.
 pub async fn schema(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<SchemaParams>,
 ) -> Result<Json<SchemaResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
@@ -458,83 +476,91 @@ pub async fn schema(
     // Hot buffer stats are cheap atomics — always read fresh (never cached).
     let (hot_events, hot_bytes) = hot_buffer_stats(&state);
 
-    // Hold the mutex for the full check-then-refresh cycle to prevent
-    // thundering herd: only one request refreshes while others wait.
-    let mut cache = state.query.schema_cache.lock().await;
-
-    if let Some(cached) = &*cache
-        && cached.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs
-    {
-        tracing::debug!(event_type = "schema_cache_hit", user = %verified.name, "serving schema from cache");
-        return Ok(Json(SchemaResponse {
-            columns: cached
-                .result
-                .columns
-                .iter()
-                .cloned()
-                .map(SchemaColumnResponse::from)
-                .collect(),
-            file_count: cached.result.file_count,
-            cached: true,
-            earliest_date: cached.earliest_date.clone(),
-            latest_date: cached.latest_date.clone(),
-            total_bytes: Some(cached.total_bytes),
-            services: Some(cached.services.clone()),
-            hot_buffer_events: hot_events,
-            hot_buffer_bytes: hot_bytes,
-        }));
-    }
-
-    tracing::info!(event_type = "schema_refresh", user = %verified.name, "refreshing schema cache");
-    let start = std::time::Instant::now();
-    let result = state.query.pool.describe_schema().await?;
-
-    // Walk parquet files for catalog metadata (dates, services, sizes).
-    let fallback_glob = state.query.pool.fallback_glob().clone();
-    let (earliest_date, latest_date, total_bytes, services) =
-        tokio::task::spawn_blocking(move || collect_catalog_metadata(&fallback_glob))
-            .await
-            .unwrap_or_default();
-
-    let elapsed = start.elapsed().as_millis();
-
-    tracing::info!(
-        event_type = "schema_complete",
-        user = %verified.name,
-        columns = result.columns.len(),
-        file_count = result.file_count,
-        services = services.len(),
-        duration_ms = elapsed,
-        "schema introspection complete"
-    );
-
-    let response = SchemaResponse {
-        columns: result
-            .columns
-            .iter()
-            .cloned()
-            .map(SchemaColumnResponse::from)
-            .collect(),
-        file_count: result.file_count,
-        cached: false,
-        earliest_date: earliest_date.clone(),
-        latest_date: latest_date.clone(),
-        total_bytes: Some(total_bytes),
-        services: Some(services.clone()),
-        hot_buffer_events: hot_events,
-        hot_buffer_bytes: hot_bytes,
+    // Columns: a catalog SELECT on every request. Postgres down → 503 (the
+    // same dependency history/saved already have). Deliberately NO fallback
+    // to the in-process pin cache: that would fork schema truth again.
+    let window_days = state.query.retention_max_age_days;
+    let since = if params.all == Some(true) || window_days == 0 {
+        None
+    } else {
+        let days = i64::try_from(window_days).unwrap_or(i64::MAX);
+        chrono::Utc::now().checked_sub_signed(chrono::Duration::days(days))
     };
+    let filter = crate::store::FieldListFilter {
+        service: params.service.clone(),
+        since,
+        ..Default::default()
+    };
+    let (fields, _truncated) = state.storage.catalog.list_fields(&filter).await?;
 
-    *cache = Some(CachedSchema {
-        result,
-        cached_at: std::time::Instant::now(),
-        earliest_date,
-        latest_date,
-        total_bytes,
-        services,
+    let mut columns: Vec<SchemaColumnResponse> = fields
+        .into_iter()
+        .map(|f| SchemaColumnResponse {
+            name: f.field,
+            data_type: f.duckdb_type,
+        })
+        .collect();
+    // Query-result display order: envelope first, metadata last, custom
+    // fields alphabetical in between.
+    columns.sort_by(|a, b| {
+        trawl_api::value::field_display_rank(&a.name)
+            .cmp(&trawl_api::value::field_display_rank(&b.name))
+            .then_with(|| a.name.cmp(&b.name))
     });
 
-    Ok(Json(response))
+    // Corpus facts: hold the mutex for the full check-then-refresh cycle to
+    // prevent thundering herd — only one request walks while others wait.
+    let mut cache = state.query.schema_cache.lock().await;
+    let (facts, cached) = match &*cache {
+        Some(facts) if facts.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs => {
+            tracing::debug!(
+                event_type = "schema_cache_hit",
+                user = %verified.name,
+                "serving corpus facts from cache"
+            );
+            (facts.clone(), true)
+        }
+        _ => {
+            let start = std::time::Instant::now();
+            let fallback_glob = state.query.pool.fallback_glob().clone();
+            let (earliest_date, latest_date, total_bytes, services, file_count) =
+                tokio::task::spawn_blocking(move || collect_catalog_metadata(&fallback_glob))
+                    .await
+                    .unwrap_or_default();
+            let facts = crate::state::CachedCorpusFacts {
+                cached_at: std::time::Instant::now(),
+                earliest_date,
+                latest_date,
+                total_bytes,
+                services,
+                file_count,
+            };
+            tracing::info!(
+                event_type = "schema_facts_refresh",
+                user = %verified.name,
+                columns = columns.len(),
+                file_count = facts.file_count,
+                services = facts.services.len(),
+                duration_ms = start.elapsed().as_millis(),
+                "corpus facts walk complete"
+            );
+            *cache = Some(facts.clone());
+            (facts, false)
+        }
+    };
+    drop(cache);
+
+    Ok(Json(SchemaResponse {
+        columns,
+        file_count: facts.file_count,
+        cached,
+        earliest_date: facts.earliest_date,
+        latest_date: facts.latest_date,
+        total_bytes: Some(facts.total_bytes),
+        services: Some(facts.services),
+        hot_buffer_events: hot_events,
+        hot_buffer_bytes: hot_bytes,
+    }))
 }
 
 /// Read hot buffer event count and byte size (cheap atomic loads).
@@ -547,13 +573,14 @@ fn hot_buffer_stats(state: &AppState) -> (Option<u64>, Option<u64>) {
     })
 }
 
-/// Parse parquet file paths to extract catalog metadata.
+/// Parse parquet file paths to extract corpus facts: earliest/latest date,
+/// total bytes, distinct services, and the parquet file count.
 ///
 /// Path structure: `{base}/{YYYY-MM-DD}/{service}.parquet`
 /// or `{base}/{YYYY-MM-DD}/{HH}/{service}.parquet`.
 fn collect_catalog_metadata(
     fallback_glob: &str,
-) -> (Option<String>, Option<String>, u64, Vec<String>) {
+) -> (Option<String>, Option<String>, u64, Vec<String>, u64) {
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -563,11 +590,11 @@ fn collect_catalog_metadata(
     let base = Path::new(base.trim_end_matches('/'));
 
     if !base.is_dir() {
-        return (None, None, 0, Vec::new());
+        return (None, None, 0, Vec::new(), 0);
     }
 
     let Ok(entries) = crate::metrics::walk_parquet_files(base) else {
-        return (None, None, 0, Vec::new());
+        return (None, None, 0, Vec::new(), 0);
     };
 
     let mut dates: BTreeSet<String> = BTreeSet::new();
@@ -596,8 +623,9 @@ fn collect_catalog_metadata(
     let earliest = dates.iter().next().cloned();
     let latest = dates.iter().next_back().cloned();
     let services: Vec<String> = services.into_iter().collect();
+    let file_count = u64::try_from(entries.len()).unwrap_or(0);
 
-    (earliest, latest, total_bytes, services)
+    (earliest, latest, total_bytes, services, file_count)
 }
 
 /// Check if a directory name looks like YYYY-MM-DD.
