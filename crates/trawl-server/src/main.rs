@@ -56,12 +56,29 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     let config_path = resolve_path(&cli.config);
-    let config = Config::from_file(&config_path)?;
+    // Pre-tracing boundary: no subscriber exists yet, so a config failure
+    // here can only surface through stderr. Name the resolved path so the
+    // operator can tell WHICH file failed (issue #56 F4).
+    let config = Config::from_file(&config_path).map_err(|e| {
+        eprintln!(
+            "[trawld] failed to load configuration from {}: {e}",
+            config_path.display()
+        );
+        e
+    })?;
 
     // Auto-detect TTY: monitor when interactive, log tail when piped.
     let monitor_active = std::io::IsTerminal::is_terminal(&std::io::stdout()) && !cli.no_monitor;
 
-    let telemetry = init_tracing(&config, monitor_active)?;
+    // Resolve the log filter explicitly: RUST_LOG is authoritative when
+    // valid; unset or invalid installs DEFAULT_LOG_FILTER, and the invalid
+    // case warns AFTER the subscriber is up (visible because `trawld=info`
+    // is part of the default).
+    let log_filter = telemetry::resolve_log_filter(std::env::var("RUST_LOG").ok().as_deref());
+    let telemetry = init_tracing(&config, monitor_active, &log_filter.directives)?;
+    if let Some(warning) = &log_filter.warning {
+        tracing::warn!(event_type = "config_warning", "{warning}");
+    }
 
     tracing::info!(event_type = "lifecycle", config = %config_path.display(), "configuration loaded");
 
@@ -496,9 +513,12 @@ fn warn_unlisted_env_dirs(config: &Config) {
 fn init_tracing(
     config: &Config,
     monitor_active: bool,
+    filter_directives: &str,
 ) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
-    let make_filter =
-        || EnvFilter::try_from_default_env().unwrap_or_else(|_| "trawl_server=info".into());
+    // The directives were resolved (and validated when operator-supplied) by
+    // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
+    // from the same string.
+    let make_filter = || EnvFilter::new(filter_directives);
 
     let use_telemetry = config.internal_telemetry_enabled();
 

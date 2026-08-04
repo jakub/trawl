@@ -308,8 +308,12 @@ web:
     existingSecret: ""
     existingSecretKey: "cookie.key"
 
-# -- Log level
-logLevel: "trawl_server=info"
+# -- Log level (RUST_LOG). The default enumerates every target trawl emits
+# under — trawl_server (library), trawld (binary: startup banner, config
+# warnings), fleet_auth (auth middleware), and the deliberately-overridden
+# auth.backend / storage.backend alarm targets. Keep them all when
+# customizing, or backend errors become invisible.
+logLevel: "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info"
 
 # -- Prometheus ServiceMonitor (requires prometheus-operator CRDs)
 serviceMonitor:

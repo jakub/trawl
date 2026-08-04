@@ -47,6 +47,72 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::ingest::wal::WalWriter;
 
 // ---------------------------------------------------------------------------
+// Default log filter: the cross-packaging contract
+// ---------------------------------------------------------------------------
+
+/// The default tracing filter installed when `RUST_LOG` is unset or invalid.
+///
+/// This exact string is the cross-packaging contract (issue #56): the Helm
+/// chart's `logLevel`, the Debian environment example, and the operator docs
+/// all carry it verbatim. It deliberately enumerates every target Trawl
+/// emits under rather than using a global `info` (which would enable noisy
+/// dependency targets):
+///
+/// - `trawl_server` — the library crate (handlers, ingest, compaction, …);
+/// - `trawld` — the binary's own module path (startup banner, config
+///   warnings, split-brain lock loss, task panics) — required for the
+///   invalid-`RUST_LOG` `config_warning` to be visible at all;
+/// - `fleet_auth` — the auth middleware crate;
+/// - `auth.backend` / `storage.backend` — deliberately-overridden targets
+///   that make backend failures independently alarmable.
+pub const DEFAULT_LOG_FILTER: &str =
+    "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info";
+
+/// A resolved log filter: the directive string to install plus an optional
+/// warning to emit once the subscriber is up.
+#[derive(Debug, Clone)]
+pub struct ResolvedLogFilter {
+    /// Directive string each layer builds its `EnvFilter` from.
+    pub directives: String,
+    /// Set when `RUST_LOG` was present but unparseable: a `config_warning`
+    /// message carrying the parse error but never the raw env value.
+    pub warning: Option<String>,
+}
+
+/// Resolve the effective tracing filter from an explicit `RUST_LOG` value.
+///
+/// - unset → [`DEFAULT_LOG_FILTER`];
+/// - set and valid → the operator's value, authoritative;
+/// - set and invalid → [`DEFAULT_LOG_FILTER`] plus a warning that carries
+///   the parse error but **not** the raw environment value (it may contain
+///   anything — pasted secrets included — and the warning is persisted as
+///   telemetry).
+///
+/// Takes the env value as a parameter so it is unit-testable without
+/// mutating process env (`unsafe_code = "forbid"`).
+pub fn resolve_log_filter(env_value: Option<&str>) -> ResolvedLogFilter {
+    match env_value {
+        None => ResolvedLogFilter {
+            directives: DEFAULT_LOG_FILTER.to_owned(),
+            warning: None,
+        },
+        Some(value) => match tracing_subscriber::EnvFilter::try_new(value) {
+            Ok(_) => ResolvedLogFilter {
+                directives: value.to_owned(),
+                warning: None,
+            },
+            Err(e) => ResolvedLogFilter {
+                directives: DEFAULT_LOG_FILTER.to_owned(),
+                warning: Some(format!(
+                    "RUST_LOG is set but could not be parsed ({e}); using the \
+                     default filter \"{DEFAULT_LOG_FILTER}\""
+                )),
+            },
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WalHandle: deferred writer injection
 // ---------------------------------------------------------------------------
 
@@ -484,6 +550,96 @@ pub fn spawn_flush_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- default filter contract (issue #56 F1) -----------------------------
+
+    /// Capture layer recording (target, level, message) triples.
+    #[derive(Clone, Default)]
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            self.events.lock().push((
+                event.metadata().target().to_owned(),
+                event.metadata().level().as_str().to_owned(),
+            ));
+        }
+    }
+
+    #[test]
+    fn default_filter_passes_all_trawl_targets_and_drops_dependency_noise() {
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::default();
+        let events = Arc::clone(&capture.events);
+        let filter = tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER);
+        let subscriber = tracing_subscriber::registry().with(capture.with_filter(filter));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!(target: "trawl_server::handlers", "lib info");
+        tracing::error!(target: "trawl_server::ingest", "lib error");
+        tracing::info!(target: "trawld", "bin info (startup banner, config_warning)");
+        tracing::info!(target: "fleet_auth::middleware", "auth middleware info");
+        tracing::error!(target: "auth.backend", "auth backend down");
+        tracing::error!(target: "storage.backend", "storage backend down");
+        tracing::info!(target: "hyper::proto", "dependency noise");
+
+        let seen = events.lock();
+        let targets: Vec<&str> = seen.iter().map(|(t, _)| t.as_str()).collect();
+        for expected in [
+            "trawl_server::handlers",
+            "trawl_server::ingest",
+            "trawld",
+            "fleet_auth::middleware",
+            "auth.backend",
+            "storage.backend",
+        ] {
+            assert!(
+                targets.contains(&expected),
+                "target {expected} must pass the default filter; saw {targets:?}"
+            );
+        }
+        assert!(
+            !targets.contains(&"hyper::proto"),
+            "dependency INFO must NOT pass the default filter; saw {targets:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_log_filter_unset_uses_default() {
+        let resolved = resolve_log_filter(None);
+        assert_eq!(resolved.directives, DEFAULT_LOG_FILTER);
+        assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_log_filter_valid_value_is_authoritative() {
+        let resolved = resolve_log_filter(Some("trawl_server=debug,hyper=warn"));
+        assert_eq!(resolved.directives, "trawl_server=debug,hyper=warn");
+        assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_log_filter_invalid_value_falls_back_with_one_warning() {
+        let raw = "sup3r_s3cret_password=notalevel";
+        let resolved = resolve_log_filter(Some(raw));
+        assert_eq!(resolved.directives, DEFAULT_LOG_FILTER);
+        let warning = resolved.warning.expect("invalid RUST_LOG must warn");
+        // The raw env value must never be logged — it can contain anything.
+        assert!(
+            !warning.contains(raw) && !warning.contains("sup3r_s3cret_password"),
+            "warning must not leak the raw env value: {warning}"
+        );
+        assert!(
+            warning.contains("RUST_LOG"),
+            "warning names the env var: {warning}"
+        );
+    }
 
     #[test]
     fn message_to_event_type_simple() {
