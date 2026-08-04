@@ -27,10 +27,11 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
+use trawl_api::value::sort_by_display_rank;
 use trawl_api::{DailyCount, ServiceColumnStats, ServiceSchema};
-use trawl_engine::executor::Executor;
 use trawl_engine::parquet_stats::{self, StatsAccumulator};
 
+use crate::catalog::FieldCatalog;
 use crate::state::{AppState, CachedServiceSchema};
 
 /// Spawn the background schema refresh task.
@@ -45,16 +46,23 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
 
         // Files skipped (unreadable) on the previous pass, so we log each newly
         // broken file once rather than every tick. Shared with the blocking
-        // refresh closure; lives for the process.
+        // refresh closure; lives for the process. `warned_unpinned` plays the
+        // same role for columns with no catalog pin.
         let warned: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let warned_unpinned: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // Types come from the in-process pin cache — the refresh is
+        // postgres-free and needs no DuckDB at all (ADR-0009 slice 3).
+        let catalog = Arc::clone(&state.query.field_catalog);
 
         loop {
             interval.tick().await;
 
             let fallback_glob = state.query.pool.fallback_glob().to_owned();
             let warned = Arc::clone(&warned);
+            let warned_unpinned = Arc::clone(&warned_unpinned);
+            let catalog = Arc::clone(&catalog);
             let result = tokio::task::spawn_blocking(move || {
-                refresh_service_schema(&fallback_glob, &warned)
+                refresh_service_schema(&fallback_glob, &warned, &warned_unpinned, &catalog)
             })
             .await;
 
@@ -99,11 +107,15 @@ struct FileInfo {
 /// Perform the full service schema refresh.
 ///
 /// Walks parquet files, groups by service, then for each service reads parquet
-/// footers for column stats and row counts. `warned` carries the set of files
-/// that failed to read on the previous pass so each break is logged once.
+/// footers for column stats and row counts; column TYPES come from `catalog`
+/// (the in-process pin cache — no `DuckDB`, no postgres). `warned` carries the
+/// set of files that failed to read on the previous pass so each break is
+/// logged once; `warned_unpinned` does the same for columns with no pin.
 fn refresh_service_schema(
     fallback_glob: &str,
     warned: &Mutex<HashSet<PathBuf>>,
+    warned_unpinned: &Mutex<HashSet<String>>,
+    catalog: &FieldCatalog,
 ) -> Result<Vec<ServiceSchema>, Box<dyn std::error::Error + Send + Sync>> {
     let base = fallback_glob
         .find('*')
@@ -140,10 +152,36 @@ fn refresh_service_schema(
     }
 
     let mut result = Vec::with_capacity(by_service.len());
+    let mut unpinned_now: HashSet<String> = HashSet::new();
 
     for (service, files) in &by_service {
-        let schema = build_service_schema(service, files, base, &prev_warned, &mut skipped_now)?;
-        result.push(schema);
+        result.push(build_service_schema(
+            service,
+            files,
+            &prev_warned,
+            &mut skipped_now,
+            &mut unpinned_now,
+            catalog,
+        ));
+    }
+
+    // Warn once per newly-unpinned column (deduped across passes, like the
+    // unreadable-file skips): an UNPINNED column can only arise from
+    // foreign/boot-skipped parquet — the condition `catalog_conform_skip` /
+    // `catalog_conform_incomplete` already flags — or transiently during the
+    // boot-conformance window, where it self-heals next tick.
+    {
+        let prev_unpinned = warned_unpinned.lock().clone();
+        let newly: Vec<&String> = unpinned_now.difference(&prev_unpinned).collect();
+        if !newly.is_empty() {
+            tracing::warn!(
+                event_type = "schema_refresh_unpinned_columns",
+                columns = ?newly,
+                "columns present in parquet but absent from the field catalog; \
+                 reported as UNPINNED (foreign or boot-skipped parquet?)"
+            );
+        }
+        *warned_unpinned.lock() = unpinned_now;
     }
 
     // Remember this pass's skips: files that recovered drop out of the set, so a
@@ -156,14 +194,16 @@ fn refresh_service_schema(
 /// Build schema for a single service from its file list.
 ///
 /// `prev_warned` is the read-only set of files already logged as broken;
-/// `skipped_now` accumulates the files skipped this pass.
+/// `skipped_now` accumulates the files skipped this pass; `unpinned_now`
+/// accumulates columns seen without a catalog pin.
 fn build_service_schema(
     service: &str,
     files: &[FileInfo],
-    base: &Path,
     prev_warned: &HashSet<PathBuf>,
     skipped_now: &mut HashSet<PathBuf>,
-) -> Result<ServiceSchema, Box<dyn std::error::Error + Send + Sync>> {
+    unpinned_now: &mut HashSet<String>,
+    catalog: &FieldCatalog,
+) -> ServiceSchema {
     // Aggregate file-level metadata. `daily_counts` is seeded with every date
     // seen in the directory tree (so a date whose only files are skipped this
     // pass still appears, with a count of 0) and filled with exact per-file row
@@ -219,40 +259,40 @@ fn build_service_schema(
     let total_events = acc.total_rows();
     let column_stats = acc.finish();
 
-    // Build a service-scoped glob for the DuckDB schema describe.
-    let service_glob = format!("{}/**/{}.parquet", base.to_string_lossy(), service);
-
-    // Column names + types via DuckDB DESCRIBE — the reconciler for cross-file
-    // schema drift. DESCRIBE reads only the footer schema (names/types), not the
-    // row-group stat values that crash `parquet_metadata()`, so it stays off the
-    // crash path the footer reader was added to avoid.
-    let executor = Executor::new()?;
-    let schema_result = executor.describe_schema(&service_glob);
-    let schema_columns = schema_result.as_ref().map_or(&[][..], |r| &r.columns);
-
-    // Merge column stats with schema column types.
-    let columns: Vec<ServiceColumnStats> = schema_columns
+    // Columns are driven by the footer stats accumulator (the union of every
+    // column name across the service's files) and TYPED by the catalog pin —
+    // the DuckDB DESCRIBE reconciler is gone (ADR-0009 slice 3). A
+    // physically-present column with no pin reports the UNPINNED sentinel:
+    // it can only arise from foreign or boot-skipped parquet.
+    let mut columns: Vec<ServiceColumnStats> = column_stats
         .iter()
-        .map(|sc| {
-            let stats = column_stats.iter().find(|cs| cs.column_name == sc.name);
+        .map(|cs| {
+            let data_type = catalog.get(&cs.column_name).map_or_else(
+                || {
+                    unpinned_now.insert(cs.column_name.clone());
+                    "UNPINNED".to_owned()
+                },
+                |ty| ty.as_duckdb().to_owned(),
+            );
             ServiceColumnStats {
-                name: sc.name.clone(),
-                data_type: sc.data_type.clone(),
-                null_count: stats.map_or(0, |s| s.null_count),
-                total_count: stats.map_or(0, |s| s.total_count),
-                min_value: stats.and_then(|s| s.min_value.clone()),
-                max_value: stats.and_then(|s| s.max_value.clone()),
-                compressed_bytes: stats.map_or(0, |s| s.compressed_bytes),
+                name: cs.column_name.clone(),
+                data_type,
+                null_count: cs.null_count,
+                total_count: cs.total_count,
+                min_value: cs.min_value.clone(),
+                max_value: cs.max_value.clone(),
+                compressed_bytes: cs.compressed_bytes,
             }
         })
         .collect();
+    sort_by_display_rank(&mut columns, |c| &c.name);
 
     let daily_event_counts: Vec<DailyCount> = daily_counts
         .into_iter()
         .map(|(date, count)| DailyCount { date, count })
         .collect();
 
-    Ok(ServiceSchema {
+    ServiceSchema {
         name: service.to_owned(),
         columns,
         earliest_date,
@@ -261,7 +301,7 @@ fn build_service_schema(
         total_bytes,
         total_events,
         daily_event_counts,
-    })
+    }
 }
 
 /// Walk ancestors of a path looking for a YYYY-MM-DD directory component.
@@ -304,6 +344,109 @@ mod tests {
         path
     }
 
+    fn empty_catalog() -> crate::catalog::FieldCatalog {
+        crate::catalog::FieldCatalog::new()
+    }
+
+    #[test]
+    fn catalog_pin_wins_over_footer_type_while_stats_stay_footer_true() {
+        // The #51 acceptance criterion: seed a catalog pin that disagrees
+        // with the file's physical type — DuckDB writes `VALUES (200)` as
+        // INTEGER, the pin says BIGINT — and the endpoint must report the
+        // catalog type while null/min/max/byte stats still match the
+        // footers. No DuckDB DESCRIBE runs at all.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_service_parquet(
+            base,
+            "2026-06-20",
+            "nginx",
+            "SELECT * FROM (VALUES (200), (404)) t(status)",
+        );
+
+        let catalog = empty_catalog();
+        catalog.merge([(
+            "status".to_owned(),
+            trawl_core::schema::CanonicalType::BigInt,
+        )]);
+
+        let glob = format!("{}/**/*.parquet", base.display());
+        let warned = Mutex::new(HashSet::new());
+        let warned_unpinned = Mutex::new(HashSet::new());
+        let services = refresh_service_schema(&glob, &warned, &warned_unpinned, &catalog).unwrap();
+
+        let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
+        let status = nginx.columns.iter().find(|c| c.name == "status").unwrap();
+        assert_eq!(
+            status.data_type, "BIGINT",
+            "the catalog pin is the type authority, not the footer/physical type"
+        );
+        assert_eq!(status.total_count, 2, "stats stay filesystem-true");
+        assert_eq!(status.min_value.as_deref(), Some("200"));
+        assert_eq!(status.max_value.as_deref(), Some("404"));
+        assert!(status.compressed_bytes > 0);
+    }
+
+    #[test]
+    fn unpinned_column_reports_unpinned_with_stats() {
+        // A physically-present column with no pin can only arise from
+        // foreign/boot-skipped parquet (catalog_conform_incomplete already
+        // flags that condition). It reports the sentinel type, keeps its
+        // stats, and is warn-logged once — not silently dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_service_parquet(
+            base,
+            "2026-06-20",
+            "nginx",
+            "SELECT * FROM (VALUES (200)) t(status)",
+        );
+
+        let glob = format!("{}/**/*.parquet", base.display());
+        let warned = Mutex::new(HashSet::new());
+        let warned_unpinned = Mutex::new(HashSet::new());
+        let services =
+            refresh_service_schema(&glob, &warned, &warned_unpinned, &empty_catalog()).unwrap();
+
+        let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
+        let status = nginx.columns.iter().find(|c| c.name == "status").unwrap();
+        assert_eq!(status.data_type, "UNPINNED");
+        assert_eq!(status.total_count, 1, "stats still populated");
+        assert!(
+            warned_unpinned.lock().contains("status"),
+            "the unpinned sighting is recorded for warn dedup across passes"
+        );
+    }
+
+    #[test]
+    fn columns_follow_field_display_rank() {
+        // Envelope columns lead, custom columns follow alphabetically —
+        // mirrors query-result ordering (previously this was DESCRIBE's
+        // physical order).
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_service_parquet(
+            base,
+            "2026-06-20",
+            "nginx",
+            "SELECT * FROM (VALUES (200, TIMESTAMP '2026-06-20 10:00:00', 'x'))
+             t(zz_custom, _time, alpha)",
+        );
+
+        let glob = format!("{}/**/*.parquet", base.display());
+        let warned = Mutex::new(HashSet::new());
+        let warned_unpinned = Mutex::new(HashSet::new());
+        let services =
+            refresh_service_schema(&glob, &warned, &warned_unpinned, &empty_catalog()).unwrap();
+
+        let names: Vec<&str> = services[0]
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["_time", "alpha", "zz_custom"]);
+    }
+
     #[test]
     fn refresh_reads_footer_stats_and_exact_daily_counts() {
         let dir = tempfile::tempdir().unwrap();
@@ -323,7 +466,9 @@ mod tests {
 
         let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
-        let services = refresh_service_schema(&glob, &warned).unwrap();
+        let warned_unpinned = Mutex::new(HashSet::new());
+        let services =
+            refresh_service_schema(&glob, &warned, &warned_unpinned, &empty_catalog()).unwrap();
 
         let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
         assert_eq!(nginx.file_count, 2);
@@ -365,7 +510,9 @@ mod tests {
         // Refresh succeeds despite the bad file...
         let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
-        let services = refresh_service_schema(&glob, &warned).unwrap();
+        let warned_unpinned = Mutex::new(HashSet::new());
+        let services =
+            refresh_service_schema(&glob, &warned, &warned_unpinned, &empty_catalog()).unwrap();
         assert!(services.iter().any(|s| s.name == "good"));
 
         // ...the bad file's service has zero events (it was skipped)...
@@ -392,9 +539,11 @@ mod tests {
 
         let glob = format!("{}/**/*.parquet", base.display());
         let warned = Mutex::new(HashSet::new());
+        let warned_unpinned = Mutex::new(HashSet::new());
+        let catalog = empty_catalog();
 
         // Pass 1: file is garbage → skipped, zero events, recorded in warned.
-        let pass1 = refresh_service_schema(&glob, &warned).unwrap();
+        let pass1 = refresh_service_schema(&glob, &warned, &warned_unpinned, &catalog).unwrap();
         let svc1 = pass1.iter().find(|s| s.name == "svc").unwrap();
         assert_eq!(svc1.total_events, 0);
         assert!(warned.lock().contains(&svc));
@@ -408,7 +557,7 @@ mod tests {
         .unwrap();
 
         // Pass 2: it reads cleanly and its rows are counted; warned set clears.
-        let pass2 = refresh_service_schema(&glob, &warned).unwrap();
+        let pass2 = refresh_service_schema(&glob, &warned, &warned_unpinned, &catalog).unwrap();
         let svc2 = pass2.iter().find(|s| s.name == "svc").unwrap();
         assert_eq!(svc2.total_events, 2);
         assert!(!warned.lock().contains(&svc));

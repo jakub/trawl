@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use trawl_engine::executor::Executor;
-use trawl_engine::value::{QueryResult, SchemaResult};
+use trawl_engine::value::QueryResult;
 
 use crate::error::ServerError;
 use crate::hot_buffer::HotBuffer;
@@ -865,22 +865,6 @@ impl ExecutorPool {
 
         self.active_interrupts.lock().remove(&query_id);
         outcome
-    }
-
-    /// Introspect the data source schema.
-    ///
-    /// Uses a fresh connection rather than a pooled executor since schema
-    /// queries are lightweight metadata-only operations, cached server-side
-    /// with a 60s TTL (see [`crate::state::SCHEMA_CACHE_TTL_SECS`]).
-    pub async fn describe_schema(&self) -> Result<SchemaResult, ServerError> {
-        let glob = Arc::clone(&self.fallback_glob);
-
-        tokio::task::spawn_blocking(move || {
-            let executor = Executor::new()?;
-            executor.describe_schema(&glob).map_err(ServerError::from)
-        })
-        .await
-        .map_err(|e| ServerError::Internal(format!("schema task panicked: {e}")))?
     }
 }
 

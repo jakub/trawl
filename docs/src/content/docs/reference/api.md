@@ -79,9 +79,85 @@ Validate DSL syntax without executing.
 
 ```
 GET /api/v1/schema
+GET /api/v1/schema?service=nginx
+GET /api/v1/schema?all=true
 ```
 
-Returns column names and types discovered from the data.
+Returns column names and types, served from the **field catalog** — the
+write-time type authority — never a parquet `DESCRIBE`. Corpus facts
+(dates, sizes, services, file count) come from a TTL-cached filesystem
+walk; `cached` reports whether *they* were cached. The column set is
+cached under the same TTL (`schema_cache_ttl_secs`) when the request is
+unscoped, so a newly pinned field can take up to that long to appear; a
+`?service=` request is always served fresh from the catalog.
+
+Parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `service` | Only fields that service has carried. |
+| `all` | `true` lifts the retention window: by default a field whose most recent observation predates `[retention] max_age_days` (default 90; 0 disables) is hidden. A field with no observations at all (e.g. the envelope on a fresh install) is always shown. |
+
+Observations come from compaction, and — for a corpus that predates the
+catalog — from the boot conformance pass, which backfills them from the
+files it adopts (timestamps taken from each file's partition hour, not from
+boot time). So `?service=` and the window answer for historical data too;
+a corpus older than `max_age_days` that retention has not yet pruned needs
+`?all=true` to list its fields.
+
+```
+GET /api/v1/schema/fields
+GET /api/v1/schema/fields?service=nginx&since_secs=604800&limit=100
+```
+
+Lists pinned fields with aggregated evidence: type, pin provenance
+(`pinned_from`, `pinned_at`), per-field service count, cumulative rows,
+first/last observation, and conflict counts. The response carries
+`pinned_total` / `pin_capacity` (catalog fill) and `truncated` (the
+default limit is 500, clamped to the pin cap).
+
+`?service=` scopes the numbers, not just the row set: `service_count`,
+`row_count`, `first_seen`, `last_seen` and the `?since_secs=` window all
+describe that one service's observations, so a field another service is
+still sending does not keep showing up under a service that stopped. The
+same holds for `?service=` on `/api/v1/schema` above.
+
+```
+GET /api/v1/schema/field?name=duration
+GET /api/v1/schema/field?name=duration&limit=500&after=<services_cursor>
+```
+
+One field's detail: the pin, one page of per-service observations, and
+retained conflict evidence. The name is a **query parameter** (a catalog
+key may contain `/`) and is ASCII-lowercased before lookup, mirroring
+ingest's fold; an unpinned name returns 404.
+
+Observations are **paged**: service names are client-chosen and their
+observation rows are never removed, so one field's history can grow
+without bound (it costs no pin slot). `limit` defaults to 100 and is
+clamped to 1000 regardless of what the caller asks for; when more rows
+follow, the response carries `services_cursor` — pass it back as `after`
+for the next page. The cursor is opaque and keyset-based (a garbled one
+returns 400, never a silent restart at page one). Conflict evidence needs
+no cursor: it is capped per field at write time.
+
+```
+GET /api/v1/schema/conflicts
+GET /api/v1/schema/conflicts?field=duration&service=envoy&since_secs=604800
+```
+
+The schema-health dashboard: recent type conflicts (a batch column whose
+conforming cast nulled rows), most recent first. Filter by `field`,
+`service`, and `since_secs`; `limit` defaults to 100 (max 1000).
+
+```
+GET /api/v1/schema/services
+```
+
+Rich per-service schema (per-column null counts, min/max, sizes, daily
+volumes) from the background footer scan. Types come from the catalog's
+in-process pin cache; a physically-present column with no pin (foreign or
+boot-skipped parquet) reports the sentinel type `UNPINNED`.
 
 ```
 GET /api/v1/schema/values/{field}

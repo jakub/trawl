@@ -1,0 +1,33 @@
+-- Read-path index for the catalog schema surfaces (ADR-0009 slice 3, #51).
+--
+-- `store::catalog::list_fields` backs `/api/v1/schema` — the endpoint the
+-- TUI/SPA autocomplete polls — and `/api/v1/schema/fields`. A `?service=`
+-- listing puts the service predicate INSIDE the `field_services` grouping
+-- (and again in the `EXISTS` presence test), and 0002 gave the table only
+-- its `(field, service)` primary key: wrong leading column, so both fell to
+-- a sequential scan of the WHOLE table. The service axis is client-chosen
+-- and unbounded (an ingest key invents service names without spending a pin
+-- slot), so that scan grows without bound.
+--
+-- Leading on `service` makes the scan proportional to ONE service's fields
+-- — bounded by `store::catalog::MAX_PINNED_FIELDS` — and the `INCLUDE`
+-- payload carries every aggregated column, so it is an index-ONLY scan with
+-- no heap fetch. Measured at 10 000 pins x 50 services (500k rows):
+-- parallel seq scan of 500 000 rows -> index-only scan of 10 000,
+-- 4 167 buffers -> 123.
+--
+-- The UNSCOPED listing gets no index: a full `GROUP BY field` reads every
+-- row whatever the access path, and postgres rightly prefers a hash
+-- aggregate over a parallel seq scan (a covering `(field) INCLUDE (...)`
+-- index was measured and not chosen). That one is bounded instead by the
+-- TTL cache in front of it (`handlers::schema`, `schema_cache_ttl_secs`).
+--
+-- `field_conflicts` keeps 0002's `(field, at DESC)` untouched: that table
+-- is already bounded on both axes (`MAX_CONFLICTS_PER_FIELD` rows per
+-- field, pin cap fields) and its aggregate is a full grouping like the
+-- unscoped one, so no index changes its shape.
+--
+-- Every constraint/index is NAMED, per the 0001 convention.
+CREATE INDEX field_services_service_field_idx
+    ON field_services (service, field)
+    INCLUDE (row_count, first_seen, last_seen);

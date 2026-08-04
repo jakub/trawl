@@ -17,7 +17,10 @@
 //! [`MAX_CONFLICTS_PER_FIELD`]. `field_services` rows are deliberately
 //! ever-observed — nothing removes one — and its worst case is bounded by
 //! the pin cap on the field axis times the services a deployment really
-//! runs; consumers window on `last_seen`.
+//! runs; consumers window on `last_seen`. Its SERVICE axis has no cap at
+//! all (service names are client-chosen and no row is ever removed), so the
+//! read surface pages it: [`CatalogStore::field_services`] takes a bounded
+//! limit and a [`ServiceCursor`], never the whole history.
 
 use std::collections::HashMap;
 
@@ -59,6 +62,24 @@ pub struct FieldConflict {
     pub rows_nulled: u64,
 }
 
+/// One `(field, service)` observation reconstructed from a standing parquet
+/// file rather than reported by the batch that wrote it — the boot
+/// conformance pass's backfill ([`CatalogStore::backfill_services`]).
+#[derive(Debug, Clone)]
+pub struct ServiceObservation {
+    /// Field name (already ASCII-folded — a catalog key).
+    pub field: String,
+    /// Service that carries the field.
+    pub service: String,
+    /// Earliest instant the corpus attests to (the oldest partition
+    /// directory carrying the column).
+    pub first_seen: DateTime<Utc>,
+    /// Latest instant the corpus attests to (the newest such partition).
+    pub last_seen: DateTime<Utc>,
+    /// Rows the corpus holds for this `(field, service)` pair.
+    pub row_count: i64,
+}
+
 /// A `field_services` observation row.
 #[derive(Debug, Clone)]
 pub struct FieldServiceRow {
@@ -73,6 +94,148 @@ pub struct FieldServiceRow {
     /// Cumulative rows compacted in batches that wrote the field — the sum
     /// of per-batch row counts, not a per-value non-null tally.
     pub row_count: i64,
+}
+
+/// A position inside one field's observation listing: the
+/// `(last_seen, service)` of the last row already delivered.
+///
+/// `(last_seen, service)` is unique per field — `(field, service)` is the
+/// primary key — so the pair identifies an exact row, and resuming after it
+/// can neither repeat nor skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceCursor {
+    /// Last observation instant of the row the page stopped at.
+    pub last_seen: DateTime<Utc>,
+    /// Service name of the row the page stopped at.
+    pub service: String,
+}
+
+impl ServiceCursor {
+    /// Wire spelling: `<rfc3339-micros>|<service>`.
+    ///
+    /// `|` is outside the service charset (`[A-Za-z0-9._-]`, enforced at
+    /// every ingest door), and RFC 3339 has no `|` either, so splitting at
+    /// the LAST `|` recovers both halves unambiguously.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!(
+            "{}|{}",
+            self.last_seen
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            self.service
+        )
+    }
+
+    /// Parse a cursor the server previously issued. `None` for anything
+    /// malformed — a cursor is opaque to clients, so a garbled one is a
+    /// client error, never a silently ignored filter.
+    #[must_use]
+    pub fn decode(raw: &str) -> Option<Self> {
+        let (ts, service) = raw.rsplit_once('|')?;
+        if service.is_empty() {
+            return None;
+        }
+        let last_seen = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+        Some(Self {
+            last_seen,
+            service: service.to_owned(),
+        })
+    }
+}
+
+/// Filter for [`CatalogStore::list_fields`].
+#[derive(Debug, Clone)]
+pub struct FieldListFilter {
+    /// Only fields observed for this service — and every aggregate below
+    /// (`service_count`, `row_count`, `first_seen`, `last_seen`, and the
+    /// `since` window read off them) is computed from THAT service's
+    /// observations alone. `None` lists every pin over every service.
+    pub service: Option<String>,
+    /// Window on the field's most recent observation: a field whose
+    /// `max(last_seen)` — within `service`, when set — predates this
+    /// instant is hidden. A field with NO observations at all (e.g. the
+    /// envelope seed on a fresh install) is ALWAYS shown — there is
+    /// nothing to age out. `None` disables the window.
+    pub since: Option<DateTime<Utc>>,
+    /// Maximum rows returned (the caller clamps; see the route handlers).
+    pub limit: i64,
+    /// Fetch the per-field conflict evidence (`conflict_count`,
+    /// `rows_nulled`). Costs a second, page-scoped query against
+    /// `field_conflicts`; callers that only want names and types
+    /// (`/api/v1/schema`) set this `false` and read zeroes.
+    pub with_conflicts: bool,
+}
+
+impl Default for FieldListFilter {
+    fn default() -> Self {
+        Self {
+            service: None,
+            since: None,
+            limit: MAX_PINNED_FIELDS,
+            with_conflicts: true,
+        }
+    }
+}
+
+/// One row of the field listing: the pin plus its aggregated observation
+/// and conflict evidence.
+#[derive(Debug, Clone)]
+pub struct FieldSummaryRow {
+    /// Field name.
+    pub field: String,
+    /// Pinned `DuckDB` type spelling.
+    pub duckdb_type: String,
+    /// Which service's batch set the pin (`_declared` for the envelope
+    /// seed; `NULL` only in hand-edited catalogs).
+    pub pinned_from: Option<String>,
+    /// When the pin was written.
+    pub pinned_at: DateTime<Utc>,
+    // The four observation aggregates below span every service that ever
+    // carried the field — or exactly the one service, when the listing was
+    // scoped by [`FieldListFilter::service`].
+    /// Distinct services that ever carried the field (1 when scoped).
+    pub service_count: i64,
+    /// Cumulative rows across the observations in scope.
+    pub row_count: i64,
+    /// Earliest observation in scope (`None` when never observed).
+    pub first_seen: Option<DateTime<Utc>>,
+    /// Most recent observation in scope (`None` when never observed).
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Conflict evidence rows currently retained for the field.
+    pub conflict_count: i64,
+    /// Total rows nulled across the retained evidence.
+    pub rows_nulled: i64,
+}
+
+/// One field's pin row ([`CatalogStore::field_pin`]).
+#[derive(Debug, Clone)]
+pub struct FieldPinRow {
+    /// Field name.
+    pub field: String,
+    /// Pinned `DuckDB` type spelling.
+    pub duckdb_type: String,
+    /// Which service's batch set the pin.
+    pub pinned_from: Option<String>,
+    /// When the pin was written.
+    pub pinned_at: DateTime<Utc>,
+}
+
+/// A `field_conflicts` row with its field name — the cross-field listing
+/// shape ([`CatalogStore::recent_conflicts`]).
+#[derive(Debug, Clone)]
+pub struct ConflictListRow {
+    /// Field name.
+    pub field: String,
+    /// Service that disagreed.
+    pub service: String,
+    /// Observed `DuckDB` type spelling.
+    pub observed_type: String,
+    /// Expected (pinned) type spelling.
+    pub expected_type: String,
+    /// Rows nulled by the conforming cast.
+    pub rows_nulled: i64,
+    /// When the conflict was recorded.
+    pub at: DateTime<Utc>,
 }
 
 /// A `field_conflicts` row as read back (types as stored text).
@@ -154,6 +317,11 @@ pub const MAX_PINNED_FIELDS: i64 = 10_000;
 /// operator WHICH values a pin is currently costing them, and the newest
 /// evidence is the evidence they act on.
 pub const MAX_CONFLICTS_PER_FIELD: i64 = 100;
+
+/// Rows per statement in [`CatalogStore::backfill_services`]. The backfill's
+/// size is (pinned fields x services), which nothing bounds below five
+/// figures, so it is written in chunks rather than one array-of-everything.
+const BACKFILL_CHUNK: usize = 1_000;
 
 /// One field name shortened for logging: a name can be as long as a client
 /// made it, so echoing it whole turns the log line into an amplifier of
@@ -497,6 +665,73 @@ impl CatalogStore {
         Ok(())
     }
 
+    /// Backfill observations for a corpus that predates the catalog — the
+    /// boot conformance pass, not the ingest path.
+    ///
+    /// `field_services` is the authority behind `?service=` and the
+    /// `last_seen` window on the schema surfaces, and only compaction ever
+    /// wrote it: on an upgrade, migration 0002 creates the table EMPTY while
+    /// the boot pass pins (and rewrites) a corpus that no live batch will
+    /// re-observe until its service next sends the field. A service that
+    /// stopped sending — or an env retired but retained — would therefore
+    /// answer `?service=` with nothing at all, and its pins would sit outside
+    /// the `last_seen` window forever (a never-observed pin is always shown,
+    /// by design). This closes that gap from the standing files themselves.
+    ///
+    /// **Idempotent**, because the pass re-runs on every boot until the
+    /// corpus is proven conformant: `first_seen` only moves earlier,
+    /// `last_seen` only later, and `row_count` takes the MAX rather than
+    /// accumulating — so re-running over the same corpus is a no-op and a
+    /// live tick's accumulated count is never clobbered downward by a
+    /// backfill that sees a retention-shrunk corpus.
+    ///
+    /// Callers must pass at most one row per `(field, service)`: postgres
+    /// refuses to let one `ON CONFLICT DO UPDATE` statement touch a row
+    /// twice. The only caller aggregates into a map keyed by exactly that
+    /// pair.
+    pub async fn backfill_services(
+        &self,
+        observations: &[ServiceObservation],
+    ) -> Result<(), StoreError> {
+        let rejected = unstorable_names(observations.iter().map(|o| o.field.as_str()));
+        if !rejected.is_empty() {
+            warn_unstorable("backfill", &rejected);
+        }
+        let storable: Vec<&ServiceObservation> = observations
+            .iter()
+            .filter(|o| trawl_core::schema::is_storable_field_name(&o.field))
+            .collect();
+
+        // Chunked: the row count is (pinned fields x services a deployment
+        // ships), which the pin cap bounds at five figures on one axis alone
+        // — too many parameters' worth of arrays for a single statement.
+        for chunk in storable.chunks(BACKFILL_CHUNK) {
+            let fields: Vec<&str> = chunk.iter().map(|o| o.field.as_str()).collect();
+            let services: Vec<&str> = chunk.iter().map(|o| o.service.as_str()).collect();
+            let first: Vec<DateTime<Utc>> = chunk.iter().map(|o| o.first_seen).collect();
+            let last: Vec<DateTime<Utc>> = chunk.iter().map(|o| o.last_seen).collect();
+            let rows: Vec<i64> = chunk.iter().map(|o| o.row_count).collect();
+
+            sqlx::query(
+                "INSERT INTO field_services (field, service, first_seen, last_seen, row_count)
+                 SELECT * FROM UNNEST(
+                     $1::text[], $2::text[], $3::timestamptz[], $4::timestamptz[], $5::bigint[])
+                 ON CONFLICT (field, service) DO UPDATE
+                 SET first_seen = LEAST(field_services.first_seen, EXCLUDED.first_seen),
+                     last_seen  = GREATEST(field_services.last_seen, EXCLUDED.last_seen),
+                     row_count  = GREATEST(field_services.row_count, EXCLUDED.row_count)",
+            )
+            .bind(&fields)
+            .bind(&services)
+            .bind(&first)
+            .bind(&last)
+            .bind(&rows)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Append conflict evidence rows (never aggregated), then trim every
     /// field this call touched back to its newest [`MAX_CONFLICTS_PER_FIELD`]
     /// rows.
@@ -563,17 +798,63 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Read the observation rows for one field, most recent first.
-    pub async fn field_services(&self, field: &str) -> Result<Vec<FieldServiceRow>, StoreError> {
+    /// Read ONE PAGE of the observation rows for one field, most recent
+    /// first, resuming after `after`.
+    ///
+    /// Paged, never whole: `field_services` is bounded on the field axis by
+    /// the pin cap but NOT on the service axis — service names are
+    /// client-chosen and rows are ever-observed, so the history of a common
+    /// envelope field grows with every service a sender ever invents,
+    /// without spending a pin slot. An unpaged read would hand one
+    /// `schema_read` request an arbitrarily large database read, allocation,
+    /// and response body.
+    ///
+    /// Keyset, not `OFFSET`: the page walks `(last_seen DESC, service ASC)`,
+    /// which is unique per field (`(field, service)` is the primary key), so
+    /// a cursor names an exact position and a concurrent observation update
+    /// cannot make a page repeat or skip a row it already delivered.
+    ///
+    /// The cursor predicate is deliberately written as
+    /// `last_seen <= cursor AND (last_seen < cursor OR service > $3)` rather
+    /// than the equivalent single `OR` chain, and `COALESCE`s the absent
+    /// cursor to `infinity` rather than guarding it with `IS NULL`. Both
+    /// shapes select the same rows, but only this one is *sargable*: the
+    /// leading conjunct is a bound postgres can push into
+    /// `field_services_field_last_seen_idx` (migration 0004) as an index
+    /// scan key, so the page STARTS at the cursor. Under the `OR` chain the
+    /// whole thing degrades to a filter and every page re-reads the field's
+    /// entire history — bounding the allocation and the response body, but
+    /// not the read, which makes walking the pages quadratic.
+    ///
+    /// Returns `(rows, next)`; `next` is `Some` when more rows follow.
+    pub async fn field_services(
+        &self,
+        field: &str,
+        after: Option<&ServiceCursor>,
+        limit: i64,
+    ) -> Result<(Vec<FieldServiceRow>, Option<ServiceCursor>), StoreError> {
+        let limit = limit.max(1);
         let rows = sqlx::query(
             "SELECT service, first_seen, last_seen, row_count
-             FROM field_services WHERE field = $1
-             ORDER BY last_seen DESC, service",
+             FROM field_services
+             WHERE field = $1
+               AND last_seen <= COALESCE($2::timestamptz, 'infinity')
+               AND (last_seen < COALESCE($2::timestamptz, 'infinity')
+                    OR service > $3)
+             ORDER BY last_seen DESC, service
+             LIMIT $4",
         )
         .bind(field)
+        .bind(after.map(|c| c.last_seen))
+        .bind(after.map_or("", |c| c.service.as_str()))
+        // Fetch one extra row purely to learn whether a next page exists.
+        .bind(limit.saturating_add(1))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
+
+        let has_more = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+        let mut rows = rows
+            .iter()
             .map(|row| {
                 Ok(FieldServiceRow {
                     service: row.try_get("service")?,
@@ -583,7 +864,17 @@ impl CatalogStore {
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(StoreError::from)
+            .map_err(StoreError::from)?;
+        rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+
+        let next = has_more.then(|| {
+            let last = rows.last().expect("a truncating page has a last row");
+            ServiceCursor {
+                last_seen: last.last_seen,
+                service: last.service.clone(),
+            }
+        });
+        Ok((rows, next))
     }
 
     /// Read the conflict rows for one field, most recent first.
@@ -613,6 +904,247 @@ impl CatalogStore {
             .map_err(StoreError::from)
     }
 
+    /// [`Self::list_fields`], `?service=` shape: `$1` service, `$2` since,
+    /// `$3` limit. See the method docs for why this is its own SQL text.
+    const LIST_FIELDS_SCOPED_SQL: &'static str = "\
+        SELECT t.field, t.duckdb_type, t.pinned_from, t.pinned_at,
+               COALESCE(s.service_count, 0)::bigint AS service_count,
+               COALESCE(s.row_count, 0)::bigint     AS row_count,
+               s.first_seen, s.last_seen
+        FROM field_types t
+        LEFT JOIN (
+            SELECT field, count(*) AS service_count, sum(row_count) AS row_count,
+                   min(first_seen) AS first_seen, max(last_seen) AS last_seen
+            FROM field_services
+            WHERE service = $1
+            GROUP BY field
+        ) s ON s.field = t.field
+        WHERE EXISTS (
+                  SELECT 1 FROM field_services fs
+                  WHERE fs.field = t.field AND fs.service = $1)
+          AND ($2::timestamptz IS NULL
+                   OR s.last_seen IS NULL
+                   OR s.last_seen >= $2)
+        ORDER BY t.field
+        LIMIT $3";
+
+    /// [`Self::list_fields`], unscoped shape: `$1` since, `$2` limit.
+    const LIST_FIELDS_UNSCOPED_SQL: &'static str = "\
+        SELECT t.field, t.duckdb_type, t.pinned_from, t.pinned_at,
+               COALESCE(s.service_count, 0)::bigint AS service_count,
+               COALESCE(s.row_count, 0)::bigint     AS row_count,
+               s.first_seen, s.last_seen
+        FROM field_types t
+        LEFT JOIN (
+            SELECT field, count(*) AS service_count, sum(row_count) AS row_count,
+                   min(first_seen) AS first_seen, max(last_seen) AS last_seen
+            FROM field_services
+            GROUP BY field
+        ) s ON s.field = t.field
+        WHERE ($1::timestamptz IS NULL
+                   OR s.last_seen IS NULL
+                   OR s.last_seen >= $1)
+        ORDER BY t.field
+        LIMIT $2";
+
+    /// List pins with their aggregated observation and conflict evidence —
+    /// the read model behind `/api/v1/schema` and `/api/v1/schema/fields`.
+    ///
+    /// The pin page is one query: `field_types` LEFT JOIN grouped
+    /// `field_services`. The LEFT join is load-bearing: a pin with no
+    /// observations (the envelope seed on a fresh install, or a boot-pass
+    /// pin over standing parquet) must always appear — windowing only hides
+    /// fields whose evidence says they aged out.
+    ///
+    /// `filter.service` scopes the AGGREGATE, not just the row set: the
+    /// predicate goes INSIDE the `field_services` grouping, so a scoped
+    /// listing reports that service's own counts and instants, and the
+    /// `since` window is evaluated against that service's `last_seen`.
+    /// Filtering only in the `WHERE` clause would leak every other
+    /// service's numbers into the listing and keep a field alive in the
+    /// window because somebody ELSE still sends it. The `EXISTS` stays as
+    /// the presence test — a pin the service never carried has no group
+    /// row, and the never-observed rule would otherwise show it.
+    ///
+    /// The conflict evidence is a SECOND query, keyed on the field names
+    /// this page actually returned, and skipped entirely when
+    /// `filter.with_conflicts` is false. Joining a grouped
+    /// `SELECT ... FROM field_conflicts GROUP BY field` instead carried no
+    /// predicate a planner could push down, so every call — including the
+    /// deliberately uncached `?service=` one — materialised an aggregate
+    /// over the whole table, which is bounded only by
+    /// [`MAX_CONFLICTS_PER_FIELD`] x [`MAX_PINNED_FIELDS`] and not by the
+    /// pin cap the scoped listing promises. Keyed on the page it rides
+    /// 0002's `(field, at DESC)` index and reads at most
+    /// `limit` x [`MAX_CONFLICTS_PER_FIELD`] rows.
+    ///
+    /// Scoped and unscoped are two SQL TEXTS, not one
+    /// `($1 IS NULL OR service = $1)` shape: sqlx prepares and caches every
+    /// statement per pooled connection, and on execution 6 postgres
+    /// (`plan_cache_mode=auto`) switches a prepared statement to its
+    /// generic plan — under which the `IS NULL`-guarded `OR` cannot be
+    /// pushed into `field_services_service_field_idx` (migration 0003) as a
+    /// scan key, so the scoped listing degrades to reading the whole table
+    /// (measured at 0003's own sizing: 2 318 → 504 366 buffers), unbounded
+    /// in the client-chosen service axis. Same reasoning as the cursor
+    /// predicate in [`Self::field_services`]. The `since` guard keeps the
+    /// `IS NULL`-`OR` shape: it filters the joined rows AFTER aggregation,
+    /// bounded by the pin cap, and is no index's scan key either way.
+    ///
+    /// Returns `(rows, truncated)`; `truncated` is set when more rows
+    /// matched than `filter.limit` allowed back.
+    pub async fn list_fields(
+        &self,
+        filter: &FieldListFilter,
+    ) -> Result<(Vec<FieldSummaryRow>, bool), StoreError> {
+        let limit = filter.limit.max(0);
+        let query = if let Some(service) = filter.service.as_deref() {
+            sqlx::query(Self::LIST_FIELDS_SCOPED_SQL).bind(service)
+        } else {
+            sqlx::query(Self::LIST_FIELDS_UNSCOPED_SQL)
+        };
+        let rows = query
+            .bind(filter.since)
+            // Fetch one extra row purely to learn whether the limit truncated.
+            .bind(limit.saturating_add(1))
+            .fetch_all(&self.pool)
+            .await?;
+
+        let truncated = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+        let take = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mut summaries = rows
+            .iter()
+            .take(take)
+            .map(|row| {
+                Ok(FieldSummaryRow {
+                    field: row.try_get("field")?,
+                    duckdb_type: row.try_get("duckdb_type")?,
+                    pinned_from: row.try_get("pinned_from")?,
+                    pinned_at: row.try_get("pinned_at")?,
+                    service_count: row.try_get("service_count")?,
+                    row_count: row.try_get("row_count")?,
+                    first_seen: row.try_get("first_seen")?,
+                    last_seen: row.try_get("last_seen")?,
+                    conflict_count: 0,
+                    rows_nulled: 0,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::from)?;
+
+        if filter.with_conflicts && !summaries.is_empty() {
+            let names: Vec<String> = summaries.iter().map(|r| r.field.clone()).collect();
+            let evidence = sqlx::query(
+                "SELECT field,
+                        count(*)::bigint                    AS conflict_count,
+                        COALESCE(sum(rows_nulled), 0)::bigint AS rows_nulled
+                 FROM field_conflicts
+                 WHERE field = ANY($1)
+                 GROUP BY field",
+            )
+            .bind(&names)
+            .fetch_all(&self.pool)
+            .await?;
+            let by_field: HashMap<String, (i64, i64)> = evidence
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get("field")?,
+                        (row.try_get("conflict_count")?, row.try_get("rows_nulled")?),
+                    ))
+                })
+                .collect::<Result<_, sqlx::Error>>()
+                .map_err(StoreError::from)?;
+            for summary in &mut summaries {
+                if let Some(&(conflict_count, rows_nulled)) = by_field.get(&summary.field) {
+                    summary.conflict_count = conflict_count;
+                    summary.rows_nulled = rows_nulled;
+                }
+            }
+        }
+
+        Ok((summaries, truncated))
+    }
+
+    /// The catalog's fill level: `(pinned, capacity)` — the same pair the
+    /// `trawl_catalog_pinned_fields` / `trawl_catalog_pin_capacity` gauges
+    /// publish, surfaced on the fields listing so a client sees headroom.
+    pub async fn pin_stats(&self) -> Result<(i64, i64), StoreError> {
+        let pinned: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((pinned, self.pin_cap))
+    }
+
+    /// Cross-field conflict listing, most recent first — the schema-health
+    /// dashboard read (`trawl schema conflicts --last 7d`).
+    ///
+    /// `field`/`service` filter exactly; `since` windows on the recording
+    /// instant. Returns `(rows, truncated)` like [`Self::list_fields`].
+    pub async fn recent_conflicts(
+        &self,
+        field: Option<&str>,
+        service: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<(Vec<ConflictListRow>, bool), StoreError> {
+        let limit = limit.max(0);
+        let rows = sqlx::query(
+            "SELECT field, service, observed_type, expected_type, rows_nulled, at
+             FROM field_conflicts
+             WHERE ($1::text IS NULL OR field = $1)
+               AND ($2::text IS NULL OR service = $2)
+               AND ($3::timestamptz IS NULL OR at >= $3)
+             ORDER BY at DESC, id DESC
+             LIMIT $4",
+        )
+        .bind(field)
+        .bind(service)
+        .bind(since)
+        .bind(limit.saturating_add(1))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let truncated = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+        let take = usize::try_from(limit).unwrap_or(usize::MAX);
+        rows.iter()
+            .take(take)
+            .map(|row| {
+                Ok(ConflictListRow {
+                    field: row.try_get("field")?,
+                    service: row.try_get("service")?,
+                    observed_type: row.try_get("observed_type")?,
+                    expected_type: row.try_get("expected_type")?,
+                    rows_nulled: row.try_get("rows_nulled")?,
+                    at: row.try_get("at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map(|rows| (rows, truncated))
+            .map_err(StoreError::from)
+    }
+
+    /// Read one field's pin row, or `None` when the field is not pinned.
+    pub async fn field_pin(&self, field: &str) -> Result<Option<FieldPinRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT field, duckdb_type, pinned_from, pinned_at
+             FROM field_types WHERE field = $1",
+        )
+        .bind(field)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| -> Result<FieldPinRow, sqlx::Error> {
+            Ok(FieldPinRow {
+                field: row.try_get("field")?,
+                duckdb_type: row.try_get("duckdb_type")?,
+                pinned_from: row.try_get("pinned_from")?,
+                pinned_at: row.try_get("pinned_at")?,
+            })
+        })
+        .transpose()
+        .map_err(StoreError::from)
+    }
+
     /// The catalog's stable identity (mirrored into the `data/CATALOG`
     /// marker so `DATABASE_URL` repoints and data-root restores are
     /// self-detecting).
@@ -638,5 +1170,68 @@ impl CatalogStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Whether the boot pass has backfilled `field_services` from the
+    /// standing corpus for this catalog.
+    ///
+    /// Tracked separately from [`Self::is_conformed`] on purpose: the
+    /// backfill ([`Self::backfill_services`]) shipped a slice after
+    /// conformance did, so an install that conformed under the earlier slice
+    /// carries `conformed_at` set and this flag NULL — the one state where
+    /// the pass must run again.
+    pub async fn services_backfilled(&self) -> Result<bool, StoreError> {
+        let backfilled: bool =
+            sqlx::query_scalar("SELECT services_backfilled_at IS NOT NULL FROM catalog_state")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(backfilled)
+    }
+
+    /// Record that the boot pass observed the standing corpus.
+    pub async fn mark_services_backfilled(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE catalog_state SET services_backfilled_at = now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cursor is opaque to clients but must round-trip exactly: a
+    /// microsecond lost in the encoding would re-deliver or skip the row it
+    /// names. Service names carry `.`, `-`, and `_`; none is `|`.
+    #[test]
+    fn service_cursor_roundtrips_exactly() {
+        for service in ["nginx", "api.v2", "svc-a_b", "x"] {
+            let cursor = ServiceCursor {
+                last_seen: DateTime::parse_from_rfc3339("2026-08-02T10:00:00.123456Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                service: service.to_owned(),
+            };
+            let decoded = ServiceCursor::decode(&cursor.encode()).expect("decodes");
+            assert_eq!(decoded, cursor, "{service}");
+        }
+    }
+
+    /// A malformed cursor is a client error, never a silently dropped
+    /// filter: decoding fails so the handler can 400 instead of restarting
+    /// the walk at page one.
+    #[test]
+    fn service_cursor_rejects_garbage() {
+        for raw in [
+            "",
+            "nginx",
+            "|nginx",
+            "2026-08-02T10:00:00Z|",
+            "not-a-time|nginx",
+            "2026-08-02T10:00:00Z",
+        ] {
+            assert!(ServiceCursor::decode(raw).is_none(), "{raw:?}");
+        }
     }
 }

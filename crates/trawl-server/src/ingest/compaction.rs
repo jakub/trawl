@@ -1119,29 +1119,118 @@ pub(crate) fn record_conflict_metrics(service: &str, conflicts: &[FieldConflict]
     }
 }
 
-/// Best-effort catalog bookkeeping after a successful conformant write:
-/// conflict rows and per-service field observations. Failures warn — the
-/// parquet is already durable and conformant, so retrying the batch for a
-/// bookkeeping error would duplicate data.
-async fn record_batch_bookkeeping(cat: &CatalogContext, service: &str, report: &WriteReport) {
-    if let Err(e) = cat.store.record_conflicts(&report.conflicts).await {
-        tracing::warn!(
-            event_type = "catalog_bookkeeping_error",
+/// Attempts a bookkeeping write gets before it is given up on, and the base
+/// of its exponential backoff.
+///
+/// The parquet is already durable when these run, so a failure cannot fail
+/// the batch — but it can leave a permanent hole: `field_services` is the
+/// authority behind `?service=` and the `last_seen` window, and a lost
+/// observation is re-made only when that service next sends that field,
+/// which for a field it has stopped sending is never. A momentary postgres
+/// blip (failover, restart, a full pool) is therefore worth riding out
+/// in-tick — inside the wall-clock budget below, which is what keeps a
+/// sustained outage from stalling anything.
+const BOOKKEEPING_ATTEMPTS: u32 = 3;
+/// Base delay between bookkeeping attempts; doubles per attempt.
+const BOOKKEEPING_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Wall-clock ceiling on one batch's bookkeeping, retries and all.
+///
+/// The attempt count alone bounds nothing: a postgres outage does not fail
+/// fast, it blocks each write for the pool's whole acquire timeout (10s,
+/// [`crate::store`]), so retries would cost attempts × 10s per batch. And
+/// bookkeeping is awaited inline in phase 4 of a chunk while `compact_once`
+/// walks envs → services → chunks sequentially with no per-tick deadline —
+/// so that cost multiplies by the number of pending batches, against a
+/// 10s compaction interval. A stalled compactor is the one failure this
+/// file will not take: WAL stops draining and the hot buffer grows until
+/// it evicts, which is invisible events.
+///
+/// So the retry gets a budget instead of a promise. The blips it exists
+/// for (a full pool, a failover mid-query) fail in milliseconds and still
+/// get every attempt; an outage costs one budget per batch no matter what
+/// the pool's acquire timeout is.
+const BOOKKEEPING_BUDGET: Duration = Duration::from_secs(2);
+
+/// Run one bookkeeping write, retrying a transient failure.
+///
+/// Both writes are safe to repeat after a failure: `touch_services` is an
+/// upsert and `record_conflicts` commits atomically. The one case a retry
+/// can double is a LOST ACK (postgres committed, the answer never arrived),
+/// which over-counts a `row_count` that is already an approximation or
+/// re-appends conflict evidence the per-field trim bounds anyway — both
+/// strictly better than the gap the retry exists to prevent.
+async fn retry_bookkeeping<F, Fut>(what: &'static str, service: &str, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), crate::store::StoreError>>,
+{
+    for n in 1..=BOOKKEEPING_ATTEMPTS {
+        let Err(e) = attempt().await else {
+            return;
+        };
+        if n == BOOKKEEPING_ATTEMPTS {
+            tracing::warn!(
+                event_type = "catalog_bookkeeping_error",
+                compact_service = %service,
+                write = what,
+                attempts = n,
+                error = %e,
+                "catalog bookkeeping write failed and was given up on"
+            );
+            return;
+        }
+        tracing::debug!(
+            event_type = "catalog_bookkeeping_retry",
             compact_service = %service,
+            write = what,
+            attempt = n,
             error = %e,
-            "failed to record field_conflicts rows"
+            "catalog bookkeeping write failed; retrying"
         );
+        tokio::time::sleep(BOOKKEEPING_BACKOFF * 2u32.pow(n - 1)).await;
     }
-    if let Err(e) = cat
-        .store
-        .touch_services(service, &report.observed_fields, report.batch_rows)
+}
+
+/// Catalog bookkeeping after a successful conformant write: conflict rows
+/// and per-service field observations. Retried under a shared budget, then
+/// warned — the parquet is already durable and conformant, so retrying the
+/// BATCH for a bookkeeping error would duplicate data.
+async fn record_batch_bookkeeping(cat: &CatalogContext, service: &str, report: &WriteReport) {
+    let store = &cat.store;
+    let conflicts = &report.conflicts;
+    let observed = &report.observed_fields;
+    let rows = report.batch_rows;
+    let writes = async move {
+        retry_bookkeeping("field_conflicts", service, move || {
+            store.record_conflicts(conflicts)
+        })
+        .await;
+        retry_bookkeeping("field_services", service, move || {
+            store.touch_services(service, observed, rows)
+        })
+        .await;
+    };
+    budgeted_bookkeeping(service, writes).await;
+}
+
+/// Run a batch's bookkeeping writes under [`BOOKKEEPING_BUDGET`], dropping
+/// them when it runs out so compaction can get on with the next chunk.
+///
+/// Cancelling mid-write is safe for the same reason the retry is: an
+/// abandoned write is at worst a lost ack on an idempotent upsert or an
+/// atomic, per-field-trimmed conflict insert.
+async fn budgeted_bookkeeping<Fut: std::future::Future<Output = ()>>(service: &str, writes: Fut) {
+    if tokio::time::timeout(BOOKKEEPING_BUDGET, writes)
         .await
+        .is_err()
     {
         tracing::warn!(
-            event_type = "catalog_bookkeeping_error",
+            event_type = "catalog_bookkeeping_timeout",
             compact_service = %service,
-            error = %e,
-            "failed to update field_services observations"
+            budget_ms = BOOKKEEPING_BUDGET.as_millis(),
+            "catalog bookkeeping exceeded its budget and was abandoned so \
+             compaction keeps draining the WAL"
         );
     }
 }
@@ -5387,5 +5476,47 @@ mod tests {
             "quarantine must surface a rename failure as Err"
         );
         assert!(bad.exists(), "original stays put when quarantine fails");
+    }
+
+    /// A postgres outage does not fail fast — each write blocks on the pool's
+    /// acquire timeout — so the retry must be bounded by wall clock, not by
+    /// attempt count, or one batch's bookkeeping outlasts the compaction
+    /// interval and the WAL stops draining.
+    #[tokio::test(start_paused = true)]
+    async fn bookkeeping_budget_bounds_a_hung_write() {
+        let start = tokio::time::Instant::now();
+        budgeted_bookkeeping("svc", std::future::pending::<()>()).await;
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            BOOKKEEPING_BUDGET,
+            "a bookkeeping write that never returns must cost exactly the budget"
+        );
+    }
+
+    /// The blips the retry exists for fail in milliseconds, so the budget
+    /// must not cost them their attempts.
+    #[tokio::test(start_paused = true)]
+    async fn budget_leaves_room_for_every_fast_failing_attempt() {
+        let calls = std::cell::Cell::new(0_u32);
+        let start = tokio::time::Instant::now();
+        budgeted_bookkeeping(
+            "svc",
+            retry_bookkeeping("field_services", "svc", || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err(crate::store::StoreError::Unavailable(
+                    sqlx::Error::PoolTimedOut,
+                )))
+            }),
+        )
+        .await;
+        assert_eq!(
+            calls.get(),
+            BOOKKEEPING_ATTEMPTS,
+            "instant failures must still get every attempt"
+        );
+        assert!(
+            tokio::time::Instant::now() - start < BOOKKEEPING_BUDGET,
+            "the full backoff ladder must fit inside the budget"
+        );
     }
 }

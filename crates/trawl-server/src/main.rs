@@ -189,8 +189,37 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             scanned = summary.scanned,
             rewritten = summary.rewritten,
             skipped = summary.skipped,
+            observed = summary.observed,
             "boot conformance pass finished"
         );
+    } else {
+        // A query-only node skips the pass, but `/api/v1/schema` still
+        // answers from this catalog's pins — which describe the archive only
+        // if this catalog wrote it. Check the same dual-sided marker as a
+        // gate, and refuse the boot rather than advertise a schema about
+        // someone else's data. Only a marker naming ANOTHER catalog does
+        // that: an archive with no marker (what an incomplete conformance
+        // pass leaves) warns and serves, exactly as the ingest node does for
+        // the same corpus.
+        let identity = trawl_server::catalog::conform::verify_archive_identity(
+            &state.storage.catalog,
+            &config.data.base_dir(),
+        )
+        .await?;
+        match identity {
+            trawl_server::catalog::conform::ArchiveIdentity::Unproven => tracing::warn!(
+                event_type = "catalog_identity_unproven",
+                "query-only node: the archive carries no conformance marker, so \
+                 the pins /api/v1/schema advertises are not proven to describe \
+                 it — boot once with [ingest] enabled = true to run the \
+                 conformance pass, and check for skipped paths if it has"
+            ),
+            identity => tracing::info!(
+                event_type = "catalog_identity",
+                identity = ?identity,
+                "query-only node: archive belongs to the connected catalog"
+            ),
+        }
     }
 
     let compaction_handle = spawn_ingest_pipeline(&config, &state)?;

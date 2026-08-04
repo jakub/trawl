@@ -43,6 +43,7 @@ clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 insta = { workspace = true }
+tempfile = { workspace = true }
 
 [package.metadata.deb]
 maintainer = "Jakub Burgis <mail@jakub.me>"

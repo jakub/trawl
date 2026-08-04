@@ -13,7 +13,7 @@ use trawl_engine::value::{QueryResult, Value};
 use crate::CliError;
 
 /// Output format for CLI query results.
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Table,
     Json,
@@ -22,10 +22,22 @@ pub enum OutputFormat {
 }
 
 /// Resolved connection parameters (after config + env + CLI override merge).
+#[derive(Clone)]
 pub struct ConnectionParams {
     pub url: String,
     pub token: String,
     pub insecure: bool,
+}
+
+/// Hand-written so the API token never reaches a log line or a panic message.
+impl std::fmt::Debug for ConnectionParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionParams")
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .field("insecure", &self.insecure)
+            .finish()
+    }
 }
 
 /// Execute a query and print the results.

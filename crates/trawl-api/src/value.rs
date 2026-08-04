@@ -10,6 +10,7 @@
 //! [`Value`] uses custom serde impls to serialize as JSON primitives
 //! (not tagged enums), so these types double as the HTTP wire format.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use serde::de::{self, Visitor};
@@ -190,6 +191,45 @@ pub const WELL_KNOWN_LOG_FIELDS: &[&str] = &[
 /// Kept in sync with `trawl_core::schema::TRAILING_LOG_FIELDS`.
 pub const TRAILING_LOG_FIELDS: &[&str] = &["_raw", "_ingested", "_repairs"];
 
+/// Display rank for a field name, mirroring query-result column order:
+/// `0` = leading envelope field ([`WELL_KNOWN_LOG_FIELDS`], in declared
+/// order), `1` = custom field, `2` = trailing metadata
+/// ([`TRAILING_LOG_FIELDS`], in declared order).
+///
+/// Callers do not sort on this directly — [`sort_by_display_rank`] owns the
+/// `(rank, name)` ordering every schema listing shares.
+#[must_use]
+pub fn field_display_rank(name: &str) -> (u8, usize) {
+    if let Some(i) = WELL_KNOWN_LOG_FIELDS.iter().position(|f| *f == name) {
+        (0, i)
+    } else if let Some(i) = TRAILING_LOG_FIELDS.iter().position(|f| *f == name) {
+        (2, i)
+    } else {
+        (1, 0)
+    }
+}
+
+/// Compare two field names in schema display order: [`field_display_rank`]
+/// first, name as the tie-break.
+#[must_use]
+pub fn cmp_by_display_rank(a: &str, b: &str) -> Ordering {
+    field_display_rank(a)
+        .cmp(&field_display_rank(b))
+        .then_with(|| a.cmp(b))
+}
+
+/// Sort a schema listing into display order, keying each item by its field
+/// name via `name`.
+///
+/// The single home of this ordering, so the `/api/v1/schema` columns,
+/// `/api/v1/schema/fields` rows, `/api/v1/schema/services` columns, and the
+/// CLI field tables can never drift apart: they present columns the way query
+/// results order them, instead of a raw alphabetical sort that would put
+/// `_ingested` first.
+pub fn sort_by_display_rank<T>(items: &mut [T], name: impl Fn(&T) -> &str) {
+    items.sort_by(|a, b| cmp_by_display_rank(name(a), name(b)));
+}
+
 /// Column metadata from a query result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
@@ -356,6 +396,29 @@ mod tests {
         Column {
             name: name.to_owned(),
         }
+    }
+
+    #[test]
+    fn field_display_rank_orders_envelope_custom_trailing() {
+        // Envelope fields rank first, in declared order.
+        assert_eq!(field_display_rank("_time"), (0, 0));
+        assert_eq!(field_display_rank("message"), (0, 6));
+        // Custom fields sit between envelope and trailing metadata; callers
+        // break ties by name.
+        assert_eq!(field_display_rank("duration").0, 1);
+        // Trailing metadata is demoted to the very end, in declared order.
+        assert_eq!(field_display_rank("_raw"), (2, 0));
+        assert_eq!(field_display_rank("_repairs"), (2, 2));
+
+        // Sorting by (rank, name) reproduces query-result column order:
+        // envelope first, custom alphabetical, metadata last — never
+        // `_ingested` alphabetically first.
+        let mut names = vec!["duration", "_ingested", "service", "_time", "alpha"];
+        sort_by_display_rank(&mut names, |n| n);
+        assert_eq!(
+            names,
+            vec!["_time", "service", "alpha", "duration", "_ingested"]
+        );
     }
 
     #[test]

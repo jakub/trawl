@@ -34,7 +34,7 @@ use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
 use crate::scheduler::execute_scheduled_query;
-use crate::state::{AppState, CachedFieldValues, CachedSchema};
+use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
     HistoryEntry, ReportRun, RunClaim, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
     format_interval, parse_interval,
@@ -443,13 +443,38 @@ fn derive_health_status(
     HealthStatus::Ok
 }
 
-/// `GET /api/v1/schema` — introspect the data source schema.
+/// Query parameters for `GET /api/v1/schema`.
+#[derive(Debug, Deserialize)]
+pub struct SchemaParams {
+    /// Only fields observed for this service.
+    pub service: Option<String>,
+    /// Lift the `last_seen` retention window (show aged-out fields too).
+    pub all: Option<bool>,
+}
+
+/// `GET /api/v1/schema` — the data schema, served from the field catalog.
 ///
-/// Returns column names and types from the configured parquet data.
-/// Results are cached for `schema_cache_ttl_secs` seconds (default: 60).
+/// Columns are a `SELECT` over `field_types` LEFT JOIN `field_services`
+/// (ADR-0009 slice 3) — the write-time type authority, never a `DESCRIBE`.
+/// By default fields whose most recent observation predates the retention
+/// window (`[retention] max_age_days`; 0 disables) are hidden; `?all=true`
+/// lifts the window, and a never-observed pin (e.g. the envelope seed) is
+/// always shown. `?service=` scopes the listing to fields that service has
+/// carried.
+///
+/// Corpus facts (dates, sizes, services, file count) stay a TTL-cached
+/// filesystem walk; `cached` reports whether THEY came from the cache.
+///
+/// The UNSCOPED column set is TTL-cached too (same TTL): it aggregates
+/// `field_services` across every service, and the service axis is
+/// client-chosen and unbounded while this endpoint is what autocomplete
+/// polls. A `?service=` listing is served straight from postgres — it is
+/// bounded by the pin cap through `field_services (service, field)`, and
+/// caching per client-chosen service name would be an unbounded cache.
 pub async fn schema(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<SchemaParams>,
 ) -> Result<Json<SchemaResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
@@ -458,83 +483,123 @@ pub async fn schema(
     // Hot buffer stats are cheap atomics — always read fresh (never cached).
     let (hot_events, hot_bytes) = hot_buffer_stats(&state);
 
-    // Hold the mutex for the full check-then-refresh cycle to prevent
-    // thundering herd: only one request refreshes while others wait.
-    let mut cache = state.query.schema_cache.lock().await;
-
-    if let Some(cached) = &*cache
-        && cached.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs
-    {
-        tracing::debug!(event_type = "schema_cache_hit", user = %verified.name, "serving schema from cache");
-        return Ok(Json(SchemaResponse {
-            columns: cached
-                .result
-                .columns
-                .iter()
-                .cloned()
-                .map(SchemaColumnResponse::from)
-                .collect(),
-            file_count: cached.result.file_count,
-            cached: true,
-            earliest_date: cached.earliest_date.clone(),
-            latest_date: cached.latest_date.clone(),
-            total_bytes: Some(cached.total_bytes),
-            services: Some(cached.services.clone()),
-            hot_buffer_events: hot_events,
-            hot_buffer_bytes: hot_bytes,
-        }));
-    }
-
-    tracing::info!(event_type = "schema_refresh", user = %verified.name, "refreshing schema cache");
-    let start = std::time::Instant::now();
-    let result = state.query.pool.describe_schema().await?;
-
-    // Walk parquet files for catalog metadata (dates, services, sizes).
-    let fallback_glob = state.query.pool.fallback_glob().clone();
-    let (earliest_date, latest_date, total_bytes, services) =
-        tokio::task::spawn_blocking(move || collect_catalog_metadata(&fallback_glob))
-            .await
-            .unwrap_or_default();
-
-    let elapsed = start.elapsed().as_millis();
-
-    tracing::info!(
-        event_type = "schema_complete",
-        user = %verified.name,
-        columns = result.columns.len(),
-        file_count = result.file_count,
-        services = services.len(),
-        duration_ms = elapsed,
-        "schema introspection complete"
-    );
-
-    let response = SchemaResponse {
-        columns: result
-            .columns
-            .iter()
-            .cloned()
-            .map(SchemaColumnResponse::from)
-            .collect(),
-        file_count: result.file_count,
-        cached: false,
-        earliest_date: earliest_date.clone(),
-        latest_date: latest_date.clone(),
-        total_bytes: Some(total_bytes),
-        services: Some(services.clone()),
-        hot_buffer_events: hot_events,
-        hot_buffer_bytes: hot_bytes,
+    // Columns: a catalog SELECT. Postgres down → 503 (the same dependency
+    // history/saved already have). Deliberately NO fallback to the
+    // in-process pin cache: that would fork schema truth again.
+    let since = if params.all == Some(true) {
+        None
+    } else {
+        since_from_days(state.query.retention_max_age_days)
     };
 
-    *cache = Some(CachedSchema {
-        result,
-        cached_at: std::time::Instant::now(),
-        earliest_date,
-        latest_date,
-        total_bytes,
-        services,
-    });
+    let columns = if params.service.is_some() {
+        catalog_schema_columns(&state, params.service.clone(), since).await?
+    } else {
+        // Hold the mutex for the full check-then-refresh cycle, like the
+        // corpus facts below: only one request runs the aggregate. The two
+        // request shapes (windowed / `?all=true`) each own a slot, so
+        // alternating traffic cannot evict the other shape's entry — see
+        // `schema_columns_cache` in state.rs.
+        let mut cache = state.query.schema_columns_cache.lock().await;
+        let slot = &mut cache[usize::from(since.is_some())];
+        let fresh = slot.as_ref().and_then(|c| {
+            (c.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs)
+                .then(|| c.columns.clone())
+        });
+        if let Some(columns) = fresh {
+            columns
+        } else {
+            let columns = catalog_schema_columns(&state, None, since).await?;
+            *slot = Some(crate::state::CachedSchemaColumns {
+                columns: columns.clone(),
+                cached_at: std::time::Instant::now(),
+            });
+            columns
+        }
+    };
 
-    Ok(Json(response))
+    // Corpus facts: hold the mutex for the full check-then-refresh cycle to
+    // prevent thundering herd — only one request walks while others wait.
+    let mut cache = state.query.schema_cache.lock().await;
+    let (facts, cached) = match &*cache {
+        Some(facts) if facts.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs => {
+            tracing::debug!(
+                event_type = "schema_cache_hit",
+                user = %verified.name,
+                "serving corpus facts from cache"
+            );
+            (facts.clone(), true)
+        }
+        _ => {
+            let start = std::time::Instant::now();
+            let fallback_glob = state.query.pool.fallback_glob().clone();
+            let (earliest_date, latest_date, total_bytes, services, file_count) =
+                tokio::task::spawn_blocking(move || collect_catalog_metadata(&fallback_glob))
+                    .await
+                    .unwrap_or_default();
+            let facts = crate::state::CachedCorpusFacts {
+                cached_at: std::time::Instant::now(),
+                earliest_date,
+                latest_date,
+                total_bytes,
+                services,
+                file_count,
+            };
+            tracing::info!(
+                event_type = "schema_facts_refresh",
+                user = %verified.name,
+                columns = columns.len(),
+                file_count = facts.file_count,
+                services = facts.services.len(),
+                duration_ms = start.elapsed().as_millis(),
+                "corpus facts walk complete"
+            );
+            *cache = Some(facts.clone());
+            (facts, false)
+        }
+    };
+    drop(cache);
+
+    Ok(Json(SchemaResponse {
+        columns,
+        file_count: facts.file_count,
+        cached,
+        earliest_date: facts.earliest_date,
+        latest_date: facts.latest_date,
+        total_bytes: Some(facts.total_bytes),
+        services: Some(facts.services),
+        hot_buffer_events: hot_events,
+        hot_buffer_bytes: hot_bytes,
+    }))
+}
+
+/// The `/api/v1/schema` column set: the catalog listing, mapped to the wire
+/// type and sorted into query-result display order (envelope first,
+/// metadata last, custom fields alphabetical in between).
+async fn catalog_schema_columns(
+    state: &AppState,
+    service: Option<String>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Vec<SchemaColumnResponse>, ServerError> {
+    let filter = crate::store::FieldListFilter {
+        service,
+        since,
+        // Names and types only — never pay for the conflict evidence on the
+        // endpoint autocomplete polls (and whose `?service=` form is
+        // deliberately uncached).
+        with_conflicts: false,
+        ..Default::default()
+    };
+    let (fields, _truncated) = state.storage.catalog.list_fields(&filter).await?;
+    let mut columns: Vec<SchemaColumnResponse> = fields
+        .into_iter()
+        .map(|f| SchemaColumnResponse {
+            name: f.field,
+            data_type: f.duckdb_type,
+        })
+        .collect();
+    trawl_api::value::sort_by_display_rank(&mut columns, |c| &c.name);
+    Ok(columns)
 }
 
 /// Read hot buffer event count and byte size (cheap atomic loads).
@@ -547,13 +612,14 @@ fn hot_buffer_stats(state: &AppState) -> (Option<u64>, Option<u64>) {
     })
 }
 
-/// Parse parquet file paths to extract catalog metadata.
+/// Parse parquet file paths to extract corpus facts: earliest/latest date,
+/// total bytes, distinct services, and the parquet file count.
 ///
 /// Path structure: `{base}/{YYYY-MM-DD}/{service}.parquet`
 /// or `{base}/{YYYY-MM-DD}/{HH}/{service}.parquet`.
 fn collect_catalog_metadata(
     fallback_glob: &str,
-) -> (Option<String>, Option<String>, u64, Vec<String>) {
+) -> (Option<String>, Option<String>, u64, Vec<String>, u64) {
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -563,11 +629,11 @@ fn collect_catalog_metadata(
     let base = Path::new(base.trim_end_matches('/'));
 
     if !base.is_dir() {
-        return (None, None, 0, Vec::new());
+        return (None, None, 0, Vec::new(), 0);
     }
 
     let Ok(entries) = crate::metrics::walk_parquet_files(base) else {
-        return (None, None, 0, Vec::new());
+        return (None, None, 0, Vec::new(), 0);
     };
 
     let mut dates: BTreeSet<String> = BTreeSet::new();
@@ -596,8 +662,9 @@ fn collect_catalog_metadata(
     let earliest = dates.iter().next().cloned();
     let latest = dates.iter().next_back().cloned();
     let services: Vec<String> = services.into_iter().collect();
+    let file_count = u64::try_from(entries.len()).unwrap_or(0);
 
-    (earliest, latest, total_bytes, services)
+    (earliest, latest, total_bytes, services, file_count)
 }
 
 /// Check if a directory name looks like YYYY-MM-DD.
@@ -856,6 +923,267 @@ pub async fn schema_services(
             "service schema not yet available".into(),
         )),
     }
+}
+
+/// Format a UTC instant as the wire's ISO 8601 string.
+fn iso8601(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// Convert a `?since_secs=` window into an absolute instant.
+///
+/// `since_secs` is request-controlled, so every step here is total:
+/// `TimeDelta::seconds` and `DateTime - TimeDelta` are both panicking
+/// constructors that a large enough query string reaches. Any window that
+/// reaches past the unix epoch saturates there — older than any row a
+/// catalog can hold, so the filter still means "everything", and the value
+/// stays bindable as a postgres `timestamptz` (whose floor is nearer than
+/// chrono's).
+fn since_from_secs(since_secs: Option<u64>) -> Option<chrono::DateTime<chrono::Utc>> {
+    since_secs.map(|s| {
+        i64::try_from(s)
+            .ok()
+            .and_then(chrono::TimeDelta::try_seconds)
+            .and_then(|d| chrono::Utc::now().checked_sub_signed(d))
+            .map_or(chrono::DateTime::UNIX_EPOCH, |dt| {
+                dt.max(chrono::DateTime::UNIX_EPOCH)
+            })
+    })
+}
+
+/// Convert the `[retention] max_age_days` window into an absolute instant.
+///
+/// `max_age_days` is a plain `u64` that nothing range-validates, and
+/// "effectively never" values (`max_age_days = 999999999999`) are what an
+/// operator reaches for, so this must be total: `TimeDelta::days` panics
+/// out of bounds (~1.07e11 days) and would 500 every `/api/v1/schema`
+/// request until the config was edited. `0` disables the window; anything
+/// reaching past the unix epoch saturates there, like [`since_from_secs`].
+fn since_from_days(window_days: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    const SECS_PER_DAY: u64 = 86_400;
+    if window_days == 0 {
+        return None;
+    }
+    since_from_secs(Some(window_days.saturating_mul(SECS_PER_DAY)))
+}
+
+/// Query parameters for `GET /api/v1/schema/fields`.
+#[derive(Debug, Deserialize)]
+pub struct CatalogFieldsParams {
+    /// Only fields observed for this service.
+    pub service: Option<String>,
+    /// Only fields observed within the last N seconds.
+    pub since_secs: Option<u64>,
+    /// Maximum fields returned (default 500, clamped to the pin cap).
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/v1/schema/fields` — the pinned-field listing with aggregated
+/// observation and conflict evidence (`trawl schema fields`).
+pub async fn catalog_fields(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<CatalogFieldsParams>,
+) -> Result<Json<trawl_api::CatalogFieldsResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let limit = params
+        .limit
+        .unwrap_or(500)
+        .clamp(1, crate::store::MAX_PINNED_FIELDS);
+    let filter = crate::store::FieldListFilter {
+        service: params.service.clone(),
+        since: since_from_secs(params.since_secs),
+        limit,
+        // This listing IS the conflict evidence surface, and the second
+        // query it costs is keyed on the page `limit` bounds.
+        with_conflicts: true,
+    };
+    let (mut rows, truncated) = state.storage.catalog.list_fields(&filter).await?;
+    let (pinned_total, pin_capacity) = state.storage.catalog.pin_stats().await?;
+
+    trawl_api::value::sort_by_display_rank(&mut rows, |r| &r.field);
+    let fields = rows
+        .into_iter()
+        .map(|r| trawl_api::CatalogFieldSummary {
+            name: r.field,
+            data_type: r.duckdb_type,
+            pinned_from: r.pinned_from,
+            pinned_at: iso8601(r.pinned_at),
+            service_count: u64::try_from(r.service_count).unwrap_or(0),
+            row_count: u64::try_from(r.row_count).unwrap_or(0),
+            first_seen: r.first_seen.map(iso8601),
+            last_seen: r.last_seen.map(iso8601),
+            conflict_count: u64::try_from(r.conflict_count).unwrap_or(0),
+            rows_nulled: u64::try_from(r.rows_nulled).unwrap_or(0),
+        })
+        .collect();
+
+    Ok(Json(trawl_api::CatalogFieldsResponse {
+        fields,
+        pinned_total: u64::try_from(pinned_total).unwrap_or(0),
+        pin_capacity: u64::try_from(pin_capacity).unwrap_or(0),
+        truncated,
+    }))
+}
+
+/// Query parameters for `GET /api/v1/schema/field`.
+///
+/// The field name travels as a QUERY parameter, never a path segment: a
+/// catalog key is any ASCII-folded client JSON key ≤255 bytes — it may
+/// contain `/`, `?`, or `%`, which a path segment cannot carry reliably.
+#[derive(Debug, Deserialize)]
+pub struct CatalogFieldParams {
+    /// Field name (ASCII-folded before lookup, mirroring ingest's fold).
+    pub name: String,
+    /// Maximum service observations returned
+    /// (default [`DEFAULT_FIELD_SERVICES_LIMIT`], max
+    /// [`MAX_FIELD_SERVICES_LIMIT`]).
+    pub limit: Option<i64>,
+    /// Opaque cursor from a previous response's `services_cursor`.
+    pub after: Option<String>,
+}
+
+/// Default page size for the field detail's service observations.
+const DEFAULT_FIELD_SERVICES_LIMIT: i64 = 100;
+
+/// Hard ceiling for the field detail's `?limit=`.
+///
+/// `field_services` rows are ever-observed and their service axis is
+/// client-chosen — a common envelope field accumulates one row per service
+/// name a sender ever invented, none of which spends a pin slot. So the
+/// detail's response size is capped here regardless of what the caller asks
+/// for, and the rest is reached by paging.
+const MAX_FIELD_SERVICES_LIMIT: i64 = 1000;
+
+/// `GET /api/v1/schema/field?name=` — one field's pin, one PAGE of its
+/// per-service observations, and its retained conflict evidence
+/// (`trawl schema field`).
+pub async fn catalog_field(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<CatalogFieldParams>,
+) -> Result<Json<trawl_api::CatalogFieldResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    // One DuckDB identifier has exactly one catalog spelling (ASCII-lower,
+    // folded at every ingest door) — fold the lookup the same way.
+    let name = params.name.to_ascii_lowercase();
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_FIELD_SERVICES_LIMIT)
+        .clamp(1, MAX_FIELD_SERVICES_LIMIT);
+    let after = match params.after.as_deref() {
+        None => None,
+        Some(raw) => Some(crate::store::ServiceCursor::decode(raw).ok_or_else(|| {
+            ServerError::BadRequest("invalid `after` cursor: pass a `services_cursor` back".into())
+        })?),
+    };
+
+    let Some(pin) = state.storage.catalog.field_pin(&name).await? else {
+        return Err(ServerError::NotFound(format!("field not pinned: {name}")));
+    };
+    let (services, next) = state
+        .storage
+        .catalog
+        .field_services(&name, after.as_ref(), limit)
+        .await?;
+    // Conflict evidence needs no cursor: `field_conflicts` is trimmed to
+    // MAX_CONFLICTS_PER_FIELD newest rows per field in the writing
+    // transaction, so this read is bounded by construction.
+    let conflicts = state.storage.catalog.conflicts_for_field(&name).await?;
+
+    Ok(Json(trawl_api::CatalogFieldResponse {
+        name: pin.field,
+        data_type: pin.duckdb_type,
+        pinned_from: pin.pinned_from,
+        pinned_at: iso8601(pin.pinned_at),
+        services: services
+            .into_iter()
+            .map(|s| trawl_api::CatalogFieldServiceRow {
+                service: s.service,
+                first_seen: iso8601(s.first_seen),
+                last_seen: iso8601(s.last_seen),
+                row_count: u64::try_from(s.row_count).unwrap_or(0),
+            })
+            .collect(),
+        services_cursor: next.map(|c| c.encode()),
+        conflicts: conflicts
+            .into_iter()
+            .map(|c| trawl_api::CatalogConflictRow {
+                field: name.clone(),
+                service: c.service,
+                observed_type: c.observed_type,
+                expected_type: c.expected_type,
+                rows_nulled: u64::try_from(c.rows_nulled).unwrap_or(0),
+                at: iso8601(c.at),
+            })
+            .collect(),
+    }))
+}
+
+/// Query parameters for `GET /api/v1/schema/conflicts`.
+#[derive(Debug, Deserialize)]
+pub struct CatalogConflictsParams {
+    /// Only conflicts for this field.
+    pub field: Option<String>,
+    /// Only conflicts from this service.
+    pub service: Option<String>,
+    /// Only conflicts recorded within the last N seconds.
+    pub since_secs: Option<u64>,
+    /// Maximum rows returned (default 100, max 1000).
+    pub limit: Option<i64>,
+}
+
+/// Ceiling for `GET /api/v1/schema/conflicts` `?limit=`.
+const MAX_CONFLICT_LIST_LIMIT: i64 = 1000;
+
+/// `GET /api/v1/schema/conflicts` — the schema-health dashboard listing
+/// (`trawl schema conflicts --last 7d`).
+pub async fn catalog_conflicts(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<CatalogConflictsParams>,
+) -> Result<Json<trawl_api::CatalogConflictsResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+
+    let limit = params
+        .limit
+        .unwrap_or(100)
+        .clamp(1, MAX_CONFLICT_LIST_LIMIT);
+    let field = params.field.as_deref().map(str::to_ascii_lowercase);
+    let (rows, truncated) = state
+        .storage
+        .catalog
+        .recent_conflicts(
+            field.as_deref(),
+            params.service.as_deref(),
+            since_from_secs(params.since_secs),
+            limit,
+        )
+        .await?;
+
+    Ok(Json(trawl_api::CatalogConflictsResponse {
+        conflicts: rows
+            .into_iter()
+            .map(|c| trawl_api::CatalogConflictRow {
+                field: c.field,
+                service: c.service,
+                observed_type: c.observed_type,
+                expected_type: c.expected_type,
+                rows_nulled: u64::try_from(c.rows_nulled).unwrap_or(0),
+                at: iso8601(c.at),
+            })
+            .collect(),
+        truncated,
+    }))
 }
 
 /// `GET /api/v1/schema/values/{field}` — sample distinct values for autocomplete.
@@ -2265,6 +2593,57 @@ pub struct StreamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_from_secs_saturates_instead_of_panicking() {
+        // `?since_secs=` is request-controlled: no value may panic the
+        // handler (a 500 via CatchPanicLayer) or produce an instant
+        // postgres cannot bind.
+        assert_eq!(since_from_secs(None), None);
+
+        let hour = since_from_secs(Some(3600)).expect("finite window");
+        let elapsed = chrono::Utc::now() - hour;
+        assert!(elapsed >= chrono::TimeDelta::seconds(3600));
+        assert!(elapsed < chrono::TimeDelta::seconds(3700));
+
+        // Each of these blew up before: the first overflows the
+        // `DateTime - TimeDelta` subtraction, the rest overflow
+        // `TimeDelta::seconds` itself.
+        for s in [
+            100_000_000_000_000_u64,
+            10_000_000_000_000_000,
+            u64::try_from(i64::MAX).expect("i64::MAX is non-negative"),
+            u64::MAX,
+        ] {
+            assert_eq!(
+                since_from_secs(Some(s)),
+                Some(chrono::DateTime::UNIX_EPOCH),
+                "since_secs={s} must saturate at the epoch"
+            );
+        }
+    }
+
+    #[test]
+    fn since_from_days_saturates_instead_of_panicking() {
+        // `[retention] max_age_days` is an unvalidated operator-set u64 on
+        // the `/api/v1/schema` path: no value may panic the handler.
+        assert_eq!(since_from_days(0), None, "0 disables the window");
+
+        let week = since_from_days(7).expect("finite window");
+        let elapsed = chrono::Utc::now() - week;
+        assert!(elapsed >= chrono::TimeDelta::days(7));
+        assert!(elapsed < chrono::TimeDelta::days(8));
+
+        // `chrono::TimeDelta::days` panics past ~1.07e11 days; the seconds
+        // multiplication overflows u64 well before that.
+        for d in [200_000_000_000_u64, u64::MAX] {
+            assert_eq!(
+                since_from_days(d),
+                Some(chrono::DateTime::UNIX_EPOCH),
+                "max_age_days={d} must saturate at the epoch"
+            );
+        }
+    }
 
     #[test]
     fn sanitize_csv_formula_prefixes_dangerous_chars() {

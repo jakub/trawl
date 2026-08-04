@@ -1,0 +1,33 @@
+-- Read-path index for the per-field observation PAGE (ADR-0009 slice 3, #51).
+--
+-- `store::catalog::field_services` backs the `services`/`services_cursor`
+-- half of `/api/v1/schema/field?name=`. It pages `WHERE field = $1 ... ORDER
+-- BY last_seen DESC, service` — and 0002's `(field, service)` primary key
+-- orders the wrong way for that sort, while 0003's `(service, field)` leads
+-- on the wrong column entirely. So every page seq-scanned the field's whole
+-- history and top-N sorted it: the paging bounded the allocation and the
+-- response body, but not the read, and walking a field end to end cost one
+-- full scan PER PAGE.
+--
+-- The index key is exactly the cursor key, so a page becomes a range scan
+-- that starts AT the cursor and stops after `limit + 1` rows — the point of
+-- keyset paging. `service ASC` (not DESC) is deliberate: the cursor's
+-- tiebreak inside one `last_seen` is `service > $3`, so the index must walk
+-- services forward within each descending `last_seen` group for the scan to
+-- be ordered. `INCLUDE (first_seen, row_count)` carries the two remaining
+-- projected columns, so once the visibility map is set the scan is
+-- index-ONLY with no heap access.
+--
+-- The index is half the fix: `field_services` also had to stop writing its
+-- cursor predicate as an `IS NULL`-guarded `OR` chain, which no index can
+-- serve as a scan key (see the sargability note on that function).
+--
+-- Measured on one field with 300 000 observation rows, the exact bound
+-- query at the default page size, resuming mid-history: parallel seq scan
+-- of 300 000 rows + top-N heapsort, 2 749 buffers, 25 ms -> index-only
+-- scan, 6 buffers, 0.04 ms (same plan under `force_generic_plan`).
+--
+-- Every constraint/index is NAMED, per the 0001 convention.
+CREATE INDEX field_services_field_last_seen_idx
+    ON field_services (field, last_seen DESC, service)
+    INCLUDE (first_seen, row_count);

@@ -1,0 +1,23 @@
+-- Read-path index for the cross-field conflict listing (ADR-0009 slice 3, #51).
+--
+-- `store::catalog::recent_conflicts` backs `GET /api/v1/schema/conflicts`
+-- (`trawl schema conflicts`), ordering `at DESC, id DESC` with every
+-- filter optional. 0002's `(field, at DESC)` index only serves that
+-- ordering under a `?field=` filter, so the DEFAULT unfiltered call fell
+-- to a sequential scan + top-N sort of the whole table. The table is
+-- bounded on both axes (`MAX_CONFLICTS_PER_FIELD` rows per field, pin cap
+-- fields) — but that bound is 100 x 10 000 = 1M rows, and a busy install
+-- with misbehaving senders paid the full sort on every request from any
+-- `schema_read` key.
+--
+-- The index key is exactly the listing's sort key, so the unfiltered page
+-- becomes an ordered scan that stops after `limit + 1` rows, and a
+-- `?since=` window is a range bound on the same leading column. (0003
+-- declined a `field_conflicts` index because the aggregate read of that
+-- era grouped the whole table regardless of access path; the ordered
+-- LIMIT listing this PR added is a different query shape, and here the
+-- index IS the bound.)
+--
+-- Every constraint/index is NAMED, per the 0001 convention.
+CREATE INDEX field_conflicts_at_idx
+    ON field_conflicts (at DESC, id DESC);

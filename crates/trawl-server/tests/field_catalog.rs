@@ -587,9 +587,10 @@ async fn field_services_is_ever_observed(pool: sqlx::PgPool) {
         .state
         .storage
         .catalog
-        .field_services("duration")
+        .field_services("duration", None, 1000)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].service, "svc-obs");
 
@@ -601,9 +602,10 @@ async fn field_services_is_ever_observed(pool: sqlx::PgPool) {
         .state
         .storage
         .catalog
-        .field_services("duration")
+        .field_services("duration", None, 1000)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(
         second[0].last_seen > first[0].last_seen,
         "compaction advances last_seen"
@@ -624,9 +626,10 @@ async fn field_services_is_ever_observed(pool: sqlx::PgPool) {
         .state
         .storage
         .catalog
-        .field_services("duration")
+        .field_services("duration", None, 1000)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(
         after.len(),
         1,
@@ -1040,6 +1043,223 @@ mod boot {
         );
     }
 
+    /// The upgrade path: migration 0002 creates `field_services` EMPTY, and
+    /// only live compaction ever wrote it — so a corpus that predates the
+    /// catalog gets pins (and rewrites) but no observations, and the filters
+    /// those rows are authoritative for silently answer wrong: `?service=`
+    /// returns nothing for a service whose data all predates the upgrade,
+    /// and its pins sit outside the `last_seen` window forever (a
+    /// never-observed pin is always shown, by design). The boot pass must
+    /// backfill from the files it adopted.
+    #[sqlx::test]
+    async fn boot_pass_backfills_observations_for_a_pre_catalog_corpus(pool: sqlx::PgPool) {
+        use trawl_server::store::FieldListFilter;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // Two services with disjoint custom fields, three and two rows.
+        plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS duration FROM (VALUES (410), (420), (430)) t(x)",
+        );
+        plant(
+            &data_dir,
+            "prod/2026-08-01/11/svc-b.parquet",
+            "SELECT TIMESTAMP '2026-08-01 11:00:00' AS \"_time\", 'svc-b' AS service, \
+             '/api' AS path FROM (VALUES (1), (2)) t(x)",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+        assert!(summary.observed > 0, "the standing corpus must be observed");
+
+        // `?service=` answers for a service that has sent nothing since.
+        let by_service = |service: &str| FieldListFilter {
+            service: Some(service.to_owned()),
+            since: None,
+            limit: 100,
+            with_conflicts: true,
+        };
+        let (rows, _) = store.list_fields(&by_service("svc-a")).await.unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.field.as_str()).collect();
+        assert!(
+            names.contains(&"duration") && names.contains(&"_time"),
+            "svc-a's own columns must be listed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"path"),
+            "svc-b's column must not leak into svc-a's listing: {names:?}"
+        );
+
+        // Observations are stamped from the partition directory, not now(),
+        // and weighed by the rows the files hold.
+        let obs = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].service, "svc-a");
+        assert_eq!(obs[0].row_count, 3);
+        assert_eq!(obs[0].first_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
+        assert_eq!(obs[0].last_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
+
+        // So the `last_seen` window can age the corpus out at all — before
+        // the backfill these pins were unwindowable.
+        let (windowed, _) = store
+            .list_fields(&FieldListFilter {
+                service: None,
+                since: Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+                        .unwrap()
+                        .into(),
+                ),
+                limit: 100,
+                with_conflicts: true,
+            })
+            .await
+            .unwrap();
+        let windowed: Vec<&str> = windowed.iter().map(|r| r.field.as_str()).collect();
+        assert!(
+            !windowed.contains(&"duration"),
+            "an observed-but-aged-out field must leave the window: {windowed:?}"
+        );
+        assert!(
+            windowed.contains(&"message"),
+            "a never-observed pin is always shown: {windowed:?}"
+        );
+
+        // Idempotent: the pass re-runs until the corpus is proven conformant
+        // (missing marker, restored data root), and a re-run must not
+        // re-accumulate the row counts it already recorded.
+        std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
+        let rerun = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(rerun.ran, "a missing marker forces the re-run");
+        let again = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(again[0].row_count, 3, "the backfill is idempotent");
+        assert_eq!(again[0].first_seen, obs[0].first_seen);
+        assert_eq!(again[0].last_seen, obs[0].last_seen);
+    }
+
+    /// The upgrade the backfill exists for, exactly as it arrives: a node
+    /// that conformed under the PREVIOUS slice carries `conformed_at` set
+    /// and `data/CATALOG` naming this catalog, but an empty `field_services`
+    /// — and nothing will ever refill it, because no live batch re-sends a
+    /// standing corpus. Gating the backfill on the conformance marker alone
+    /// would short-circuit the pass on precisely those installs, so the
+    /// backfill carries its own flag and an unset one re-arms the pass.
+    #[sqlx::test]
+    async fn backfill_reruns_on_a_corpus_conformed_before_the_backfill_existed(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS duration FROM (VALUES (410), (420), (430)) t(x)",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+
+        // Rewind to the state the previous slice leaves behind: conformed,
+        // marker published, pins seeded — observations never taken.
+        sqlx::query("DELETE FROM field_services")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE catalog_state SET services_backfilled_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(store.is_conformed().await.unwrap(), "still conformed");
+        assert!(
+            data_dir.join("CATALOG").exists(),
+            "the marker still names this catalog"
+        );
+
+        let upgrade = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(
+            upgrade.ran,
+            "an un-backfilled corpus must re-arm the pass despite conformance"
+        );
+        let obs = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(obs.len(), 1, "the standing corpus is observed: {obs:?}");
+        assert_eq!(obs[0].service, "svc-a");
+        assert_eq!(obs[0].row_count, 3);
+
+        // And exactly once: the flag the pass stamps stops the next boot
+        // paying for the scan again.
+        let settled = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(
+            !settled.ran,
+            "both flags set and the marker matching must skip the pass"
+        );
+    }
+
+    /// A live tick's accumulated `row_count` must survive a later backfill
+    /// that sees a retention-shrunk corpus: the backfill takes the MAX, it
+    /// never rewrites a count downward.
+    #[sqlx::test]
+    async fn backfill_never_clobbers_a_live_count_downward(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS duration FROM (VALUES (410), (420), (430)) t(x)",
+        );
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        // Live compaction accumulates past the corpus the pass saw.
+        store
+            .touch_services("svc-a", &["duration".to_owned()], 900)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+
+        let obs = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(obs[0].row_count, 903, "the live count stands");
+        assert!(
+            obs[0].last_seen > obs[0].first_seen,
+            "the live touch's now() stays the latest observation"
+        );
+    }
+
     /// `data/scheduled/**` holds report-run outputs, not the log corpus —
     /// the boot pass must never scan it: no pins from its columns, no
     /// rewrite of its files.
@@ -1247,6 +1467,113 @@ mod boot {
         assert!(clean.ran, "the skipped directory forced a re-run");
         assert_eq!(clean.skipped, 0);
         assert!(data_dir.join("CATALOG").exists());
+    }
+
+    /// A query-only node (`[ingest] enabled = false`) never runs the pass,
+    /// so nothing else proves the archive it serves came from the catalog it
+    /// is connected to. `/api/v1/schema` answers from that catalog's pins, so
+    /// a repointed app database over a populated foreign archive would
+    /// advertise the seeded envelope while queries read entirely different
+    /// physical columns. A marker naming another catalog is positive proof of
+    /// that pairing, and the boot gate refuses it.
+    #[sqlx::test]
+    async fn query_only_boot_refuses_an_archive_from_another_catalog(pool: sqlx::PgPool) {
+        let store = CatalogStore::new(pool.clone());
+
+        // Marker naming a different catalog (the app database was repointed,
+        // or the data root was restored from another install's backup).
+        let stale = tempfile::tempdir().unwrap();
+        let stale_data = stale.path().join("data");
+        plant_disagreeing_corpus(&stale_data);
+        std::fs::write(
+            stale_data.join("CATALOG"),
+            "00000000-0000-0000-0000-000000000000\n",
+        )
+        .unwrap();
+        let err = conform::verify_archive_identity(&store, &stale_data)
+            .await
+            .expect_err("a marker from another catalog must not pass the gate");
+        assert!(
+            err.contains("00000000-0000-0000-0000-000000000000"),
+            "the refusal must name the foreign catalog id: {err}"
+        );
+    }
+
+    /// An archive with NO marker is not proof of a foreign catalog — it is
+    /// what an incomplete conformance pass leaves behind (any skipped path
+    /// withholds `data/CATALOG`), and an ingest node warns and serves it. The
+    /// query-only gate must answer that identical state the same way, or
+    /// "disable ingest and restart to investigate" becomes a startup failure
+    /// curable only by re-enabling ingest.
+    #[sqlx::test]
+    async fn query_only_boot_serves_an_unmarked_archive_unproven(pool: sqlx::PgPool) {
+        let store = CatalogStore::new(pool.clone());
+
+        let unmarked = tempfile::tempdir().unwrap();
+        let unmarked_data = unmarked.path().join("data");
+        plant_disagreeing_corpus(&unmarked_data);
+        assert_eq!(
+            conform::verify_archive_identity(&store, &unmarked_data)
+                .await
+                .expect("an unmarked archive must not refuse the boot"),
+            conform::ArchiveIdentity::Unproven,
+            "no marker means unproven, not foreign"
+        );
+
+        // The state a pass that skipped a path actually leaves: it ran, it
+        // rewrote what it owned, and it withheld the marker.
+        let cache = FieldCatalog::new();
+        let skipped = tempfile::tempdir().unwrap();
+        let skipped_data = skipped.path().join("data");
+        plant_disagreeing_corpus(&skipped_data);
+        std::fs::create_dir_all(skipped_data.join("exports")).unwrap();
+        std::fs::copy(
+            skipped_data.join("prod/2026-08-01/10/svc-a.parquet"),
+            skipped_data.join("exports/report.parquet"),
+        )
+        .unwrap();
+        let summary = conform::ensure_conformance(&store, &cache, &skipped_data, "2GB")
+            .await
+            .expect("an operator's export subtree is skipped, not fatal");
+        assert!(summary.skipped > 0 && !skipped_data.join("CATALOG").exists());
+        assert_eq!(
+            conform::verify_archive_identity(&store, &skipped_data)
+                .await
+                .expect("the same corpus must boot a query-only node too"),
+            conform::ArchiveIdentity::Unproven
+        );
+    }
+
+    /// The gate is identity, not paranoia: an archive this catalog conformed
+    /// passes, and so does a cold start with no parquet at all (there is no
+    /// schema to get wrong).
+    #[sqlx::test]
+    async fn query_only_boot_accepts_its_own_and_empty_archives(pool: sqlx::PgPool) {
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant_disagreeing_corpus(&data_dir);
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+        assert_eq!(
+            conform::verify_archive_identity(&store, &data_dir)
+                .await
+                .expect("an archive this catalog conformed must pass the gate"),
+            conform::ArchiveIdentity::Proven,
+            "the published marker proves the identity"
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            conform::verify_archive_identity(&store, &empty.path().join("data"))
+                .await
+                .expect("a cold start has no archive to misdescribe"),
+            conform::ArchiveIdentity::Empty,
+            "an empty archive is unproven but harmless"
+        );
     }
 
     /// Wiring: server boot itself runs the conformance pass — pins land in
