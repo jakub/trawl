@@ -120,7 +120,7 @@ A configuration-file failure happens *before* any tracing subscriber exists: it 
 - emits a startup `warn` naming the path and its contents whenever the log is enabled;
 - bounds it with `server.query_log_max_bytes` (default 100 MiB): past the cap the file rolls over to a single retained `<path>.1` (also `0600`); `0` disables rollover.
 
-Retention is exactly those two files — there is no multi-generation rotation or age-based cleanup; delete them when done debugging. Result samples never enter default `service=trawld` telemetry, which since issue #56 carries query metadata (`query_id`, `query_len`, actor, outcome, timing) but not raw query text — the full text lives in authenticated query history, this debug log, and a DEBUG-only `query_text` tracing event.
+Retention is exactly those two files — there is no multi-generation rotation or age-based cleanup; delete them when done debugging. Result samples never enter default `service=trawld` telemetry, which since issue #56 carries query metadata (`query_id`, `query_len`, actor, outcome, timing, and a stable `error_class`) but neither raw query text nor error text — for queries, exports, and SSE streams alike. The full text lives in authenticated query history, this debug log, and the DEBUG-only `query_text` / `query_error_text` tracing events.
 
 ### `[data]`
 
