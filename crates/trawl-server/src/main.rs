@@ -191,6 +191,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             skipped = summary.skipped,
             "boot conformance pass finished"
         );
+    } else {
+        // A query-only node skips the pass, but `/api/v1/schema` still
+        // answers from this catalog's pins — which describe the archive only
+        // if this catalog wrote it. Check the same dual-sided marker as a
+        // gate, and refuse the boot rather than advertise a schema about
+        // someone else's data.
+        let proven = trawl_server::catalog::conform::verify_archive_identity(
+            &state.storage.catalog,
+            &config.data.base_dir(),
+        )
+        .await?;
+        tracing::info!(
+            event_type = "catalog_identity",
+            proven,
+            "query-only node: archive belongs to the connected catalog"
+        );
     }
 
     let compaction_handle = spawn_ingest_pipeline(&config, &state)?;

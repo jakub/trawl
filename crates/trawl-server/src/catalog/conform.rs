@@ -172,6 +172,74 @@ async fn hydrate(
     Ok(pins)
 }
 
+/// Query-only boot gate: prove the standing archive was written by the
+/// catalog this node is connected to.
+///
+/// An ingest-enabled node earns that proof by running the pass above. A
+/// query-only node deliberately does not (it owns nothing under the data
+/// root), yet it still serves `/api/v1/schema` — and since ADR-0009 slice 3
+/// that answer is the catalog's pins, not a `DESCRIBE`. Pins from an
+/// unrelated catalog describe unrelated columns: point a query-only trawld
+/// at a shared or read-only archive with a fresh `trawl` database and
+/// `/schema` advertises the seeded envelope while queries read entirely
+/// different physical columns. So the same dual-sided marker that lets the
+/// pass skip itself is checked here as a gate, and a mismatch refuses the
+/// boot rather than serving a schema about someone else's data.
+///
+/// Returns whether the marker proved the identity; `false` means the archive
+/// positively holds no parquet (a cold start — nothing there to misdescribe).
+/// Only the unproven path walks the tree, so a matching marker costs one
+/// `read_to_string`.
+pub async fn verify_archive_identity(
+    store: &CatalogStore,
+    data_dir: &Path,
+) -> Result<bool, String> {
+    let catalog_id = store
+        .catalog_id()
+        .await
+        .map_err(|e| format!("failed to read catalog identity: {e}"))?;
+    let marker = read_marker(data_dir);
+    if marker.as_deref() == Some(catalog_id.as_str()) {
+        return Ok(true);
+    }
+    if archive_is_empty(data_dir)? {
+        return Ok(false);
+    }
+    Err(format!(
+        "the parquet archive at {} was not written by the catalog this node is \
+         connected to (data/{CATALOG_MARKER} = {}, catalog_state.catalog_id = \
+         {catalog_id}), so its columns are not the pins /api/v1/schema would \
+         advertise. Point the app database at the catalog that owns this \
+         archive, or boot once with [ingest] enabled = true to run the \
+         conformance pass and adopt it",
+        data_dir.display(),
+        marker.as_deref().unwrap_or("<absent>"),
+    ))
+}
+
+/// Whether the data root positively holds no parquet — the only state in
+/// which an unprovable identity is harmless.
+///
+/// A walk failure is NOT emptiness: the subtree it could not enumerate may
+/// hold the whole corpus, so it fails the gate exactly like a mismatched
+/// marker. Unlike the conformance pass — which isolates a bad path so one
+/// unreadable corner cannot keep an ingest node down — this gate has nothing
+/// to isolate: it is proving a negative, and an unread directory is no proof.
+fn archive_is_empty(data_dir: &Path) -> Result<bool, String> {
+    if !data_dir.is_dir() {
+        return Ok(true);
+    }
+    let (files, errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
+    if let Some((path, e)) = errors.into_iter().next() {
+        return Err(format!(
+            "cannot enumerate {} ({e}), so the archive cannot be proven empty and \
+             its identity cannot be proven either",
+            path.display()
+        ));
+    }
+    Ok(files.is_empty())
+}
+
 /// Run the boot conformance pass unless the dual-sided identity says it
 /// already ran for exactly this (catalog, data root) pair.
 pub async fn ensure_conformance(

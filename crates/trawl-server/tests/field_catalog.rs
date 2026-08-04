@@ -1249,6 +1249,79 @@ mod boot {
         assert!(data_dir.join("CATALOG").exists());
     }
 
+    /// A query-only node (`[ingest] enabled = false`) never runs the pass,
+    /// so nothing else proves the archive it serves came from the catalog it
+    /// is connected to. `/api/v1/schema` answers from that catalog's pins, so
+    /// a fresh app database over a populated foreign archive would advertise
+    /// the seeded envelope while queries read entirely different physical
+    /// columns. The boot gate refuses instead — whether the marker is absent
+    /// (never conformed) or names another catalog (repointed database).
+    #[sqlx::test]
+    async fn query_only_boot_refuses_an_archive_from_another_catalog(pool: sqlx::PgPool) {
+        let store = CatalogStore::new(pool.clone());
+
+        // Fresh app database (only the envelope seed pins), populated archive
+        // that no conformance pass ever adopted: no marker.
+        let unmarked = tempfile::tempdir().unwrap();
+        let unmarked_data = unmarked.path().join("data");
+        plant_disagreeing_corpus(&unmarked_data);
+        let err = conform::verify_archive_identity(&store, &unmarked_data)
+            .await
+            .expect_err("an unadopted archive must not be served as this catalog's schema");
+        assert!(
+            err.contains("was not written by the catalog") && err.contains("<absent>"),
+            "the refusal must name the missing marker: {err}"
+        );
+
+        // Marker naming a different catalog (the app database was repointed,
+        // or the data root was restored from another install's backup).
+        let stale = tempfile::tempdir().unwrap();
+        let stale_data = stale.path().join("data");
+        plant_disagreeing_corpus(&stale_data);
+        std::fs::write(
+            stale_data.join("CATALOG"),
+            "00000000-0000-0000-0000-000000000000\n",
+        )
+        .unwrap();
+        let err = conform::verify_archive_identity(&store, &stale_data)
+            .await
+            .expect_err("a marker from another catalog must not pass the gate");
+        assert!(
+            err.contains("00000000-0000-0000-0000-000000000000"),
+            "the refusal must name the foreign catalog id: {err}"
+        );
+    }
+
+    /// The gate is identity, not paranoia: an archive this catalog conformed
+    /// passes, and so does a cold start with no parquet at all (there is no
+    /// schema to get wrong).
+    #[sqlx::test]
+    async fn query_only_boot_accepts_its_own_and_empty_archives(pool: sqlx::PgPool) {
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant_disagreeing_corpus(&data_dir);
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+        assert!(
+            conform::verify_archive_identity(&store, &data_dir)
+                .await
+                .expect("an archive this catalog conformed must pass the gate"),
+            "the published marker proves the identity"
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            !conform::verify_archive_identity(&store, &empty.path().join("data"))
+                .await
+                .expect("a cold start has no archive to misdescribe"),
+            "an empty archive is unproven but harmless"
+        );
+    }
+
     /// Wiring: server boot itself runs the conformance pass — pins land in
     /// the process cache and one query returns the full corrected corpus,
     /// without this test ever calling `ensure_conformance`.
