@@ -1,6 +1,6 @@
 # A declared event schema, and a catalog that makes column types authoritative at write time
 
-status: accepted (2026-07-29), amended (2026-07-29) after adversarial review — see Amendment
+status: accepted (2026-07-29), amended (2026-07-29) after adversarial review, amended (2026-08-03) after the slice-2 implementation review — see Amendments
 
 trawl has no data model. `validate_event` requires exactly one field — `service` —
 and every other top-level JSON key becomes a physical parquet column whose type
@@ -348,3 +348,58 @@ itself is untouched.
   cutover alongside `timestamp_invalid`), and an unexpected query
   failure with cold files present returns an error rather than hot-only
   success.
+
+## Amendment (2026-08-03): lossless casts, and one spelling per identifier
+
+The slice-2 (#50) implementation review surfaced two places where the design
+as written lost data silently. Both fixes were verified by execution against
+the bundled DuckDB 1.5.5 and are pinned in
+`trawl-engine/tests/duckdb_probe.rs`; the schema itself is again untouched.
+
+- **A cast counts as a success only if the value survives the round trip
+  unchanged — at pin time and at conform time.** The candidate ladder's
+  "`TRY_CAST` success ≥90%" delegated the success test to the engine, and
+  the engine ROUNDS rather than fails: `TRY_CAST(1.5 AS BIGINT)` is `2`
+  (from JSON, VARCHAR and DOUBLE sources alike), so a 95%-fractional batch
+  scored ≥90% on the BIGINT rung, pinned BIGINT, and silently rounded every
+  value on write forever — with no `field_conflicts` row, because the tally
+  used the same counting. Every typed conform cast is now wrapped in a
+  round-trip guard (`CASE WHEN <round-trips> THEN TRY_CAST(...) END`),
+  which fixes ladder scoring, the written value, and the conflict tally in
+  one expression: a lossy cast scores as a rung failure, writes NULL, and
+  counts into `field_conflicts`/`rows_nulled`. Comparison spaces are chosen
+  per rung, from probe evidence: BIGINT/DOUBLE compare the cast against the
+  value's canonical text re-parsed in DOUBLE space (rounding refused,
+  representation drift tolerated — `4.0 = 4`, and u64::MAX still pins
+  DOUBLE, since pinning DOUBLE *means* accepting DOUBLE's >2^53 precision);
+  TIMESTAMP compares in TIMESTAMP space (format drift tolerated, parse
+  failures still NULL); BOOLEAN compares strict text, so `1` never conforms
+  to `true`. A corollary: `TRY_CAST(true AS BIGINT) = 1` no longer counts,
+  so the previously-unreachable Boolean rung is live — a ≥90%-boolean batch
+  pins BOOLEAN.
+- **Field names are ASCII-lowercased at ingest, before anything reads
+  them.** Catalog pins were case-sensitive (postgres TEXT keys on raw
+  client JSON spellings) while DuckDB identifiers are ASCII
+  case-insensitive: `Dur` and `dur` pinned independently, each file
+  conformed to its own pin, and `union_by_name` folded them into one column
+  — a hard Conversion error on every spanning query; the interim
+  VARCHAR-degrade defence then broke numeric comparisons on such fields
+  permanently. The canonicalizer now folds every field name to ASCII
+  lowercase first (per-character, which is exactly DuckDB's identifier
+  equivalence — `CAFÉ` folds to `cafÉ`, distinct from `café`), so one code
+  path sees one spelling: a lone `_Time` is the `_time` wire input,
+  `Service` validates as `service`, a custom `Dur` pins and stores as
+  `dur`. Two new closed-enum repair codes: `field.name_case_folded` (a name
+  was folded; recorded only when it changed something) and
+  `field.name_case_collision` (two keys in one event named one identifier;
+  the exact-lowercase spelling's value wins when present, else the
+  ASCII-lexicographically-first variant's — the loser stays in `_raw`).
+  `field.name_reserved` is retired: with fold-first canonicalization a
+  case-variant of an envelope column either loses the collision to the
+  exact key or is legitimately consumed as that column. The boot
+  conformance pass folds too — pin votes group by folded name,
+  most-rows-wins inside the group, and rewrites rename columns to the
+  folded form — so parquet written before the fold shipped converges. With
+  both in place the read-side case-variant defences (the pin cache's
+  VARCHAR degrade, the emitter's runtime fold) are deleted rather than
+  kept as dead code.
