@@ -1087,6 +1087,30 @@ impl CatalogStore {
             .await?;
         Ok(())
     }
+
+    /// Whether the boot pass has backfilled `field_services` from the
+    /// standing corpus for this catalog.
+    ///
+    /// Tracked separately from [`Self::is_conformed`] on purpose: the
+    /// backfill ([`Self::backfill_services`]) shipped a slice after
+    /// conformance did, so an install that conformed under the earlier slice
+    /// carries `conformed_at` set and this flag NULL — the one state where
+    /// the pass must run again.
+    pub async fn services_backfilled(&self) -> Result<bool, StoreError> {
+        let backfilled: bool =
+            sqlx::query_scalar("SELECT services_backfilled_at IS NOT NULL FROM catalog_state")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(backfilled)
+    }
+
+    /// Record that the boot pass observed the standing corpus.
+    pub async fn mark_services_backfilled(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE catalog_state SET services_backfilled_at = now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

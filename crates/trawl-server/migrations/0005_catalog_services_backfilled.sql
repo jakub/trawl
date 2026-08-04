@@ -1,0 +1,20 @@
+-- The boot pass's `field_services` backfill needs its OWN completion flag
+-- (ADR-0009 slice 3, #51).
+--
+-- `catalog_state.conformed_at` records that the corpus was proven conformant
+-- — slice 2's job, and slice 2 already set it on every install that has
+-- booted since. The observation backfill shipped a slice LATER, and it is
+-- gated by the same pass: an install that conformed under slice 2 answers
+-- "already conformed" at boot, returns before the backfill is ever reached,
+-- and so never observes the standing corpus it adopted. That is exactly the
+-- upgrade the backfill exists for, and reusing `conformed_at` as its flag
+-- makes it inert on precisely those nodes: `?service=` lists nothing for a
+-- service whose data is standing parquet with no post-upgrade compaction
+-- tick, and `row_count`/`first_seen` under-report.
+--
+-- So the backfill gets a flag of its own. NULL on every existing row (the
+-- upgrade case: the pass re-runs once, backfills, and stamps this), NULL on
+-- a fresh install too (where the first boot's pass sets it alongside
+-- `conformed_at`). Both flags are stamped by the same publish step, so a
+-- pass that skipped a path stamps neither and stays armed for the next boot.
+ALTER TABLE catalog_state ADD COLUMN services_backfilled_at TIMESTAMPTZ;

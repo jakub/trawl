@@ -1150,6 +1150,73 @@ mod boot {
         assert_eq!(again[0].last_seen, obs[0].last_seen);
     }
 
+    /// The upgrade the backfill exists for, exactly as it arrives: a node
+    /// that conformed under the PREVIOUS slice carries `conformed_at` set
+    /// and `data/CATALOG` naming this catalog, but an empty `field_services`
+    /// — and nothing will ever refill it, because no live batch re-sends a
+    /// standing corpus. Gating the backfill on the conformance marker alone
+    /// would short-circuit the pass on precisely those installs, so the
+    /// backfill carries its own flag and an unset one re-arms the pass.
+    #[sqlx::test]
+    async fn backfill_reruns_on_a_corpus_conformed_before_the_backfill_existed(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS duration FROM (VALUES (410), (420), (430)) t(x)",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .expect("boot pass runs");
+
+        // Rewind to the state the previous slice leaves behind: conformed,
+        // marker published, pins seeded — observations never taken.
+        sqlx::query("DELETE FROM field_services")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE catalog_state SET services_backfilled_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(store.is_conformed().await.unwrap(), "still conformed");
+        assert!(
+            data_dir.join("CATALOG").exists(),
+            "the marker still names this catalog"
+        );
+
+        let upgrade = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(
+            upgrade.ran,
+            "an un-backfilled corpus must re-arm the pass despite conformance"
+        );
+        let obs = store
+            .field_services("duration", None, 1000)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(obs.len(), 1, "the standing corpus is observed: {obs:?}");
+        assert_eq!(obs[0].service, "svc-a");
+        assert_eq!(obs[0].row_count, 3);
+
+        // And exactly once: the flag the pass stamps stops the next boot
+        // paying for the scan again.
+        let settled = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(
+            !settled.ran,
+            "both flags set and the marker matching must skip the pass"
+        );
+    }
+
     /// A live tick's accumulated `row_count` must survive a later backfill
     /// that sees a retention-shrunk corpus: the backfill takes the MAX, it
     /// never rewrites a count downward.
