@@ -298,6 +298,15 @@ web:
       memory: 256Mi
   extraEnv: []
 
+  # -- Log level (RUST_LOG) for the trawl-web sidecar ONLY. The proxy emits
+  # its session, origin, upstream and startup diagnostics under trawl_web,
+  # and the shared session/origin primitives under fleet_auth — neither of
+  # which the trawld `logLevel` names, so the sidecar gets its own filter
+  # rather than inheriting a target-only filter that would silence it.
+  # Matches trawl_web::DEFAULT_LOG_FILTER; keep both targets when
+  # customizing, or proxy and auth failures become invisible.
+  logLevel: "trawl_web=info,fleet_auth=info"
+
   # Cookie secret — a 32-byte AEAD key.
   #
   # When existingSecret is empty the chart generates a Secret on first
@@ -308,11 +317,12 @@ web:
     existingSecret: ""
     existingSecretKey: "cookie.key"
 
-# -- Log level (RUST_LOG). The default enumerates every target trawl emits
-# under — trawl_server (library), trawld (binary: startup banner, config
-# warnings), fleet_auth (auth middleware), and the deliberately-overridden
-# auth.backend / storage.backend alarm targets. Keep them all when
-# customizing, or backend errors become invisible.
+# -- Log level (RUST_LOG) for the trawld container. The default enumerates
+# every target trawld emits under — trawl_server (library), trawld (binary:
+# startup banner, config warnings), fleet_auth (auth middleware), and the
+# deliberately-overridden auth.backend / storage.backend alarm targets. Keep
+# them all when customizing, or backend errors become invisible. The
+# trawl-web sidecar has its own filter (see web.logLevel).
 logLevel: "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info"
 
 # -- Prometheus ServiceMonitor (requires prometheus-operator CRDs)

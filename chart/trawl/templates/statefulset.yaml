@@ -164,8 +164,10 @@ spec:
             # verification buys us nothing here.
             - name: TRAWL_WEB_INSECURE_UPSTREAM
               value: "1"
+            # The proxy's own filter — trawld's logLevel names neither
+            # trawl_web nor the proxy's fleet_auth events.
             - name: RUST_LOG
-              value: {{ .Values.logLevel | quote }}
+              value: {{ .Values.web.logLevel | quote }}
             {{- with .Values.web.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

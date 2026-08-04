@@ -110,6 +110,14 @@ trawld's stdout log and its internal telemetry ([`internal_telemetry`](#ingest))
 
 A configuration-file failure happens *before* any tracing subscriber exists: it is reported on stderr with the resolved config path, not through telemetry.
 
+**`trawl-web` filters separately.** The session proxy is a different process with a different target, so it must never inherit trawld's filter — a target-only filter that omits `trawl_web` silences the proxy completely. Its own default is:
+
+```text
+trawl_web=info,fleet_auth=info
+```
+
+`trawl_web` carries the proxy's session, origin, upstream and startup diagnostics; `fleet_auth` the shared session/origin primitives. Same contract shape as trawld's: the binary fallback, the Helm chart's `web.logLevel`, and the Debian `/etc/default/trawl-web` example all carry this exact string, and a set-and-valid `RUST_LOG` is authoritative.
+
 #### The query debug log
 
 `server.query_log` (or `TRAWL_QUERY_LOG` / `--query-log`) enables an ndjson debug log with one entry per query execution — built for `tail -f | jq` debugging.
