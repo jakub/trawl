@@ -892,9 +892,23 @@ fn iso8601(dt: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// Convert a `?since_secs=` window into an absolute instant.
+///
+/// `since_secs` is request-controlled, so every step here is total:
+/// `TimeDelta::seconds` and `DateTime - TimeDelta` are both panicking
+/// constructors that a large enough query string reaches. Any window that
+/// reaches past the unix epoch saturates there — older than any row a
+/// catalog can hold, so the filter still means "everything", and the value
+/// stays bindable as a postgres `timestamptz` (whose floor is nearer than
+/// chrono's).
 fn since_from_secs(since_secs: Option<u64>) -> Option<chrono::DateTime<chrono::Utc>> {
     since_secs.map(|s| {
-        chrono::Utc::now() - chrono::Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX))
+        i64::try_from(s)
+            .ok()
+            .and_then(chrono::TimeDelta::try_seconds)
+            .and_then(|d| chrono::Utc::now().checked_sub_signed(d))
+            .map_or(chrono::DateTime::UNIX_EPOCH, |dt| {
+                dt.max(chrono::DateTime::UNIX_EPOCH)
+            })
     })
 }
 
@@ -2525,6 +2539,35 @@ pub struct StreamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_from_secs_saturates_instead_of_panicking() {
+        // `?since_secs=` is request-controlled: no value may panic the
+        // handler (a 500 via CatchPanicLayer) or produce an instant
+        // postgres cannot bind.
+        assert_eq!(since_from_secs(None), None);
+
+        let hour = since_from_secs(Some(3600)).expect("finite window");
+        let elapsed = chrono::Utc::now() - hour;
+        assert!(elapsed >= chrono::TimeDelta::seconds(3600));
+        assert!(elapsed < chrono::TimeDelta::seconds(3700));
+
+        // Each of these blew up before: the first overflows the
+        // `DateTime - TimeDelta` subtraction, the rest overflow
+        // `TimeDelta::seconds` itself.
+        for s in [
+            100_000_000_000_000_u64,
+            10_000_000_000_000_000,
+            u64::try_from(i64::MAX).expect("i64::MAX is non-negative"),
+            u64::MAX,
+        ] {
+            assert_eq!(
+                since_from_secs(Some(s)),
+                Some(chrono::DateTime::UNIX_EPOCH),
+                "since_secs={s} must saturate at the epoch"
+            );
+        }
+    }
 
     #[test]
     fn sanitize_csv_formula_prefixes_dangerous_chars() {
