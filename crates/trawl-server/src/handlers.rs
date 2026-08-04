@@ -486,12 +486,10 @@ pub async fn schema(
     // Columns: a catalog SELECT. Postgres down → 503 (the same dependency
     // history/saved already have). Deliberately NO fallback to the
     // in-process pin cache: that would fork schema truth again.
-    let window_days = state.query.retention_max_age_days;
-    let since = if params.all == Some(true) || window_days == 0 {
+    let since = if params.all == Some(true) {
         None
     } else {
-        let days = i64::try_from(window_days).unwrap_or(i64::MAX);
-        chrono::Utc::now().checked_sub_signed(chrono::Duration::days(days))
+        since_from_days(state.query.retention_max_age_days)
     };
 
     let columns = if params.service.is_some() {
@@ -946,6 +944,22 @@ fn since_from_secs(since_secs: Option<u64>) -> Option<chrono::DateTime<chrono::U
                 dt.max(chrono::DateTime::UNIX_EPOCH)
             })
     })
+}
+
+/// Convert the `[retention] max_age_days` window into an absolute instant.
+///
+/// `max_age_days` is a plain `u64` that nothing range-validates, and
+/// "effectively never" values (`max_age_days = 999999999999`) are what an
+/// operator reaches for, so this must be total: `TimeDelta::days` panics
+/// out of bounds (~1.07e11 days) and would 500 every `/api/v1/schema`
+/// request until the config was edited. `0` disables the window; anything
+/// reaching past the unix epoch saturates there, like [`since_from_secs`].
+fn since_from_days(window_days: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    const SECS_PER_DAY: u64 = 86_400;
+    if window_days == 0 {
+        return None;
+    }
+    since_from_secs(Some(window_days.saturating_mul(SECS_PER_DAY)))
 }
 
 /// Query parameters for `GET /api/v1/schema/fields`.
@@ -2597,6 +2611,28 @@ mod tests {
                 since_from_secs(Some(s)),
                 Some(chrono::DateTime::UNIX_EPOCH),
                 "since_secs={s} must saturate at the epoch"
+            );
+        }
+    }
+
+    #[test]
+    fn since_from_days_saturates_instead_of_panicking() {
+        // `[retention] max_age_days` is an unvalidated operator-set u64 on
+        // the `/api/v1/schema` path: no value may panic the handler.
+        assert_eq!(since_from_days(0), None, "0 disables the window");
+
+        let week = since_from_days(7).expect("finite window");
+        let elapsed = chrono::Utc::now() - week;
+        assert!(elapsed >= chrono::TimeDelta::days(7));
+        assert!(elapsed < chrono::TimeDelta::days(8));
+
+        // `chrono::TimeDelta::days` panics past ~1.07e11 days; the seconds
+        // multiplication overflows u64 well before that.
+        for d in [200_000_000_000_u64, u64::MAX] {
+            assert_eq!(
+                since_from_days(d),
+                Some(chrono::DateTime::UNIX_EPOCH),
+                "max_age_days={d} must saturate at the epoch"
             );
         }
     }
