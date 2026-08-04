@@ -904,6 +904,49 @@ impl CatalogStore {
             .map_err(StoreError::from)
     }
 
+    /// [`Self::list_fields`], `?service=` shape: `$1` service, `$2` since,
+    /// `$3` limit. See the method docs for why this is its own SQL text.
+    const LIST_FIELDS_SCOPED_SQL: &'static str = "\
+        SELECT t.field, t.duckdb_type, t.pinned_from, t.pinned_at,
+               COALESCE(s.service_count, 0)::bigint AS service_count,
+               COALESCE(s.row_count, 0)::bigint     AS row_count,
+               s.first_seen, s.last_seen
+        FROM field_types t
+        LEFT JOIN (
+            SELECT field, count(*) AS service_count, sum(row_count) AS row_count,
+                   min(first_seen) AS first_seen, max(last_seen) AS last_seen
+            FROM field_services
+            WHERE service = $1
+            GROUP BY field
+        ) s ON s.field = t.field
+        WHERE EXISTS (
+                  SELECT 1 FROM field_services fs
+                  WHERE fs.field = t.field AND fs.service = $1)
+          AND ($2::timestamptz IS NULL
+                   OR s.last_seen IS NULL
+                   OR s.last_seen >= $2)
+        ORDER BY t.field
+        LIMIT $3";
+
+    /// [`Self::list_fields`], unscoped shape: `$1` since, `$2` limit.
+    const LIST_FIELDS_UNSCOPED_SQL: &'static str = "\
+        SELECT t.field, t.duckdb_type, t.pinned_from, t.pinned_at,
+               COALESCE(s.service_count, 0)::bigint AS service_count,
+               COALESCE(s.row_count, 0)::bigint     AS row_count,
+               s.first_seen, s.last_seen
+        FROM field_types t
+        LEFT JOIN (
+            SELECT field, count(*) AS service_count, sum(row_count) AS row_count,
+                   min(first_seen) AS first_seen, max(last_seen) AS last_seen
+            FROM field_services
+            GROUP BY field
+        ) s ON s.field = t.field
+        WHERE ($1::timestamptz IS NULL
+                   OR s.last_seen IS NULL
+                   OR s.last_seen >= $1)
+        ORDER BY t.field
+        LIMIT $2";
+
     /// List pins with their aggregated observation and conflict evidence —
     /// the read model behind `/api/v1/schema` and `/api/v1/schema/fields`.
     ///
@@ -935,6 +978,19 @@ impl CatalogStore {
     /// 0002's `(field, at DESC)` index and reads at most
     /// `limit` x [`MAX_CONFLICTS_PER_FIELD`] rows.
     ///
+    /// Scoped and unscoped are two SQL TEXTS, not one
+    /// `($1 IS NULL OR service = $1)` shape: sqlx prepares and caches every
+    /// statement per pooled connection, and on execution 6 postgres
+    /// (`plan_cache_mode=auto`) switches a prepared statement to its
+    /// generic plan — under which the `IS NULL`-guarded `OR` cannot be
+    /// pushed into `field_services_service_field_idx` (migration 0003) as a
+    /// scan key, so the scoped listing degrades to reading the whole table
+    /// (measured at 0003's own sizing: 2 318 → 504 366 buffers), unbounded
+    /// in the client-chosen service axis. Same reasoning as the cursor
+    /// predicate in [`Self::field_services`]. The `since` guard keeps the
+    /// `IS NULL`-`OR` shape: it filters the joined rows AFTER aggregation,
+    /// bounded by the pin cap, and is no index's scan key either way.
+    ///
     /// Returns `(rows, truncated)`; `truncated` is set when more rows
     /// matched than `filter.limit` allowed back.
     pub async fn list_fields(
@@ -942,34 +998,17 @@ impl CatalogStore {
         filter: &FieldListFilter,
     ) -> Result<(Vec<FieldSummaryRow>, bool), StoreError> {
         let limit = filter.limit.max(0);
-        let rows = sqlx::query(
-            "SELECT t.field, t.duckdb_type, t.pinned_from, t.pinned_at,
-                    COALESCE(s.service_count, 0)::bigint AS service_count,
-                    COALESCE(s.row_count, 0)::bigint     AS row_count,
-                    s.first_seen, s.last_seen
-             FROM field_types t
-             LEFT JOIN (
-                 SELECT field, count(*) AS service_count, sum(row_count) AS row_count,
-                        min(first_seen) AS first_seen, max(last_seen) AS last_seen
-                 FROM field_services
-                 WHERE ($1::text IS NULL OR service = $1)
-                 GROUP BY field
-             ) s ON s.field = t.field
-             WHERE ($1::text IS NULL OR EXISTS (
-                        SELECT 1 FROM field_services fs
-                        WHERE fs.field = t.field AND fs.service = $1))
-               AND ($2::timestamptz IS NULL
-                        OR s.last_seen IS NULL
-                        OR s.last_seen >= $2)
-             ORDER BY t.field
-             LIMIT $3",
-        )
-        .bind(filter.service.as_deref())
-        .bind(filter.since)
-        // Fetch one extra row purely to learn whether the limit truncated.
-        .bind(limit.saturating_add(1))
-        .fetch_all(&self.pool)
-        .await?;
+        let query = if let Some(service) = filter.service.as_deref() {
+            sqlx::query(Self::LIST_FIELDS_SCOPED_SQL).bind(service)
+        } else {
+            sqlx::query(Self::LIST_FIELDS_UNSCOPED_SQL)
+        };
+        let rows = query
+            .bind(filter.since)
+            // Fetch one extra row purely to learn whether the limit truncated.
+            .bind(limit.saturating_add(1))
+            .fetch_all(&self.pool)
+            .await?;
 
         let truncated = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
         let take = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -1094,7 +1133,7 @@ impl CatalogStore {
         .bind(field)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| {
+        row.map(|row| -> Result<FieldPinRow, sqlx::Error> {
             Ok(FieldPinRow {
                 field: row.try_get("field")?,
                 duckdb_type: row.try_get("duckdb_type")?,
@@ -1103,7 +1142,7 @@ impl CatalogStore {
             })
         })
         .transpose()
-        .map_err(|e: sqlx::Error| StoreError::from(e))
+        .map_err(StoreError::from)
     }
 
     /// The catalog's stable identity (mirrored into the `data/CATALOG`
