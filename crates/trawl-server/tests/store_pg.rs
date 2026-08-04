@@ -1786,6 +1786,259 @@ mod catalog {
         );
     }
 
+    // -- catalog read model (#51) -------------------------------------------
+
+    /// Age a `(field, service)` observation into the past by `days`.
+    async fn age_observation(pool: &PgPool, field: &str, service: &str, days: i64) {
+        sqlx::query(
+            "UPDATE field_services
+             SET last_seen = now() - make_interval(days => $3::int)
+             WHERE field = $1 AND service = $2",
+        )
+        .bind(field)
+        .bind(service)
+        .bind(days)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn list_fields_aggregates_observations_and_conflicts(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[
+                proposal("duration", CanonicalType::BigInt),
+                proposal("path", CanonicalType::Varchar),
+            ])
+            .await
+            .unwrap();
+        store
+            .touch_services("svc-a", &["duration".to_owned()], 3)
+            .await
+            .unwrap();
+        store
+            .touch_services("svc-b", &["duration".to_owned()], 2)
+            .await
+            .unwrap();
+        store
+            .record_conflicts(&[FieldConflict {
+                field: "duration".to_owned(),
+                service: "svc-b".to_owned(),
+                observed_type: "VARCHAR".to_owned(),
+                expected_type: CanonicalType::BigInt,
+                rows_nulled: 1,
+            }])
+            .await
+            .unwrap();
+
+        let (rows, truncated) = store
+            .list_fields(&trawl_server::store::FieldListFilter::default())
+            .await
+            .unwrap();
+        assert!(!truncated);
+
+        let duration = rows.iter().find(|r| r.field == "duration").unwrap();
+        assert_eq!(duration.duckdb_type, "BIGINT");
+        assert_eq!(duration.service_count, 2);
+        assert_eq!(duration.row_count, 5, "cumulative rows across services");
+        assert_eq!(duration.conflict_count, 1);
+        assert_eq!(duration.rows_nulled, 1);
+        assert!(duration.first_seen.is_some());
+        assert!(duration.last_seen.is_some());
+        assert_eq!(duration.pinned_from.as_deref(), Some("svc-a"));
+
+        // A pinned-but-never-observed field carries zeroed aggregates.
+        let path = rows.iter().find(|r| r.field == "path").unwrap();
+        assert_eq!(path.service_count, 0);
+        assert_eq!(path.row_count, 0);
+        assert_eq!(path.conflict_count, 0);
+        assert!(path.first_seen.is_none());
+        assert!(path.last_seen.is_none());
+
+        // The envelope seed is part of the listing (it IS pinned).
+        assert!(rows.iter().any(|r| r.field == "_time"));
+        assert_eq!(rows.len(), ENVELOPE_TYPES.len() + 2);
+    }
+
+    #[sqlx::test]
+    async fn list_fields_service_filter_via_observations(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[
+                proposal("duration", CanonicalType::BigInt),
+                proposal("path", CanonicalType::Varchar),
+            ])
+            .await
+            .unwrap();
+        store
+            .touch_services("nginx", &["duration".to_owned()], 1)
+            .await
+            .unwrap();
+        store
+            .touch_services("postgres", &["path".to_owned()], 1)
+            .await
+            .unwrap();
+
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                service: Some("nginx".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.field.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["duration"],
+            "only fields observed for the service are listed"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_fields_windows_on_last_seen_keeping_never_observed(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[proposal("duration", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        store
+            .touch_services("svc-a", &["duration".to_owned()], 1)
+            .await
+            .unwrap();
+        age_observation(&pool, "duration", "svc-a", 100).await;
+
+        let since = chrono::Utc::now() - chrono::Duration::days(90);
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                since: Some(since),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !rows.iter().any(|r| r.field == "duration"),
+            "an aged-out field is windowed away"
+        );
+        assert!(
+            rows.iter().any(|r| r.field == "_time"),
+            "a never-observed pin (the envelope seed) is ALWAYS shown — \
+             there is nothing to age out"
+        );
+
+        // Lifting the window (since: None) restores the aged field.
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter::default())
+            .await
+            .unwrap();
+        assert!(rows.iter().any(|r| r.field == "duration"));
+    }
+
+    #[sqlx::test]
+    async fn list_fields_truncates_at_limit(pool: PgPool) {
+        let store = catalog(&pool);
+        let (rows, truncated) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                limit: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(truncated, "more pins exist than the limit returned");
+
+        let (rows, truncated) = store
+            .list_fields(&trawl_server::store::FieldListFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), ENVELOPE_TYPES.len());
+        assert!(!truncated);
+    }
+
+    #[sqlx::test]
+    async fn pin_stats_reports_fill_against_cap(pool: PgPool) {
+        let store = catalog(&pool);
+        let (pinned, cap) = store.pin_stats().await.unwrap();
+        assert_eq!(pinned, i64::try_from(ENVELOPE_TYPES.len()).unwrap());
+        assert_eq!(cap, trawl_server::store::MAX_PINNED_FIELDS);
+
+        let store = catalog(&pool).with_pin_cap(42);
+        let (_, cap) = store.pin_stats().await.unwrap();
+        assert_eq!(
+            cap, 42,
+            "the overridden cap is what fill is measured against"
+        );
+    }
+
+    #[sqlx::test]
+    async fn recent_conflicts_filters_orders_and_windows(pool: PgPool) {
+        let store = catalog(&pool);
+        let mk = |field: &str, service: &str, nulled: u64| FieldConflict {
+            field: field.to_owned(),
+            service: service.to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: nulled,
+        };
+        store
+            .record_conflicts(&[mk("duration", "svc-a", 1)])
+            .await
+            .unwrap();
+        store
+            .record_conflicts(&[mk("duration", "svc-b", 2)])
+            .await
+            .unwrap();
+        store
+            .record_conflicts(&[mk("path", "svc-a", 3)])
+            .await
+            .unwrap();
+
+        // Unfiltered: newest first, across fields.
+        let (rows, truncated) = store.recent_conflicts(None, None, None, 100).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(!truncated);
+        assert_eq!(rows[0].field, "path");
+        assert_eq!(rows[2].service, "svc-a");
+        assert_eq!(rows[2].field, "duration");
+
+        // Field filter.
+        let (rows, _) = store
+            .recent_conflicts(Some("duration"), None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.field == "duration"));
+
+        // Service filter.
+        let (rows, _) = store
+            .recent_conflicts(None, Some("svc-b"), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].service, "svc-b");
+
+        // Since filter: age one row into the past, then window it away.
+        sqlx::query(
+            "UPDATE field_conflicts SET at = now() - interval '10 days'
+             WHERE field = 'path'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let since = chrono::Utc::now() - chrono::Duration::days(7);
+        let (rows, _) = store
+            .recent_conflicts(None, None, Some(since), 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "the aged conflict is outside the window");
+        assert!(rows.iter().all(|r| r.field == "duration"));
+
+        // Limit + truncated.
+        let (rows, truncated) = store.recent_conflicts(None, None, None, 2).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(truncated);
+    }
+
     #[sqlx::test]
     async fn catalog_id_is_stable_and_conformance_flips_once(pool: PgPool) {
         let store = catalog(&pool);

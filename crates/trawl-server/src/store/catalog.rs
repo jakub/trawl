@@ -75,6 +75,77 @@ pub struct FieldServiceRow {
     pub row_count: i64,
 }
 
+/// Filter for [`CatalogStore::list_fields`].
+#[derive(Debug, Clone)]
+pub struct FieldListFilter {
+    /// Only fields observed for this service (`EXISTS` over
+    /// `field_services`). `None` lists every pin.
+    pub service: Option<String>,
+    /// Window on the field's most recent observation: a field whose
+    /// `max(last_seen)` predates this instant is hidden. A field with NO
+    /// observations at all (e.g. the envelope seed on a fresh install) is
+    /// ALWAYS shown — there is nothing to age out. `None` disables the
+    /// window.
+    pub since: Option<DateTime<Utc>>,
+    /// Maximum rows returned (the caller clamps; see the route handlers).
+    pub limit: i64,
+}
+
+impl Default for FieldListFilter {
+    fn default() -> Self {
+        Self {
+            service: None,
+            since: None,
+            limit: MAX_PINNED_FIELDS,
+        }
+    }
+}
+
+/// One row of the field listing: the pin plus its aggregated observation
+/// and conflict evidence.
+#[derive(Debug, Clone)]
+pub struct FieldSummaryRow {
+    /// Field name.
+    pub field: String,
+    /// Pinned `DuckDB` type spelling.
+    pub duckdb_type: String,
+    /// Which service's batch set the pin (`_declared` for the envelope
+    /// seed; `NULL` only in hand-edited catalogs).
+    pub pinned_from: Option<String>,
+    /// When the pin was written.
+    pub pinned_at: DateTime<Utc>,
+    /// Distinct services that ever carried the field.
+    pub service_count: i64,
+    /// Cumulative rows across all services' observations.
+    pub row_count: i64,
+    /// Earliest observation across services (`None` when never observed).
+    pub first_seen: Option<DateTime<Utc>>,
+    /// Most recent observation across services (`None` when never observed).
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Conflict evidence rows currently retained for the field.
+    pub conflict_count: i64,
+    /// Total rows nulled across the retained evidence.
+    pub rows_nulled: i64,
+}
+
+/// A `field_conflicts` row with its field name — the cross-field listing
+/// shape ([`CatalogStore::recent_conflicts`]).
+#[derive(Debug, Clone)]
+pub struct ConflictListRow {
+    /// Field name.
+    pub field: String,
+    /// Service that disagreed.
+    pub service: String,
+    /// Observed `DuckDB` type spelling.
+    pub observed_type: String,
+    /// Expected (pinned) type spelling.
+    pub expected_type: String,
+    /// Rows nulled by the conforming cast.
+    pub rows_nulled: i64,
+    /// When the conflict was recorded.
+    pub at: DateTime<Utc>,
+}
+
 /// A `field_conflicts` row as read back (types as stored text).
 #[derive(Debug, Clone)]
 pub struct FieldConflictRow {
@@ -610,6 +681,136 @@ impl CatalogStore {
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::from)
+    }
+
+    /// List pins with their aggregated observation and conflict evidence —
+    /// the read model behind `/api/v1/schema` and `/api/v1/schema/fields`.
+    ///
+    /// One query: `field_types` LEFT JOIN grouped `field_services` LEFT
+    /// JOIN grouped `field_conflicts`. LEFT joins are load-bearing: a pin
+    /// with no observations (the envelope seed on a fresh install, or a
+    /// boot-pass pin over standing parquet) must always appear — windowing
+    /// only hides fields whose evidence says they aged out.
+    ///
+    /// Returns `(rows, truncated)`; `truncated` is set when more rows
+    /// matched than `filter.limit` allowed back.
+    pub async fn list_fields(
+        &self,
+        filter: &FieldListFilter,
+    ) -> Result<(Vec<FieldSummaryRow>, bool), StoreError> {
+        let limit = filter.limit.max(0);
+        let rows = sqlx::query(
+            "SELECT t.field, t.duckdb_type, t.pinned_from, t.pinned_at,
+                    COALESCE(s.service_count, 0)::bigint AS service_count,
+                    COALESCE(s.row_count, 0)::bigint     AS row_count,
+                    s.first_seen, s.last_seen,
+                    COALESCE(c.conflict_count, 0)::bigint AS conflict_count,
+                    COALESCE(c.rows_nulled, 0)::bigint    AS rows_nulled
+             FROM field_types t
+             LEFT JOIN (
+                 SELECT field, count(*) AS service_count, sum(row_count) AS row_count,
+                        min(first_seen) AS first_seen, max(last_seen) AS last_seen
+                 FROM field_services GROUP BY field
+             ) s ON s.field = t.field
+             LEFT JOIN (
+                 SELECT field, count(*) AS conflict_count, sum(rows_nulled) AS rows_nulled
+                 FROM field_conflicts GROUP BY field
+             ) c ON c.field = t.field
+             WHERE ($1::text IS NULL OR EXISTS (
+                        SELECT 1 FROM field_services fs
+                        WHERE fs.field = t.field AND fs.service = $1))
+               AND ($2::timestamptz IS NULL
+                        OR s.last_seen IS NULL
+                        OR s.last_seen >= $2)
+             ORDER BY t.field
+             LIMIT $3",
+        )
+        .bind(filter.service.as_deref())
+        .bind(filter.since)
+        // Fetch one extra row purely to learn whether the limit truncated.
+        .bind(limit.saturating_add(1))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let truncated = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+        let take = usize::try_from(limit).unwrap_or(usize::MAX);
+        rows.iter()
+            .take(take)
+            .map(|row| {
+                Ok(FieldSummaryRow {
+                    field: row.try_get("field")?,
+                    duckdb_type: row.try_get("duckdb_type")?,
+                    pinned_from: row.try_get("pinned_from")?,
+                    pinned_at: row.try_get("pinned_at")?,
+                    service_count: row.try_get("service_count")?,
+                    row_count: row.try_get("row_count")?,
+                    first_seen: row.try_get("first_seen")?,
+                    last_seen: row.try_get("last_seen")?,
+                    conflict_count: row.try_get("conflict_count")?,
+                    rows_nulled: row.try_get("rows_nulled")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map(|rows| (rows, truncated))
+            .map_err(StoreError::from)
+    }
+
+    /// The catalog's fill level: `(pinned, capacity)` — the same pair the
+    /// `trawl_catalog_pinned_fields` / `trawl_catalog_pin_capacity` gauges
+    /// publish, surfaced on the fields listing so a client sees headroom.
+    pub async fn pin_stats(&self) -> Result<(i64, i64), StoreError> {
+        let pinned: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((pinned, self.pin_cap))
+    }
+
+    /// Cross-field conflict listing, most recent first — the schema-health
+    /// dashboard read (`trawl schema conflicts --last 7d`).
+    ///
+    /// `field`/`service` filter exactly; `since` windows on the recording
+    /// instant. Returns `(rows, truncated)` like [`Self::list_fields`].
+    pub async fn recent_conflicts(
+        &self,
+        field: Option<&str>,
+        service: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<(Vec<ConflictListRow>, bool), StoreError> {
+        let limit = limit.max(0);
+        let rows = sqlx::query(
+            "SELECT field, service, observed_type, expected_type, rows_nulled, at
+             FROM field_conflicts
+             WHERE ($1::text IS NULL OR field = $1)
+               AND ($2::text IS NULL OR service = $2)
+               AND ($3::timestamptz IS NULL OR at >= $3)
+             ORDER BY at DESC, id DESC
+             LIMIT $4",
+        )
+        .bind(field)
+        .bind(service)
+        .bind(since)
+        .bind(limit.saturating_add(1))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let truncated = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+        let take = usize::try_from(limit).unwrap_or(usize::MAX);
+        rows.iter()
+            .take(take)
+            .map(|row| {
+                Ok(ConflictListRow {
+                    field: row.try_get("field")?,
+                    service: row.try_get("service")?,
+                    observed_type: row.try_get("observed_type")?,
+                    expected_type: row.try_get("expected_type")?,
+                    rows_nulled: row.try_get("rows_nulled")?,
+                    at: row.try_get("at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map(|rows| (rows, truncated))
             .map_err(StoreError::from)
     }
 
