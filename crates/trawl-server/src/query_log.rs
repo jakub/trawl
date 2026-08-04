@@ -15,6 +15,14 @@
 //! size-bounded: past `server.query_log_max_bytes` the file rolls over
 //! to a single retained `<path>.1` (also owner-only; `0` disables
 //! rollover).
+//!
+//! Tightening is best-effort in exactly one direction: POSIX `chmod`
+//! requires the caller to own the file, so a pre-existing log owned by
+//! another uid cannot be re-moded even when it opens fine for append.
+//! That refuses the open only when the file is *actually* reachable by
+//! group or other — an already-owner-only foreign file is as tight as
+//! this code would have made it, so it warns and continues rather than
+//! turning an opt-in debug feature into a boot failure.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -53,11 +61,48 @@ fn open_owner_only(path: &Path) -> io::Result<File> {
     let file = opts.open(path)?;
     // `mode` only applies at creation — tighten a pre-existing file too.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
+    tighten_to_owner_only(&file, path)?;
     Ok(file)
+}
+
+/// Whether a failed `chmod` on the log must refuse the open: it must,
+/// unless the file's observed mode is already free of every group and
+/// other bit. `None` (mode unreadable) is treated as unsafe.
+#[cfg(unix)]
+fn chmod_failure_is_fatal(mode: Option<u32>) -> bool {
+    mode.is_none_or(|m| m & 0o077 != 0)
+}
+
+/// `chmod 0600` an already-open log file, tolerating the one failure
+/// that carries no exposure: a foreign-owned file that is already
+/// owner-only (see the module docs).
+#[cfg(unix)]
+fn tighten_to_owner_only(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Err(chmod_err) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) else {
+        return Ok(());
+    };
+    let mode = file
+        .metadata()
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o777);
+    if chmod_failure_is_fatal(mode) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is group/other-accessible and cannot be tightened to 0600: {chmod_err}",
+                path.display()
+            ),
+        ));
+    }
+    tracing::warn!(
+        event_type = "query_log_chmod_failed",
+        path = %path.display(),
+        error = %chmod_err,
+        "could not chmod query log to 0600 (not its owner?); the existing \
+         mode is already owner-only, continuing"
+    );
+    Ok(())
 }
 
 impl QueryLog {
@@ -279,6 +324,31 @@ mod tests {
             mode_of(&path),
             0o600,
             "pre-existing query log must be tightened to owner-only"
+        );
+    }
+
+    /// A `chmod` we are not permitted to make (foreign-owned file) is
+    /// only worth refusing the open over when the file is actually
+    /// exposed — otherwise trawld would refuse to boot over an opt-in
+    /// debug log that leaks nothing.
+    #[cfg(unix)]
+    #[test]
+    fn chmod_failure_is_fatal_only_when_group_or_other_can_reach_the_file() {
+        for mode in [0o600, 0o400, 0o200, 0o000] {
+            assert!(
+                !chmod_failure_is_fatal(Some(mode)),
+                "{mode:04o} is already owner-only; failing chmod must not refuse the open"
+            );
+        }
+        for mode in [0o644, 0o640, 0o660, 0o606, 0o601, 0o666] {
+            assert!(
+                chmod_failure_is_fatal(Some(mode)),
+                "{mode:04o} is group/other-accessible and untightenable; must refuse"
+            );
+        }
+        assert!(
+            chmod_failure_is_fatal(None),
+            "an unreadable mode must be assumed unsafe"
         );
     }
 
