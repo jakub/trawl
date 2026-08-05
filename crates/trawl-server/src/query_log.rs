@@ -6,7 +6,7 @@
 //!
 //! One JSON object per query execution, capturing DSL, generated SQL,
 //! source paths, hot buffer state, result sample, and timing. Designed
-//! for `tail -f /tmp/trawl-query.log | jq` debugging workflows.
+//! for `tail -f /var/lib/trawl/query-debug.log | jq` debugging workflows.
 //!
 //! This file is MORE sensitive than the underlying event corpus: one
 //! record combines identity, raw query text, SQL parameter values,

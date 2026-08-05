@@ -20,6 +20,15 @@ use std::path::Path;
 /// pre-existing looser file is tightened too. `mode` is ignored on
 /// non-Unix platforms.
 ///
+/// On Unix the open also carries `O_NOFOLLOW`, so a symlink at the
+/// final path component is refused (`ELOOP`) rather than followed.
+/// These paths are operator-configured, appended to, and `chmod`ed:
+/// following a link planted by a local user — in a shared-writable
+/// directory, or in the window a rollover's rename leaves open — would
+/// append trawl's most sensitive output into a file of their choosing
+/// and re-mode that file to `mode`. A log path that is *deliberately*
+/// a symlink must be given as the link target instead.
+///
 /// The post-open `chmod` failure is *returned, not raised*: POSIX
 /// `chmod` requires the caller to own the file, so a file owned by
 /// another uid can open fine and still refuse to be re-moded. Whether
@@ -38,11 +47,14 @@ pub fn open_with_mode(
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(mode);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
     #[cfg(not(unix))]
     let _ = mode;
 
-    let file = opts.open(path)?;
+    let file = opts
+        .open(path)
+        .map_err(|err| describe_open_error(path, err))?;
 
     #[cfg(unix)]
     let chmod_error = {
@@ -54,6 +66,26 @@ pub fn open_with_mode(
     let chmod_error = None;
 
     Ok((file, chmod_error))
+}
+
+/// Turn the `O_NOFOLLOW` refusal into a message an operator can act on —
+/// a bare `ELOOP` on a path they configured reads like a filesystem bug.
+/// Every other error is passed through untouched.
+fn describe_open_error(path: &Path, err: io::Error) -> io::Error {
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ELOOP) {
+        return io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symbolic link; trawl will not follow one for an owner-only \
+                 diagnostic file (configure the link target instead)",
+                path.display()
+            ),
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    err
 }
 
 #[cfg(all(test, unix))]
@@ -96,6 +128,41 @@ mod tests {
             mode_of(&path),
             0o600,
             "mode() only applies at creation; the tighten step must run"
+        );
+    }
+
+    /// A symlink at the log path is a local user's way of redirecting
+    /// trawl's most sensitive output into a file they control — and, via
+    /// the tighten step, of getting an arbitrary file `chmod`ed. The open
+    /// must fail without touching the target at all.
+    #[test]
+    fn refuses_to_follow_a_symlink_at_the_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("victim");
+        std::fs::write(&target, "untouched").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = tmp.path().join("planted.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = open_with_mode(&link, 0o600, |opts| {
+            opts.create(true).append(true);
+        })
+        .expect_err("a symlinked log path must be refused, not followed");
+        assert!(
+            err.to_string().contains("symbolic link"),
+            "the refusal must name the cause: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "untouched",
+            "the link target must not be opened for append"
+        );
+        assert_eq!(
+            mode_of(&target),
+            0o644,
+            "the link target's mode must not be changed"
         );
     }
 

@@ -6321,6 +6321,7 @@ name = "trawl-config"
 version = "0.4.0"
 dependencies = [
  "chrono",
+ "libc",
  "serde",
  "shellexpand",
  "tempfile",

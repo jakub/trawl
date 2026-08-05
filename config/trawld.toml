@@ -48,8 +48,11 @@
 # ndjson query debug log (one entry per query execution). SENSITIVE:
 # entries combine identity, raw query text, generated SQL with parameter
 # values, source paths, and result samples. The file is owner-only (0600)
-# on Unix and bounded by query_log_max_bytes.
-# query_log = "/tmp/trawl-query.log"
+# on Unix and bounded by query_log_max_bytes. Put it in a directory only
+# trawld can write (NOT /tmp or any other shared-writable directory) —
+# the mode protects the file's contents, not the path leading to it.
+# A symlink at the path is refused, never followed.
+# query_log = "/var/lib/trawl/query-debug.log"
 
 # Size cap for the query debug log. Past it the file rolls over to a
 # single retained <path>.1 (also 0600). 0 disables rollover (unbounded).
