@@ -18,6 +18,11 @@
 //! trawld, an occupied or unwritable `<path>.1` — keeps the entry and
 //! backs off a whole cap before trying again, so an unrotatable path
 //! costs one attempt per `max_bytes` written rather than one per query.
+//! A rollover that lands its rename but cannot reopen the active path
+//! (fd exhaustion, a re-planted symlink) is undone; in the one case
+//! where even the undo fails the writer is left holding a file that is
+//! no longer the configured path, so the log *stops* rather than growing
+//! an unbounded, unwatched file full of identity and query text.
 //!
 //! Tightening is best-effort in exactly one direction: POSIX `chmod`
 //! requires the caller to own the file, so a pre-existing log owned by
@@ -57,6 +62,13 @@ struct Inner {
     /// syscall pair and emit another persisted `warn` on every single
     /// query, forever.
     next_attempt_bytes: u64,
+    /// Set when a rollover renamed the active file away, failed to
+    /// reopen `path`, AND failed to undo the rename: `writer` then holds
+    /// the *rotated* generation, and no further rollover can ever
+    /// succeed because `path` no longer exists. Writing on would append
+    /// to a file nobody is tailing, without bound and without the cap
+    /// this log exists to honour, so the log is closed until restart.
+    detached: bool,
 }
 
 /// Open `path` for appending, owner-only on Unix (`0600` at creation,
@@ -128,6 +140,7 @@ impl QueryLog {
                 max_bytes,
                 size,
                 next_attempt_bytes: max_bytes,
+                detached: false,
             }),
         })
     }
@@ -147,6 +160,12 @@ impl QueryLog {
             tracing::warn!("query log mutex poisoned, skipping entry");
             return;
         };
+        if inner.detached {
+            // A rollover left the writer on a file that is no longer the
+            // configured path and could not be undone (warned once, at
+            // detach). Appending here would defeat the size cap forever.
+            return;
+        }
         let line_bytes = line.len() as u64 + 1;
         if inner.max_bytes > 0
             && inner.size > 0
@@ -184,12 +203,21 @@ impl Inner {
     /// a rename that lands but is not followed by a successful reopen is
     /// undone: otherwise the writer would go on appending into the file
     /// that is now the *rotated* generation, breaking the "entries are
-    /// split, not duplicated" contract.
+    /// split, not duplicated" contract — and, because `path` would no
+    /// longer exist, no later rollover could bound that file either.
+    /// Should the undo itself fail, the writer is unrecoverably detached
+    /// from `path` and the log is closed rather than left unbounded.
     fn rollover(&mut self) -> io::Result<()> {
+        self.rollover_with(open_owner_only)
+    }
+
+    /// `rollover`, with the reopen injected so the post-rename failure
+    /// window is reachable from tests.
+    fn rollover_with(&mut self, reopen: fn(&Path) -> io::Result<File>) -> io::Result<()> {
         self.writer.flush()?;
         let rotated = self.rotated_path();
         std::fs::rename(&self.path, &rotated)?;
-        match open_owner_only(&self.path) {
+        match reopen(&self.path) {
             Ok(file) => {
                 self.writer = BufWriter::new(file);
                 self.size = 0;
@@ -198,11 +226,13 @@ impl Inner {
             }
             Err(err) => {
                 if let Err(restore) = std::fs::rename(&rotated, &self.path) {
-                    tracing::warn!(
+                    self.detached = true;
+                    tracing::error!(
                         error = %restore,
+                        reopen_error = %err,
                         path = %self.path.display(),
-                        "query log rollover could not be undone; entries continue \
-                         into the rotated file"
+                        "query log rollover could not be undone; the writer no longer \
+                         holds the configured path, so the log is closed until restart"
                     );
                 }
                 Err(err)
@@ -487,6 +517,79 @@ mod tests {
         assert!(rotated.is_file(), "back-off expires and rollover resumes");
         let new = std::fs::read_to_string(&path).unwrap();
         assert!(new.contains("e5") && !new.contains("e4"), "entries split");
+    }
+
+    /// The rename can land and the reopen still fail (fd exhaustion, a
+    /// symlink re-planted at the path, a directory gone read-only in the
+    /// window). The writer must not be left holding the rotated file:
+    /// that would append every later entry to `<path>.1` — unbounded,
+    /// since `path` no longer exists for any future rollover to rename.
+    #[test]
+    fn failed_reopen_undoes_the_rename_and_keeps_the_active_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let rotated = tmp.path().join("query.log.1");
+
+        let log = QueryLog::open(&path, 4096).unwrap();
+        log.write(&entry("before"));
+
+        let err = log
+            .inner
+            .lock()
+            .unwrap()
+            .rollover_with(|_| Err(io::Error::other("reopen refused")))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "reopen refused");
+
+        assert!(path.is_file(), "the active log is restored, not left gone");
+        assert!(!rotated.exists(), "the half-done rotation is undone");
+
+        log.write(&entry("after"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("before") && content.contains("after"),
+            "writing continues into the active path, not the rotated one"
+        );
+        assert!(!rotated.exists(), "still nothing at the rotated path");
+    }
+
+    /// ...and when even the undo fails — here the reopen loses a race to
+    /// a directory planted at the path — the writer is holding a file
+    /// that is no longer `path` and never can be rotated again, so the
+    /// log closes instead of growing without bound.
+    #[test]
+    fn unrestorable_rollover_closes_the_log_instead_of_growing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let rotated = tmp.path().join("query.log.1");
+
+        let log = QueryLog::open(&path, 4096).unwrap();
+        log.write(&entry("before"));
+
+        let err = log
+            .inner
+            .lock()
+            .unwrap()
+            .rollover_with(|p| {
+                // Occupy the active path so the undo rename cannot land.
+                std::fs::create_dir(p)?;
+                Err(io::Error::other("reopen refused"))
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "reopen refused");
+        assert!(path.is_dir(), "the obstruction is untouched");
+
+        let rotated_len = std::fs::metadata(&rotated).unwrap().len();
+        log.write(&entry("after"));
+        assert_eq!(
+            std::fs::metadata(&rotated).unwrap().len(),
+            rotated_len,
+            "a detached log stops writing rather than appending to the rotated file"
+        );
+        assert!(
+            log.inner.lock().unwrap().detached,
+            "the log is marked closed until restart"
+        );
     }
 
     #[test]
