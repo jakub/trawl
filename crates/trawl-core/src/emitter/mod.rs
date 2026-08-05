@@ -19,6 +19,7 @@ mod validate;
 use crate::ast::{PipeStage, Query, Spanned};
 use state::EmitterState;
 
+pub(crate) use fields::coerce_filter_value;
 pub use fields::map_field_name;
 pub use functions::is_aggregate_function;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};

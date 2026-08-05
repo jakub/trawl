@@ -21,6 +21,8 @@ pub mod emitter;
 pub mod format;
 
 /// In-memory expression evaluator for streaming pipeline stages.
+pub mod compare;
+
 pub mod eval;
 
 /// In-memory event filter compiled from the search stage.

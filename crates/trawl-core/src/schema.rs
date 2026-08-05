@@ -90,6 +90,21 @@ pub fn resolve_field_alias(name: &str) -> &str {
     }
 }
 
+/// The catalog spelling of a DSL field reference: resolve the time aliases,
+/// then ASCII-lowercase (ADR-0011 slice A).
+///
+/// Catalog names are ASCII-folded at every producer's door (ingest, boot
+/// seeding, compaction proposals), and `DuckDB` folds identifiers over
+/// ASCII too — so `Status` in a query names the same column, and the same
+/// pin, as `status`. Without this fold a mixed-case reference would
+/// silently fall back to unpinned while the lowercase spelling is
+/// pin-aware. Non-ASCII stays put, mirroring `DuckDB`'s ASCII-only
+/// identifier folding.
+#[must_use]
+pub fn catalog_key(dsl_name: &str) -> String {
+    resolve_field_alias(dsl_name).to_ascii_lowercase()
+}
+
 // ---------------------------------------------------------------------------
 // Field-catalog type vocabulary (ADR-0009 slice 2)
 // ---------------------------------------------------------------------------
@@ -250,6 +265,15 @@ impl FieldTypes {
     #[must_use]
     pub fn get(&self, field: &str) -> Option<CanonicalType> {
         self.entries.get(field).copied()
+    }
+
+    /// Look up the pin for a DSL field reference, through [`catalog_key`]
+    /// (alias resolution + ASCII fold). The emitter's and the in-memory
+    /// filter's shared pin lookup — both must agree on which pin a query
+    /// token names (ADR-0011 slice A).
+    #[must_use]
+    pub fn pin_for(&self, dsl_name: &str) -> Option<CanonicalType> {
+        self.get(&catalog_key(dsl_name))
     }
 
     /// Whether the map holds no pins.
@@ -441,6 +465,34 @@ mod tests {
         for f in [RAW, REPAIRS, ENV, SERVICE, HOST, SEVERITY_TEXT, MESSAGE] {
             assert_eq!(ty(f), CanonicalType::Varchar, "{f}");
         }
+    }
+
+    #[test]
+    fn catalog_key_resolves_aliases_then_folds_ascii() {
+        // Alias resolution first: the pinned column is `_time`, whatever
+        // spelling the DSL used.
+        assert_eq!(catalog_key("timestamp"), "_time");
+        assert_eq!(catalog_key("@timestamp"), "_time");
+        // ASCII fold second: catalog names are ingest-folded lowercase, so
+        // `Status` must find the `status` pin instead of silently falling
+        // back to unpinned.
+        assert_eq!(catalog_key("Status"), "status");
+        assert_eq!(catalog_key("DUR"), "dur");
+        // Non-ASCII stays put — DuckDB folds identifiers over ASCII only.
+        assert_eq!(catalog_key("CAFÉ"), "cafÉ");
+        assert_eq!(catalog_key("host"), "host");
+    }
+
+    #[test]
+    fn pin_for_looks_up_through_the_catalog_key() {
+        let mut ft = FieldTypes::new();
+        ft.insert("status", CanonicalType::Varchar);
+        ft.insert("_time", CanonicalType::Timestamp);
+        assert_eq!(ft.pin_for("status"), Some(CanonicalType::Varchar));
+        assert_eq!(ft.pin_for("Status"), Some(CanonicalType::Varchar));
+        assert_eq!(ft.pin_for("timestamp"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("@timestamp"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("unpinned"), None);
     }
 
     #[test]
