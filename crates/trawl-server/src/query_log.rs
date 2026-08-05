@@ -14,7 +14,10 @@
 //! (`0600` on Unix, tightening a pre-existing looser file at open) and
 //! size-bounded: past `server.query_log_max_bytes` the file rolls over
 //! to a single retained `<path>.1` (also owner-only; `0` disables
-//! rollover).
+//! rollover). A rollover that fails — the log deleted under a running
+//! trawld, an occupied or unwritable `<path>.1` — keeps the entry and
+//! backs off a whole cap before trying again, so an unrotatable path
+//! costs one attempt per `max_bytes` written rather than one per query.
 //!
 //! Tightening is best-effort in exactly one direction: POSIX `chmod`
 //! requires the caller to own the file, so a pre-existing log owned by
@@ -46,6 +49,14 @@ struct Inner {
     max_bytes: u64,
     /// Current size of the active file.
     size: u64,
+    /// Size past which the next rollover is attempted — `max_bytes`
+    /// normally, but a *failed* attempt pushes it one whole cap ahead.
+    /// Without that back-off an unrotatable path (the log deleted under
+    /// a running trawld, a `<path>.1` that is a directory, a
+    /// foreign-owned rotated file) would re-run the flush + rename
+    /// syscall pair and emit another persisted `warn` on every single
+    /// query, forever.
+    next_attempt_bytes: u64,
 }
 
 /// Open `path` for appending, owner-only on Unix (`0600` at creation,
@@ -116,6 +127,7 @@ impl QueryLog {
                 path: path.to_path_buf(),
                 max_bytes,
                 size,
+                next_attempt_bytes: max_bytes,
             }),
         })
     }
@@ -138,12 +150,19 @@ impl QueryLog {
         let line_bytes = line.len() as u64 + 1;
         if inner.max_bytes > 0
             && inner.size > 0
-            && inner.size + line_bytes > inner.max_bytes
+            && inner.size + line_bytes > inner.next_attempt_bytes
             && let Err(e) = inner.rollover()
         {
             // Keep writing to the over-cap file rather than lose the
-            // entry — the cap is a bound, not a durability contract.
-            tracing::warn!(error = %e, "query log rollover failed; continuing in current file");
+            // entry — the cap is a bound, not a durability contract —
+            // but do not re-attempt (or re-warn) until another cap's
+            // worth of entries has been written.
+            inner.next_attempt_bytes = inner.size.saturating_add(inner.max_bytes);
+            tracing::warn!(
+                error = %e,
+                retry_after_bytes = inner.next_attempt_bytes,
+                "query log rollover failed; continuing in current file"
+            );
         }
         if let Err(e) = writeln!(inner.writer, "{line}") {
             tracing::warn!(error = %e, "failed to write query log entry");
@@ -160,14 +179,42 @@ impl Inner {
     /// Roll the active file over to `<path>.1` (replacing any previous
     /// rotated file — exactly one previous generation is retained) and
     /// reopen a fresh active file. The rename preserves the `0600` mode.
+    ///
+    /// On error the caller keeps writing through the existing writer, so
+    /// a rename that lands but is not followed by a successful reopen is
+    /// undone: otherwise the writer would go on appending into the file
+    /// that is now the *rotated* generation, breaking the "entries are
+    /// split, not duplicated" contract.
     fn rollover(&mut self) -> io::Result<()> {
         self.writer.flush()?;
+        let rotated = self.rotated_path();
+        std::fs::rename(&self.path, &rotated)?;
+        match open_owner_only(&self.path) {
+            Ok(file) => {
+                self.writer = BufWriter::new(file);
+                self.size = 0;
+                self.next_attempt_bytes = self.max_bytes;
+                Ok(())
+            }
+            Err(err) => {
+                if let Err(restore) = std::fs::rename(&rotated, &self.path) {
+                    tracing::warn!(
+                        error = %restore,
+                        path = %self.path.display(),
+                        "query log rollover could not be undone; entries continue \
+                         into the rotated file"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// The single retained previous generation, `<path>.1`.
+    fn rotated_path(&self) -> PathBuf {
         let mut rotated = self.path.clone().into_os_string();
         rotated.push(".1");
-        std::fs::rename(&self.path, PathBuf::from(rotated))?;
-        self.writer = BufWriter::new(open_owner_only(&self.path)?);
-        self.size = 0;
-        Ok(())
+        PathBuf::from(rotated)
     }
 }
 
@@ -397,6 +444,49 @@ mod tests {
         assert!(!old.contains("aaaaa"), "oldest generation is gone");
         let files: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
         assert_eq!(files.len(), 2, "exactly path + path.1");
+    }
+
+    /// A rollover that cannot happen (here: `<path>.1` occupied by a
+    /// directory — same shape as the log being deleted under a running
+    /// trawld) must not be re-attempted per entry: every attempt is a
+    /// flush + rename syscall pair and a *persisted* warn, so retrying
+    /// one per query would be exactly the write amplification this log
+    /// is bounded to avoid.
+    #[test]
+    fn failed_rollover_backs_off_instead_of_retrying_every_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let rotated = tmp.path().join("query.log.1");
+        std::fs::create_dir(&rotated).unwrap();
+
+        // Two entries fit under the cap; the third triggers a rollover.
+        let line = serde_json::to_string(&entry("e1")).unwrap().len() as u64 + 1;
+        let cap = 2 * line + 18;
+
+        let log = QueryLog::open(&path, cap).unwrap();
+        log.write(&entry("e1"));
+        log.write(&entry("e2"));
+        log.write(&entry("e3")); // rollover attempted, fails on the directory
+        assert!(rotated.is_dir(), "the obstruction is untouched");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("e1") && content.contains("e3"),
+            "a failed rollover still writes the entry"
+        );
+
+        // Clear the obstruction: the very next entry must NOT re-attempt.
+        std::fs::remove_dir(&rotated).unwrap();
+        log.write(&entry("e4"));
+        assert!(
+            !rotated.exists(),
+            "a failed rollover is backed off, not retried on the next entry"
+        );
+
+        // ...but one cap's worth later it tries again, and succeeds.
+        log.write(&entry("e5"));
+        assert!(rotated.is_file(), "back-off expires and rollover resumes");
+        let new = std::fs::read_to_string(&path).unwrap();
+        assert!(new.contains("e5") && !new.contains("e4"), "entries split");
     }
 
     #[test]
