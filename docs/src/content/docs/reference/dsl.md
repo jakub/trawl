@@ -31,6 +31,42 @@ env=prod                        # environment (path-pruned)
 
 **Operators:** `=`, `!=`, `>`, `>=`, `<`, `<=`
 
+#### Pinned comparison semantics
+
+On a server, every stored field carries a type pin in the field catalog
+(the envelope columns are pinned on install; custom fields pin at first
+typed sight). Search-stage field filters consult the pin, so a
+comparison means the same thing whatever the query literal looks like:
+
+- **VARCHAR-pinned field, `=` / `!=` / IN list** — compares **as text**:
+  `status=200` matches the stored string `"200"` (and only that exact
+  spelling — not `"200.0"`).
+- **VARCHAR-pinned field, ordered comparison with a numeric literal** —
+  compares **numerically** via `TRY_CAST(col AS DOUBLE)`: `status>=400`
+  matches `"404"`/`"500"`, and non-numeric values like `"accepted"`
+  simply don't match (they never error the query).
+- **VARCHAR-pinned field, ordered comparison with a non-numeric
+  literal** — lexical string comparison, unchanged.
+- **Numeric/timestamp/boolean-pinned field, glob or regex** — matches
+  the value's **text form** (`status=4*` finds 404 in a BIGINT column).
+- Everything else — numeric pins with numeric literals, and every
+  comparison on an **unpinned** field — keeps plain literal-driven
+  behavior.
+
+Live tail (SSE) applies exactly the same rules, so a streamed query and
+its batch form agree event for event.
+
+Two deliberate boundaries:
+
+- **Numeric-literal detection is by content, not quoting**: the parser
+  discards quote provenance, so `status>"400"` and `status>400` are the
+  same query.
+- **Embedded mode (`--data`) and the pipeline `| where` stage stay
+  literal-driven** — there is no catalog behind `--data`, and `| where`
+  is a typed expression evaluated after the search stage. `| where
+  status > 400` over a VARCHAR-pinned column can therefore still error
+  where the search-stage `status>400` filters cleanly.
+
 ### Severity: the `level` alias
 
 `level` is a **query alias for the numeric `severity` column** (OTel
