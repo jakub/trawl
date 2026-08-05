@@ -64,6 +64,11 @@ pub(crate) struct EmitterState {
     params: Vec<SqlValue>,
     /// How text search binds `_raw` in this pass (see [`RawBinding`]).
     raw_binding: RawBinding,
+    /// The full catalog pin set typing search-stage comparisons (ADR-0011
+    /// slice A). Distinct from the hot-branch conformance pins passed to
+    /// [`Self::with_hot_source`] — empty for pin-blind emission
+    /// (embedded mode, [`super::emit`]).
+    compare_pins: crate::schema::FieldTypes,
 }
 
 /// How the `_raw` column is bound by text search in one emission pass.
@@ -285,16 +290,16 @@ impl EmitterState {
     pub(crate) fn with_hot_source(
         primary: &str,
         hot: &str,
-        pins: &crate::schema::FieldTypes,
+        hot_pins: &crate::schema::FieldTypes,
     ) -> Result<Self, super::EmitError> {
         let primary_reader = build_reader(primary)?;
         let hot_reader = hot_reader(hot)?;
 
-        let mut parts = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + pins.len());
+        let mut parts = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + hot_pins.len());
         for col in crate::schema::TIMESTAMP_COLUMNS {
             parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
         }
-        for (quoted, ty) in conformable_pins(pins) {
+        for (quoted, ty) in conformable_pins(hot_pins) {
             parts.push(format!("{} AS {quoted}", conform_untyped(&quoted, ty)));
         }
         let hot_replace = parts.join(", ");
@@ -324,7 +329,22 @@ impl EmitterState {
             ctes: Vec::new(),
             params: Vec::new(),
             raw_binding: RawBinding::Available,
+            compare_pins: crate::schema::FieldTypes::new(),
         }
+    }
+
+    /// Attach the comparison pin set (ADR-0011 slice A). Builder-style so
+    /// the `emit*` entry points can funnel through one constructor per
+    /// source shape.
+    pub(crate) fn with_compare_pins(mut self, pins: &crate::schema::FieldTypes) -> Self {
+        self.compare_pins = pins.clone();
+        self
+    }
+
+    /// The pin typing a comparison against `dsl_name`, looked up through
+    /// [`crate::schema::catalog_key`] (alias resolution + ASCII fold).
+    pub(crate) fn compare_pin(&self, dsl_name: &str) -> Option<crate::schema::CanonicalType> {
+        self.compare_pins.pin_for(dsl_name)
     }
 
     /// Emit the raw-free variant of this query: text search binds a typed

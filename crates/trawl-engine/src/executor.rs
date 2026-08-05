@@ -108,7 +108,8 @@ impl Executor {
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, pins)?;
+        let emitted =
+            emitter::emit_with_hot_source(&ast, source, hot_source, pins, &FieldTypes::new())?;
         let mut outcome = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
 
         // A hot value disagreeing with a catalog pin is already conformed on
@@ -132,7 +133,8 @@ impl Executor {
         if matches!(&outcome, Ok(r) if r.columns.is_empty())
             && let Some(pruned) = self.pruned_cold_source(source)
         {
-            let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins)?;
+            let pruned_emitted =
+                emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins, &FieldTypes::new())?;
             outcome = self.execute_emitted(&pruned_emitted, max_rows, utc_offset_secs);
         }
 
@@ -454,7 +456,8 @@ impl Executor {
         max_rows: usize,
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, pins)?;
+        let emitted =
+            emitter::emit_with_hot_source(&ast, source, hot_source, pins, &FieldTypes::new())?;
         let mut outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
         // Same prune retry as `run_query_with_hot`: `read_parquet` rejects a
@@ -471,7 +474,8 @@ impl Executor {
         if matches!(&outcome, Err(EngineError::Database(e)) if is_no_files_error(e))
             && let Some(pruned) = self.pruned_cold_source(source)
         {
-            let pruned_emitted = emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins)?;
+            let pruned_emitted =
+                emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins, &FieldTypes::new())?;
             outcome = self.export_parquet_from_emitted(&pruned_emitted, output_path, max_rows);
         }
 

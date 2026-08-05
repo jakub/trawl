@@ -3,9 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken, Spanned};
+use crate::compare::{self, CompareForm, PatternForm};
 
 use super::SqlValue;
-use super::fields::{coerce_filter_value, quote_field};
+use super::fields::quote_field;
 use super::severity::{LEVEL_FIELD, level_in_list, level_predicate};
 use super::state::EmitterState;
 
@@ -151,38 +152,57 @@ fn emit_search_token(
                 return Ok(());
             }
             let field = quote_field(&ff.field);
+            // The catalog pin typing this comparison (ADR-0011 slice A) —
+            // `None` outside the catalog-backed paths, which keeps every
+            // branch below literal-driven.
+            let pin = state.compare_pin(&ff.field);
             match &ff.value {
                 FilterValue::Literal(v) => {
                     let sql_op = filter_op_to_sql(ff.op);
                     match ff.op {
                         FilterOp::Glob => {
+                            let target = pattern_target(&field, pin);
                             let placeholder = state.push_param(SqlValue::String(v.clone()));
-                            state.push_where(format!("{field} GLOB {placeholder}"));
+                            state.push_where(format!("{target} GLOB {placeholder}"));
                         }
                         FilterOp::Regex => {
+                            let target = pattern_target(&field, pin);
                             let placeholder = state.push_param(SqlValue::String(v.clone()));
-                            state.push_where(format!("regexp_matches({field}, {placeholder})"));
+                            state.push_where(format!("regexp_matches({target}, {placeholder})"));
                         }
-                        _ => {
-                            let val = coerce_filter_value(v);
-                            let placeholder = state.push_param(val);
-                            if ff.op == FilterOp::Ne {
-                                // SQL three-valued logic: NULL != x → UNKNOWN → filtered out.
-                                // Include NULLs explicitly so != behaves as users expect.
+                        _ => match compare::compare_form(pin, ff.op, v) {
+                            // VARCHAR pin + ordered numeric literal:
+                            // numeric comparison over the text column —
+                            // TRY_CAST so a non-numeric stored value is
+                            // NULL (no match), never a Conversion throw.
+                            CompareForm::NumericOnText(n) => {
+                                let placeholder = state.push_param(SqlValue::Float(n));
                                 state.push_where(format!(
-                                    "({field} {sql_op} {placeholder} OR {field} IS NULL)"
+                                    "TRY_CAST({field} AS DOUBLE) {sql_op} {placeholder}"
                                 ));
-                            } else {
-                                state.push_where(format!("{field} {sql_op} {placeholder}"));
                             }
-                        }
+                            form => {
+                                let val = comparable_value(form);
+                                let placeholder = state.push_param(val);
+                                if ff.op == FilterOp::Ne {
+                                    // SQL three-valued logic: NULL != x → UNKNOWN → filtered out.
+                                    // Include NULLs explicitly so != behaves as users expect.
+                                    state.push_where(format!(
+                                        "({field} {sql_op} {placeholder} OR {field} IS NULL)"
+                                    ));
+                                } else {
+                                    state.push_where(format!("{field} {sql_op} {placeholder}"));
+                                }
+                            }
+                        },
                     }
                 }
                 FilterValue::List(vs) => {
                     let placeholders: Vec<String> = vs
                         .iter()
                         .map(|v| {
-                            let val = coerce_filter_value(v);
+                            // Each IN element binds like an equality.
+                            let val = comparable_value(compare::compare_form(pin, FilterOp::Eq, v));
                             state.push_param(val)
                         })
                         .collect();
@@ -216,6 +236,31 @@ fn emit_search_token(
         SearchToken::Group(groups) => emit_or_groups(groups, state)?,
     }
     Ok(())
+}
+
+/// The column expression a glob/regex matches against: the column itself,
+/// or `CAST(col AS VARCHAR)` when the field is pinned to a non-VARCHAR
+/// type (ADR-0011 slice A) — glob on a BIGINT column matches its text
+/// form instead of leaving the outcome to `DuckDB`'s implicit-cast rules.
+fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalType>) -> String {
+    match compare::pattern_form(pin) {
+        PatternForm::Native => field.to_owned(),
+        PatternForm::CastText => format!("CAST({field} AS VARCHAR)"),
+    }
+}
+
+/// Collapse the equality-class forms to the `SqlValue` they bind.
+/// `NumericOnText` is handled by its own SQL shape before this is called
+/// and never produced for `=`/`!=`/IN elements.
+fn comparable_value(form: CompareForm) -> SqlValue {
+    match form {
+        CompareForm::Native(val) => val,
+        CompareForm::Text(s) => SqlValue::String(s),
+        CompareForm::NumericOnText(_) => {
+            debug_assert!(false, "NumericOnText has its own emission shape");
+            SqlValue::String(String::new())
+        }
+    }
 }
 
 fn filter_op_to_sql(op: FilterOp) -> &'static str {

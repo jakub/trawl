@@ -25,6 +25,12 @@ pub(crate) fn quote_field(name: &str) -> String {
 /// Coerce a string filter value to the most specific `SqlValue`.
 ///
 /// Tries `i64`, then `f64`, falls back to `String`.
+///
+/// This is the NO-PIN branch of the comparison rules (ADR-0011 slice A):
+/// unpinned fields, embedded mode, and every typed-pin case the rule
+/// table leaves unchanged route through here via
+/// [`crate::compare::compare_form`], which owns the decision of when a
+/// catalog pin overrides this literal-driven coercion.
 pub(crate) fn coerce_filter_value(s: &str) -> SqlValue {
     if let Ok(i) = s.parse::<i64>() {
         return SqlValue::Int(i);
