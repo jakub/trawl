@@ -19,6 +19,7 @@ use trawl_core::emitter::{self, EmittedQuery, SqlValue};
 use trawl_core::eval::eval_expr;
 use trawl_core::filter::CompiledFilter;
 use trawl_core::parser;
+use trawl_core::schema::{CanonicalType, FieldTypes};
 
 // ── Deterministic RNG (splitmix64) ────────────────────────────────────
 
@@ -329,7 +330,7 @@ fn filter_matches_sql_parity() {
         };
 
         // In-memory filter result — a compile error mirrors an emit error.
-        let Ok(filter) = CompiledFilter::compile(&query.search) else {
+        let Ok(filter) = CompiledFilter::compile(&query.search, &FieldTypes::new()) else {
             skipped += 1;
             continue;
         };
@@ -381,7 +382,8 @@ fn filter_matches_sql_parity() {
 /// Assert filter and SQL agree for one (dsl, event) pair.
 fn assert_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>) {
     let query = parser::parse(dsl).expect("dsl parses");
-    let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
+    let filter =
+        CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
     let filter_result = filter.matches(event);
 
     let mut tmp = tempfile::Builder::new()
@@ -549,5 +551,237 @@ fn time_filter_parity_on_time_column() {
         let mut event = envelope_event(Some(9), "hello", None);
         event.insert("_time".into(), Value::String(ts));
         assert_parity(&conn, dsl, &event);
+    }
+}
+
+// ── Pinned parity (ADR-0011 slice A) ──────────────────────────────────
+
+/// Execute emitted SQL strictly: ANY `DuckDB` error fails the test. The
+/// pinned rules exist precisely so a comparison against a pinned column
+/// can never throw — an unexpected error here is a broken rule, never a
+/// "no match".
+fn sql_matches_strict(conn: &Connection, emitted: &EmittedQuery) -> bool {
+    let count_sql = format!("SELECT count(*)::BIGINT FROM ({}) AS _sub", emitted.sql);
+    let params = bind_params(&emitted.params);
+    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let count: i64 = conn
+        .query_row(&count_sql, param_refs.as_slice(), |row| row.get(0))
+        .unwrap_or_else(|e| {
+            panic!(
+                "unexpected DuckDB error under pins: {e}\nsql: {count_sql}\nparams: {:?}",
+                emitted.params
+            )
+        });
+    count > 0
+}
+
+fn pinned(entries: &[(&str, CanonicalType)]) -> FieldTypes {
+    let mut ft = FieldTypes::new();
+    for (field, ty) in entries {
+        ft.insert(field, *ty);
+    }
+    ft
+}
+
+/// Assert filter and pin-aware SQL agree for one (dsl, event, pins)
+/// triple, over a source whose physical column type equals the pin.
+///
+/// Non-null events ride ndjson (`read_json` infers VARCHAR for JSON
+/// strings, BIGINT for JSON ints — already the pin's physical type). An
+/// all-null event would infer a JSON column instead — off the write-time
+/// invariant every real cold file satisfies — so the null case goes
+/// through a parquet COPY harness that types the column explicitly.
+fn assert_pinned_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>, ft: &FieldTypes) {
+    let query = parser::parse(dsl).expect("dsl parses");
+    let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
+    let filter_result = filter.matches(event);
+
+    // Keep the temp files alive for the duration of the SQL run.
+    let _guard: Box<dyn std::any::Any>;
+    let source = if event.get("status") == Some(&Value::Null) {
+        let tmp = tempfile::Builder::new()
+            .suffix(".parquet")
+            .tempfile()
+            .unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+        let ty = match ft.get("status") {
+            Some(t) => t.as_duckdb(),
+            None => "VARCHAR",
+        };
+        conn.execute_batch(&format!(
+            "COPY (SELECT CAST(NULL AS {ty}) AS status, 'hello' AS message) \
+             TO '{path}' (FORMAT PARQUET)"
+        ))
+        .expect("write typed-null parquet");
+        _guard = Box::new(tmp);
+        path
+    } else {
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".ndjson")
+            .tempfile()
+            .unwrap();
+        writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+        _guard = Box::new(tmp);
+        path
+    };
+    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let sql_result = sql_matches_strict(conn, &emitted);
+
+    assert_eq!(
+        filter_result, sql_result,
+        "pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nsql: {}\nparams: {:?}",
+        emitted.sql, emitted.params
+    );
+}
+
+fn status_event(value: &Value) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("status".into(), value.clone());
+    m.insert("message".into(), Value::String("hello".into()));
+    m
+}
+
+/// The slice-A deterministic matrix: a VARCHAR-pinned `status` over
+/// string-stored values (the physical column `read_json` infers is
+/// VARCHAR, matching the pin) × every operator class × numeric and
+/// non-numeric literals. Unexpected `DuckDB` errors fail the test.
+#[test]
+fn pinned_varchar_matrix_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+    let values = [
+        Value::String("200".into()),
+        Value::String("404".into()),
+        Value::String("accepted".into()),
+        Value::String("0".into()),
+        Value::String("1.5".into()),
+        Value::Null,
+    ];
+    let dsls = [
+        // eq/ne/IN, numeric and non-numeric literals
+        "status=200",
+        "status!=200",
+        "status=200,301",
+        "status=200,accepted",
+        "status=accepted",
+        "status!=accepted",
+        // ordered, numeric literal (TRY_CAST DOUBLE rule)
+        "status>400",
+        "status>=400",
+        "status<400",
+        "status<=400",
+        "status>=0",
+        "status>1",
+        "status<2",
+        // ordered, non-numeric literal (lexical rule, unchanged)
+        "status>accepted",
+        "status<accepted",
+        // glob / regex (unchanged under the VARCHAR pin)
+        "status=2*",
+        "status=/2.*/",
+    ];
+    for value in &values {
+        let event = status_event(value);
+        for dsl in dsls {
+            assert_pinned_parity(&conn, dsl, &event, &ft);
+        }
+    }
+}
+
+/// BIGINT-pinned control: glob/regex against integer-stored values (the
+/// physical column is BIGINT, matching the pin) go through
+/// `CAST(col AS VARCHAR)` on the SQL side and the matcher's
+/// stringification in memory — and must agree.
+#[test]
+fn pinned_bigint_pattern_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::BigInt)]);
+    for value in [200i64, 404, 0, 4] {
+        let event = status_event(&Value::Number(value.into()));
+        for dsl in [
+            "status=4*",
+            "status=2*",
+            "status=/4.*/",
+            "status=/^40.$/",
+            // non-pattern ops stay native under a typed pin
+            "status=404",
+            "status>=400",
+            "status!=200",
+        ] {
+            assert_pinned_parity(&conn, dsl, &event, &ft);
+        }
+    }
+}
+
+/// Hot+cold union with BOTH pin sets: the cold branch reads one event,
+/// the hot branch another (conformed via the REPLACE list), and the
+/// pin-aware comparison must agree with the in-memory filter over the
+/// pair — SQL matches iff the filter matches either event.
+#[test]
+fn pinned_hot_cold_union_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+
+    let envelope = |status: &str| {
+        let mut m = Map::new();
+        m.insert("_time".into(), Value::String("2026-01-01T12:00:00Z".into()));
+        m.insert(
+            "_ingested".into(),
+            Value::String("2026-01-01T12:00:01Z".into()),
+        );
+        m.insert("status".into(), Value::String(status.into()));
+        m.insert("message".into(), Value::String("hello".into()));
+        m
+    };
+
+    let cases = [
+        ("status=200", "200", "404"),
+        ("status=200", "404", "200"),
+        ("status=200", "404", "500"),
+        ("status>=400", "500", "accepted"),
+        ("status>=400", "accepted", "200"),
+        ("status!=200", "200", "200"),
+        ("status=200,301", "301", "accepted"),
+    ];
+    for (dsl, cold_status, hot_status) in cases {
+        let cold = envelope(cold_status);
+        let hot = envelope(hot_status);
+
+        let mut cold_tmp = tempfile::Builder::new()
+            .suffix(".ndjson")
+            .tempfile()
+            .unwrap();
+        writeln!(cold_tmp, "{}", Value::Object(cold.clone())).unwrap();
+        cold_tmp.flush().unwrap();
+        let mut hot_tmp = tempfile::Builder::new()
+            .suffix(".ndjson")
+            .tempfile()
+            .unwrap();
+        writeln!(hot_tmp, "{}", Value::Object(hot.clone())).unwrap();
+        hot_tmp.flush().unwrap();
+
+        let query = parser::parse(dsl).expect("dsl parses");
+        // hot_pins = pins ∩ hot keys; `status` is observed in the hot
+        // snapshot, so both sets carry it here.
+        let emitted = emitter::emit_with_hot_source(
+            &query,
+            cold_tmp.path().to_str().unwrap(),
+            hot_tmp.path().to_str().unwrap(),
+            &ft,
+            &ft,
+        )
+        .expect("emit succeeds");
+        let sql_result = sql_matches_strict(&conn, &emitted);
+
+        let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
+        let filter_result = filter.matches(&cold) || filter.matches(&hot);
+
+        assert_eq!(
+            filter_result, sql_result,
+            "hot+cold pinned parity mismatch\ndsl: {dsl:?}\ncold: {cold_status} hot: {hot_status}\nsql: {}",
+            emitted.sql
+        );
     }
 }

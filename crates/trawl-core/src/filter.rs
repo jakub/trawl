@@ -16,7 +16,9 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
-use crate::emitter::EmitError;
+use crate::compare::{self, CompareForm};
+use crate::emitter::{EmitError, SqlValue};
+use crate::schema::FieldTypes;
 
 /// A compiled filter that can match JSON events in memory.
 ///
@@ -176,6 +178,13 @@ struct TextMatcher {
 impl CompiledFilter {
     /// Compile a filter from a parsed search stage.
     ///
+    /// `pins` is the field catalog's full pin snapshot (ADR-0011 slice A):
+    /// comparisons against pinned fields follow the same rule table the
+    /// SQL emitter's `emit_with_pins` applies — batch/live parity is part
+    /// of the contract. Pass an empty set where no catalog exists
+    /// (embedded mode, plain unit tests); every comparison then stays
+    /// literal-driven, exactly as before.
+    ///
     /// Regex and glob patterns are compiled eagerly. Invalid patterns
     /// are silently skipped (they would also fail at SQL execution time).
     ///
@@ -186,7 +195,7 @@ impl CompiledFilter {
     /// or regex). Such a filter has no in-memory meaning: compiling it to
     /// a match-nothing predicate would turn a typo into a silently empty
     /// live stream while the same query errors on `/api/v1/query`.
-    pub fn compile(search: &SearchStage) -> Result<Self, EmitError> {
+    pub fn compile(search: &SearchStage, pins: &FieldTypes) -> Result<Self, EmitError> {
         let time_filter = search.time_filter.as_ref().map(|tf| TimeMatcher {
             duration_secs: tf.node.duration.to_seconds(),
         });
@@ -203,7 +212,7 @@ impl CompiledFilter {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
 
-        let groups = compile_groups(&search.groups)?;
+        let groups = compile_groups(&search.groups, pins)?;
 
         Ok(Self {
             groups,
@@ -273,19 +282,23 @@ impl CompiledFilter {
 /// Compile OR-of-AND groups, dropping tokens with no in-memory matcher.
 fn compile_groups(
     groups: &[Vec<crate::ast::Spanned<SearchToken>>],
+    pins: &FieldTypes,
 ) -> Result<Vec<Vec<TokenMatcher>>, EmitError> {
     groups
         .iter()
         .map(|group| {
             group
                 .iter()
-                .filter_map(|token| compile_token(&token.node).transpose())
+                .filter_map(|token| compile_token(&token.node, pins).transpose())
                 .collect()
         })
         .collect()
 }
 
-fn compile_token(token: &SearchToken) -> Result<Option<TokenMatcher>, EmitError> {
+fn compile_token(
+    token: &SearchToken,
+    pins: &FieldTypes,
+) -> Result<Option<TokenMatcher>, EmitError> {
     Ok(match token {
         SearchToken::FieldFilter(ff) => {
             // `level` is the severity band alias — mirror the SQL emitter.
@@ -294,7 +307,16 @@ fn compile_token(token: &SearchToken) -> Result<Option<TokenMatcher>, EmitError>
                     ff.op, &ff.value,
                 )?)));
             }
+            // The catalog pin typing this comparison (ADR-0011 slice A);
+            // the lookup folds through `catalog_key`, same as the emitter.
+            let pin = pins.pin_for(&ff.field);
             let predicate = match (&ff.op, &ff.value) {
+                // Glob/regex need no pin-aware change here: the matcher
+                // already stringifies every JSON value unconditionally
+                // (`json_to_string`), which is the in-memory mirror of the
+                // SQL side's `CAST(col AS VARCHAR)` under a typed pin —
+                // corroborated by execution probes in
+                // trawl-engine/tests/duckdb_probe.rs, not assumed.
                 (FilterOp::Glob, FilterValue::Literal(pattern)) => {
                     let Ok(regex) = Regex::new(&glob_to_regex(pattern)) else {
                         return Ok(None);
@@ -308,11 +330,14 @@ fn compile_token(token: &SearchToken) -> Result<Option<TokenMatcher>, EmitError>
                     FieldPredicate::Regex { regex }
                 }
                 (_, FilterValue::List(values)) => FieldPredicate::InList {
-                    values: values.iter().map(|v| coerce_value(v)).collect(),
+                    values: values
+                        .iter()
+                        .map(|v| coerce_form(compare::compare_form(pin, FilterOp::Eq, v)))
+                        .collect(),
                 },
                 (op, FilterValue::Literal(v)) => FieldPredicate::Compare {
                     op: compile_op(*op),
-                    value: coerce_value(v),
+                    value: coerce_form(compare::compare_form(pin, *op, v)),
                 },
             };
             Some(TokenMatcher::Field(FieldMatcher {
@@ -357,13 +382,13 @@ fn compile_token(token: &SearchToken) -> Result<Option<TokenMatcher>, EmitError>
             }))
         }
         SearchToken::Not(inner) => {
-            let Some(inner_matcher) = compile_token(&inner.node)? else {
+            let Some(inner_matcher) = compile_token(&inner.node, pins)? else {
                 return Ok(None);
             };
             Some(TokenMatcher::Not(Box::new(inner_matcher)))
         }
         SearchToken::Group(groups) => {
-            let compiled_groups = compile_groups(groups)?;
+            let compiled_groups = compile_groups(groups, pins)?;
             Some(TokenMatcher::OrGroup(compiled_groups))
         }
     })
@@ -387,17 +412,28 @@ fn compile_op(op: FilterOp) -> CompareOp {
     }
 }
 
-/// Coerce a string filter value to the most specific type.
+/// Map a resolved [`CompareForm`] onto the matcher's coercion vocabulary.
 ///
-/// Matches `emitter::fields::coerce_filter_value()` exactly.
-fn coerce_value(s: &str) -> CoercedValue {
-    if let Ok(i) = s.parse::<i64>() {
-        return CoercedValue::Int(i);
+/// One rule table, two consumers (ADR-0011 slice A): [`crate::compare`]
+/// decides how the literal binds, this translates the decision into the
+/// evaluator's terms:
+///
+/// - `Native` — today's literal-driven coercion, verbatim.
+/// - `Text` — string comparison against the event value's text form,
+///   mirroring the SQL side's `col = '200'` on the VARCHAR column.
+/// - `NumericOnText` — float comparison whose non-numeric-means-no-match
+///   evaluation ([`extract_f64`] returning `None`) mirrors
+///   `TRY_CAST(col AS DOUBLE)` degrading to NULL.
+fn coerce_form(form: CompareForm) -> CoercedValue {
+    match form {
+        CompareForm::Native(SqlValue::Int(i)) => CoercedValue::Int(i),
+        CompareForm::Native(SqlValue::Float(f)) | CompareForm::NumericOnText(f) => {
+            CoercedValue::Float(f)
+        }
+        CompareForm::Native(SqlValue::String(s)) | CompareForm::Text(s) => CoercedValue::Str(s),
+        // coerce_filter_value never yields Bool; keep the match total.
+        CompareForm::Native(SqlValue::Bool(b)) => CoercedValue::Str(b.to_string()),
     }
-    if let Ok(f) = s.parse::<f64>() {
-        return CoercedValue::Float(f);
-    }
-    CoercedValue::Str(s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +460,21 @@ impl FieldMatcher {
             // Missing field → no match (mirrors SQL NULL semantics).
             return false;
         };
+        if event_val.is_null() {
+            // SQL three-valued logic: a NULL value makes every comparison
+            // UNKNOWN (no match) — except `!=`, whose emitted form carries
+            // `OR col IS NULL` and therefore INCLUDES null rows. Decided
+            // here, before coercion, so every coercion class agrees with
+            // the SQL on nulls (stringifying null to "" made ordered
+            // string comparisons diverge).
+            return matches!(
+                &self.predicate,
+                FieldPredicate::Compare {
+                    op: CompareOp::Ne,
+                    ..
+                }
+            );
+        }
 
         match &self.predicate {
             FieldPredicate::Compare { op, value } => compare_values(event_val, *op, value),
@@ -762,7 +813,25 @@ mod tests {
     /// Helper: parse DSL, compile filter, test against event.
     fn matches_event(dsl: &str, event_json: &str) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
+        let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+            .expect("filter compiles");
+        let event: serde_json::Map<String, Value> =
+            serde_json::from_str(event_json).expect("valid JSON object");
+        filter.matches(&event)
+    }
+
+    /// Helper: like `matches_event`, with catalog pins (ADR-0011 slice A).
+    fn matches_event_pinned(
+        dsl: &str,
+        event_json: &str,
+        pins: &[(&str, crate::schema::CanonicalType)],
+    ) -> bool {
+        let mut ft = crate::schema::FieldTypes::new();
+        for (field, ty) in pins {
+            ft.insert(field, *ty);
+        }
+        let query = parser::parse(dsl).expect("parse should succeed");
+        let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
         filter.matches(&event)
@@ -773,7 +842,8 @@ mod tests {
     /// between event construction and evaluation, which flakes under load.
     fn matches_event_at(dsl: &str, event_json: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
+        let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+            .expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
         filter.matches_at(&event, now)
@@ -939,6 +1009,169 @@ mod tests {
         ));
     }
 
+    // ── pin-aware comparisons (ADR-0011 slice A) ──────────────────────
+
+    use crate::schema::CanonicalType as CT;
+
+    const VARCHAR_STATUS: &[(&str, CT)] = &[("status", CT::Varchar)];
+    const BIGINT_STATUS: &[(&str, CT)] = &[("status", CT::BigInt)];
+
+    #[test]
+    fn pinned_varchar_eq_numeric_compares_as_text() {
+        // String-stored "200" matches; a number 200 stringifies to the
+        // same text (mirrors the hot branch's json_extract_string).
+        assert!(matches_event_pinned(
+            "status=200",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(matches_event_pinned(
+            "status=200",
+            r#"{"status": 200}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=200",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=200",
+            r#"{"status": "404"}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    #[test]
+    fn pinned_varchar_ne_numeric_includes_json_null() {
+        assert!(matches_event_pinned(
+            "status!=200",
+            r#"{"status": "404"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status!=200",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        // SQL emits `(status != '200' OR status IS NULL)` — a JSON null
+        // must match here too, or batch and live disagree on every
+        // repaired event.
+        assert!(matches_event_pinned(
+            "status!=200",
+            r#"{"status": null}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    #[test]
+    fn pinned_varchar_in_list_compares_as_text() {
+        assert!(matches_event_pinned(
+            "status=200,301",
+            r#"{"status": "301"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=200,301",
+            r#"{"status": "404"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=200,301",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    #[test]
+    fn pinned_varchar_ordered_numeric_matches_numeric_text() {
+        // "404"/"500" are numeric under TRY_CAST(DOUBLE) semantics.
+        assert!(matches_event_pinned(
+            "status>=400",
+            r#"{"status": "404"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(matches_event_pinned(
+            "status>=400",
+            r#"{"status": "500"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status>=400",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        // Non-numeric values are NULL under TRY_CAST — never a match,
+        // never an error.
+        assert!(!matches_event_pinned(
+            "status>=400",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status>=400",
+            r#"{"status": null}"#,
+            VARCHAR_STATUS
+        ));
+        // DOUBLE domain uniformly: "1.5" sits between 1 and 2.
+        assert!(matches_event_pinned(
+            "dur>1",
+            r#"{"dur": "1.5"}"#,
+            &[("dur", CT::Varchar)]
+        ));
+        assert!(matches_event_pinned(
+            "dur<2",
+            r#"{"dur": "1.5"}"#,
+            &[("dur", CT::Varchar)]
+        ));
+    }
+
+    #[test]
+    fn pinned_varchar_ordered_lexical_stays_lexical() {
+        assert!(matches_event_pinned(
+            "host>alpha",
+            r#"{"host": "beta"}"#,
+            &[("host", CT::Varchar)]
+        ));
+        assert!(!matches_event_pinned(
+            "host>alpha",
+            r#"{"host": "aleph"}"#,
+            &[("host", CT::Varchar)]
+        ));
+    }
+
+    #[test]
+    fn pinned_bigint_glob_and_regex_match_text_form() {
+        assert!(matches_event_pinned(
+            "status=4*",
+            r#"{"status": 404}"#,
+            BIGINT_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=4*",
+            r#"{"status": 200}"#,
+            BIGINT_STATUS
+        ));
+        assert!(matches_event_pinned(
+            "status=/40./",
+            r#"{"status": 404}"#,
+            BIGINT_STATUS
+        ));
+    }
+
+    #[test]
+    fn pinned_lookup_is_case_folded() {
+        // `Status` names the same folded catalog entry as `status`. The
+        // JSON-null-under-`!=` outcome is only reachable through the pin
+        // (unpinned Int coercion excludes nulls), so a match proves the
+        // mixed-case reference found the folded pin.
+        assert!(matches_event_pinned(
+            "Status!=200",
+            r#"{"Status": null}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
     // ── text search ───────────────────────────────────────────────────
 
     #[test]
@@ -1094,10 +1327,13 @@ mod tests {
                     || panic!("{dsl:?} should be an emit error"),
                     |e| e.to_string(),
                 );
-            let compile_error = CompiledFilter::compile(&query.search).err().map_or_else(
-                || panic!("{dsl:?} should not compile to a filter"),
-                |e| e.to_string(),
-            );
+            let compile_error =
+                CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+                    .err()
+                    .map_or_else(
+                        || panic!("{dsl:?} should not compile to a filter"),
+                        |e| e.to_string(),
+                    );
             assert_eq!(compile_error, emit_error, "{dsl:?}");
         }
     }
@@ -1336,7 +1572,8 @@ mod tests {
     #[test]
     fn matches_at_uses_provided_now() {
         let query = parser::parse("last=1h").expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
+        let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+            .expect("filter compiles");
 
         // Event 30 min ago from "now".
         let now = chrono::Utc::now();
