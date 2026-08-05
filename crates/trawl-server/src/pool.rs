@@ -189,13 +189,22 @@ fn run_query_blocking(
                     source,
                     hot_path,
                     &hot.field_types,
+                    // Interim empty comparison set — the catalog snapshot
+                    // is wired in with the pool plumbing (ADR-0011 slice A).
+                    &trawl_core::schema::FieldTypes::new(),
                     max_result_rows,
                     utc_offset_secs,
                 )
                 .map_err(ServerError::from)
         } else {
             executor
-                .run_query(dsl, source, max_result_rows, utc_offset_secs)
+                .run_query(
+                    dsl,
+                    source,
+                    &trawl_core::schema::FieldTypes::new(),
+                    max_result_rows,
+                    utc_offset_secs,
+                )
                 .map_err(ServerError::from)
         }
     }));
@@ -797,11 +806,18 @@ impl ExecutorPool {
                         &source,
                         hot_path,
                         &hot.field_types,
+                        &trawl_core::schema::FieldTypes::new(),
                         &tmp_path,
                         max_rows,
                     )
                 } else {
-                    executor.export_parquet(&dsl, &source, &tmp_path, max_rows)
+                    executor.export_parquet(
+                        &dsl,
+                        &source,
+                        &trawl_core::schema::FieldTypes::new(),
+                        &tmp_path,
+                        max_rows,
+                    )
                 }
                 .map_err(ServerError::from)
             }));

@@ -22,7 +22,7 @@ trait RunQueryUnlimited {
 
 impl RunQueryUnlimited for Executor {
     fn run_query_max(&self, dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
-        self.run_query(dsl, source, usize::MAX, 0)
+        self.run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
     }
 }
 
@@ -697,7 +697,7 @@ fn setup_kv() -> (Executor, String) {
 fn extract_kv_basic_pipeline() {
     let (exec, src) = setup_kv();
     let result = exec
-        .run_query("* | extract kv | head 5", &src, 1000, 0)
+        .run_query("* | extract kv | head 5", &src, &FieldTypes::new(), 1000, 0)
         .unwrap();
     // Should have original columns + extracted kv columns.
     let col_names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
@@ -715,7 +715,13 @@ fn extract_kv_basic_pipeline() {
 fn extract_kv_with_where() {
     let (exec, src) = setup_kv();
     let result = exec
-        .run_query("* | extract kv | where status >= 400", &src, 1000, 0)
+        .run_query(
+            "* | extract kv | where status >= 400",
+            &src,
+            &FieldTypes::new(),
+            1000,
+            0,
+        )
         .unwrap();
     // status >= 400: 500 and 404 → 2 rows.
     assert_eq!(result.row_count(), 2);
@@ -728,6 +734,7 @@ fn extract_kv_with_stats() {
         .run_query(
             "* | extract kv | stats count() by method | sort -count",
             &src,
+            &FieldTypes::new(),
             1000,
             0,
         )
@@ -743,7 +750,13 @@ fn extract_kv_with_stats() {
 fn extract_kv_with_search_prefix() {
     let (exec, src) = setup_kv();
     let result = exec
-        .run_query("host=web01 | extract kv | head 10", &src, 1000, 0)
+        .run_query(
+            "host=web01 | extract kv | head 10",
+            &src,
+            &FieldTypes::new(),
+            1000,
+            0,
+        )
         .unwrap();
     // web01 has 3 rows.
     assert_eq!(result.row_count(), 3);
@@ -761,8 +774,14 @@ fn export_parquet_writes_valid_file() {
     // Remove the temp file so export_parquet creates it fresh.
     drop(tmp);
 
-    exec.export_parquet("service=nginx | head 3", &glob, &path, 1000)
-        .unwrap();
+    exec.export_parquet(
+        "service=nginx | head 3",
+        &glob,
+        &FieldTypes::new(),
+        &path,
+        1000,
+    )
+    .unwrap();
 
     // Verify the file exists and is re-readable via DuckDB.
     assert!(path.exists());
@@ -783,6 +802,7 @@ fn export_parquet_with_stats_roundtrips() {
     exec.export_parquet(
         "* | stats count() by service | sort -count",
         &glob,
+        &FieldTypes::new(),
         &path,
         1000,
     )
@@ -804,7 +824,13 @@ fn export_parquet_rejects_rust_stages() {
     drop(tmp);
 
     let err = exec
-        .export_parquet("* | extract kv | head 5", &src, &path, 1000)
+        .export_parquet(
+            "* | extract kv | head 5",
+            &src,
+            &FieldTypes::new(),
+            &path,
+            1000,
+        )
         .unwrap_err();
     assert!(
         err.to_string().contains("post-processing"),
@@ -906,6 +932,7 @@ fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
             &source,
             hot.to_str().unwrap(),
             &duration_bigint_pins(),
+            &FieldTypes::new(),
             usize::MAX,
             0,
         )
@@ -951,6 +978,7 @@ fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
             &source,
             hot.to_str().unwrap(),
             &duration_bigint_pins(),
+            &FieldTypes::new(),
             usize::MAX,
             0,
         )
@@ -978,6 +1006,7 @@ fn export_parquet_hot_pin_conflict_nulls_hot_value() {
         &source,
         hot.to_str().unwrap(),
         &duration_bigint_pins(),
+        &FieldTypes::new(),
         &out,
         1000,
     )
@@ -1029,6 +1058,7 @@ fn export_parquet_hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
         &source,
         hot.to_str().unwrap(),
         &duration_bigint_pins(),
+        &FieldTypes::new(),
         &out,
         1000,
     )
@@ -1067,6 +1097,7 @@ fn foreign_nonconformant_corpus_errors_loudly() {
             &source,
             hot.to_str().unwrap(),
             &FieldTypes::new(),
+            &FieldTypes::new(),
             usize::MAX,
             0,
         )
@@ -1102,6 +1133,7 @@ fn foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
             &source,
             hot.to_str().unwrap(),
             &FieldTypes::new(),
+            &FieldTypes::new(),
             usize::MAX,
             0,
         )
@@ -1127,6 +1159,7 @@ fn export_parquet_foreign_nonconformant_corpus_errors_loudly() {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
             1000,
@@ -1165,6 +1198,7 @@ fn export_parquet_foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_s
             "*",
             &source,
             hot.to_str().unwrap(),
+            &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
             1000,
@@ -1212,7 +1246,15 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
     pins.insert("_time", trawl_core::schema::CanonicalType::Timestamp);
     pins.insert("_ingested", trawl_core::schema::CanonicalType::Timestamp);
     let result = exec
-        .run_query_with_hot("*", &source, hot.to_str().unwrap(), &pins, usize::MAX, 0)
+        .run_query_with_hot(
+            "*",
+            &source,
+            hot.to_str().unwrap(),
+            &pins,
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
         .expect("hot+cold query must not error on a malformed hot timestamp");
 
     assert_eq!(
@@ -1275,6 +1317,7 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
                 &source,
                 hot.to_str().unwrap(),
                 &FieldTypes::new(),
+                &FieldTypes::new(),
                 usize::MAX,
                 0,
             )
@@ -1296,4 +1339,175 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
              (with_cold={with_cold})"
         );
     }
+}
+
+// ── pin-aware comparisons survive every lane (ADR-0011 slice A) ────────
+
+/// Cold parquet with a VARCHAR `status` column holding mixed
+/// numeric-looking and word values — the write-time-conformant shape a
+/// VARCHAR pin guarantees.
+fn write_varchar_status_parquet(dir: &std::path::Path) {
+    use duckdb::Connection;
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
+                      'svc' AS service, unnest(['200', '404', 'accepted']) AS status) \
+         TO '{}' (FORMAT PARQUET)",
+        dir.join("status.parquet").display()
+    ))
+    .unwrap();
+}
+
+fn status_varchar_pins() -> FieldTypes {
+    let mut pins = FieldTypes::new();
+    pins.insert("status", trawl_core::schema::CanonicalType::Varchar);
+    pins
+}
+
+#[test]
+fn pinned_comparison_applies_on_cold_only_run_query() {
+    // The formerly pin-blind branch (pool cold path): run_query itself
+    // must consult the pins. `status=200` binds text and matches only the
+    // stored "200"; `status>=400` TRY_CASTs and excludes "accepted"
+    // without erroring (pin-blind emission Conversion-errors here).
+    let dir = tempfile::tempdir().unwrap();
+    write_varchar_status_parquet(dir.path());
+    let exec = Executor::new().unwrap();
+    let source = format!("{}/*.parquet", dir.path().display());
+    let pins = status_varchar_pins();
+
+    let eq = exec
+        .run_query("status=200", &source, &pins, usize::MAX, 0)
+        .expect("text equality must not error on the VARCHAR column");
+    assert_eq!(eq.row_count(), 1);
+
+    let ordered = exec
+        .run_query("status>=400", &source, &pins, usize::MAX, 0)
+        .expect("ordered numeric comparison must not error over 'accepted'");
+    assert_eq!(ordered.row_count(), 1, "only '404' is >= 400");
+}
+
+#[test]
+fn pinned_comparison_survives_pruned_list_source() {
+    // One list element points at an hour dir holding no file; the pruned
+    // retry must carry the same comparison pins — a pin dropped on retry
+    // turns `status>=400` into a Conversion error over 'accepted'.
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::create_dir_all(&empty).unwrap();
+    write_varchar_status_parquet(&full);
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"status\":\"500\"}\n",
+    )
+    .unwrap();
+
+    let exec = Executor::new().unwrap();
+    let source = format!(
+        "['{}/*.parquet', '{}/*.parquet']",
+        full.display(),
+        empty.display()
+    );
+    let pins = status_varchar_pins();
+    let result = exec
+        .run_query_with_hot(
+            "status>=400",
+            &source,
+            hot.to_str().unwrap(),
+            &pins,
+            &pins,
+            usize::MAX,
+            0,
+        )
+        .expect("the pruned retry must keep the comparison pins");
+    // cold '404' + hot '500'; cold 'accepted'/'200' excluded, no error.
+    assert_eq!(result.row_count(), 2);
+}
+
+#[test]
+fn pinned_comparison_survives_hot_only_fallback() {
+    // Genuine cold start: the glob matches nothing, so the executor falls
+    // back to the hot-only read — which must keep the SAME comparison
+    // interpretation. The hot snapshot holds both a numeric-looking and a
+    // word value; pin-blind emission would Conversion-error the ordered
+    // comparison over the VARCHAR-inferred column.
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        concat!(
+            "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"status\":\"404\"}\n",
+            "{\"_time\":\"2024-01-15T10:00:02Z\",\"_ingested\":\"2024-01-15T10:00:02Z\",\"service\":\"svc\",\"status\":\"accepted\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let exec = Executor::new().unwrap();
+    let source = format!("{}/nothing/*.parquet", dir.path().display());
+    let pins = status_varchar_pins();
+    let result = exec
+        .run_query_with_hot(
+            "status>=400",
+            &source,
+            hot.to_str().unwrap(),
+            &pins,
+            &pins,
+            usize::MAX,
+            0,
+        )
+        .expect("the hot-only fallback must keep the comparison pins");
+    assert_eq!(result.row_count(), 1, "only '404' matches, no error");
+}
+
+#[test]
+fn pinned_comparison_survives_export_retry() {
+    // The export lane: pruned-list retry with comparison pins carried.
+    use duckdb::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::create_dir_all(&empty).unwrap();
+    write_varchar_status_parquet(&full);
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"status\":\"500\"}\n",
+    )
+    .unwrap();
+    let out = dir.path().join("export.parquet");
+
+    let exec = Executor::new().unwrap();
+    let source = format!(
+        "['{}/*.parquet', '{}/*.parquet']",
+        full.display(),
+        empty.display()
+    );
+    let pins = status_varchar_pins();
+    exec.export_parquet_with_hot(
+        "status>=400",
+        &source,
+        hot.to_str().unwrap(),
+        &pins,
+        &pins,
+        &out,
+        1000,
+    )
+    .expect("the export retry must keep the comparison pins");
+
+    let conn = Connection::open_in_memory().unwrap();
+    let rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                out.display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 2, "cold '404' + hot '500'");
 }

@@ -169,7 +169,15 @@ async fn run_parquet_export(
     if let Some(data) = data {
         // Embedded mode: export directly via DuckDB.
         let executor = trawl_engine::executor::Executor::new()?;
-        executor.export_parquet(query, data, output_path, usize::MAX)?;
+        // Embedded mode is pin-blind by design (no catalog, ADR-0011
+        // slice A): the explicit empty set keeps that decision visible.
+        executor.export_parquet(
+            query,
+            data,
+            &trawl_core::schema::FieldTypes::new(),
+            output_path,
+            usize::MAX,
+        )?;
     } else if let Some(conn) = conn {
         // Daemon mode: fetch parquet bytes via HTTP export endpoint.
         let client = make_client(conn)?;
@@ -203,8 +211,16 @@ fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryRes
     let utc_offset_secs =
         trawl_engine::timezone::resolve_utc_offset(timezone).map_err(CliError::Usage)?;
     let executor = trawl_engine::executor::Executor::new()?;
-    // CLI has no server-side row limit — use usize::MAX.
-    Ok(executor.run_query(query, data, usize::MAX, utc_offset_secs)?)
+    // CLI has no server-side row limit — use usize::MAX. Embedded mode is
+    // pin-blind by design (no catalog, ADR-0011 slice A): the explicit
+    // empty set keeps that decision visible.
+    Ok(executor.run_query(
+        query,
+        data,
+        &trawl_core::schema::FieldTypes::new(),
+        usize::MAX,
+        utc_offset_secs,
+    )?)
 }
 
 /// Build an `HttpClient` from resolved connection params.

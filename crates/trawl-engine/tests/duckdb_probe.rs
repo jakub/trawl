@@ -577,3 +577,284 @@ fn unconformed_hot_column_throws_the_union_and_varchar_conform_saves_it() {
          promote the cold TIMESTAMP to VARCHAR rather than throwing"
     );
 }
+
+// ── ADR-0011 slice A: pin-aware comparison rules, execution-evidenced ──
+//
+// One probe per emission rule, against real VARCHAR and BIGINT columns —
+// including the PRE-existing pin-blind behavior being replaced, so the
+// change is evidenced (and a DuckDB bump that alters the implicit-cast
+// outcome surfaces here, not in production).
+
+/// A VARCHAR column seeded with mixed numeric-looking and word values —
+/// the shape a VARCHAR pin guarantees on disk.
+fn varchar_status_conn() -> duckdb::Connection {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t AS SELECT unnest(['200', '404', '500', 'accepted', '1.5']) AS v",
+    )
+    .unwrap();
+    conn
+}
+
+fn count(conn: &duckdb::Connection, sql: &str) -> Result<i64, duckdb::Error> {
+    conn.query_row(sql, [], |row| row.get(0))
+}
+
+/// PRE-existing behavior (replaced by the slice-A rules): pin-blind
+/// emission binds an INTEGER parameter against the VARCHAR column, and
+/// the outcome is an ERROR either way — `=`/IN make `DuckDB` cast the
+/// COLUMN to INT64 and the first word value throws a Conversion error;
+/// ordered comparisons refuse to bind at all (Binder: "Cannot compare
+/// values of type VARCHAR and type BIGINT"). `status=200` against a
+/// VARCHAR-pinned column was breakage, not a filter. Pinned here with
+/// bound parameters (exactly what the emitter produces) so a `DuckDB` bump
+/// that changes the implicit-cast outcome surfaces.
+#[test]
+fn pin_blind_int_comparison_on_varchar_column_errors() {
+    let conn = varchar_status_conn();
+    let eq: Result<i64, _> = conn.query_row(
+        "SELECT count(*)::BIGINT FROM t WHERE v = ?",
+        [200i64],
+        |row| row.get(0),
+    );
+    let err = eq.expect_err("Int param equality over 'accepted' must throw");
+    assert!(
+        trawl_engine::executor::is_conversion_error(&err),
+        "= binds by casting the column: expected Conversion class, got {err}"
+    );
+
+    let in_list: Result<i64, _> = conn.query_row(
+        "SELECT count(*)::BIGINT FROM t WHERE v IN (?, ?)",
+        [200i64, 301i64],
+        |row| row.get(0),
+    );
+    let err = in_list.expect_err("Int param IN over 'accepted' must throw");
+    assert!(trawl_engine::executor::is_conversion_error(&err), "{err}");
+
+    let ordered: Result<i64, _> = conn.query_row(
+        "SELECT count(*)::BIGINT FROM t WHERE v >= ?",
+        [400i64],
+        |row| row.get(0),
+    );
+    let err = ordered.expect_err("Int param ordered comparison must refuse to bind");
+    assert!(
+        err.to_string().contains("Binder Error"),
+        ">= refuses VARCHAR-vs-BIGINT outright: {err}"
+    );
+}
+
+/// Rule: VARCHAR pin + `=`/`!=`/IN binds text — matches exactly the
+/// stored string, never errors, and does not equate numeric variants
+/// ('200' != '200.0').
+#[test]
+fn varchar_text_equality_matches_exact_string_only() {
+    let conn = varchar_status_conn();
+    assert_eq!(
+        count(&conn, "SELECT count(*)::BIGINT FROM t WHERE v = '200'").unwrap(),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*)::BIGINT FROM t WHERE v IN ('200', '301', 'accepted')"
+        )
+        .unwrap(),
+        2
+    );
+    // != with the OR-IS-NULL policy over a column with no NULLs: everything else.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*)::BIGINT FROM t WHERE (v != '200' OR v IS NULL)"
+        )
+        .unwrap(),
+        4
+    );
+    // Text equality is exact: no numeric equivalence.
+    assert_eq!(
+        count(&conn, "SELECT count(*)::BIGINT FROM t WHERE v = '200.0'").unwrap(),
+        0
+    );
+}
+
+/// Rule: VARCHAR pin + ordered numeric literal → `TRY_CAST(v AS DOUBLE)`.
+/// Numeric-looking strings order numerically, non-numeric values are NULL
+/// (excluded), and nothing throws.
+#[test]
+fn varchar_try_cast_double_orders_numerically_and_nulls_words() {
+    let conn = varchar_status_conn();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*)::BIGINT FROM t WHERE TRY_CAST(v AS DOUBLE) >= 400"
+        )
+        .unwrap(),
+        2, // '404', '500'; 'accepted' NULLs out, '200'/'1.5' below
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*)::BIGINT FROM t WHERE TRY_CAST(v AS DOUBLE) > 1"
+        )
+        .unwrap(),
+        4, // everything numeric except nothing — '1.5','200','404','500'
+    );
+    // TRY_CAST(v) of 'accepted' is NULL: excluded from BOTH sides of the
+    // comparison, never an error.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*)::BIGINT FROM t WHERE TRY_CAST(v AS DOUBLE) < 1000"
+        )
+        .unwrap(),
+        4
+    );
+}
+
+/// Why DOUBLE uniformly and never a per-literal BIGINT domain:
+/// `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2, so a BIGINT domain would make
+/// `dur>1` and `dur>1.5` disagree about the same stored value. DOUBLE
+/// keeps 1.5 as 1.5. (The rounding premise itself is also pinned by the
+/// conform-guard probes above.)
+#[test]
+fn try_cast_bigint_rounds_where_double_preserves() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let (as_bigint, as_double): (i64, f64) = conn
+        .query_row(
+            "SELECT TRY_CAST('1.5' AS BIGINT), TRY_CAST('1.5' AS DOUBLE)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(as_bigint, 2, "TRY_CAST to BIGINT rounds");
+    assert!((as_double - 1.5).abs() < f64::EPSILON, "DOUBLE preserves");
+}
+
+/// PRE-existing behavior on the pattern rule: GLOB and `regexp_matches`
+/// both REFUSE a numeric column outright (Binder: no `~~~(INTEGER,
+/// UNKNOWN)` / `regexp_matches(INTEGER, UNKNOWN)` overload) — glob on a
+/// numeric pin was an error, not a text match. The explicit CAST is what
+/// makes the pattern rules work at all.
+#[test]
+fn pin_blind_patterns_on_bigint_column_refuse_to_bind() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t AS SELECT unnest([200, 404, 500]) AS v")
+        .unwrap();
+    for sql in [
+        "SELECT count(*)::BIGINT FROM t WHERE v GLOB ?",
+        "SELECT count(*)::BIGINT FROM t WHERE regexp_matches(v, ?)",
+    ] {
+        let outcome: Result<i64, _> = conn.query_row(sql, ["4*"], |row| row.get(0));
+        let err = outcome.expect_err("patterns must not bind against BIGINT");
+        assert!(err.to_string().contains("Binder Error"), "{sql}: {err}");
+    }
+}
+
+/// Rule: typed pins glob/regex via `CAST(col AS VARCHAR)` — both match
+/// the text form of BIGINT values, explicitly.
+#[test]
+fn cast_text_patterns_match_bigint_text_form() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE t AS SELECT unnest([200, 404, 500]) AS v")
+        .unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*)::BIGINT FROM t WHERE CAST(v AS VARCHAR) GLOB '4*'"
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*)::BIGINT FROM t WHERE regexp_matches(CAST(v AS VARCHAR), '^[45]0[04]$')"
+        )
+        .unwrap(),
+        2, // 404 and 500; 200 starts with neither 4 nor 5
+    );
+}
+
+/// The text form a TIMESTAMP pin globs/regexes against is `DuckDB`'s CAST
+/// rendering — space-separated, no 'T', no 'Z' — NOT the RFC 3339 wire
+/// form. Documented residual (risk (c) of the slice): a live-tail event
+/// carries the RFC 3339 string, so a pattern anchored on the separator
+/// can disagree between batch and live. The date prefix (the overwhelming
+/// pattern use) agrees on both.
+#[test]
+fn timestamp_cast_text_form_is_space_separated() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let rendered: String = conn
+        .query_row(
+            "SELECT CAST(CAST('2026-01-15T09:00:00Z' AS TIMESTAMP) AS VARCHAR)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rendered, "2026-01-15 09:00:00");
+}
+
+/// The rules over `read_json` columns — the hot-only fallback's untyped
+/// source (no REPLACE conformance). A VARCHAR-inferred column behaves
+/// like the parquet case: text eq exact, TRY_CAST-DOUBLE orders and NULLs
+/// words. A BIGINT-inferred column under the VARCHAR pin's text-eq form
+/// implicit-casts the literal to the column side and still matches.
+#[test]
+fn pinned_rules_hold_over_read_json_columns() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // VARCHAR inference (strings, incl. a word).
+    let strings = dir.path().join("strings.ndjson");
+    {
+        let mut f = std::fs::File::create(&strings).unwrap();
+        for v in ["200", "404", "accepted"] {
+            writeln!(f, "{{\"v\": \"{v}\"}}").unwrap();
+        }
+    }
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let reader = hot_reader(&strings);
+    assert_eq!(
+        count(
+            &conn,
+            &format!("SELECT count(*)::BIGINT FROM {reader} WHERE v = '200'")
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            &format!("SELECT count(*)::BIGINT FROM {reader} WHERE TRY_CAST(v AS DOUBLE) >= 400")
+        )
+        .unwrap(),
+        1
+    );
+
+    // BIGINT inference (a hot event sent numbers for a VARCHAR-pinned
+    // field before conformance): the text literal implicit-casts onto the
+    // BIGINT column and matches the numeric value.
+    let ints = dir.path().join("ints.ndjson");
+    {
+        let mut f = std::fs::File::create(&ints).unwrap();
+        for v in [200, 404] {
+            writeln!(f, "{{\"v\": {v}}}").unwrap();
+        }
+    }
+    let reader = hot_reader(&ints);
+    assert_eq!(
+        count(
+            &conn,
+            &format!("SELECT count(*)::BIGINT FROM {reader} WHERE v = '200'")
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            &format!("SELECT count(*)::BIGINT FROM {reader} WHERE TRY_CAST(v AS DOUBLE) >= 400")
+        )
+        .unwrap(),
+        1
+    );
+}

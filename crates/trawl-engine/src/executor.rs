@@ -65,17 +65,24 @@ impl Executor {
 
     /// Full pipeline: parse DSL, emit SQL, execute.
     ///
+    /// `pins` is the field catalog's full pin snapshot typing the
+    /// search-stage comparisons (ADR-0011 slice A). Every caller decides:
+    /// the server passes its catalog snapshot; embedded mode passes an
+    /// explicit `FieldTypes::new()`, making its documented pin-blindness
+    /// visible at the call site.
+    ///
     /// `utc_offset_secs` is applied to all timestamp values at format time.
     /// Pass `0` for UTC display.
     pub fn run_query(
         &self,
         dsl: &str,
         source: &str,
+        pins: &FieldTypes,
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit(&ast, source)?;
+        let emitted = emitter::emit_with_pins(&ast, source, pins)?;
         let mut result = self.execute_emitted(&emitted, max_rows, utc_offset_secs)?;
         if !emitted.rust_stages.is_empty() {
             result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
@@ -97,19 +104,23 @@ impl Executor {
     /// not taken as proof of that — it is re-checked against the files on
     /// disk, because a list source reports "no files" for a single empty
     /// element too (ADR-0008).
+    /// `hot_pins` conforms the hot branch (pins ∩ snapshot keys); `pins`
+    /// is the full catalog snapshot typing the comparisons — one
+    /// interpretation per query, carried through every retry below
+    /// (ADR-0011 slice A).
     #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
         &self,
         dsl: &str,
         source: &str,
         hot_source: &str,
+        hot_pins: &FieldTypes,
         pins: &FieldTypes,
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted =
-            emitter::emit_with_hot_source(&ast, source, hot_source, pins, &FieldTypes::new())?;
+        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, hot_pins, pins)?;
         let mut outcome = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
 
         // A hot value disagreeing with a catalog pin is already conformed on
@@ -134,7 +145,7 @@ impl Executor {
             && let Some(pruned) = self.pruned_cold_source(source)
         {
             let pruned_emitted =
-                emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins, &FieldTypes::new())?;
+                emitter::emit_with_hot_source(&ast, &pruned, hot_source, hot_pins, pins)?;
             outcome = self.execute_emitted(&pruned_emitted, max_rows, utc_offset_secs);
         }
 
@@ -164,7 +175,10 @@ impl Executor {
             ColdAction::HotOnlyIfNoColdFiles => !self.cold_files_present(source),
         };
         let mut result = if hot_only {
-            let hot_emitted = emitter::emit(&ast, hot_source)?;
+            // Hot-only still types comparisons with the same pins — the
+            // interpretation of `status>=400` must not change because the
+            // cold corpus happens to be empty.
+            let hot_emitted = emitter::emit_with_pins(&ast, hot_source, pins)?;
             match self.execute_emitted(&hot_emitted, max_rows, utc_offset_secs) {
                 // Hot-only also hit a binder/emit error (e.g. empty ndjson
                 // between compaction cycles). Treat as empty, not error.
@@ -428,11 +442,12 @@ impl Executor {
         &self,
         dsl: &str,
         source: &str,
+        pins: &FieldTypes,
         output_path: &Path,
         max_rows: usize,
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit(&ast, source)?;
+        let emitted = emitter::emit_with_pins(&ast, source, pins)?;
         self.export_parquet_from_emitted(&emitted, output_path, max_rows)
     }
 
@@ -451,13 +466,13 @@ impl Executor {
         dsl: &str,
         source: &str,
         hot_source: &str,
+        hot_pins: &FieldTypes,
         pins: &FieldTypes,
         output_path: &Path,
         max_rows: usize,
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted =
-            emitter::emit_with_hot_source(&ast, source, hot_source, pins, &FieldTypes::new())?;
+        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, hot_pins, pins)?;
         let mut outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
         // Same prune retry as `run_query_with_hot`: `read_parquet` rejects a
@@ -475,7 +490,7 @@ impl Executor {
             && let Some(pruned) = self.pruned_cold_source(source)
         {
             let pruned_emitted =
-                emitter::emit_with_hot_source(&ast, &pruned, hot_source, pins, &FieldTypes::new())?;
+                emitter::emit_with_hot_source(&ast, &pruned, hot_source, hot_pins, pins)?;
             outcome = self.export_parquet_from_emitted(&pruned_emitted, output_path, max_rows);
         }
 
@@ -485,7 +500,7 @@ impl Executor {
             Err(EngineError::Database(_) | EngineError::Emit(_))
                 if !self.cold_files_present(source) =>
             {
-                let hot_emitted = emitter::emit(&ast, hot_source)?;
+                let hot_emitted = emitter::emit_with_pins(&ast, hot_source, pins)?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
             }
             other => other,
@@ -1300,7 +1315,7 @@ mod tests {
             meta.data_type
         );
 
-        let result = exec.run_query("* | fields meta", &glob, usize::MAX, 0);
+        let result = exec.run_query("* | fields meta", &glob, &FieldTypes::new(), usize::MAX, 0);
         assert!(
             matches!(result, Err(EngineError::Database(ref e)) if is_conversion_error(e)),
             "a query over the irreconcilable mix must error loudly (the \
@@ -1343,7 +1358,7 @@ mod tests {
         // Prove describe matches read time: a SELECT over the same glob must
         // succeed, returning both rows the union merges.
         let result = exec
-            .run_query("* | fields meta", &glob, usize::MAX, 0)
+            .run_query("* | fields meta", &glob, &FieldTypes::new(), usize::MAX, 0)
             .expect("SELECT meta over the merged-STRUCT glob must succeed");
         assert_eq!(
             result.row_count(),
@@ -1374,6 +1389,7 @@ mod tests {
                 "*",
                 &source,
                 hot.to_str().unwrap(),
+                &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
                 0,
@@ -1528,6 +1544,7 @@ mod tests {
             &source,
             hot.to_str().unwrap(),
             &FieldTypes::new(),
+            &FieldTypes::new(),
             usize::MAX,
             0,
         );
@@ -1559,6 +1576,7 @@ mod tests {
                 "nonexistent_field=value",
                 &source,
                 hot.to_str().unwrap(),
+                &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
                 0,
@@ -1652,6 +1670,7 @@ mod tests {
                 &source,
                 hot.to_str().unwrap(),
                 &FieldTypes::new(),
+                &FieldTypes::new(),
                 usize::MAX,
                 0,
             )
@@ -1686,6 +1705,7 @@ mod tests {
             &source,
             missing_hot.to_str().unwrap(),
             &FieldTypes::new(),
+            &FieldTypes::new(),
             usize::MAX,
             0,
         );
@@ -1719,6 +1739,7 @@ mod tests {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
             1000,
@@ -1773,6 +1794,7 @@ mod tests {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
             1000,

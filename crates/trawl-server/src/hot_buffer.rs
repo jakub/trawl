@@ -575,6 +575,7 @@ mod tests {
                     &source,
                     hot,
                     &trawl_core::schema::FieldTypes::new(),
+                    &trawl_core::schema::FieldTypes::new(),
                     usize::MAX,
                     0,
                 )
