@@ -175,10 +175,13 @@ impl Executor {
             ColdAction::HotOnlyIfNoColdFiles => !self.cold_files_present(source),
         };
         let mut result = if hot_only {
-            // Hot-only still types comparisons with the same pins — the
-            // interpretation of `status>=400` must not change because the
-            // cold corpus happens to be empty.
-            let hot_emitted = emitter::emit_with_pins(&ast, hot_source, pins)?;
+            // Hot-only keeps BOTH halves of the interpretation: the same
+            // comparison pins, and the same hot-column conformance the
+            // union's hot branch applies. Reading the raw ndjson would let
+            // `read_json`'s inference type the columns, so `status=200.0`
+            // over a VARCHAR-pinned field would match a hot numeric `200`
+            // here and stop matching the moment a parquet file appeared.
+            let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
             match self.execute_emitted(&hot_emitted, max_rows, utc_offset_secs) {
                 // Hot-only also hit a binder/emit error (e.g. empty ndjson
                 // between compaction cycles). Treat as empty, not error.
@@ -500,7 +503,10 @@ impl Executor {
             Err(EngineError::Database(_) | EngineError::Emit(_))
                 if !self.cold_files_present(source) =>
             {
-                let hot_emitted = emitter::emit_with_pins(&ast, hot_source, pins)?;
+                // Hot-only, conformed like the union's hot branch — an
+                // export must not write JSON-inferred types where the
+                // hot+cold lane would have written the catalog's.
+                let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
             }
             other => other,

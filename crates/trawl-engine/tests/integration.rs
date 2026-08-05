@@ -1511,3 +1511,119 @@ fn pinned_comparison_survives_export_retry() {
         .unwrap();
     assert_eq!(rows, 2, "cold '404' + hot '500'");
 }
+
+/// A hot snapshot whose `status` values are JSON NUMBERS — the shape that
+/// makes `read_json` infer BIGINT for a field the catalog pins VARCHAR.
+fn write_numeric_status_hot(hot: &std::path::Path) {
+    std::fs::write(
+        hot,
+        "{\"_time\":\"2024-01-15T10:00:01Z\",\"_ingested\":\"2024-01-15T10:00:01Z\",\"service\":\"svc\",\"status\":200}\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
+    // Cold start (the glob matches no file), so the executor reads hot-only.
+    // That changes the SOURCE, never the TYPES: the hot column must arrive
+    // conformed to the VARCHAR pin exactly as the union's hot branch
+    // conforms it, or the answer would flip the moment the first parquet
+    // landed. Reading the raw ndjson infers BIGINT, and `status=200.0`
+    // matches by implicit cast — while the hot+cold union and the SSE
+    // filter both compare the text '200' and reject it.
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    write_numeric_status_hot(&hot);
+
+    let exec = Executor::new().unwrap();
+    let source = format!("{}/nothing/*.parquet", dir.path().display());
+    let pins = status_varchar_pins();
+
+    let exact = exec
+        .run_query_with_hot(
+            "status=200",
+            &source,
+            hot.to_str().unwrap(),
+            &pins,
+            &pins,
+            usize::MAX,
+            0,
+        )
+        .expect("text equality must not error on the hot-only lane");
+    assert_eq!(exact.row_count(), 1, "the text '200' must match");
+    let status = exact
+        .columns
+        .iter()
+        .position(|c| c.name == "status")
+        .expect("status column must be present");
+    assert_eq!(
+        exact.rows[0][status],
+        Value::String("200".to_owned()),
+        "the hot value must arrive as the pinned VARCHAR — an Integer here \
+         means the hot-only lane read JSON-inferred types"
+    );
+
+    let decimal = exec
+        .run_query_with_hot(
+            "status=200.0",
+            &source,
+            hot.to_str().unwrap(),
+            &pins,
+            &pins,
+            usize::MAX,
+            0,
+        )
+        .expect("text equality must not error on the hot-only lane");
+    assert_eq!(
+        decimal.row_count(),
+        0,
+        "'200' is not the text '200.0' — a match means DuckDB compared a \
+         JSON-inferred BIGINT instead of the pinned text"
+    );
+}
+
+#[test]
+fn export_hot_only_fallback_conforms_hot_columns_to_the_pin() {
+    // The export lane of the same cold start: the exported parquet must
+    // carry the catalog's type, not `read_json`'s inference — otherwise an
+    // export taken before the first compaction disagrees with one taken
+    // after.
+    use duckdb::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    let out = dir.path().join("export.parquet");
+    write_numeric_status_hot(&hot);
+
+    let exec = Executor::new().unwrap();
+    let source = format!("{}/nothing/*.parquet", dir.path().display());
+    let pins = status_varchar_pins();
+    exec.export_parquet_with_hot(
+        "*",
+        &source,
+        hot.to_str().unwrap(),
+        &pins,
+        &pins,
+        &out,
+        1000,
+    )
+    .expect("the hot-only export must succeed on a cold start");
+
+    let conn = Connection::open_in_memory().unwrap();
+    let ty: String = conn
+        .query_row(
+            &format!(
+                "SELECT column_type FROM (DESCRIBE SELECT * FROM read_parquet('{}')) \
+                 WHERE column_name = 'status'",
+                out.display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        ty, "VARCHAR",
+        "the exported hot column must carry the catalog pin, not the \
+         JSON-inferred type"
+    );
+}

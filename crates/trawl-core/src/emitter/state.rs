@@ -248,6 +248,21 @@ fn conformable_pins(
         .collect()
 }
 
+/// The `REPLACE` list conforming a hot-buffer read to the catalog, shared
+/// by every lane that reads the snapshot ([`EmitterState::with_hot_source`]
+/// and [`EmitterState::with_hot_only_source`]) so hot rows carry the same
+/// types whether or not cold data happens to exist.
+fn hot_replace_list(hot_pins: &crate::schema::FieldTypes) -> String {
+    let mut parts = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + hot_pins.len());
+    for col in crate::schema::TIMESTAMP_COLUMNS {
+        parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
+    }
+    for (quoted, ty) in conformable_pins(hot_pins) {
+        parts.push(format!("{} AS {quoted}", conform_untyped(&quoted, ty)));
+    }
+    parts.join(", ")
+}
+
 /// Public accessor for the parquet/list source reader expression, so the
 /// engine can `DESCRIBE` the same cold source the emitter reads from.
 pub fn source_reader(source: &str) -> Result<String, super::EmitError> {
@@ -294,21 +309,36 @@ impl EmitterState {
     ) -> Result<Self, super::EmitError> {
         let primary_reader = build_reader(primary)?;
         let hot_reader = hot_reader(hot)?;
-
-        let mut parts = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + hot_pins.len());
-        for col in crate::schema::TIMESTAMP_COLUMNS {
-            parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
-        }
-        for (quoted, ty) in conformable_pins(hot_pins) {
-            parts.push(format!("{} AS {quoted}", conform_untyped(&quoted, ty)));
-        }
-        let hot_replace = parts.join(", ");
+        let hot_replace = hot_replace_list(hot_pins);
 
         let composite = format!(
             "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
              SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
         );
         Ok(Self::with_source(composite))
+    }
+
+    /// Construct with the hot-buffer ndjson as the SOLE source, carrying the
+    /// same `REPLACE` conformance the union's hot branch gets.
+    ///
+    /// The executor reads hot-only whenever there is provably no cold data to
+    /// hide (a genuine cold start, ADR-0008). That is a change of *sources*,
+    /// never a change of *types*: reading the raw ndjson would hand the query
+    /// whatever `read_json` inferred — a JSON numeric `200` under a VARCHAR
+    /// pin binds as BIGINT and matches `status=200.0` by implicit cast, while
+    /// the conformed hot+cold union and the SSE filter compare the text
+    /// `'200'` and reject it. Sharing one `REPLACE` list with
+    /// [`Self::with_hot_source`] keeps a result from flipping the moment the
+    /// first parquet lands (ADR-0011 slice A).
+    pub(crate) fn with_hot_only_source(
+        hot: &str,
+        hot_pins: &crate::schema::FieldTypes,
+    ) -> Result<Self, super::EmitError> {
+        let hot_reader = hot_reader(hot)?;
+        let hot_replace = hot_replace_list(hot_pins);
+        Ok(Self::with_source(format!(
+            "(SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
+        )))
     }
 
     fn with_source(source: String) -> Self {

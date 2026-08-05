@@ -217,6 +217,27 @@ pub fn emit_with_hot_source(
     })
 }
 
+/// Emit SQL reading ONLY the hot-buffer ndjson, conformed exactly as the
+/// union's hot branch is (ADR-0011 slice A).
+///
+/// Same two pin sets, same two roles as [`emit_with_hot_source`]:
+/// `hot_pins` (intersected with the snapshot's keys) conforms the hot
+/// columns, `pins` (the full catalog snapshot) types the comparisons. This
+/// is the executor's cold-start lane — reading the raw ndjson through
+/// [`emit_with_pins`] instead would let `read_json`'s inference, not the
+/// catalog, decide a hot column's type, so a query's answer would change
+/// the moment the first parquet file landed.
+pub fn emit_hot_only(
+    query: &Query,
+    hot_source: &str,
+    hot_pins: &crate::schema::FieldTypes,
+    pins: &crate::schema::FieldTypes,
+) -> Result<EmittedQuery, EmitError> {
+    emit_with_raw_fallback(query, || {
+        Ok(EmitterState::with_hot_only_source(hot_source, hot_pins)?.with_compare_pins(pins))
+    })
+}
+
 /// Emit the query, and — when text search bound `_raw` — a second time with
 /// the column replaced by a typed NULL, stored as
 /// [`EmittedQuery::raw_free_sql`] for the executor's fallback.
