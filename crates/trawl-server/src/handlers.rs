@@ -2468,13 +2468,13 @@ pub async fn stream_query(
         .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
     // Rejects whatever the SQL emitter rejects (e.g. `level=eror`) instead
     // of opening a live-looking stream that can never match an event.
-    // Interim empty pin set — the catalog snapshot is wired in with the
-    // executor-pool plumbing (ADR-0011 slice A server wiring).
-    let filter = trawl_core::filter::CompiledFilter::compile(
-        &ast.search,
-        &trawl_core::schema::FieldTypes::new(),
-    )
-    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    // Compiled with the catalog's current pin snapshot so /query and
+    // /stream cannot disagree on a pinned comparison (ADR-0011 slice A).
+    // The snapshot is held for the stream's life — a mid-stream repin
+    // waits for reconnect (slice B's invalidation path).
+    let filter =
+        trawl_core::filter::CompiledFilter::compile(&ast.search, &state.query.field_catalog.all())
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     // Compile the pipeline stages for streaming evaluation.
     let stream_plan = trawl_core::stream::compile_stream_plan(&ast.pipeline)
