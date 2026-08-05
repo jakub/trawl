@@ -10,6 +10,15 @@
 //!
 //! Key invariant: `filter.matches(event)` must agree with running the
 //! emitted SQL against `DuckDB` for every `(event, search_stage)` pair.
+//!
+//! Evaluation is therefore three-valued, like the SQL it mirrors: every
+//! matcher answers [`Truth`] (`Some(true)`/`Some(false)`/`None` for
+//! UNKNOWN), UNKNOWN propagates through NOT/AND/OR by SQL's rules, and
+//! only a final `Some(true)` is a match. Collapsing UNKNOWN to `false`
+//! at the leaf would survive a top-level filter but invert under `NOT`:
+//! `NOT status>=400` over a VARCHAR-pinned `status="accepted"` is a live
+//! match while `NOT (TRY_CAST(status AS DOUBLE) >= 400)` stays NULL and
+//! is filtered out — a false-positive live alert.
 
 use aho_corasick::AhoCorasick;
 use regex::Regex;
@@ -61,7 +70,7 @@ enum TokenMatcher {
 /// In-memory mirror of the SQL `level` → severity band predicates
 /// (`emitter::severity`). SSE and SQL must agree on every event.
 enum SeverityMatcher {
-    /// `level=tok` — severity within the band; NULL/absent → no match.
+    /// `level=tok` — severity within the band; NULL/absent → UNKNOWN.
     Band { lo: u8, hi: u8 },
     /// `level=a,b` — severity within any listed band.
     Bands { bands: Vec<(u8, u8)> },
@@ -73,23 +82,22 @@ enum SeverityMatcher {
 }
 
 impl SeverityMatcher {
-    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
+    /// A NULL/absent `severity` makes the band predicates UNKNOWN, exactly
+    /// as `severity BETWEEN lo AND hi` does in SQL. `NotBand` is the one
+    /// total form — its emitted shape carries `OR "severity" IS NULL`.
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
         let sev = event.get("severity").and_then(extract_i64);
         match self {
-            Self::Band { lo, hi } => {
-                sev.is_some_and(|n| n >= i64::from(*lo) && n <= i64::from(*hi))
-            }
-            Self::Bands { bands } => sev.is_some_and(|n| {
+            Self::Band { lo, hi } => sev.map(|n| n >= i64::from(*lo) && n <= i64::from(*hi)),
+            Self::Bands { bands } => sev.map(|n| {
                 bands
                     .iter()
                     .any(|(lo, hi)| n >= i64::from(*lo) && n <= i64::from(*hi))
             }),
             Self::NotBand { lo, hi } => {
-                sev.is_none_or(|n| n < i64::from(*lo) || n > i64::from(*hi))
+                Some(sev.is_none_or(|n| n < i64::from(*lo) || n > i64::from(*hi)))
             }
-            Self::Ordered { op, number } => {
-                sev.is_some_and(|n| apply_ord(n.cmp(&i64::from(*number)), *op))
-            }
+            Self::Ordered { op, number } => sev.map(|n| apply_ord(n.cmp(&i64::from(*number)), *op)),
         }
     }
 }
@@ -155,12 +163,18 @@ enum CompareOp {
 
 /// A filter value coerced to the most specific numeric type.
 ///
-/// Mirrors the coercion in `emitter::fields::coerce_filter_value()`.
+/// Mirrors the coercion in `emitter::fields::coerce_filter_value()`, plus
+/// the pinned form that binds differently ([`CoercedValue::NumericOnText`]).
 #[derive(Clone, Debug)]
 enum CoercedValue {
     Int(i64),
     Float(f64),
     Str(String),
+    /// The VARCHAR-pinned ordered-numeric form: the SQL side is
+    /// `TRY_CAST(col AS DOUBLE) op ?`, so a non-numeric stored value is
+    /// NULL — UNKNOWN, not FALSE. Kept apart from [`CoercedValue::Float`]
+    /// so the unpinned literal-driven path stays byte-identical.
+    NumericOnText(f64),
 }
 
 struct TextMatcher {
@@ -272,10 +286,9 @@ impl CompiledFilter {
             return true;
         }
 
-        // OR of AND: any group where all matchers pass.
-        self.groups
-            .iter()
-            .any(|group| group.iter().all(|m| m.matches(event)))
+        // OR of AND, in SQL's three-valued logic: only TRUE is a match —
+        // a WHERE clause evaluating to UNKNOWN filters the row out.
+        eval_groups(&self.groups, event) == Some(true)
     }
 }
 
@@ -421,15 +434,14 @@ fn compile_op(op: FilterOp) -> CompareOp {
 /// - `Native` — today's literal-driven coercion, verbatim.
 /// - `Text` — string comparison against the event value's text form,
 ///   mirroring the SQL side's `col = '200'` on the VARCHAR column.
-/// - `NumericOnText` — float comparison whose non-numeric-means-no-match
-///   evaluation ([`extract_f64`] returning `None`) mirrors
-///   `TRY_CAST(col AS DOUBLE)` degrading to NULL.
+/// - `NumericOnText` — float comparison whose non-numeric evaluation
+///   ([`extract_f64`] returning `None`) mirrors `TRY_CAST(col AS DOUBLE)`
+///   degrading to NULL: UNKNOWN, so `NOT` leaves it unmatched.
 fn coerce_form(form: CompareForm) -> CoercedValue {
     match form {
         CompareForm::Native(SqlValue::Int(i)) => CoercedValue::Int(i),
-        CompareForm::Native(SqlValue::Float(f)) | CompareForm::NumericOnText(f) => {
-            CoercedValue::Float(f)
-        }
+        CompareForm::Native(SqlValue::Float(f)) => CoercedValue::Float(f),
+        CompareForm::NumericOnText(f) => CoercedValue::NumericOnText(f),
         CompareForm::Native(SqlValue::String(s)) | CompareForm::Text(s) => CoercedValue::Str(s),
         // coerce_filter_value never yields Bool; keep the match total.
         CompareForm::Native(SqlValue::Bool(b)) => CoercedValue::Str(b.to_string()),
@@ -440,50 +452,88 @@ fn coerce_form(form: CompareForm) -> CoercedValue {
 // Matching
 // ---------------------------------------------------------------------------
 
+/// One SQL truth value: `Some(true)`, `Some(false)`, or `None` = UNKNOWN.
+type Truth = Option<bool>;
+
+/// SQL `AND` over a sequence: FALSE if any FALSE, else UNKNOWN if any
+/// UNKNOWN, else TRUE. Short-circuits on the first FALSE, like `all()`.
+fn and_all(items: impl IntoIterator<Item = Truth>) -> Truth {
+    let mut unknown = false;
+    for item in items {
+        match item {
+            Some(false) => return Some(false),
+            None => unknown = true,
+            Some(true) => {}
+        }
+    }
+    if unknown { None } else { Some(true) }
+}
+
+/// SQL `OR` over a sequence: TRUE if any TRUE, else UNKNOWN if any
+/// UNKNOWN, else FALSE. Short-circuits on the first TRUE, like `any()`.
+fn or_any(items: impl IntoIterator<Item = Truth>) -> Truth {
+    let mut unknown = false;
+    for item in items {
+        match item {
+            Some(true) => return Some(true),
+            None => unknown = true,
+            Some(false) => {}
+        }
+    }
+    if unknown { None } else { Some(false) }
+}
+
+/// SQL `OR` of `AND` groups — the search stage's own shape.
+fn eval_groups(groups: &[Vec<TokenMatcher>], event: &serde_json::Map<String, Value>) -> Truth {
+    or_any(
+        groups
+            .iter()
+            .map(|group| and_all(group.iter().map(|m| m.eval(event)))),
+    )
+}
+
 impl TokenMatcher {
-    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
         match self {
-            Self::Field(fm) => fm.matches(event),
-            Self::Severity(sm) => sm.matches(event),
-            Self::Text(tm) => tm.matches(event),
-            Self::Not(inner) => !inner.matches(event),
-            Self::OrGroup(groups) => groups
-                .iter()
-                .any(|group| group.iter().all(|m| m.matches(event))),
+            Self::Field(fm) => fm.eval(event),
+            Self::Severity(sm) => sm.eval(event),
+            Self::Text(tm) => tm.eval(event),
+            // `NOT UNKNOWN` is UNKNOWN, never a match — the SQL `NOT (...)`
+            // this mirrors stays NULL and the row is filtered out.
+            Self::Not(inner) => inner.eval(event).map(|b| !b),
+            Self::OrGroup(groups) => eval_groups(groups, event),
         }
     }
 }
 
 impl FieldMatcher {
-    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
-        let Some(event_val) = event.get(&self.field) else {
-            // Missing field → no match (mirrors SQL NULL semantics).
-            return false;
-        };
-        if event_val.is_null() {
-            // SQL three-valued logic: a NULL value makes every comparison
-            // UNKNOWN (no match) — except `!=`, whose emitted form carries
-            // `OR col IS NULL` and therefore INCLUDES null rows. Decided
-            // here, before coercion, so every coercion class agrees with
-            // the SQL on nulls (stringifying null to "" made ordered
-            // string comparisons diverge).
-            return matches!(
-                &self.predicate,
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
+        let event_val = event.get(&self.field).filter(|v| !v.is_null());
+        let Some(event_val) = event_val else {
+            // SQL three-valued logic: a missing field is a NULL column and
+            // a JSON null is a NULL value, so every comparison is UNKNOWN
+            // — except `!=`, whose emitted form carries `OR col IS NULL`
+            // and is therefore TRUE. Decided here, before coercion, so
+            // every coercion class agrees with the SQL on nulls
+            // (stringifying null to "" made ordered comparisons diverge).
+            return match &self.predicate {
                 FieldPredicate::Compare {
-                    op: CompareOp::Ne,
-                    ..
-                }
-            );
-        }
+                    op: CompareOp::Ne, ..
+                } => Some(true),
+                _ => None,
+            };
+        };
 
         match &self.predicate {
             FieldPredicate::Compare { op, value } => compare_values(event_val, *op, value),
-            FieldPredicate::InList { values } => values
-                .iter()
-                .any(|v| compare_values(event_val, CompareOp::Eq, v)),
+            FieldPredicate::InList { values } => or_any(
+                values
+                    .iter()
+                    .map(|v| compare_values(event_val, CompareOp::Eq, v)),
+            ),
             FieldPredicate::Glob { regex } | FieldPredicate::Regex { regex } => {
                 let s = json_to_string(event_val);
-                regex.is_match(&s)
+                Some(regex.is_match(&s))
             }
         }
     }
@@ -504,7 +554,12 @@ impl TextMatcher {
     /// so a term matches another field's value *and* a field name — and the
     /// negated form excludes on the same basis (see
     /// [`crate::emitter`]'s `push_text_search` and the DSL reference).
-    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
+    /// A missing/non-string column is NULL, so the positive form is UNKNOWN
+    /// (not FALSE) when neither column matches and one is NULL — `NOT term`
+    /// must then leave the event unmatched, as `NOT (NULL OR NULL)` does.
+    /// The negated form's `COALESCE(... , TRUE)` makes its `_raw` side
+    /// total, so only a NULL `message` can make it UNKNOWN.
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
         let msg = match event.get("message") {
             Some(Value::String(s)) => Some(self.searcher.is_match(s)),
             _ => None,
@@ -514,44 +569,49 @@ impl TextMatcher {
             _ => None,
         };
         if self.negated {
-            msg == Some(false) && raw != Some(true)
+            and_all([msg.map(|m| !m), Some(raw != Some(true))])
         } else {
-            msg == Some(true) || raw == Some(true)
+            or_any([msg, raw])
         }
     }
 }
 
-/// Compare a JSON event value against a coerced filter value.
+/// Compare a non-null JSON event value against a coerced filter value.
 ///
 /// Implements type promotion matching `DuckDB`'s implicit casting:
 /// - Int filter: try to extract event value as i64 (number or string parse)
 /// - Float filter: try to extract event value as f64
 /// - String filter: compare as strings (convert event value to string if needed)
-fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -> bool {
+/// - `NumericOnText` filter: `TRY_CAST(col AS DOUBLE)` — a value that isn't
+///   numeric is NULL, so the comparison is UNKNOWN
+fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -> Truth {
     match filter_val {
         CoercedValue::Int(fv) => {
             if let Some(ev) = extract_i64(event_val) {
-                apply_ord(ev.cmp(fv), op)
+                Some(apply_ord(ev.cmp(fv), op))
             } else if let Some(ev) = extract_f64(event_val) {
                 // Promote filter value to f64 for mixed comparison.
                 #[allow(clippy::cast_precision_loss)]
-                apply_f64(ev, *fv as f64, op)
+                Some(apply_f64(ev, *fv as f64, op))
             } else {
                 // String filter value that happened to parse as int —
                 // fall back to string comparison.
-                false
+                Some(false)
             }
         }
         CoercedValue::Float(fv) => {
             if let Some(ev) = extract_f64(event_val) {
-                apply_f64(ev, *fv, op)
+                Some(apply_f64(ev, *fv, op))
             } else {
-                false
+                Some(false)
             }
         }
+        // The TRY_CAST rung: non-numeric text is NULL, so UNKNOWN — the
+        // one place a non-null event value can still be UNKNOWN.
+        CoercedValue::NumericOnText(fv) => extract_f64(event_val).map(|ev| apply_f64(ev, *fv, op)),
         CoercedValue::Str(fv) => {
             let ev = json_to_string(event_val);
-            apply_ord(ev.as_str().cmp(fv.as_str()), op)
+            Some(apply_ord(ev.as_str().cmp(fv.as_str()), op))
         }
     }
 }
@@ -1170,6 +1230,59 @@ mod tests {
             r#"{"Status": null}"#,
             VARCHAR_STATUS
         ));
+    }
+
+    #[test]
+    fn pinned_not_over_unknown_is_never_a_match() {
+        // A TRY_CAST miss is NULL, so `NOT (TRY_CAST(status AS DOUBLE)
+        // >= 400)` is NULL and the batch query drops the row — the live
+        // stream must not fire on it (executed against DuckDB in
+        // tests/filter_parity.rs::pinned_varchar_matrix_parity).
+        assert!(!matches_event_pinned(
+            "NOT status>=400",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+        // Same for a NULL column, across every predicate class.
+        for dsl in [
+            "NOT status>=400",
+            "NOT status=200",
+            "NOT status=200,301",
+            "NOT status=2*",
+            "NOT status=/2.*/",
+            "NOT status>accepted",
+        ] {
+            assert!(
+                !matches_event_pinned(dsl, r#"{"status": null}"#, VARCHAR_STATUS),
+                "{dsl} over a NULL column must stay UNKNOWN"
+            );
+            assert!(
+                !matches_event_pinned(dsl, "{}", VARCHAR_STATUS),
+                "{dsl} over an absent field must stay UNKNOWN"
+            );
+        }
+        // `!=` is the total form (`OR col IS NULL`): TRUE on a null, so
+        // NOT genuinely inverts to no-match.
+        assert!(!matches_event_pinned(
+            "NOT status!=200",
+            r#"{"status": null}"#,
+            VARCHAR_STATUS
+        ));
+        // A real FALSE still inverts — UNKNOWN is not a blanket veto.
+        assert!(matches_event_pinned(
+            "NOT status>=400",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    #[test]
+    fn unpinned_not_over_null_column_is_not_a_match() {
+        // The same rule without a catalog: `NOT (status = 200)` over a
+        // NULL is NULL in SQL, so no live match either.
+        assert!(!matches_event("NOT status=200", r#"{"status": null}"#));
+        assert!(!matches_event("NOT status=200", r#"{"message": "hi"}"#));
+        assert!(matches_event("NOT status=200", r#"{"status": 404}"#));
     }
 
     // ── text search ───────────────────────────────────────────────────

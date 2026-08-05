@@ -44,7 +44,9 @@ comparison means the same thing whatever the query literal looks like:
 - **VARCHAR-pinned field, ordered comparison with a numeric literal** —
   compares **numerically** via `TRY_CAST(col AS DOUBLE)`: `status>=400`
   matches `"404"`/`"500"`, and non-numeric values like `"accepted"`
-  simply don't match (they never error the query).
+  simply don't match (they never error the query). A value the cast
+  can't answer is *unknown*, not *false*, exactly as in SQL — so
+  `NOT status>=400` doesn't match those rows either.
 - **VARCHAR-pinned field, ordered comparison with a non-numeric
   literal** — lexical string comparison, unchanged.
 - **Numeric/timestamp/boolean-pinned field, glob or regex** — matches

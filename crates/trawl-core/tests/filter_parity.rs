@@ -681,6 +681,18 @@ fn pinned_varchar_matrix_parity() {
         // glob / regex (unchanged under the VARCHAR pin)
         "status=2*",
         "status=/2.*/",
+        // NOT over each class: a TRY_CAST miss and a NULL column are
+        // UNKNOWN, and `NOT UNKNOWN` is UNKNOWN — never a live match the
+        // batch query would drop.
+        "NOT status>=400",
+        "NOT status<400",
+        "NOT status=200",
+        "NOT status!=200",
+        "NOT status=200,301",
+        "NOT status=accepted",
+        "NOT status>accepted",
+        "NOT status=2*",
+        "NOT status=/2.*/",
     ];
     for value in &values {
         let event = status_event(value);
@@ -709,6 +721,9 @@ fn pinned_bigint_pattern_parity() {
             "status=404",
             "status>=400",
             "status!=200",
+            "NOT status=4*",
+            "NOT status>=400",
+            "NOT status!=200",
         ] {
             assert_pinned_parity(&conn, dsl, &event, &ft);
         }
