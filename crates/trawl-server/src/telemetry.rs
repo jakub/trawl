@@ -36,9 +36,16 @@
 //! Events are serialized to ndjson and accumulated in an active buffer
 //! (bytes + their event maps, swapped together). Each flush cycle stages
 //! the active buffer as one [`Batch`] on a FIFO retry queue, then writes
-//! pending batches oldest-first. One batch per WAL write — the hot-buffer
-//! `batch_id` must stay `{env}/{wal-file-stem}` of the file THAT batch
-//! landed in, so batches are never merged.
+//! pending batches oldest-first. Once a write SUCCEEDS in a cycle the
+//! rest of the queue drains COALESCED: consecutive batches are
+//! concatenated up to [`MAX_DRAIN_UNIT_BYTES`] and written as one WAL
+//! file, so recovering from a long outage costs writes proportional to
+//! queued BYTES rather than to the flush ticks it lasted. That is safe for
+//! the hot-buffer `batch_id` contract — it must stay `{env}/{wal-file-stem}`
+//! of the file the events landed in, and a coalesced unit lands in exactly
+//! one file, so it has exactly one stem and publishes as one `IngestBatch`.
+//! While the volume is still failing nothing merges, so the cap keeps its
+//! per-tick shedding granularity.
 //!
 //! A failed write RETAINS the batch for retry (rate-limited stderr +
 //! `trawl_telemetry_wal_write_failures_total`); a transient storage error
@@ -293,6 +300,21 @@ struct Batch {
     events: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Maximum serialized ndjson one drain unit may carry into a single WAL
+/// write.
+///
+/// The retry queue is bounded in BYTES, and [`WalLayerInner::stage`] makes
+/// one batch per flush tick, so a long WAL outage can leave thousands of
+/// tiny batches queued. Writing them one file each would mean thousands of
+/// sequential create + write + fsync + rename + dir-fsync round trips —
+/// tens of seconds of blocking-pool I/O during which nothing new is
+/// published — and as many WAL files for compaction to chew through.
+/// Coalescing bounds the recovery drain by queued bytes instead: with the
+/// default 16 MiB budget the entire queue leaves in a handful of writes.
+/// A unit whose first batch alone exceeds this is still written (a drain
+/// must never stall), so the ceiling is a target, not a hard limit.
+const MAX_DRAIN_UNIT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Documented per-event overhead estimate charged on top of the serialized
 /// bytes for a retained event map (allocator overhead, map buckets,
 /// `String` headers). Like the hot buffer's `max_bytes`, the resulting
@@ -485,9 +507,13 @@ impl WalLayer {
             return;
         };
         self.inner.stage();
-        while let Some(batch) = self.inner.pop_oldest() {
+        let mut coalesce = false;
+        while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
             match writer.write(env, "trawld", &batch.bytes) {
-                Ok(wal_path) => self.inner.publish(env, &wal_path, batch),
+                Ok(wal_path) => {
+                    coalesce = true;
+                    self.inner.publish(env, &wal_path, batch);
+                }
                 Err(e) => {
                     self.inner.record_write_failure(&e);
                     self.inner.requeue_front(batch);
@@ -501,13 +527,19 @@ impl WalLayer {
     /// Async flush cycle: stage the active buffer, then write pending
     /// batches oldest-first with each WAL write (and both of its
     /// durability barriers) on the blocking pool. Stops at the first
-    /// failure, retaining the failed batch at the queue front.
+    /// failure, retaining the failed unit at the queue front.
+    ///
+    /// Once a write has succeeded, the rest of the queue drains in
+    /// COALESCED units of at most [`MAX_DRAIN_UNIT_BYTES`], so recovering
+    /// from a long outage costs writes proportional to queued bytes rather
+    /// than to the number of flush ticks the outage lasted.
     pub async fn flush_cycle(&self) {
         let Some((writer, env)) = self.inner.handle.get() else {
             return;
         };
         self.inner.stage();
-        while let Some(batch) = self.inner.pop_oldest() {
+        let mut coalesce = false;
+        while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
             let w = Arc::clone(writer);
             let batch_env = Arc::clone(env);
             // Captured before the batch moves into the closure, so a lost
@@ -519,7 +551,10 @@ impl WalLayer {
             })
             .await;
             match joined {
-                Ok((Ok(wal_path), batch)) => self.inner.publish(env, &wal_path, batch),
+                Ok((Ok(wal_path), batch)) => {
+                    coalesce = true;
+                    self.inner.publish(env, &wal_path, batch);
+                }
                 Ok((Err(e), batch)) => {
                     self.inner.record_write_failure(&e);
                     self.inner.requeue_front(batch);
@@ -633,12 +668,39 @@ impl WalLayerInner {
         .increment(bytes);
     }
 
-    /// Pop the oldest pending batch for a write attempt. No lock is held
-    /// by the caller across the write itself. The batch stays charged to
-    /// [`Self::staged`] while it is in flight — it is still resident
-    /// memory, and a wedged write must not make it invisible to the cap.
-    fn pop_oldest(&self) -> Option<Batch> {
-        self.pending.lock().pop_front()
+    /// Pop the oldest pending batches for one write attempt. With
+    /// `coalesce`, they are concatenated oldest-first while they fit in
+    /// [`MAX_DRAIN_UNIT_BYTES`] (the first is always taken, however large).
+    /// Every line already ends in `\n`, so concatenation is valid ndjson,
+    /// and the merged unit lands in ONE WAL file — one filename stem, one
+    /// published `IngestBatch`.
+    ///
+    /// `coalesce` is set only once a write has SUCCEEDED in this cycle:
+    /// merging exists to bound the RECOVERY drain, and merging while the
+    /// volume is still failing would only coarsen the cap's shedding
+    /// granularity (one `admit` would shed a merged unit where a per-tick
+    /// batch is all it needed to reclaim).
+    ///
+    /// No lock is held by the caller across the write itself. The unit
+    /// stays charged to [`Self::staged`] while it is in flight — it is
+    /// still resident memory, and a wedged write must not make it invisible
+    /// to the cap. [`charge_of`] is linear in bytes and events, so merging
+    /// moves no charge and the shared budget is unaffected.
+    fn pop_drain_unit(&self, coalesce: bool) -> Option<Batch> {
+        let mut pending = self.pending.lock();
+        let mut unit = pending.pop_front()?;
+        if !coalesce {
+            return Some(unit);
+        }
+        while let Some(next) = pending.front() {
+            if unit.bytes.len() + next.bytes.len() > MAX_DRAIN_UNIT_BYTES {
+                break;
+            }
+            let mut next = pending.pop_front().expect("peeked front exists");
+            unit.bytes.append(&mut next.bytes);
+            unit.events.append(&mut next.events);
+        }
+        Some(unit)
     }
 
     /// Put a failed batch back at the queue front, preserving FIFO order.
@@ -1733,6 +1795,83 @@ mod tests {
         assert_eq!(dropped_report[0]["dropped_bytes_buffer_cap"], a_bytes);
     }
 
+    /// A long outage queues one batch per flush tick; the drain must not
+    /// cost one fsynced WAL file per tick. The lead write proves the volume
+    /// unmerged, then the remaining queue coalesces into a single write —
+    /// one file, one `batch_id`, one published batch — with every event
+    /// preserved in FIFO order.
+    #[tokio::test]
+    async fn queued_batches_coalesce_into_one_wal_write_on_drain() {
+        use crate::bus::{EventBus, EventSubscriber, LocalEventBus};
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = broken_wal_root(tmp.path());
+        let writer = Arc::new(WalWriter::new(wal_root.clone()));
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+
+        let bus = Arc::new(LocalEventBus::new(16));
+        let mut sub = bus.subscribe();
+
+        let layer = WalLayer::new(handle, "prod");
+        layer.set_bus(Arc::clone(&bus));
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Six flush cycles against a broken volume → six pending batches.
+        for i in 0..6 {
+            tracing::info!(event_type = "outage", seq = i, "during outage");
+            layer_ref.flush_cycle().await;
+        }
+        assert_eq!(layer_ref.inner.pending.lock().len(), 6);
+
+        repair_wal_root(&wal_root);
+        layer_ref.flush_cycle().await;
+        assert!(layer_ref.inner.pending.lock().is_empty());
+
+        let files: Vec<_> = std::fs::read_dir(wal_root.join("prod"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "six batches drained as a lead write plus one coalesced write"
+        );
+
+        let events = read_wal_events(&wal_root.join("prod"));
+        let seqs: Vec<i64> = events.iter().filter_map(|e| e["seq"].as_i64()).collect();
+        assert_eq!(seqs, (0..6).collect::<Vec<_>>(), "FIFO order preserved");
+
+        // The lead batch, then ONE published batch for the coalesced rest.
+        let lead = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("timed out waiting for lead batch")
+            .expect("recv failed");
+        assert_eq!(lead.events.len(), 1);
+        let coalesced = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("timed out waiting for coalesced batch")
+            .expect("recv failed");
+        assert_eq!(coalesced.events.len(), 5);
+        assert_ne!(
+            lead.batch_id, coalesced.batch_id,
+            "each write keeps its own WAL-stem batch_id"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "the coalesced remainder published once"
+        );
+    }
+
     /// The budget must cover ACTIVE and IN-FLIGHT memory, not just the
     /// queue. A batch handed to a wedged write is popped from `pending`
     /// but still resident; if the cap ignored it (and exempted the newest
@@ -1759,7 +1898,7 @@ mod tests {
         // popped from the queue, still in memory.
         tracing::info!(event_type = "wedged", "in flight");
         layer_ref.inner.stage();
-        let in_flight = layer_ref.inner.pop_oldest().expect("batch staged");
+        let in_flight = layer_ref.inner.pop_drain_unit(false).expect("batch staged");
         let charge = batch_charge(&in_flight);
         assert!(layer_ref.inner.pending.lock().is_empty());
         assert_eq!(
