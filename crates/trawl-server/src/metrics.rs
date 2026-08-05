@@ -39,6 +39,7 @@ pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_t
 pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
 pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
 pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
+pub const AUTH_FAILURES_TOTAL: &str = "trawl_auth_failures_total";
 pub const TELEMETRY_WAL_WRITE_FAILURES_TOTAL: &str = "trawl_telemetry_wal_write_failures_total";
 pub const TELEMETRY_EVENTS_DROPPED_TOTAL: &str = "trawl_telemetry_events_dropped_total";
 pub const TELEMETRY_BYTES_DROPPED_TOTAL: &str = "trawl_telemetry_bytes_dropped_total";
@@ -131,6 +132,20 @@ pub fn describe_metrics() {
         CATALOG_PIN_CAPACITY,
         "Field-catalog pin ceiling (store::catalog::MAX_PINNED_FIELDS); a \
          field arriving at a full catalog is never stored as a column"
+    );
+    describe_counter!(
+        AUTH_FAILURES_TOTAL,
+        "Requests rejected by the authenticated routers' auth stack, \
+         labelled by reason (unauthorized = missing, malformed, invalid, \
+         revoked or expired bearer token; backend_unavailable = the \
+         keystore failed to answer; no_trawl_grant = a verified key that \
+         resolves no usable trawl permission; forbidden / internal = \
+         defensive, an unmarked rejection from the bearer shell). The \
+         reason set is closed and carries no key, name or path label. The \
+         pre-authn events themselves are stdout-only by design (see \
+         telemetry::PRE_AUTH_TARGETS), so this counter is the only \
+         in-product signal for credential stuffing, token brute force and \
+         a revoked key still in use"
     );
     describe_counter!(
         TELEMETRY_WAL_WRITE_FAILURES_TOTAL,

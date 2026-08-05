@@ -181,6 +181,16 @@ pub const PREAUTH_TRANSPORT_TARGET: &str = "preauth.transport";
 /// (`trawl_server`), `storage.backend`, and the catalog/health events that
 /// a backend outage also produces all still persist.
 ///
+/// Exclusion from the corpus is NOT the loss of the signal. Every one of
+/// these rejections is counted on `/metrics` as
+/// `trawl_auth_failures_total{reason}` from trawl's own policy layer
+/// (`crate::policy::count_auth_failure`), which sits outside the bearer
+/// shell and therefore sees exactly the 401/503 it produces. A counter with
+/// a closed label set cannot be amplified — the series count is fixed
+/// however hard an unauthenticated client hammers the endpoint — so
+/// credential stuffing, token brute force and a revoked key still in use
+/// stay alarmable without handing anyone a durable-write lever.
+///
 /// Matching is by target segment, so `fleet_auth` covers
 /// `fleet_auth::middleware` but never a `fleet_authority` target.
 pub const PRE_AUTH_TARGETS: [&str; 3] = ["fleet_auth", "auth.backend", PREAUTH_TRANSPORT_TARGET];

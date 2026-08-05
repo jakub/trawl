@@ -209,6 +209,7 @@ pub async fn require_trawl_grant(req: Request, next: Next) -> Response {
     };
 
     if !verified.has_any_trawl_permission() {
+        count_auth_failure("no_trawl_grant");
         tracing::info!(
             event_type = "auth_failure",
             reason = "no_trawl_grant",
@@ -229,6 +230,20 @@ fn mark(mut resp: Response) -> Response {
     resp
 }
 
+/// Count one rejected request against `trawl_auth_failures_total{reason}`.
+///
+/// This is the ONLY in-product signal for a failed authentication. The
+/// events behind a 401/503 come from fleet-auth's bearer shell, which sits
+/// outside the rate limiter, so [`crate::telemetry::PRE_AUTH_TARGETS`]
+/// keeps them off the WAL — an unauthenticated flood must not become
+/// durable corpus growth. A counter has no such problem: `reason` is a
+/// closed, code-defined set, so the series count is fixed however hard the
+/// endpoint is hammered, and credential stuffing, token brute force or a
+/// revoked key still in use stay alarmable on `/metrics`.
+fn count_auth_failure(reason: &'static str) {
+    metrics::counter!(crate::metrics::AUTH_FAILURES_TOTAL, "reason" => reason).increment(1);
+}
+
 /// Axum middleware: keep trawl's [`trawl_api::ErrorResponse`] envelope at the
 /// trust boundary (ADR-0004 AC5).
 ///
@@ -244,6 +259,11 @@ fn mark(mut resp: Response) -> Response {
 /// - 500 → `internal_error`
 /// - 503 → `service_unavailable` "auth backend unavailable" — never
 ///   postgres detail
+///
+/// Every rewritten response is also counted under
+/// `trawl_auth_failures_total{reason}` ([`count_auth_failure`]): the
+/// underlying fleet-auth events are stdout-only, so without this counter a
+/// 401 storm would leave no in-product trace at all.
 pub async fn normalize_auth_errors(req: Request, next: Next) -> Response {
     use axum::http::StatusCode;
     use trawl_api::ErrorCode;
@@ -253,15 +273,26 @@ pub async fn normalize_auth_errors(req: Request, next: Next) -> Response {
         return resp;
     }
 
-    let (code, message) = match resp.status() {
-        StatusCode::UNAUTHORIZED => (ErrorCode::AuthError, "authentication failed"),
-        StatusCode::FORBIDDEN => (ErrorCode::Forbidden, "forbidden"),
-        StatusCode::INTERNAL_SERVER_ERROR => (ErrorCode::InternalError, "internal server error"),
-        StatusCode::SERVICE_UNAVAILABLE => {
-            (ErrorCode::ServiceUnavailable, "auth backend unavailable")
-        }
+    let (code, message, reason) = match resp.status() {
+        StatusCode::UNAUTHORIZED => (
+            ErrorCode::AuthError,
+            "authentication failed",
+            "unauthorized",
+        ),
+        StatusCode::FORBIDDEN => (ErrorCode::Forbidden, "forbidden", "forbidden"),
+        StatusCode::INTERNAL_SERVER_ERROR => (
+            ErrorCode::InternalError,
+            "internal server error",
+            "internal",
+        ),
+        StatusCode::SERVICE_UNAVAILABLE => (
+            ErrorCode::ServiceUnavailable,
+            "auth backend unavailable",
+            "backend_unavailable",
+        ),
         _ => return resp,
     };
+    count_auth_failure(reason);
 
     let envelope = trawl_api::ErrorResponse {
         error: trawl_api::ErrorEnvelope::simple(code, message),
@@ -554,5 +585,64 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let json = body_json(resp).await;
         assert_eq!(json["detail"], "fleet-flat body", "429 passes through");
+    }
+
+    /// The pre-authn events are stdout-only, so `/metrics` is the only
+    /// in-product signal a failed authentication leaves. A local recorder
+    /// (not the global one — `telemetry.rs` already installs that) proves
+    /// each reason lands, and that pass-through statuses do not inflate it.
+    #[test]
+    fn auth_failures_counter_records_every_rejection_reason() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // `with_local_recorder` is thread-local and a current-thread runtime
+        // drives the futures on this very thread, so the middleware's
+        // `counter!` calls resolve to `recorder`.
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                run_normalizer(StatusCode::UNAUTHORIZED, false).await;
+                run_normalizer(StatusCode::SERVICE_UNAVAILABLE, false).await;
+                run_normalizer(StatusCode::INTERNAL_SERVER_ERROR, false).await;
+                run_normalizer(StatusCode::FORBIDDEN, false).await;
+                run_policy(Some(key_with(vec![role(
+                    "coastwatch-viewer",
+                    &[("coastwatch", "stories_read")],
+                )])))
+                .await;
+                // Neither of these is an auth rejection.
+                run_normalizer(StatusCode::TOO_MANY_REQUESTS, false).await;
+                run_policy(Some(key_with(vec![role(
+                    "trawl-reader",
+                    &[("trawl", "query")],
+                )])))
+                .await;
+            });
+        });
+
+        let rendered = handle.render();
+        for reason in [
+            "unauthorized",
+            "backend_unavailable",
+            "internal",
+            "forbidden",
+            "no_trawl_grant",
+        ] {
+            assert!(
+                rendered.contains(&format!(
+                    "trawl_auth_failures_total{{reason=\"{reason}\"}} 1"
+                )),
+                "missing or miscounted reason {reason}: {rendered}"
+            );
+        }
+        assert_eq!(
+            rendered.matches("trawl_auth_failures_total{").count(),
+            5,
+            "closed label set — no extra series: {rendered}"
+        );
     }
 }
