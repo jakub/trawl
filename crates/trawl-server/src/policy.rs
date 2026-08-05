@@ -198,6 +198,14 @@ pub struct TrawlPolicyApplied;
 /// request extensions). Mounted on BOTH authenticated sub-routers (`/api/v1`
 /// tree and `/ingest`), so it is a mandatory layer, not a per-handler
 /// convention.
+///
+/// Because it sits outside the limiter, the rejection is UNMETERED: it is
+/// counted (`trawl_auth_failures_total{reason="no_trawl_grant"}` — a closed
+/// label set) and logged on [`crate::telemetry::UNMETERED_POLICY_TARGET`],
+/// which the WAL layer refuses. A valid fleet key with zero trawl
+/// permissions is a supported thing to hold (the keystore is shared across
+/// fleet apps), so a persisted event here would be a durable-write
+/// amplifier that no rate limit can slow.
 pub async fn require_trawl_grant(req: Request, next: Next) -> Response {
     let Some(verified) = req.extensions().get::<VerifiedKey>() else {
         // require_bearer_only always inserts the key; missing means mis-mounted
@@ -210,7 +218,11 @@ pub async fn require_trawl_grant(req: Request, next: Next) -> Response {
 
     if !verified.has_any_trawl_permission() {
         count_auth_failure("no_trawl_grant");
+        // Unmetered target: this 403 is decided outside the rate limiter
+        // (see below), so the event is stdout-only — a grantless key must
+        // not be able to write one durable record per request.
         tracing::info!(
+            target: crate::telemetry::UNMETERED_POLICY_TARGET,
             event_type = "auth_failure",
             reason = "no_trawl_grant",
             name = %verified.name,
@@ -233,10 +245,12 @@ fn mark(mut resp: Response) -> Response {
 /// Count one rejected request against `trawl_auth_failures_total{reason}`.
 ///
 /// This is the ONLY in-product signal for a failed authentication. The
-/// events behind a 401/503 come from fleet-auth's bearer shell, which sits
-/// outside the rate limiter, so [`crate::telemetry::PRE_AUTH_TARGETS`]
-/// keeps them off the WAL — an unauthenticated flood must not become
-/// durable corpus growth. A counter has no such problem: `reason` is a
+/// events behind a 401/503 come from fleet-auth's bearer shell, and the
+/// one behind a grantless 403 from [`require_trawl_grant`] — all of it
+/// decided outside the rate limiter, so
+/// [`crate::telemetry::UNMETERED_TARGETS`] keeps them off the WAL: a flood
+/// nothing meters must not become durable corpus growth. A counter has no
+/// such problem: `reason` is a
 /// closed, code-defined set, so the series count is fixed however hard the
 /// endpoint is hammered, and credential stuffing, token brute force or a
 /// revoked key still in use stay alarmable on `/metrics`.
@@ -479,6 +493,74 @@ mod tests {
         assert!(resp.extensions().get::<TrawlPolicyApplied>().is_some());
         let json = body_json(resp).await;
         assert_eq!(json["error"]["code"], "forbidden");
+    }
+
+    /// The grantless 403 is decided OUTSIDE the rate limiter (mounted that
+    /// way on purpose — see `require_trawl_grant`), so its event must be
+    /// stdout-only: a valid fleet key resolving zero trawl permissions is a
+    /// supported thing to hold, and a persisted event would let its holder
+    /// grow the corpus one durable record per request, unmetered. Drives the
+    /// REAL middleware through the REAL WAL filter.
+    #[tokio::test]
+    async fn grantless_403_event_is_logged_but_never_persisted() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+
+        impl<S> tracing_subscriber::Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(event.metadata().target().to_owned());
+            }
+        }
+
+        let stdout = Capture::default();
+        let wal = Capture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                stdout
+                    .clone()
+                    .with_filter(tracing_subscriber::EnvFilter::new(
+                        crate::telemetry::DEFAULT_LOG_FILTER,
+                    )),
+            )
+            .with(wal.clone().with_filter(crate::telemetry::wal_filter(
+                crate::telemetry::DEFAULT_LOG_FILTER,
+            )));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let resp = run_policy(Some(key_with(vec![role(
+            "coastwatch-viewer",
+            &[("coastwatch", "stories_read")],
+        )])))
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let logged = stdout.0.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|t| t == crate::telemetry::UNMETERED_POLICY_TARGET),
+            "the rejection must still be visible on stdout under the default \
+             filter; saw {logged:?}"
+        );
+        let persisted = wal.0.lock().unwrap().clone();
+        assert!(
+            persisted.is_empty(),
+            "an unmetered rejection must never reach the WAL layer; saw {persisted:?}"
+        );
     }
 
     #[tokio::test]

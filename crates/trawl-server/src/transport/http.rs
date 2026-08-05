@@ -337,7 +337,7 @@ pub async fn serve(
                     // not this module's path: a bare TCP connect-and-close
                     // provokes one, so persisting them would make an
                     // unauthenticated connection flood a durable-write
-                    // amplifier. The target is in `PRE_AUTH_TARGETS`, so the
+                    // amplifier. The target is in `UNMETERED_TARGETS`, so the
                     // WAL layer refuses it while stdout keeps it.
                     let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                         Ok(s) => s,

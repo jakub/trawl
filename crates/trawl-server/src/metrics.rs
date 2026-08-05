@@ -142,8 +142,9 @@ pub fn describe_metrics() {
          resolves no usable trawl permission; forbidden / internal = \
          defensive, an unmarked rejection from the bearer shell). The \
          reason set is closed and carries no key, name or path label. The \
-         pre-authn events themselves are stdout-only by design (see \
-         telemetry::PRE_AUTH_TARGETS), so this counter is the only \
+         events themselves are stdout-only by design — every one of these \
+         rejections is decided outside the per-key rate limiter (see \
+         telemetry::UNMETERED_TARGETS) — so this counter is the only \
          in-product signal for credential stuffing, token brute force and \
          a revoked key still in use"
     );

@@ -25,12 +25,14 @@
 //! The stdout logger and this layer build their filters from the SAME
 //! resolved directive string, but they are not the same filter: the WAL
 //! layer additionally refuses the targets in
-//! [`PRE_AUTH_TARGETS`]. Those events are emitted from fleet-auth's bearer
-//! shell, which runs BEFORE the rate limiter, and from the accept loop,
-//! which runs before there is even a TLS session — persisting them would
-//! let an unauthenticated client turn a connection or request flood into
-//! durable corpus growth. They stay on stdout, where retention is the
-//! operator's log pipeline rather than trawl's own disk.
+//! [`UNMETERED_TARGETS`]. Those events are emitted from request handling
+//! that no per-key rate limiter has metered yet — fleet-auth's bearer
+//! shell, which runs BEFORE the limiter; the accept loop, which runs
+//! before there is even a TLS session; trawl's own grant check, which
+//! 403s a grantless key outside the limiter by design. Persisting them
+//! would let a client the limiter cannot slow turn a connection or
+//! request flood into durable corpus growth. They stay on stdout, where
+//! retention is the operator's log pipeline rather than trawl's own disk.
 //!
 //! ## Buffering and the bounded retry queue
 //!
@@ -147,7 +149,7 @@ use crate::ingest::wal::WalWriter;
 ///   visible on stdout at all.
 ///
 /// This is the STDOUT filter. Persistence is narrower: see
-/// [`PRE_AUTH_TARGETS`] and [`wal_filter`].
+/// [`UNMETERED_TARGETS`] and [`wal_filter`].
 pub const DEFAULT_LOG_FILTER: &str = "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info";
 
 /// Target for accept-loop diagnostics that fire before any request — and
@@ -155,12 +157,31 @@ pub const DEFAULT_LOG_FILTER: &str = "trawl_server=info,trawld=info,fleet_auth=i
 /// connection-level error.
 ///
 /// A deliberately-overridden target (not `trawl_server::transport::http`)
-/// so [`PRE_AUTH_TARGETS`] can exclude it from persistence without
+/// so [`UNMETERED_TARGETS`] can exclude it from persistence without
 /// silencing the rest of the transport module.
 pub const PREAUTH_TRANSPORT_TARGET: &str = "preauth.transport";
 
-/// Targets emitted from the PRE-AUTHENTICATION request path: logged, never
-/// persisted as `service=trawld` telemetry.
+/// Target for the policy layer's grant rejection — authenticated, but
+/// rejected before the rate limiter runs.
+///
+/// `require_trawl_grant` is mounted OUTSIDE `rate_limit_middleware` on
+/// purpose (a grantless key must not spend a bucket to be told no; pinned
+/// by the `ac3_grantless_key_never_reaches_rate_limiter` integration
+/// test), so its 403 is unmetered — and the fleet keystore is explicitly
+/// designed to hold keys with zero trawl permissions (a coastwatch-only
+/// key is one). A holder of any such key could otherwise turn every 403
+/// into a durable record. A sub-target of `trawl_server::policy` rather
+/// than a new root: `trawl_server=info` already enables it on stdout, so
+/// the [`DEFAULT_LOG_FILTER`] contract is unchanged, while
+/// [`UNMETERED_TARGETS`] keeps it — and only it — out of the corpus. The
+/// rest of the policy module (including [`normalize_auth_errors`]'s own
+/// post-metering events) still persists.
+///
+/// [`normalize_auth_errors`]: crate::policy::normalize_auth_errors
+pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
+
+/// Targets emitted from request handling that NO per-key rate limiter has
+/// metered: logged, never persisted as `service=trawld` telemetry.
 ///
 /// fleet-auth's bearer shell warns on every missing/malformed header and
 /// every invalid or revoked key, and reports keystore trouble under
@@ -169,17 +190,21 @@ pub const PREAUTH_TRANSPORT_TARGET: &str = "preauth.transport";
 /// run before authn). Cheaper still is [`PREAUTH_TRANSPORT_TARGET`]: the
 /// accept loop warns on every failed TLS handshake, which a bare TCP
 /// connect-and-close is enough to provoke — no request, no TLS session, no
-/// key. Writing any of it to the WAL would hand an unauthenticated client a
-/// durable-write amplifier: one ~400-byte record per rejected connection or
-/// request, compacted into the corpus and competing with real log data for
-/// retention.
+/// key. Last is [`UNMETERED_POLICY_TARGET`]: trawl's own grant check also
+/// sits outside the limiter, so an authenticated key that resolves no
+/// trawl permission — exactly what a shared-keystore neighbour's key is —
+/// gets its 403 unmetered too. Writing any of it to the WAL would hand a
+/// client the limiter cannot slow a durable-write amplifier: one ~400-byte
+/// record per rejected connection or request, compacted into the corpus
+/// and competing with real log data for retention.
 ///
 /// The events are not lost — they keep flowing to stdout (and to the
 /// legacy JSON log file) under the same directives, where retention is the
 /// operator's log pipeline. What is lost from the corpus is only the
-/// per-request repetition: trawld's own post-authn `auth_failure`
-/// (`trawl_server`), `storage.backend`, and the catalog/health events that
-/// a backend outage also produces all still persist.
+/// per-request repetition of an unmetered rejection: everything trawld
+/// emits behind the limiter — the rest of `trawl_server`,
+/// `storage.backend`, and the catalog/health events that a backend outage
+/// also produces — still persists.
 ///
 /// Exclusion from the corpus is NOT the loss of the signal. Every one of
 /// these rejections is counted on `/metrics` as
@@ -192,14 +217,21 @@ pub const PREAUTH_TRANSPORT_TARGET: &str = "preauth.transport";
 /// stay alarmable without handing anyone a durable-write lever.
 ///
 /// Matching is by target segment, so `fleet_auth` covers
-/// `fleet_auth::middleware` but never a `fleet_authority` target.
-pub const PRE_AUTH_TARGETS: [&str; 3] = ["fleet_auth", "auth.backend", PREAUTH_TRANSPORT_TARGET];
+/// `fleet_auth::middleware` but never a `fleet_authority` target — and
+/// `trawl_server::policy::unmetered` excludes only itself and its own
+/// descendants, never `trawl_server::policy`.
+pub const UNMETERED_TARGETS: [&str; 4] = [
+    "fleet_auth",
+    "auth.backend",
+    PREAUTH_TRANSPORT_TARGET,
+    UNMETERED_POLICY_TARGET,
+];
 
 /// Whether events on `target` may be persisted as telemetry — false for
-/// every [`PRE_AUTH_TARGETS`] entry and its module descendants.
+/// every [`UNMETERED_TARGETS`] entry and its module descendants.
 #[must_use]
 pub fn is_persisted_target(target: &str) -> bool {
-    !PRE_AUTH_TARGETS.iter().any(|excluded| {
+    !UNMETERED_TARGETS.iter().any(|excluded| {
         target == *excluded
             || target
                 .strip_prefix(excluded)
@@ -214,8 +246,9 @@ pub fn is_persisted_target(target: &str) -> bool {
 /// `fleet_auth=off` directive: `EnvFilter` resolves by specificity, so an
 /// operator `RUST_LOG` naming `fleet_auth::middleware=info` would outrank
 /// an appended target-level `off` and quietly restore the amplifier. The
-/// pre-auth exclusion is an invariant of what trawl writes to its own
-/// disk, not a log level.
+/// unmetered exclusion is an invariant of what trawl writes to its own
+/// disk, not a log level — which is also why the grant rejection keeps its
+/// INFO level and loses its target instead of being demoted to DEBUG.
 pub fn wal_filter<S>(directives: &str) -> impl tracing_subscriber::layer::Filter<S> + 'static
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -1189,6 +1222,7 @@ mod tests {
         tracing::error!(target: "auth.backend", "auth backend down");
         tracing::error!(target: "storage.backend", "storage backend down");
         tracing::warn!(target: PREAUTH_TRANSPORT_TARGET, "TLS handshake failed");
+        tracing::info!(target: UNMETERED_POLICY_TARGET, "policy: no trawl grant");
         tracing::info!(target: "hyper::proto", "dependency noise");
 
         let seen = events.lock();
@@ -1201,6 +1235,9 @@ mod tests {
             "auth.backend",
             "storage.backend",
             PREAUTH_TRANSPORT_TARGET,
+            // A sub-target of trawl_server, so the contract string needs no
+            // directive of its own for it to stay visible on stdout.
+            UNMETERED_POLICY_TARGET,
         ] {
             assert!(
                 targets.contains(&expected),
@@ -1214,29 +1251,37 @@ mod tests {
     }
 
     #[test]
-    fn pre_auth_targets_are_never_persisted() {
+    fn unmetered_targets_are_never_persisted() {
         assert!(!is_persisted_target("fleet_auth"));
         assert!(!is_persisted_target("fleet_auth::middleware"));
         assert!(!is_persisted_target("auth.backend"));
         // The accept loop's pre-TLS diagnostics: a bare TCP
         // connect-and-close is enough to emit one.
         assert!(!is_persisted_target(PREAUTH_TRANSPORT_TARGET));
+        // The grant rejection: authenticated, but decided outside the rate
+        // limiter, so a grantless key could otherwise write one record per
+        // request forever.
+        assert!(!is_persisted_target(UNMETERED_POLICY_TARGET));
+        assert!(!is_persisted_target("trawl_server::policy::unmetered::x"));
         // Prefix matching is per segment, not per byte.
         assert!(is_persisted_target("fleet_authority"));
         assert!(is_persisted_target("fleet_auth_shim::x"));
-        // Everything trawld emits itself keeps persisting, including the
-        // post-authn auth_failure event and the storage alarm target.
+        // Everything trawld emits behind the limiter keeps persisting —
+        // including the REST of the policy module and the storage alarm
+        // target.
         assert!(is_persisted_target("trawl_server::policy"));
+        assert!(is_persisted_target("trawl_server::policy::other"));
         assert!(is_persisted_target("trawld"));
         assert!(is_persisted_target("storage.backend"));
     }
 
-    /// The pre-authn auth events are logged (previous test) but must never
-    /// reach the WAL layer: fleet-auth's bearer shell runs OUTSIDE the rate
-    /// limiter, so persisting them would let an unauthenticated flood grow
-    /// the corpus one durable record per rejected request.
+    /// The unmetered events are logged (previous test) but must never reach
+    /// the WAL layer: fleet-auth's bearer shell and trawl's own grant check
+    /// both run OUTSIDE the rate limiter, so persisting them would let a
+    /// client the limiter cannot slow grow the corpus one durable record per
+    /// rejected request.
     #[test]
-    fn wal_filter_drops_pre_auth_targets_the_stdout_filter_keeps() {
+    fn wal_filter_drops_unmetered_targets_the_stdout_filter_keeps() {
         use tracing_subscriber::prelude::*;
 
         let capture = CaptureLayer::default();
@@ -1249,7 +1294,8 @@ mod tests {
         tracing::warn!(target: "fleet_auth::middleware", "auth: invalid or revoked key");
         tracing::error!(target: "auth.backend", "auth: db error");
         tracing::warn!(target: PREAUTH_TRANSPORT_TARGET, event_type = "tls_handshake_failed", "TLS handshake failed");
-        tracing::info!(target: "trawl_server::policy", "policy: auth failure (post-authn)");
+        tracing::info!(target: UNMETERED_POLICY_TARGET, event_type = "auth_failure", "policy: no trawl grant (403)");
+        tracing::info!(target: "trawl_server::policy", "policy: metered event");
         tracing::error!(target: "storage.backend", "app-state store error");
         tracing::info!(target: "trawld", "starting trawld");
 
@@ -1259,10 +1305,11 @@ mod tests {
             "fleet_auth::middleware",
             "auth.backend",
             PREAUTH_TRANSPORT_TARGET,
+            UNMETERED_POLICY_TARGET,
         ] {
             assert!(
                 !targets.contains(&excluded),
-                "pre-authn target {excluded} must not be persisted; saw {targets:?}"
+                "unmetered target {excluded} must not be persisted; saw {targets:?}"
             );
         }
         for kept in ["trawl_server::policy", "storage.backend", "trawld"] {
