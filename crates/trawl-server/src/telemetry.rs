@@ -26,10 +26,11 @@
 //! resolved directive string, but they are not the same filter: the WAL
 //! layer additionally refuses the targets in
 //! [`PRE_AUTH_TARGETS`]. Those events are emitted from fleet-auth's bearer
-//! shell, which runs BEFORE the rate limiter — persisting them would let
-//! an unauthenticated client turn a request flood into durable corpus
-//! growth. They stay on stdout, where retention is the operator's log
-//! pipeline rather than trawl's own disk.
+//! shell, which runs BEFORE the rate limiter, and from the accept loop,
+//! which runs before there is even a TLS session — persisting them would
+//! let an unauthenticated client turn a connection or request flood into
+//! durable corpus growth. They stay on stdout, where retention is the
+//! operator's log pipeline rather than trawl's own disk.
 //!
 //! ## Buffering and the bounded retry queue
 //!
@@ -139,12 +140,24 @@ use crate::ingest::wal::WalWriter;
 ///   invalid-`RUST_LOG` `config_warning` to be visible at all;
 /// - `fleet_auth` — the auth middleware crate;
 /// - `auth.backend` / `storage.backend` — deliberately-overridden targets
-///   that make backend failures independently alarmable.
+///   that make backend failures independently alarmable;
+/// - [`PREAUTH_TRANSPORT_TARGET`] — the accept loop's pre-TLS diagnostics,
+///   overridden off `trawl_server` precisely so they can be excluded from
+///   persistence, and therefore needing their own directive to stay
+///   visible on stdout at all.
 ///
 /// This is the STDOUT filter. Persistence is narrower: see
 /// [`PRE_AUTH_TARGETS`] and [`wal_filter`].
-pub const DEFAULT_LOG_FILTER: &str =
-    "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info";
+pub const DEFAULT_LOG_FILTER: &str = "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info";
+
+/// Target for accept-loop diagnostics that fire before any request — and
+/// therefore before any authentication — exists: a failed TLS handshake, a
+/// connection-level error.
+///
+/// A deliberately-overridden target (not `trawl_server::transport::http`)
+/// so [`PRE_AUTH_TARGETS`] can exclude it from persistence without
+/// silencing the rest of the transport module.
+pub const PREAUTH_TRANSPORT_TARGET: &str = "preauth.transport";
 
 /// Targets emitted from the PRE-AUTHENTICATION request path: logged, never
 /// persisted as `service=trawld` telemetry.
@@ -153,10 +166,13 @@ pub const DEFAULT_LOG_FILTER: &str =
 /// every invalid or revoked key, and reports keystore trouble under
 /// `auth.backend` — all of it from middleware that sits OUTSIDE
 /// `rate_limit_middleware` (the limiter needs a verified key, so it cannot
-/// run before authn). Writing those events to the WAL would hand an
-/// unauthenticated client a durable-write amplifier: one ~400-byte record
-/// per rejected request, compacted into the corpus and competing with real
-/// log data for retention.
+/// run before authn). Cheaper still is [`PREAUTH_TRANSPORT_TARGET`]: the
+/// accept loop warns on every failed TLS handshake, which a bare TCP
+/// connect-and-close is enough to provoke — no request, no TLS session, no
+/// key. Writing any of it to the WAL would hand an unauthenticated client a
+/// durable-write amplifier: one ~400-byte record per rejected connection or
+/// request, compacted into the corpus and competing with real log data for
+/// retention.
 ///
 /// The events are not lost — they keep flowing to stdout (and to the
 /// legacy JSON log file) under the same directives, where retention is the
@@ -167,7 +183,7 @@ pub const DEFAULT_LOG_FILTER: &str =
 ///
 /// Matching is by target segment, so `fleet_auth` covers
 /// `fleet_auth::middleware` but never a `fleet_authority` target.
-pub const PRE_AUTH_TARGETS: [&str; 2] = ["fleet_auth", "auth.backend"];
+pub const PRE_AUTH_TARGETS: [&str; 3] = ["fleet_auth", "auth.backend", PREAUTH_TRANSPORT_TARGET];
 
 /// Whether events on `target` may be persisted as telemetry — false for
 /// every [`PRE_AUTH_TARGETS`] entry and its module descendants.
@@ -1162,6 +1178,7 @@ mod tests {
         tracing::info!(target: "fleet_auth::middleware", "auth middleware info");
         tracing::error!(target: "auth.backend", "auth backend down");
         tracing::error!(target: "storage.backend", "storage backend down");
+        tracing::warn!(target: PREAUTH_TRANSPORT_TARGET, "TLS handshake failed");
         tracing::info!(target: "hyper::proto", "dependency noise");
 
         let seen = events.lock();
@@ -1173,6 +1190,7 @@ mod tests {
             "fleet_auth::middleware",
             "auth.backend",
             "storage.backend",
+            PREAUTH_TRANSPORT_TARGET,
         ] {
             assert!(
                 targets.contains(&expected),
@@ -1190,6 +1208,9 @@ mod tests {
         assert!(!is_persisted_target("fleet_auth"));
         assert!(!is_persisted_target("fleet_auth::middleware"));
         assert!(!is_persisted_target("auth.backend"));
+        // The accept loop's pre-TLS diagnostics: a bare TCP
+        // connect-and-close is enough to emit one.
+        assert!(!is_persisted_target(PREAUTH_TRANSPORT_TARGET));
         // Prefix matching is per segment, not per byte.
         assert!(is_persisted_target("fleet_authority"));
         assert!(is_persisted_target("fleet_auth_shim::x"));
@@ -1217,13 +1238,18 @@ mod tests {
         tracing::warn!(target: "fleet_auth::middleware", "auth: missing or malformed bearer header");
         tracing::warn!(target: "fleet_auth::middleware", "auth: invalid or revoked key");
         tracing::error!(target: "auth.backend", "auth: db error");
+        tracing::warn!(target: PREAUTH_TRANSPORT_TARGET, event_type = "tls_handshake_failed", "TLS handshake failed");
         tracing::info!(target: "trawl_server::policy", "policy: auth failure (post-authn)");
         tracing::error!(target: "storage.backend", "app-state store error");
         tracing::info!(target: "trawld", "starting trawld");
 
         let seen = events.lock();
         let targets: Vec<&str> = seen.iter().map(|(t, _)| t.as_str()).collect();
-        for excluded in ["fleet_auth::middleware", "auth.backend"] {
+        for excluded in [
+            "fleet_auth::middleware",
+            "auth.backend",
+            PREAUTH_TRANSPORT_TARGET,
+        ] {
             assert!(
                 !targets.contains(&excluded),
                 "pre-authn target {excluded} must not be persisted; saw {targets:?}"

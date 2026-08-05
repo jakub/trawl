@@ -357,5 +357,5 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `resources.requests.cpu` | string | `250m` | CPU request |
 | `resources.requests.memory` | string | `512Mi` | Memory request |
 | `resources.limits.memory` | string | `2Gi` | Memory limit |
-| `logLevel` | string | `trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info` | RUST_LOG for the trawld container (keep the backend alarm targets when customizing) |
+| `logLevel` | string | `trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info` | RUST_LOG for the trawld container (keep the backend alarm and preauth.transport targets when customizing) |
 | `serviceMonitor.enabled` | bool | `false` | Create prometheus-operator ServiceMonitor |

@@ -536,8 +536,9 @@ fn init_tracing(
     // The directives were resolved (and validated when operator-supplied) by
     // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
     // from the same string. The WAL layer builds a narrower one
-    // (`telemetry::wal_filter`): pre-authn auth events are logged but never
-    // persisted, so an unauthenticated flood cannot grow the corpus.
+    // (`telemetry::wal_filter`): pre-authn auth and transport events are
+    // logged but never persisted, so an unauthenticated connection or
+    // request flood cannot grow the corpus.
     let make_filter = || EnvFilter::new(filter_directives);
 
     let use_telemetry = config.internal_telemetry_enabled();

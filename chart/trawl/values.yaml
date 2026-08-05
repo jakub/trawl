@@ -319,11 +319,12 @@ web:
 
 # -- Log level (RUST_LOG) for the trawld container. The default enumerates
 # every target trawld emits under — trawl_server (library), trawld (binary:
-# startup banner, config warnings), fleet_auth (auth middleware), and the
-# deliberately-overridden auth.backend / storage.backend alarm targets. Keep
-# them all when customizing, or backend errors become invisible. The
-# trawl-web sidecar has its own filter (see web.logLevel).
-logLevel: "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info"
+# startup banner, config warnings), fleet_auth (auth middleware), the
+# deliberately-overridden auth.backend / storage.backend alarm targets, and
+# preauth.transport (accept-loop TLS handshake / connection diagnostics).
+# Keep them all when customizing, or backend and transport errors become
+# invisible. The trawl-web sidecar has its own filter (see web.logLevel).
+logLevel: "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info"
 
 # -- Prometheus ServiceMonitor (requires prometheus-operator CRDs)
 serviceMonitor:

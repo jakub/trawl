@@ -333,10 +333,16 @@ pub async fn serve(
 
                 let n_conn = Arc::clone(&notify);
                 connections.spawn(async move {
+                    // Accept-loop diagnostics carry PREAUTH_TRANSPORT_TARGET,
+                    // not this module's path: a bare TCP connect-and-close
+                    // provokes one, so persisting them would make an
+                    // unauthenticated connection flood a durable-write
+                    // amplifier. The target is in `PRE_AUTH_TARGETS`, so the
+                    // WAL layer refuses it while stdout keeps it.
                     let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!(event_type = "tls_handshake_failed", peer = %peer_addr, error = %e, "TLS handshake failed");
+                            tracing::warn!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "tls_handshake_failed", peer = %peer_addr, error = %e, "TLS handshake failed");
                             return;
                         }
                     };
@@ -361,13 +367,13 @@ pub async fn serve(
                     tokio::select! {
                         result = conn.as_mut() => {
                             if let Err(e) = result {
-                                tracing::debug!(event_type = "connection_error", peer = %peer_addr, error = %e, "connection error");
+                                tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_error", peer = %peer_addr, error = %e, "connection error");
                             }
                         }
                         () = n_conn.notified() => {
                             conn.as_mut().graceful_shutdown();
                             if let Err(e) = conn.await {
-                                tracing::debug!(event_type = "connection_error", peer = %peer_addr, error = %e, "connection error during shutdown");
+                                tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_error", peer = %peer_addr, error = %e, "connection error during shutdown");
                             }
                         }
                     }
