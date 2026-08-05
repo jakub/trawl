@@ -45,6 +45,19 @@
 # file logging. Stdout remains active for human consumption.
 # log_file = "/var/log/trawld.log"
 
+# ndjson query debug log (one entry per query execution). SENSITIVE:
+# entries combine identity, raw query text, generated SQL with parameter
+# values, source paths, and result samples. The file is owner-only (0600)
+# on Unix and bounded by query_log_max_bytes. Put it in a directory only
+# trawld can write (NOT /tmp or any other shared-writable directory) —
+# the mode protects the file's contents, not the path leading to it.
+# A symlink at the path is refused, never followed.
+# query_log = "/var/lib/trawl/query-debug.log"
+
+# Size cap for the query debug log. Past it the file rolls over to a
+# single retained <path>.1 (also 0600). 0 disables rollover (unbounded).
+# query_log_max_bytes = "100M"
+
 # TLS certificate and key (PEM format). If omitted, a self-signed
 # certificate is auto-generated at startup. Both must be set or both omitted.
 # tls_cert_path = "/etc/trawl/cert.pem"
@@ -121,7 +134,12 @@ database_url = "postgres://fleet:fleet@localhost:5433/trawl"
 # compaction_interval_secs = 10
 
 # Write internal server events (queries, auth, compaction) to the ingest
-# pipeline as service:trawld. Enables self-hosted dashboards and audit trails.
+# pipeline as service:trawld. Enables self-hosted dashboards.
+# Covers the trawld daemon ONLY: trawl-web and the CLIs log to stdout,
+# and fleet-admin mutations are observed by a 30s polling audit task
+# (coalescing diffs, not a transactional ledger). Default query lifecycle
+# events carry query_id/metadata but not raw query text (that lives in
+# history, the query debug log, and a DEBUG-only query_text event).
 # Requires ingest.enabled = true. Replaces the log_file JSON logger.
 # internal_telemetry = true
 
@@ -156,6 +174,16 @@ database_url = "postgres://fleet:fleet@localhost:5433/trawl"
 # Lower values reduce latency for self-hosted dashboards but increase
 # disk I/O from more frequent small writes.
 # telemetry_flush_interval_secs = 1
+
+# ONE memory budget for everything internal telemetry holds while the WAL
+# is unhealthy: the active buffer, the retry queue (a failed flush retains
+# its batch instead of dropping it) and the batch in flight through a
+# write. Like hot_buffer_max_bytes this is an estimate: serialized ndjson
+# plus the retained event maps plus per-event overhead. It is enforced as
+# events arrive — over budget, the OLDEST queued batches are shed first
+# and then the incoming event itself is dropped, all counted in
+# trawl_telemetry_events_dropped_total{reason="buffer_cap"}.
+# telemetry_buffer_max_bytes = "16M"
 
 [retention]
 # Delete date directories older than this many days. 0 = disabled.

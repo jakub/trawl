@@ -35,6 +35,14 @@ struct Cli {
     no_monitor: bool,
 }
 
+/// Wall-clock cap on how long process exit waits for blocking-pool work
+/// that has already STARTED — chiefly the telemetry/WAL durability
+/// barriers (fsync, dir-fsync). Dropping a Tokio runtime normally waits on
+/// those forever, so a frozen volume would stall restarts and rolling
+/// deployments indefinitely; past this budget the runtime is abandoned and
+/// the process exits with the wedged thread still parked in the kernel.
+const RUNTIME_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Install crash-dump capture before any threads are spawned or the async
     // runtime is built: the minidump monitor is launched by re-execing this
@@ -42,10 +50,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // monitor mode this never returns. Held for the whole process lifetime.
     let _crashdump = trawl_crashdump::init();
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(async_main())
+        .build()?;
+    let result = runtime.block_on(async_main());
+    // Bounded exit: `async_main` has already run the graceful shutdown
+    // sequence (each task under its own budget), so anything still running
+    // here is a wedged blocking operation, not pending work worth waiting on.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_BUDGET);
+    result
 }
 
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
@@ -56,12 +69,29 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     let config_path = resolve_path(&cli.config);
-    let config = Config::from_file(&config_path)?;
+    // Pre-tracing boundary: no subscriber exists yet, so a config failure
+    // here can only surface through stderr. Name the resolved path so the
+    // operator can tell WHICH file failed (issue #56 F4).
+    let config = Config::from_file(&config_path).map_err(|e| {
+        eprintln!(
+            "[trawld] failed to load configuration from {}: {e}",
+            config_path.display()
+        );
+        e
+    })?;
 
     // Auto-detect TTY: monitor when interactive, log tail when piped.
     let monitor_active = std::io::IsTerminal::is_terminal(&std::io::stdout()) && !cli.no_monitor;
 
-    let telemetry = init_tracing(&config, monitor_active)?;
+    // Resolve the log filter explicitly: RUST_LOG is authoritative when
+    // valid; unset or invalid installs DEFAULT_LOG_FILTER, and the invalid
+    // case warns AFTER the subscriber is up (visible because `trawld=info`
+    // is part of the default).
+    let log_filter = telemetry::resolve_log_filter(std::env::var("RUST_LOG").ok().as_deref());
+    let telemetry = init_tracing(&config, monitor_active, &log_filter.directives)?;
+    if let Some(warning) = &log_filter.warning {
+        tracing::warn!(event_type = "config_warning", "{warning}");
+    }
 
     tracing::info!(event_type = "lifecycle", config = %config_path.display(), "configuration loaded");
 
@@ -122,12 +152,17 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
     if let Some(ref path) = query_log_path {
-        let log = trawl_server::query_log::QueryLog::open(path)
-            .map_err(|e| format!("failed to open query log {}: {e}", path.display()))?;
-        tracing::info!(
-            event_type = "lifecycle",
+        let log =
+            trawl_server::query_log::QueryLog::open(path, config.server.query_log_max_bytes as u64)
+                .map_err(|e| format!("failed to open query log {}: {e}", path.display()))?;
+        tracing::warn!(
+            event_type = "query_log_enabled",
             path = %path.display(),
-            "query debug log enabled"
+            max_bytes = config.server.query_log_max_bytes,
+            "query debug log enabled — this file records raw query text, \
+             SQL parameter values, and result samples; it is owner-only \
+             (0600) and rolls over to a single retained .1 sibling at \
+             query_log_max_bytes (0 = unbounded)"
         );
         state.query.query_log = Some(Arc::new(log));
     }
@@ -496,28 +531,38 @@ fn warn_unlisted_env_dirs(config: &Config) {
 fn init_tracing(
     config: &Config,
     monitor_active: bool,
+    filter_directives: &str,
 ) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
-    let make_filter =
-        || EnvFilter::try_from_default_env().unwrap_or_else(|_| "trawl_server=info".into());
+    // The directives were resolved (and validated when operator-supplied) by
+    // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
+    // from the same string. The WAL layer builds a narrower one
+    // (`telemetry::wal_filter`): pre-authn auth and transport events are
+    // logged but never persisted, so an unauthenticated connection or
+    // request flood cannot grow the corpus.
+    let make_filter = || EnvFilter::new(filter_directives);
 
     let use_telemetry = config.internal_telemetry_enabled();
 
     if use_telemetry {
         // WAL layer replaces the JSON file logger.
         let handle = WalHandle::new();
-        let wal_layer = WalLayer::new(handle.clone(), &config.ingest.default_env);
+        let wal_layer = WalLayer::new_with_buffer_cap(
+            handle.clone(),
+            &config.ingest.default_env,
+            config.ingest.telemetry_buffer_max_bytes,
+        );
         let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>
 
         if monitor_active {
             // Skip stdout layer — TUI owns the terminal.
             tracing_subscriber::registry()
-                .with(wal_layer.with_filter(make_filter()))
+                .with(wal_layer.with_filter(telemetry::wal_filter(filter_directives)))
                 .init();
         } else {
             let stdout_layer = fmt::layer().with_filter(make_filter());
             tracing_subscriber::registry()
                 .with(stdout_layer)
-                .with(wal_layer.with_filter(make_filter()))
+                .with(wal_layer.with_filter(telemetry::wal_filter(filter_directives)))
                 .init();
         }
         Ok(Some((handle, flush_layer)))

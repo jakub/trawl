@@ -663,6 +663,7 @@ pub async fn setup_in_dir_with_data(
             max_query_history: 1000,
             max_sse_connections: 32,
             query_log: None,
+            query_log_max_bytes: trawl_server::config::DEFAULT_QUERY_LOG_MAX_BYTES,
             rate_limit,
             monitor_refresh_ms: 1000,
         },

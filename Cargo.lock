@@ -6293,6 +6293,7 @@ dependencies = [
  "tracing-subscriber",
  "trawl-api",
  "trawl-client",
+ "trawl-config",
  "trawl-core",
  "trawl-dashboard",
  "trawl-engine",
@@ -6320,8 +6321,10 @@ name = "trawl-config"
 version = "0.4.0"
 dependencies = [
  "chrono",
+ "libc",
  "serde",
  "shellexpand",
+ "tempfile",
  "thiserror 2.0.19",
  "toml",
 ]

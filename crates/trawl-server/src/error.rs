@@ -87,6 +87,38 @@ impl ServerError {
             other => other.to_string(),
         }
     }
+
+    /// Return a stable, content-free classification of this error.
+    ///
+    /// SECURITY: default-filter telemetry logs this INSTEAD of any message.
+    /// [`safe_message`](Self::safe_message) is safe to hand a *client* but not
+    /// safe to persist: it deliberately preserves parse/emit text, and
+    /// parser/emitter messages quote the user's own tokens and format strings
+    /// (`Self::Engine(EngineError::Database)`'s raw form likewise embeds the
+    /// generated SQL and the values it choked on). The class comes from a
+    /// closed set of literals, so it is safe to store in the retained
+    /// `service=trawld` corpus and stable enough to alarm on.
+    pub fn error_class(&self) -> &'static str {
+        match self {
+            Self::Engine(EngineError::Parse(_)) => "parse",
+            Self::Engine(EngineError::Emit(_)) => "emit",
+            Self::Engine(EngineError::Database(_)) => "database",
+            Self::Engine(EngineError::ResultTooLarge(_)) => "result_too_large",
+            Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
+            Self::Engine(EngineError::Io(_)) => "io",
+            Self::Store(_) => "store",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::Forbidden(_) => "forbidden",
+            Self::BadRequest(_) => "bad_request",
+            Self::NotFound(_) => "not_found",
+            Self::Timeout => "timeout",
+            Self::Ingest(_) => "ingest",
+            Self::RateLimited => "rate_limited",
+            Self::TooManyStreams => "too_many_streams",
+            Self::ServiceUnavailable(_) => "service_unavailable",
+            Self::Internal(_) => "internal",
+        }
+    }
 }
 
 impl From<fleet_auth::AuthError> for ServerError {
@@ -293,6 +325,32 @@ mod tests {
         let err = ServerError::Internal("something broke".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The class is what default telemetry persists, so it must be a fixed
+    /// literal — never a rendering of the user's own query text.
+    #[test]
+    fn error_class_never_carries_user_content() {
+        let parse = ServerError::Engine(EngineError::Parse(vec![trawl_core::parser::ParseError {
+            message: "unexpected 'zz_secret_token'".into(),
+            span: 0..3,
+            label: None,
+            hint: None,
+        }]));
+        assert_eq!(parse.error_class(), "parse");
+        assert!(parse.safe_message().contains("zz_secret_token"));
+
+        let db = ServerError::Engine(EngineError::Database(duckdb::Error::InvalidColumnName(
+            "zz_secret_column".into(),
+        )));
+        assert_eq!(db.error_class(), "database");
+        assert!(!db.to_string().is_empty());
+
+        assert_eq!(ServerError::Timeout.error_class(), "timeout");
+        assert_eq!(
+            ServerError::Internal("dsn leaked".into()).error_class(),
+            "internal"
+        );
     }
 
     #[test]

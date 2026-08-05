@@ -59,6 +59,10 @@ Four roles: admin, analyst, reader, ingest.
 
 Manual accept loop with rustls. Certificate hot-reload via content-based polling (default 300s). HTTP/1.1 and HTTP/2 via ALPN negotiation.
 
+### Internal telemetry
+
+`trawld` observes itself: its structured tracing events become ordinary `service=trawld` records, WAL-durable before they are queryable, with loss and WAL health exported as `trawl_telemetry_*` Prometheus series (see [data flow](/architecture/data-flow/#internal-telemetry) for the pipeline and its guarantees). The boundary is deliberate and narrow: it covers the daemon only — `trawl-web` and the CLIs log to stdout for the deployment's collector, fleet keystore mutations are observed by a coalescing 30-second poll rather than a transactional ledger, default query lifecycle events carry metadata (`query_id`, actor, outcome, timing) but never raw query text, and there is no OTLP export.
+
 ## Comparison to Splunk
 
 ### Similarities

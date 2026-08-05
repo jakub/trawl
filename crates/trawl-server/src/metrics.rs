@@ -39,10 +39,17 @@ pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_t
 pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
 pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
 pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
+pub const AUTH_FAILURES_TOTAL: &str = "trawl_auth_failures_total";
+pub const TELEMETRY_WAL_WRITE_FAILURES_TOTAL: &str = "trawl_telemetry_wal_write_failures_total";
+pub const TELEMETRY_EVENTS_DROPPED_TOTAL: &str = "trawl_telemetry_events_dropped_total";
+pub const TELEMETRY_BYTES_DROPPED_TOTAL: &str = "trawl_telemetry_bytes_dropped_total";
+pub const TELEMETRY_BUFFER_EVENTS: &str = "trawl_telemetry_buffer_events";
+pub const TELEMETRY_BUFFER_BYTES: &str = "trawl_telemetry_buffer_bytes";
 
 // -- description registration ------------------------------------------------
 
 /// Register metric descriptions (help text + units). Call once at startup.
+#[allow(clippy::too_many_lines)] // a flat list of describe calls, one per metric
 pub fn describe_metrics() {
     describe_counter!(QUERIES_TOTAL, "Total number of queries executed");
     describe_histogram!(QUERY_DURATION, "Query execution duration in seconds");
@@ -125,6 +132,52 @@ pub fn describe_metrics() {
         CATALOG_PIN_CAPACITY,
         "Field-catalog pin ceiling (store::catalog::MAX_PINNED_FIELDS); a \
          field arriving at a full catalog is never stored as a column"
+    );
+    describe_counter!(
+        AUTH_FAILURES_TOTAL,
+        "Requests rejected by the authenticated routers' auth stack, \
+         labelled by reason (unauthorized = missing, malformed, invalid, \
+         revoked or expired bearer token; backend_unavailable = the \
+         keystore failed to answer; no_trawl_grant = a verified key that \
+         resolves no usable trawl permission; forbidden / internal = \
+         defensive, an unmarked rejection from the bearer shell). The \
+         reason set is closed and carries no key, name or path label. The \
+         events themselves are stdout-only by design — every one of these \
+         rejections is decided outside the per-key rate limiter (see \
+         telemetry::UNMETERED_TARGETS) — so this counter is the only \
+         in-product signal for credential stuffing, token brute force and \
+         a revoked key still in use"
+    );
+    describe_counter!(
+        TELEMETRY_WAL_WRITE_FAILURES_TOTAL,
+        "Self-telemetry WAL write failures; the failed batch is retained \
+         for retry, so a rising counter with no drops means the retry \
+         queue is absorbing a storage outage"
+    );
+    describe_counter!(
+        TELEMETRY_EVENTS_DROPPED_TOTAL,
+        "Self-telemetry events dropped, labelled by reason (preinit_cap = \
+         bootstrap buffer overflow before the WAL writer was injected, \
+         buffer_cap = the shared active+queue+in-flight memory budget was \
+         full during a prolonged WAL outage)"
+    );
+    describe_counter!(
+        TELEMETRY_BYTES_DROPPED_TOTAL,
+        "Self-telemetry ndjson bytes dropped, labelled by reason (exact \
+         for buffer_cap; a mean-line-size estimate for preinit_cap, which \
+         drops before serialization)"
+    );
+    describe_gauge!(
+        TELEMETRY_BUFFER_EVENTS,
+        "Self-telemetry events held in memory — active buffer, retry queue \
+         and the batch in flight through a WAL write; nonzero across cycles \
+         means the WAL is unhealthy — warns before loss begins"
+    );
+    describe_gauge!(
+        TELEMETRY_BUFFER_BYTES,
+        "Estimated bytes charged against ingest.telemetry_buffer_max_bytes \
+         by ALL self-telemetry memory — active buffer, retry queue and the \
+         in-flight batch (serialized bytes plus retained event maps)"
     );
 }
 

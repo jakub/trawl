@@ -1,7 +1,12 @@
 # Environment overrides for trawl-web (session proxy)
 # Uncomment and modify as needed.
 
-# RUST_LOG=trawl_web=info
+# Tracing filter. The commented value below is the built-in default —
+# trawl_web is the proxy's own target (session, origin, upstream, startup)
+# and fleet_auth the shared session/origin primitives. Keep both when
+# customizing, or proxy and auth failures become invisible. trawld's filter
+# names neither target, so do not reuse it here.
+# RUST_LOG=trawl_web=info,fleet_auth=info
 
 # Skip TLS verification of the upstream trawld self-signed cert.
 # Safe ONLY when trawl-web and trawld live on the same host talking loopback.

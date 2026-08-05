@@ -71,20 +71,33 @@ pub async fn query(
         )));
     }
 
+    // One id from the pool's counter keys the tracker entry AND the pool's
+    // interrupt map, so cancel-by-id interrupts the query the client sees.
+    // Allocated BEFORE query_start so every lifecycle event correlates on
+    // query_id without carrying the query text (issue #56 F5).
+    let query_id = state.query.pool.allocate_query_id();
+    state.query.tracker.start(query_id, &verified, &req.query);
+
+    // Default-filter lifecycle events carry metadata only — never the raw
+    // DSL, which can contain customer identifiers or incident indicators.
+    // Full text lives in authenticated history, the tracker, the opt-in
+    // query debug log, and the DEBUG-only query_text event below.
     tracing::info!(
         event_type = "query_start",
         user = %verified.name,
         roles = %verified.roles_display(),
-        query = %req.query,
+        query_id,
+        query_len = req.query.len(),
         limit,
         offset,
         "executing query"
     );
-
-    // One id from the pool's counter keys the tracker entry AND the pool's
-    // interrupt map, so cancel-by-id interrupts the query the client sees.
-    let query_id = state.query.pool.allocate_query_id();
-    state.query.tracker.start(query_id, &verified, &req.query);
+    tracing::debug!(
+        event_type = "query_text",
+        query_id,
+        query = %req.query,
+        "raw query text (DEBUG-only: never stored under the default filter)"
+    );
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
     // Resolve timezone from request (default to UTC when absent).
@@ -168,10 +181,10 @@ pub async fn query(
             tracing::info!(
                 event_type = "query_complete",
                 user = %verified.name,
-                query = %req.query,
+                query_id,
+                query_len = req.query.len(),
                 total_rows = total,
                 returned_rows = returned,
-                query_id,
                 duration_ms,
                 "query complete"
             );
@@ -215,8 +228,8 @@ pub async fn query(
             tracing::warn!(
                 event_type = "query_timeout",
                 user = %verified.name,
-                query = %req.query,
                 query_id,
+                query_len = req.query.len(),
                 duration_ms,
                 timeout_secs = state.query.timeout_secs,
                 "query timed out"
@@ -242,6 +255,15 @@ pub async fn query(
 
             metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "error").increment(1);
             metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
+
+            // Default-filter failure events carry the CLASS only. Neither
+            // `safe_msg` nor the raw error is safe to persist here:
+            // safe_message() deliberately preserves parser/emitter text
+            // (which quotes the user's own tokens and format strings), and
+            // the raw database error embeds the generated SQL plus the
+            // values it choked on. Both live on in the client response, the
+            // tracker, the opt-in query debug log, and the DEBUG event below.
+            let error_class = e.error_class();
             match &e {
                 ServerError::Engine(
                     trawl_engine::error::EngineError::Parse(_)
@@ -250,30 +272,35 @@ pub async fn query(
                     tracing::warn!(
                         event_type = "query_failed",
                         error_type = "parse",
+                        error_class,
                         user = %verified.name,
-                        query = %req.query,
                         query_id,
+                        query_len = req.query.len(),
                         duration_ms,
-                        error = %safe_msg,
                         "query failed: bad request"
                     );
                 }
                 _ => {
-                    // Log the raw error for operator debugging; the safe
-                    // (redacted) version is what reaches the client and tracker.
                     tracing::error!(
                         event_type = "query_failed",
                         error_type = "engine",
+                        error_class,
                         user = %verified.name,
-                        query = %req.query,
                         query_id,
+                        query_len = req.query.len(),
                         duration_ms,
-                        error = %e,
-                        safe_error = %safe_msg,
                         "query failed: engine error"
                     );
                 }
             }
+            tracing::debug!(
+                event_type = "query_error_text",
+                query_id,
+                error_class,
+                error = %e,
+                safe_error = %safe_msg,
+                "query failure detail (DEBUG-only: never stored under the default filter)"
+            );
 
             write_query_log(
                 &state,
@@ -1988,14 +2015,25 @@ pub async fn export(
     let max_export_rows = state.query.max_export_rows;
     let limit = req.limit.unwrap_or(max_export_rows).min(max_export_rows);
 
+    // One id keys the whole export lifecycle AND the pool's interrupt map,
+    // so the events correlate without carrying the query text (issue #56 F5).
+    let query_id = state.query.pool.allocate_query_id();
+
     tracing::info!(
         event_type = "export_start",
         user = %verified.name,
         roles = %verified.roles_display(),
-        query = %req.query,
+        query_id,
+        query_len = req.query.len(),
         %format,
         limit,
         "executing export"
+    );
+    tracing::debug!(
+        event_type = "query_text",
+        query_id,
+        query = %req.query,
+        "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
     let start = std::time::Instant::now();
@@ -2007,19 +2045,15 @@ pub async fn export(
         let bytes = state
             .query
             .pool
-            .export_parquet(
-                state.query.pool.allocate_query_id(),
-                &req.query,
-                limit,
-                timeout,
-            )
+            .export_parquet(query_id, &req.query, limit, timeout)
             .await?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         tracing::info!(
             event_type = "export_complete",
             user = %verified.name,
-            query = %req.query,
+            query_id,
+            query_len = req.query.len(),
             format = "parquet",
             bytes = bytes.len(),
             duration_ms,
@@ -2048,13 +2082,7 @@ pub async fn export(
     let outcome = state
         .query
         .pool
-        .execute(
-            state.query.pool.allocate_query_id(),
-            &req.query,
-            timeout,
-            capture_debug,
-            0,
-        )
+        .execute(query_id, &req.query, timeout, capture_debug, 0)
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -2099,7 +2127,8 @@ pub async fn export(
     tracing::info!(
         event_type = "export_complete",
         user = %verified.name,
-        query = %req.query,
+        query_id,
+        query_len = req.query.len(),
         %format,
         rows = limited.row_count(),
         bytes = body.len(),
@@ -2415,11 +2444,23 @@ pub async fn stream_query(
 
     let query_dsl = params.query.clone();
 
+    // Same id vocabulary as /query and /export: correlate on the id, never
+    // on the DSL, which can carry customer identifiers or incident
+    // indicators (issue #56 F5).
+    let query_id = state.query.pool.allocate_query_id();
+
     tracing::info!(
         event_type = "stream_start",
         user = %verified.name,
-        query = %query_dsl,
+        query_id,
+        query_len = query_dsl.len(),
         "starting SSE stream"
+    );
+    tracing::debug!(
+        event_type = "query_text",
+        query_id,
+        query = %query_dsl,
+        "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
     // Parse and compile the filter once upfront.

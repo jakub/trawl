@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+pub mod fs;
+
 /// Top-level daemon configuration, loaded from TOML.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -96,7 +98,21 @@ pub struct ServerConfig {
 
     /// Optional query debug log path. When set, every query execution is
     /// logged as ndjson to this file for `tail -f | jq` debugging.
+    ///
+    /// Sensitive: entries combine identity, raw query text, SQL parameter
+    /// values, source paths, and result samples. The file is owner-only
+    /// (`0600`) on Unix and bounded by `query_log_max_bytes`.
     pub query_log: Option<PathBuf>,
+
+    /// Size cap for the query debug log. Past it the file rolls over to a
+    /// single retained `<path>.1`. Default: 100 MiB. `0` disables
+    /// rollover (unbounded file). Accepts human-readable sizes like
+    /// `"100M"`.
+    #[serde(
+        default = "default_query_log_max_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub query_log_max_bytes: usize,
 
     /// Allowed CORS origins (e.g. `["https://trawl.example.com"]`).
     /// Empty list (default) means no CORS headers are sent, so the browser's
@@ -310,6 +326,21 @@ pub struct IngestConfig {
     #[serde(default = "default_telemetry_flush_interval_secs")]
     pub telemetry_flush_interval_secs: u64,
 
+    /// One cap on ALL memory internal telemetry holds while the WAL is
+    /// unhealthy: the active buffer, the retry queue, and the batch in
+    /// flight through a write. Default: 16 MiB. Accepts human-readable
+    /// sizes like `"16M"`. Like `hot_buffer_max_bytes`, the charge is an
+    /// estimate: serialized ndjson bytes plus the retained event maps
+    /// (which hold roughly the same payload again) plus a fixed per-event
+    /// overhead. Enforced as events arrive: over budget the oldest queued
+    /// batches are shed first and then the incoming event itself, counted
+    /// in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}`.
+    #[serde(
+        default = "default_telemetry_buffer_max_bytes",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub telemetry_buffer_max_bytes: usize,
+
     /// Maximum WAL files per compaction chunk. Larger backlogs are split
     /// into chunks of this size and merged incrementally. Default: 500.
     #[serde(default = "default_compaction_chunk_size")]
@@ -413,6 +444,7 @@ impl Default for IngestConfig {
             hot_buffer_max_bytes: default_hot_buffer_max_bytes(),
             stats_interval_secs: DEFAULT_STATS_INTERVAL_SECS,
             telemetry_flush_interval_secs: DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS,
+            telemetry_buffer_max_bytes: default_telemetry_buffer_max_bytes(),
             compaction_chunk_size: DEFAULT_COMPACTION_CHUNK_SIZE,
             compaction_memory_limit: DEFAULT_COMPACTION_MEMORY_LIMIT.to_string(),
             default_env: default_env_name(),
@@ -896,6 +928,13 @@ fn default_telemetry_flush_interval_secs() -> u64 {
     DEFAULT_TELEMETRY_FLUSH_INTERVAL_SECS
 }
 
+/// Default telemetry retry-queue memory cap (16 MiB, estimated charge).
+pub const DEFAULT_TELEMETRY_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn default_telemetry_buffer_max_bytes() -> usize {
+    DEFAULT_TELEMETRY_BUFFER_MAX_BYTES
+}
+
 /// Default key audit polling interval (seconds).
 pub const DEFAULT_AUDIT_INTERVAL_SECS: u64 = 30;
 
@@ -1115,6 +1154,13 @@ fn default_schema_cache_ttl_secs() -> u64 {
 
 fn default_max_query_history() -> usize {
     DEFAULT_MAX_QUERY_HISTORY
+}
+
+/// Default query debug log size cap (100 MiB; `0` disables rollover).
+pub const DEFAULT_QUERY_LOG_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+fn default_query_log_max_bytes() -> usize {
+    DEFAULT_QUERY_LOG_MAX_BYTES
 }
 
 fn default_max_sse_connections() -> usize {

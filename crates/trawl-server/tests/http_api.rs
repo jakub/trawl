@@ -105,6 +105,289 @@ async fn query_rejects_bad_dsl(pool: sqlx::PgPool) {
     }
 }
 
+// -- query lifecycle telemetry (issue #56 F5) --------------------------------
+
+mod lifecycle_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// One captured tracing event: level plus stringified fields.
+    #[derive(Debug, Clone)]
+    pub struct Captured {
+        pub level: String,
+        pub fields: BTreeMap<String, String>,
+    }
+
+    /// Capture layer recording every event's fields as strings.
+    #[derive(Clone, Default)]
+    pub struct Capture {
+        events: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl Capture {
+        pub fn events(&self) -> Vec<Captured> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    struct Visitor<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut Visitor(&mut fields));
+            self.events.lock().unwrap().push(Captured {
+                level: event.metadata().level().as_str().to_owned(),
+                fields,
+            });
+        }
+    }
+}
+
+/// Default-filter lifecycle events for `/query`, `/export` and `/stream`
+/// share a `query_id` and contain no user-supplied content — not the raw
+/// DSL, and not an error message either (parser/emitter text quotes the
+/// user's own tokens). The details survive only as DEBUG-level
+/// `query_text` / `query_error_text` events `trawl_server=info` never stores.
+///
+/// One test, four sentinels: the capture layer is a GLOBAL subscriber, and
+/// only the first installer in a process wins.
+#[sqlx::test(migrations = false)]
+async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgPool) {
+    use lifecycle_capture::Capture;
+    use tracing_subscriber::prelude::*;
+
+    let info_capture = Capture::default();
+    let debug_capture = Capture::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            info_capture
+                .clone()
+                .with_filter(tracing_subscriber::EnvFilter::new(
+                    trawl_server::telemetry::DEFAULT_LOG_FILTER,
+                )),
+        )
+        .with(
+            debug_capture
+                .clone()
+                .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=debug")),
+        );
+    // Global (not thread-local) — the server runs on other tokio workers.
+    tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+
+    let server = setup(pool).await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // The sentinel is a bare-text search term: valid DSL, matches nothing.
+    let dsl = "service=nginx zz_sentinel_needle";
+    client.query_paginated(dsl, None, None).await.unwrap();
+
+    let info_events = info_capture.events();
+    let start = info_events
+        .iter()
+        .find(|e| {
+            e.fields
+                .get("event_type")
+                .is_some_and(|t| t.contains("query_start"))
+        })
+        .expect("query_start captured at info");
+    let complete = info_events
+        .iter()
+        .find(|e| {
+            e.fields
+                .get("event_type")
+                .is_some_and(|t| t.contains("query_complete"))
+        })
+        .expect("query_complete captured at info");
+
+    // Correlatable without query text: same allocated query_id...
+    let start_id = start
+        .fields
+        .get("query_id")
+        .expect("query_start has query_id");
+    let complete_id = complete
+        .fields
+        .get("query_id")
+        .expect("query_complete has query_id");
+    assert_eq!(start_id, complete_id, "lifecycle events share the query_id");
+
+    // ...plus query_len for pathological-request diagnosis.
+    assert_eq!(
+        start.fields.get("query_len").map(String::as_str),
+        Some(dsl.len().to_string().as_str()),
+        "query_start carries query_len"
+    );
+
+    // The raw text IS available — as a separate DEBUG-only event.
+    let query_text = debug_capture
+        .events()
+        .into_iter()
+        .find(|e| {
+            e.fields
+                .get("query")
+                .is_some_and(|q| q.contains("zz_sentinel_needle"))
+        })
+        .expect("query_text event captured at debug");
+    assert_eq!(query_text.level, "DEBUG");
+    assert!(
+        query_text
+            .fields
+            .get("event_type")
+            .is_some_and(|t| t.contains("query_text")),
+        "the DEBUG event carrying raw DSL is query_text: {query_text:?}"
+    );
+    assert!(
+        query_text.fields.contains_key("query_id"),
+        "query_text is keyed on query_id"
+    );
+
+    // -- a FAILING query --------------------------------------------------
+    //
+    // The emitter rejects an unknown `level` token by quoting it, so an
+    // error message in default telemetry republishes whatever was typed.
+    let bad_dsl = "level=zz_failure_needle";
+    let err = client
+        .query_paginated(bad_dsl, None, None)
+        .await
+        .expect_err("unknown level token is rejected");
+    match err {
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 400),
+        other => panic!("expected 400 for the bad level token, got: {other:?}"),
+    }
+
+    // -- an export ---------------------------------------------------------
+    let raw = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let export_dsl = "service=nginx zz_export_needle";
+    let export_resp = raw
+        .post(format!("{}/api/v1/export?format=csv", server.url))
+        .bearer_auth(&server.analyst_token)
+        .json(&serde_json::json!({ "query": export_dsl }))
+        .send()
+        .await
+        .expect("export request");
+    assert!(export_resp.status().is_success(), "{export_resp:?}");
+
+    // -- an SSE stream -----------------------------------------------------
+    let stream_dsl = "service=nginx zz_stream_needle";
+    let stream_resp = raw
+        .get(format!("{}/api/v1/stream", server.url))
+        .query(&[("query", stream_dsl)])
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .expect("stream request");
+    // Headers are enough: stream_start is logged before the SSE body opens.
+    assert!(stream_resp.status().is_success(), "{stream_resp:?}");
+    drop(stream_resp);
+
+    let info_events = info_capture.events();
+    let find_info = |event_type: &str| {
+        info_events
+            .iter()
+            .find(|e| {
+                e.fields
+                    .get("event_type")
+                    .is_some_and(|t| t.contains(event_type))
+            })
+            .unwrap_or_else(|| panic!("{event_type} captured at info"))
+    };
+
+    // The failure event classifies, and carries no message of any kind:
+    // safe_message() deliberately preserves parse/emit text.
+    let failed = find_info("query_failed");
+    assert!(
+        failed
+            .fields
+            .get("error_class")
+            .is_some_and(|c| c.contains("emit")),
+        "query_failed carries a stable error_class: {failed:?}"
+    );
+    assert!(
+        !failed.fields.contains_key("error") && !failed.fields.contains_key("safe_error"),
+        "query_failed carries no error text: {failed:?}"
+    );
+
+    // Export and stream speak the same id vocabulary as /query.
+    let export_start = find_info("export_start");
+    let export_complete = find_info("export_complete");
+    assert_eq!(
+        export_start.fields.get("query_id"),
+        export_complete.fields.get("query_id"),
+        "export lifecycle events share the query_id"
+    );
+    assert_eq!(
+        export_start.fields.get("query_len").map(String::as_str),
+        Some(export_dsl.len().to_string().as_str()),
+        "export_start carries query_len"
+    );
+    let stream_start = find_info("stream_start");
+    assert!(
+        stream_start.fields.contains_key("query_id"),
+        "stream_start is keyed on query_id: {stream_start:?}"
+    );
+    assert_eq!(
+        stream_start.fields.get("query_len").map(String::as_str),
+        Some(stream_dsl.len().to_string().as_str()),
+        "stream_start carries query_len"
+    );
+
+    // No user-supplied content anywhere in the default-filter stream.
+    for sentinel in [
+        "zz_sentinel_needle",
+        "zz_failure_needle",
+        "zz_export_needle",
+        "zz_stream_needle",
+    ] {
+        for event in &info_events {
+            for (name, value) in &event.fields {
+                assert!(
+                    !value.contains(sentinel),
+                    "{sentinel} leaked into default-filter telemetry: field {name} of {event:?}"
+                );
+            }
+        }
+    }
+
+    // Every one of them IS recoverable at DEBUG, keyed on query_id.
+    let debug_events = debug_capture.events();
+    for (sentinel, event_type) in [
+        ("zz_failure_needle", "query_error_text"),
+        ("zz_export_needle", "query_text"),
+        ("zz_stream_needle", "query_text"),
+    ] {
+        let found = debug_events
+            .iter()
+            .find(|e| {
+                e.fields
+                    .get("event_type")
+                    .is_some_and(|t| t.contains(event_type))
+                    && e.fields.values().any(|v| v.contains(sentinel))
+            })
+            .unwrap_or_else(|| panic!("{sentinel} recoverable at debug via {event_type}"));
+        assert_eq!(found.level, "DEBUG");
+        assert!(
+            found.fields.contains_key("query_id"),
+            "{event_type} is keyed on query_id: {found:?}"
+        );
+    }
+}
+
 // -- schema endpoint tests ---------------------------------------------------
 
 /// The fixture corpus is dated 2024-01-15 — years outside the default

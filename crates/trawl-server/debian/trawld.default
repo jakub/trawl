@@ -1,7 +1,13 @@
 # Environment overrides for trawld
 # Uncomment and modify as needed.
 
-# RUST_LOG=trawld=info
+# Tracing filter. The commented value below is the built-in default —
+# trawl_server is the library target, trawld the binary's own events,
+# fleet_auth the auth middleware, auth.backend / storage.backend the
+# deliberately-overridden backend alarm targets, and preauth.transport the
+# accept loop's TLS handshake / connection diagnostics. Keep all six when
+# customizing, or backend and transport errors become invisible.
+# RUST_LOG=trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info
 
 # Postgres DSNs (take precedence over trawld.toml; keep credentials here
 # if you prefer them out of the config file — this file is 0640 root:trawl).

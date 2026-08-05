@@ -317,6 +317,7 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `web.bindAddr` | string | `0.0.0.0:8090` | Bind address for trawl-web (pod-IP reachable) |
 | `web.sessionTtlSecs` | int | `86400` | Browser session lifetime (seconds) |
 | `web.allowInsecureCookies` | bool | `false` | Drop `Secure` flag on session cookies (behind TLS-terminating ingress only) |
+| `web.logLevel` | string | `trawl_web=info,fleet_auth=info` | RUST_LOG for the sidecar (the trawld `logLevel` names no trawl-web target) |
 | `web.resources` | object | cpu 50m / mem 64Mi–256Mi | Resource requests/limits for the sidecar |
 | `web.cookieSecret.existingSecret` | string | `""` | Name of a pre-existing Secret holding the cookie key (chart generates one when empty) |
 | `web.cookieSecret.existingSecretKey` | string | `cookie.key` | Key within the Secret that holds the 32-byte AEAD key |
@@ -356,5 +357,5 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `resources.requests.cpu` | string | `250m` | CPU request |
 | `resources.requests.memory` | string | `512Mi` | Memory request |
 | `resources.limits.memory` | string | `2Gi` | Memory limit |
-| `logLevel` | string | `trawl_server=info` | RUST_LOG value |
+| `logLevel` | string | `trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info` | RUST_LOG for the trawld container (keep the backend alarm and preauth.transport targets when customizing) |
 | `serviceMonitor.enabled` | bool | `false` | Create prometheus-operator ServiceMonitor |
