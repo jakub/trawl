@@ -907,6 +907,242 @@ fn cast_text_patterns_match_bigint_text_form() {
     );
 }
 
+/// The BIGINT pin's pattern text is the CONFORMED integer's rendering, and
+/// the live mirror (`compare::try_cast_bigint`) must read the same value
+/// out of the same wire text — stringifying the wire text instead answers
+/// `status=0*` TRUE for a stored 404 and `status=a*` TRUE for a value the
+/// column stores as NULL.
+#[test]
+fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let inputs = [
+        // Plain integers, incl. the leading-zero case the wire text and the
+        // stored value spell differently.
+        "404",
+        "0404",
+        "00200",
+        "+5",
+        "-0",
+        "9223372036854775807",
+        "-9223372036854775808",
+        // Whitespace and `_` separators, as for the DOUBLE domain.
+        " 404 ",
+        "\t404\n",
+        "404_000",
+        "1_0",
+        "1_0.5",
+        "1e1_0",
+        // Fractional / exponent texts ROUND, half AWAY FROM ZERO.
+        "1.5",
+        "1.4",
+        "2.5",
+        "3.5",
+        "-1.5",
+        "-2.5",
+        "0.5",
+        "-0.5",
+        ".5",
+        "1.",
+        "0.0",
+        "1e3",
+        "1.9e2",
+        "1e18",
+        "1.5e18",
+        "1.0000000000000001",
+        // Radix prefixes bind on the raw text: no sign, no whitespace.
+        "0x10",
+        "0X10",
+        "0b101",
+        "0B101",
+        "-0x10",
+        " 0x10 ",
+        "0xzz",
+        "0x+10",
+        "0x1.5",
+        "0o17",
+        "010",
+        // No reading at all.
+        "accepted",
+        "",
+        "true",
+        "nan",
+        "inf",
+        "1,000",
+        "4 04",
+        "\u{a0}404",
+        "1e",
+        "e1",
+        "-",
+        // Out of BIGINT range: NULL, never a saturated approximation.
+        "9223372036854775808",
+        "-9223372036854775809",
+        "1e19",
+        "1e400",
+    ];
+    for input in inputs {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT CAST(TRY_CAST(? AS BIGINT) AS VARCHAR)",
+                [input],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let live = trawl_core::compare::try_cast_bigint(input).map(|i| i.to_string());
+        assert_eq!(live, sql, "BIGINT pattern text disagrees for {input:?}");
+    }
+
+    // Documented residual: the fractional rung reads through f64, so a
+    // fractional text within a half-ULP of ±2^63 loses to DuckDB's exact
+    // decimal rounding. Integer texts — what a BIGINT-pinned field
+    // actually carries — are exact across the whole range (above).
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT CAST(TRY_CAST('9223372036854775807.4' AS BIGINT) AS VARCHAR)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sql.as_deref(), Some("9223372036854775807"));
+    assert_eq!(
+        trawl_core::compare::try_cast_bigint("9223372036854775807.4"),
+        None
+    );
+
+    // The whole point: a stored 404 renders `404`, so the wire text's own
+    // leading zero matches on neither side.
+    let matched: bool = conn
+        .query_row(
+            "SELECT CAST(TRY_CAST('0404' AS BIGINT) AS VARCHAR) GLOB '0*'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!matched, "the stored BIGINT is 404, so `0*` misses");
+}
+
+/// A JSON number `read_json` typed DOUBLE still conforms to a BIGINT pin —
+/// and that cast rounds half to EVEN, where the VARCHAR cast above rounds
+/// half AWAY FROM ZERO. Two rungs, two roundings, both mirrored.
+#[test]
+fn double_to_bigint_rounds_half_to_even_on_both_engines() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let inputs = [
+        1.5,
+        2.5,
+        3.5,
+        -1.5,
+        -2.5,
+        0.4,
+        -0.4,
+        0.0,
+        -0.0,
+        200.0,
+        1e18,
+        1e19,
+        1e300,
+        9.223_372_036_854_776e18,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for input in inputs {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT CAST(TRY_CAST(CAST(? AS DOUBLE) AS BIGINT) AS VARCHAR)",
+                [input],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let live = trawl_core::compare::double_to_bigint(input).map(|i| i.to_string());
+        assert_eq!(live, sql, "DOUBLE→BIGINT disagrees for {input}");
+    }
+    // The two rungs really do disagree on a tie, so the mirror cannot
+    // share one rounding rule.
+    assert_eq!(trawl_core::compare::double_to_bigint(2.5), Some(2));
+    assert_eq!(trawl_core::compare::try_cast_bigint("2.5"), Some(3));
+}
+
+/// The BOOLEAN pin's pattern text is `true`/`false`, lowercase, over a
+/// closed vocabulary — a wire `"TRUE"` stores as `true`, so a matcher that
+/// stringified the wire value would answer `flag=TRUE*` TRUE where the
+/// batch query answers FALSE.
+#[test]
+fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let texts = [
+        "true",
+        "TRUE",
+        "True",
+        "tRuE",
+        "t",
+        "T",
+        "yes",
+        "yEs",
+        "Y",
+        "y",
+        "1",
+        "false",
+        "FALSE",
+        "f",
+        "F",
+        "no",
+        "nO",
+        "N",
+        "n",
+        "0", // Outside the vocabulary: NULL.
+        "on",
+        "off",
+        "",
+        " true ",
+        "\ttrue\n",
+        "accepted",
+        "2",
+        "-1",
+        "1.0",
+        "01",
+        "+1",
+        "true1",
+        "\u{a0}true",
+    ];
+    for input in texts {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT CAST(TRY_CAST(? AS BOOLEAN) AS VARCHAR)",
+                [input],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let live = trawl_core::compare::try_cast_boolean(input).map(|b| b.to_string());
+        assert_eq!(live, sql, "BOOLEAN pattern text disagrees for {input:?}");
+    }
+
+    // A numeric wire value is its zero test — total, so it never NULLs out.
+    for input in [1.0, 0.0, -0.0, 2.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT CAST(TRY_CAST(CAST(? AS DOUBLE) AS BOOLEAN) AS VARCHAR)",
+                [input],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let live = trawl_core::compare::double_to_boolean(input).to_string();
+        assert_eq!(Some(live), sql, "DOUBLE→BOOLEAN disagrees for {input}");
+    }
+
+    // The whole point: a stored `true` renders lowercase.
+    let matched: bool = conn
+        .query_row(
+            "SELECT CAST(TRY_CAST('TRUE' AS BOOLEAN) AS VARCHAR) GLOB 'TRUE*'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !matched,
+        "the stored BOOLEAN renders `true`, so `TRUE*` misses"
+    );
+}
+
 /// The DOUBLE pin's pattern text is `DuckDB`'s DOUBLE rendering, and the
 /// live mirror (`compare::canonical_double_text`) must produce the same
 /// string for the same stored value — the wire number's own

@@ -325,13 +325,12 @@ fn compile_token(
             let pin = pins.pin_for(&ff.field);
             // Glob/regex match ONE canonical text per pin, resolved by the
             // shared rule table: plain stringification mirrors the SQL
-            // side's column / `CAST(col AS VARCHAR)`, a TIMESTAMP pin
-            // renders RFC 3339 microseconds on both sides so a pattern
-            // anchored on the separator, the zone suffix or the fraction
-            // cannot mean one thing live and another in batch, and a
-            // DOUBLE pin renders `DuckDB`'s DOUBLE text so `dur=/^200$/`
-            // cannot match a wire `200` live and miss the stored
-            // `200.0`. All three
+            // side's bare column only where there is no pin to conform to
+            // (unpinned, VARCHAR), and every typed pin renders the value's
+            // own cast reading — RFC 3339 microseconds for TIMESTAMP,
+            // `DuckDB`'s DOUBLE text for DOUBLE, the conformed integer for
+            // BIGINT, lowercase `true`/`false` for BOOLEAN — so a pattern
+            // cannot mean one thing live and another in batch. All four
             // are corroborated by execution probes in
             // trawl-engine/tests/duckdb_probe.rs, not assumed.
             let form = compare::pattern_form(pin);
@@ -663,20 +662,34 @@ fn extract_f64(v: &Value) -> Option<f64> {
 /// The text a glob/regex matches for one event value, under the pin's
 /// pattern form — the in-memory mirror of the SQL side's `pattern_target`.
 ///
-/// `None` is a NULL pattern target: only the TIMESTAMP and DOUBLE pins
-/// can produce one, for a value the matching `TRY_CAST` would also null
-/// out (a non-string JSON value for TIMESTAMP; a value with no numeric
-/// reading for DOUBLE), which is exactly what conformance already wrote
-/// to disk.
+/// `None` is a NULL pattern target: every typed pin can produce one, for a
+/// value the matching `TRY_CAST` would also null out (a non-string JSON
+/// value for TIMESTAMP; a value with no numeric reading for DOUBLE or
+/// BIGINT; a value outside the boolean vocabulary for BOOLEAN), which is
+/// exactly what conformance already wrote to disk.
 ///
-/// The DOUBLE reading mirrors what conformance stored, not what the wire
-/// carried: a JSON number is its own double, a JSON string goes through
-/// `DuckDB`'s cast domain ([`compare::try_cast_double`], so `"200"` is the
-/// same `200.0` the guarded conform wrote), and anything else — bool,
-/// array, object — is the NULL that cast writes.
+/// Each typed reading mirrors what conformance stored, not what the wire
+/// carried — the wire text is only the same string when the value already
+/// reads as its pin, and the divergences are silent (a live tail firing on
+/// events the equivalent batch query drops):
+///
+/// - DOUBLE: a JSON number is its own double, a JSON string goes through
+///   `DuckDB`'s cast domain ([`compare::try_cast_double`], so `"200"` is
+///   the same `200.0` the conform wrote);
+/// - BIGINT: a JSON integer is itself, a JSON fractional number rounds
+///   half to even and a JSON string goes through the wider VARCHAR domain
+///   ([`compare::try_cast_bigint`], so `"0404"` globs as `404`);
+/// - BOOLEAN: a JSON bool is itself, a number is its zero test and a
+///   string goes through `DuckDB`'s boolean vocabulary
+///   ([`compare::try_cast_boolean`], so `"TRUE"` globs as `true`).
+///
+/// A JSON bool under a numeric pin reads 1/0, which is its cast in both
+/// inference classes that keep it a bool (BOOLEAN, JSON); an array or
+/// object — stringified at ingest, so never a pinned column's live shape —
+/// is the NULL that cast writes.
 fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
     match form {
-        PatternForm::Native | PatternForm::CastText => Some(json_to_string(v)),
+        PatternForm::Native => Some(json_to_string(v)),
         PatternForm::Rfc3339Text => match v {
             Value::String(s) => compare::canonical_timestamp_text(s),
             _ => None,
@@ -684,9 +697,26 @@ fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
         PatternForm::DoubleText => match v {
             Value::Number(n) => n.as_f64(),
             Value::String(s) => compare::try_cast_double(s),
+            Value::Bool(b) => Some(f64::from(u8::from(*b))),
             _ => None,
         }
         .map(compare::canonical_double_text),
+        PatternForm::BigIntText => match v {
+            Value::Number(n) => n
+                .as_i64()
+                .or_else(|| n.as_f64().and_then(compare::double_to_bigint)),
+            Value::String(s) => compare::try_cast_bigint(s),
+            Value::Bool(b) => Some(i64::from(*b)),
+            _ => None,
+        }
+        .map(|i| i.to_string()),
+        PatternForm::BooleanText => match v {
+            Value::Bool(b) => Some(*b),
+            Value::Number(n) => n.as_f64().map(compare::double_to_boolean),
+            Value::String(s) => compare::try_cast_boolean(s),
+            _ => None,
+        }
+        .map(|b| b.to_string()),
     }
 }
 

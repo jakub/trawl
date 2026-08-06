@@ -15,12 +15,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `status>=400` compares **numerically** via `TRY_CAST(col AS DOUBLE)` —
   `"404"` matches, `"accepted"` quietly doesn't, and nothing errors where the
   pin-blind emission previously threw a Conversion/Binder error. Glob and
-  regex against numeric/boolean pins match the value's text form
-  (`status=4*` finds 404 in a BIGINT column; previously a hard error) —
-  for a **double** pin that text is DuckDB's own double rendering, which
-  always carries a fraction and a signed two-digit exponent (`200.0`,
-  `1e-07`), so `dur=/^200$/` matches nothing on either side while
-  `dur=/^200\.0$/` matches both — and
+  regex against numeric/boolean pins match the **stored** value's text
+  form (`status=4*` finds 404 in a BIGINT column; previously a hard
+  error) — which is not always how the event spelled it: a wire `"0404"`
+  is stored as the integer 404 (so `status=0*` matches nothing),
+  `"accepted"` under an integer pin is stored as NULL, a **boolean** pin
+  renders the lowercase word whatever the wire case was (`"TRUE"` is
+  `true`, so `flag=TRUE*` matches nothing and `flag=/^true$/` matches
+  everything truthy), and for a **double** pin that text is DuckDB's own
+  double rendering, which always carries a fraction and a signed
+  two-digit exponent (`200.0`, `1e-07`), so `dur=/^200$/` matches nothing
+  on either side while `dur=/^200\.0$/` matches both — and
   against a **timestamp** pin they match the RFC 3339 UTC-microsecond form
   the event carries on the wire (`_time=/T09:/`, `_time=/\.123456Z$/`) —
   the same text batch and live, not DuckDB's space-separated rendering.

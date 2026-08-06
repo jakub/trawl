@@ -247,10 +247,13 @@ fn emit_search_token(
 fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalType>) -> String {
     match compare::pattern_form(pin) {
         PatternForm::Native => field.to_owned(),
-        // A DOUBLE column's own CAST rendering IS its canonical pattern
-        // text (`200.0`, `1e-07`); the live side mirrors that rendering
-        // rather than the wire number's stringification.
-        PatternForm::CastText | PatternForm::DoubleText => format!("CAST({field} AS VARCHAR)"),
+        // A conformed column's own CAST rendering IS its canonical pattern
+        // text (`404`, `true`, `200.0`, `1e-07`); the live side mirrors
+        // that rendering over the value's cast reading rather than
+        // stringifying the wire value.
+        PatternForm::BigIntText | PatternForm::BooleanText | PatternForm::DoubleText => {
+            format!("CAST({field} AS VARCHAR)")
+        }
         PatternForm::Rfc3339Text => {
             format!(
                 "strftime({field}, '{}')",

@@ -1077,3 +1077,116 @@ fn pinned_hot_cold_union_parity() {
         );
     }
 }
+
+/// Assert filter and hot-only SQL agree for one (dsl, event, pins) triple.
+///
+/// The hot-only lane is the SSE filter's own corpus: the same event the
+/// matcher sees, read back through the `REPLACE` conformance
+/// (`TRY_CAST(col AS <pin>)`) the executor applies on a cold start. So the
+/// wire value is not spelled out here the way
+/// [`assert_pinned_parity_over_column`] spells the stored column — the
+/// point is precisely that the emitter conforms the SAME bytes the matcher
+/// reads, and the two must still answer alike.
+fn assert_hot_only_parity(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+) {
+    let query = parser::parse(dsl).expect("dsl parses");
+    let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
+    let filter_result = filter.matches(event);
+
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+    tmp.flush().unwrap();
+
+    // hot_pins = pins ∩ the snapshot's keys: the REPLACE list must never
+    // name a column the snapshot does not carry.
+    let mut hot_pins = FieldTypes::new();
+    for (field, ty) in ft.iter() {
+        if event.contains_key(field) {
+            hot_pins.insert(field, ty);
+        }
+    }
+    let emitted = emitter::emit_hot_only(&query, tmp.path().to_str().unwrap(), &hot_pins, ft)
+        .expect("emit succeeds");
+    let sql_result = sql_matches_strict(conn, &emitted);
+
+    assert_eq!(
+        filter_result, sql_result,
+        "hot-only pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nsql: {}\nparams: {:?}",
+        emitted.sql, emitted.params
+    );
+}
+
+/// Patterns over the hot-only lane, where the matcher and the query read
+/// the SAME event — the strictest form of the batch/live contract, and the
+/// one that catches a pattern text taken from the wire instead of from the
+/// conformed value.
+///
+/// Every case here diverged before the typed pattern texts landed: the
+/// matcher globbed `accepted` / `0404` / `TRUE` / `1.50` while the query
+/// globbed the conformed `NULL` / `404` / `true` / `1.5`, so a live tail
+/// fired on events the equivalent `/api/v1/query` dropped.
+#[test]
+fn pinned_hot_only_pattern_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let patterns = [
+        "status=4*",
+        "status=0*",
+        "status=a*",
+        "status=t*",
+        "status=T*",
+        "status=1*",
+        "status=/acc.*/",
+        "status=/^404$/",
+        "status=/^true$/",
+        r"status=/^1\.5$/",
+        "status=/^2$/",
+        "NOT status=4*",
+        "NOT status=a*",
+        "NOT status=/^true$/",
+    ];
+    // (pin, wire value the matcher AND the query both read)
+    let cases = [
+        // The reported BIGINT divergences: a non-numeric text conforms to
+        // NULL, a leading-zero text conforms to a differently-spelled
+        // integer, and the control (a wire integer) must keep matching.
+        (CanonicalType::BigInt, Value::from("accepted")),
+        (CanonicalType::BigInt, Value::from("0404")),
+        (CanonicalType::BigInt, Value::from(404)),
+        (CanonicalType::BigInt, Value::from("1.5")),
+        (CanonicalType::BigInt, Value::from(2.5)),
+        (CanonicalType::BigInt, Value::from(true)),
+        (CanonicalType::BigInt, Value::Null),
+        // BOOLEAN: the vocabulary is case-insensitive, the rendering is not.
+        (CanonicalType::Boolean, Value::from("TRUE")),
+        (CanonicalType::Boolean, Value::from(true)),
+        (CanonicalType::Boolean, Value::from(false)),
+        (CanonicalType::Boolean, Value::from("no")),
+        (CanonicalType::Boolean, Value::from("1")),
+        (CanonicalType::Boolean, Value::from("accepted")),
+        (CanonicalType::Boolean, Value::Null),
+        // DOUBLE, already typed-text: a trailing zero in the wire text is
+        // not in DuckDB's rendering.
+        (CanonicalType::Double, Value::from("1.50")),
+        (CanonicalType::Double, Value::from(404)),
+        // VARCHAR and unpinned keep the wire text on both sides.
+        (CanonicalType::Varchar, Value::from("0404")),
+        (CanonicalType::Varchar, Value::from("accepted")),
+    ];
+    for (pin, wire) in cases {
+        let ft = pinned(&[("status", pin)]);
+        let mut event = status_event(&wire);
+        // The REPLACE list always names both envelope timestamps.
+        event.insert("_time".into(), Value::from("2026-01-01T12:00:00Z"));
+        event.insert("_ingested".into(), Value::from("2026-01-01T12:00:01Z"));
+        for dsl in patterns {
+            assert_hot_only_parity(&conn, dsl, &event, &ft);
+        }
+    }
+}

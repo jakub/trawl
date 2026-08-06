@@ -53,8 +53,19 @@ comparison means the same thing whatever the query literal looks like:
   *above* every number, so it matches `status>400`.
 - **VARCHAR-pinned field, ordered comparison with a non-numeric
   literal** — lexical string comparison, unchanged.
-- **Integer/boolean-pinned field, glob or regex** — matches the value's
-  **text form** (`status=4*` finds 404 in a BIGINT column).
+- **Integer-pinned field, glob or regex** — matches the **stored
+  integer's** text form, which is not always how the event spelled it:
+  `status=4*` finds 404 in a BIGINT column, and a wire `"0404"` is stored
+  as 404, so it matches `status=4*` and *not* `status=0*`. A value with no
+  integer reading (`"accepted"`) is stored as NULL and is *unknown*, not
+  false.
+- **Boolean-pinned field, glob or regex** — matches `true`/`false`,
+  lowercase. DuckDB's boolean vocabulary is case-insensitive and wider
+  than the wire spelling (`"TRUE"`, `"t"`, `"yes"`, `"1"` all store as
+  `true`), but the *stored* text is always the lowercase word — so
+  `flag=/^true$/` matches all of them and `flag=TRUE*` matches none. A
+  value outside the vocabulary is stored as NULL and is *unknown*, not
+  false.
 - **Double-pinned field, glob or regex** — matches the value's text form
   too, but a double's text form is not what the event's JSON looked like:
   it always carries a fraction, and switches to a signed, two-digit
