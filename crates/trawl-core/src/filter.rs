@@ -357,9 +357,17 @@ fn compile_token(
                 },
             };
             Some(TokenMatcher::Field(FieldMatcher {
-                // `timestamp`/`@timestamp` alias the physical `_time` key,
-                // matching the SQL emitter's quote_field mapping.
-                field: crate::schema::resolve_field_alias(&ff.field).to_owned(),
+                // The event key is the SAME `catalog_key` the pin lookup
+                // used: `timestamp`/`@timestamp` alias the physical `_time`
+                // key (matching the SQL emitter's quote_field mapping), and
+                // the ASCII fold mirrors DuckDB binding `"Status"` to the
+                // real `status` column. Ingest folds every incoming field
+                // name, so an exact lookup on the folded spelling is the
+                // one that finds the value — without the fold a mixed-case
+                // reference would read every event as a NULL column, which
+                // `!=` reports as a match (`OR col IS NULL`): live tail
+                // would stream everything while `/query` returned nothing.
+                field: crate::schema::catalog_key(&ff.field),
                 predicate,
             }))
         }
@@ -1277,13 +1285,35 @@ mod tests {
 
     #[test]
     fn pinned_lookup_is_case_folded() {
-        // `Status` names the same folded catalog entry as `status`. The
-        // JSON-null-under-`!=` outcome is only reachable through the pin
-        // (unpinned Int coercion excludes nulls), so a match proves the
-        // mixed-case reference found the folded pin.
+        // Both halves fold, over an event whose key is spelled the way
+        // ingest actually writes it (lowercase). The EVENT lookup: DuckDB
+        // binds `"Status"` to the real `status` column, so a mixed-case
+        // reference must read the value, not an absent key — and `!=` over
+        // an absent key is a MATCH (`OR col IS NULL`), so a fold miss here
+        // streams every event live while `/query` returns none.
+        assert!(matches_event_pinned(
+            "Status=200",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "Status!=200",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        // The PIN lookup: "0200" is text-unequal to "200" but numerically
+        // equal, so only the VARCHAR pin's text comparison rejects it —
+        // a miss would fall back to the unpinned Int coercion and match.
+        assert!(!matches_event_pinned(
+            "Status=200",
+            r#"{"status": "0200"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(matches_event("status=200", r#"{"status": "0200"}"#));
+        // A JSON null still matches `!=` through the folded key.
         assert!(matches_event_pinned(
             "Status!=200",
-            r#"{"Status": null}"#,
+            r#"{"status": null}"#,
             VARCHAR_STATUS
         ));
     }

@@ -766,6 +766,45 @@ fn pinned_bigint_pattern_parity() {
     }
 }
 
+/// A mixed-case DSL reference names ONE column on both sides: `DuckDB`
+/// folds `"Status"` onto the physical `status`, and ingest folds every
+/// incoming field name, so the matcher must read the same folded key.
+///
+/// Absent-key `!=` is a MATCH (`OR col IS NULL`), so a matcher that reads
+/// `Status` verbatim sees a NULL column on EVERY event and fires on all of
+/// them while the batch query returns only the real non-matching rows —
+/// which is why this runs against `DuckDB` rather than asserting a shape.
+#[test]
+fn mixed_case_field_reference_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+    let dsls = [
+        "Status=200",
+        "Status!=200",
+        "STATUS!=200",
+        "Status=200,301",
+        "Status>=400",
+        "Status=2*",
+        "Status=/2.*/",
+        "NOT Status!=200",
+    ];
+    let values = [
+        Value::String("200".into()),
+        Value::String("404".into()),
+        Value::String("accepted".into()),
+        Value::Null,
+    ];
+    let events = values
+        .iter()
+        .map(status_event)
+        .chain(std::iter::once(absent_status_event()));
+    for event in events {
+        for dsl in dsls {
+            assert_pinned_parity(&conn, dsl, &event, &ft);
+        }
+    }
+}
+
 /// Patterns over a TIMESTAMP-pinned column: batch renders the canonical
 /// RFC 3339 microsecond text through `strftime`, the live matcher renders
 /// the same text from the wire value, so a pattern anchored on the
