@@ -46,7 +46,11 @@ comparison means the same thing whatever the query literal looks like:
   matches `"404"`/`"500"`, and non-numeric values like `"accepted"`
   simply don't match (they never error the query). A value the cast
   can't answer is *unknown*, not *false*, exactly as in SQL — so
-  `NOT status>=400` doesn't match those rows either.
+  `NOT status>=400` doesn't match those rows either. "Numeric" here is
+  the cast's own reading, which is a little wider than it looks:
+  surrounding whitespace is ignored (`" 200"` is 200), `_` between
+  digits is a separator (`"200_000"` is 200000), and `"nan"` sorts
+  *above* every number, so it matches `status>400`.
 - **VARCHAR-pinned field, ordered comparison with a non-numeric
   literal** — lexical string comparison, unchanged.
 - **Numeric/boolean-pinned field, glob or regex** — matches the value's

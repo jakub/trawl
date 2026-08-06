@@ -711,6 +711,138 @@ fn varchar_try_cast_double_orders_numerically_and_nulls_words() {
     );
 }
 
+/// The ordered-numeric rung's DOMAIN, run on both engines side by side:
+/// `TRY_CAST(v AS DOUBLE)` in `DuckDB` against `compare::try_cast_double`
+/// in the live matcher. `str::parse::<f64>` is NOT that domain — `DuckDB`
+/// trims ASCII whitespace and honours `_` digit separators — and every
+/// disagreement costs the stream a row the batch query returns.
+#[test]
+fn try_cast_double_domain_matches_the_live_mirror() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let inputs = [
+        // Whitespace: trimmed both ends, ASCII only (\x0b included, which
+        // Rust's is_ascii_whitespace excludes; U+00A0 is not whitespace).
+        " 200",
+        "200 ",
+        "\t200\n",
+        "\r200\r",
+        "\x0b200\x0c",
+        "  200  ",
+        "\u{a0}200",
+        "\u{2000}200",
+        "2 00",
+        " ",
+        "",
+        // `_` digit separators: only between ASCII digits.
+        "200_000",
+        "1_000.5",
+        "1_0",
+        "-1_0",
+        "+1_0",
+        "1.0_0",
+        "1e1_0",
+        " 1_0 ",
+        "1_0.0_1e1_0",
+        "_200",
+        "200_",
+        "1__0",
+        "1._5",
+        "1.5_",
+        "1_.5",
+        "1_e3",
+        "1e_3",
+        "_",
+        // Shapes the two engines already agree on.
+        "200",
+        "1.5",
+        "-0.5",
+        "+5",
+        "1.",
+        ".5",
+        "-.5",
+        "1e3",
+        "1E3",
+        "1e+3",
+        "1e-3",
+        "00200",
+        "1e400",
+        "-1e400",
+        "1e-400",
+        "nan",
+        "-NAN",
+        "+nan",
+        "inf",
+        "-inf",
+        "infinity",
+        "0x10",
+        "0b101",
+        "1,000",
+        "1d",
+        "true",
+        "1.5e2.5",
+        "1-",
+        "accepted",
+    ];
+    for input in inputs {
+        let sql: Option<f64> = conn
+            .query_row("SELECT TRY_CAST(? AS DOUBLE)", [input], |row| row.get(0))
+            .unwrap();
+        let live = trawl_core::compare::try_cast_double(input);
+        // NaN != NaN, so compare bit patterns, not values.
+        assert_eq!(
+            sql.map(f64::to_bits).is_some(),
+            live.map(f64::to_bits).is_some(),
+            "cast domain disagrees for {input:?}: sql={sql:?} live={live:?}"
+        );
+        if let (Some(sql), Some(live)) = (sql, live) {
+            assert!(
+                sql.to_bits() == live.to_bits() || (sql.is_nan() && live.is_nan()),
+                "cast value disagrees for {input:?}: sql={sql:?} live={live:?}"
+            );
+        }
+    }
+}
+
+/// `DuckDB`'s DOUBLE ordering is TOTAL — NaN sits above every value
+/// (including `inf`) and equals itself, `-0.0` equals `0.0` — where
+/// Rust's own operators answer FALSE to every NaN comparison. So a
+/// stored `'nan'` matches `dur>1` in batch and must match live too:
+/// `compare::double_cmp` is that ordering.
+#[test]
+fn double_ordering_is_total_with_nan_on_top() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let vals = [
+        ("'nan'", f64::NAN),
+        ("'inf'", f64::INFINITY),
+        ("'-inf'", f64::NEG_INFINITY),
+        ("1.0", 1.0),
+        ("-1e308", -1e308),
+        ("'-0'", -0.0),
+        ("0.0", 0.0),
+    ];
+    for (a_sql, a) in vals {
+        for (b_sql, b) in vals {
+            let sql: (bool, bool, bool) = conn
+                .query_row(
+                    &format!(
+                        "SELECT CAST({a_sql} AS DOUBLE) > CAST({b_sql} AS DOUBLE), \
+                                CAST({a_sql} AS DOUBLE) < CAST({b_sql} AS DOUBLE), \
+                                CAST({a_sql} AS DOUBLE) = CAST({b_sql} AS DOUBLE)"
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let ord = trawl_core::compare::double_cmp(a, b);
+            assert_eq!(
+                (ord.is_gt(), ord.is_lt(), ord.is_eq()),
+                sql,
+                "ordering disagrees for {a_sql} vs {b_sql}"
+            );
+        }
+    }
+}
+
 /// Why DOUBLE uniformly and never a per-literal BIGINT domain:
 /// `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2, so a BIGINT domain would make
 /// `dur>1` and `dur>1.5` disagree about the same stored value. DOUBLE

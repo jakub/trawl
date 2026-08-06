@@ -1003,35 +1003,14 @@ fn eval_tonumber(args: &[EvalValue]) -> EvalValue {
     match args.first() {
         Some(EvalValue::Int(n)) => EvalValue::Float(*n as f64),
         Some(EvalValue::Float(n)) => EvalValue::Float(*n),
-        Some(EvalValue::Str(s)) => strip_digit_separators(s.trim())
-            .parse::<f64>()
-            .map_or(EvalValue::Null, EvalValue::Float),
+        // One owner for the cast domain — whitespace trimming and `_`
+        // digit separators alike (see `compare::try_cast_double`), so the
+        // scalar and the search stage's ordered-numeric rung can't drift.
+        Some(EvalValue::Str(s)) => {
+            crate::compare::try_cast_double(s).map_or(EvalValue::Null, EvalValue::Float)
+        }
         None | Some(_) => EvalValue::Null,
     }
-}
-
-/// Remove ASCII digit separators (`_`) the way `DuckDB`'s `TRY_CAST(... AS
-/// DOUBLE)` does: a `_` is honored ONLY when it has an ASCII digit immediately
-/// before AND immediately after it. Any other `_` is left in place so the
-/// subsequent `f64::parse` rejects it (returning `Null`), exactly matching
-/// `DuckDB`: `1_000` -> `1000`, `1_0.0_5` -> `10.05`, but `_1000` / `1000_` /
-/// `1__000` / `1_e3` / `1,000` all stay unparseable.
-fn strip_digit_separators(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    for (i, ch) in s.char_indices() {
-        // `_` is single-byte ASCII, so `i` is a valid index into `bytes` and
-        // the neighbour checks stay on byte boundaries.
-        if ch == '_'
-            && i > 0
-            && bytes[i - 1].is_ascii_digit()
-            && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
-        {
-            continue; // drop the honored separator
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// `tostring(x)` — mirrors `CAST(x AS VARCHAR)`.

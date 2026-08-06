@@ -30,6 +30,12 @@
 //! `status>"400"` is indistinguishable from `status>400`. Documented, not
 //! fixed here (fixing it is a parser change, out of slice-A scope).
 //!
+//! The ordered-numeric rung is `DuckDB`'s cast domain, not Rust's float
+//! parser: [`try_cast_double`] and [`double_cmp`] are the live mirrors of
+//! `TRY_CAST(col AS DOUBLE)` and of `DuckDB`'s total DOUBLE ordering, and
+//! every widening they carry (whitespace, `_` separators, NaN ordering)
+//! is a value batch would return and the stream would otherwise drop.
+//!
 //! `DOUBLE` uniformly for the ordered-numeric rule, never `BIGINT`:
 //! `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2 (pinned by
 //! `trawl-engine/tests/duckdb_probe.rs`), so a per-literal-type domain
@@ -172,6 +178,80 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
         Some(CanonicalType::Timestamp) => PatternForm::Rfc3339Text,
         Some(_) => PatternForm::CastText,
     }
+}
+
+/// The DOUBLE `DuckDB` reads out of a stored text under
+/// `TRY_CAST(col AS DOUBLE)` — the live mirror of the ordered-numeric
+/// rung, and deliberately NOT `str::parse::<f64>`.
+///
+/// `DuckDB`'s cast domain is strictly wider than Rust's float parser in
+/// two ways (both executed in `trawl-engine/tests/duckdb_probe.rs`), and
+/// both widen it in the direction that costs live matches: batch returns
+/// the row, the stream drops it.
+///
+/// - ASCII whitespace is trimmed off BOTH ends — space, `\t`, `\n`,
+///   `\r`, `\x0b`, `\x0c` (C `isspace`, so `\x0b` too, which
+///   [`char::is_ascii_whitespace`] excludes), and never a non-ASCII
+///   space like U+00A0. `' 200'` is 200 to `DuckDB`.
+/// - `_` digit separators are accepted strictly BETWEEN ASCII digits:
+///   `'200_000'` is 200000 and `'1e1_0'` is 1e10, while `'_200'`,
+///   `'200_'`, `'1__0'`, `'1._5'` and `'1_e3'` are NULL.
+///
+/// Everything else the two engines already agree on, so the normalized
+/// text goes to Rust's parser verbatim: `nan`/`inf`/`infinity` in any
+/// case and sign, `+5`, `1.`, `.5`, `1e3`, `00200`, and out-of-range
+/// exponents saturating to ±inf / ±0. `None` is the NULL `TRY_CAST`
+/// writes — UNKNOWN, never a false FALSE that `NOT` could invert.
+#[must_use]
+pub fn try_cast_double(text: &str) -> Option<f64> {
+    let trimmed = text.trim_matches(is_c_space);
+    if trimmed.contains('_') {
+        return strip_digit_separators(trimmed)?.parse().ok();
+    }
+    trimmed.parse().ok()
+}
+
+/// C `isspace` over ASCII — what `DuckDB` strips before a numeric cast.
+fn is_c_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+}
+
+/// Remove `_` digit separators, or `None` if any sits somewhere
+/// `DuckDB` refuses it (anywhere but between two ASCII digits).
+fn strip_digit_separators(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    for (idx, ch) in text.char_indices() {
+        if ch != '_' {
+            out.push(ch);
+            continue;
+        }
+        // Byte-indexed neighbours: a multi-byte char's trailing byte is
+        // never an ASCII digit, so a non-digit neighbour is rejected
+        // whatever its encoding.
+        let prev = idx.checked_sub(1).map(|i| bytes[i]);
+        let next = bytes.get(idx + 1).copied();
+        if !prev.is_some_and(|b| b.is_ascii_digit()) || !next.is_some_and(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// `DuckDB`'s ordering over DOUBLE, which is TOTAL: NaN sits above every
+/// other value (including `inf`) and equals itself, while `-0.0` equals
+/// `0.0`. Rust's own operators answer FALSE to every NaN comparison, so
+/// a stored `'nan'` under the ordered-numeric rung matches `dur>1` in
+/// batch and would miss in the stream without this.
+#[must_use]
+pub fn double_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // partial_cmp is None only when a NaN is involved.
+    a.partial_cmp(&b).unwrap_or(match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        _ => Ordering::Less,
+    })
 }
 
 /// Whether the literal's content is numeric, under the same i64-then-f64
@@ -391,6 +471,72 @@ mod tests {
         ] {
             assert_eq!(canonical_timestamp_text(input), None, "{input:?}");
         }
+    }
+
+    // ── the stored-value cast domain mirrors DuckDB ───────────────────
+
+    /// Every expectation here is the value `DuckDB`'s
+    /// `TRY_CAST(v AS DOUBLE)` returns for the same text (executed side
+    /// by side in `trawl-engine/tests/duckdb_probe.rs`).
+    #[test]
+    fn try_cast_double_mirrors_duckdb_cast_domain() {
+        // ASCII whitespace is trimmed off both ends, `\x0b` included.
+        for text in [
+            " 200",
+            "200 ",
+            "\t200\n",
+            "\r200\r",
+            "\x0b200\x0c",
+            "  200  ",
+        ] {
+            assert_eq!(try_cast_double(text), Some(200.0), "{text:?}");
+        }
+        // Non-ASCII spaces are not whitespace to DuckDB.
+        for text in ["\u{a0}200", "\u{2000}200", "2 00", " ", ""] {
+            assert_eq!(try_cast_double(text), None, "{text:?}");
+        }
+        // `_` separators, accepted only between ASCII digits.
+        assert_eq!(try_cast_double("200_000"), Some(200_000.0));
+        assert_eq!(try_cast_double("1_000.5"), Some(1000.5));
+        assert_eq!(try_cast_double("1_0"), Some(10.0));
+        assert_eq!(try_cast_double("-1_0"), Some(-10.0));
+        assert_eq!(try_cast_double("1.0_0"), Some(1.0));
+        assert_eq!(try_cast_double("1e1_0"), Some(1e10));
+        assert_eq!(try_cast_double(" 1_0 "), Some(10.0));
+        for text in [
+            "_200", "200_", "1__0", "1._5", "1.5_", "1_.5", "1_e3", "1e_3", "_",
+        ] {
+            assert_eq!(try_cast_double(text), None, "{text:?}");
+        }
+        // Shapes both engines already agree on, unchanged.
+        assert_eq!(try_cast_double("+5"), Some(5.0));
+        assert_eq!(try_cast_double("1."), Some(1.0));
+        assert_eq!(try_cast_double(".5"), Some(0.5));
+        assert_eq!(try_cast_double("1e3"), Some(1000.0));
+        assert_eq!(try_cast_double("00200"), Some(200.0));
+        assert_eq!(try_cast_double("1e400"), Some(f64::INFINITY));
+        assert!(try_cast_double("nan").is_some_and(f64::is_nan));
+        assert!(try_cast_double("-NAN").is_some_and(f64::is_nan));
+        assert_eq!(try_cast_double("infinity"), Some(f64::INFINITY));
+        for text in ["0x10", "1,000", "1d", "true", "1.5e2.5", "1-"] {
+            assert_eq!(try_cast_double(text), None, "{text:?}");
+        }
+    }
+
+    /// `DuckDB` orders DOUBLE totally: NaN above everything and equal to
+    /// itself, `-0.0` equal to `0.0` (probe-pinned).
+    #[test]
+    fn double_cmp_puts_nan_on_top() {
+        use std::cmp::Ordering;
+        let nan = f64::NAN;
+        assert_eq!(double_cmp(nan, nan), Ordering::Equal);
+        for other in [1.0, 0.0, -1e308, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(double_cmp(nan, other), Ordering::Greater, "{other}");
+            assert_eq!(double_cmp(other, nan), Ordering::Less, "{other}");
+        }
+        assert_eq!(double_cmp(-0.0, 0.0), Ordering::Equal);
+        assert_eq!(double_cmp(f64::INFINITY, 1e308), Ordering::Greater);
+        assert_eq!(double_cmp(1.0, 2.0), Ordering::Less);
     }
 
     // ── the numeric-literal ladder mirrors coerce_filter_value ────────

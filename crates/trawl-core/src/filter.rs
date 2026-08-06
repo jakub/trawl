@@ -437,9 +437,11 @@ fn compile_op(op: FilterOp) -> CompareOp {
 /// - `Native` — today's literal-driven coercion, verbatim.
 /// - `Text` — string comparison against the event value's text form,
 ///   mirroring the SQL side's `col = '200'` on the VARCHAR column.
-/// - `NumericOnText` — float comparison whose non-numeric evaluation
-///   ([`extract_f64`] returning `None`) mirrors `TRY_CAST(col AS DOUBLE)`
-///   degrading to NULL: UNKNOWN, so `NOT` leaves it unmatched.
+/// - `NumericOnText` — float comparison over the value's text form,
+///   read through [`compare::try_cast_double`] so the domain is
+///   `DuckDB`'s cast domain; a value outside it mirrors
+///   `TRY_CAST(col AS DOUBLE)` degrading to NULL: UNKNOWN, so `NOT`
+///   leaves it unmatched.
 fn coerce_form(form: CompareForm) -> CoercedValue {
     match form {
         CompareForm::Native(SqlValue::Int(i)) => CoercedValue::Int(i),
@@ -587,8 +589,9 @@ impl TextMatcher {
 /// - Int filter: try to extract event value as i64 (number or string parse)
 /// - Float filter: try to extract event value as f64
 /// - String filter: compare as strings (convert event value to string if needed)
-/// - `NumericOnText` filter: `TRY_CAST(col AS DOUBLE)` — a value that isn't
-///   numeric is NULL, so the comparison is UNKNOWN
+/// - `NumericOnText` filter: `TRY_CAST(col AS DOUBLE)` over the value's
+///   text form — a value outside `DuckDB`'s cast domain is NULL, so the
+///   comparison is UNKNOWN
 fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -> Truth {
     match filter_val {
         CoercedValue::Int(fv) => {
@@ -611,9 +614,16 @@ fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -
                 Some(false)
             }
         }
-        // The TRY_CAST rung: non-numeric text is NULL, so UNKNOWN — the
-        // one place a non-null event value can still be UNKNOWN.
-        CoercedValue::NumericOnText(fv) => extract_f64(event_val).map(|ev| apply_f64(ev, *fv, op)),
+        // The TRY_CAST rung: the column is VARCHAR under the pin, so the
+        // batch side casts the value's TEXT form — and DuckDB's cast
+        // domain is wider than Rust's float parser (whitespace, `_`
+        // separators) while its DOUBLE ordering is total (NaN above
+        // everything). Both are mirrored in `compare`, or the stream
+        // silently drops rows the batch query returns. Text outside the
+        // domain is NULL, so UNKNOWN — the one place a non-null event
+        // value can still be UNKNOWN.
+        CoercedValue::NumericOnText(fv) => compare::try_cast_double(&json_to_string(event_val))
+            .map(|ev| apply_ord(compare::double_cmp(ev, *fv), op)),
         CoercedValue::Str(fv) => {
             let ev = json_to_string(event_val);
             Some(apply_ord(ev.as_str().cmp(fv.as_str()), op))

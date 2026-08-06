@@ -657,6 +657,20 @@ fn pinned_varchar_matrix_parity() {
         Value::String("accepted".into()),
         Value::String("0".into()),
         Value::String("1.5".into()),
+        // Values inside DuckDB's TRY_CAST(… AS DOUBLE) domain but outside
+        // `str::parse::<f64>` — batch counts them as numbers, so the live
+        // matcher must too (whitespace, `_` separators). 'nan' additionally
+        // orders ABOVE every literal in DuckDB's total DOUBLE ordering
+        // where Rust's operators answer false.
+        Value::String(" 200".into()),
+        Value::String("200_000".into()),
+        Value::String("nan".into()),
+        Value::String("inf".into()),
+        Value::String("-inf".into()),
+        Value::String("+5".into()),
+        Value::String("1e3".into()),
+        // Outside both domains: still UNKNOWN on both sides.
+        Value::String("0x10".into()),
         Value::Null,
     ];
     let dsls = [
