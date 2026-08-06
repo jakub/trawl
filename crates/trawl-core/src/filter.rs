@@ -325,10 +325,13 @@ fn compile_token(
             let pin = pins.pin_for(&ff.field);
             // Glob/regex match ONE canonical text per pin, resolved by the
             // shared rule table: plain stringification mirrors the SQL
-            // side's column / `CAST(col AS VARCHAR)`, and a TIMESTAMP pin
+            // side's column / `CAST(col AS VARCHAR)`, a TIMESTAMP pin
             // renders RFC 3339 microseconds on both sides so a pattern
             // anchored on the separator, the zone suffix or the fraction
-            // cannot mean one thing live and another in batch. Both halves
+            // cannot mean one thing live and another in batch, and a
+            // DOUBLE pin renders `DuckDB`'s DOUBLE text so `dur=/^200$/`
+            // cannot match a wire `200` live and miss the stored
+            // `200.0`. All three
             // are corroborated by execution probes in
             // trawl-engine/tests/duckdb_probe.rs, not assumed.
             let form = compare::pattern_form(pin);
@@ -660,10 +663,17 @@ fn extract_f64(v: &Value) -> Option<f64> {
 /// The text a glob/regex matches for one event value, under the pin's
 /// pattern form — the in-memory mirror of the SQL side's `pattern_target`.
 ///
-/// `None` is a NULL pattern target: only a TIMESTAMP pin can produce one,
-/// for a value `DuckDB`'s `TRY_CAST(… AS TIMESTAMP)` would also null out
-/// (a non-string JSON value, or text with no timestamp reading), which is
-/// exactly what conformance already wrote to disk.
+/// `None` is a NULL pattern target: only the TIMESTAMP and DOUBLE pins
+/// can produce one, for a value the matching `TRY_CAST` would also null
+/// out (a non-string JSON value for TIMESTAMP; a value with no numeric
+/// reading for DOUBLE), which is exactly what conformance already wrote
+/// to disk.
+///
+/// The DOUBLE reading mirrors what conformance stored, not what the wire
+/// carried: a JSON number is its own double, a JSON string goes through
+/// `DuckDB`'s cast domain ([`compare::try_cast_double`], so `"200"` is the
+/// same `200.0` the guarded conform wrote), and anything else — bool,
+/// array, object — is the NULL that cast writes.
 fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
     match form {
         PatternForm::Native | PatternForm::CastText => Some(json_to_string(v)),
@@ -671,6 +681,12 @@ fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
             Value::String(s) => compare::canonical_timestamp_text(s),
             _ => None,
         },
+        PatternForm::DoubleText => match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => compare::try_cast_double(s),
+            _ => None,
+        }
+        .map(compare::canonical_double_text),
     }
 }
 

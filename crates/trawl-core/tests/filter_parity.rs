@@ -643,6 +643,47 @@ fn assert_pinned_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>
     );
 }
 
+/// Assert filter and pin-aware SQL agree for one (dsl, event, pins)
+/// triple over a source whose `status` column is written by an explicit
+/// SQL expression.
+///
+/// The wire shape and the stored shape are NOT the same thing once a pin
+/// exists: a wire `200` and a wire `"200"` both conform to the DOUBLE
+/// `200.0`, and no `read_json` inference reproduces that. So the stored
+/// value is spelled out — exactly the column compaction wrote — while the
+/// matcher still sees the wire event.
+fn assert_pinned_parity_over_column(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+    stored_sql: &str,
+) {
+    let query = parser::parse(dsl).expect("dsl parses");
+    let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
+    let filter_result = filter.matches(event);
+
+    let tmp = tempfile::Builder::new()
+        .suffix(".parquet")
+        .tempfile()
+        .unwrap();
+    let source = tmp.path().to_str().unwrap().to_owned();
+    conn.execute_batch(&format!(
+        "COPY (SELECT {stored_sql} AS status, 'hello' AS message) \
+         TO '{source}' (FORMAT PARQUET)"
+    ))
+    .expect("write typed parquet");
+
+    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let sql_result = sql_matches_strict(conn, &emitted);
+
+    assert_eq!(
+        filter_result, sql_result,
+        "pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nstored: {stored_sql}\nsql: {}\nparams: {:?}",
+        emitted.sql, emitted.params
+    );
+}
+
 fn status_event(value: &Value) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("status".into(), value.clone());
@@ -761,6 +802,88 @@ fn pinned_bigint_pattern_parity() {
         .chain(std::iter::once(absent_status_event()));
     for event in events {
         for dsl in dsls {
+            assert_pinned_parity(&conn, dsl, &event, &ft);
+        }
+    }
+}
+
+/// DOUBLE-pinned patterns: the column is DOUBLE whatever the wire number
+/// looked like, so the pattern text is `DuckDB`'s DOUBLE rendering
+/// (`200.0`, `1e-07`, `1.2345678901234568e+17`) on BOTH sides — a matcher
+/// that stringified the wire value would answer `status=/^200$/` TRUE
+/// where the batch query answers FALSE.
+///
+/// Each case pairs the wire event the matcher sees with the stored column
+/// compaction wrote for it: a wire `200`, a wire `200.0` and a wire
+/// `"200"` all conform to the same DOUBLE (the conform guard round-trips
+/// `TRY_CAST(text AS DOUBLE)`), while text with no numeric reading
+/// conforms to NULL.
+#[test]
+fn pinned_double_pattern_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Double)]);
+    let patterns = [
+        "status=2*",
+        "status=200*",
+        "status=/^200$/",
+        r"status=/^200\.0$/",
+        r"status=/^-?[0-9]+\.0$/",
+        "status=/e[+-]/",
+        "status=/^0.0$/",
+        r"status=/^-0\.0$/",
+        "NOT status=/^200$/",
+        r"NOT status=/^200\.0$/",
+        "NOT status=2*",
+    ];
+    // Non-pattern ops stay native under a typed pin, unchanged.
+    let natives = [
+        "status=200",
+        "status>=400",
+        "status!=200",
+        "NOT status>=400",
+    ];
+    // (wire value the matcher sees, the DOUBLE column compaction stored)
+    let cases = [
+        (Value::from(200), "CAST(200 AS DOUBLE)"),
+        (Value::from(200.0), "CAST(200 AS DOUBLE)"),
+        (Value::from("200"), "CAST(200 AS DOUBLE)"),
+        (Value::from(0), "CAST(0 AS DOUBLE)"),
+        // Negative zero keeps its sign in DuckDB's rendering. Spelled as
+        // a product because the SQL literal `-0.0` constant-folds to
+        // positive zero — the stored value would not be the one under
+        // test.
+        (Value::from(-0.0), "CAST(0.0 AS DOUBLE) * -1"),
+        (Value::from(-3), "CAST(-3 AS DOUBLE)"),
+        (Value::from(1.5), "CAST(1.5 AS DOUBLE)"),
+        (Value::from(404), "CAST(404 AS DOUBLE)"),
+        // Sci-notation shapes: the exponent is signed and two-digit wide
+        // in DuckDB, unsigned and unpadded in Rust's own rendering.
+        (Value::from(1e-7), "CAST(1e-7 AS DOUBLE)"),
+        (
+            Value::from(123_456_789_012_345_680i64),
+            "CAST(123456789012345680 AS DOUBLE)",
+        ),
+    ];
+    for (wire, stored) in cases {
+        let event = status_event(&wire);
+        for dsl in patterns.iter().chain(natives.iter()) {
+            assert_pinned_parity_over_column(&conn, dsl, &event, &ft, stored);
+        }
+    }
+    // A wire value the pin NULLs out: no numeric reading, so the pattern
+    // target is a NULL column in batch and `None` in memory — UNKNOWN on
+    // both sides. Patterns only: whether a non-conforming wire value
+    // should compare as its own text or as the NULL the corpus stores is
+    // the wire-vs-conformed question every typed pin already has (a
+    // string under a BIGINT pin included), not the pattern rule.
+    let unreadable = status_event(&Value::from("accepted"));
+    for dsl in patterns {
+        assert_pinned_parity_over_column(&conn, dsl, &unreadable, &ft, "CAST(NULL AS DOUBLE)");
+    }
+    // Explicit null and the field-less event go through the shared
+    // typed-null harness.
+    for event in [status_event(&Value::Null), absent_status_event()] {
+        for dsl in patterns.iter().chain(natives.iter()) {
             assert_pinned_parity(&conn, dsl, &event, &ft);
         }
     }

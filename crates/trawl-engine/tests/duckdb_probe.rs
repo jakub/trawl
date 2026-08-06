@@ -907,6 +907,61 @@ fn cast_text_patterns_match_bigint_text_form() {
     );
 }
 
+/// The DOUBLE pin's pattern text is `DuckDB`'s DOUBLE rendering, and the
+/// live mirror (`compare::canonical_double_text`) must produce the same
+/// string for the same stored value — the wire number's own
+/// stringification does NOT (`200` vs `200.0`, `1e-7` vs `1e-07`,
+/// `123456789012345680` vs `1.2345678901234568e+17`), so a matcher that
+/// stringified the wire value would answer `dur=/^200$/` TRUE where the
+/// batch query answers FALSE.
+#[test]
+fn double_pattern_text_is_duckdb_rendering_on_both_engines() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    // Values are BOUND, never spelled as SQL literals: `-0.0` written as a
+    // literal is constant-folded to positive zero before anything renders
+    // it, which would hide the fact that a stored `-0.0` keeps its sign.
+    let inputs = [
+        200.0,
+        0.0,
+        -0.0,
+        -3.0,
+        1.5,
+        1e-7,
+        1e16,
+        1.234_567_890_123_456_8e17,
+        1e100,
+        1e-300,
+        0.0001,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    for input in inputs {
+        let sql: String = conn
+            .query_row(
+                "SELECT CAST(CAST(? AS DOUBLE) AS VARCHAR)",
+                [input],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let live = trawl_core::compare::canonical_double_text(input);
+        assert_eq!(live, sql, "canonical pattern text disagrees for {input}");
+    }
+
+    // The whole point: an anchored pattern means the same thing on both
+    // sides of the same value — and `^200$` matches NEITHER, because the
+    // stored double renders `200.0`.
+    let matched: bool = conn
+        .query_row(
+            "SELECT regexp_matches(CAST(CAST(200 AS DOUBLE) AS VARCHAR), '^200$')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!matched, "a DOUBLE 200 renders 200.0, so ^200$ misses");
+    assert_eq!(trawl_core::compare::canonical_double_text(200.0), "200.0");
+}
+
 /// Why a TIMESTAMP pin needs its own pattern text: `DuckDB`'s plain CAST
 /// rendering is space-separated, zoneless and fraction-trimmed — a form
 /// no live event carries. Globbing that would make `_time=/T09:/` match

@@ -16,7 +16,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `"404"` matches, `"accepted"` quietly doesn't, and nothing errors where the
   pin-blind emission previously threw a Conversion/Binder error. Glob and
   regex against numeric/boolean pins match the value's text form
-  (`status=4*` finds 404 in a BIGINT column; previously a hard error), and
+  (`status=4*` finds 404 in a BIGINT column; previously a hard error) —
+  for a **double** pin that text is DuckDB's own double rendering, which
+  always carries a fraction and a signed two-digit exponent (`200.0`,
+  `1e-07`), so `dur=/^200$/` matches nothing on either side while
+  `dur=/^200\.0$/` matches both — and
   against a **timestamp** pin they match the RFC 3339 UTC-microsecond form
   the event carries on the wire (`_time=/T09:/`, `_time=/\.123456Z$/`) —
   the same text batch and live, not DuckDB's space-separated rendering.

@@ -22,7 +22,8 @@
 //! | VARCHAR | ordered + non-numeric literal | [`CompareForm::Native`] — lexical, unchanged |
 //! | VARCHAR | glob / regex | [`PatternForm::Native`] — unchanged |
 //! | `TIMESTAMP` | glob / regex | [`PatternForm::Rfc3339Text`] — the canonical RFC 3339 UTC-microsecond text |
-//! | other typed pins | glob / regex | [`PatternForm::CastText`] — `CAST(col AS VARCHAR)` first |
+//! | `DOUBLE` | glob / regex | [`PatternForm::DoubleText`] — `DuckDB`'s DOUBLE rendering (`200.0`, `1e-07`) |
+//! | `BIGINT` / `BOOLEAN` | glob / regex | [`PatternForm::CastText`] — `CAST(col AS VARCHAR)` first |
 //! | typed pins | everything else | [`CompareForm::Native`] — unchanged (already correct) |
 //!
 //! "Numeric literal" is decided by content (the same i64-then-f64 ladder as
@@ -64,24 +65,41 @@ pub enum CompareForm {
 /// A pattern needs ONE text per pinned type, or batch and live disagree:
 /// the SQL side matches the stored typed value's rendering while the
 /// live matcher matches the wire JSON. `CAST(col AS VARCHAR)` is already
-/// that one text for BIGINT/DOUBLE/BOOLEAN, but never for TIMESTAMP —
-/// `DuckDB` renders a TIMESTAMP space-separated and zoneless
-/// (`2026-01-15 09:00:00`) where the event carries RFC 3339
-/// (`2026-01-15T09:00:00.000000Z`), so `_time=/T09:/` would match live
-/// and miss in batch. [`Self::Rfc3339Text`] pins both sides to the wire
-/// form (see [`TIMESTAMP_PATTERN_SQL_FORMAT`] and
-/// [`canonical_timestamp_text`]).
+/// that one text for BIGINT and BOOLEAN, whose renderings are exactly
+/// what a JSON int / JSON bool stringifies to — but for neither
+/// TIMESTAMP nor DOUBLE:
+///
+/// - `DuckDB` renders a TIMESTAMP space-separated and zoneless
+///   (`2026-01-15 09:00:00`) where the event carries RFC 3339
+///   (`2026-01-15T09:00:00.000000Z`), so `_time=/T09:/` would match live
+///   and miss in batch. [`Self::Rfc3339Text`] pins both sides to the wire
+///   form (see [`TIMESTAMP_PATTERN_SQL_FORMAT`] and
+///   [`canonical_timestamp_text`]).
+/// - `DuckDB` renders a DOUBLE with a mandatory fraction and a signed,
+///   two-digit exponent (`200.0`, `0.0`, `1e-07`,
+///   `1.2345678901234568e+17`) where the same wire value stringifies as
+///   `200` / `0` / `1e-7` / `123456789012345680` — the conformed column
+///   is DOUBLE whatever the wire number looked like, so `dur=/^200$/`
+///   would match live and miss in batch. [`Self::DoubleText`] renders the
+///   value's DOUBLE reading on the live side too (see
+///   [`canonical_double_text`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternForm {
     /// Match against the column directly (unpinned or VARCHAR pin).
     Native,
-    /// `CAST(col AS VARCHAR)` first — the column is pinned to a
-    /// non-VARCHAR type, so glob/regex match its text form.
+    /// `CAST(col AS VARCHAR)` first — the column is pinned BIGINT or
+    /// BOOLEAN, so glob/regex match its text form, which is the wire
+    /// value's own stringification.
     CastText,
     /// The TIMESTAMP pin's canonical text: RFC 3339, UTC, always six
     /// fractional digits — `strftime` on the SQL side,
     /// [`canonical_timestamp_text`] on the live side.
     Rfc3339Text,
+    /// The DOUBLE pin's canonical text: `DuckDB`'s own DOUBLE rendering —
+    /// `CAST(col AS VARCHAR)` on the SQL side (the column already IS
+    /// DOUBLE), [`canonical_double_text`] over the value's DOUBLE reading
+    /// on the live side.
+    DoubleText,
 }
 
 /// The `DuckDB` `strftime` format producing a TIMESTAMP pin's canonical
@@ -171,13 +189,33 @@ pub fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> 
 }
 
 /// Resolve the binding for a glob/regex pattern under the field's pin.
+///
+/// Exhaustive on purpose: a new [`CanonicalType`] must state which text
+/// its patterns match, because "whatever `CAST(col AS VARCHAR)` says" is
+/// only a *live-mirrorable* answer for types the wire form already
+/// stringifies to identically.
 #[must_use]
 pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
     match pin {
         None | Some(CanonicalType::Varchar) => PatternForm::Native,
         Some(CanonicalType::Timestamp) => PatternForm::Rfc3339Text,
-        Some(_) => PatternForm::CastText,
+        Some(CanonicalType::Double) => PatternForm::DoubleText,
+        Some(CanonicalType::BigInt | CanonicalType::Boolean) => PatternForm::CastText,
     }
+}
+
+/// Render a DOUBLE in the pattern text `DuckDB`'s `CAST(col AS VARCHAR)`
+/// produces — the live mirror of the DOUBLE pin's pattern target, and the
+/// same renderer `tostring()` uses in streaming eval (one renderer, so
+/// `dur=/^200$/` and `tostring(dur)` cannot disagree about `200.0`).
+///
+/// The rendering rules (shortest round-trip digits, a mandatory `.0` on
+/// integral values, sign-stripped zero, signed two-digit exponents,
+/// lowercase `inf`/`nan`) are documented on the renderer itself and
+/// executed against `DuckDB` in `trawl-engine/tests/duckdb_probe.rs`.
+#[must_use]
+pub fn canonical_double_text(x: f64) -> String {
+    crate::eval::duckdb_double_to_string(x)
 }
 
 /// The DOUBLE `DuckDB` reads out of a stored text under
@@ -397,15 +435,49 @@ mod tests {
     #[test]
     fn typed_pins_cast_patterns_to_text() {
         for pin in TYPED_PINS {
-            let expected = if pin == CanonicalType::Timestamp {
+            let expected = match pin {
                 // TIMESTAMP has its own canonical text: DuckDB's default
                 // rendering is space-separated and zoneless, which no live
                 // event carries.
-                PatternForm::Rfc3339Text
-            } else {
-                PatternForm::CastText
+                CanonicalType::Timestamp => PatternForm::Rfc3339Text,
+                // DOUBLE likewise: DuckDB's rendering carries a mandatory
+                // fraction and signed two-digit exponents, which the wire
+                // number's stringification does not.
+                CanonicalType::Double => PatternForm::DoubleText,
+                _ => PatternForm::CastText,
             };
             assert_eq!(pattern_form(Some(pin)), expected, "{pin:?}");
+        }
+    }
+
+    /// The DOUBLE pin's pattern text is `DuckDB`'s DOUBLE rendering, NOT
+    /// the wire number's stringification — every expectation here is the
+    /// string `CAST(v AS VARCHAR)` returns over a DOUBLE column (executed
+    /// side by side in `trawl-engine/tests/duckdb_probe.rs`).
+    #[test]
+    fn canonical_double_text_mirrors_duckdb_rendering() {
+        let cases = [
+            // The reported divergence: a wire `200` stores as 200.0, and
+            // `dur=/^200$/` must miss on both sides, not just in batch.
+            (200.0, "200.0"),
+            (0.0, "0.0"),
+            // A stored -0.0 renders signed; only a SQL literal `-0.0`
+            // folds to positive zero before it is ever rendered.
+            (-0.0, "-0.0"),
+            (-3.0, "-3.0"),
+            (1.5, "1.5"),
+            (1e-7, "1e-07"),
+            (1e16, "1e+16"),
+            (1.234_567_890_123_456_8e17, "1.2345678901234568e+17"),
+            (1e100, "1e+100"),
+            (1e-300, "1e-300"),
+            (0.0001, "0.0001"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(canonical_double_text(input), expected, "{input}");
         }
     }
 

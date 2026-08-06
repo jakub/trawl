@@ -53,8 +53,16 @@ comparison means the same thing whatever the query literal looks like:
   *above* every number, so it matches `status>400`.
 - **VARCHAR-pinned field, ordered comparison with a non-numeric
   literal** — lexical string comparison, unchanged.
-- **Numeric/boolean-pinned field, glob or regex** — matches the value's
+- **Integer/boolean-pinned field, glob or regex** — matches the value's
   **text form** (`status=4*` finds 404 in a BIGINT column).
+- **Double-pinned field, glob or regex** — matches the value's text form
+  too, but a double's text form is not what the event's JSON looked like:
+  it always carries a fraction, and switches to a signed, two-digit
+  exponent outside `1e-4 … 1e16` (`200.0`, `0.0`, `-3.0`, `1e-07`,
+  `1.2345678901234568e+17`). So `dur=/^200$/` matches nothing while
+  `dur=/^200\.0$/` matches — the same on both sides, batch and live. A
+  value with no numeric reading is stored as NULL and is *unknown*, not
+  false.
 - **Timestamp-pinned field, glob or regex** — matches the **RFC 3339
   UTC-microsecond form** the event carries on the wire, always with a `T`
   separator, six fractional digits and a trailing `Z`

@@ -103,7 +103,10 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 /// presentation rules that diverge from Rust's `Display`/`Debug`:
 ///
 /// 1. Integer-valued doubles always carry a `.0` suffix (`1.0`, not `1`).
-/// 2. Negative zero loses its sign: `-0.0` → `"0.0"`.
+/// 2. Negative zero KEEPS its sign: `-0.0` → `"-0.0"`. (A SQL *literal*
+///    `-0.0` renders `0.0`, but only because the parser constant-folds it to
+///    positive zero — a computed or stored `-0.0` renders signed, probe-pinned
+///    in `trawl-engine/tests/duckdb_probe.rs`.)
 /// 3. Scientific notation kicks in at the SAME magnitude thresholds as Rust's
 ///    `{:?}` (`>= 1e16` and `< 1e-4`), so we lean on Debug for the switch-over.
 /// 4. The exponent ALWAYS carries a sign and is zero-padded to a minimum of two
@@ -113,19 +116,17 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 ///
 /// This is the single renderer behind `tostring()`, `concat()`/`||`, and any
 /// other `CAST(… AS VARCHAR)` over a float in the batch path; mirroring it in
-/// streaming eval closes the #22-class batch-vs-live divergence.
-fn duckdb_double_to_string(x: f64) -> String {
+/// streaming eval closes the #22-class batch-vs-live divergence. It is also
+/// the DOUBLE pin's glob/regex text — re-exported as
+/// [`crate::compare::canonical_double_text`], so a pattern over a
+/// DOUBLE-pinned column matches the same string in both engines.
+pub(crate) fn duckdb_double_to_string(x: f64) -> String {
     if x.is_nan() {
         return "nan".to_string();
     }
     if x.is_infinite() {
         return if x < 0.0 { "-inf" } else { "inf" }.to_string();
     }
-    // Both +0.0 and -0.0 compare equal to 0.0; DuckDB strips the sign.
-    if x == 0.0 {
-        return "0.0".to_string();
-    }
-
     // Rust Debug already gives shortest-roundtrip digits, the `.0` suffix on
     // integer-valued doubles, and the same sci-notation thresholds as DuckDB.
     let s = format!("{x:?}");
@@ -2027,7 +2028,9 @@ mod tests {
             (1.0, "1.0"),
             (2.0, "2.0"),
             (0.0, "0.0"),
-            (-0.0, "0.0"),
+            // A stored/computed -0.0 renders SIGNED (only a SQL literal
+            // `-0.0` folds to positive zero) — probe-pinned.
+            (-0.0, "-0.0"),
             (1.5, "1.5"),
             (-1.5, "-1.5"),
             (-42.75, "-42.75"),
