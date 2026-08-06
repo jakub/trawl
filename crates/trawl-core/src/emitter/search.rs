@@ -239,13 +239,21 @@ fn emit_search_token(
 }
 
 /// The column expression a glob/regex matches against: the column itself,
-/// or `CAST(col AS VARCHAR)` when the field is pinned to a non-VARCHAR
-/// type (ADR-0011 slice A) — glob on a BIGINT column matches its text
-/// form instead of leaving the outcome to `DuckDB`'s implicit-cast rules.
+/// or the pin's canonical pattern text (ADR-0011 slice A) — glob on a
+/// BIGINT column matches its text form instead of leaving the outcome to
+/// `DuckDB`'s implicit-cast rules, and a TIMESTAMP renders as the RFC 3339
+/// wire form the live matcher sees rather than `DuckDB`'s space-separated
+/// default. The live side mirrors this exactly (`crate::filter`).
 fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalType>) -> String {
     match compare::pattern_form(pin) {
         PatternForm::Native => field.to_owned(),
         PatternForm::CastText => format!("CAST({field} AS VARCHAR)"),
+        PatternForm::Rfc3339Text => {
+            format!(
+                "strftime({field}, '{}')",
+                compare::TIMESTAMP_PATTERN_SQL_FORMAT
+            )
+        }
     }
 }
 

@@ -15,8 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `status>=400` compares **numerically** via `TRY_CAST(col AS DOUBLE)` —
   `"404"` matches, `"accepted"` quietly doesn't, and nothing errors where the
   pin-blind emission previously threw a Conversion/Binder error. Glob and
-  regex against numeric/timestamp/boolean pins match the value's text form
-  (`status=4*` finds 404 in a BIGINT column; previously a hard error).
+  regex against numeric/boolean pins match the value's text form
+  (`status=4*` finds 404 in a BIGINT column; previously a hard error), and
+  against a **timestamp** pin they match the RFC 3339 UTC-microsecond form
+  the event carries on the wire (`_time=/T09:/`, `_time=/\.123456Z$/`) —
+  the same text batch and live, not DuckDB's space-separated rendering.
   **This is live on day one for every install**: the envelope seed pins
   `host`/`service`/`env`/`message`/`severity_text`/`_raw` as VARCHAR, so e.g.
   `host=42` changes from a potential Conversion error to a clean text match

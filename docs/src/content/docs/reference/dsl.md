@@ -49,8 +49,16 @@ comparison means the same thing whatever the query literal looks like:
   `NOT status>=400` doesn't match those rows either.
 - **VARCHAR-pinned field, ordered comparison with a non-numeric
   literal** — lexical string comparison, unchanged.
-- **Numeric/timestamp/boolean-pinned field, glob or regex** — matches
-  the value's **text form** (`status=4*` finds 404 in a BIGINT column).
+- **Numeric/boolean-pinned field, glob or regex** — matches the value's
+  **text form** (`status=4*` finds 404 in a BIGINT column).
+- **Timestamp-pinned field, glob or regex** — matches the **RFC 3339
+  UTC-microsecond form** the event carries on the wire, always with a `T`
+  separator, six fractional digits and a trailing `Z`
+  (`2026-01-15T09:00:00.000000Z`). So `_time=2026-01-15*`,
+  `_time=/T09:/` and `_time=/\.123456Z$/` all mean the same thing in a
+  batch query and in live tail. A value with no timestamp reading is
+  stored as NULL and is *unknown*, not false — `NOT _time=/T09:/` doesn't
+  match it either.
 - Everything else — numeric pins with numeric literals, and every
   comparison on an **unpinned** field — keeps plain literal-driven
   behavior.

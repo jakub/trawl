@@ -25,7 +25,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
-use crate::compare::{self, CompareForm};
+use crate::compare::{self, CompareForm, PatternForm};
 use crate::emitter::{EmitError, SqlValue};
 use crate::schema::FieldTypes;
 
@@ -147,8 +147,8 @@ struct FieldMatcher {
 enum FieldPredicate {
     Compare { op: CompareOp, value: CoercedValue },
     InList { values: Vec<CoercedValue> },
-    Glob { regex: Regex },
-    Regex { regex: Regex },
+    Glob { regex: Regex, form: PatternForm },
+    Regex { regex: Regex, form: PatternForm },
 }
 
 #[derive(Clone, Copy)]
@@ -323,24 +323,27 @@ fn compile_token(
             // The catalog pin typing this comparison (ADR-0011 slice A);
             // the lookup folds through `catalog_key`, same as the emitter.
             let pin = pins.pin_for(&ff.field);
+            // Glob/regex match ONE canonical text per pin, resolved by the
+            // shared rule table: plain stringification mirrors the SQL
+            // side's column / `CAST(col AS VARCHAR)`, and a TIMESTAMP pin
+            // renders RFC 3339 microseconds on both sides so a pattern
+            // anchored on the separator, the zone suffix or the fraction
+            // cannot mean one thing live and another in batch. Both halves
+            // are corroborated by execution probes in
+            // trawl-engine/tests/duckdb_probe.rs, not assumed.
+            let form = compare::pattern_form(pin);
             let predicate = match (&ff.op, &ff.value) {
-                // Glob/regex need no pin-aware change here: the matcher
-                // already stringifies every JSON value unconditionally
-                // (`json_to_string`), which is the in-memory mirror of the
-                // SQL side's `CAST(col AS VARCHAR)` under a typed pin —
-                // corroborated by execution probes in
-                // trawl-engine/tests/duckdb_probe.rs, not assumed.
                 (FilterOp::Glob, FilterValue::Literal(pattern)) => {
                     let Ok(regex) = Regex::new(&glob_to_regex(pattern)) else {
                         return Ok(None);
                     };
-                    FieldPredicate::Glob { regex }
+                    FieldPredicate::Glob { regex, form }
                 }
                 (FilterOp::Regex, FilterValue::Literal(pattern)) => {
                     let Ok(regex) = Regex::new(pattern) else {
                         return Ok(None);
                     };
-                    FieldPredicate::Regex { regex }
+                    FieldPredicate::Regex { regex, form }
                 }
                 (_, FilterValue::List(values)) => FieldPredicate::InList {
                     values: values
@@ -531,9 +534,11 @@ impl FieldMatcher {
                     .iter()
                     .map(|v| compare_values(event_val, CompareOp::Eq, v)),
             ),
-            FieldPredicate::Glob { regex } | FieldPredicate::Regex { regex } => {
-                let s = json_to_string(event_val);
-                Some(regex.is_match(&s))
+            FieldPredicate::Glob { regex, form } | FieldPredicate::Regex { regex, form } => {
+                // No canonical text (a TIMESTAMP pin over a value with no
+                // timestamp reading) is a NULL column in batch, and
+                // `strftime(NULL, …) GLOB p` is NULL: UNKNOWN, not FALSE.
+                pattern_text(event_val, *form).map(|s| regex.is_match(&s))
             }
         }
     }
@@ -631,6 +636,23 @@ fn extract_f64(v: &Value) -> Option<f64> {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.parse().ok(),
         _ => None,
+    }
+}
+
+/// The text a glob/regex matches for one event value, under the pin's
+/// pattern form — the in-memory mirror of the SQL side's `pattern_target`.
+///
+/// `None` is a NULL pattern target: only a TIMESTAMP pin can produce one,
+/// for a value `DuckDB`'s `TRY_CAST(… AS TIMESTAMP)` would also null out
+/// (a non-string JSON value, or text with no timestamp reading), which is
+/// exactly what conformance already wrote to disk.
+fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
+    match form {
+        PatternForm::Native | PatternForm::CastText => Some(json_to_string(v)),
+        PatternForm::Rfc3339Text => match v {
+            Value::String(s) => compare::canonical_timestamp_text(s),
+            _ => None,
+        },
     }
 }
 

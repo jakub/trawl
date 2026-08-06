@@ -730,6 +730,85 @@ fn pinned_bigint_pattern_parity() {
     }
 }
 
+/// Patterns over a TIMESTAMP-pinned column: batch renders the canonical
+/// RFC 3339 microsecond text through `strftime`, the live matcher renders
+/// the same text from the wire value, so a pattern anchored on the
+/// separator, the zone suffix or the fraction means ONE thing.
+///
+/// The column is written the way compaction writes it — `TRY_CAST` of the
+/// wire text to the pin — so a value with no timestamp reading is NULL on
+/// disk and UNKNOWN in memory, including under `NOT`.
+#[test]
+fn pinned_timestamp_pattern_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("_time", CanonicalType::Timestamp)]);
+    let values = [
+        // The canonical wire form ingest writes.
+        Value::String("2026-01-15T09:00:00.000000Z".into()),
+        Value::String("2026-01-15T09:00:00.123456Z".into()),
+        Value::String("2026-01-15T22:00:00.000000Z".into()),
+        // Shapes a custom TIMESTAMP-pinned field can carry.
+        Value::String("2026-01-15 09:00:00".into()),
+        Value::String("2026-01-15T09:00:00+05:30".into()),
+        Value::String("2026-01-15".into()),
+        // No timestamp reading → NULL column / UNKNOWN matcher.
+        Value::String("yesterday-ish".into()),
+        Value::Null,
+    ];
+    let dsls = [
+        // separator-anchored, both ways round
+        "_time=/T09:/",
+        "_time=/ 09:/",
+        // zone suffix
+        "_time=/Z$/",
+        // fractional seconds
+        r"_time=/\.000000Z$/",
+        r"_time=/\.123456Z$/",
+        // date prefix (glob and regex)
+        "_time=2026-01-15*",
+        "_time=2026-01-15T09*",
+        "_time=/^2026-01-15/",
+        // NOT over each shape: UNKNOWN must not invert into a live match
+        "NOT _time=/T09:/",
+        "NOT _time=/Z$/",
+        "NOT _time=2026-01-15T09*",
+    ];
+
+    for value in &values {
+        let mut event = Map::new();
+        event.insert("_time".into(), value.clone());
+        event.insert("message".into(), Value::String("hello".into()));
+
+        let tmp = tempfile::Builder::new()
+            .suffix(".parquet")
+            .tempfile()
+            .unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+        let wire = match value {
+            Value::String(s) => format!("'{s}'"),
+            _ => "NULL".to_owned(),
+        };
+        conn.execute_batch(&format!(
+            "COPY (SELECT TRY_CAST({wire} AS TIMESTAMP) AS _time, 'hello' AS message) \
+             TO '{path}' (FORMAT PARQUET)"
+        ))
+        .expect("write timestamp parquet");
+
+        for dsl in dsls {
+            let query = parser::parse(dsl).expect("dsl parses");
+            let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
+            let filter_result = filter.matches(&event);
+            let emitted = emitter::emit_with_pins(&query, &path, &ft).expect("emit succeeds");
+            let sql_result = sql_matches_strict(&conn, &emitted);
+            assert_eq!(
+                filter_result, sql_result,
+                "timestamp pattern parity mismatch\ndsl: {dsl:?}\nvalue: {value:?}\nsql: {}",
+                emitted.sql
+            );
+        }
+    }
+}
+
 /// Hot+cold union with BOTH pin sets: the cold branch reads one event,
 /// the hot branch another (conformed via the REPLACE list), and the
 /// pin-aware comparison must agree with the in-memory filter over the

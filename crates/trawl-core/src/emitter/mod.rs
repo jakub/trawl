@@ -1575,8 +1575,12 @@ mod tests {
         assert_snapshot!(emit_dsl_with_pins("status=4*", &[("status", CT::BigInt)]));
     }
 
+    /// A TIMESTAMP pin renders the canonical RFC 3339 pattern text, not
+    /// `DuckDB`'s space-separated CAST rendering — the live matcher builds
+    /// the same string from the wire value (`compare::
+    /// canonical_timestamp_text`), so an anchored pattern means one thing.
     #[test]
-    fn pinned_timestamp_regex_casts_to_varchar() {
+    fn pinned_timestamp_regex_renders_rfc3339_text() {
         assert_snapshot!(emit_dsl_with_pins(
             r"_time=/2026-01-.*/",
             &[("_time", CT::Timestamp)]

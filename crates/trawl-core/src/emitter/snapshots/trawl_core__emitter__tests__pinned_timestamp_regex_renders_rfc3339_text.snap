@@ -4,7 +4,7 @@ expression: "emit_dsl_with_pins(r\"_time=/2026-01-.*/\", &[(\"_time\", CT::Times
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE regexp_matches(CAST("_time" AS VARCHAR), ?)
+WHERE regexp_matches(strftime("_time", '%Y-%m-%dT%H:%M:%S.%fZ'), ?)
 ---
 params:
   0: '2026-01-.*'

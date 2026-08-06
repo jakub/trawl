@@ -775,12 +775,10 @@ fn cast_text_patterns_match_bigint_text_form() {
     );
 }
 
-/// The text form a TIMESTAMP pin globs/regexes against is `DuckDB`'s CAST
-/// rendering — space-separated, no 'T', no 'Z' — NOT the RFC 3339 wire
-/// form. Documented residual (risk (c) of the slice): a live-tail event
-/// carries the RFC 3339 string, so a pattern anchored on the separator
-/// can disagree between batch and live. The date prefix (the overwhelming
-/// pattern use) agrees on both.
+/// Why a TIMESTAMP pin needs its own pattern text: `DuckDB`'s plain CAST
+/// rendering is space-separated, zoneless and fraction-trimmed — a form
+/// no live event carries. Globbing that would make `_time=/T09:/` match
+/// live and miss in batch, on every install (`_time` is seeded TIMESTAMP).
 #[test]
 fn timestamp_cast_text_form_is_space_separated() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -792,6 +790,86 @@ fn timestamp_cast_text_form_is_space_separated() {
         )
         .unwrap();
     assert_eq!(rendered, "2026-01-15 09:00:00");
+}
+
+/// The rule: a TIMESTAMP pin globs/regexes against ONE canonical text —
+/// `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)` in SQL, `compare::
+/// canonical_timestamp_text` in the live matcher — so both engines answer
+/// the same string for the same wire value. This runs the matrix through
+/// `DuckDB` and the Rust mirror side by side; each conform is written the
+/// way compaction writes it (`TRY_CAST` to the pin), so a value with no
+/// reading is NULL on disk and `None` in memory.
+///
+/// The shapes cover the separator (`T` vs space), the zone suffix (`Z`,
+/// `±HH:MM`, `±HH`, none — `DuckDB` stores the WALL CLOCK and drops the
+/// offset), fractional seconds (absent, short, over-long) and the
+/// date-only/slash forms.
+#[test]
+fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let fmt = trawl_core::compare::TIMESTAMP_PATTERN_SQL_FORMAT;
+    let inputs = [
+        "2026-01-15T09:00:00.000000Z",
+        "2026-01-15T09:00:00Z",
+        "2026-01-15 09:00:00",
+        "2026-01-15T09:00",
+        "  2026-01-15 09:00:00  ",
+        "2026-01-15T09:00:00+05:30",
+        "2026-01-15T09:00:00-08:00",
+        "2026-01-15T09:00:00+02",
+        "2026-01-15T09:00:00.123Z",
+        "2026-01-15T09:00:00.1234567",
+        "2026-01-15T09:00:00.0000000000Z",
+        "2026-01-15",
+        "2026/01/15",
+        "2026/01/15 09:00:00",
+        // No reading: NULL on the SQL side, None in memory.
+        "yesterday-ish",
+        "",
+        "2026-01-15T",
+        "2026-01-15 ",
+        // Epoch numerals are not timestamps to DuckDB.
+        "1737000000",
+        "1737000000123",
+    ];
+    for input in inputs {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT strftime(TRY_CAST(? AS TIMESTAMP), ?)",
+                [input, fmt],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let live = trawl_core::compare::canonical_timestamp_text(input);
+        assert_eq!(live, sql, "canonical pattern text disagrees for {input:?}");
+    }
+
+    // The whole point: an anchored pattern now means the same thing on
+    // both sides of the same value.
+    let matched: bool = conn
+        .query_row(
+            &format!(
+                "SELECT strftime(TRY_CAST('2026-01-15T09:00:00.000000Z' AS TIMESTAMP), '{fmt}') \
+                 GLOB '*T09:*'"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(matched, "batch matches the separator-anchored pattern");
+
+    // A non-timestamp value is NULL, not the empty string: GLOB over it is
+    // NULL (UNKNOWN), which is what the live matcher's `None` mirrors.
+    let unknown: Option<bool> = conn
+        .query_row(
+            &format!(
+                "SELECT strftime(TRY_CAST('yesterday-ish' AS TIMESTAMP), '{fmt}') GLOB '2026*'"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unknown, None);
 }
 
 /// The rules over `read_json` columns — the hot-only fallback's untyped
