@@ -561,7 +561,17 @@ fn time_filter_parity_on_time_column() {
 /// can never throw — an unexpected error here is a broken rule, never a
 /// "no match".
 fn sql_matches_strict(conn: &Connection, emitted: &EmittedQuery) -> bool {
-    let count_sql = format!("SELECT count(*)::BIGINT FROM ({}) AS _sub", emitted.sql);
+    sql_matches_strict_row(conn, emitted, "TRUE")
+}
+
+/// [`sql_matches_strict`] restricted to the rows a source carries beside
+/// the one under test — the filter names the target row, never the
+/// predicate under test.
+fn sql_matches_strict_row(conn: &Connection, emitted: &EmittedQuery, row_filter: &str) -> bool {
+    let count_sql = format!(
+        "SELECT count(*)::BIGINT FROM ({}) AS _sub WHERE {row_filter}",
+        emitted.sql
+    );
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
     let count: i64 = conn
@@ -1093,6 +1103,24 @@ fn assert_hot_only_parity(
     event: &Map<String, Value>,
     ft: &FieldTypes,
 ) {
+    assert_hot_only_parity_beside(conn, dsl, event, ft, &[]);
+}
+
+/// [`assert_hot_only_parity`] with SIBLING events sharing the snapshot.
+///
+/// The siblings are not incidental: `read_json` types each column from the
+/// whole file, so a sibling decides how the event under test is SPELLED
+/// once it is read back (a fractional `status` widens the column to DOUBLE
+/// and stores `200` as `"200.0"`). Only the target row is asked about —
+/// it is the one whose `message` is `hello`, and the row filter sits
+/// outside the emitted predicate.
+fn assert_hot_only_parity_beside(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+    siblings: &[Map<String, Value>],
+) {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
     let filter_result = filter.matches(event);
@@ -1102,6 +1130,9 @@ fn assert_hot_only_parity(
         .tempfile()
         .unwrap();
     writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+    for sibling in siblings {
+        writeln!(tmp, "{}", Value::Object(sibling.clone())).unwrap();
+    }
     tmp.flush().unwrap();
 
     // hot_pins = pins ∩ the snapshot's keys: the REPLACE list must never
@@ -1114,13 +1145,95 @@ fn assert_hot_only_parity(
     }
     let emitted = emitter::emit_hot_only(&query, tmp.path().to_str().unwrap(), &hot_pins, ft)
         .expect("emit succeeds");
-    let sql_result = sql_matches_strict(conn, &emitted);
+    let sql_result = sql_matches_strict_row(conn, &emitted, "message = 'hello'");
 
     assert_eq!(
         filter_result, sql_result,
-        "hot-only pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nsql: {}\nparams: {:?}",
+        "hot-only pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nsiblings: {siblings:?}\nsql: {}\nparams: {:?}",
         emitted.sql, emitted.params
     );
+}
+
+/// The equality-class DSLs a VARCHAR-pinned numeric field is queried with.
+const VARCHAR_EQ_DSLS: [&str; 10] = [
+    "status=200",
+    "status!=200",
+    "status=200.0",
+    "status!=200.0",
+    "status=200,301",
+    "status=200,accepted",
+    "status=accepted",
+    "NOT status=200",
+    "NOT status!=200",
+    "NOT status=200,301",
+];
+
+/// A VARCHAR pin does NOT mean the stored text is the wire text.
+/// `read_json` types each column from the whole batch, so one fractional
+/// sibling makes a wire `200` read back as `"200.0"` — and compaction's
+/// `TRY_CAST(col AS VARCHAR)` writes exactly that spelling to parquet, so
+/// the widening is durable, not hot-only.
+///
+/// Exact-text equality is therefore unmirrorable: the live matcher only
+/// ever sees the wire `200`. Both sides carry the value's numeric reading
+/// beside its text, and this is the execution evidence — the same batch
+/// the reviewer's probe used, answered identically on both sides.
+#[test]
+fn pinned_varchar_eq_survives_read_json_widening() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+    // The sibling that widens `status` to DOUBLE for the whole snapshot.
+    let mut sibling = status_event(&Value::from(200.5));
+    sibling.insert("message".into(), Value::from("sibling"));
+    for wire in [
+        Value::from(200),
+        Value::from(200.0),
+        Value::from(200.5),
+        Value::from(404),
+        Value::from("200"),
+        Value::from("accepted"),
+        Value::Null,
+    ] {
+        let mut event = status_event(&wire);
+        // The REPLACE list always names both envelope timestamps.
+        event.insert("_time".into(), Value::from("2026-01-01T12:00:00Z"));
+        event.insert("_ingested".into(), Value::from("2026-01-01T12:00:01Z"));
+        let mut sibling = sibling.clone();
+        sibling.insert("_time".into(), Value::from("2026-01-01T12:00:00Z"));
+        sibling.insert("_ingested".into(), Value::from("2026-01-01T12:00:01Z"));
+        for dsl in VARCHAR_EQ_DSLS {
+            assert_hot_only_parity_beside(&conn, dsl, &event, &ft, &[sibling.clone()]);
+        }
+    }
+}
+
+/// The cold half of the same divergence: the spellings compaction actually
+/// writes for a wire number under a VARCHAR pin, each spelled out as the
+/// stored column while the matcher still reads the wire event.
+#[test]
+fn pinned_varchar_eq_over_conformed_number_spellings() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+    // (wire value, the text conformance stored for it)
+    let cases = [
+        // DOUBLE inference: the reported case.
+        (Value::from(200), "'200.0'"),
+        (Value::from(200.0), "'200.0'"),
+        // BIGINT inference: same value, plain spelling.
+        (Value::from(200), "'200'"),
+        // Exponent renderings DuckDB produces for extreme magnitudes.
+        (Value::from(1e20), "'1e+20'"),
+        (Value::from(1e-7), "'1e-07'"),
+        // Text the wire carried verbatim, numeric and not.
+        (Value::from("200"), "'200'"),
+        (Value::from("accepted"), "'accepted'"),
+    ];
+    for (wire, stored) in cases {
+        let event = status_event(&wire);
+        for dsl in VARCHAR_EQ_DSLS {
+            assert_pinned_parity_over_column(&conn, dsl, &event, &ft, stored);
+        }
+    }
 }
 
 /// Patterns over the hot-only lane, where the matcher and the query read

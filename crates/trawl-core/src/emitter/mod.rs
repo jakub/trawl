@@ -1536,23 +1536,47 @@ mod tests {
 
     use crate::schema::CanonicalType as CT;
 
+    /// A numeric literal binds BOTH the text and its numeric reading: the
+    /// stored text of a number is `read_json`'s inference rendered
+    /// (`"200.0"`), so exact text alone would be a batch miss where the
+    /// live matcher — which only sees the wire `200` — hits.
     #[test]
-    fn pinned_varchar_eq_numeric_binds_text() {
+    fn pinned_varchar_eq_numeric_binds_text_and_reading() {
         assert_snapshot!(emit_dsl_with_pins("status=200", &[("status", CT::Varchar)]));
     }
 
     #[test]
-    fn pinned_varchar_ne_numeric_binds_text_keeping_null_policy() {
+    fn pinned_varchar_ne_numeric_binds_text_and_reading_keeping_null_policy() {
         assert_snapshot!(emit_dsl_with_pins(
             "status!=200",
             &[("status", CT::Varchar)]
         ));
     }
 
+    /// A list with a numeric element expands to the OR of its per-element
+    /// equalities — an element with two arms has no single bound value.
     #[test]
-    fn pinned_varchar_in_list_binds_text() {
+    fn pinned_varchar_in_list_expands_to_or_of_equalities() {
         assert_snapshot!(emit_dsl_with_pins(
             "status=200,301,404",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// A list with no numeric element keeps the plain `IN (…)` shape.
+    #[test]
+    fn pinned_varchar_in_list_without_numbers_keeps_in_shape() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status=accepted,pending",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// Mixed lists mix the shapes, element by element.
+    #[test]
+    fn pinned_varchar_in_list_mixes_text_and_numeric_elements() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status=200,accepted",
             &[("status", CT::Varchar)]
         ));
     }
@@ -1591,7 +1615,9 @@ mod tests {
     /// the same (ingest-folded, DuckDB-case-insensitive) column and must
     /// find the same pin — never silently fall back to unpinned. The
     /// identifier keeps the user's spelling (`DuckDB` folds it), so the
-    /// evidence is the bound parameter: text under the VARCHAR pin.
+    /// evidence is the bound parameters: the text arm and its numeric
+    /// reading under the VARCHAR pin, where an unpinned emission binds
+    /// the number alone.
     #[test]
     fn pinned_lookup_is_case_folded() {
         let ft = pins(&[("status", CT::Varchar)]);
@@ -1600,8 +1626,8 @@ mod tests {
             let emitted = emit_with_pins(&query, SRC, &ft).expect("emit should succeed");
             assert_eq!(
                 emitted.params,
-                vec![SqlValue::String("200".into())],
-                "{dsl} must bind text under the folded pin"
+                vec![SqlValue::String("200".into()), SqlValue::Float(200.0)],
+                "{dsl} must bind the pinned two-armed equality"
             );
         }
     }

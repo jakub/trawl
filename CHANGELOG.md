@@ -11,8 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Search-stage field filters — batch queries, exports, *and* live tail (SSE) —
   now consult the field's pinned type instead of guessing from the query
   literal. Against a VARCHAR-pinned field, `status=200` / `status!=200` /
-  `status=200,301` compare **as text** (matching the stored `"200"` exactly),
-  and `status>=400` compares **numerically** via `TRY_CAST(col AS DOUBLE)` —
+  `status=200,301` compare **as text** (matching the stored `"200"`), with a
+  numeric literal additionally matching any spelling of the same number
+  (`"0200"`, `"200.0"`) — the text a number is stored under depends on the
+  batch it arrived in, so the reading is what keeps live tail and `/query`
+  answering alike — and `status>=400` compares **numerically** via
+  `TRY_CAST(col AS DOUBLE)` —
   `"404"` matches, `"accepted"` quietly doesn't, and nothing errors where the
   pin-blind emission previously threw a Conversion/Binder error. Glob and
   regex against numeric/boolean pins match the **stored** value's text

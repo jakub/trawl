@@ -175,6 +175,17 @@ enum CoercedValue {
     /// NULL — UNKNOWN, not FALSE. Kept apart from [`CoercedValue::Float`]
     /// so the unpinned literal-driven path stays byte-identical.
     NumericOnText(f64),
+    /// The VARCHAR-pinned equality form for a numeric literal: the SQL
+    /// side is `(col = ? OR COALESCE(TRY_CAST(col AS DOUBLE) = ?, FALSE))`
+    /// (and its complement for `!=`), because a number's STORED text is
+    /// `read_json`'s inference rendered — `"200.0"` for a wire `200` that
+    /// shared a batch with a fractional value — while this matcher only
+    /// ever sees the wire JSON. The numeric reading is the half the two
+    /// sides can agree on; see [`crate::compare`].
+    TextOrNumeric {
+        text: String,
+        number: f64,
+    },
 }
 
 struct TextMatcher {
@@ -452,11 +463,15 @@ fn compile_op(op: FilterOp) -> CompareOp {
 ///   `DuckDB`'s cast domain; a value outside it mirrors
 ///   `TRY_CAST(col AS DOUBLE)` degrading to NULL: UNKNOWN, so `NOT`
 ///   leaves it unmatched.
+/// - `TextOrNumeric` — the equality-class form under a VARCHAR pin: the
+///   value's text form OR its `TRY_CAST(… AS DOUBLE)` reading, mirroring
+///   the SQL side's `COALESCE`d two-armed predicate.
 fn coerce_form(form: CompareForm) -> CoercedValue {
     match form {
         CompareForm::Native(SqlValue::Int(i)) => CoercedValue::Int(i),
         CompareForm::Native(SqlValue::Float(f)) => CoercedValue::Float(f),
         CompareForm::NumericOnText(f) => CoercedValue::NumericOnText(f),
+        CompareForm::TextOrNumeric { text, number } => CoercedValue::TextOrNumeric { text, number },
         CompareForm::Native(SqlValue::String(s)) | CompareForm::Text(s) => CoercedValue::Str(s),
         // coerce_filter_value never yields Bool; keep the match total.
         CompareForm::Native(SqlValue::Bool(b)) => CoercedValue::Str(b.to_string()),
@@ -602,6 +617,8 @@ impl TextMatcher {
 /// - `NumericOnText` filter: `TRY_CAST(col AS DOUBLE)` over the value's
 ///   text form — a value outside `DuckDB`'s cast domain is NULL, so the
 ///   comparison is UNKNOWN
+/// - `TextOrNumeric` filter: the value's text form OR its `TRY_CAST(…
+///   AS DOUBLE)` reading, both `COALESCE`d exactly as the SQL is
 fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -> Truth {
     match filter_val {
         CoercedValue::Int(fv) => {
@@ -637,6 +654,29 @@ fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -
         CoercedValue::Str(fv) => {
             let ev = json_to_string(event_val);
             Some(apply_ord(ev.as_str().cmp(fv.as_str()), op))
+        }
+        // The two-armed equality rung. The wire text is only the stored
+        // text when `read_json` did not widen the column, so the numeric
+        // reading carries the cases where it did (`200` stored `"200.0"`).
+        // Both arms are total here, mirroring the SQL's COALESCEs: a value
+        // with no numeric reading falls back to the text answer alone
+        // rather than poisoning the predicate with UNKNOWN.
+        CoercedValue::TextOrNumeric { text, number } => {
+            let ev = json_to_string(event_val);
+            let text_eq = ev.as_str() == text.as_str();
+            let number_eq = compare::try_cast_double(&ev)
+                .map(|read| compare::double_cmp(read, *number).is_eq());
+            match op {
+                CompareOp::Eq => Some(text_eq || number_eq.unwrap_or(false)),
+                CompareOp::Ne => Some(!text_eq && number_eq.is_none_or(|eq| !eq)),
+                // Ordered ops never resolve to this form (`compare_form`
+                // sends them to `NumericOnText`); fall back to the text
+                // comparison rather than inventing an ordering.
+                ordered => {
+                    debug_assert!(false, "TextOrNumeric is an equality-class form");
+                    Some(apply_ord(ev.as_str().cmp(text.as_str()), ordered))
+                }
+            }
         }
     }
 }
@@ -1163,17 +1203,33 @@ mod tests {
     const BIGINT_STATUS: &[(&str, CT)] = &[("status", CT::BigInt)];
 
     #[test]
-    fn pinned_varchar_eq_numeric_compares_as_text() {
-        // String-stored "200" matches; a number 200 stringifies to the
-        // same text (mirrors the hot branch's json_extract_string).
+    fn pinned_varchar_eq_numeric_compares_as_text_or_reading() {
+        // String-stored "200" matches on the text arm.
         assert!(matches_event_pinned(
             "status=200",
             r#"{"status": "200"}"#,
             VARCHAR_STATUS
         ));
+        // A wire NUMBER matches on the numeric arm, which is the arm that
+        // survives `read_json` widening the column: the same event stores
+        // "200" beside integers and "200.0" beside a fractional sibling,
+        // and batch answers TRUE either way (executed in
+        // `tests/filter_parity.rs`).
         assert!(matches_event_pinned(
             "status=200",
             r#"{"status": 200}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(matches_event_pinned(
+            "status=200",
+            r#"{"status": 200.0}"#,
+            VARCHAR_STATUS
+        ));
+        // Other spellings of the same number are the same number to
+        // `TRY_CAST` — as they were before pins existed.
+        assert!(matches_event_pinned(
+            "status=200",
+            r#"{"status": "0200"}"#,
             VARCHAR_STATUS
         ));
         assert!(!matches_event_pinned(
@@ -1186,6 +1242,34 @@ mod tests {
             r#"{"status": "404"}"#,
             VARCHAR_STATUS
         ));
+        // A non-numeric literal keeps the pure text arm.
+        assert!(matches_event_pinned(
+            "status=accepted",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    /// `!=` is the complement of `=` over non-null values, including for
+    /// the values with no numeric reading that motivate a VARCHAR pin:
+    /// `status!=200` must still return `"accepted"`, not drop it into
+    /// UNKNOWN. Mirrors the SQL's `COALESCE(…, TRUE)`.
+    #[test]
+    fn pinned_varchar_ne_numeric_keeps_unreadable_values() {
+        for value in [r#""accepted""#, r#""n/a""#, r#""404""#, "404"] {
+            let event = format!(r#"{{"status": {value}}}"#);
+            assert!(
+                matches_event_pinned("status!=200", &event, VARCHAR_STATUS),
+                "status!=200 must match {value}"
+            );
+        }
+        for value in [r#""200""#, "200", "200.0"] {
+            let event = format!(r#"{{"status": {value}}}"#);
+            assert!(
+                !matches_event_pinned("status!=200", &event, VARCHAR_STATUS),
+                "status!=200 must not match {value}"
+            );
+        }
     }
 
     #[test]
@@ -1347,15 +1431,15 @@ mod tests {
             r#"{"status": "200"}"#,
             VARCHAR_STATUS
         ));
-        // The PIN lookup: "0200" is text-unequal to "200" but numerically
-        // equal, so only the VARCHAR pin's text comparison rejects it —
-        // a miss would fall back to the unpinned Int coercion and match.
-        assert!(!matches_event_pinned(
-            "Status=200",
-            r#"{"status": "0200"}"#,
+        // The PIN lookup: "accepted" has no numeric reading, so only the
+        // VARCHAR pin's text arm can answer `!=` at all — a fold miss
+        // falls back to the unpinned Int coercion, which answers FALSE.
+        assert!(matches_event_pinned(
+            "Status!=200",
+            r#"{"status": "accepted"}"#,
             VARCHAR_STATUS
         ));
-        assert!(matches_event("status=200", r#"{"status": "0200"}"#));
+        assert!(!matches_event("status!=200", r#"{"status": "accepted"}"#));
         // A JSON null still matches `!=` through the folded key.
         assert!(matches_event_pinned(
             "Status!=200",

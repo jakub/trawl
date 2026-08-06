@@ -39,8 +39,15 @@ typed sight). Search-stage field filters consult the pin, so a
 comparison means the same thing whatever the query literal looks like:
 
 - **VARCHAR-pinned field, `=` / `!=` / IN list** — compares **as text**:
-  `status=200` matches the stored string `"200"` (and only that exact
-  spelling — not `"200.0"`).
+  `status=accepted` matches the stored string `"accepted"`, exactly. A
+  *numeric* literal matches the exact text **or** any spelling of the
+  same number: `status=200` finds `"200"`, `"0200"` and `"200.0"`, but
+  not `"accepted"` or `"404"`. The numeric half is not optional — the
+  text a number is stored under depends on the batch it arrived in (one
+  fractional value anywhere in the batch stores `200` as `"200.0"`), and
+  live tail must answer the same as a batch query. `!=` is the exact
+  complement: `status!=200` returns `"accepted"` and every other
+  non-200 value.
 - **VARCHAR-pinned field, ordered comparison with a numeric literal** —
   compares **numerically** via `TRY_CAST(col AS DOUBLE)`: `status>=400`
   matches `"404"`/`"500"`, and non-numeric values like `"accepted"`

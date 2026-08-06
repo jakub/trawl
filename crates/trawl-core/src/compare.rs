@@ -17,7 +17,8 @@
 //! | pinned type | operation | form |
 //! |---|---|---|
 //! | unpinned | all | [`CompareForm::Native`] — literal-driven, unchanged |
-//! | VARCHAR | `=` / `!=` / IN element | [`CompareForm::Text`] — compare as text (`'200'`) |
+//! | VARCHAR | `=` / `!=` / IN element, non-numeric literal | [`CompareForm::Text`] — compare as text (`'accepted'`) |
+//! | VARCHAR | `=` / `!=` / IN element, numeric literal | [`CompareForm::TextOrNumeric`] — the text OR the value's `TRY_CAST(col AS DOUBLE)` reading |
 //! | VARCHAR | ordered + numeric literal | [`CompareForm::NumericOnText`] — `TRY_CAST(col AS DOUBLE)`; non-numeric values NULL out |
 //! | VARCHAR | ordered + non-numeric literal | [`CompareForm::Native`] — lexical, unchanged |
 //! | VARCHAR | glob / regex | [`PatternForm::Native`] — unchanged |
@@ -31,6 +32,36 @@
 //! [`coerce_filter_value`]): the AST discards quote provenance, so
 //! `status>"400"` is indistinguishable from `status>400`. Documented, not
 //! fixed here (fixing it is a parser change, out of slice-A scope).
+//!
+//! ## Why the equality rung carries a numeric reading
+//!
+//! A VARCHAR pin does NOT mean the stored text is the text the wire
+//! carried. The column is conformed from whatever `read_json` inferred for
+//! it — on the hot branch `json_extract_string(to_json(col), '$')`, in
+//! compaction `TRY_CAST(col AS VARCHAR)` — so a wire `200` sitting in a
+//! batch that also carries `200.5` infers DOUBLE and stores `"200.0"`, in
+//! parquet, durably (probed in `trawl-core/tests/filter_parity.rs`). The
+//! live matcher only ever sees the wire JSON, so an EXACT-text equality is
+//! unmirrorable: `status=200` would be a batch miss and a live hit — the
+//! silent divergence [`crate::filter`]'s invariant forbids.
+//!
+//! The numeric reading is the inference-independent half: every rendering
+//! `DuckDB` can produce for a number (`200`, `200.0`, `2e2`) casts back to
+//! that same DOUBLE, and the wire value's own reading equals it. So an
+//! equality against a numeric literal matches on EITHER — the exact text
+//! (`"200"`, the enum-shaped case ADR-0011 is about) or the numeric reading
+//! (`"200.0"`, the same value spelled by `read_json`'s inference). `!=` is
+//! its complement (text differs AND the reading differs, `COALESCE`d TRUE
+//! so `status!=200` still returns `"accepted"`), and both sides evaluate
+//! the identical rule.
+//!
+//! Residual, pre-existing and out of slice-A scope: `read_json` also infers
+//! TIMESTAMP for date-shaped STRINGS, and conformance then stores
+//! `DuckDB`'s space-separated rendering — so an equality against a
+//! timestamp-shaped literal can still differ from the wire text. That
+//! predates pin-awareness (a non-numeric literal bound the same string
+//! before this rule table existed) and is a write-path fidelity question,
+//! not a comparison rule.
 //!
 //! The ordered-numeric rung is `DuckDB`'s cast domain, not Rust's float
 //! parser: [`try_cast_double`] and [`double_cmp`] are the live mirrors of
@@ -53,8 +84,16 @@ use crate::schema::CanonicalType;
 pub enum CompareForm {
     /// Today's literal-driven binding — the unpinned/typed-pin default.
     Native(SqlValue),
-    /// Compare as text: the literal binds as a string (`'200'`).
+    /// Compare as text: the literal binds as a string (`'accepted'`).
     Text(String),
+    /// The VARCHAR-pinned equality form for a NUMERIC literal: the value
+    /// matches when its stored TEXT is the literal **or** its
+    /// `TRY_CAST(… AS DOUBLE)` reading is the literal's number.
+    ///
+    /// The text half is ADR-0011's rule; the numeric half is what makes it
+    /// mirrorable, because the stored text of a number is `read_json`'s
+    /// inference rendered, not the wire spelling (see the module doc).
+    TextOrNumeric { text: String, number: f64 },
     /// Ordered numeric comparison over a VARCHAR column:
     /// `TRY_CAST(col AS DOUBLE) op ?` with the literal bound as DOUBLE —
     /// non-numeric stored values become NULL and don't match.
@@ -193,7 +232,13 @@ pub fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> 
         return CompareForm::Native(coerce_filter_value(literal));
     }
     match op {
-        FilterOp::Eq | FilterOp::Ne => CompareForm::Text(literal.to_owned()),
+        FilterOp::Eq | FilterOp::Ne => numeric_literal(literal).map_or_else(
+            || CompareForm::Text(literal.to_owned()),
+            |number| CompareForm::TextOrNumeric {
+                text: literal.to_owned(),
+                number,
+            },
+        ),
         FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => numeric_literal(literal)
             .map_or_else(
                 || CompareForm::Native(coerce_filter_value(literal)),
@@ -490,14 +535,47 @@ mod tests {
 
     #[test]
     fn varchar_eq_class_binds_text_for_every_literal() {
-        for (lit, _) in literal_shapes() {
+        for (lit, native) in literal_shapes() {
+            // A numeric literal additionally carries its reading — the
+            // stored text of a number is `read_json`'s inference rendered,
+            // so exact text alone is unmirrorable live (see the module doc).
+            let expected = if is_numeric(&native) {
+                CompareForm::TextOrNumeric {
+                    text: lit.to_owned(),
+                    number: as_f64(&native),
+                }
+            } else {
+                CompareForm::Text(lit.to_owned())
+            };
             for op in EQ_CLASS {
                 assert_eq!(
                     compare_form(Some(CanonicalType::Varchar), op, lit),
-                    CompareForm::Text(lit.to_owned()),
+                    expected,
                     "varchar {op:?} {lit:?}"
                 );
             }
+        }
+    }
+
+    /// The equality rung's numeric half is decided by the SAME ladder the
+    /// ordered rung uses: one literal is either a number to both or to
+    /// neither, so `status=200` and `status>=200` cannot disagree about
+    /// what `200` is.
+    #[test]
+    fn varchar_eq_and_ordered_agree_on_what_is_numeric() {
+        for (lit, _) in literal_shapes()
+            .into_iter()
+            .chain([("accepted", SqlValue::String("accepted".to_owned()))])
+        {
+            let eq_numeric = matches!(
+                compare_form(Some(CanonicalType::Varchar), FilterOp::Eq, lit),
+                CompareForm::TextOrNumeric { .. }
+            );
+            let ordered_numeric = matches!(
+                compare_form(Some(CanonicalType::Varchar), FilterOp::Gt, lit),
+                CompareForm::NumericOnText(_)
+            );
+            assert_eq!(eq_numeric, ordered_numeric, "{lit:?}");
         }
     }
 

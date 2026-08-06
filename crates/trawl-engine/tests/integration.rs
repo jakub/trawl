@@ -1528,9 +1528,9 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
     // That changes the SOURCE, never the TYPES: the hot column must arrive
     // conformed to the VARCHAR pin exactly as the union's hot branch
     // conforms it, or the answer would flip the moment the first parquet
-    // landed. Reading the raw ndjson infers BIGINT, and `status=200.0`
-    // matches by implicit cast — while the hot+cold union and the SSE
-    // filter both compare the text '200' and reject it.
+    // landed — in the returned VALUE (a JSON-inferred BIGINT comes back as
+    // an Integer) and in what a non-numeric literal does (text compares,
+    // a BIGINT column throws a Conversion error).
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     write_numeric_status_hot(&hot);
@@ -1563,6 +1563,12 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
          means the hot-only lane read JSON-inferred types"
     );
 
+    // A VARCHAR pin does not fix how a NUMBER is spelled on disk —
+    // `read_json`'s inference does, and this same event stores as '200.0'
+    // the moment a fractional sibling shares its batch. So the equality
+    // rule carries the value's numeric reading and `status=200.0` matches
+    // the stored '200', exactly as the SSE matcher answers for the same
+    // wire value (ADR-0011 slice A, `trawl-core/tests/filter_parity.rs`).
     let decimal = exec
         .run_query_with_hot(
             "status=200.0",
@@ -1576,10 +1582,24 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
         .expect("text equality must not error on the hot-only lane");
     assert_eq!(
         decimal.row_count(),
-        0,
-        "'200' is not the text '200.0' — a match means DuckDB compared a \
-         JSON-inferred BIGINT instead of the pinned text"
+        1,
+        "'200.0' is the same number as the stored '200'"
     );
+
+    // And the column really is text: a non-numeric literal compares
+    // cleanly, which a JSON-inferred BIGINT column could not do.
+    let word = exec
+        .run_query_with_hot(
+            "status!=accepted",
+            &source,
+            hot.to_str().unwrap(),
+            &pins,
+            &pins,
+            usize::MAX,
+            0,
+        )
+        .expect("a non-numeric literal must not throw on the hot-only lane");
+    assert_eq!(word.row_count(), 1, "'200' is not the text 'accepted'");
 }
 
 #[test]

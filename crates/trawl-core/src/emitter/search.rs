@@ -140,76 +140,7 @@ fn emit_search_token(
     state: &mut EmitterState,
 ) -> Result<(), super::EmitError> {
     match token {
-        SearchToken::FieldFilter(ff) => {
-            // `level` is a DSL alias for the numeric severity column:
-            // band predicates, not string comparison (ADR-0009).
-            if ff.field == LEVEL_FIELD {
-                let clause = match &ff.value {
-                    FilterValue::Literal(v) => level_predicate(ff.op, v)?,
-                    FilterValue::List(vs) => level_in_list(vs)?,
-                };
-                state.push_where(clause);
-                return Ok(());
-            }
-            let field = quote_field(&ff.field);
-            // The catalog pin typing this comparison (ADR-0011 slice A) —
-            // `None` outside the catalog-backed paths, which keeps every
-            // branch below literal-driven.
-            let pin = state.compare_pin(&ff.field);
-            match &ff.value {
-                FilterValue::Literal(v) => {
-                    let sql_op = filter_op_to_sql(ff.op);
-                    match ff.op {
-                        FilterOp::Glob => {
-                            let target = pattern_target(&field, pin);
-                            let placeholder = state.push_param(SqlValue::String(v.clone()));
-                            state.push_where(format!("{target} GLOB {placeholder}"));
-                        }
-                        FilterOp::Regex => {
-                            let target = pattern_target(&field, pin);
-                            let placeholder = state.push_param(SqlValue::String(v.clone()));
-                            state.push_where(format!("regexp_matches({target}, {placeholder})"));
-                        }
-                        _ => match compare::compare_form(pin, ff.op, v) {
-                            // VARCHAR pin + ordered numeric literal:
-                            // numeric comparison over the text column —
-                            // TRY_CAST so a non-numeric stored value is
-                            // NULL (no match), never a Conversion throw.
-                            CompareForm::NumericOnText(n) => {
-                                let placeholder = state.push_param(SqlValue::Float(n));
-                                state.push_where(format!(
-                                    "TRY_CAST({field} AS DOUBLE) {sql_op} {placeholder}"
-                                ));
-                            }
-                            form => {
-                                let val = comparable_value(form);
-                                let placeholder = state.push_param(val);
-                                if ff.op == FilterOp::Ne {
-                                    // SQL three-valued logic: NULL != x → UNKNOWN → filtered out.
-                                    // Include NULLs explicitly so != behaves as users expect.
-                                    state.push_where(format!(
-                                        "({field} {sql_op} {placeholder} OR {field} IS NULL)"
-                                    ));
-                                } else {
-                                    state.push_where(format!("{field} {sql_op} {placeholder}"));
-                                }
-                            }
-                        },
-                    }
-                }
-                FilterValue::List(vs) => {
-                    let placeholders: Vec<String> = vs
-                        .iter()
-                        .map(|v| {
-                            // Each IN element binds like an equality.
-                            let val = comparable_value(compare::compare_form(pin, FilterOp::Eq, v));
-                            state.push_param(val)
-                        })
-                        .collect();
-                    state.push_where(format!("{field} IN ({})", placeholders.join(", ")));
-                }
-            }
-        }
+        SearchToken::FieldFilter(ff) => emit_field_filter(ff, state)?,
         SearchToken::TextSearch(ts) => {
             // wildcard = no filter
             if ts.term == "*" {
@@ -238,6 +169,131 @@ fn emit_search_token(
     Ok(())
 }
 
+/// Emit one field filter — the comparison arm the catalog pin types
+/// (ADR-0011 slice A).
+fn emit_field_filter(
+    ff: &crate::ast::FieldFilter,
+    state: &mut EmitterState,
+) -> Result<(), super::EmitError> {
+    // `level` is a DSL alias for the numeric severity column:
+    // band predicates, not string comparison (ADR-0009).
+    if ff.field == LEVEL_FIELD {
+        let clause = match &ff.value {
+            FilterValue::Literal(v) => level_predicate(ff.op, v)?,
+            FilterValue::List(vs) => level_in_list(vs)?,
+        };
+        state.push_where(clause);
+        return Ok(());
+    }
+    let field = quote_field(&ff.field);
+    // The catalog pin typing this comparison (ADR-0011 slice A) — `None`
+    // outside the catalog-backed paths, which keeps every branch below
+    // literal-driven.
+    let pin = state.compare_pin(&ff.field);
+    match &ff.value {
+        FilterValue::Literal(v) => {
+            let sql_op = filter_op_to_sql(ff.op);
+            match ff.op {
+                FilterOp::Glob => {
+                    let target = pattern_target(&field, pin);
+                    let placeholder = state.push_param(SqlValue::String(v.clone()));
+                    state.push_where(format!("{target} GLOB {placeholder}"));
+                }
+                FilterOp::Regex => {
+                    let target = pattern_target(&field, pin);
+                    let placeholder = state.push_param(SqlValue::String(v.clone()));
+                    state.push_where(format!("regexp_matches({target}, {placeholder})"));
+                }
+                _ => match compare::compare_form(pin, ff.op, v) {
+                    // VARCHAR pin + ordered numeric literal: numeric
+                    // comparison over the text column — TRY_CAST so a
+                    // non-numeric stored value is NULL (no match), never a
+                    // Conversion throw.
+                    CompareForm::NumericOnText(n) => {
+                        let placeholder = state.push_param(SqlValue::Float(n));
+                        state.push_where(format!(
+                            "TRY_CAST({field} AS DOUBLE) {sql_op} {placeholder}"
+                        ));
+                    }
+                    // VARCHAR pin + equality-class numeric literal: the
+                    // exact text OR the column's numeric reading, because
+                    // the stored text of a number is `read_json`'s
+                    // inference rendered (`"200.0"`), not the wire spelling
+                    // the live matcher sees (`crate::compare`).
+                    CompareForm::TextOrNumeric { text, number } => {
+                        let predicate = text_or_numeric(&field, ff.op, text, number, state);
+                        if ff.op == FilterOp::Ne {
+                            // Same NULL policy as the plain `!=` shape
+                            // below: a NULL column matches.
+                            state.push_where(format!("({predicate} OR {field} IS NULL)"));
+                        } else {
+                            state.push_where(predicate);
+                        }
+                    }
+                    form => {
+                        let val = comparable_value(form);
+                        let placeholder = state.push_param(val);
+                        if ff.op == FilterOp::Ne {
+                            // SQL three-valued logic: NULL != x → UNKNOWN → filtered out.
+                            // Include NULLs explicitly so != behaves as users expect.
+                            state.push_where(format!(
+                                "({field} {sql_op} {placeholder} OR {field} IS NULL)"
+                            ));
+                        } else {
+                            state.push_where(format!("{field} {sql_op} {placeholder}"));
+                        }
+                    }
+                },
+            }
+        }
+        FilterValue::List(vs) => emit_in_list(&field, pin, vs, state),
+    }
+    Ok(())
+}
+
+/// Emit an IN list — each element binds like an equality.
+///
+/// A `TextOrNumeric` element has no single bound value, so a list carrying
+/// one expands to the OR of its per-element equalities: the same set
+/// membership, and the same shape the live matcher evaluates (its
+/// `InList` is an OR of `=` comparisons). Lists with no such element keep
+/// the plain `IN (…)` shape, byte-identical to unpinned emission.
+fn emit_in_list(
+    field: &str,
+    pin: Option<crate::schema::CanonicalType>,
+    values: &[String],
+    state: &mut EmitterState,
+) {
+    let forms: Vec<CompareForm> = values
+        .iter()
+        .map(|v| compare::compare_form(pin, FilterOp::Eq, v))
+        .collect();
+    if forms
+        .iter()
+        .any(|f| matches!(f, CompareForm::TextOrNumeric { .. }))
+    {
+        let predicates: Vec<String> = forms
+            .into_iter()
+            .map(|form| match form {
+                CompareForm::TextOrNumeric { text, number } => {
+                    text_or_numeric(field, FilterOp::Eq, text, number, state)
+                }
+                other => {
+                    let placeholder = state.push_param(comparable_value(other));
+                    format!("{field} = {placeholder}")
+                }
+            })
+            .collect();
+        state.push_where(format!("({})", predicates.join(" OR ")));
+    } else {
+        let placeholders: Vec<String> = forms
+            .into_iter()
+            .map(|form| state.push_param(comparable_value(form)))
+            .collect();
+        state.push_where(format!("{field} IN ({})", placeholders.join(", ")));
+    }
+}
+
 /// The column expression a glob/regex matches against: the column itself,
 /// or the pin's canonical pattern text (ADR-0011 slice A) — glob on a
 /// BIGINT column matches its text form instead of leaving the outcome to
@@ -263,15 +319,46 @@ fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalType>) -> Str
     }
 }
 
+/// The equality predicate for a VARCHAR-pinned numeric literal
+/// (ADR-0011 slice A): the stored text OR the column's numeric reading.
+///
+/// `=` is `(col = '200' OR COALESCE(TRY_CAST(col AS DOUBLE) = 200, FALSE))`
+/// and `!=` is its exact complement over non-NULL values. Both `COALESCE`s
+/// are load-bearing: without them a value with no numeric reading
+/// (`'accepted'`) would make the whole predicate UNKNOWN — `status=200`
+/// would then be filtered out AND survive `NOT`, and `status!=200` would
+/// stop returning the enum-shaped rows that motivate the VARCHAR pin. A
+/// NULL column stays UNKNOWN either way (`NULL = ? OR FALSE` is NULL),
+/// which is what the live matcher answers for an absent key.
+fn text_or_numeric(
+    field: &str,
+    op: FilterOp,
+    text: String,
+    number: f64,
+    state: &mut EmitterState,
+) -> String {
+    let text_param = state.push_param(SqlValue::String(text));
+    let num_param = state.push_param(SqlValue::Float(number));
+    let cast = format!("TRY_CAST({field} AS DOUBLE)");
+    if op == FilterOp::Ne {
+        format!("({field} != {text_param} AND COALESCE({cast} != {num_param}, TRUE))")
+    } else {
+        format!("({field} = {text_param} OR COALESCE({cast} = {num_param}, FALSE))")
+    }
+}
+
 /// Collapse the equality-class forms to the `SqlValue` they bind.
-/// `NumericOnText` is handled by its own SQL shape before this is called
-/// and never produced for `=`/`!=`/IN elements.
+/// `NumericOnText` and `TextOrNumeric` are handled by their own SQL shapes
+/// before this is called.
 fn comparable_value(form: CompareForm) -> SqlValue {
     match form {
         CompareForm::Native(val) => val,
         CompareForm::Text(s) => SqlValue::String(s),
-        CompareForm::NumericOnText(_) => {
-            debug_assert!(false, "NumericOnText has its own emission shape");
+        CompareForm::NumericOnText(_) | CompareForm::TextOrNumeric { .. } => {
+            debug_assert!(
+                false,
+                "the pinned numeric forms have their own emission shape"
+            );
             SqlValue::String(String::new())
         }
     }

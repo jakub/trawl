@@ -1693,6 +1693,52 @@ async fn pinned_varchar_comparisons_behave_over_http(pool: sqlx::PgPool) {
         2,
         "cold '404' plus hot '500'"
     );
+
+    // Wire NUMBERS under the same VARCHAR pin. `read_json` types the
+    // column from the whole batch, so the fractional sibling widens it to
+    // DOUBLE and `200` is stored as the text "200.0" — durably, once
+    // compaction writes the parquet. The equality rule carries the
+    // value's numeric reading precisely so this row is still `status=200`
+    // on both the hot and the cold side, and on the live tail.
+    let numeric: Vec<serde_json::Value> = [json!(200), json!(200.5)]
+        .iter()
+        .map(|n| {
+            json!({
+                "service": "pin-svc", "env": "prod", "host": "web01",
+                "timestamp": now_ts(), "message": format!("num-{n}"), "status": n,
+            })
+        })
+        .collect();
+    assert_eq!(
+        h.ingest
+            .ingest(&numeric)
+            .await
+            .expect("ingest numeric")
+            .accepted,
+        2
+    );
+    assert_eq!(
+        count("service=pin-svc status=200 last=1h").await,
+        2,
+        "the wire 200 matches alongside the stored '200'"
+    );
+
+    compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
+    assert_eq!(
+        h.server.state.query.field_catalog.get("status"),
+        Some(trawl_core::schema::CanonicalType::Varchar),
+        "the pin is unchanged — numbers conform to text"
+    );
+    assert_eq!(
+        count("service=pin-svc status=200 last=1h").await,
+        2,
+        "and still matches once the widened text is on disk"
+    );
+    assert_eq!(
+        count("service=pin-svc status>=200.5 last=1h").await,
+        4,
+        "'301', '404', '500' and the stored '200.5'"
+    );
 }
 
 /// Read SSE chunks until `needle` shows up (bounded), returning the
@@ -1714,9 +1760,10 @@ async fn read_until(resp: &mut reqwest::Response, needle: &str) -> String {
 }
 
 /// ADR-0011 slice A acceptance: live tail receives the pins. A string
-/// "404" event matches `status>=400` on the SSE stream, and the text-eq
-/// rule is discriminably live — `status=200` must NOT match "200.00"
-/// (the pin-blind numeric coercion would).
+/// "404" event matches `status>=400` on the SSE stream, and the
+/// equality rule is discriminably live — `status!=200` must match
+/// "accepted" (the pin-blind numeric coercion drops it) while still
+/// excluding every spelling of 200.
 #[sqlx::test(migrations = false)]
 async fn sse_stream_applies_varchar_pin(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -1770,12 +1817,14 @@ async fn sse_stream_applies_varchar_pin(pool: sqlx::PgPool) {
     );
     drop(stream);
 
-    // Text-eq rule live, discriminably: "200.00" would match the
-    // pin-blind numeric coercion (200.00 == 200) but must NOT match the
-    // pinned text form; the exact "200" must.
+    // Equality rule live, discriminably: `status!=200` must return
+    // "accepted" — the pin-blind numeric coercion cannot read it and
+    // answers no-match — while both spellings of 200 stay excluded, the
+    // text one through the text arm and "200.00" through the numeric
+    // reading that keeps batch and live agreeing about a widened column.
     let mut stream = raw
         .get(format!("{}/api/v1/stream", h.server.url))
-        .query(&[("query", "service=sse-svc status=200")])
+        .query(&[("query", "service=sse-svc status!=200")])
         .bearer_auth(&h.server.analyst_token)
         .send()
         .await
@@ -1784,17 +1833,21 @@ async fn sse_stream_applies_varchar_pin(pool: sqlx::PgPool) {
     let live: Vec<serde_json::Value> = vec![
         json!({
             "service": "sse-svc", "env": "prod", "host": "web01",
+            "timestamp": now_ts(), "message": "exact-form", "status": "200",
+        }),
+        json!({
+            "service": "sse-svc", "env": "prod", "host": "web01",
             "timestamp": now_ts(), "message": "decimal-form", "status": "200.00",
         }),
         json!({
             "service": "sse-svc", "env": "prod", "host": "web01",
-            "timestamp": now_ts(), "message": "exact-form", "status": "200",
+            "timestamp": now_ts(), "message": "word-form", "status": "accepted",
         }),
     ];
     h.ingest.ingest(&live).await.expect("ingest eq live");
-    let buf = read_until(&mut stream, "exact-form").await;
+    let buf = read_until(&mut stream, "word-form").await;
     assert!(
-        !buf.contains("decimal-form"),
-        "the VARCHAR pin compares as text — '200.00' must not match status=200: {buf}"
+        !buf.contains("exact-form") && !buf.contains("decimal-form"),
+        "no spelling of 200 may match status!=200: {buf}"
     );
 }
