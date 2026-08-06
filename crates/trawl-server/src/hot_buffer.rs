@@ -461,6 +461,10 @@ mod tests {
                     "_time".into(),
                     serde_json::Value::String("2024-01-15T10:00:00Z".into()),
                 );
+                m.insert(
+                    "_ingested".into(),
+                    serde_json::Value::String("2024-01-15T10:00:00Z".into()),
+                );
                 m.insert("service".into(), serde_json::Value::String("svc".into()));
                 m.insert("message".into(), serde_json::Value::String(format!("m{i}")));
                 m
@@ -469,6 +473,10 @@ mod tests {
         let mut repaired = serde_json::Map::new();
         repaired.insert(
             "_time".into(),
+            serde_json::Value::String("2024-01-15T10:00:00Z".into()),
+        );
+        repaired.insert(
+            "_ingested".into(),
             serde_json::Value::String("2024-01-15T10:00:00Z".into()),
         );
         repaired.insert("service".into(), serde_json::Value::String("svc".into()));
