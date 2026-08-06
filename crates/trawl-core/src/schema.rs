@@ -239,9 +239,18 @@ pub const ENVELOPE_TYPES: &[(&str, CanonicalType)] = &[
 /// An ordered field → canonical-type map, as threaded from the server's
 /// pin cache into the emitter (pins ∩ hot-snapshot keys). Ordered so the
 /// emitted SQL is deterministic.
+///
+/// The map is shared behind an `Arc` and written copy-on-write: a pin set
+/// is built once and then read many times — the emitter carries one per
+/// pass, and a single logical query can re-emit up to three times on the
+/// pruned-retry / hot-only-fallback ladder. With the catalog bounded at
+/// `MAX_PINNED_FIELDS` (10 000 install-wide) a deep copy per clone is a
+/// real per-query cost; `clone` here is a refcount bump instead. Mutation
+/// stays available (`insert` through [`std::sync::Arc::make_mut`]) and
+/// unshared instances — the build-then-share path — never copy at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FieldTypes {
-    entries: std::collections::BTreeMap<String, CanonicalType>,
+    entries: std::sync::Arc<std::collections::BTreeMap<String, CanonicalType>>,
 }
 
 impl FieldTypes {
@@ -252,8 +261,11 @@ impl FieldTypes {
     }
 
     /// Insert or overwrite a field's type.
+    ///
+    /// Copy-on-write: copies the map only when another clone is still
+    /// holding it, which the build-then-share callers never do.
     pub fn insert(&mut self, field: &str, ty: CanonicalType) {
-        self.entries.insert(field.to_owned(), ty);
+        std::sync::Arc::make_mut(&mut self.entries).insert(field.to_owned(), ty);
     }
 
     /// Iterate `(field, type)` in field-name order.
@@ -511,5 +523,21 @@ mod tests {
         );
         assert!(!ft.is_empty());
         assert!(FieldTypes::new().is_empty());
+    }
+
+    #[test]
+    fn cloning_shares_the_map_and_insert_copies_on_write() {
+        let mut ft = FieldTypes::new();
+        ft.insert("status", CanonicalType::Varchar);
+        let shared = ft.clone();
+        // The emitter clones a pin set per pass (up to three passes per
+        // logical query); that must not deep-copy the catalog.
+        assert!(std::sync::Arc::ptr_eq(&ft.entries, &shared.entries));
+
+        // ... and a write through one handle must not reach the other.
+        ft.insert("duration", CanonicalType::BigInt);
+        assert_eq!(ft.get("duration"), Some(CanonicalType::BigInt));
+        assert_eq!(shared.get("duration"), None);
+        assert_eq!(shared.get("status"), Some(CanonicalType::Varchar));
     }
 }

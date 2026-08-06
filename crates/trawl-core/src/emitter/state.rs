@@ -366,6 +366,11 @@ impl EmitterState {
     /// Attach the comparison pin set (ADR-0011 slice A). Builder-style so
     /// the `emit*` entry points can funnel through one constructor per
     /// source shape.
+    ///
+    /// The clone is a refcount bump, not a map copy ([`crate::schema::FieldTypes`]
+    /// shares its entries behind an `Arc`): every emission takes one, the
+    /// raw-free fallback takes a second, and the executor's pruned-retry /
+    /// hot-only ladder can re-emit a third time for one logical query.
     pub(crate) fn with_compare_pins(mut self, pins: &crate::schema::FieldTypes) -> Self {
         self.compare_pins = pins.clone();
         self
