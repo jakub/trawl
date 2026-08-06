@@ -591,6 +591,13 @@ fn pinned(entries: &[(&str, CanonicalType)]) -> FieldTypes {
 /// all-null event would infer a JSON column instead — off the write-time
 /// invariant every real cold file satisfies — so the null case goes
 /// through a parquet COPY harness that types the column explicitly.
+///
+/// An ABSENT key takes that same parquet path, because in batch it IS the
+/// null case: a file whose rows never carried the field still reads the
+/// pinned column as NULL. Absent is the dominant shape on the event bus
+/// (the canonicalizer only fills envelope fields), so the two must answer
+/// identically or `/query` and `/stream` disagree on every field-less
+/// event.
 fn assert_pinned_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>, ft: &FieldTypes) {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
@@ -598,7 +605,7 @@ fn assert_pinned_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>
 
     // Keep the temp files alive for the duration of the SQL run.
     let _guard: Box<dyn std::any::Any>;
-    let source = if event.get("status") == Some(&Value::Null) {
+    let source = if matches!(event.get("status"), None | Some(&Value::Null)) {
         let tmp = tempfile::Builder::new()
             .suffix(".parquet")
             .tempfile()
@@ -639,6 +646,13 @@ fn assert_pinned_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>
 fn status_event(value: &Value) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("status".into(), value.clone());
+    m.insert("message".into(), Value::String("hello".into()));
+    m
+}
+
+/// The field-less event: `status` never reaches the bus at all.
+fn absent_status_event() -> Map<String, Value> {
+    let mut m = Map::new();
     m.insert("message".into(), Value::String("hello".into()));
     m
 }
@@ -708,8 +722,11 @@ fn pinned_varchar_matrix_parity() {
         "NOT status=2*",
         "NOT status=/2.*/",
     ];
-    for value in &values {
-        let event = status_event(value);
+    let events = values
+        .iter()
+        .map(status_event)
+        .chain(std::iter::once(absent_status_event()));
+    for event in events {
         for dsl in dsls {
             assert_pinned_parity(&conn, dsl, &event, &ft);
         }
@@ -724,21 +741,26 @@ fn pinned_varchar_matrix_parity() {
 fn pinned_bigint_pattern_parity() {
     let conn = Connection::open_in_memory().unwrap();
     let ft = pinned(&[("status", CanonicalType::BigInt)]);
-    for value in [200i64, 404, 0, 4] {
-        let event = status_event(&Value::Number(value.into()));
-        for dsl in [
-            "status=4*",
-            "status=2*",
-            "status=/4.*/",
-            "status=/^40.$/",
-            // non-pattern ops stay native under a typed pin
-            "status=404",
-            "status>=400",
-            "status!=200",
-            "NOT status=4*",
-            "NOT status>=400",
-            "NOT status!=200",
-        ] {
+    let dsls = [
+        "status=4*",
+        "status=2*",
+        "status=/4.*/",
+        "status=/^40.$/",
+        // non-pattern ops stay native under a typed pin
+        "status=404",
+        "status>=400",
+        "status!=200",
+        "NOT status=4*",
+        "NOT status>=400",
+        "NOT status!=200",
+    ];
+    let events = [200i64, 404, 0, 4]
+        .into_iter()
+        .map(|v| status_event(&Value::Number(v.into())))
+        // ... and the field-less event, a NULL BIGINT column in batch.
+        .chain(std::iter::once(absent_status_event()));
+    for event in events {
+        for dsl in dsls {
             assert_pinned_parity(&conn, dsl, &event, &ft);
         }
     }

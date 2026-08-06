@@ -1156,6 +1156,30 @@ mod tests {
         ));
     }
 
+    /// An absent key IS the null case: in batch, a row whose file never
+    /// carried the field reads the column as NULL, so `!=` includes it
+    /// through `OR col IS NULL`. Absent is the dominant shape on the bus
+    /// (the canonicalizer only fills envelope fields), so a divergence
+    /// here would drop every field-less event from live tail while
+    /// `/query` returned them all. Executed against `DuckDB` in
+    /// `tests/filter_parity.rs` (both pinned matrices carry the field-less
+    /// event).
+    #[test]
+    fn absent_field_matches_ne_like_explicit_null() {
+        for dsl in ["status!=200", "status!=accepted"] {
+            for event in [r#"{"status": null}"#, "{}"] {
+                assert!(
+                    matches_event_pinned(dsl, event, VARCHAR_STATUS),
+                    "{dsl} over {event} must match under a VARCHAR pin"
+                );
+                assert!(
+                    matches_event(dsl, event),
+                    "{dsl} over {event} must match unpinned"
+                );
+            }
+        }
+    }
+
     #[test]
     fn pinned_varchar_in_list_compares_as_text() {
         assert!(matches_event_pinned(
