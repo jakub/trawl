@@ -179,6 +179,8 @@ A hot-only fallback is permitted only when it cannot hide cold data: on a genuin
 
 A completely separate code path from SQL queries. `CompiledFilter` compiles the search stage of the DSL into an in-memory matcher using aho-corasick for text search and regex for glob patterns. Events are filtered against the broadcast channel, not DuckDB.
 
+Separate path, identical answer: the filter is compiled with the field catalog's pin snapshot and applies the same comparison rules the SQL emitter does (one rule table, two consumers — ADR-0011 slice A), and it evaluates in SQL's three-valued logic, so a missing field is *unknown* rather than false and `NOT` cannot invert it into a match. The snapshot is taken when the stream opens and held for its life — a repin takes effect on reconnect. See the [DSL reference](/reference/dsl/) for the operator-facing rules.
+
 Bounded by an SSE semaphore (default: 32 concurrent streams). Back-pressure is communicated to clients via `StreamEvent::Lagged` events.
 
 ## Internal telemetry
