@@ -39,8 +39,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   immediately — strictly a fix, but saved queries that leaned on implicit
   casting may match differently. Unpinned fields, embedded mode (`--data`,
   no catalog) and the pipeline `| where` stage keep today's literal-driven
-  behavior, documented in the DSL reference. This lands **before** the repin
+  *coercion* — how the literal binds is unchanged there — but the live-tail
+  NULL rules in the next entry change for **every** query, pinned or not.
+  Both are documented in the DSL reference. This lands **before** the repin
   engine (#53) so a future type repin changes storage, not query meaning.
+
+- **Live tail (SSE) evaluates the search stage in SQL's three-valued logic
+  — two NULL reversals, on unpinned fields as much as pinned ones
+  (ADR-0011 slice A, #63).** The in-memory matcher behind
+  `GET /api/v1/stream` used to collapse "the event has no such field" to
+  *false* and then let `NOT` negate that into a match. It now answers
+  UNKNOWN, like the NULL column it mirrors, and UNKNOWN propagates through
+  `NOT`/`AND`/`OR` by SQL's rules. Pins are what surfaced this, not what
+  caused it: each direction was already a live/batch divergence against SQL
+  that has emitted `("f" != ? OR "f" IS NULL)` and a bare `NOT (...)` since
+  long before this release, so the fix is live tail agreeing with the batch
+  answer operators were already getting from `/api/v1/query`. Two live-tail
+  behaviors flip, in opposite directions:
+  - `f!=x` now **matches events that carry no `f`** (and events whose `f`
+    is JSON null). Bus events carry the envelope plus whatever their sender
+    sent, so a live tail keyed on `!=` over a sparse custom field can go
+    from a trickle to most of the firehose. Pair it with `f=*` (or filter
+    on a field the events actually carry) to get the old shape back.
+  - `NOT f=x` — and any negated field filter, `NOT level=...` band, or
+    `NOT <bare term>` — **no longer matches events that carry no `f`**,
+    because `NOT (NULL)` is NULL and the batch query has always dropped
+    those rows. **A live alert written as `NOT f=x` to catch events missing
+    `f` stops firing**; use `f!=x`, whose emitted form is the total one.
 
 ### Added
 - **Self-telemetry gets a bounded retry queue and first-class loss metrics (#56).** A failed telemetry WAL flush now *retains* its batch on a FIFO retry queue instead of dropping it, and drains oldest-first once the volume recovers — coalescing consecutive queued batches into WAL writes of at most 4 MiB (one file, one `batch_id`, one published batch) so a long outage recovers in a handful of fsynced writes instead of one per flush tick, while nothing merges until a write has actually succeeded — with the WAL write (and both fsync barriers) moved off the async executor onto Tokio's blocking pool. The durability-before-visibility invariant is unchanged and now exactly-once: a batch reaches the hot buffer and SSE strictly after its WAL write succeeds. Retained memory is capped by the new `[ingest] telemetry_buffer_max_bytes` (default 16 MiB, an estimated charge like `hot_buffer_max_bytes`) — one budget over the active buffer, the retry queue *and* the batch in flight through a write, enforced as events arrive so a wedged write cannot let the active buffer grow unbounded; over budget the *oldest* queued batches are shed first and then the incoming event itself, all with exact accounting, and the previously-silent pre-init bootstrap cap now counts its drops too. New Prometheus series — `trawl_telemetry_wal_write_failures_total`, `trawl_telemetry_{events,bytes}_dropped_total{reason="preinit_cap"|"buffer_cap"}`, and the `trawl_telemetry_buffer_{events,bytes}` depth gauges — stay scrapeable precisely while self-ingestion is unavailable; the searchable `telemetry_dropped` recovery event now carries event counts and per-reason totals. Graceful shutdown attempts a final flush under a 5-second budget so an unhealthy volume cannot hang the daemon.

@@ -96,6 +96,33 @@ comparison means the same thing whatever the query literal looks like:
 Live tail (SSE) applies exactly the same rules, so a streamed query and
 its batch form agree event for event.
 
+#### Missing fields and nulls
+
+A field an event doesn't carry is a NULL column, and a comparison against
+NULL is **unknown** — neither true nor false. This is SQL's rule and it
+holds everywhere: batch queries, exports, and live tail, on pinned and
+unpinned fields alike. Only a *true* row is returned, so an unknown one is
+filtered out. Two consequences are worth knowing before you write an alert:
+
+- `f!=x` **matches events that carry no `f`** (and events whose `f` is
+  null). Its emitted form is `("f" != ? OR "f" IS NULL)` — the one total
+  comparison. On live tail that is a wide net: bus events carry the
+  envelope plus whatever their sender sent, so `f!=x` over a sparse custom
+  field streams nearly everything. Pair it with `f=*` to require the field.
+- `NOT f=x` **does not match events that carry no `f`** — `NOT (NULL)` is
+  NULL, which is unknown, which is filtered out. If you want "events
+  missing `f`, plus events where it isn't `x`", write `f!=x`, not
+  `NOT f=x`. The same holds for `NOT level=...` when an event has no
+  `severity`, and for `NOT <bare term>` when it has no `message`/`_raw`.
+
+:::caution[Changed in the ADR-0011 release]
+Live tail previously treated a missing field as *false* rather than
+unknown, so `f!=x` matched nothing on such events and `NOT f=x` matched
+all of them — the opposite of what the same query returned from
+`/api/v1/query`. Live tail now agrees with the batch answer. Alerts built
+on `NOT f=x` to catch events missing a field need rewriting as `f!=x`.
+:::
+
 Two deliberate boundaries:
 
 - **Numeric-literal detection is by content, not quoting**: the parser
