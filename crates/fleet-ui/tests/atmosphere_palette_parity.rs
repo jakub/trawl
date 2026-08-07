@@ -14,6 +14,8 @@
 //! the floor must re-theme through the token system, never through a
 //! second hard-coded color that could drift from `--bg`.
 
+mod common;
+
 use fleet_ui::atmosphere::palette;
 
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
@@ -108,6 +110,36 @@ fn atmosphere_geometry_is_pinned() {
     }
 }
 
+/// Does this single selector *target* the `html` element — i.e. is `html`
+/// its subject (the rightmost compound)? `html body` styles the body, not
+/// the root, so only the subject counts.
+fn targets_html(selector: &str) -> bool {
+    selector
+        .split([' ', '\t', '\n', '>', '+', '~'])
+        .rfind(|compound| !compound.is_empty())
+        .and_then(|subject| subject.strip_prefix("html"))
+        // `html`, `html.dark`, `html:root` — but not `htmlish`.
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '-'))
+}
+
+/// Every rule in `css` whose selector list targets `html`, descending one
+/// level into at-rule blocks so a rule fenced behind `@supports`/`@media`
+/// (fleet-ui.css fences the Gecko scrollbar rule that way) is not missed.
+fn html_rules(css: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for rule in common::rules(css) {
+        let Some(open) = rule.find('{') else { continue };
+        let head = rule[..open].trim();
+        if head.starts_with('@') {
+            let inner = rule[open + 1..].trim_end();
+            out.extend(html_rules(inner.strip_suffix('}').unwrap_or(inner)));
+        } else if head.split(',').any(targets_html) {
+            out.push(rule);
+        }
+    }
+    out
+}
+
 #[test]
 fn html_selector_declares_no_background() {
     // The .login-shell background removal (css_chrome_parity) depends on
@@ -117,28 +149,23 @@ fn html_selector_declares_no_background() {
     // re-occlude nothing but ALSO stop body's floor from reaching the
     // viewport behind the z-index:-1 canvas. Scan every html-selector
     // rule body for a background declaration.
-    let mut search_from = 0;
-    while let Some(pos) = FLEET_CSS[search_from..].find("html") {
-        let abs = search_from + pos;
-        search_from = abs + 4;
-        // Only selector positions: preceded by newline/space/comma and
-        // part of a selector list that opens a block before a `;`.
-        let prev = FLEET_CSS[..abs].chars().next_back();
-        if !matches!(prev, None | Some('\n' | ' ' | ',')) {
-            continue; // prose in a comment, e.g. "…html"
-        }
-        let rest = &FLEET_CSS[abs..];
-        let Some(open) = rest.find('{') else { continue };
-        let head = &rest[..open];
-        if head.contains(';') || head.contains("/*") || head.contains('\n') && head.contains('.') {
-            continue; // not a selector for this occurrence
-        }
-        let block = &rest[open..=open + rest[open..].find('}').unwrap_or(rest.len() - open - 1)];
+    let html_rules = html_rules(FLEET_CSS);
+    // Vacuous-pass guard: fleet-ui.css declares `html, body { … }` and the
+    // @supports-fenced `html { scrollbar-color: … }`. Finding neither means
+    // the splitter stopped seeing html rules, not that they are clean.
+    assert!(
+        html_rules.len() >= 2,
+        "expected the known `html` rules (reset + scrollbar fence), found \
+         {} — the rule scan regressed and this test would pass vacuously",
+        html_rules.len()
+    );
+    for rule in html_rules {
+        let body = &rule[rule.find('{').expect("rule has a block")..];
         assert!(
-            !block.contains("background"),
+            !body.contains("background"),
             "an `html` selector rule declares a background — this stops \
              body's var(--bg) from propagating to the viewport canvas \
-             and breaks the .atmosphere degradation floor: {block}"
+             and breaks the .atmosphere degradation floor: {rule}"
         );
     }
 }
