@@ -175,12 +175,16 @@ jobs:
       - name: Rebuild vendor bundles
         working-directory: crates/trawl-web-ui/vendor
         run: bash build.sh
+      - name: Rebuild fleet-ui vendor bundle
+        working-directory: crates/fleet-ui/vendor
+        run: bash build.sh
       - name: Fail if committed bundles drifted
         run: |
           git diff --exit-code \
             crates/trawl-web-ui/vendor/codemirror.js \
             crates/trawl-web-ui/vendor/uplot.js \
-            crates/trawl-web-ui/vendor/uplot.css
+            crates/trawl-web-ui/vendor/uplot.css \
+            crates/fleet-ui/vendor/paper-shaders.js
 
   trunk-build:
     name: web UI release build (trunk)
@@ -199,6 +203,16 @@ jobs:
       - name: Build SPA
         working-directory: crates/trawl-web-ui
         run: trunk build --release
+      # The fleet-ui workbench trunk build is the ONLY automated check
+      # that its index.html copy-file directive resolves: wasm-bindgen's
+      # `module = "/vendor/paper-shaders.js"` import fails at runtime
+      # with no compile-time signal if the bundle isn't copied into
+      # dist/vendor/ (ADR-0012 consumer contract).
+      - name: Build fleet-ui workbench
+        working-directory: crates/fleet-ui
+        run: |
+          trunk build
+          test -f dist/vendor/paper-shaders.js
       - name: Precompress SPA + enforce wire-size budgets
         run: cargo xtask compress-web
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
