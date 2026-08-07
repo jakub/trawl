@@ -1,3 +1,4 @@
+/*! @paper-design/shaders v0.0.79 | Apache-2.0 | see crates/fleet-ui/vendor/NOTICE */
 var xe=`#version 300 es
 precision mediump float;
 

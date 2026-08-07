@@ -23,11 +23,18 @@ else
 fi
 
 echo "[vendor] bundling paper-shaders.js"
+# Apache-2.0 attribution must ride IN the artifact browsers receive:
+# LICENSE/NOTICE never leave the repo checkout, and only a `/*!` banner
+# survives minification. The version is read from the package.json pin
+# so the banner can never drift from it (asserted by
+# tests/atmosphere_vendor_contract.rs).
+SHADERS_VERSION="$(node -p "require('./package.json').dependencies['@paper-design/shaders']")"
 npx esbuild src/paper-shaders.ts \
   --bundle \
   --format=esm \
   --minify \
   --target=es2022 \
+  --banner:js="/*! @paper-design/shaders v${SHADERS_VERSION} | Apache-2.0 | see crates/fleet-ui/vendor/NOTICE */" \
   --outfile=paper-shaders.js \
   --log-level=warning
 
