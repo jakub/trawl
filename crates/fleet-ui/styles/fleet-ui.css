@@ -48,6 +48,8 @@
  *     .status-dot tones, .sc-spark, .toggle, .kbd/.kbd-inline,
  *     .results-footer pager family, .inp-wrap, .actions-wrap/
  *     .actions-menu/.btn-icon
+ *   - Atmosphere backdrop (coastwatch#308): .atmosphere fixed layer
+ *     (var(--bg) fallback floor) + its canvas sizing
  *
  * What this file does NOT ship (stays in each app's own stylesheet):
  *   - [data-rowstyle] selectors targeting .results-table (the enum is
@@ -1286,4 +1288,30 @@ textarea:focus-visible,
   font-size: var(--fs-small);
   color: var(--ink-3);
   font-family: var(--font-mono);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Atmosphere — WebGL shader backdrop (coastwatch#308, ADR-0012)
+ * ─────────────────────────────────────────────────────────────── */
+/* Fixed full-viewport layer behind everything; content composes above
+ * it (z-index: -1 keeps normal-flow siblings on top with no stacking
+ * gymnastics on their side). The background is the DEGRADATION FLOOR:
+ * it paints before the shader mounts and is all that shows when WebGL
+ * is unavailable or the context is lost — var(--bg) so it re-themes
+ * with the token system (never a literal color; pinned var()-only by
+ * atmosphere_palette_parity). */
+.atmosphere {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--bg);
+}
+/* ShaderMount sizes its canvas to the parent; make that sizing
+ * explicit so a partially-initialized mount can't leave a 0×0 or
+ * inline-sized canvas. */
+.atmosphere canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }

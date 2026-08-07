@@ -35,6 +35,7 @@
 //! exercised by native unit tests and nameable by native consumer
 //! code. The renderers themselves stay wasm32-only.
 
+pub mod atmosphere;
 pub mod badge;
 pub mod button;
 pub mod copy_button;
@@ -92,6 +93,8 @@ pub use toast::{Toast, ToastKind, ToastStack};
 
 #[cfg(target_arch = "wasm32")]
 pub use actions_menu::{ActionItem, ActionsMenu};
+#[cfg(target_arch = "wasm32")]
+pub use atmosphere::Atmosphere;
 #[cfg(target_arch = "wasm32")]
 pub use badge::Badge;
 #[cfg(target_arch = "wasm32")]

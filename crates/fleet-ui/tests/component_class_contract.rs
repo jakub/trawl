@@ -58,6 +58,7 @@ const LIB: &str = include_str!("../src/lib.rs");
 const LOAD_MORE: &str = include_str!("../src/load_more.rs");
 const WHEN: &str = include_str!("../src/time/when.rs");
 const CLOCK: &str = include_str!("../src/time/clock.rs");
+const ATMOSPHERE: &str = include_str!("../src/atmosphere/component.rs");
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
 
 /// Assert `src` contains `hook` (a class literal or class-idiom substring),
@@ -423,5 +424,31 @@ fn error_banner_emits_error_class_with_alert_role() {
         ERROR_BANNER.contains(r#"role="alert""#),
         "ErrorBanner must keep role=\"alert\" — the one sanctioned DOM \
          delta of the issue #28 migration (attribute-only, zero pixels)"
+    );
+}
+
+#[test]
+fn atmosphere_emits_its_hook_and_is_hidden_from_the_accessibility_tree() {
+    // jakub/coastwatch#308: the shader backdrop mounts into
+    // `.atmosphere` — the fixed full-viewport layer whose CSS paints
+    // the var(--bg) fallback floor (the AC-6 degradation surface).
+    emits(ATMOSPHERE, r#"class="atmosphere""#, ".atmosphere");
+    // Pure decoration: never in the accessibility tree.
+    assert!(
+        ATMOSPHERE.contains(r#"aria-hidden="true""#),
+        "the atmosphere layer is decorative — it must carry \
+         aria-hidden=\"true\" so screen readers skip the canvas"
+    );
+}
+
+#[test]
+fn atmosphere_disposes_its_shader_mount_on_cleanup() {
+    // The chart.rs lifecycle idiom: leaked ShaderMounts keep a rAF loop
+    // + WebGL context alive per route transition (the AC-3 leak class).
+    assert!(
+        ATMOSPHERE.contains("on_cleanup") && ATMOSPHERE.contains("dispose"),
+        "Atmosphere must dispose its ShaderHandle in on_cleanup — \
+         otherwise every route transition leaks a canvas and its rAF \
+         loop (the mount/dispose contract of jakub/coastwatch#308 AC 3)"
     );
 }
