@@ -1,15 +1,17 @@
-        PASS [   6.083s] (2610/2622) trawl-server::http_api trigger_run_starts_execution
-        PASS [   5.679s] (2611/2622) trawl-server::http_api validate_query_unknown_function
-        PASS [   5.679s] (2612/2622) trawl-server::http_api validate_query_valid
-        PASS [   5.730s] (2613/2622) trawl-server::http_api validate_query_syntax_error
-        PASS [   5.382s] (2614/2622) trawl-server::http_api validate_rejects_reader
-        PASS [   5.669s] (2615/2622) trawl-server::http_api whoami_admin_has_server_manage
-        PASS [   5.664s] (2616/2622) trawl-server::http_api whoami_no_trawl_grant_is_403
-        PASS [   0.006s] (2617/2622) trawl-server::timestamp_repair common::sweep_guards_parse_own_database_name
-        PASS [   5.687s] (2618/2622) trawl-server::http_api whoami_reader_lacks_server_manage
-        PASS [   5.751s] (2619/2622) trawl-server::http_api vector_shaped_ingest_queryable_via_level_alias
-        PASS [   5.687s] (2620/2622) trawl-server::http_api whoami_rejects_missing_auth
-        PASS [   5.767s] (2621/2622) trawl-server::timestamp_repair offset_timestamp_canonicalized_to_utc_instant
-        PASS [   5.932s] (2622/2622) trawl-server::timestamp_repair trigger_variants_survive_ingest_compact_query
+$ DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet_test \
+    cargo nextest run --workspace --test-threads=8   # lefthook pre-push `test`
+        PASS [   5.975s] (2611/2623) trawl-server::http_api trigger_run_starts_execution
+        PASS [   5.714s] (2612/2623) trawl-server::http_api validate_query_syntax_error
+        PASS [   5.674s] (2613/2623) trawl-server::http_api validate_query_unknown_function
+        PASS [   5.674s] (2614/2623) trawl-server::http_api validate_query_valid
+        PASS [   5.492s] (2615/2623) trawl-server::http_api validate_rejects_reader
+        PASS [   5.718s] (2616/2623) trawl-server::http_api whoami_no_trawl_grant_is_403
+        PASS [   5.719s] (2617/2623) trawl-server::http_api whoami_admin_has_server_manage
+        PASS [   0.007s] (2618/2623) trawl-server::timestamp_repair common::sweep_guards_parse_own_database_name
+        PASS [   5.729s] (2619/2623) trawl-server::http_api whoami_reader_lacks_server_manage
+        PASS [   5.787s] (2620/2623) trawl-server::http_api vector_shaped_ingest_queryable_via_level_alias
+        PASS [   5.704s] (2621/2623) trawl-server::http_api whoami_rejects_missing_auth
+        PASS [   5.783s] (2622/2623) trawl-server::timestamp_repair offset_timestamp_canonicalized_to_utc_instant
+        PASS [   5.950s] (2623/2623) trawl-server::timestamp_repair trigger_variants_survive_ingest_compact_query
 ────────────
-     Summary [ 127.409s] 2622 tests run: 2622 passed, 0 skipped
+     Summary [ 131.325s] 2623 tests run: 2623 passed, 0 skipped

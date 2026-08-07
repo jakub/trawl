@@ -1,0 +1,17 @@
+$ DATABASE_URL=postgres://fleet:fleet@localhost:5434/fleet_test_nd \
+    cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli \
+    --no-default-features --test-threads=8 \
+    -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'
+# lefthook pre-push `test-no-defaults` — the config CI's `test` job also runs.
+# Covers the atmosphere slice: fleet-ui's `atmosphere` feature is default-off,
+# so this is the shape every non-opting consumer compiles in.
+        PASS [   0.063s] (1262/1269) trawl-web::log_filter_contract representative_trawl_web_events_pass_the_installed_chart_filter
+        PASS [   0.068s] (1263/1269) trawl-web::log_filter_contract chart_sidecar_filter_matches_the_binary_default
+        PASS [   0.053s] (1264/1269) trawl-web::session_lifecycle expired_cookie_in_prod_mode_includes_secure
+        PASS [   0.047s] (1265/1269) trawl-web::session_lifecycle expired_session_returns_401_with_clear_cookie
+        PASS [   0.045s] (1266/1269) trawl-web::session_lifecycle missing_cookie_does_not_send_set_cookie
+        PASS [   0.043s] (1267/1269) trawl-web::session_lifecycle tampered_cookie_does_not_send_set_cookie
+        PASS [   5.377s] (1268/1269) trawl-server::store_pg lock_loss_is_detected_and_frees_the_lock_for_a_replacement
+        PASS [  10.149s] (1269/1269) trawl-server::store_pg boot_unreachable_database_fails_descriptively
+────────────
+     Summary [  41.608s] 1269 tests run: 1269 passed, 0 skipped

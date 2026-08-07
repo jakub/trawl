@@ -3,7 +3,9 @@
 Captured against the fleet-ui workbench (`trunk serve` on :8082, the
 shell_demo `/login` route) and trawl-web-ui (`trunk serve` on :8083),
 driven via Playwright (Chromium). Native/build gates ran on the same
-tree (`feat/issue-308-shader-atmosphere`).
+tree (`feat/issue-308-shader-atmosphere`) — the lint and nextest
+transcripts below were captured at `a9ef621d`, the last code-bearing
+commit on the branch, so re-run them if a later commit touches code.
 
 ## AC-3 — one canvas, clean unmount, clean console
 
@@ -53,9 +55,17 @@ tree (`feat/issue-308-shader-atmosphere`).
 - `trawl-trunk-build-transcript.txt` — trawl-web-ui `trunk build`
   succeeds with no npm step anywhere.
 - `nextest-transcript.txt` — `cargo nextest run --workspace`:
-  **2622 tests run: 2622 passed, 0 skipped** (includes the 153
+  **2623 tests run: 2623 passed, 0 skipped** (includes the 154
   fleet-ui native tests: palette parity, vendor contract, chrome
   parity, class contracts).
+- `nextest-no-defaults-transcript.txt` — the second pre-push suite,
+  `--no-default-features` on its own postgres cluster:
+  **1269 tests run: 1269 passed, 0 skipped**. This is the config CI's
+  `test` job runs, and the one the atmosphere slice ships in by
+  default — the `atmosphere` feature is off unless a consumer opts in.
+- `lint-transcript.txt` — `cargo fmt --check` clean, and
+  `cargo clippy --workspace --all-targets` emits zero warnings both
+  with default features (`-D warnings`) and `--no-default-features`.
 - `cargo check -p fleet-ui --target wasm32-unknown-unknown` clean both
   with and without `--features atmosphere`; fleet-ui `trunk build`
   emits the vendored bundle as a wasm-bindgen snippet at
