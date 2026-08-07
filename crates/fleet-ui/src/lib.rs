@@ -14,7 +14,11 @@
 //! - **form & actions** — `Btn`, `Field`, `Toggle`, `Segmented`,
 //!   `SearchInput`, `CopyButton`, `Kbd`;
 //! - **content & data** — `Badge`, `StatusDot`, `Sparkline`, `Tabs`,
-//!   `Loaded`, `Pager`, `LoadMore`, `When`, `ErrorBanner`, `IconView`.
+//!   `Loaded`, `Pager`, `LoadMore`, `When`, `ErrorBanner`, `IconView`;
+//! - **decoration** — `Atmosphere`, the WebGL mesh-gradient backdrop
+//!   over the vendored `@paper-design/shaders` bundle (ADR-0012);
+//!   consumers owe the `copy-file` directive documented in
+//!   [`atmosphere`].
 //!
 //! Consumed by trawl-web-ui and the future coastwatch-web via
 //! workspace path deps; CSS is consumed via Trunk's `data-trunk
@@ -29,7 +33,9 @@
 //! [`sparkline::geometry`], [`loaded::state`], [`load_more`]'s phase
 //! resolution, [`copy_button`]'s toast decision,
 //! [`modal::confirm_state`], the [`overlay`] stack, the
-//! [`time`] formatters, and the [`icon::Icon`] enum — so their
+//! [`time`] formatters, [`atmosphere::palette`] (the shader knobs
+//! site, its stops parity-pinned against the stylesheet), and the
+//! [`icon::Icon`] enum — so their
 //! contracts (localStorage JSON, CSS-class composition, state
 //! machines, canonical copy, focus ownership, timestamp buckets) are
 //! exercised by native unit tests and nameable by native consumer
