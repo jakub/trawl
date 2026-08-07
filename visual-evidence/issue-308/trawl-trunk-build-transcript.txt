@@ -1,0 +1,8 @@
+$ trunk build   # crates/trawl-web-ui — no npm step anywhere
+2026-08-07T19:41:08.251705Z  INFO 🚀 Starting trunk 0.21.14
+2026-08-07T19:41:08.251827Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-308/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-308/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.24s
+2026-08-07T19:41:16.748250Z  INFO applying new distribution
+2026-08-07T19:41:16.749503Z  INFO ✅ success

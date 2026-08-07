@@ -14,7 +14,13 @@
 //! - **form & actions** — `Btn`, `Field`, `Toggle`, `Segmented`,
 //!   `SearchInput`, `CopyButton`, `Kbd`;
 //! - **content & data** — `Badge`, `StatusDot`, `Sparkline`, `Tabs`,
-//!   `Loaded`, `Pager`, `LoadMore`, `When`, `ErrorBanner`, `IconView`.
+//!   `Loaded`, `Pager`, `LoadMore`, `When`, `ErrorBanner`, `IconView`;
+//! - **decoration** — `Atmosphere`, the WebGL mesh-gradient backdrop
+//!   over the vendored `@paper-design/shaders` bundle, which rides
+//!   along as a wasm-bindgen snippet — no consumer build wiring, but
+//!   behind the **default-off `atmosphere` cargo feature**, because
+//!   linking the snippet plants its 142 KB in the dist of every
+//!   consumer, mounted or not (ADR-0012, [`atmosphere`]).
 //!
 //! Consumed by trawl-web-ui and the future coastwatch-web via
 //! workspace path deps; CSS is consumed via Trunk's `data-trunk
@@ -29,12 +35,15 @@
 //! [`sparkline::geometry`], [`loaded::state`], [`load_more`]'s phase
 //! resolution, [`copy_button`]'s toast decision,
 //! [`modal::confirm_state`], the [`overlay`] stack, the
-//! [`time`] formatters, and the [`icon::Icon`] enum — so their
+//! [`time`] formatters, [`atmosphere::palette`] (the shader knobs
+//! site, its stops parity-pinned against the stylesheet), and the
+//! [`icon::Icon`] enum — so their
 //! contracts (localStorage JSON, CSS-class composition, state
 //! machines, canonical copy, focus ownership, timestamp buckets) are
 //! exercised by native unit tests and nameable by native consumer
 //! code. The renderers themselves stay wasm32-only.
 
+pub mod atmosphere;
 pub mod badge;
 pub mod button;
 pub mod copy_button;
@@ -92,6 +101,8 @@ pub use toast::{Toast, ToastKind, ToastStack};
 
 #[cfg(target_arch = "wasm32")]
 pub use actions_menu::{ActionItem, ActionsMenu};
+#[cfg(all(target_arch = "wasm32", feature = "atmosphere"))]
+pub use atmosphere::Atmosphere;
 #[cfg(target_arch = "wasm32")]
 pub use badge::Badge;
 #[cfg(target_arch = "wasm32")]

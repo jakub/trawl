@@ -162,7 +162,11 @@ jobs:
         with:
           shared-key: wasm-check
       - run: cargo check -p trawl-web-ui --target wasm32-unknown-unknown
+      # Both sides of the default-off `atmosphere` feature: the bare run is
+      # the shape non-mounting consumers compile (and the one that must NOT
+      # link the vendored snippet), the second covers the backdrop itself.
       - run: cargo check -p fleet-ui --target wasm32-unknown-unknown
+      - run: cargo check -p fleet-ui --target wasm32-unknown-unknown --features atmosphere
 
   vendor-drift:
     name: web UI vendor bundle drift
@@ -175,12 +179,16 @@ jobs:
       - name: Rebuild vendor bundles
         working-directory: crates/trawl-web-ui/vendor
         run: bash build.sh
+      - name: Rebuild fleet-ui vendor bundle
+        working-directory: crates/fleet-ui/vendor
+        run: bash build.sh
       - name: Fail if committed bundles drifted
         run: |
           git diff --exit-code \
             crates/trawl-web-ui/vendor/codemirror.js \
             crates/trawl-web-ui/vendor/uplot.js \
-            crates/trawl-web-ui/vendor/uplot.css
+            crates/trawl-web-ui/vendor/uplot.css \
+            crates/fleet-ui/vendor/paper-shaders.js
 
   trunk-build:
     name: web UI release build (trunk)
@@ -196,9 +204,36 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
+      # The SPA depends on fleet-ui but does not mount Atmosphere, so it must
+      # not ship (or modulepreload) the 142 KB shader bundle. That holds only
+      # while the `atmosphere` feature stays off here — feature unification
+      # would silently re-plant the snippet — so assert the dist is clean
+      # (ADR-0012).
       - name: Build SPA
         working-directory: crates/trawl-web-ui
-        run: trunk build --release
+        run: |
+          # wasm-bindgen appends to its output dir and never prunes it, and
+          # rust-cache restores that dir — so an orphaned snippet from an
+          # earlier build would be copied into dist and read as a leak.
+          # Purge the staging snippets so the assertion below sees only what
+          # THIS build emitted.
+          rm -rf ../../target/wasm-bindgen/release/snippets
+          trunk build --release
+          if ls dist/snippets/fleet-ui-*/vendor/paper-shaders.js >/dev/null 2>&1; then
+            echo "::error::trawl-web-ui dist ships the fleet-ui shader snippet — the atmosphere feature leaked on"
+            exit 1
+          fi
+      # The workbench is the only wasm-target build of the Atmosphere
+      # backdrop (it opts in via `data-cargo-features` in index.html).
+      # wasm-bindgen inlines `module = "/vendor/paper-shaders.js"` as a
+      # compile-time snippet, so a missing bundle already fails the build;
+      # the assertion pins the emission path the generated shim imports
+      # (ADR-0012).
+      - name: Build fleet-ui workbench
+        working-directory: crates/fleet-ui
+        run: |
+          trunk build
+          test -f dist/snippets/*/vendor/paper-shaders.js
       - name: Precompress SPA + enforce wire-size budgets
         run: cargo xtask compress-web
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

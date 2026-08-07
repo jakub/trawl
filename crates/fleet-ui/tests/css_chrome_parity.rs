@@ -25,6 +25,13 @@
 //!     footer-auto-sizing change) — the row that lets a footer-less app
 //!     collapse the footer to zero while trawl's statusbar sizes itself.
 //!   * The six chrome keyframes must survive the move to fleet-ui.css.
+//!   * `.login-shell` lost its `background: var(--bg)` declaration
+//!     (jakub/coastwatch#308, ADR-0012) — a DELIBERATE delta: an opaque
+//!     normal-flow block paints above the `z-index: -1` `.atmosphere`
+//!     canvas and fully occluded the backdrop. Zero-visual-delta today
+//!     because `body`'s `background: var(--bg)` propagates to the
+//!     canvas (html declares none). `.login-shell` is not in the golden
+//!     fixture, so no re-capture was needed.
 //!
 //! Reading the shipped stylesheet at test time turns those prose claims
 //! into a `cargo nextest` guard, mirroring the `ToastKind` / `Btn`
@@ -36,6 +43,10 @@
 //! below enforce the Mira control recipes — weight-500 buttons, tinted
 //! destructive, `--on-accent` text, 2px `--ring` focus, tokenized radii
 //! — so the new values are the guarded baseline, not a casualty.
+
+mod common;
+
+use common::rules;
 
 const CSS: &str = include_str!("../styles/fleet-ui.css");
 
@@ -60,38 +71,6 @@ fn rule_body(selector: &str) -> &'static str {
         .find('}')
         .unwrap_or_else(|| panic!("unterminated rule for `{selector}`"));
     &CSS[start..start + end]
-}
-
-/// Split a flat stylesheet into its individual top-level rules, dropping
-/// blank and comment lines between them. A rule runs from its selector
-/// line to the line where brace depth returns to zero, so single-line
-/// rules, multi-line rules, and `@keyframes` blocks each come out whole.
-/// The chrome CSS is un-nested, so this stays simple.
-fn rules(css: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur: Vec<&str> = Vec::new();
-    let mut depth: i32 = 0;
-    for line in css.lines() {
-        if depth == 0 {
-            let t = line.trim_start();
-            if t.is_empty() || t.starts_with("/*") || t.starts_with('*') {
-                continue;
-            }
-        }
-        cur.push(line);
-        for ch in line.chars() {
-            match ch {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-        }
-        if depth == 0 && !cur.is_empty() {
-            out.push(cur.join("\n"));
-            cur.clear();
-        }
-    }
-    out
 }
 
 #[test]
@@ -155,6 +134,24 @@ fn login_error_spacing_preserved() {
         "`.login-card .error-banner` must keep `margin-bottom: 16px` — the \
          login form's error spacing depends on this override of the base \
          `.error-banner`"
+    );
+}
+
+#[test]
+fn login_shell_declares_no_background() {
+    // jakub/coastwatch#308 / ADR-0012 composability: `.login-shell` is a
+    // normal-flow opaque block covering the viewport — ANY background on
+    // it paints above the `z-index: -1` `.atmosphere` canvas and fully
+    // occludes the backdrop. The page background it used to provide comes
+    // from `body { background: var(--bg) }` via root propagation instead
+    // (html declares none — pinned by atmosphere_palette_parity), so
+    // removing the declaration is zero visual delta without a backdrop
+    // and the whole point with one.
+    assert!(
+        !rule_body(".login-shell").contains("background"),
+        "`.login-shell` must not declare a background — an opaque \
+         normal-flow block occludes the z-index:-1 .atmosphere backdrop \
+         (jakub/coastwatch#308); the page floor is body's var(--bg)"
     );
 }
 

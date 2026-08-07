@@ -1,0 +1,10 @@
+$ cargo fmt --check
+(no output — clean)
+
+$ cargo clippy --workspace --all-targets -- -D warnings   # lefthook pre-commit
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.24s
+
+$ cargo clippy --workspace --all-targets --no-default-features   # CI `clippy` job
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.11s
+
+# Zero warnings emitted in either configuration.
