@@ -72,3 +72,78 @@ fn banner_version_matches_the_package_json_pin() {
          package.json pin; got: {banner}"
     );
 }
+
+const INTEROP: &str = include_str!("../src/atmosphere/interop.rs");
+const WRAPPER_TS: &str = include_str!("../vendor/src/paper-shaders.ts");
+
+#[test]
+fn bundle_is_a_self_contained_esm_module() {
+    // wasm-bindgen `module = "…"` loads the file as ONE browser ES
+    // module with no resolver: a relative import or a CommonJS
+    // `require()` escaping minification means the bundle silently fails
+    // to load at runtime — the backdrop just never appears.
+    let body = &BUNDLE[BUNDLE.find("*/").map_or(0, |i| i + 2)..];
+    for needle in ["from\"./", "from\"../", "from \"./", "from \"../"] {
+        assert!(
+            !body.contains(needle),
+            "bundle contains a relative import (`{needle}`) — it must \
+             be a single self-contained file (esbuild --bundle)"
+        );
+    }
+    assert!(
+        !body.contains("require("),
+        "bundle contains a CommonJS require() — browsers cannot resolve \
+         it inside an ES module (esbuild --format=esm regressed)"
+    );
+}
+
+#[test]
+fn bundle_exports_the_wrapper_api() {
+    // The two names wasm-bindgen binds (createShader) and the catalog
+    // the vendor-side name resolution reads. esbuild keeps export
+    // names verbatim in the `export{… as name}` clause.
+    for export in ["createShader", "shaderCatalog"] {
+        assert!(
+            BUNDLE.contains(export),
+            "bundle must export `{export}` — wasm-bindgen resolves it \
+             by name at module load; a rename is a silent runtime break"
+        );
+    }
+}
+
+#[test]
+fn interop_path_agrees_with_the_vendored_filename() {
+    // Three names must agree or the import 404s at runtime with no
+    // compile signal: the wasm-bindgen module path in interop.rs, the
+    // committed vendor file (whose existence include_str! proves), and
+    // the copy-file directive target in index.html.
+    assert!(
+        INTEROP.contains(r#"module = "/vendor/paper-shaders.js""#),
+        "interop.rs must bind module = \"/vendor/paper-shaders.js\" — \
+         the runtime path the copy-file directive materializes"
+    );
+    let index_html = include_str!("../index.html");
+    assert!(
+        index_html.contains(r#"rel="copy-file" href="vendor/paper-shaders.js""#)
+            && index_html.contains(r#"data-target-path="vendor""#),
+        "index.html must copy-file vendor/paper-shaders.js into \
+         dist/vendor/ — without the directive the module import 404s \
+         at runtime with no compile-time signal"
+    );
+}
+
+#[test]
+fn palette_shader_is_a_catalog_key() {
+    // createShader falls through to treating an unknown name as RAW
+    // GLSL source — a typo'd catalog name compiles as a broken shader
+    // and renders nothing, silently. Pin the name against the
+    // unminified wrapper source's catalog keys.
+    let key = format!("\n  {}: ", fleet_ui::atmosphere::palette::SHADER);
+    assert!(
+        WRAPPER_TS.contains(&key),
+        "palette::SHADER `{}` is not a shaderCatalog key in \
+         vendor/src/paper-shaders.ts — the wrapper would fall through \
+         to compiling the NAME as raw GLSL and render nothing",
+        fleet_ui::atmosphere::palette::SHADER
+    );
+}
