@@ -34,8 +34,8 @@ fn main() {
 // TopBar and Rail are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
 use fleet_ui::{
-    AppLink, Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal, ModeTab,
-    RailItem, Shell, Size, TabItem, Tabs, ToastBus, UserInfo, Variant, install,
+    AppLink, Atmosphere, Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal,
+    ModeTab, RailItem, Shell, Size, TabItem, Tabs, ToastBus, UserInfo, Variant, install,
 };
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
@@ -274,7 +274,12 @@ fn DemoApp() -> impl IntoView {
     // mount — panics with "spawn_local before a global executor was
     // initialized". This mirrors trawl-web-ui's `App`, which likewise
     // calls `fleet_ui::install` in its body.
-    let _prefs = install("fleet-ui-demo:prefs");
+    let prefs = install("fleet-ui-demo:prefs");
+    // …and, like trawl-web-ui's App, the prefs must be PROVIDED as
+    // context: TopBar's theme toggle reaches them via
+    // `use_context::<UiPrefs>()` and silently no-ops without this
+    // (the demo previously discarded `_prefs` — a latent bug).
+    provide_context(prefs);
 
     let rail_items_sig = Signal::derive(rail_items);
     let app_links_sig = Signal::derive(app_links);
@@ -291,6 +296,11 @@ fn DemoApp() -> impl IntoView {
         <Router>
             <Routes fallback=|| view! { <p>"…"</p> }>
                 <Route path=path!("/login") view=move || view! {
+                    // The shader backdrop composed under the login card
+                    // — the coastwatch#308 target arrangement, and the
+                    // trunk-served evidence venue for ACs 3–6 (the
+                    // static design-cards workbench cannot host WebGL).
+                    <Atmosphere theme=prefs.theme()/>
                     <Login
                         brand="demo"
                         brand_accent="·"
@@ -333,6 +343,21 @@ fn DemoApp() -> impl IntoView {
                     </Shell>
                 }/>
             </Routes>
+            // Always-visible theme toggle, OUTSIDE <Routes> so it stays
+            // mounted on /login too (the real Shell's TopBar toggle only
+            // exists on shell routes). This is what lets AC-4 — a live
+            // re-color of the SAME mounted canvas, no remount — be
+            // driven and captured while /login is on screen.
+            <button
+                class="btn"
+                style="position:fixed;right:12px;bottom:12px;z-index:10"
+                on:click=move |_| prefs.theme().update(|t| *t = t.toggled())
+            >
+                {move || match prefs.theme().get() {
+                    fleet_ui::theme::Theme::Light => "theme: light",
+                    fleet_ui::theme::Theme::Dark => "theme: dark",
+                }}
+            </button>
         </Router>
     }
 }
