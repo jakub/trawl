@@ -782,11 +782,17 @@ textarea:focus-visible,
  *  rule lives in the form block so login-specific spacing
  *  (margin-bottom) is preserved without duplicating the base rule.
  * ─────────────────────────────────────────────────────────────── */
+/* No background here — deliberately (coastwatch#308, ADR-0012). An
+ * opaque normal-flow block paints ABOVE the z-index:-1 .atmosphere
+ * canvas, so a background on .login-shell fully occludes the shader
+ * backdrop. The page floor it used to paint comes from body's
+ * `background: var(--bg)` propagating to the viewport canvas instead
+ * (html declares no background of its own — both invariants pinned by
+ * atmosphere_palette_parity / css_chrome_parity). */
 .login-shell {
   display: grid;
   place-items: center;
   height: 100%;
-  background: var(--bg);
 }
 
 .login-card {
