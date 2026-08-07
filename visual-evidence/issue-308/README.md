@@ -1,0 +1,69 @@
+# jakub/coastwatch#308 evidence — Atmosphere WebGL shader backdrop (ADR-0012)
+
+Captured against the fleet-ui workbench (`trunk serve` on :8082, the
+shell_demo `/login` route) and trawl-web-ui (`trunk serve` on :8083),
+driven via Playwright (Chromium). Native/build gates ran on the same
+tree (`feat/issue-308-shader-atmosphere`).
+
+## AC-3 — one canvas, clean unmount, clean console
+
+- `login-light.png` — `/login` with the mesh-gradient backdrop under
+  the login card, light theme. DOM probe: exactly 1 `canvas`, inside
+  the single `div.atmosphere[aria-hidden=true]`.
+- Three SPA round trips `/login → / → /login` (leptos-router popstate,
+  no reloads): canvas count 1 → 0 → 1 on every trip — `on_cleanup`
+  disposes the mount, nothing accumulates.
+- `console-roundtrips.log` — full transcript for the session: 0 errors.
+  The warnings are trunk-dev's preload-integrity notice, the EXPECTED
+  `CONTEXT_LOST_WEBGL` from `dispose()` releasing the context on route
+  exit, and NVIDIA driver perf chatter (ReadPixels stalls from the
+  screenshot captures).
+
+## AC-4 — theme flip re-colors the SAME canvas, no remount
+
+- `login-dark.png` — after clicking the workbench theme toggle while
+  `/login` stayed mounted. Node-identity probe across the flip:
+  `before === after` true, `isConnected` true, still exactly 1 canvas.
+  The mesh re-colored in place via `setUniforms`.
+
+## AC-5 — prefers-reduced-motion: static frame, no rAF
+
+- `login-reduced-motion.png` — `emulateMedia({reducedMotion:
+  'reduce'})`, fresh mount. A static mesh frame paints; instrumented
+  `requestAnimationFrame` counted **0** callbacks scheduled over
+  1500 ms — the vendored package stops its loop entirely at speed 0.
+
+## AC-6 — WebGL2 unavailable: silent var(--bg) floor
+
+- `login-no-webgl2.png` — `getContext('webgl2'|'webgl')` stubbed to
+  `null` via init script before any page script ran. No canvas mounts;
+  `.atmosphere`'s computed background equals body's (`oklch(0.145 0 0)`
+  dark floor — flat `var(--bg)`); console shows zero errors (only the
+  trunk-dev preload notice).
+
+## AC-7 — bundle size
+
+- `vendor-drift-transcript.txt` — `du -h` reports **144K** on disk
+  (142K file) against the issue's 500 KB cap, and a fresh
+  `vendor/build.sh` run leaves `git status` clean (drift gate green,
+  Apache-2.0 banner riding in the artifact).
+
+## AC-2 / AC-8 — builds and native suite
+
+- `trawl-trunk-build-transcript.txt` — trawl-web-ui `trunk build`
+  succeeds with no npm step anywhere.
+- `nextest-transcript.txt` — `cargo nextest run --workspace`:
+  **2622 tests run: 2622 passed, 0 skipped** (includes the 153
+  fleet-ui native tests: palette parity, vendor contract, chrome
+  parity, class contracts).
+- `cargo check -p fleet-ui --target wasm32-unknown-unknown` clean;
+  fleet-ui `trunk build` produces `dist/vendor/paper-shaders.js`
+  (the copy-file contract resolves).
+
+## .login-shell zero-delta check (trawl-web-ui)
+
+- `trawl-login-light.png` / `trawl-login-dark.png` — trawl-web-ui's
+  real `/login` after the `.login-shell` background removal:
+  `.login-shell` computes `rgba(0,0,0,0)` and body's `var(--bg)` paints
+  the viewport in both themes — visually identical to before the
+  change (no backdrop is mounted there in this slice).
