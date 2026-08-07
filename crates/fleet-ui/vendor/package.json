@@ -1,0 +1,15 @@
+{
+  "name": "fleet-ui-vendor",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Vendored JS bundle (@paper-design/shaders) consumed by fleet-ui via wasm-bindgen. Committed output lives alongside sources; CI gates drift.",
+  "scripts": {
+    "build": "bash build.sh"
+  },
+  "dependencies": {
+    "@paper-design/shaders": "0.0.79"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.0"
+  }
+}
